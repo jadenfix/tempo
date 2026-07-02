@@ -13,6 +13,7 @@ repository = "https://github.com/jadenfix/tempo"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 async-trait = "0.1"
+sha2 = "0.10"
 thiserror = "2"
 
 [workspace.lints.rust]

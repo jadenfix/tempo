@@ -1258,6 +1258,7 @@ mod tests {
         journal.append(JournalEvent::ActionPlanned {
             action: second.clone(),
         })?;
+        drop(journal);
 
         let mut agent = AgentLoop::open(
             &journal_path,
@@ -1299,6 +1300,7 @@ mod tests {
             action: Action::Scroll { x: 0.0, y: 99.0 },
             diff: diff(0, 1),
         })?;
+        drop(journal);
 
         assert!(matches!(
             AgentLoop::open(
