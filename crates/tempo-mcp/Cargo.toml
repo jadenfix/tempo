@@ -5,5 +5,15 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+base64 = "0.22"
+serde.workspace = true
+serde_json.workspace = true
+tempo-handshake = { path = "../tempo-handshake" }
 tempo-schema = { path = "../tempo-schema" }
 tempo-driver = { path = "../tempo-driver" }
+thiserror.workspace = true
+url = "2"
+
+[dev-dependencies]
+async-trait.workspace = true
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
