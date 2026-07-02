@@ -16,7 +16,7 @@ use tempo_handshake::{
     Lane as HandshakeLane, ProbeHit, ProbeReport, ProbeResponse, StructuredSignal,
 };
 use tempo_observe::composite_set_of_marks_png;
-use tempo_schema::{Action, NodeId};
+use tempo_schema::{Action, ActionBatch, NodeId};
 use thiserror::Error;
 use url::{Host, Url};
 
@@ -240,6 +240,14 @@ where
                     Err(error) => Ok(ToolCall::error(error.to_string())),
                 }
             }
+            "act_batch" => {
+                let args: ActBatchArgs = parse_args(arguments)?;
+                let driver = self.driver_for_mut(args.driver_id.as_deref())?;
+                match driver.act_batch(&args.batch).await {
+                    Ok(outcome) => Ok(ToolCall::success(step_outcome_json(outcome))),
+                    Err(error) => Ok(ToolCall::error(error.to_string())),
+                }
+            }
             "fork" => {
                 let args: ForkArgs = parse_args(arguments)?;
                 let forked = {
@@ -433,6 +441,17 @@ pub fn tools() -> Vec<ToolDescriptor> {
             ),
         },
         ToolDescriptor {
+            name: "act_batch",
+            description: "Execute a batch of tempo semantic actions with quiescence policy.",
+            input_schema: object_schema(
+                vec![
+                    ("batch", json!({"type": "object"})),
+                    ("driver_id", json!({"type": "string"})),
+                ],
+                &["batch"],
+            ),
+        },
+        ToolDescriptor {
             name: "fork",
             description: "Fork the current page state when the active driver supports it.",
             input_schema: object_schema(vec![("driver_id", json!({"type": "string"}))], &[]),
@@ -477,7 +496,7 @@ pub fn tools() -> Vec<ToolDescriptor> {
 }
 
 pub fn describe() -> &'static str {
-    "tempo MCP server core: initialize/ping/tools/list/tools/call for observe, act, fork, extract, screenshot, and handshake"
+    "tempo MCP server core: initialize/ping/tools/list/tools/call for observe, act, act_batch, fork, extract, screenshot, and handshake"
 }
 
 #[derive(Debug, Error)]
@@ -550,6 +569,13 @@ struct ActArgs {
     #[serde(default)]
     driver_id: Option<String>,
     action: Action,
+}
+
+#[derive(Debug, Deserialize)]
+struct ActBatchArgs {
+    #[serde(default)]
+    driver_id: Option<String>,
+    batch: ActionBatch,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -959,6 +985,7 @@ mod tests {
             vec![
                 "observe",
                 "act",
+                "act_batch",
                 "fork",
                 "extract",
                 "screenshot",
@@ -1005,6 +1032,20 @@ mod tests {
         .await?;
         assert_eq!(act["status"], "applied");
         assert_eq!(act["diff"]["seq"], 2);
+
+        let batch = call_tool(
+            &mut server,
+            "act_batch",
+            json!({
+                "batch": {
+                    "actions": [{"kind": "scroll", "x": 0.0, "y": 12.0}],
+                    "quiescence": "composite"
+                }
+            }),
+        )
+        .await?;
+        assert_eq!(batch["status"], "applied");
+        assert_eq!(batch["diff"]["seq"], 3);
 
         let extract =
             call_tool(&mut server, "extract", json!({"node_id": "button.primary"})).await?;
