@@ -258,11 +258,68 @@ impl DriverTrait for TestDriver {
 pub mod conformance {
     use super::*;
 
+    /// Expected native page-state fork behavior for a driver under conformance.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum ForkExpectation {
+        /// Accept either a native fork or an explicit unsupported capability.
+        Optional,
+        /// `fork()` must return an independent driver handle.
+        Supported,
+        /// `fork()` must report `Unsupported` rather than a transport failure.
+        Unsupported,
+    }
+
+    /// Portable conformance inputs for engines that need a fixture URL or have
+    /// engine-specific optional capabilities.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct ConformanceConfig {
+        pub navigation_url: String,
+        pub fork: ForkExpectation,
+        pub extract_node: Option<NodeId>,
+    }
+
+    impl ConformanceConfig {
+        pub fn new(navigation_url: impl Into<String>) -> Self {
+            Self {
+                navigation_url: navigation_url.into(),
+                ..Self::default()
+            }
+        }
+
+        pub fn with_fork(mut self, fork: ForkExpectation) -> Self {
+            self.fork = fork;
+            self
+        }
+
+        pub fn with_extract_node(mut self, node: impl Into<NodeId>) -> Self {
+            self.extract_node = Some(node.into());
+            self
+        }
+    }
+
+    impl Default for ConformanceConfig {
+        fn default() -> Self {
+            Self {
+                navigation_url: "https://example.com".into(),
+                fork: ForkExpectation::Optional,
+                extract_node: None,
+            }
+        }
+    }
+
     /// Runs the portable conformance checks against any driver. Returns `Ok(())` on pass.
     pub async fn assert_driver_conformance<D: DriverTrait>(driver: &mut D) -> Result<(), String> {
+        assert_driver_conformance_with(driver, ConformanceConfig::default()).await
+    }
+
+    /// Runs conformance checks with explicit capability expectations.
+    pub async fn assert_driver_conformance_with<D: DriverTrait>(
+        driver: &mut D,
+        config: ConformanceConfig,
+    ) -> Result<(), String> {
         // 1. goto returns an observation carrying the frozen schema version.
         let obs = driver
-            .goto("https://example.com")
+            .goto(&config.navigation_url)
             .await
             .map_err(|e| e.to_string())?;
         if obs.schema_version != tempo_schema::SCHEMA_VERSION {
@@ -291,7 +348,86 @@ pub mod conformance {
             return Err("observe_diff ignored since_seq".into());
         }
 
-        // 4. screenshot returns PNG bytes, matching the protocol surfaces that expose
+        // 4. Script evaluation is part of C3 and is required by BiDi, Servo M-vanilla,
+        // and extraction helpers. Conformance only requires a transport-successful
+        // value here because each engine returns its native JSON shape.
+        let evaluated = driver
+            .evaluate_script("document.readyState", false)
+            .await
+            .map_err(|e| format!("evaluate_script failed: {e}"))?;
+        if evaluated.is_null() {
+            return Err("evaluate_script returned null".into());
+        }
+
+        // 5. Typed extraction must work for at least one grounded node on the
+        // fixture page. Engines should pass an explicit node when their fixture
+        // uses a known selector/NodeId; otherwise the first observed element is used.
+        let extract_node = config
+            .extract_node
+            .clone()
+            .or_else(|| obs.elements.first().map(|element| element.node_id.clone()))
+            .ok_or_else(|| "conformance fixture did not expose an extractable node".to_string())?;
+        let extracted = driver
+            .extract(&extract_node)
+            .await
+            .map_err(|e| format!("extract failed: {e}"))?;
+        if extracted.is_null() || extracted.get("found") == Some(&serde_json::Value::Bool(false)) {
+            return Err("extract did not return a grounded value".into());
+        }
+
+        // 6. Successful batched actions must apply as a unit and return a normal
+        // step outcome.
+        let ok_batch = ActionBatch {
+            actions: vec![
+                Action::Scroll { x: 0.0, y: 0.0 },
+                Action::Extract {
+                    node: extract_node.clone(),
+                },
+            ],
+            quiescence: tempo_schema::QuiescencePolicy::FixedMillis(0),
+        };
+        let out = driver
+            .act_batch(&ok_batch)
+            .await
+            .map_err(|e| format!("successful batch failed with transport error: {e}"))?;
+        if !matches!(out, StepOutcome::Applied { .. }) {
+            return Err("successful batch did not yield Applied".into());
+        }
+
+        // 7. Batched actions preserve the grounding contract too: a NodeId miss
+        // is a StepError, not a transport error or partial success.
+        let batch = ActionBatch {
+            actions: vec![Action::Click {
+                node: NodeId("tempo-conformance-missing-node".into()),
+            }],
+            quiescence: tempo_schema::QuiescencePolicy::FixedMillis(0),
+        };
+        let out = driver.act_batch(&batch).await.map_err(|_| {
+            "batched grounding miss surfaced as TransportError (contract violation)".to_string()
+        })?;
+        if !matches!(out, StepOutcome::StepError { .. }) {
+            return Err("batched missing node did not yield StepError".into());
+        }
+
+        // 8. Native fork capability must be explicit. Engines that do not support
+        // it return Unsupported so tempo-speculate can fall back to replay-fork.
+        match config.fork {
+            ForkExpectation::Optional => match driver.fork().await {
+                Ok(mut forked) => assert_fork_observes(&mut *forked).await?,
+                Err(_unsupported) => {}
+            },
+            ForkExpectation::Supported => match driver.fork().await {
+                Ok(mut forked) => assert_fork_observes(&mut *forked).await?,
+                Err(error) => return Err(error.to_string()),
+            },
+            ForkExpectation::Unsupported => {
+                if driver.fork().await.is_ok() {
+                    return Err("driver unexpectedly supported native fork".into());
+                }
+            }
+        }
+
+        // 9. screenshot returns PNG bytes, matching the protocol surfaces that expose
         // `image/png` screenshots over MCP and BiDi.
         let screenshot = driver.screenshot().await.map_err(|e| e.to_string())?;
         if !screenshot.starts_with(PNG_SIGNATURE) || screenshot.len() <= PNG_SIGNATURE.len() {
@@ -301,16 +437,29 @@ pub mod conformance {
         driver.close().await.map_err(|e| e.to_string())?;
         Ok(())
     }
+
+    async fn assert_fork_observes(driver: &mut dyn DriverTrait) -> Result<(), String> {
+        let fork_obs = driver.observe().await.map_err(|e| e.to_string())?;
+        if fork_obs.schema_version != tempo_schema::SCHEMA_VERSION {
+            return Err("fork observation schema version mismatch".into());
+        }
+        driver.close().await.map_err(|e| e.to_string())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
 
     #[test]
     fn test_driver_passes_conformance() {
-        let mut d = TestDriver::new();
-        let res = futures::executor::block_on(conformance::assert_driver_conformance(&mut d));
+        let mut d = TestDriver::new().with_elements(vec![button("submit")]);
+        let config = conformance::ConformanceConfig::default()
+            .with_fork(conformance::ForkExpectation::Supported);
+        let res = futures::executor::block_on(conformance::assert_driver_conformance_with(
+            &mut d, config,
+        ));
         assert!(res.is_ok(), "conformance failed: {res:?}");
     }
 
@@ -322,5 +471,89 @@ mod tests {
         assert!(bytes.starts_with(PNG_SIGNATURE));
         assert!(bytes.len() > PNG_SIGNATURE.len());
         Ok(())
+    }
+
+    #[test]
+    fn conformance_accepts_drivers_that_explicitly_do_not_fork() {
+        let mut driver = NoForkDriver(TestDriver::new().with_elements(vec![button("submit")]));
+        let config = conformance::ConformanceConfig::default()
+            .with_fork(conformance::ForkExpectation::Unsupported);
+
+        let res = futures::executor::block_on(conformance::assert_driver_conformance_with(
+            &mut driver,
+            config,
+        ));
+
+        assert!(res.is_ok(), "conformance failed: {res:?}");
+    }
+
+    struct NoForkDriver(TestDriver);
+
+    #[async_trait]
+    impl DriverTrait for NoForkDriver {
+        fn engine(&self) -> Engine {
+            self.0.engine()
+        }
+
+        async fn goto(&mut self, url: &str) -> Result<CompiledObservation, TransportError> {
+            self.0.goto(url).await
+        }
+
+        async fn observe(&mut self) -> Result<CompiledObservation, TransportError> {
+            self.0.observe().await
+        }
+
+        async fn observe_diff(
+            &mut self,
+            since_seq: u64,
+        ) -> Result<ObservationDiff, TransportError> {
+            self.0.observe_diff(since_seq).await
+        }
+
+        async fn act(&mut self, action: &Action) -> Result<StepOutcome, TransportError> {
+            self.0.act(action).await
+        }
+
+        async fn act_batch(&mut self, batch: &ActionBatch) -> Result<StepOutcome, TransportError> {
+            self.0.act_batch(batch).await
+        }
+
+        async fn fork(&mut self) -> Result<Box<dyn DriverTrait>, Unsupported> {
+            Err(Unsupported("native fork intentionally unsupported"))
+        }
+
+        async fn extract(&mut self, node: &NodeId) -> Result<serde_json::Value, TransportError> {
+            self.0.extract(node).await
+        }
+
+        async fn evaluate_script(
+            &mut self,
+            expression: &str,
+            await_promise: bool,
+        ) -> Result<serde_json::Value, TransportError> {
+            self.0.evaluate_script(expression, await_promise).await
+        }
+
+        async fn screenshot(&mut self) -> Result<Vec<u8>, TransportError> {
+            self.0.screenshot().await
+        }
+
+        async fn close(&mut self) -> Result<(), TransportError> {
+            self.0.close().await
+        }
+    }
+
+    fn button(id: &str) -> tempo_schema::InteractiveElement {
+        tempo_schema::InteractiveElement {
+            node_id: NodeId(id.into()),
+            role: "button".into(),
+            name: vec![tempo_schema::TaintSpan {
+                provenance: tempo_schema::Provenance::Page,
+                text: "Submit".into(),
+            }],
+            value: Vec::new(),
+            bounds: Some([0.0, 0.0, 100.0, 30.0]),
+            rank: 1.0,
+        }
     }
 }

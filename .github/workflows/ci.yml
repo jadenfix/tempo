@@ -39,6 +39,14 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings -D clippy::unwrap_used -D clippy::expect_used
       - name: cargo test (contracts + conformance)
         run: cargo test --workspace
+      - name: cargo test (live CDP conformance)
+        run: |
+          CHROME="$(command -v google-chrome || command -v chromium-browser || command -v chromium || true)"
+          if [ -z "$CHROME" ]; then
+            echo "Chrome/Chromium is required for live CDP conformance"
+            exit 1
+          fi
+          TEMPO_CDP_CHROME="$CHROME" cargo test -p tempo-engine-cdp live_cdp_driver_passes_conformance_v2 -- --nocapture
       # Always-green invariant (final.md §8.3): tempo-engine-servo must build against
       # pinned VANILLA servo. Enabled once the engine crate carries the servo dep.
       # - run: cargo check -p tempo-engine-servo --no-default-features --features servo-vanilla
