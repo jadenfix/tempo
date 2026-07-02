@@ -190,6 +190,7 @@ pub fn probe_http_origin(
 ) -> Result<HttpProbeRun, HttpProbeError> {
     let client = reqwest::blocking::Client::builder()
         .timeout(config.timeout)
+        .redirect(url_policy_redirect(config.url_policy.clone()))
         .build()
         .map_err(|error| HttpProbeError::ClientBuild(error.to_string()))?;
     let origin = canonical_probe_origin(target)?;
@@ -410,6 +411,36 @@ struct IndexedProbeFetch {
     response: Option<ProbeResponse>,
     failure: Option<HttpProbeFailure>,
 }
+
+/// Redirect policy that re-validates every hop against the URL policy.
+///
+/// The reqwest default follows up to 10 redirects with no per-hop check, so a
+/// probed origin could `302 Location: http://169.254.169.254/...` and the
+/// client would follow it into an internal/loopback target, capturing the
+/// internal response body (issue #80). This stops any redirect whose target the
+/// URL policy would block, and caps the hop count.
+fn url_policy_redirect(url_policy: UrlPolicy) -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(move |attempt| {
+        if attempt.previous().len() >= 10 {
+            return attempt.error(HttpRedirectBlocked("too many redirects".to_string()));
+        }
+        match url_policy.enforce(attempt.url().as_str()) {
+            Ok(()) => attempt.follow(),
+            Err(error) => attempt.error(HttpRedirectBlocked(error.to_string())),
+        }
+    })
+}
+
+#[derive(Debug)]
+struct HttpRedirectBlocked(String);
+
+impl std::fmt::Display for HttpRedirectBlocked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "redirect blocked by URL policy: {}", self.0)
+    }
+}
+
+impl std::error::Error for HttpRedirectBlocked {}
 
 fn fetch_probe(
     index: usize,
@@ -771,6 +802,90 @@ mod tests {
             .find(|response| response.path == "/llms.txt")
             .ok_or_else(|| io::Error::other("missing llms.txt response"))?;
         assert_eq!(llms_response.body, "01234567");
+        Ok(())
+    }
+
+    #[test]
+    fn redirect_policy_blocks_hop_to_private_target() -> TestResult {
+        // Issue #80: a probed origin that 302s to a private/metadata target must
+        // not be followed by the client.
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let handle = thread::spawn(move || -> Result<(), io::Error> {
+            if let Some(stream) = listener.incoming().next() {
+                let mut stream = stream?;
+                stream.set_read_timeout(Some(StdDuration::from_secs(5)))?;
+                let mut buffer = [0_u8; 512];
+                let _ = stream.read(&mut buffer)?;
+                let body = "internal-secret";
+                let response = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: http://169.254.169.254/latest/meta-data\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes())?;
+                stream.flush()?;
+            }
+            Ok(())
+        });
+
+        let client = reqwest::blocking::Client::builder()
+            .redirect(url_policy_redirect(UrlPolicy::block_private()))
+            .build()?;
+        let result = client.get(format!("http://{addr}/start")).send();
+        let _ = handle.join();
+
+        match result {
+            Ok(_) => Err(Box::new(io::Error::other(
+                "redirect to metadata host was followed",
+            ))),
+            Err(error) => {
+                assert!(error.is_redirect(), "expected redirect error, got {error}");
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn redirect_policy_follows_allowed_hop() -> TestResult {
+        // A redirect to an allowed target is still followed.
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let handle = thread::spawn(move || -> Result<(), io::Error> {
+            let mut incoming = listener.incoming();
+            if let Some(stream) = incoming.next() {
+                let mut stream = stream?;
+                stream.set_read_timeout(Some(StdDuration::from_secs(5)))?;
+                let mut buffer = [0_u8; 512];
+                let _ = stream.read(&mut buffer)?;
+                let location = format!("http://{addr}/final");
+                let response = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                stream.write_all(response.as_bytes())?;
+                stream.flush()?;
+            }
+            if let Some(stream) = incoming.next() {
+                let mut stream = stream?;
+                stream.set_read_timeout(Some(StdDuration::from_secs(5)))?;
+                let mut buffer = [0_u8; 512];
+                let _ = stream.read(&mut buffer)?;
+                let body = "final-ok";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes())?;
+                stream.flush()?;
+            }
+            Ok(())
+        });
+
+        let client = reqwest::blocking::Client::builder()
+            .redirect(url_policy_redirect(UrlPolicy::allow_all()))
+            .build()?;
+        let text = client.get(format!("http://{addr}/start")).send()?.text()?;
+        let _ = handle.join();
+        assert_eq!(text, "final-ok");
         Ok(())
     }
 

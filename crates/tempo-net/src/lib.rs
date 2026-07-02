@@ -1631,6 +1631,14 @@ impl UrlParts {
             BlockReason::new(BlockCode::InvalidUrl, "URL has no scheme separator")
         })?;
         let scheme = scheme.to_ascii_lowercase();
+        // Normalize the authority/path the way the WHATWG parser (used by the
+        // real fetch path via the `url` crate / reqwest / Servo) would, so this
+        // guard cannot diverge from the host that is actually connected to
+        // (issue #79). Without this, `https://169.254.169.254\@allowed.example/`
+        // parses here as host `allowed.example` (allowed) while the fetch path
+        // normalizes `\` to `/` and connects to the metadata IP.
+        let normalized_rest = normalize_special_rest(&scheme, rest);
+        let rest = normalized_rest.as_str();
         let authority = authority(rest);
         let authority = authority
             .rsplit_once('@')
@@ -1688,6 +1696,29 @@ impl UrlParts {
             (_, port) => port,
         }
     }
+}
+
+/// Apply the WHATWG normalizations that matter for authority extraction so the
+/// SSRF guard agrees with the real fetch path:
+///   * ASCII tab (`\t`), newline (`\n`), and carriage return (`\r`) are removed
+///     from the URL before parsing.
+///   * For the special `http(s)` schemes a backslash is equivalent to a forward
+///     slash, so it terminates the authority exactly like `/`.
+///
+/// Only the authority/path segment is rewritten; the query and fragment bytes
+/// are preserved verbatim so signature bases stay byte-stable.
+fn normalize_special_rest(scheme: &str, rest: &str) -> String {
+    let mut cleaned: String = rest
+        .chars()
+        .filter(|ch| !matches!(ch, '\t' | '\n' | '\r'))
+        .collect();
+    if scheme == "http" || scheme == "https" {
+        let split = cleaned.find(['?', '#']).unwrap_or(cleaned.len());
+        let tail = cleaned.split_off(split);
+        cleaned = cleaned.replace('\\', "/");
+        cleaned.push_str(&tail);
+    }
+    cleaned
 }
 
 fn authority(rest: &str) -> &str {
@@ -1823,14 +1854,17 @@ fn blocked_ipv4_reason(ip: &Ipv4Addr) -> Option<String> {
     if octets[0] == 169 && octets[1] == 254 {
         return Some(format!("{ip} is link-local/cloud metadata"));
     }
+    if octets[0] == 100 && (64..=127).contains(&octets[1]) {
+        return Some(format!("{ip} is carrier-grade NAT (100.64.0.0/10)"));
+    }
     if octets[0] == 0 {
         return Some(format!("{ip} is unspecified"));
     }
     if (224..=239).contains(&octets[0]) {
         return Some(format!("{ip} is multicast"));
     }
-    if octets[0] == 255 {
-        return Some(format!("{ip} is broadcast/reserved"));
+    if octets[0] >= 240 {
+        return Some(format!("{ip} is reserved (240.0.0.0/4)"));
     }
     None
 }
@@ -1942,6 +1976,44 @@ mod tests {
         ] {
             assert_blocked(&policy, url, BlockCode::BlockedIp);
         }
+    }
+
+    #[test]
+    fn url_policy_blocks_whatwg_backslash_and_userinfo_bypasses() {
+        // Issue #79: a backslash is a `/` for special schemes, so the metadata
+        // IP is the real host even though a naive parser sees `allowed.example`.
+        let policy = UrlPolicy::block_private();
+        for url in [
+            "https://169.254.169.254\\@allowed.example/",
+            "https://169.254.169.254\\.allowed.example/",
+            // Embedded tab/newline must be stripped before parsing.
+            "https://169.254.169.254\t\\@allowed.example/",
+            "https://169.254.169.254\n\\@allowed.example/",
+        ] {
+            assert_blocked(&policy, url, BlockCode::BlockedIp);
+        }
+        // Userinfo pointing at a public host is still stripped and allowed; the
+        // backslash form above only differs because `\` terminates the authority.
+        assert_allowed(&policy, "https://user:pass@example.com/path");
+        assert_allowed(&policy, "https://allowed.example\\@example.com/");
+    }
+
+    #[test]
+    fn url_policy_blocks_cgnat_and_reserved_ipv4() {
+        // Issue #82: CGNAT 100.64.0.0/10 and reserved 240.0.0.0/4.
+        let policy = UrlPolicy::block_private();
+        for url in [
+            "http://100.64.0.1/",
+            "http://100.127.255.255/",
+            "http://240.0.0.1/",
+            "http://254.254.254.254/",
+            "http://255.255.255.255/",
+        ] {
+            assert_blocked(&policy, url, BlockCode::BlockedIp);
+        }
+        // Neighbouring public ranges stay allowed.
+        assert_allowed(&policy, "http://100.63.255.255/");
+        assert_allowed(&policy, "http://100.128.0.1/");
     }
 
     #[test]
