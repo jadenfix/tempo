@@ -6,6 +6,8 @@ license.workspace = true
 
 [dependencies]
 tempo-schema = { path = "../tempo-schema" }
+thiserror.workspace = true
+url = "2"
 
 [dev-dependencies]
 serde_json.workspace = true
