@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
@@ -139,12 +139,51 @@ impl UrlPolicy {
         UrlPolicyVerdict::Allow
     }
 
+    /// Evaluate both the URL and the socket address selected by DNS/connect.
+    ///
+    /// This is the socket-level SSRF guard used by dispatchers after name
+    /// resolution but before opening a connection. It catches public hostnames
+    /// that resolve to loopback, RFC 1918, link-local metadata, unique-local, or
+    /// multicast targets.
+    pub fn check_resolved_ip(&self, url: &str, resolved_ip: IpAddr) -> UrlPolicyVerdict {
+        if self.mode == UrlPolicyMode::AllowAll {
+            return UrlPolicyVerdict::Allow;
+        }
+        if let UrlPolicyVerdict::Block(reason) = self.check(url) {
+            return UrlPolicyVerdict::Block(reason);
+        }
+        if let Some(detail) = blocked_ip_reason(&resolved_ip) {
+            return UrlPolicyVerdict::Block(BlockReason::new(
+                BlockCode::BlockedIp,
+                format!("resolved IP {detail}"),
+            ));
+        }
+        UrlPolicyVerdict::Allow
+    }
+
     /// Return `Err` when `check` would block the URL.
     pub fn enforce(&self, url: &str) -> Result<(), UrlBlocked> {
         match self.check(url) {
             UrlPolicyVerdict::Allow => Ok(()),
             UrlPolicyVerdict::Block(reason) => Err(UrlBlocked { reason }),
         }
+    }
+
+    /// Return `Err` when either the URL or its resolved socket IP is blocked.
+    pub fn enforce_resolved_ip(&self, url: &str, resolved_ip: IpAddr) -> Result<(), UrlBlocked> {
+        match self.check_resolved_ip(url, resolved_ip) {
+            UrlPolicyVerdict::Allow => Ok(()),
+            UrlPolicyVerdict::Block(reason) => Err(UrlBlocked { reason }),
+        }
+    }
+
+    /// Return `Err` when either the URL or resolved socket address is blocked.
+    pub fn enforce_resolved_socket(
+        &self,
+        url: &str,
+        resolved_socket: SocketAddr,
+    ) -> Result<(), UrlBlocked> {
+        self.enforce_resolved_ip(url, resolved_socket.ip())
     }
 }
 
@@ -785,6 +824,30 @@ impl AuditRecord {
     /// Enforce URL policy and emit a sanitized, taint-free audit record.
     pub fn from_request(request: &NetworkRequest, policy: &UrlPolicy) -> Result<Self, UrlBlocked> {
         policy.enforce(&request.url)?;
+        Self::from_policy_checked_request(request)
+    }
+
+    /// Enforce URL policy plus socket-level SSRF policy, then emit a sanitized audit record.
+    pub fn from_request_with_resolved_ip(
+        request: &NetworkRequest,
+        policy: &UrlPolicy,
+        resolved_ip: IpAddr,
+    ) -> Result<Self, UrlBlocked> {
+        policy.enforce_resolved_ip(&request.url, resolved_ip)?;
+        Self::from_policy_checked_request(request)
+    }
+
+    /// Enforce URL policy plus socket-level SSRF policy, then emit a sanitized audit record.
+    pub fn from_request_with_resolved_socket(
+        request: &NetworkRequest,
+        policy: &UrlPolicy,
+        resolved_socket: SocketAddr,
+    ) -> Result<Self, UrlBlocked> {
+        policy.enforce_resolved_socket(&request.url, resolved_socket)?;
+        Self::from_policy_checked_request(request)
+    }
+
+    fn from_policy_checked_request(request: &NetworkRequest) -> Result<Self, UrlBlocked> {
         let parts = UrlParts::parse(&request.url).map_err(|reason| UrlBlocked { reason })?;
         Ok(Self {
             request_id: request.id.clone(),
@@ -1566,6 +1629,58 @@ mod tests {
     }
 
     #[test]
+    fn url_policy_blocks_private_resolved_socket_targets() {
+        let policy = UrlPolicy::block_private();
+        let public_url = "https://public.example/agent";
+
+        for ip in [
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)),
+            IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254)),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ] {
+            let result = policy.enforce_resolved_ip(public_url, ip);
+            assert!(
+                matches!(&result, Err(error) if error.reason.code == BlockCode::BlockedIp),
+                "{public_url} resolved to {ip} should have been blocked: {result:?}"
+            );
+            if let Err(error) = result {
+                assert!(error.reason.detail.contains("resolved IP"));
+            }
+        }
+
+        let socket = SocketAddr::from(([192, 168, 1, 10], 443));
+        let result = policy.enforce_resolved_socket(public_url, socket);
+        assert!(
+            matches!(&result, Err(error) if error.reason.code == BlockCode::BlockedIp),
+            "{public_url} resolved to {socket} should have been blocked: {result:?}"
+        );
+    }
+
+    #[test]
+    fn url_policy_allows_public_resolved_socket_targets() -> Result<(), UrlBlocked> {
+        let policy = UrlPolicy::block_private();
+        policy.enforce_resolved_ip(
+            "https://public.example/agent",
+            IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
+        )?;
+        policy.enforce_resolved_socket(
+            "https://public.example/agent",
+            SocketAddr::from(([93, 184, 216, 34], 443)),
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn url_policy_allow_all_skips_resolved_socket_guard() -> Result<(), UrlBlocked> {
+        UrlPolicy::allow_all().enforce_resolved_ip(
+            "file:///etc/passwd",
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+        )?;
+        Ok(())
+    }
+
+    #[test]
     fn url_policy_allows_public_http_targets() {
         let policy = UrlPolicy::block_private();
         assert_allowed(&policy, "https://example.com/search?q=tempo#frag");
@@ -1665,6 +1780,37 @@ mod tests {
 
         let audit = AuditRecord::from_request(&request, &UrlPolicy::block_private());
         assert!(audit.is_err(), "{audit:?}");
+    }
+
+    #[test]
+    fn audit_record_enforces_resolved_socket_policy_before_emitting() -> Result<(), UrlBlocked> {
+        let profile = NetworkProfile::ephemeral("session-a");
+        let request = NetworkRequest::new(
+            "r1",
+            "GET",
+            "https://public.example/agent?payload=page-derived",
+            profile.id,
+            IdentityMode::AgentDeclared,
+        );
+
+        let audit = AuditRecord::from_request_with_resolved_ip(
+            &request,
+            &UrlPolicy::block_private(),
+            IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
+        )?;
+        assert_eq!(audit.origin, "https://public.example");
+        assert!(audit.taint_free);
+
+        let blocked = AuditRecord::from_request_with_resolved_socket(
+            &request,
+            &UrlPolicy::block_private(),
+            SocketAddr::from(([169, 254, 169, 254], 443)),
+        );
+        assert!(
+            matches!(&blocked, Err(error) if error.reason.code == BlockCode::BlockedIp),
+            "blocked resolved socket emitted audit record: {blocked:?}"
+        );
+        Ok(())
     }
 
     #[test]
