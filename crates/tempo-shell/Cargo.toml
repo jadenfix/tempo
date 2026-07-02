@@ -16,5 +16,10 @@ tempo-driver = { path = "../tempo-driver" }
 tempo-headless = { path = "../tempo-headless" }
 thiserror = { workspace = true }
 
+[dev-dependencies]
+futures = "0.3"
+tempo-driver = { path = "../tempo-driver", features = ["test-driver"] }
+tempo-engine-host = { path = "../tempo-engine-host" }
+
 [lints]
 workspace = true
