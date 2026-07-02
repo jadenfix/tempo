@@ -9,5 +9,10 @@ name = "tempod"
 path = "src/main.rs"
 
 [dependencies]
-tempo-schema = { path = "../tempo-schema" }
-tempo-driver = { path = "../tempo-driver" }
+serde.workspace = true
+serde_json.workspace = true
+tempo-bidi = { path = "../tempo-bidi" }
+tempo-engine-host = { path = "../tempo-engine-host" }
+tempo-mcp = { path = "../tempo-mcp" }
+tempo-session = { path = "../tempo-session" }
+thiserror.workspace = true
