@@ -12,6 +12,8 @@ use async_trait::async_trait;
 use tempo_schema::{Action, ActionBatch, CompiledObservation, NodeId, ObservationDiff};
 use thiserror::Error;
 
+const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+
 /// Transport / backend failures: crashed engine, navigation timeout, SSRF block.
 /// Distinct from a step error, which is a *grounding* failure the agent can react to.
 #[derive(Debug, Error)]
@@ -95,6 +97,15 @@ pub struct TestDriver {
     url: String,
     elements: Vec<tempo_schema::InteractiveElement>,
 }
+
+#[cfg(any(test, feature = "test-driver"))]
+const TEST_SCREENSHOT_PNG: &[u8] = &[
+    0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, b'I', b'H', b'D', b'R',
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4,
+    0x89, 0x00, 0x00, 0x00, 0x0a, b'I', b'D', b'A', b'T', 0x78, 0x9c, 0x63, 0x00, 0x01, 0x00, 0x00,
+    0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, b'I', b'E', b'N', b'D', 0xae,
+    0x42, 0x60, 0x82,
+];
 
 #[cfg(any(test, feature = "test-driver"))]
 impl TestDriver {
@@ -234,7 +245,7 @@ impl DriverTrait for TestDriver {
     }
 
     async fn screenshot(&mut self) -> Result<Vec<u8>, TransportError> {
-        Ok(Vec::new())
+        Ok(TEST_SCREENSHOT_PNG.to_vec())
     }
 
     async fn close(&mut self) -> Result<(), TransportError> {
@@ -280,6 +291,13 @@ pub mod conformance {
             return Err("observe_diff ignored since_seq".into());
         }
 
+        // 4. screenshot returns PNG bytes, matching the protocol surfaces that expose
+        // `image/png` screenshots over MCP and BiDi.
+        let screenshot = driver.screenshot().await.map_err(|e| e.to_string())?;
+        if !screenshot.starts_with(PNG_SIGNATURE) || screenshot.len() <= PNG_SIGNATURE.len() {
+            return Err("screenshot did not return PNG bytes".into());
+        }
+
         driver.close().await.map_err(|e| e.to_string())?;
         Ok(())
     }
@@ -294,5 +312,15 @@ mod tests {
         let mut d = TestDriver::new();
         let res = futures::executor::block_on(conformance::assert_driver_conformance(&mut d));
         assert!(res.is_ok(), "conformance failed: {res:?}");
+    }
+
+    #[test]
+    fn test_driver_screenshot_returns_real_png_bytes() -> Result<(), String> {
+        let mut driver = TestDriver::new();
+        let bytes = futures::executor::block_on(driver.screenshot()).map_err(|e| e.to_string())?;
+
+        assert!(bytes.starts_with(PNG_SIGNATURE));
+        assert!(bytes.len() > PNG_SIGNATURE.len());
+        Ok(())
     }
 }
