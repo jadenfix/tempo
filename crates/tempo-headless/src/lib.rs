@@ -704,31 +704,16 @@ fn bidi_response(status: u16, message: BidiMessage) -> HttpResponse {
 }
 
 fn route_mcp(pool: &mut SessionPool, request: &HttpRequest) -> HttpResponse {
-    let Some(driver) = pool.driver.clone() else {
-        return mcp_requires_driver(&request.body);
+    if let Some(driver) = pool.driver.clone() {
+        let mut server = tempo_mcp::TempoMcpServer::new(driver);
+        return HttpResponse::from_mcp(futures::executor::block_on(
+            server.handle_post(request.origin.as_deref(), &request.body),
+        ));
     };
-    let mut server = tempo_mcp::TempoMcpServer::new(driver);
-    HttpResponse::from_mcp(futures::executor::block_on(
-        server.handle_post(request.origin.as_deref(), &request.body),
+    HttpResponse::from_mcp(tempo_mcp::handle_post_driverless(
+        request.origin.as_deref(),
+        &request.body,
     ))
-}
-
-fn mcp_requires_driver(body: &[u8]) -> HttpResponse {
-    let id = serde_json::from_slice::<serde_json::Value>(body)
-        .ok()
-        .and_then(|value| value.get("id").cloned())
-        .unwrap_or(serde_json::Value::Null);
-    HttpResponse::json(
-        503,
-        json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "error": {
-                "code": -32002,
-                "message": "MCP tool calls require an attached engine driver",
-            }
-        }),
-    )
 }
 
 fn session_id_from_action_path(path: &str, action: &str) -> Result<TempodSessionId, TempodError> {
@@ -1114,7 +1099,7 @@ mod tests {
     }
 
     #[test]
-    fn mcp_endpoint_exposes_http_semantics_without_driver() -> TestResult {
+    fn mcp_endpoint_routes_driverless_tools_without_driver() -> TestResult {
         let mut pool = SessionPool::default();
         let get_response = route_http_request(
             &mut pool,
@@ -1134,13 +1119,46 @@ mod tests {
                 body: br#"{"jsonrpc":"2.0","id":9,"method":"tools/list"}"#.to_vec(),
             },
         )?;
+        let handshake_response = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/mcp".into(),
+                origin: None,
+                body: br#"{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"handshake","arguments":{"origin":"https://mcp.test","responses":[{"path":"/mcp/catalog.json","status":200,"content_type":"application/json","body":"{\"tools\":[]}"}]}}}"#.to_vec(),
+            },
+        )?;
+        let observe_response = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/mcp".into(),
+                origin: None,
+                body: br#"{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"observe","arguments":{}}}"#.to_vec(),
+            },
+        )?;
 
         assert_eq!(get_response.status, 405);
         assert_eq!(get_response.content_type, "text/plain; charset=utf-8");
-        assert_eq!(post_response.status, 503);
-        let value: Value = serde_json::from_slice(&post_response.body)?;
-        assert_eq!(value["jsonrpc"], "2.0");
-        assert_eq!(value["id"], 9);
+        assert_eq!(post_response.status, 200);
+        let tools: Value = serde_json::from_slice(&post_response.body)?;
+        assert_eq!(tools["jsonrpc"], "2.0");
+        assert_eq!(tools["id"], 9);
+        assert_eq!(tools["result"]["tools"][0]["name"], "observe");
+
+        assert_eq!(handshake_response.status, 200);
+        let handshake: Value = serde_json::from_slice(&handshake_response.body)?;
+        assert_eq!(handshake["id"], 10);
+        assert_eq!(handshake["result"]["structuredContent"]["lane"], "mcp");
+        assert_eq!(
+            handshake["result"]["structuredContent"]["skips_render"],
+            true
+        );
+
+        assert_eq!(observe_response.status, 200);
+        let observe: Value = serde_json::from_slice(&observe_response.body)?;
+        assert_eq!(observe["id"], 11);
+        assert_eq!(observe["error"]["code"], -32002);
         Ok(())
     }
 

@@ -20,6 +20,7 @@ use thiserror::Error;
 use url::{Host, Url};
 
 pub const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
+const DRIVER_REQUIRED_ERROR_CODE: i64 = -32002;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct McpHttpResponse {
@@ -248,66 +249,14 @@ where
             }
             "handshake" => {
                 let args: HandshakeArgs = parse_args(arguments)?;
-                Ok(ToolCall::success(self.handshake_json(args)))
+                Ok(ToolCall::success(handshake_result_json(
+                    &self.handshake_report,
+                    &self.handshake_probe_config,
+                    args,
+                )))
             }
             _ => Err(JsonRpcError::invalid_params("unknown tool")),
         }
-    }
-
-    fn handshake_json(&self, args: HandshakeArgs) -> Value {
-        let mut report = ProbeReport::from_hits(self.handshake_report.hits().to_vec());
-        let live_http_requested = args
-            .live_http
-            .unwrap_or_else(|| args.origin.is_some() && args.responses.is_empty());
-        let response_report =
-            ProbeReport::from_responses(args.responses.into_iter().map(Into::into));
-        for hit in response_report.hits() {
-            report.add_hit(hit.clone());
-        }
-        report.record_web_mcp(args.web_mcp.unwrap_or(false));
-
-        let mut live_http = false;
-        let mut probe_responses = Vec::new();
-        let mut probe_failures = Vec::new();
-        let mut probe_error = None;
-        if live_http_requested {
-            if let Some(origin) = args.origin.as_deref() {
-                live_http = true;
-                match probe_http_origin_off_runtime(origin, self.handshake_probe_config.clone()) {
-                    Ok(run) => {
-                        for hit in run.report.hits() {
-                            report.add_hit(hit.clone());
-                        }
-                        probe_responses = run
-                            .responses
-                            .iter()
-                            .map(probe_response_json)
-                            .collect::<Vec<_>>();
-                        probe_failures = run
-                            .failures
-                            .iter()
-                            .map(probe_failure_json)
-                            .collect::<Vec<_>>();
-                    }
-                    Err(error) => {
-                        probe_error = Some(error.to_string());
-                    }
-                }
-            }
-        }
-
-        let decision = decide_lane(&report);
-        json!({
-            "lane": handshake_lane_name(decision.lane),
-            "skips_render": decision.skips_render(),
-            "selected": decision.selected.as_ref().map(probe_hit_json),
-            "hits": report.hits().iter().map(probe_hit_json).collect::<Vec<_>>(),
-            "probe_urls": args.origin.as_deref().map(probe_urls).unwrap_or_default(),
-            "live_http": live_http,
-            "probe_responses": probe_responses,
-            "probe_failures": probe_failures,
-            "probe_error": probe_error,
-        })
     }
 }
 
@@ -316,6 +265,48 @@ pub fn handle_get() -> McpHttpResponse {
         405,
         "this MCP endpoint does not offer a server-initiated stream",
     )
+}
+
+/// Handle MCP POST messages that do not require a page driver.
+///
+/// This keeps pre-render discovery available before an engine is attached:
+/// initialize, ping, tools/list, and the handshake tool work; page-driving tools
+/// return a JSON-RPC error instead of silently creating a browser stand-in.
+pub fn handle_post_driverless(origin: Option<&str>, body: &[u8]) -> McpHttpResponse {
+    handle_post_driverless_with_config(origin, body, HttpProbeConfig::default())
+}
+
+pub fn handle_post_driverless_with_config(
+    origin: Option<&str>,
+    body: &[u8],
+    handshake_probe_config: HttpProbeConfig,
+) -> McpHttpResponse {
+    if !origin_allowed(origin) {
+        return McpHttpResponse::json(
+            403,
+            json_rpc_error(Value::Null, -32600, "origin not allowed"),
+        );
+    }
+
+    let message: Value = match serde_json::from_slice(body) {
+        Ok(value) => value,
+        Err(error) => {
+            return McpHttpResponse::json(
+                400,
+                json_rpc_error(Value::Null, -32700, format!("parse error: {error}")),
+            );
+        }
+    };
+
+    let Some(id) = message.get("id").filter(|id| !id.is_null()).cloned() else {
+        return McpHttpResponse::empty(202);
+    };
+
+    let reply = handle_driverless_message(&message, handshake_probe_config);
+    match reply {
+        Ok(result) => McpHttpResponse::json(200, json_rpc_result(id, result)),
+        Err(error) => McpHttpResponse::json(200, json_rpc_error(id, error.code, error.message)),
+    }
 }
 
 /// Origin is optional for non-browser clients; when present, only loopback
@@ -402,6 +393,13 @@ impl JsonRpcError {
     fn invalid_params(message: impl Into<String>) -> Self {
         Self {
             code: -32602,
+            message: message.into(),
+        }
+    }
+
+    fn driver_required(message: impl Into<String>) -> Self {
+        Self {
+            code: DRIVER_REQUIRED_ERROR_CODE,
             message: message.into(),
         }
     }
@@ -501,6 +499,128 @@ fn probe_http_origin_off_runtime(
         Ok(result) => result.map_err(|error| error.to_string()),
         Err(_) => Err("HTTP probe worker panicked".into()),
     }
+}
+
+fn handle_driverless_message(
+    message: &Value,
+    handshake_probe_config: HttpProbeConfig,
+) -> Result<Value, JsonRpcError> {
+    if !message.is_object() {
+        return Err(JsonRpcError::invalid_request(
+            "JSON-RPC message must be an object",
+        ));
+    }
+
+    let method = message
+        .get("method")
+        .and_then(Value::as_str)
+        .ok_or_else(|| JsonRpcError::invalid_request("JSON-RPC method is required"))?;
+    let params = message.get("params").cloned().unwrap_or(Value::Null);
+
+    match method {
+        "initialize" => Ok(json!({
+            "protocolVersion": MCP_PROTOCOL_VERSION,
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "tempo", "version": env!("CARGO_PKG_VERSION")},
+        })),
+        "ping" => Ok(json!({})),
+        "tools/list" => Ok(json!({"tools": tool_descriptor_json()})),
+        "tools/call" => driverless_tools_call(&params, handshake_probe_config),
+        other => Err(JsonRpcError::method_not_found(format!(
+            "method not found: {other}"
+        ))),
+    }
+}
+
+fn driverless_tools_call(
+    params: &Value,
+    handshake_probe_config: HttpProbeConfig,
+) -> Result<Value, JsonRpcError> {
+    let name = params
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| JsonRpcError::invalid_params("tools/call requires params.name"))?;
+    if !tools().iter().any(|tool| tool.name == name) {
+        return Err(JsonRpcError::invalid_params(format!(
+            "unknown tool: {name}"
+        )));
+    }
+
+    let arguments = params
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    if name != "handshake" {
+        return Err(JsonRpcError::driver_required(format!(
+            "MCP tool call requires an attached engine driver: {name}"
+        )));
+    }
+
+    let args: HandshakeArgs = parse_args(arguments)?;
+    Ok(tool_call_json(ToolCall::success(handshake_result_json(
+        &ProbeReport::new(),
+        &handshake_probe_config,
+        args,
+    ))))
+}
+
+fn handshake_result_json(
+    handshake_report: &ProbeReport,
+    handshake_probe_config: &HttpProbeConfig,
+    args: HandshakeArgs,
+) -> Value {
+    let mut report = ProbeReport::from_hits(handshake_report.hits().to_vec());
+    let live_http_requested = args
+        .live_http
+        .unwrap_or_else(|| args.origin.is_some() && args.responses.is_empty());
+    let response_report = ProbeReport::from_responses(args.responses.into_iter().map(Into::into));
+    for hit in response_report.hits() {
+        report.add_hit(hit.clone());
+    }
+    report.record_web_mcp(args.web_mcp.unwrap_or(false));
+
+    let mut live_http = false;
+    let mut probe_responses = Vec::new();
+    let mut probe_failures = Vec::new();
+    let mut probe_error = None;
+    if live_http_requested {
+        if let Some(origin) = args.origin.as_deref() {
+            live_http = true;
+            match probe_http_origin_off_runtime(origin, handshake_probe_config.clone()) {
+                Ok(run) => {
+                    for hit in run.report.hits() {
+                        report.add_hit(hit.clone());
+                    }
+                    probe_responses = run
+                        .responses
+                        .iter()
+                        .map(probe_response_json)
+                        .collect::<Vec<_>>();
+                    probe_failures = run
+                        .failures
+                        .iter()
+                        .map(probe_failure_json)
+                        .collect::<Vec<_>>();
+                }
+                Err(error) => {
+                    probe_error = Some(error.to_string());
+                }
+            }
+        }
+    }
+
+    let decision = decide_lane(&report);
+    json!({
+        "lane": handshake_lane_name(decision.lane),
+        "skips_render": decision.skips_render(),
+        "selected": decision.selected.as_ref().map(probe_hit_json),
+        "hits": report.hits().iter().map(probe_hit_json).collect::<Vec<_>>(),
+        "probe_urls": args.origin.as_deref().map(probe_urls).unwrap_or_default(),
+        "live_http": live_http,
+        "probe_responses": probe_responses,
+        "probe_failures": probe_failures,
+        "probe_error": probe_error,
+    })
 }
 
 fn json_rpc_result(id: Value, result: Value) -> Value {
@@ -848,6 +968,39 @@ mod tests {
             .as_str()
             .map(|reason| reason.contains("URL blocked"))
             .unwrap_or(false)));
+        Ok(())
+    }
+
+    #[test]
+    fn driverless_mcp_serves_metadata_and_handshake_without_engine() -> Result<(), String> {
+        let tools =
+            handle_post_driverless(None, br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#)
+                .json_value()
+                .map_err(|error| error.to_string())?;
+        assert_eq!(tools["result"]["tools"][0]["name"], "observe");
+
+        let handshake = handle_post_driverless(
+            None,
+            br#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"handshake","arguments":{"origin":"https://example.test","responses":[{"path":"/openapi.json","status":200,"content_type":"application/json","body":"{\"openapi\":\"3.1.0\"}"}]}}}"#,
+        )
+        .json_value()
+        .map_err(|error| error.to_string())?;
+        let result = &handshake["result"]["structuredContent"];
+        assert_eq!(result["lane"], "api");
+        assert_eq!(result["skips_render"], true);
+        assert_eq!(result["selected"]["signal"], "openapi");
+
+        let observe = handle_post_driverless(
+            None,
+            br#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"observe","arguments":{}}}"#,
+        )
+        .json_value()
+        .map_err(|error| error.to_string())?;
+        assert_eq!(observe["error"]["code"], DRIVER_REQUIRED_ERROR_CODE);
+        assert!(observe["error"]["message"]
+            .as_str()
+            .ok_or("missing driver-required message")?
+            .contains("attached engine driver"));
         Ok(())
     }
 
