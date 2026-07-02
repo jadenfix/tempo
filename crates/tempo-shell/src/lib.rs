@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
-use tempo_headless::{TempodSession, TempodSessionId};
+use tempo_headless::{TempodSession, TempodSessionEvent, TempodSessionId};
 use thiserror::Error;
 
 pub const DEFAULT_TEMPOD_ADDR: &str = "127.0.0.1:8787";
@@ -22,6 +22,7 @@ Commands:
   sessions
   open URL
   adopt SESSION_ID
+  events SESSION_ID [AFTER_SEQ]
   close SESSION_ID
   agent-card
   handshake ORIGIN
@@ -81,12 +82,27 @@ pub enum ShellCommand {
     Help,
     Health,
     Sessions,
-    Open { url: String },
-    Adopt { session_id: String },
-    Close { session_id: String },
+    Open {
+        url: String,
+    },
+    Adopt {
+        session_id: String,
+    },
+    Events {
+        session_id: String,
+        after_seq: Option<u64>,
+    },
+    Close {
+        session_id: String,
+    },
     AgentCard,
-    Handshake { origin: String },
-    Tool { name: String, arguments: Value },
+    Handshake {
+        origin: String,
+    },
+    Tool {
+        name: String,
+        arguments: Value,
+    },
     Drain,
 }
 
@@ -101,6 +117,10 @@ impl ShellCommand {
             Self::Sessions => write_json(stdout, &client.sessions()?),
             Self::Open { url } => write_json(stdout, &client.open(url)?),
             Self::Adopt { session_id } => write_json(stdout, &client.adopt(session_id)?),
+            Self::Events {
+                session_id,
+                after_seq,
+            } => write_json(stdout, &client.events(session_id, *after_seq)?),
             Self::Close { session_id } => write_json(stdout, &client.close(session_id)?),
             Self::AgentCard => write_json(stdout, &client.agent_card()?),
             Self::Handshake { origin } => write_json(stdout, &client.handshake(origin)?),
@@ -156,6 +176,19 @@ impl ShellClient {
     pub fn adopt(&self, session_id: &str) -> Result<TempodSession, ShellError> {
         let path = format!("/sessions/{}/adopt", safe_path_segment(session_id)?);
         self.request_json("POST", &path, None::<serde_json::Value>)
+    }
+
+    pub fn events(
+        &self,
+        session_id: &str,
+        after_seq: Option<u64>,
+    ) -> Result<Vec<TempodSessionEvent>, ShellError> {
+        let mut path = format!("/sessions/{}/events", safe_path_segment(session_id)?);
+        if let Some(after_seq) = after_seq {
+            path.push_str("?after_seq=");
+            path.push_str(&after_seq.to_string());
+        }
+        self.request_json("GET", &path, None::<serde_json::Value>)
     }
 
     pub fn close(&self, session_id: &str) -> Result<TempodSession, ShellError> {
@@ -271,6 +304,7 @@ fn parse_command(args: &[String]) -> Result<ShellCommand, ShellError> {
         "adopt" => one_arg(rest, "adopt SESSION_ID", |session_id| ShellCommand::Adopt {
             session_id,
         }),
+        "events" => parse_events_command(rest),
         "close" => one_arg(rest, "close SESSION_ID", |session_id| ShellCommand::Close {
             session_id,
         }),
@@ -284,6 +318,25 @@ fn parse_command(args: &[String]) -> Result<ShellCommand, ShellError> {
         other => Err(ShellError::Usage(format!(
             "unknown command: {other}\n\n{USAGE}"
         ))),
+    }
+}
+
+fn parse_events_command(rest: &[String]) -> Result<ShellCommand, ShellError> {
+    match rest {
+        [session_id] => Ok(ShellCommand::Events {
+            session_id: session_id.clone(),
+            after_seq: None,
+        }),
+        [session_id, after_seq] => Ok(ShellCommand::Events {
+            session_id: session_id.clone(),
+            after_seq: Some(after_seq.parse().map_err(|err: std::num::ParseIntError| {
+                ShellError::Usage(format!("events AFTER_SEQ must be a u64: {err}"))
+            })?),
+        }),
+        [] => Err(ShellError::Usage(
+            "events SESSION_ID [AFTER_SEQ] requires a session id".into(),
+        )),
+        [_, _, extra, ..] => Err(ShellError::Usage(format!("unexpected argument: {extra}"))),
     }
 }
 
@@ -403,7 +456,9 @@ mod tests {
     use tempo_engine_host::{
         serve_driver_connection, EngineHostError, EngineIpcClient, EngineIpcConnection,
     };
-    use tempo_headless::{serve_one, SessionPool, TempodError, TempodSessionState};
+    use tempo_headless::{
+        serve_one, SessionPool, TempodError, TempodSessionEventKind, TempodSessionState,
+    };
 
     type TestResult = Result<(), Box<dyn Error>>;
 
@@ -440,6 +495,20 @@ mod tests {
         let options = ShellOptions::parse(["agent-card"])?;
 
         assert_eq!(options.command, ShellCommand::AgentCard);
+        Ok(())
+    }
+
+    #[test]
+    fn parses_events_command_with_cursor() -> TestResult {
+        let options = ShellOptions::parse(["events", "session-0", "7"])?;
+
+        assert_eq!(
+            options.command,
+            ShellCommand::Events {
+                session_id: "session-0".into(),
+                after_seq: Some(7),
+            }
+        );
         Ok(())
     }
 
@@ -502,6 +571,39 @@ mod tests {
         assert!(card["skills"]
             .as_array()
             .is_some_and(|skills| skills.iter().any(|skill| skill["id"] == "handshake")));
+        Ok(())
+    }
+
+    #[test]
+    fn client_reads_real_tempod_session_events_with_cursor() -> TestResult {
+        let pool = Arc::new(Mutex::new(SessionPool::default()));
+        let opened = with_tempod(&pool, |addr| {
+            ShellClient::new(addr.to_string()).open("https://events.test")
+        })?;
+
+        let initial = with_tempod(&pool, |addr| {
+            ShellClient::new(addr.to_string()).events(&opened.id.0, None)
+        })?;
+        assert_eq!(initial.len(), 1);
+        assert_eq!(initial[0].seq, 0);
+        assert!(matches!(
+            initial[0].event,
+            TempodSessionEventKind::SessionCreated { .. }
+        ));
+
+        with_tempod(&pool, |addr| {
+            ShellClient::new(addr.to_string()).adopt(&opened.id.0)
+        })?;
+        let after_create = with_tempod(&pool, |addr| {
+            ShellClient::new(addr.to_string()).events(&opened.id.0, Some(0))
+        })?;
+
+        assert_eq!(after_create.len(), 1);
+        assert_eq!(after_create[0].seq, 1);
+        assert!(matches!(
+            after_create[0].event,
+            TempodSessionEventKind::SessionAdopted
+        ));
         Ok(())
     }
 
