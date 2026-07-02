@@ -1450,7 +1450,7 @@ mod tests {
     use tempo_engine_host::{
         serve_driver_connection, DriverRequest, EngineIpcConnection, RestartPolicy,
     };
-    use tempo_schema::{Action, ObservationDiff};
+    use tempo_schema::{Action, ObservationDiff, QuiescencePolicy};
 
     type TestResult = Result<(), Box<dyn Error>>;
 
@@ -2149,6 +2149,56 @@ mod tests {
             "https://mcp.test"
         );
         assert_eq!(value["result"]["structuredContent"]["seq"], 4);
+        Ok(())
+    }
+
+    #[test]
+    fn mcp_endpoint_routes_act_batch_to_attached_engine_driver() -> TestResult {
+        let mut pool = SessionPool::default();
+        let handle = attach_driver_handler(&mut pool, |request| {
+            assert_eq!(
+                request.command,
+                HostDriverCommand::ActBatch {
+                    batch: ActionBatch {
+                        actions: vec![Action::Scroll { x: 0.0, y: 12.0 }],
+                        quiescence: QuiescencePolicy::Composite,
+                    },
+                }
+            );
+            DriverResponse::Step {
+                outcome: StepOutcome::Applied {
+                    diff: ObservationDiff {
+                        since_seq: 1,
+                        seq: 2,
+                        added: Vec::new(),
+                        removed: Vec::new(),
+                        changed: Vec::new(),
+                    },
+                }
+                .into(),
+            }
+        })?;
+
+        let response = route_http_request(
+            &mut pool,
+            mcp_tool_request(
+                12,
+                "act_batch",
+                json!({
+                    "batch": {
+                        "actions": [{"kind": "scroll", "x": 0.0, "y": 12.0}],
+                        "quiescence": "composite",
+                    }
+                }),
+            )?,
+        )?;
+        join_driver_handler(handle)?;
+
+        assert_eq!(response.status, 200);
+        let value: Value = serde_json::from_slice(&response.body)?;
+        assert_eq!(value["id"], 12);
+        assert_eq!(value["result"]["structuredContent"]["status"], "applied");
+        assert_eq!(value["result"]["structuredContent"]["diff"]["seq"], 2);
         Ok(())
     }
 
