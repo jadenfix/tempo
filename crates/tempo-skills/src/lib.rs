@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use tempo_schema::{Action, ActionBatch, NodeId, QuiescencePolicy};
+use tempo_schema::{Action, ActionBatch, NodeId, QuiescencePolicy, SideEffect};
 use thiserror::Error;
 
 /// Stored skill definition. The `(name, version)` pair is the stable key.
@@ -19,10 +19,16 @@ pub struct SkillDefinition {
     pub name: String,
     pub version: String,
     pub description: String,
+    #[serde(default = "default_skill_side_effect")]
+    pub side_effect: SideEffect,
     #[serde(default)]
     pub inputs: Vec<SkillInput>,
     pub quiescence: QuiescencePolicy,
     pub steps: Vec<ActionTemplate>,
+}
+
+const fn default_skill_side_effect() -> SideEffect {
+    SideEffect::Write
 }
 
 impl SkillDefinition {
@@ -186,6 +192,15 @@ impl ActionTemplate {
             Self::Skill { name, .. } => name.referenced_params(params),
         }
     }
+
+    const fn minimum_side_effect(&self) -> SideEffect {
+        match self {
+            Self::Goto { .. } | Self::Scroll { .. } | Self::Extract { .. } => SideEffect::Read,
+            Self::Click { .. } | Self::Type { .. } | Self::Select { .. } | Self::Skill { .. } => {
+                SideEffect::Write
+            }
+        }
+    }
 }
 
 /// Directory-backed skill store.
@@ -306,6 +321,11 @@ pub enum SkillError {
     UndeclaredInput(String),
     #[error("skill must contain at least one step")]
     EmptySkill,
+    #[error("skill side effect {declared:?} does not cover direct step side effect {required:?}")]
+    SkillSideEffectUndercovers {
+        declared: SideEffect,
+        required: SideEffect,
+    },
     #[error("skill not found: {0}")]
     SkillNotFound(String),
 }
@@ -331,8 +351,17 @@ fn validate_definition(definition: &SkillDefinition) -> Result<(), SkillError> {
     }
 
     let mut referenced = BTreeSet::new();
+    let mut required_side_effect = SideEffect::Read;
     for step in &definition.steps {
         step.referenced_params(&mut referenced);
+        required_side_effect = required_side_effect.max(step.minimum_side_effect());
+    }
+
+    if definition.side_effect < required_side_effect {
+        return Err(SkillError::SkillSideEffectUndercovers {
+            declared: definition.side_effect,
+            required: required_side_effect,
+        });
     }
 
     for param in referenced {
@@ -541,6 +570,7 @@ mod tests {
             name: "object-value".into(),
             version: "1".into(),
             description: "reject object input".into(),
+            side_effect: SideEffect::Write,
             inputs: vec![SkillInput::required("node")],
             quiescence: QuiescencePolicy::Composite,
             steps: vec![ActionTemplate::Click {
@@ -590,11 +620,54 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn skill_side_effect_is_persisted_and_defaults_to_write_for_old_files() -> TestResult {
+        let skill = checkout_skill();
+        let value = serde_json::to_value(&skill)?;
+        assert_eq!(value["side_effect"], "write");
+
+        let legacy_value = serde_json::json!({
+            "name": "legacy_checkout",
+            "version": "1",
+            "description": "legacy file without side effect metadata",
+            "inputs": [],
+            "quiescence": "composite",
+            "steps": [
+                {
+                    "kind": "click",
+                    "node": {
+                        "kind": "literal",
+                        "value": "buy"
+                    }
+                }
+            ]
+        });
+        let legacy: SkillDefinition = serde_json::from_value(legacy_value)?;
+        assert_eq!(legacy.side_effect, SideEffect::Write);
+
+        Ok(())
+    }
+
+    #[test]
+    fn skill_side_effect_cannot_undercover_direct_steps() {
+        let mut skill = checkout_skill();
+        skill.side_effect = SideEffect::Read;
+
+        assert!(matches!(
+            validate_definition(&skill),
+            Err(SkillError::SkillSideEffectUndercovers {
+                declared: SideEffect::Read,
+                required: SideEffect::Write,
+            })
+        ));
+    }
+
     fn checkout_skill() -> SkillDefinition {
         SkillDefinition {
             name: "checkout".into(),
             version: "1".into(),
             description: "open a page, type a note, and click buy".into(),
+            side_effect: SideEffect::Write,
             inputs: vec![
                 SkillInput::required("url"),
                 SkillInput::required("buy_button"),
