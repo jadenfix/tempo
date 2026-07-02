@@ -705,7 +705,7 @@ fn decode_entities(value: impl AsRef<str>) -> String {
         .replace("&gt;", ">")
 }
 
-/// Stable crate summary used by scaffold smoke tests and binaries.
+/// Stable crate summary used by smoke tests and binaries.
 pub fn describe() -> &'static str {
     "compat fallback lane: adapts Chromium CDP to DriverTrait v2"
 }
@@ -784,10 +784,13 @@ mod tests {
             "http://169.254.169.254/latest/meta-data",
             "file:///etc/passwd",
         ] {
-            let Err(error) = enforce_url_policy(url, false) else {
-                panic!("expected URL policy block for {url}");
-            };
-            assert!(matches!(error, TransportError::UrlBlocked));
+            assert!(
+                matches!(
+                    enforce_url_policy(url, false),
+                    Err(TransportError::UrlBlocked)
+                ),
+                "expected URL policy block for {url}"
+            );
         }
         assert!(enforce_url_policy("https://example.com", false).is_ok());
         assert!(enforce_url_policy("http://127.0.0.1", true).is_ok());

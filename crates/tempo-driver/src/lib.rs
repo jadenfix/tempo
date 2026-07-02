@@ -1,12 +1,12 @@
-//! tempo-driver — Contract **C3**: the engine-agnostic `DriverTrait` v2, plus `MockDriver`
-//! and the conformance suite. This is the substrate every non-engine team develops against
-//! (final.md §5): freezing it unblocks WS4–WS10 regardless of Servo progress.
+//! tempo-driver — Contract **C3**: the engine-agnostic `DriverTrait` v2 and the
+//! conformance suite. This is the substrate every non-engine team develops against
+//! (final.md §5): freezing it unblocks WS4–WS10 while Servo and CDP progress.
 //!
 //! `DriverTrait` v2 is a superset of `beater_browser::BrowserDriver`, adding diff-based
 //! re-observation, batched actions, page-state forking, and typed extraction. It is
 //! implemented by `tempo-engine-servo` (primary), `tempo-engine-cdp` (fallback), and
-//! `MockDriver` (tests). The grounding contract is preserved: a NodeId miss is a
-//! `StepError`, never a `TransportError`.
+//! the optional `TestDriver` for conformance tests. The grounding contract is
+//! preserved: a NodeId miss is a `StepError`, never a `TransportError`.
 
 use async_trait::async_trait;
 use tempo_schema::{Action, ActionBatch, CompiledObservation, NodeId, ObservationDiff};
@@ -45,7 +45,8 @@ pub struct Unsupported(pub &'static str);
 pub enum Engine {
     Servo,
     Cdp,
-    Mock,
+    #[cfg(any(test, feature = "test-driver"))]
+    Test,
 }
 
 /// C3: the engine-agnostic driver interface. Object-safe so it can cross the UDS wire
@@ -80,15 +81,16 @@ pub trait DriverTrait: Send + Sync {
     async fn close(&mut self) -> Result<(), TransportError>;
 }
 
-/// In-memory `DriverTrait` for tests. Ships with C3; the whole org codes against this until
-/// the real engines pass conformance (final.md §8.2 M0).
-pub struct MockDriver {
+/// In-memory `DriverTrait` used only by conformance tests.
+#[cfg(any(test, feature = "test-driver"))]
+pub struct TestDriver {
     seq: u64,
     url: String,
     elements: Vec<tempo_schema::InteractiveElement>,
 }
 
-impl MockDriver {
+#[cfg(any(test, feature = "test-driver"))]
+impl TestDriver {
     pub fn new() -> Self {
         Self {
             seq: 0,
@@ -97,7 +99,7 @@ impl MockDriver {
         }
     }
 
-    /// Seed the mock page with elements so tests can plan actions against known NodeIds.
+    /// Seed the page with elements so tests can plan actions against known NodeIds.
     pub fn with_elements(mut self, elements: Vec<tempo_schema::InteractiveElement>) -> Self {
         self.elements = elements;
         self
@@ -118,16 +120,18 @@ impl MockDriver {
     }
 }
 
-impl Default for MockDriver {
+#[cfg(any(test, feature = "test-driver"))]
+impl Default for TestDriver {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(any(test, feature = "test-driver"))]
 #[async_trait]
-impl DriverTrait for MockDriver {
+impl DriverTrait for TestDriver {
     fn engine(&self) -> Engine {
-        Engine::Mock
+        Engine::Test
     }
 
     async fn goto(&mut self, url: &str) -> Result<CompiledObservation, TransportError> {
@@ -196,7 +200,7 @@ impl DriverTrait for MockDriver {
     }
 
     async fn fork(&mut self) -> Result<Box<dyn DriverTrait>, Unsupported> {
-        let forked = MockDriver {
+        let forked = TestDriver {
             seq: self.seq,
             url: self.url.clone(),
             elements: self.elements.clone(),
@@ -268,8 +272,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mock_driver_passes_conformance() {
-        // Minimal executor to avoid pulling a full async runtime into the scaffold.
+    fn test_driver_passes_conformance() {
+        // Minimal executor to avoid pulling a full async runtime into the driver crate.
         fn block_on<F: std::future::Future>(mut f: F) -> F::Output {
             use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
             fn noop(_: *const ()) {}
@@ -287,7 +291,7 @@ mod tests {
             }
         }
 
-        let mut d = MockDriver::new();
+        let mut d = TestDriver::new();
         let res = block_on(conformance::assert_driver_conformance(&mut d));
         assert!(res.is_ok(), "conformance failed: {res:?}");
     }

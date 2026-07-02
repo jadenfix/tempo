@@ -867,7 +867,7 @@ mod tests {
     use std::path::PathBuf;
     use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
-    use tempo_driver::MockDriver;
+    use tempo_driver::TestDriver;
     use tempo_engine_cdp::{CdpConfig, CdpTempoDriver};
     use tempo_schema::{InteractiveElement, NodeId, ObservationDiff, Provenance, TaintSpan};
 
@@ -1028,8 +1028,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runner_executes_mock_driver_and_journals_live_outcomes() -> TestResult {
-        let root = unique_dir("runner-mock")?;
+    async fn runner_executes_test_driver_and_journals_live_outcomes() -> TestResult {
+        let root = unique_dir("runner-test-driver")?;
         remove_dir_if_exists(&root)?;
         fs::create_dir_all(&root)?;
         let journal_path = root.join("session.jsonl");
@@ -1039,12 +1039,15 @@ mod tests {
                 node: NodeId("submit".into()),
             }],
         );
-        let mut driver = MockDriver::new().with_elements(vec![button("submit")]);
-        let runner = AgentRunner::new(&journal_path, AgentRunIds::new("run-mock", "session-mock"));
+        let mut driver = TestDriver::new().with_elements(vec![button("submit")]);
+        let runner = AgentRunner::new(
+            &journal_path,
+            AgentRunIds::new("run-test-driver", "session-test-driver"),
+        );
 
         let report = runner.run_driver_task(&mut driver, &task).await?;
 
-        assert_eq!(report.engine, Engine::Mock);
+        assert_eq!(report.engine, Engine::Test);
         assert_eq!(report.status, AgentRunStatus::Completed);
         assert_eq!(report.actions_completed, 1);
         assert!(report.max_observation_bytes > 0);
@@ -1081,7 +1084,7 @@ mod tests {
         );
         let ids = AgentRunIds::new("run-resume", "session-resume");
 
-        let mut first_driver = MockDriver::new().with_elements(vec![button("submit")]);
+        let mut first_driver = TestDriver::new().with_elements(vec![button("submit")]);
         let first_runner = AgentRunner::new(&journal_path, ids.clone());
         let first = first_runner
             .run_driver_task(&mut first_driver, &task)
@@ -1089,7 +1092,7 @@ mod tests {
         assert_eq!(first.status, AgentRunStatus::Completed);
         let entry_count = read_journal_entries(&journal_path)?.len();
 
-        let mut second_driver = MockDriver::new().with_elements(vec![button("submit")]);
+        let mut second_driver = TestDriver::new().with_elements(vec![button("submit")]);
         let second_runner = AgentRunner::new(&journal_path, ids);
         let second = second_runner
             .run_driver_task(&mut second_driver, &task)
@@ -1114,7 +1117,7 @@ mod tests {
                 node: NodeId("submit".into()),
             })],
         );
-        let mut driver = MockDriver::new().with_elements(vec![button("submit")]);
+        let mut driver = TestDriver::new().with_elements(vec![button("submit")]);
         let runner = AgentRunner::new(
             &journal_path,
             AgentRunIds::new("run-policy", "session-policy"),
@@ -1143,7 +1146,7 @@ mod tests {
         fs::create_dir_all(&root)?;
         let journal_path = root.join("session.jsonl");
         let task = DriverTask::new("https://example.com", vec![]);
-        let mut driver = MockDriver::new().with_elements(vec![button("submit")]);
+        let mut driver = TestDriver::new().with_elements(vec![button("submit")]);
         let runner = AgentRunner::new(
             &journal_path,
             AgentRunIds::new("run-budget", "session-budget"),

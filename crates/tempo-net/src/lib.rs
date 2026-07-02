@@ -1191,9 +1191,13 @@ mod tests {
     }
 
     fn assert_blocked(policy: &UrlPolicy, url: &str, code: BlockCode) {
-        match policy.check(url) {
-            UrlPolicyVerdict::Allow => panic!("{url} unexpectedly allowed"),
-            UrlPolicyVerdict::Block(reason) => assert_eq!(reason.code, code, "{url}"),
+        let verdict = policy.check(url);
+        assert!(
+            matches!(verdict, UrlPolicyVerdict::Block(_)),
+            "{url} unexpectedly allowed"
+        );
+        if let UrlPolicyVerdict::Block(reason) = verdict {
+            assert_eq!(reason.code, code, "{url}");
         }
     }
 
@@ -1297,7 +1301,7 @@ mod tests {
     }
 
     #[test]
-    fn audit_record_is_taint_free_and_origin_only() {
+    fn audit_record_is_taint_free_and_origin_only() -> Result<(), UrlBlocked> {
         let profile = NetworkProfile::ephemeral("session-a");
         let request = NetworkRequest::new(
             "r1",
@@ -1307,11 +1311,7 @@ mod tests {
             IdentityMode::AgentDeclared,
         );
 
-        let audit = AuditRecord::from_request(&request, &UrlPolicy::block_private());
-        let audit = match audit {
-            Ok(audit) => audit,
-            Err(err) => panic!("{err}"),
-        };
+        let audit = AuditRecord::from_request(&request, &UrlPolicy::block_private())?;
 
         assert_eq!(audit.request_id, RequestId("r1".into()));
         assert_eq!(audit.method, "GET");
@@ -1321,6 +1321,7 @@ mod tests {
         assert!(audit.taint_free);
         assert!(!audit.origin.contains("secret"));
         assert!(!audit.origin.contains("page-derived"));
+        Ok(())
     }
 
     #[test]
@@ -1339,11 +1340,8 @@ mod tests {
     }
 
     #[test]
-    fn web_bot_auth_signs_and_verifies_rfc_9421_headers() {
-        let key = match WebBotAuthSigningKey::from_seed("tempo-agent", &[7u8; 32]) {
-            Ok(key) => key,
-            Err(err) => panic!("{err}"),
-        };
+    fn web_bot_auth_signs_and_verifies_rfc_9421_headers() -> Result<(), SignatureError> {
+        let key = WebBotAuthSigningKey::from_seed("tempo-agent", &[7u8; 32])?;
         let verifier = key.verifier();
         let request = NetworkRequest::new(
             "r1",
@@ -1354,10 +1352,7 @@ mod tests {
         )
         .with_header("accept", "application/json");
 
-        let headers = match request.sign_web_bot_auth(&key, 1_800_000_000) {
-            Ok(headers) => headers,
-            Err(err) => panic!("{err}"),
-        };
+        let headers = request.sign_web_bot_auth(&key, 1_800_000_000)?;
 
         assert_eq!(
             headers.signature_input,
@@ -1366,37 +1361,28 @@ mod tests {
         assert!(headers.signature.starts_with("sig1=:"));
         assert!(headers.signature.ends_with(':'));
 
-        let base = match signature_base(
+        let base = signature_base(
             &request,
             &SignatureParameters::web_bot_auth("tempo-agent", 1_800_000_000),
-        ) {
-            Ok(base) => base,
-            Err(err) => panic!("{err}"),
-        };
+        )?;
         assert_eq!(
             base,
             "\"@method\": GET\n\"@authority\": example.com\n\"@scheme\": https\n\"@path\": /agent/path\n\"@signature-params\": (\"@method\" \"@authority\" \"@scheme\" \"@path\");created=1800000000;keyid=\"tempo-agent\";alg=\"ed25519\""
         );
 
-        let verified = verify_request_signature(
+        verify_request_signature(
             &request,
             &headers.signature_input,
             &headers.signature,
             &verifier,
-        );
-        assert!(verified.is_ok(), "{verified:?}");
+        )?;
+        Ok(())
     }
 
     #[test]
-    fn web_bot_auth_rejects_tampered_requests_and_wrong_keys() {
-        let key = match WebBotAuthSigningKey::from_seed("tempo-agent", &[7u8; 32]) {
-            Ok(key) => key,
-            Err(err) => panic!("{err}"),
-        };
-        let wrong = match WebBotAuthSigningKey::from_seed("other-agent", &[9u8; 32]) {
-            Ok(key) => key.verifier(),
-            Err(err) => panic!("{err}"),
-        };
+    fn web_bot_auth_rejects_tampered_requests_and_wrong_keys() -> Result<(), SignatureError> {
+        let key = WebBotAuthSigningKey::from_seed("tempo-agent", &[7u8; 32])?;
+        let wrong = WebBotAuthSigningKey::from_seed("other-agent", &[9u8; 32])?.verifier();
         let request = NetworkRequest::new(
             "r1",
             "POST",
@@ -1404,10 +1390,7 @@ mod tests {
             "profile-a",
             IdentityMode::AgentDeclared,
         );
-        let headers = match request.sign_web_bot_auth(&key, 1_800_000_000) {
-            Ok(headers) => headers,
-            Err(err) => panic!("{err}"),
-        };
+        let headers = request.sign_web_bot_auth(&key, 1_800_000_000)?;
         let tampered = NetworkRequest::new(
             "r1",
             "POST",
@@ -1437,10 +1420,11 @@ mod tests {
             wrong_key_result,
             Err(SignatureError::KeyIdMismatch { .. })
         ));
+        Ok(())
     }
 
     #[test]
-    fn signature_base_can_cover_request_headers() {
+    fn signature_base_can_cover_request_headers() -> Result<(), SignatureError> {
         let request = NetworkRequest::new(
             "r1",
             "GET",
@@ -1457,14 +1441,12 @@ mod tests {
             components: vec![CoveredComponent::Header("accept".into())],
         };
 
-        let base = match signature_base(&request, &params) {
-            Ok(base) => base,
-            Err(err) => panic!("{err}"),
-        };
+        let base = signature_base(&request, &params)?;
         assert_eq!(
             base,
             "\"accept\": application/json, text/plain\n\"@signature-params\": (\"accept\");created=1800000000;keyid=\"tempo-agent\";alg=\"ed25519\""
         );
+        Ok(())
     }
 
     #[test]

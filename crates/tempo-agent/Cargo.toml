@@ -15,5 +15,6 @@ serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+tempo-driver = { path = "../tempo-driver", features = ["test-driver"] }
 tempo-engine-cdp = { path = "../tempo-engine-cdp" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
