@@ -14,6 +14,7 @@ use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tempo_agent::StepTriple;
+use tempo_bidi::{BidiErrorCode, BidiMessage, BidiRouter, RoutedCommand};
 use tempo_engine_host::{EngineHost, EngineHostConfig, EngineHostError};
 use thiserror::Error;
 
@@ -45,6 +46,7 @@ pub struct TempodSession {
 #[derive(Clone, Debug, Default)]
 pub struct SessionPool {
     sessions: BTreeMap<TempodSessionId, TempodSession>,
+    bidi: BidiRouter,
     next_id: u64,
     draining: bool,
 }
@@ -246,6 +248,9 @@ fn route_http_request(
 ) -> Result<HttpResponse, TempodError> {
     match (request.method.as_str(), request.path.as_str()) {
         ("GET", "/health") => Ok(HttpResponse::json(200, json!({"ok": true}))),
+        ("GET", "/mcp") => Ok(HttpResponse::from_mcp(tempo_mcp::handle_get())),
+        ("POST", "/mcp") => Ok(mcp_requires_driver(&request.body)),
+        ("POST", "/bidi") => Ok(route_bidi(pool, request.body)),
         ("GET", "/sessions") => Ok(HttpResponse::json(200, pool.list())),
         ("POST", "/sessions") => {
             let body: CreateSessionRequest = serde_json::from_slice(&request.body)?;
@@ -279,6 +284,54 @@ fn route_http_request(
             )))
         }
     }
+}
+
+fn route_bidi(pool: &mut SessionPool, body: Vec<u8>) -> HttpResponse {
+    match pool.bidi.route_json(&body) {
+        Ok(RoutedCommand::Immediate(message)) => bidi_response(200, message),
+        Ok(RoutedCommand::Driver { id, .. }) => bidi_response(
+            503,
+            BidiMessage::error(
+                Some(id),
+                BidiErrorCode::UnknownError,
+                "driver command requires an attached engine driver",
+            ),
+        ),
+        Err(error) => bidi_response(
+            400,
+            BidiMessage::error(None, BidiErrorCode::InvalidArgument, error.to_string()),
+        ),
+    }
+}
+
+fn bidi_response(status: u16, message: BidiMessage) -> HttpResponse {
+    match serde_json::to_vec(&message) {
+        Ok(body) => HttpResponse::new(status, "application/json", body),
+        Err(error) => HttpResponse::json(
+            500,
+            json!({
+                "error": error.to_string(),
+            }),
+        ),
+    }
+}
+
+fn mcp_requires_driver(body: &[u8]) -> HttpResponse {
+    let id = serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| value.get("id").cloned())
+        .unwrap_or(serde_json::Value::Null);
+    HttpResponse::json(
+        503,
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {
+                "code": -32002,
+                "message": "MCP tool calls require an attached engine driver",
+            }
+        }),
+    )
 }
 
 fn session_id_from_action_path(path: &str, action: &str) -> Result<TempodSessionId, TempodError> {
@@ -391,16 +444,29 @@ struct CreateSessionRequest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct HttpResponse {
     status: u16,
+    content_type: &'static str,
     body: Vec<u8>,
 }
 
 impl HttpResponse {
+    fn new(status: u16, content_type: &'static str, body: Vec<u8>) -> Self {
+        Self {
+            status,
+            content_type,
+            body,
+        }
+    }
+
     fn json(status: u16, body: impl Serialize) -> Self {
         let body = match serde_json::to_vec(&body) {
             Ok(body) => body,
             Err(err) => format!("{{\"error\":\"{err}\"}}").into_bytes(),
         };
-        Self { status, body }
+        Self::new(status, "application/json", body)
+    }
+
+    fn from_mcp(response: tempo_mcp::McpHttpResponse) -> Self {
+        Self::new(response.status, response.content_type, response.body)
     }
 
     fn to_bytes(&self) -> Vec<u8> {
@@ -409,12 +475,15 @@ impl HttpResponse {
             201 => "Created",
             400 => "Bad Request",
             404 => "Not Found",
+            405 => "Method Not Allowed",
             500 => "Internal Server Error",
+            503 => "Service Unavailable",
             _ => "OK",
         };
         let mut bytes = format!(
-            "HTTP/1.1 {} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            "HTTP/1.1 {} {reason}\r\ncontent-type: {}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
             self.status,
+            self.content_type,
             self.body.len()
         )
         .into_bytes();
@@ -516,6 +585,74 @@ mod tests {
 
         assert!(response.starts_with("HTTP/1.1 200 OK"));
         assert!(response.contains("https://one.test"));
+        Ok(())
+    }
+
+    #[test]
+    fn bidi_endpoint_routes_immediate_protocol_commands() -> TestResult {
+        let mut pool = SessionPool::default();
+        let response = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/bidi".into(),
+                body: br#"{"id":1,"method":"session.status","params":{}}"#.to_vec(),
+            },
+        )?;
+
+        assert_eq!(response.status, 200);
+        let value: Value = serde_json::from_slice(&response.body)?;
+        assert_eq!(value["type"], "success");
+        assert_eq!(value["id"], 1);
+        assert_eq!(value["result"]["ready"], true);
+        Ok(())
+    }
+
+    #[test]
+    fn bidi_endpoint_requires_driver_for_engine_commands() -> TestResult {
+        let mut pool = SessionPool::default();
+        let response = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/bidi".into(),
+                body: br#"{"id":7,"method":"browsingContext.navigate","params":{"context":"ctx","url":"https://example.test"}}"#.to_vec(),
+            },
+        )?;
+
+        assert_eq!(response.status, 503);
+        let value: Value = serde_json::from_slice(&response.body)?;
+        assert_eq!(value["type"], "error");
+        assert_eq!(value["id"], 7);
+        Ok(())
+    }
+
+    #[test]
+    fn mcp_endpoint_exposes_http_semantics_without_driver() -> TestResult {
+        let mut pool = SessionPool::default();
+        let get_response = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "GET".into(),
+                path: "/mcp".into(),
+                body: Vec::new(),
+            },
+        )?;
+        let post_response = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/mcp".into(),
+                body: br#"{"jsonrpc":"2.0","id":9,"method":"tools/list"}"#.to_vec(),
+            },
+        )?;
+
+        assert_eq!(get_response.status, 405);
+        assert_eq!(get_response.content_type, "text/plain; charset=utf-8");
+        assert_eq!(post_response.status, 503);
+        let value: Value = serde_json::from_slice(&post_response.body)?;
+        assert_eq!(value["jsonrpc"], "2.0");
+        assert_eq!(value["id"], 9);
         Ok(())
     }
 
