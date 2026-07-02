@@ -9,7 +9,10 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use tempo_act::{execute_action, ExecutionStatus};
 use tempo_driver::{DriverTrait, Engine, StepOutcome, TransportError};
-use tempo_policy::{decide_action, ConfirmationGate, InputTaint};
+use tempo_policy::{
+    decide_action, ConfirmationGate, InputTaint, Origin, OriginError, OriginPolicyOutcome,
+    OriginPolicySet,
+};
 use tempo_schema::{Action, CompiledObservation, ObservationDiff, SideEffect};
 use tempo_session::{
     read_journal_entries, JournalEntry, JournalError, JournalEvent, RunId, SessionId,
@@ -444,6 +447,7 @@ pub struct AgentRunner {
     token_budget: TokenBudget,
     observation_budget: ObservationBudgetLimit,
     confirmation_mode: ConfirmationMode,
+    origin_policies: OriginPolicySet,
 }
 
 impl AgentRunner {
@@ -454,6 +458,7 @@ impl AgentRunner {
             token_budget: TokenBudget::new(DEFAULT_MAX_OBSERVATION_TOKENS as u64),
             observation_budget: ObservationBudgetLimit::default(),
             confirmation_mode: ConfirmationMode::default(),
+            origin_policies: OriginPolicySet::new(),
         }
     }
 
@@ -469,6 +474,11 @@ impl AgentRunner {
 
     pub fn with_confirmation_mode(mut self, confirmation_mode: ConfirmationMode) -> Self {
         self.confirmation_mode = confirmation_mode;
+        self
+    }
+
+    pub fn with_origin_policy_set(mut self, origin_policies: OriginPolicySet) -> Self {
+        self.origin_policies = origin_policies;
         self
     }
 
@@ -502,7 +512,7 @@ impl AgentRunner {
         }
 
         if let Some((action_index, reason)) = &agent.cursor().last_step_error {
-            report.status = if reason.starts_with("policy requires") {
+            report.status = if is_policy_denial_reason(reason) {
                 AgentRunStatus::PolicyDenied {
                     action_index: *action_index,
                     reason: reason.clone(),
@@ -516,11 +526,13 @@ impl AgentRunner {
             return Ok(report);
         }
 
+        let mut current_origin;
         if !has_session_started(&initial_entries) {
             let observation = driver
                 .goto(&task.start_url)
                 .await
                 .map_err(|source| AgentError::transport("initial goto", source))?;
+            current_origin = self.origin_for_url("initial observation", &observation.url)?;
             agent.record_session_started(task.start_url.clone())?;
             self.record_observation(&mut agent, &mut report, observation)?;
         } else {
@@ -528,6 +540,7 @@ impl AgentRunner {
                 .observe()
                 .await
                 .map_err(|source| AgentError::transport("resume observe", source))?;
+            current_origin = self.origin_for_url("resume observation", &observation.url)?;
             self.record_observation(&mut agent, &mut report, observation)?;
         }
 
@@ -537,13 +550,11 @@ impl AgentRunner {
                 .steps
                 .get(index)
                 .ok_or(AgentError::JournalHasExtraStep { index })?;
-            let policy = self.step_policy(driver_step, &planned.key);
+            let policy_origin = self.origin_for_step(driver_step, current_origin.as_ref())?;
+            let policy = self.step_policy(driver_step, &planned.key, policy_origin.as_ref());
 
             if !policy.confirmed {
-                let reason = format!(
-                    "policy requires {:?} for {:?}",
-                    policy.confirmation_gate, policy.side_effect
-                );
+                let reason = policy_denied_reason(&policy);
                 let triple = agent.record_next_outcome(StepOutcome::StepError {
                     reason: reason.clone(),
                 })?;
@@ -577,6 +588,7 @@ impl AgentRunner {
                 .observe()
                 .await
                 .map_err(|source| AgentError::transport("post-action observe", source))?;
+            current_origin = self.origin_for_url("post-action observation", &observation.url)?;
             let observation_budget =
                 self.record_observation(&mut agent, &mut report, observation)?;
             let step_error = match &triple.outcome {
@@ -618,13 +630,84 @@ impl AgentRunner {
         Ok(budget)
     }
 
-    fn step_policy(&self, step: &DriverStep, key: &IdempotencyKey) -> StepPolicyReport {
+    fn origin_for_step(
+        &self,
+        step: &DriverStep,
+        current_origin: Option<&Origin>,
+    ) -> Result<Option<Origin>, AgentError> {
+        match &step.action {
+            Action::Goto { url } => self
+                .origin_for_url("planned goto", url)
+                .map(|origin| origin.or_else(|| current_origin.cloned())),
+            _ => Ok(current_origin.cloned()),
+        }
+    }
+
+    fn origin_for_url(
+        &self,
+        context: &'static str,
+        url: &str,
+    ) -> Result<Option<Origin>, AgentError> {
+        match Origin::from_url(url) {
+            Ok(origin) => Ok(Some(origin)),
+            Err(_reason) if self.origin_policies.is_empty() => Ok(None),
+            Err(reason) => Err(AgentError::InvalidOrigin {
+                context,
+                url: url.to_string(),
+                reason,
+            }),
+        }
+    }
+
+    fn step_policy(
+        &self,
+        step: &DriverStep,
+        key: &IdempotencyKey,
+        origin: Option<&Origin>,
+    ) -> StepPolicyReport {
+        if let Some(origin) = origin {
+            return match self
+                .origin_policies
+                .decide_action(origin, &step.action, step.input_taint)
+            {
+                OriginPolicyOutcome::Allow(allowed) => {
+                    let decision = allowed.decision;
+                    StepPolicyReport {
+                        origin: Some(allowed.origin.as_str().to_string()),
+                        side_effect: decision.side_effect,
+                        input_tainted: decision.input_taint.is_tainted(),
+                        confirmation_gate: decision.gate,
+                        confirmed: self.confirmation_mode.permits(decision.gate),
+                        denied: false,
+                        denial_reason: None,
+                        idempotency_key: key.clone(),
+                    }
+                }
+                OriginPolicyOutcome::Deny(denial) => {
+                    let decision = denial.decision;
+                    StepPolicyReport {
+                        origin: Some(denial.origin.as_str().to_string()),
+                        side_effect: decision.side_effect,
+                        input_tainted: decision.input_taint.is_tainted(),
+                        confirmation_gate: decision.gate,
+                        confirmed: false,
+                        denied: true,
+                        denial_reason: Some(denial.reason),
+                        idempotency_key: key.clone(),
+                    }
+                }
+            };
+        }
+
         let decision = decide_action(&step.action, step.input_taint);
         StepPolicyReport {
+            origin: None,
             side_effect: decision.side_effect,
             input_tainted: decision.input_taint.is_tainted(),
             confirmation_gate: decision.gate,
             confirmed: self.confirmation_mode.permits(decision.gate),
+            denied: false,
+            denial_reason: None,
             idempotency_key: key.clone(),
         }
     }
@@ -693,10 +776,13 @@ pub struct AgentStepReport {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StepPolicyReport {
+    pub origin: Option<String>,
     pub side_effect: SideEffect,
     pub input_tainted: bool,
     pub confirmation_gate: ConfirmationGate,
     pub confirmed: bool,
+    pub denied: bool,
+    pub denial_reason: Option<String>,
     pub idempotency_key: IdempotencyKey,
 }
 
@@ -784,6 +870,29 @@ fn has_session_started(entries: &[JournalEntry]) -> bool {
         .any(|entry| matches!(entry.event, JournalEvent::SessionStarted { .. }))
 }
 
+fn is_policy_denial_reason(reason: &str) -> bool {
+    reason.starts_with("policy requires") || reason.starts_with("policy denied")
+}
+
+fn policy_denied_reason(policy: &StepPolicyReport) -> String {
+    if policy.denied {
+        let origin = policy.origin.as_deref().unwrap_or("unknown origin");
+        let reason = policy
+            .denial_reason
+            .as_deref()
+            .unwrap_or("origin policy denied this action");
+        return format!(
+            "policy denied {:?} at {origin}: {reason}",
+            policy.side_effect
+        );
+    }
+
+    format!(
+        "policy requires {:?} for {:?}",
+        policy.confirmation_gate, policy.side_effect
+    )
+}
+
 /// Conservative token estimate used only for local observation budget checks.
 pub fn estimate_tokens(bytes: usize) -> usize {
     bytes.div_ceil(4)
@@ -804,6 +913,12 @@ pub enum AgentError {
     Transport {
         context: String,
         source: TransportError,
+    },
+    #[error("invalid origin during {context}: {url}: {reason}")]
+    InvalidOrigin {
+        context: &'static str,
+        url: String,
+        reason: OriginError,
     },
     #[error("token budget exceeded: attempted {attempted}, max {max}")]
     TokenBudgetExceeded { attempted: u64, max: u64 },
@@ -869,6 +984,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
     use tempo_driver::TestDriver;
     use tempo_engine_cdp::{CdpConfig, CdpTempoDriver};
+    use tempo_policy::{OriginPolicyOverride, OriginPolicyRule};
     use tempo_schema::{InteractiveElement, NodeId, ObservationDiff, Provenance, TaintSpan};
 
     type TestResult = Result<(), Box<dyn Error>>;
@@ -1134,6 +1250,100 @@ mod tests {
         assert!(!read_journal_entries(&journal_path)?
             .iter()
             .any(|entry| matches!(entry.event, JournalEvent::SessionClosed)));
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runner_denies_origin_block_before_driver_execution() -> TestResult {
+        let root = unique_dir("runner-origin-deny")?;
+        remove_dir_if_exists(&root)?;
+        fs::create_dir_all(&root)?;
+        let journal_path = root.join("session.jsonl");
+        let origin = Origin::parse("https://example.com")?;
+        let task = DriverTask::new(
+            "https://example.com/path",
+            vec![Action::Click {
+                node: NodeId("submit".into()),
+            }],
+        );
+        let mut driver = TestDriver::new().with_elements(vec![button("submit")]);
+        let runner = AgentRunner::new(
+            &journal_path,
+            AgentRunIds::new("run-origin-deny", "session-origin-deny"),
+        )
+        .with_origin_policy_set(OriginPolicySet::from_rules([
+            OriginPolicyRule::for_origin(
+                origin,
+                OriginPolicyOverride::Deny {
+                    reason: "origin locked for automation".into(),
+                },
+            ),
+        ]));
+
+        let report = runner.run_driver_task(&mut driver, &task).await?;
+
+        assert!(matches!(
+            report.status,
+            AgentRunStatus::PolicyDenied { ref reason, .. }
+                if reason.contains("origin locked for automation")
+        ));
+        assert_eq!(report.actions_completed, 1);
+        assert_eq!(
+            report.steps[0].policy.origin.as_deref(),
+            Some("https://example.com")
+        );
+        assert!(report.steps[0].policy.denied);
+        assert!(matches!(
+            report.steps[0].triple.outcome,
+            StepTripleOutcome::StepError { .. }
+        ));
+        assert!(!read_journal_entries(&journal_path)?
+            .iter()
+            .any(|entry| matches!(entry.event, JournalEvent::StepApplied { .. })));
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runner_applies_origin_confirmation_gate() -> TestResult {
+        let root = unique_dir("runner-origin-gate")?;
+        remove_dir_if_exists(&root)?;
+        fs::create_dir_all(&root)?;
+        let journal_path = root.join("session.jsonl");
+        let origin = Origin::parse("https://example.com")?;
+        let task = DriverTask::new(
+            "https://example.com",
+            vec![Action::Click {
+                node: NodeId("submit".into()),
+            }],
+        );
+        let mut driver = TestDriver::new().with_elements(vec![button("submit")]);
+        let runner = AgentRunner::new(
+            &journal_path,
+            AgentRunIds::new("run-origin-gate", "session-origin-gate"),
+        )
+        .with_confirmation_mode(ConfirmationMode::AutoConfirmAll)
+        .with_origin_policy_set(OriginPolicySet::from_rules([OriginPolicyRule::for_origin(
+            origin,
+            OriginPolicyOverride::Require(ConfirmationGate::Confirm),
+        )]));
+
+        let report = runner.run_driver_task(&mut driver, &task).await?;
+
+        assert_eq!(report.status, AgentRunStatus::Completed);
+        assert_eq!(
+            report.steps[0].policy.origin.as_deref(),
+            Some("https://example.com")
+        );
+        assert_eq!(
+            report.steps[0].policy.confirmation_gate,
+            ConfirmationGate::Confirm
+        );
+        assert!(report.steps[0].policy.confirmed);
+        assert!(!report.steps[0].policy.denied);
 
         remove_dir_if_exists(&root)?;
         Ok(())
