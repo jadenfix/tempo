@@ -412,6 +412,7 @@ impl SessionPool {
 
     pub fn attach_engine_driver(&mut self, engine: Engine, client: EngineIpcClient) {
         self.close_forked_contexts();
+        self.close_mcp_forks();
         let driver = AttachedEngineDriver::new(engine, client);
         self.mcp = Some(Arc::new(Mutex::new(tempo_mcp::TempoMcpServer::new(
             driver.clone(),
@@ -426,7 +427,7 @@ impl SessionPool {
     pub fn detach_engine_driver(&mut self) {
         self.close_forked_contexts();
         self.driver = None;
-        self.mcp = None;
+        self.close_mcp_forks();
         self.bidi_contexts.clear();
         self.next_bidi_context_id = 1;
     }
@@ -438,6 +439,28 @@ impl SessionPool {
             if driver.driver_id.is_some() {
                 let _ = futures::executor::block_on(driver.close());
             }
+        }
+    }
+
+    /// Best-effort close of every live forked driver held by the current MCP
+    /// server before it is dropped at session teardown, so remote engine
+    /// contexts (up to `MAX_LIVE_FORKS`) do not leak for the process lifetime.
+    ///
+    /// `close_all_forks` is async and talks to the engine over IPC, so a `Drop`
+    /// impl cannot do this. The whole MCP stack is driven synchronously via
+    /// `futures::executor::block_on` (mirroring `route_mcp`), so we do the same
+    /// here. Teardown must not fail on cleanup, so lock and close errors are
+    /// logged and swallowed. Leaves `self.mcp` as `None`.
+    fn close_mcp_forks(&mut self) {
+        let Some(server) = self.mcp.take() else {
+            return;
+        };
+        let Ok(mut server) = server.lock() else {
+            eprintln!("tempod: MCP server lock poisoned during fork teardown; skipping fork close");
+            return;
+        };
+        for error in futures::executor::block_on(server.close_all_forks()) {
+            eprintln!("tempod: error closing MCP fork at teardown: {error}");
         }
     }
 
@@ -2413,6 +2436,128 @@ mod tests {
         let fork: Value = serde_json::from_slice(&fork_response.body)?;
         assert_eq!(root["result"]["structuredContent"]["seq"], 0);
         assert_eq!(fork["result"]["structuredContent"]["seq"], 1);
+        Ok(())
+    }
+
+    /// Engine-host-side driver that counts how many times `close()` is invoked
+    /// across the root driver and every fork it spawns (forks share the counter).
+    /// Lets a test assert that fork closes actually reach the engine over IPC.
+    struct CloseCountingDriver {
+        inner: Box<dyn DriverTrait>,
+        closes: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl CloseCountingDriver {
+        fn new(closes: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+            Self {
+                inner: Box::new(TestDriver::new()),
+                closes,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl DriverTrait for CloseCountingDriver {
+        fn engine(&self) -> Engine {
+            self.inner.engine()
+        }
+
+        async fn goto(&mut self, url: &str) -> Result<CompiledObservation, TransportError> {
+            self.inner.goto(url).await
+        }
+
+        async fn observe(&mut self) -> Result<CompiledObservation, TransportError> {
+            self.inner.observe().await
+        }
+
+        async fn observe_diff(
+            &mut self,
+            since_seq: u64,
+        ) -> Result<ObservationDiff, TransportError> {
+            self.inner.observe_diff(since_seq).await
+        }
+
+        async fn act(&mut self, action: &Action) -> Result<StepOutcome, TransportError> {
+            self.inner.act(action).await
+        }
+
+        async fn act_batch(&mut self, batch: &ActionBatch) -> Result<StepOutcome, TransportError> {
+            self.inner.act_batch(batch).await
+        }
+
+        async fn fork(&mut self) -> Result<Box<dyn DriverTrait>, Unsupported> {
+            let forked_inner = self.inner.fork().await?;
+            Ok(Box::new(CloseCountingDriver {
+                inner: forked_inner,
+                closes: Arc::clone(&self.closes),
+            }))
+        }
+
+        async fn extract(&mut self, node: &NodeId) -> Result<serde_json::Value, TransportError> {
+            self.inner.extract(node).await
+        }
+
+        async fn evaluate_script(
+            &mut self,
+            expression: &str,
+            await_promise: bool,
+        ) -> Result<serde_json::Value, TransportError> {
+            self.inner.evaluate_script(expression, await_promise).await
+        }
+
+        async fn screenshot(&mut self) -> Result<Vec<u8>, TransportError> {
+            self.inner.screenshot().await
+        }
+
+        async fn close(&mut self) -> Result<(), TransportError> {
+            self.closes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.close().await
+        }
+    }
+
+    #[test]
+    fn detach_engine_driver_closes_live_forks() -> TestResult {
+        // Regression guard for the #93 leak (#121 follow-up): tearing down a
+        // session must close every live fork so remote engine contexts do not
+        // leak. Against the pre-fix `detach_engine_driver` (which just dropped
+        // the MCP server) the fork closes never reach the engine and `closes`
+        // stays at 0, failing this test.
+        let closes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let engine_closes = Arc::clone(&closes);
+        let (client_stream, server_stream) = UnixStream::pair()?;
+        let server = thread::spawn(move || -> Result<(), EngineHostError> {
+            let mut connection = EngineIpcConnection::from_stream(server_stream);
+            let mut driver = CloseCountingDriver::new(engine_closes);
+            futures::executor::block_on(serve_driver_connection(&mut connection, &mut driver))
+        });
+
+        let mut pool = SessionPool::default();
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+
+        // Open three live forks through the MCP endpoint.
+        for id in 0..3 {
+            let response = route_http_request(&mut pool, mcp_tool_request(id, "fork", json!({}))?)?;
+            let fork: Value = serde_json::from_slice(&response.body)?;
+            assert!(
+                fork["result"]["structuredContent"]["driver_id"].is_string(),
+                "fork {id} did not return a driver_id: {fork}"
+            );
+        }
+
+        // Session teardown must close the forks before dropping the server.
+        pool.detach_engine_driver();
+        assert!(pool.mcp.is_none(), "detach must drop the MCP server");
+
+        // Drop the pool so the root IPC connection closes and the engine host
+        // thread finishes, then confirm all three fork closes were observed.
+        drop(pool);
+        join_driver_handler(server)?;
+        assert_eq!(
+            closes.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "every live fork must be closed at session teardown"
+        );
         Ok(())
     }
 

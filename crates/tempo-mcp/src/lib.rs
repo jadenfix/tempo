@@ -725,23 +725,21 @@ fn handshake_probe_target(args: &HandshakeArgs) -> Option<String> {
     }
 }
 
-/// Run the blocking HTTP probe without stalling the async executor.
+/// Run the blocking HTTP probe from the async `call_tool` path.
 ///
-/// `probe_http_origin` uses a blocking HTTP client, so it is dispatched to a
-/// dedicated blocking pool thread via `spawn_blocking` and awaited, rather than
-/// parking a runtime worker on a `std::thread` join for the probe duration.
+/// This path is runtime-agnostic on purpose: the production caller drives the
+/// async MCP server with `futures::executor::block_on` (see
+/// `tempo-headless::route_mcp`), so there is no tokio runtime available and
+/// `tokio::task::spawn_blocking` would panic. `probe_http_origin` uses a
+/// blocking HTTP client, so it is run on its own std thread and joined, which
+/// works under any executor. Because the surrounding server is always driven by
+/// a synchronous `block_on`, parking the current thread on that join is correct
+/// here.
 async fn run_handshake_probe(
     args: &HandshakeArgs,
     config: &HttpProbeConfig,
 ) -> Option<Result<tempo_handshake::HttpProbeRun, String>> {
-    let origin = handshake_probe_target(args)?;
-    let config = config.clone();
-    let result = match tokio::task::spawn_blocking(move || probe_http_origin(&origin, config)).await
-    {
-        Ok(result) => result.map_err(|error| error.to_string()),
-        Err(_) => Err("HTTP probe worker panicked".into()),
-    };
-    Some(result)
+    run_handshake_probe_blocking(args, config)
 }
 
 /// Blocking-context variant of [`run_handshake_probe`] for the driverless path,
@@ -1394,6 +1392,50 @@ mod tests {
             .as_array()
             .ok_or("probe_failures must be an array")?
             .is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn handshake_live_probe_runs_without_a_tokio_runtime() -> Result<(), String> {
+        // Regression guard for the production tempod path (#94/#121 follow-up):
+        // `tempo-headless::route_mcp` drives this async server with
+        // `futures::executor::block_on` and there is NO tokio runtime present.
+        // The live handshake probe must therefore not use
+        // `tokio::task::spawn_blocking`, which panics ("must be called from the
+        // context of a Tokio 1.x runtime") outside a tokio runtime. This test
+        // deliberately runs as a plain `#[test]` (not `#[tokio::test]`) and
+        // drives the probe via `block_on`, exactly like the daemon does.
+        //
+        // Against the pre-fix code this call panicked inside `block_on`, failing
+        // the test; the fix runs the blocking probe on a std thread instead.
+        assert!(
+            tokio::runtime::Handle::try_current().is_err(),
+            "regression guard must run without a tokio runtime"
+        );
+
+        let (origin, fixture) = serve_handshake_fixture().map_err(|error| error.to_string())?;
+        let mut server = TempoMcpServer::new(MemoryDriver::new()).with_handshake_probe_config(
+            HttpProbeConfig::default().with_url_policy(UrlPolicy::allow_all()),
+        );
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/call",
+            "params": {"name": "handshake", "arguments": {"origin": origin}},
+        });
+        let response =
+            futures::executor::block_on(server.handle_post(None, body.to_string().as_bytes()));
+        join_server(fixture)?;
+
+        let value = response.json_value().map_err(|error| error.to_string())?;
+        assert!(
+            value.get("error").is_none(),
+            "handshake returned an error: {value}"
+        );
+        let result = &value["result"]["structuredContent"];
+        assert_eq!(result["live_http"], true);
+        assert_eq!(result["lane"], "mcp");
+        assert_eq!(result["selected"]["signal"], "mcp_catalog");
         Ok(())
     }
 
