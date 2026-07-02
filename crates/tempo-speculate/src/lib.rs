@@ -6,6 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use tempo_act::{execute_action, execute_batch, ActionExecution, ExecutionStatus};
 use tempo_driver::{DriverTrait, Engine, TransportError, Unsupported};
@@ -274,7 +275,7 @@ where
             })?;
         let actual = replay_outcome_from_execution(execution);
         let expected_outcome = expected.outcome();
-        if actual != expected_outcome {
+        if !replay_outcomes_match(&actual, &expected_outcome) {
             return Err(SpeculateError::ReplayStepDiverged {
                 branch: branch.id.clone(),
                 seq: expected.seq(),
@@ -311,14 +312,20 @@ where
 ///
 /// Drivers with native `fork()` support get one branch-local driver per branch and
 /// run the replay jobs concurrently. Engines that return `Unsupported` degrade to
-/// deterministic sequential replay on the provided driver; each branch still
-/// starts from `plan.start_url` and replays the same journaled prefix.
-pub async fn execute_replay_fork<D>(
+/// deterministic sequential replay: `provision_branch_driver` is invoked once per
+/// branch to obtain a *fresh* driver, so each branch starts from clean durable
+/// session state (no cookies, storage, or login left over from a sibling branch)
+/// before replaying `plan.start_url` and the same journaled prefix. Each provisioned
+/// driver is closed after its branch completes.
+pub async fn execute_replay_fork<D, F, Fut>(
     driver: &mut D,
     plan: &ReplayForkPlan,
+    provision_branch_driver: F,
 ) -> Result<ReplayForkExecution, SpeculateError>
 where
     D: DriverTrait + ?Sized,
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<Box<dyn DriverTrait>, SpeculateError>>,
 {
     let requests = branch_requests(&plan.branches);
     validate_branch_ids(&requests)?;
@@ -333,8 +340,12 @@ where
         }
         Err(err) => {
             let schedule = schedule_branches(&requests, Err(err))?;
-            let branches =
-                execute_sequential_replay_branches(driver, plan, schedule.branches()).await?;
+            let branches = execute_sequential_replay_branches(
+                plan,
+                schedule.branches(),
+                provision_branch_driver,
+            )
+            .await?;
             Ok(ReplayForkExecution { schedule, branches })
         }
     }
@@ -354,7 +365,15 @@ where
 {
     let mut drivers = Vec::with_capacity(count);
     for _ in 0..count {
-        drivers.push(driver.fork().await?);
+        match driver.fork().await {
+            Ok(forked) => drivers.push(forked),
+            Err(unsupported) => {
+                // A later fork failed: close the drivers already forked so a partial
+                // fork set does not leak page/target handles before we fall back.
+                close_branch_drivers(drivers).await;
+                return Err(unsupported);
+            }
+        }
     }
     Ok(drivers)
 }
@@ -367,34 +386,68 @@ async fn execute_parallel_replay_branches(
     let mut branches = replay_branch_map(&plan.branches)?;
     let mut jobs = Vec::with_capacity(branch_ids.len());
 
-    for (id, mut branch_driver) in branch_ids.iter().cloned().zip(branch_drivers) {
+    for (id, branch_driver) in branch_ids.iter().cloned().zip(branch_drivers) {
         let branch = branches
             .remove(&id)
             .ok_or_else(|| SpeculateError::MissingBranch(id.clone()))?;
-        jobs.push(
-            async move { execute_replay_branch(branch_driver.as_mut(), plan, &branch).await },
-        );
+        jobs.push(run_and_close_branch(branch_driver, plan, branch));
     }
 
-    futures::future::try_join_all(jobs).await
+    // Run every branch to completion (rather than short-circuiting) so each forked
+    // driver is closed by its own job even when a sibling branch diverges. Only then
+    // surface the first failure, preserving deterministic branch order in the result.
+    let results = futures::future::join_all(jobs).await;
+    let mut executions = Vec::with_capacity(results.len());
+    for result in results {
+        executions.push(result?);
+    }
+    Ok(executions)
 }
 
-async fn execute_sequential_replay_branches<D>(
-    driver: &mut D,
+/// Run one branch on its forked driver and close that driver afterward, on both the
+/// success and error paths. A fork is a real page/target/process, so it must be
+/// closed explicitly rather than relying on `Drop`, which cannot await.
+async fn run_and_close_branch(
+    mut branch_driver: Box<dyn DriverTrait>,
+    plan: &ReplayForkPlan,
+    branch: ReplayBranch,
+) -> Result<ReplayBranchExecution, SpeculateError> {
+    let result = execute_replay_branch(branch_driver.as_mut(), plan, &branch).await;
+    // Best-effort close: never mask the branch outcome with a teardown error.
+    let _ = branch_driver.close().await;
+    result
+}
+
+/// Best-effort close of a set of branch drivers, ignoring teardown errors.
+async fn close_branch_drivers(drivers: Vec<Box<dyn DriverTrait>>) {
+    for mut driver in drivers {
+        let _ = driver.close().await;
+    }
+}
+
+async fn execute_sequential_replay_branches<F, Fut>(
     plan: &ReplayForkPlan,
     branch_ids: &[BranchId],
+    mut provision_branch_driver: F,
 ) -> Result<Vec<ReplayBranchExecution>, SpeculateError>
 where
-    D: DriverTrait + ?Sized,
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<Box<dyn DriverTrait>, SpeculateError>>,
 {
-    let branches = replay_branch_map(&plan.branches)?;
+    let mut branches = replay_branch_map(&plan.branches)?;
     let mut executions = Vec::with_capacity(branch_ids.len());
 
     for id in branch_ids {
         let branch = branches
-            .get(id)
+            .remove(id)
             .ok_or_else(|| SpeculateError::MissingBranch(id.clone()))?;
-        executions.push(execute_replay_branch(driver, plan, branch).await?);
+        // Fresh driver per branch: each speculative branch must start from clean
+        // durable session state, never one contaminated by a prior branch.
+        let mut branch_driver = provision_branch_driver().await?;
+        let result = execute_replay_branch(branch_driver.as_mut(), plan, &branch).await;
+        // Best-effort close: never mask the branch outcome with a teardown error.
+        let _ = branch_driver.close().await;
+        executions.push(result?);
     }
 
     Ok(executions)
@@ -457,6 +510,37 @@ fn cassette_map(cassettes: Vec<ResponseCassette>) -> BTreeMap<String, ResponseCa
         map.insert(cassette.key.0.clone(), cassette);
     }
     map
+}
+
+/// Compare a replayed step outcome against the journaled one on replay-stable
+/// content identity only. The `since_seq`/`seq` counters on `ObservationDiff` are
+/// relative to the original run: replay re-executes only journaled actions and does
+/// not reproduce the standalone `observe()` calls (and real compilers bump `seq` on
+/// every compile), so those counters legitimately drift even for identical replays.
+/// Comparing added/removed/changed elements (and the step status/reason) avoids the
+/// spurious `ReplayStepDiverged` that a raw equality check would produce.
+fn replay_outcomes_match(actual: &ReplayStepOutcome, expected: &ReplayStepOutcome) -> bool {
+    match (actual, expected) {
+        (
+            ReplayStepOutcome::Applied { diff: actual_diff },
+            ReplayStepOutcome::Applied {
+                diff: expected_diff,
+            },
+        ) => {
+            actual_diff.added == expected_diff.added
+                && actual_diff.removed == expected_diff.removed
+                && actual_diff.changed == expected_diff.changed
+        }
+        (
+            ReplayStepOutcome::StepError {
+                reason: actual_reason,
+            },
+            ReplayStepOutcome::StepError {
+                reason: expected_reason,
+            },
+        ) => actual_reason == expected_reason,
+        _ => false,
+    }
 }
 
 fn replay_outcome_from_execution(execution: ActionExecution) -> ReplayStepOutcome {
@@ -541,6 +625,8 @@ mod tests {
     use async_trait::async_trait;
     use std::error::Error;
     use std::fs;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
     use tempo_driver::TestDriver;
     use tempo_schema::QuiescencePolicy;
@@ -841,7 +927,10 @@ mod tests {
         )?;
         let mut driver = TestDriver::new();
 
-        let report = futures::executor::block_on(execute_replay_fork(&mut driver, &plan))?;
+        let report =
+            futures::executor::block_on(execute_replay_fork(&mut driver, &plan, || async {
+                Ok(Box::new(TestDriver::new()) as Box<dyn DriverTrait>)
+            }))?;
 
         assert_eq!(
             report.schedule,
@@ -880,7 +969,10 @@ mod tests {
         )?;
         let mut driver = NoForkDriver::new();
 
-        let report = futures::executor::block_on(execute_replay_fork(&mut driver, &plan))?;
+        let report =
+            futures::executor::block_on(execute_replay_fork(&mut driver, &plan, || async {
+                Ok(Box::new(TestDriver::new()) as Box<dyn DriverTrait>)
+            }))?;
 
         assert_eq!(
             report.schedule,
@@ -901,6 +993,159 @@ mod tests {
             .branches
             .iter()
             .all(|branch| branch.engine == Engine::Test && branch.branch.action_count == 1));
+        Ok(())
+    }
+
+    #[test]
+    fn reusing_one_driver_across_branches_contaminates_state() -> TestResult {
+        // Directly documents the hazard the sequential fallback must avoid: a driver
+        // whose durable state survives `goto` diverges on the second branch because it
+        // carries residue from the first. This is exactly why each branch needs a
+        // fresh/clean driver.
+        let plan = single_step_prefix_plan("branch-a");
+        let closes = Arc::new(AtomicUsize::new(0));
+        let mut driver = StatefulDriver::new(Arc::clone(&closes));
+
+        // First branch on a clean driver replays cleanly.
+        futures::executor::block_on(execute_replay_branch(&mut driver, &plan, &plan.branches[0]))?;
+
+        // Reusing the same driver for a second branch diverges on the prefix: leftover
+        // state from branch one shows up as extra observed content.
+        let err = futures::executor::block_on(execute_replay_branch(
+            &mut driver,
+            &plan,
+            &plan.branches[0],
+        ));
+        assert!(matches!(
+            err,
+            Err(SpeculateError::ReplayStepDiverged { branch, .. })
+                if branch == BranchId("branch-a".into())
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn sequential_fallback_provisions_fresh_closed_driver_per_branch() -> TestResult {
+        // #111 + #113 (sequential path): the fork-less orchestrator must hand every
+        // branch a freshly provisioned, clean driver and close it afterward. Using
+        // `StatefulDriver` (whose state would contaminate a reused instance) proves the
+        // branches stay isolated: if any branch reused a prior driver, its prefix would
+        // diverge.
+        let plan = ReplayForkPlan::from_records(
+            PathBuf::from("session.jsonl"),
+            PathBuf::from("cassettes.jsonl"),
+            vec![
+                journal_entry(
+                    0,
+                    JournalEvent::SessionStarted {
+                        url: "https://example.com".into(),
+                    },
+                ),
+                journal_entry(
+                    1,
+                    JournalEvent::StepApplied {
+                        action: Action::Scroll { x: 0.0, y: 1.0 },
+                        diff: empty_diff(1, 2),
+                    },
+                ),
+            ],
+            vec![],
+            vec![
+                branch("branch-a", Action::Scroll { x: 0.0, y: 1.0 }),
+                branch("branch-b", Action::Scroll { x: 0.0, y: 2.0 }),
+            ],
+        )?;
+        // Fork source reports Unsupported so the orchestrator takes the sequential path.
+        let mut fork_source = NoForkDriver::new();
+        let provisioned = Arc::new(AtomicUsize::new(0));
+        let closes = Arc::new(AtomicUsize::new(0));
+        let provisioned_for_closure = Arc::clone(&provisioned);
+        let closes_for_closure = Arc::clone(&closes);
+
+        let report =
+            futures::executor::block_on(execute_replay_fork(&mut fork_source, &plan, move || {
+                provisioned_for_closure.fetch_add(1, Ordering::SeqCst);
+                let closes = Arc::clone(&closes_for_closure);
+                async move { Ok(Box::new(StatefulDriver::new(closes)) as Box<dyn DriverTrait>) }
+            }))?;
+
+        assert!(report.schedule.is_sequential());
+        assert_eq!(
+            execution_ids(&report.branches),
+            vec!["branch-a", "branch-b"]
+        );
+        // One fresh driver provisioned and closed per branch.
+        assert_eq!(provisioned.load(Ordering::SeqCst), 2);
+        assert_eq!(closes.load(Ordering::SeqCst), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn identical_replay_with_drifting_seq_is_not_divergent_but_content_change_is() -> TestResult {
+        // #112: replay diffs carry run-relative `since_seq`/`seq` counters that drift
+        // (real compilers bump `seq` on every observe). Identical content must NOT be
+        // flagged divergent, while a genuine content change still must be.
+        let plan = single_step_prefix_plan("branch-a");
+
+        // Same content, but the observation counters drift by 5 as a live compiler
+        // would: this must replay cleanly.
+        let mut drifted = RecompilingDriver::new(5, vec![]);
+        let report = futures::executor::block_on(execute_replay_branch(
+            &mut drifted,
+            &plan,
+            &plan.branches[0],
+        ))?;
+        assert_eq!(report.id, BranchId("branch-a".into()));
+
+        // A real content change (an extra observed element) must still diverge.
+        let mut changed = RecompilingDriver::new(0, vec![marker_element("leaked")]);
+        let err = futures::executor::block_on(execute_replay_branch(
+            &mut changed,
+            &plan,
+            &plan.branches[0],
+        ));
+        assert!(matches!(
+            err,
+            Err(SpeculateError::ReplayStepDiverged { branch, .. })
+                if branch == BranchId("branch-a".into())
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn parallel_replay_fork_closes_every_forked_driver() -> TestResult {
+        // #113 (parallel path): each forked branch driver must be closed after its
+        // branch completes.
+        let plan = ReplayForkPlan::from_records(
+            PathBuf::from("session.jsonl"),
+            PathBuf::from("cassettes.jsonl"),
+            vec![journal_entry(
+                0,
+                JournalEvent::SessionStarted {
+                    url: "https://example.com".into(),
+                },
+            )],
+            vec![],
+            vec![
+                branch("branch-a", Action::Scroll { x: 0.0, y: 1.0 }),
+                branch("branch-b", Action::Scroll { x: 0.0, y: 2.0 }),
+            ],
+        )?;
+        let closes = Arc::new(AtomicUsize::new(0));
+        let mut fork_source = CountingForkDriver::new(Arc::clone(&closes));
+
+        let report =
+            futures::executor::block_on(execute_replay_fork(&mut fork_source, &plan, || async {
+                Ok(Box::new(TestDriver::new()) as Box<dyn DriverTrait>)
+            }))?;
+
+        assert!(!report.schedule.is_sequential());
+        assert_eq!(
+            execution_ids(&report.branches),
+            vec!["branch-a", "branch-b"]
+        );
+        // Both forked branch drivers were closed (the fork source itself is not).
+        assert_eq!(closes.load(Ordering::SeqCst), 2);
         Ok(())
     }
 
@@ -975,6 +1220,47 @@ mod tests {
                 actions: vec![action],
                 quiescence: QuiescencePolicy::Composite,
             },
+        }
+    }
+
+    /// A one-branch plan whose prefix is a single applied Scroll with an empty diff,
+    /// starting from `https://example.com`.
+    fn single_step_prefix_plan(branch_id: &str) -> ReplayForkPlan {
+        let entries = vec![
+            journal_entry(
+                0,
+                JournalEvent::SessionStarted {
+                    url: "https://example.com".into(),
+                },
+            ),
+            journal_entry(
+                1,
+                JournalEvent::StepApplied {
+                    action: Action::Scroll { x: 0.0, y: 1.0 },
+                    diff: empty_diff(1, 2),
+                },
+            ),
+        ];
+        match ReplayForkPlan::from_records(
+            PathBuf::from("session.jsonl"),
+            PathBuf::from("cassettes.jsonl"),
+            entries,
+            vec![],
+            vec![branch(branch_id, Action::Scroll { x: 0.0, y: 2.0 })],
+        ) {
+            Ok(plan) => plan,
+            Err(err) => unreachable!("valid fixture plan should build: {err:?}"),
+        }
+    }
+
+    fn marker_element(node: &str) -> tempo_schema::InteractiveElement {
+        tempo_schema::InteractiveElement {
+            node_id: tempo_schema::NodeId(node.into()),
+            role: "button".into(),
+            name: vec![],
+            value: vec![],
+            bounds: None,
+            rank: 0.0,
         }
     }
 
@@ -1080,6 +1366,349 @@ mod tests {
         }
 
         async fn close(&mut self) -> Result<(), TransportError> {
+            self.inner.close().await
+        }
+    }
+
+    /// Driver whose durable state (a navigation counter) survives `goto`, so reuse
+    /// across branches leaks observable content. Never forks (forces the sequential
+    /// path) and counts `close()` calls.
+    struct StatefulDriver {
+        inner: TestDriver,
+        navigations: u64,
+        closes: Arc<AtomicUsize>,
+    }
+
+    impl StatefulDriver {
+        fn new(closes: Arc<AtomicUsize>) -> Self {
+            Self {
+                inner: TestDriver::new(),
+                navigations: 0,
+                closes,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl DriverTrait for StatefulDriver {
+        fn engine(&self) -> Engine {
+            self.inner.engine()
+        }
+
+        async fn goto(
+            &mut self,
+            url: &str,
+        ) -> Result<tempo_schema::CompiledObservation, TransportError> {
+            // Real engines do not drop cookies/storage on navigation; model that by
+            // accumulating state across gotos rather than resetting.
+            self.navigations += 1;
+            self.inner.goto(url).await
+        }
+
+        async fn observe(&mut self) -> Result<tempo_schema::CompiledObservation, TransportError> {
+            self.inner.observe().await
+        }
+
+        async fn observe_diff(
+            &mut self,
+            since_seq: u64,
+        ) -> Result<ObservationDiff, TransportError> {
+            let mut diff = self.inner.observe_diff(since_seq).await?;
+            // Residual content from prior branches: zero on a freshly provisioned
+            // driver (one navigation), non-empty once reused.
+            let residual = self.navigations.saturating_sub(1);
+            diff.added = (0..residual)
+                .map(|i| marker_element(&format!("residual-{i}")))
+                .collect();
+            Ok(diff)
+        }
+
+        async fn act(
+            &mut self,
+            action: &Action,
+        ) -> Result<tempo_driver::StepOutcome, TransportError> {
+            self.inner.act(action).await
+        }
+
+        async fn act_batch(
+            &mut self,
+            batch: &ActionBatch,
+        ) -> Result<tempo_driver::StepOutcome, TransportError> {
+            self.inner.act_batch(batch).await
+        }
+
+        async fn fork(&mut self) -> Result<Box<dyn DriverTrait>, Unsupported> {
+            Err(Unsupported("native fork"))
+        }
+
+        async fn extract(
+            &mut self,
+            node: &tempo_schema::NodeId,
+        ) -> Result<serde_json::Value, TransportError> {
+            self.inner.extract(node).await
+        }
+
+        async fn evaluate_script(
+            &mut self,
+            expression: &str,
+            await_promise: bool,
+        ) -> Result<serde_json::Value, TransportError> {
+            self.inner.evaluate_script(expression, await_promise).await
+        }
+
+        async fn screenshot(&mut self) -> Result<Vec<u8>, TransportError> {
+            self.inner.screenshot().await
+        }
+
+        async fn close(&mut self) -> Result<(), TransportError> {
+            self.closes.fetch_add(1, Ordering::SeqCst);
+            self.inner.close().await
+        }
+    }
+
+    /// Driver that simulates a live compiler: `observe_diff` drifts the run-relative
+    /// `since_seq`/`seq` counters and can inject a genuine content change, without
+    /// touching the replay-stable added/removed/changed sets unless asked.
+    struct RecompilingDriver {
+        inner: TestDriver,
+        seq_drift: u64,
+        injected_added: Vec<tempo_schema::InteractiveElement>,
+    }
+
+    impl RecompilingDriver {
+        fn new(seq_drift: u64, injected_added: Vec<tempo_schema::InteractiveElement>) -> Self {
+            Self {
+                inner: TestDriver::new(),
+                seq_drift,
+                injected_added,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl DriverTrait for RecompilingDriver {
+        fn engine(&self) -> Engine {
+            self.inner.engine()
+        }
+
+        async fn goto(
+            &mut self,
+            url: &str,
+        ) -> Result<tempo_schema::CompiledObservation, TransportError> {
+            self.inner.goto(url).await
+        }
+
+        async fn observe(&mut self) -> Result<tempo_schema::CompiledObservation, TransportError> {
+            self.inner.observe().await
+        }
+
+        async fn observe_diff(
+            &mut self,
+            since_seq: u64,
+        ) -> Result<ObservationDiff, TransportError> {
+            let mut diff = self.inner.observe_diff(since_seq).await?;
+            diff.since_seq += self.seq_drift;
+            diff.seq += self.seq_drift;
+            diff.added = self.injected_added.clone();
+            Ok(diff)
+        }
+
+        async fn act(
+            &mut self,
+            action: &Action,
+        ) -> Result<tempo_driver::StepOutcome, TransportError> {
+            self.inner.act(action).await
+        }
+
+        async fn act_batch(
+            &mut self,
+            batch: &ActionBatch,
+        ) -> Result<tempo_driver::StepOutcome, TransportError> {
+            self.inner.act_batch(batch).await
+        }
+
+        async fn fork(&mut self) -> Result<Box<dyn DriverTrait>, Unsupported> {
+            Err(Unsupported("native fork"))
+        }
+
+        async fn extract(
+            &mut self,
+            node: &tempo_schema::NodeId,
+        ) -> Result<serde_json::Value, TransportError> {
+            self.inner.extract(node).await
+        }
+
+        async fn evaluate_script(
+            &mut self,
+            expression: &str,
+            await_promise: bool,
+        ) -> Result<serde_json::Value, TransportError> {
+            self.inner.evaluate_script(expression, await_promise).await
+        }
+
+        async fn screenshot(&mut self) -> Result<Vec<u8>, TransportError> {
+            self.inner.screenshot().await
+        }
+
+        async fn close(&mut self) -> Result<(), TransportError> {
+            self.inner.close().await
+        }
+    }
+
+    /// Fork source whose forked children count their own `close()` calls, letting the
+    /// parallel path assert every branch driver is torn down.
+    struct CountingForkDriver {
+        inner: TestDriver,
+        closes: Arc<AtomicUsize>,
+    }
+
+    impl CountingForkDriver {
+        fn new(closes: Arc<AtomicUsize>) -> Self {
+            Self {
+                inner: TestDriver::new(),
+                closes,
+            }
+        }
+    }
+
+    /// A forked child of `CountingForkDriver` that records when it is closed.
+    struct CountingForkChild {
+        inner: TestDriver,
+        closes: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl DriverTrait for CountingForkDriver {
+        fn engine(&self) -> Engine {
+            self.inner.engine()
+        }
+
+        async fn goto(
+            &mut self,
+            url: &str,
+        ) -> Result<tempo_schema::CompiledObservation, TransportError> {
+            self.inner.goto(url).await
+        }
+
+        async fn observe(&mut self) -> Result<tempo_schema::CompiledObservation, TransportError> {
+            self.inner.observe().await
+        }
+
+        async fn observe_diff(
+            &mut self,
+            since_seq: u64,
+        ) -> Result<ObservationDiff, TransportError> {
+            self.inner.observe_diff(since_seq).await
+        }
+
+        async fn act(
+            &mut self,
+            action: &Action,
+        ) -> Result<tempo_driver::StepOutcome, TransportError> {
+            self.inner.act(action).await
+        }
+
+        async fn act_batch(
+            &mut self,
+            batch: &ActionBatch,
+        ) -> Result<tempo_driver::StepOutcome, TransportError> {
+            self.inner.act_batch(batch).await
+        }
+
+        async fn fork(&mut self) -> Result<Box<dyn DriverTrait>, Unsupported> {
+            Ok(Box::new(CountingForkChild {
+                inner: TestDriver::new(),
+                closes: Arc::clone(&self.closes),
+            }))
+        }
+
+        async fn extract(
+            &mut self,
+            node: &tempo_schema::NodeId,
+        ) -> Result<serde_json::Value, TransportError> {
+            self.inner.extract(node).await
+        }
+
+        async fn evaluate_script(
+            &mut self,
+            expression: &str,
+            await_promise: bool,
+        ) -> Result<serde_json::Value, TransportError> {
+            self.inner.evaluate_script(expression, await_promise).await
+        }
+
+        async fn screenshot(&mut self) -> Result<Vec<u8>, TransportError> {
+            self.inner.screenshot().await
+        }
+
+        async fn close(&mut self) -> Result<(), TransportError> {
+            self.inner.close().await
+        }
+    }
+
+    #[async_trait]
+    impl DriverTrait for CountingForkChild {
+        fn engine(&self) -> Engine {
+            self.inner.engine()
+        }
+
+        async fn goto(
+            &mut self,
+            url: &str,
+        ) -> Result<tempo_schema::CompiledObservation, TransportError> {
+            self.inner.goto(url).await
+        }
+
+        async fn observe(&mut self) -> Result<tempo_schema::CompiledObservation, TransportError> {
+            self.inner.observe().await
+        }
+
+        async fn observe_diff(
+            &mut self,
+            since_seq: u64,
+        ) -> Result<ObservationDiff, TransportError> {
+            self.inner.observe_diff(since_seq).await
+        }
+
+        async fn act(
+            &mut self,
+            action: &Action,
+        ) -> Result<tempo_driver::StepOutcome, TransportError> {
+            self.inner.act(action).await
+        }
+
+        async fn act_batch(
+            &mut self,
+            batch: &ActionBatch,
+        ) -> Result<tempo_driver::StepOutcome, TransportError> {
+            self.inner.act_batch(batch).await
+        }
+
+        async fn fork(&mut self) -> Result<Box<dyn DriverTrait>, Unsupported> {
+            Err(Unsupported("native fork"))
+        }
+
+        async fn extract(
+            &mut self,
+            node: &tempo_schema::NodeId,
+        ) -> Result<serde_json::Value, TransportError> {
+            self.inner.extract(node).await
+        }
+
+        async fn evaluate_script(
+            &mut self,
+            expression: &str,
+            await_promise: bool,
+        ) -> Result<serde_json::Value, TransportError> {
+            self.inner.evaluate_script(expression, await_promise).await
+        }
+
+        async fn screenshot(&mut self) -> Result<Vec<u8>, TransportError> {
+            self.inner.screenshot().await
+        }
+
+        async fn close(&mut self) -> Result<(), TransportError> {
+            self.closes.fetch_add(1, Ordering::SeqCst);
             self.inner.close().await
         }
     }
