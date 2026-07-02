@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+tempo-driver = { path = "../tempo-driver" }
+tempo-schema = { path = "../tempo-schema" }
 tempo-session = { path = "../tempo-session" }
 serde.workspace = true
 serde_json.workspace = true
