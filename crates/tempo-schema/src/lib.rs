@@ -103,26 +103,42 @@ pub enum SideEffect {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Action {
-    Goto { url: String },
-    Click { node: NodeId },
-    Type { node: NodeId, text: String },
-    Select { node: NodeId, value: String },
-    Scroll { x: f32, y: f32 },
-    Extract { node: NodeId },
+    Goto {
+        url: String,
+    },
+    Click {
+        node: NodeId,
+    },
+    Type {
+        node: NodeId,
+        text: String,
+    },
+    Select {
+        node: NodeId,
+        value: String,
+    },
+    Scroll {
+        x: f32,
+        y: f32,
+    },
+    Extract {
+        node: NodeId,
+    },
     /// Invoke a named macro/skill from the skill store (final.md tempo-skills).
-    Skill { name: String, input: serde_json::Value },
+    Skill {
+        name: String,
+        input: serde_json::Value,
+    },
 }
 
 impl Action {
     /// Static side-effect class for this action (before argument-derived escalation).
     pub fn side_effect(&self) -> SideEffect {
         match self {
-            Action::Goto { .. }
-            | Action::Scroll { .. }
-            | Action::Extract { .. } => SideEffect::Read,
-            Action::Click { .. }
-            | Action::Type { .. }
-            | Action::Select { .. } => SideEffect::Write,
+            Action::Goto { .. } | Action::Scroll { .. } | Action::Extract { .. } => {
+                SideEffect::Read
+            }
+            Action::Click { .. } | Action::Type { .. } | Action::Select { .. } => SideEffect::Write,
             // Skills declare their own class; default to the safe-but-gated Write.
             Action::Skill { .. } => SideEffect::Write,
         }
@@ -152,9 +168,15 @@ mod tests {
 
     #[test]
     fn taint_predicate_flags_page_content() {
-        let span = TaintSpan { provenance: Provenance::Page, text: "x".into() };
+        let span = TaintSpan {
+            provenance: Provenance::Page,
+            text: "x".into(),
+        };
         assert!(span.is_tainted());
-        let sys = TaintSpan { provenance: Provenance::System, text: "x".into() };
+        let sys = TaintSpan {
+            provenance: Provenance::System,
+            text: "x".into(),
+        };
         assert!(!sys.is_tainted());
     }
 
@@ -173,7 +195,10 @@ mod tests {
             elements: vec![InteractiveElement {
                 node_id: NodeId("n1".into()),
                 role: "button".into(),
-                name: vec![TaintSpan { provenance: Provenance::Page, text: "Buy".into() }],
+                name: vec![TaintSpan {
+                    provenance: Provenance::Page,
+                    text: "Buy".into(),
+                }],
                 value: vec![],
                 bounds: Some([0.0, 0.0, 10.0, 10.0]),
                 rank: 0.9,
