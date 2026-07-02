@@ -280,6 +280,9 @@ pub enum ServoEmbedderCommand {
         x: f32,
         y: f32,
     },
+    Wait {
+        millis: u64,
+    },
     ExtractNode {
         node: NodeId,
     },
@@ -301,6 +304,7 @@ impl ServoEmbedderCommand {
             Action::Type { node, text } => Self::TypeText { node, text },
             Action::Select { node, value } => Self::SelectValue { node, value },
             Action::Scroll { x, y } => Self::Scroll { x, y },
+            Action::Wait { millis } => Self::Wait { millis },
             Action::Extract { node } => Self::ExtractNode { node },
             Action::Skill { name, input } => Self::InvokeSkill { name, input },
         }
@@ -779,6 +783,7 @@ mod tests {
                 text: "hello".into(),
             }),
             ServoEmbedderCommand::from_action(Action::Scroll { x: 0.0, y: 12.0 }),
+            ServoEmbedderCommand::from_action(Action::Wait { millis: 250 }),
         ];
 
         assert_eq!(
@@ -795,6 +800,7 @@ mod tests {
                     text: "hello".into(),
                 },
                 ServoEmbedderCommand::Scroll { x: 0.0, y: 12.0 },
+                ServoEmbedderCommand::Wait { millis: 250 },
             ]
         );
     }

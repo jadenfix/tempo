@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+beater-browser = { git = "https://github.com/jadenfix/beater.git", rev = "d8dbcf9fad1680f6de2b05fa4f3558d30cc2ec5e" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
