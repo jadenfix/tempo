@@ -11,11 +11,18 @@ use std::fs::File;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use tempo_agent::{
+    AgentRunIds, AgentRunReport, AgentRunStatus, AgentRunner, ConfirmationMode, DriverTask,
+    StepTripleOutcome,
+};
 use tempo_compat::{run_injection_gate, CompatScorecard, CompatThresholds, InjectionCaseResult};
+use tempo_driver::{DriverTrait, TransportError};
+use tempo_engine_cdp::{CdpConfig, CdpTempoDriver};
 use tempo_evals::{
     eval_record_from_session_journal, read_eval_records, write_scorecard, EvalBudget, EvalError,
     Lane, Scorecard, SessionEvalDescriptor,
 };
+use tempo_schema::Action;
 use tempo_session::{read_journal_entries, JournalEntry, JournalError, JournalEvent};
 use thiserror::Error;
 
@@ -34,6 +41,10 @@ Commands:
             [--min-observation-quality N] [--max-challenge-rate N]
   injection-gate --input PATH [--output PATH]
   replay --journal PATH [--output PATH]
+  run-cdp-task --start-url URL --actions PATH --journal PATH [--output PATH]
+            [--run-id ID] [--session-id ID] [--chrome PATH]
+            [--allow-private-network]
+            [--confirmation-mode deny|auto-clean|auto-all]
 ";
 
 fn main() -> ExitCode {
@@ -86,6 +97,17 @@ enum Command {
         journal: PathBuf,
         output: Output,
     },
+    RunCdpTask {
+        start_url: String,
+        actions: PathBuf,
+        journal: PathBuf,
+        output: Output,
+        run_id: String,
+        session_id: String,
+        chrome: Option<String>,
+        allow_private_network: bool,
+        confirmation_mode: ConfirmationMode,
+    },
 }
 
 impl Command {
@@ -107,6 +129,7 @@ impl Command {
             "compat-lanes" => parse_compat_lanes(options),
             "injection-gate" => parse_injection_gate(options),
             "replay" => parse_replay(options),
+            "run-cdp-task" => parse_run_cdp_task(options),
             other => Err(CliError::Usage(format!(
                 "unknown command: {other}\n\n{USAGE}"
             ))),
@@ -175,6 +198,30 @@ impl Command {
                 let entries = read_journal_entries(&journal)?;
                 let summary = ReplaySummary::from_entries(&journal, &entries);
                 write_json(&output, &summary, stdout)
+            }
+            Self::RunCdpTask {
+                start_url,
+                actions,
+                journal,
+                output,
+                run_id,
+                session_id,
+                chrome,
+                allow_private_network,
+                confirmation_mode,
+            } => {
+                let actions = read_json(&actions)?;
+                let report = run_cdp_task(RunCdpTaskConfig {
+                    start_url,
+                    actions,
+                    journal,
+                    run_id,
+                    session_id,
+                    chrome,
+                    allow_private_network,
+                    confirmation_mode,
+                })?;
+                write_json(&output, &report, stdout)
             }
         }
     }
@@ -371,6 +418,50 @@ fn parse_replay(options: &[String]) -> Result<Command, CliError> {
     })
 }
 
+fn parse_run_cdp_task(options: &[String]) -> Result<Command, CliError> {
+    let mut start_url = None;
+    let mut actions = None;
+    let mut journal = None;
+    let mut output = Output::Stdout;
+    let mut run_id = "tempo-cli-run".to_string();
+    let mut session_id = "tempo-cli-session".to_string();
+    let mut chrome = None;
+    let mut allow_private_network = false;
+    let mut confirmation_mode = ConfirmationMode::DenyHumanRequired;
+    let mut index = 0;
+
+    while index < options.len() {
+        match options[index].as_str() {
+            "--start-url" => start_url = Some(take_value(options, &mut index)?),
+            "--actions" => actions = Some(PathBuf::from(take_value(options, &mut index)?)),
+            "--journal" => journal = Some(PathBuf::from(take_value(options, &mut index)?)),
+            "--output" => output = Output::Path(PathBuf::from(take_value(options, &mut index)?)),
+            "--run-id" => run_id = take_value(options, &mut index)?,
+            "--session-id" => session_id = take_value(options, &mut index)?,
+            "--chrome" => chrome = Some(take_value(options, &mut index)?),
+            "--allow-private-network" => allow_private_network = true,
+            "--confirmation-mode" => {
+                confirmation_mode = parse_confirmation_mode(take_value(options, &mut index)?)?;
+            }
+            "-h" | "--help" => return Ok(Command::Help),
+            flag => return Err(unknown_flag(flag)),
+        }
+        index += 1;
+    }
+
+    Ok(Command::RunCdpTask {
+        start_url: required_string("--start-url", start_url)?,
+        actions: required_path("--actions", actions)?,
+        journal: required_path("--journal", journal)?,
+        output,
+        run_id,
+        session_id,
+        chrome,
+        allow_private_network,
+        confirmation_mode,
+    })
+}
+
 fn take_value(options: &[String], index: &mut usize) -> Result<String, CliError> {
     let flag = options[*index].clone();
     *index += 1;
@@ -411,6 +502,18 @@ fn parse_lane(value: String) -> Result<Lane, CliError> {
         "cdp" => Ok(Lane::Cdp),
         _ => Err(CliError::InvalidValue {
             flag: "--lane",
+            value,
+        }),
+    }
+}
+
+fn parse_confirmation_mode(value: String) -> Result<ConfirmationMode, CliError> {
+    match value.as_str() {
+        "deny" => Ok(ConfirmationMode::DenyHumanRequired),
+        "auto-clean" => Ok(ConfirmationMode::AutoConfirmClean),
+        "auto-all" => Ok(ConfirmationMode::AutoConfirmAll),
+        _ => Err(CliError::InvalidValue {
+            flag: "--confirmation-mode",
             value,
         }),
     }
@@ -526,6 +629,169 @@ impl ReplaySummary {
     }
 }
 
+struct RunCdpTaskConfig {
+    start_url: String,
+    actions: Vec<Action>,
+    journal: PathBuf,
+    run_id: String,
+    session_id: String,
+    chrome: Option<String>,
+    allow_private_network: bool,
+    confirmation_mode: ConfirmationMode,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize)]
+struct RunCdpTaskReport {
+    engine: String,
+    journal: String,
+    status: RunCdpTaskStatus,
+    actions_completed: usize,
+    observations: usize,
+    max_observation_bytes: usize,
+    max_observation_tokens: usize,
+    steps: Vec<RunCdpTaskStep>,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize)]
+struct RunCdpTaskStatus {
+    state: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    action_index: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize)]
+struct RunCdpTaskStep {
+    index: usize,
+    idempotency_key: String,
+    side_effect: String,
+    input_tainted: bool,
+    confirmation_gate: String,
+    confirmed: bool,
+    denied: bool,
+    outcome: RunCdpTaskStepOutcome,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize)]
+struct RunCdpTaskStepOutcome {
+    state: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+}
+
+impl RunCdpTaskReport {
+    fn from_agent_report(report: AgentRunReport) -> Self {
+        Self {
+            engine: engine_name(report.engine),
+            journal: report.journal_path.display().to_string(),
+            status: run_status(&report.status),
+            actions_completed: report.actions_completed,
+            observations: report.observations,
+            max_observation_bytes: report.max_observation_bytes,
+            max_observation_tokens: report.max_observation_tokens,
+            steps: report.steps.iter().map(RunCdpTaskStep::from).collect(),
+        }
+    }
+}
+
+impl From<&tempo_agent::AgentStepReport> for RunCdpTaskStep {
+    fn from(step: &tempo_agent::AgentStepReport) -> Self {
+        Self {
+            index: step.index,
+            idempotency_key: step.policy.idempotency_key.0.clone(),
+            side_effect: format!("{:?}", step.policy.side_effect),
+            input_tainted: step.policy.input_tainted,
+            confirmation_gate: format!("{:?}", step.policy.confirmation_gate),
+            confirmed: step.policy.confirmed,
+            denied: step.policy.denied,
+            outcome: step_outcome(&step.triple.outcome),
+        }
+    }
+}
+
+fn run_cdp_task(config: RunCdpTaskConfig) -> Result<RunCdpTaskReport, CliError> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async move {
+        let mut cdp_config = CdpConfig::default();
+        if let Some(chrome) = config.chrome {
+            cdp_config = cdp_config.with_executable(chrome);
+        }
+        let mut driver = CdpTempoDriver::launch_with(cdp_config).await?;
+        if config.allow_private_network {
+            driver = driver.allow_private_network_access();
+        }
+
+        let runner = AgentRunner::new(
+            &config.journal,
+            AgentRunIds::new(config.run_id, config.session_id),
+        )
+        .with_confirmation_mode(config.confirmation_mode);
+        let task = DriverTask::new(config.start_url, config.actions);
+
+        let run_result = runner.run_driver_task(&mut driver, &task).await;
+        let close_result = driver.close().await;
+        let report = run_result?;
+        close_result?;
+        Ok(RunCdpTaskReport::from_agent_report(report))
+    })
+}
+
+fn run_status(status: &AgentRunStatus) -> RunCdpTaskStatus {
+    match status {
+        AgentRunStatus::Running => RunCdpTaskStatus {
+            state: "running",
+            action_index: None,
+            reason: None,
+        },
+        AgentRunStatus::Completed => RunCdpTaskStatus {
+            state: "completed",
+            action_index: None,
+            reason: None,
+        },
+        AgentRunStatus::AlreadyComplete => RunCdpTaskStatus {
+            state: "already_complete",
+            action_index: None,
+            reason: None,
+        },
+        AgentRunStatus::StepError {
+            action_index,
+            reason,
+        } => RunCdpTaskStatus {
+            state: "step_error",
+            action_index: Some(*action_index),
+            reason: Some(reason.clone()),
+        },
+        AgentRunStatus::PolicyDenied {
+            action_index,
+            reason,
+        } => RunCdpTaskStatus {
+            state: "policy_denied",
+            action_index: Some(*action_index),
+            reason: Some(reason.clone()),
+        },
+    }
+}
+
+fn step_outcome(outcome: &StepTripleOutcome) -> RunCdpTaskStepOutcome {
+    match outcome {
+        StepTripleOutcome::Applied { .. } => RunCdpTaskStepOutcome {
+            state: "applied",
+            reason: None,
+        },
+        StepTripleOutcome::StepError { reason } => RunCdpTaskStepOutcome {
+            state: "step_error",
+            reason: Some(reason.clone()),
+        },
+    }
+}
+
+fn engine_name(engine: tempo_driver::Engine) -> String {
+    format!("{engine:?}").to_ascii_lowercase()
+}
+
 #[derive(Debug, Error)]
 enum CliError {
     #[error("{0}")]
@@ -552,6 +818,10 @@ enum CliError {
     Eval(#[from] EvalError),
     #[error("journal operation failed: {0}")]
     Journal(#[from] JournalError),
+    #[error("agent operation failed: {0}")]
+    Agent(#[from] tempo_agent::AgentError),
+    #[error("driver operation failed: {0}")]
+    Transport(#[from] TransportError),
     #[error("scorecard gate failed with {violations} violation(s)")]
     GateFailed { violations: usize },
     #[error("invalid value for {flag}: {value}")]
@@ -585,7 +855,9 @@ impl CliError {
             | Self::JsonRead { .. }
             | Self::JsonWrite { .. }
             | Self::Eval(_)
-            | Self::Journal(_) => 1,
+            | Self::Journal(_)
+            | Self::Agent(_)
+            | Self::Transport(_) => 1,
         }
     }
 }
@@ -822,6 +1094,87 @@ mod tests {
         assert_eq!(value["session_closed"], true);
         assert_eq!(value["applied_steps"], 1);
         remove_dir(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn run_cdp_task_command_parses_live_driver_options() -> TestResult {
+        let actions = PathBuf::from("actions.json");
+        let journal = PathBuf::from("session.jsonl");
+        let output = PathBuf::from("report.json");
+
+        let command = Command::parse([
+            "run-cdp-task".to_string(),
+            "--start-url".into(),
+            "https://example.com".into(),
+            "--actions".into(),
+            input_string(&actions),
+            "--journal".into(),
+            input_string(&journal),
+            "--output".into(),
+            input_string(&output),
+            "--run-id".into(),
+            "run-live".into(),
+            "--session-id".into(),
+            "session-live".into(),
+            "--chrome".into(),
+            "/Applications/Chromium.app/Contents/MacOS/Chromium".into(),
+            "--allow-private-network".into(),
+            "--confirmation-mode".into(),
+            "auto-clean".into(),
+        ])?;
+
+        match command {
+            Command::RunCdpTask {
+                start_url,
+                actions: parsed_actions,
+                journal: parsed_journal,
+                output: Output::Path(parsed_output),
+                run_id,
+                session_id,
+                chrome,
+                allow_private_network,
+                confirmation_mode,
+            } => {
+                assert_eq!(start_url, "https://example.com");
+                assert_eq!(parsed_actions, actions);
+                assert_eq!(parsed_journal, journal);
+                assert_eq!(parsed_output, output);
+                assert_eq!(run_id, "run-live");
+                assert_eq!(session_id, "session-live");
+                assert_eq!(
+                    chrome.as_deref(),
+                    Some("/Applications/Chromium.app/Contents/MacOS/Chromium")
+                );
+                assert!(allow_private_network);
+                assert_eq!(confirmation_mode, ConfirmationMode::AutoConfirmClean);
+            }
+            other => return Err(format!("unexpected command parse result: {other:?}").into()),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn run_cdp_task_command_rejects_invalid_confirmation_mode() -> TestResult {
+        let result = Command::parse([
+            "run-cdp-task",
+            "--start-url",
+            "https://example.com",
+            "--actions",
+            "actions.json",
+            "--journal",
+            "session.jsonl",
+            "--confirmation-mode",
+            "always",
+        ]);
+
+        match result {
+            Err(CliError::InvalidValue {
+                flag: "--confirmation-mode",
+                value,
+            }) => assert_eq!(value, "always"),
+            other => return Err(format!("unexpected command parse result: {other:?}").into()),
+        }
         Ok(())
     }
 

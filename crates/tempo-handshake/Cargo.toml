@@ -9,6 +9,7 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 tempo-net = { path = "../tempo-net" }
 tempo-schema = { path = "../tempo-schema" }
 thiserror.workspace = true
+url = "2"
 
 [lints]
 workspace = true

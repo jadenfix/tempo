@@ -11,9 +11,11 @@ tempo-act = { path = "../tempo-act" }
 tempo-session = { path = "../tempo-session" }
 serde.workspace = true
 thiserror.workspace = true
+futures = "0.3"
 
 [dev-dependencies]
-futures = "0.3"
+async-trait.workspace = true
+serde_json.workspace = true
 tempo-driver = { path = "../tempo-driver", features = ["test-driver"] }
 
 [lints]

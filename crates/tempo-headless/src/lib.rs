@@ -276,15 +276,30 @@ enum DriverClientError {
 }
 
 /// In-memory session pool for a tempod process.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct SessionPool {
     sessions: BTreeMap<TempodSessionId, TempodSession>,
     bidi: BidiRouter,
     driver: Option<AttachedEngineDriver>,
+    mcp: Option<Arc<Mutex<tempo_mcp::TempoMcpServer<AttachedEngineDriver>>>>,
     bidi_contexts: BTreeMap<BrowsingContextId, AttachedEngineDriver>,
     next_bidi_context_id: u64,
     next_id: u64,
     draining: bool,
+}
+
+impl fmt::Debug for SessionPool {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionPool")
+            .field("sessions", &self.sessions)
+            .field("bidi", &self.bidi)
+            .field("driver", &self.driver)
+            .field("mcp_attached", &self.mcp.is_some())
+            .field("next_id", &self.next_id)
+            .field("draining", &self.draining)
+            .finish()
+    }
 }
 
 impl SessionPool {
@@ -338,6 +353,9 @@ impl SessionPool {
 
     pub fn attach_engine_driver(&mut self, engine: Engine, client: EngineIpcClient) {
         let driver = AttachedEngineDriver::new(engine, client);
+        self.mcp = Some(Arc::new(Mutex::new(tempo_mcp::TempoMcpServer::new(
+            driver.clone(),
+        ))));
         self.bidi_contexts.clear();
         self.next_bidi_context_id = 1;
         self.bidi_contexts
@@ -347,6 +365,7 @@ impl SessionPool {
 
     pub fn detach_engine_driver(&mut self) {
         self.driver = None;
+        self.mcp = None;
         self.bidi_contexts.clear();
         self.next_bidi_context_id = 1;
     }
@@ -809,8 +828,15 @@ fn bidi_response(status: u16, message: BidiMessage) -> HttpResponse {
 }
 
 fn route_mcp(pool: &mut SessionPool, request: &HttpRequest) -> HttpResponse {
-    if let Some(driver) = pool.driver.clone() {
-        let mut server = tempo_mcp::TempoMcpServer::new(driver);
+    if let Some(server) = &pool.mcp {
+        let Ok(mut server) = server.lock() else {
+            return HttpResponse::json(
+                500,
+                json!({
+                    "error": "MCP server lock failed",
+                }),
+            );
+        };
         return HttpResponse::from_mcp(futures::executor::block_on(
             server.handle_post(request.origin.as_deref(), &request.body),
         ));
@@ -1508,6 +1534,56 @@ mod tests {
     }
 
     #[test]
+    fn mcp_endpoint_persists_fork_driver_ids_across_posts() -> TestResult {
+        let (client_stream, server_stream) = UnixStream::pair()?;
+        let server = thread::spawn(move || -> Result<(), EngineHostError> {
+            let mut connection = EngineIpcConnection::from_stream(server_stream);
+            let mut driver = TestDriver::new();
+            futures::executor::block_on(serve_driver_connection(&mut connection, &mut driver))
+        });
+        let mut pool = SessionPool::default();
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+
+        let fork_response = route_http_request(&mut pool, mcp_tool_request(1, "fork", json!({}))?)?;
+        let fork: Value = serde_json::from_slice(&fork_response.body)?;
+        let driver_id = fork["result"]["structuredContent"]["driver_id"]
+            .as_str()
+            .ok_or("fork response must include a driver_id")?
+            .to_string();
+
+        let act_response = route_http_request(
+            &mut pool,
+            mcp_tool_request(
+                2,
+                "act",
+                json!({
+                    "driver_id": driver_id.clone(),
+                    "action": {"kind": "scroll", "x": 0.0, "y": 8.0},
+                }),
+            )?,
+        )?;
+        let root_response =
+            route_http_request(&mut pool, mcp_tool_request(3, "observe", json!({}))?)?;
+        let fork_response = route_http_request(
+            &mut pool,
+            mcp_tool_request(4, "observe", json!({"driver_id": driver_id}))?,
+        )?;
+
+        drop(pool);
+        join_driver_handler(server)?;
+
+        assert_eq!(act_response.status, 200);
+        let act: Value = serde_json::from_slice(&act_response.body)?;
+        assert_eq!(act["result"]["structuredContent"]["status"], "applied");
+
+        let root: Value = serde_json::from_slice(&root_response.body)?;
+        let fork: Value = serde_json::from_slice(&fork_response.body)?;
+        assert_eq!(root["result"]["structuredContent"]["seq"], 0);
+        assert_eq!(fork["result"]["structuredContent"]["seq"], 1);
+        Ok(())
+    }
+
+    #[test]
     fn attached_engine_driver_fork_routes_to_forked_handle() -> TestResult {
         let (client_stream, server_stream) = UnixStream::pair()?;
         let server = thread::spawn(move || -> Result<(), EngineHostError> {
@@ -1635,6 +1711,28 @@ mod tests {
             Ok(result) => Ok(result?),
             Err(_) => Err("driver handler thread failed".into()),
         }
+    }
+
+    fn mcp_tool_request(
+        id: u64,
+        name: &str,
+        arguments: Value,
+    ) -> Result<HttpRequest, serde_json::Error> {
+        Ok(HttpRequest {
+            method: "POST".into(),
+            path: "/mcp".into(),
+            host: None,
+            origin: Some("http://127.0.0.1".into()),
+            body: serde_json::to_vec(&json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": {
+                    "name": name,
+                    "arguments": arguments,
+                },
+            }))?,
+        })
     }
 
     fn observation(url: &str, seq: u64) -> CompiledObservation {
