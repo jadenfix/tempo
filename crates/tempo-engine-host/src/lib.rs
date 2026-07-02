@@ -12,7 +12,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Read, Write};
-use std::os::unix::fs::FileTypeExt;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -23,6 +23,8 @@ use thiserror::Error;
 
 pub const MAX_FRAME_BYTES: u32 = 1024 * 1024;
 pub const ENGINE_HOST_SOCKET_ENV: &str = "TEMPO_ENGINE_HOST_SOCKET";
+pub const ENGINE_HOST_TOKEN_ENV: &str = "TEMPO_ENGINE_HOST_TOKEN";
+pub const DRIVER_AUTH_METHOD: &str = "driver.auth";
 pub const DRIVER_REQUEST_METHOD: &str = "driver.request";
 pub const DRIVER_RESPONSE_METHOD: &str = "driver.response";
 const SCREENSHOT_FRAME_OVERHEAD_RESERVE: usize = 4096;
@@ -106,15 +108,17 @@ pub struct EngineHost {
     config: EngineHostConfig,
     child: Child,
     restarts: u32,
+    control_token: Option<String>,
 }
 
 impl EngineHost {
     pub fn spawn(config: EngineHostConfig) -> Result<Self, EngineHostError> {
-        let child = spawn_child(&config)?;
+        let child = spawn_child(&config, None)?;
         Ok(Self {
             config,
             child,
             restarts: 0,
+            control_token: None,
         })
     }
 
@@ -152,7 +156,7 @@ impl EngineHost {
                         last_status: status,
                     });
                 }
-                self.child = spawn_child(&self.config)?;
+                self.child = spawn_child(&self.config, self.control_token.as_deref())?;
                 self.restarts = self.restarts.saturating_add(1);
                 Ok(true)
             }
@@ -184,7 +188,14 @@ impl EngineHost {
             .clone()
             .ok_or(EngineHostError::MissingControlSocketPath)?;
         let server = EngineIpcServer::bind(socket_path)?;
-        let host = Self::spawn(config)?;
+        let token = server.auth_token().to_string();
+        let child = spawn_child(&config, Some(&token))?;
+        let host = Self {
+            config,
+            child,
+            restarts: 0,
+            control_token: Some(token),
+        };
         Ok((host, server))
     }
 }
@@ -392,33 +403,47 @@ enum ScreenshotChunkPayload {
     },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct AuthPayload {
+    token: String,
+}
+
 /// Bound Unix-domain-socket listener for engine child connections.
 pub struct EngineIpcServer {
     listener: UnixListener,
     path: PathBuf,
+    auth_token: String,
 }
 
 impl EngineIpcServer {
     pub fn bind(path: impl AsRef<Path>) -> Result<Self, EngineHostError> {
         let path = path.as_ref().to_path_buf();
-        if let Some(parent) = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            fs::create_dir_all(parent)?;
-        }
+        ensure_private_socket_parent(&path)?;
         remove_stale_socket(&path)?;
         let listener = UnixListener::bind(&path)?;
-        Ok(Self { listener, path })
+        if let Err(error) = fs::set_permissions(&path, fs::Permissions::from_mode(0o600)) {
+            let _ = fs::remove_file(&path);
+            return Err(EngineHostError::Io(error));
+        }
+        Ok(Self {
+            listener,
+            path,
+            auth_token: generate_control_token()?,
+        })
     }
 
     pub fn accept(&self) -> Result<EngineIpcConnection, EngineHostError> {
-        let (stream, _) = self.listener.accept()?;
+        let (mut stream, _) = self.listener.accept()?;
+        verify_control_token(&mut stream, &self.auth_token)?;
         Ok(EngineIpcConnection { stream })
     }
 
     pub fn local_path(&self) -> &Path {
         &self.path
+    }
+
+    pub fn auth_token(&self) -> &str {
+        &self.auth_token
     }
 }
 
@@ -436,14 +461,35 @@ pub struct EngineIpcClient {
 
 impl EngineIpcClient {
     pub fn connect(path: impl AsRef<Path>) -> Result<Self, EngineHostError> {
-        Ok(Self {
+        let token = std::env::var(ENGINE_HOST_TOKEN_ENV)
+            .map_err(|_| EngineHostError::MissingControlToken)?;
+        Self::connect_with_token(path, &token)
+    }
+
+    pub fn connect_with_token(
+        path: impl AsRef<Path>,
+        token: &str,
+    ) -> Result<Self, EngineHostError> {
+        let mut client = Self {
             stream: UnixStream::connect(path)?,
             next_id: 1,
-        })
+        };
+        client.authenticate(token)?;
+        Ok(client)
     }
 
     pub fn from_stream(stream: UnixStream) -> Self {
         Self { stream, next_id: 1 }
+    }
+
+    pub fn authenticate(&mut self, token: &str) -> Result<(), EngineHostError> {
+        let payload = serde_json::to_value(AuthPayload {
+            token: token.to_string(),
+        })?;
+        write_frame(
+            &mut self.stream,
+            &WireFrame::new(0, DRIVER_AUTH_METHOD, payload),
+        )
     }
 
     pub fn request(&mut self, command: DriverCommand) -> Result<DriverResponse, EngineHostError> {
@@ -820,7 +866,10 @@ fn max_screenshot_chunk_bytes() -> usize {
     chunk_bytes.max(1)
 }
 
-fn spawn_child(config: &EngineHostConfig) -> Result<Child, EngineHostError> {
+fn spawn_child(
+    config: &EngineHostConfig,
+    control_token: Option<&str>,
+) -> Result<Child, EngineHostError> {
     let mut command = Command::new(&config.program);
     command
         .args(&config.args)
@@ -829,6 +878,9 @@ fn spawn_child(config: &EngineHostConfig) -> Result<Child, EngineHostError> {
         .stderr(Stdio::null());
     if let Some(socket_path) = &config.control_socket {
         command.env(ENGINE_HOST_SOCKET_ENV, socket_path);
+    }
+    if let Some(control_token) = control_token {
+        command.env(ENGINE_HOST_TOKEN_ENV, control_token);
     }
     Ok(command.spawn()?)
 }
@@ -860,6 +912,85 @@ fn is_disconnect(error: &std::io::Error) -> bool {
             | std::io::ErrorKind::BrokenPipe
             | std::io::ErrorKind::ConnectionReset
     )
+}
+
+fn ensure_private_socket_parent(path: &Path) -> Result<(), EngineHostError> {
+    let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    else {
+        return Ok(());
+    };
+
+    match fs::metadata(parent) {
+        Ok(metadata) => validate_private_socket_directory(parent, &metadata),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(parent)?;
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+            let metadata = fs::metadata(parent)?;
+            validate_private_socket_directory(parent, &metadata)
+        }
+        Err(err) => Err(EngineHostError::Io(err)),
+    }
+}
+
+fn validate_private_socket_directory(
+    path: &Path,
+    metadata: &fs::Metadata,
+) -> Result<(), EngineHostError> {
+    if !metadata.is_dir() {
+        return Err(EngineHostError::SocketPathOccupied {
+            path: path.to_path_buf(),
+        });
+    }
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(EngineHostError::InsecureSocketDirectory {
+            path: path.to_path_buf(),
+            mode,
+        });
+    }
+    Ok(())
+}
+
+fn verify_control_token(
+    reader: &mut impl Read,
+    expected_token: &str,
+) -> Result<(), EngineHostError> {
+    let frame = read_expected_frame(reader, DRIVER_AUTH_METHOD)?;
+    let payload: AuthPayload = serde_json::from_value(frame.payload)?;
+    if !constant_time_eq(payload.token.as_bytes(), expected_token.as_bytes()) {
+        return Err(EngineHostError::ControlAuthFailed);
+    }
+    Ok(())
+}
+
+fn generate_control_token() -> Result<String, EngineHostError> {
+    let mut bytes = [0_u8; 32];
+    getrandom::fill(&mut bytes)
+        .map_err(|error| EngineHostError::ControlTokenGeneration(error.to_string()))?;
+    Ok(hex_encode(&bytes))
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    let mut diff = left.len() ^ right.len();
+    let max_len = left.len().max(right.len());
+    for index in 0..max_len {
+        let left_byte = left.get(index).copied().unwrap_or(0);
+        let right_byte = right.get(index).copied().unwrap_or(0);
+        diff |= usize::from(left_byte ^ right_byte);
+    }
+    diff == 0
 }
 
 fn remove_stale_socket(path: &Path) -> Result<(), EngineHostError> {
@@ -903,6 +1034,14 @@ pub enum EngineHostError {
     MissingControlSocketPath,
     #[error("engine host socket path is occupied by a non-socket file: {path:?}")]
     SocketPathOccupied { path: PathBuf },
+    #[error("engine host socket directory is not private: {path:?} mode {mode:o}")]
+    InsecureSocketDirectory { path: PathBuf, mode: u32 },
+    #[error("engine host control token is missing")]
+    MissingControlToken,
+    #[error("engine host control token generation failed: {0}")]
+    ControlTokenGeneration(String),
+    #[error("engine host control authentication failed")]
+    ControlAuthFailed,
     #[error("unexpected engine frame method: expected {expected}, got {actual}")]
     UnexpectedFrameMethod {
         expected: &'static str,
@@ -1208,13 +1347,14 @@ mod tests {
     fn ipc_client_and_server_round_trip_driver_command_over_uds() -> TestResult {
         let root = unique_dir("uds")?;
         remove_dir_if_exists(&root)?;
-        fs::create_dir_all(&root)?;
+        create_private_dir(&root)?;
         let socket_path = root.join("engine.sock");
         let server = EngineIpcServer::bind(&socket_path)?;
         let client_path = socket_path.clone();
+        let auth_token = server.auth_token().to_string();
 
         let handle = thread::spawn(move || -> Result<DriverResponse, EngineHostError> {
-            let mut client = EngineIpcClient::connect(client_path)?;
+            let mut client = EngineIpcClient::connect_with_token(client_path, &auth_token)?;
             client.request(DriverCommand::ObserveDiff { since_seq: 41 })
         });
 
@@ -1239,6 +1379,28 @@ mod tests {
 
         let response = join_client(handle)?;
         assert_eq!(response, DriverResponse::Diff { diff });
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn ipc_accept_rejects_wrong_control_token() -> TestResult {
+        let root = unique_dir("uds-auth")?;
+        remove_dir_if_exists(&root)?;
+        create_private_dir(&root)?;
+        let socket_path = root.join("engine.sock");
+        let server = EngineIpcServer::bind(&socket_path)?;
+        let mut stream = UnixStream::connect(&socket_path)?;
+        let payload = serde_json::to_value(AuthPayload {
+            token: "not-the-server-token".into(),
+        })?;
+        write_frame(&mut stream, &WireFrame::new(0, DRIVER_AUTH_METHOD, payload))?;
+
+        assert!(matches!(
+            server.accept(),
+            Err(EngineHostError::ControlAuthFailed)
+        ));
 
         remove_dir_if_exists(&root)?;
         Ok(())
@@ -1342,13 +1504,13 @@ mod tests {
     fn spawn_with_ipc_binds_socket_and_passes_path_to_child() -> TestResult {
         let root = unique_dir("spawn-ipc")?;
         remove_dir_if_exists(&root)?;
-        fs::create_dir_all(&root)?;
+        create_private_dir(&root)?;
         let socket_path = root.join("engine.sock");
         let marker_path = root.join("socket-env.txt");
         let config = EngineHostConfig::new("sh")
             .arg("-c")
             .arg(format!(
-                "printf '%s' \"${ENGINE_HOST_SOCKET_ENV}\" > \"$1\""
+                "printf '%s\\n%s' \"${ENGINE_HOST_SOCKET_ENV}\" \"${ENGINE_HOST_TOKEN_ENV}\" > \"$1\""
             ))
             .arg("tempo-engine-host-test")
             .arg(marker_path.to_string_lossy().to_string())
@@ -1359,10 +1521,12 @@ mod tests {
 
         assert_eq!(server.local_path(), socket_path.as_path());
         assert!(fs::symlink_metadata(&socket_path)?.file_type().is_socket());
-        assert_eq!(
-            fs::read_to_string(&marker_path)?,
-            socket_path.display().to_string()
-        );
+        let marker = fs::read_to_string(&marker_path)?;
+        let mut marker_lines = marker.lines();
+        let expected_socket = socket_path.display().to_string();
+        assert_eq!(marker_lines.next(), Some(expected_socket.as_str()));
+        assert_eq!(marker_lines.next(), Some(server.auth_token()));
+        assert_eq!(server.auth_token().len(), 64);
 
         remove_dir_if_exists(&root)?;
         Ok(())
@@ -1372,7 +1536,7 @@ mod tests {
     fn ipc_bind_rejects_non_socket_path() -> TestResult {
         let root = unique_dir("occupied")?;
         remove_dir_if_exists(&root)?;
-        fs::create_dir_all(&root)?;
+        create_private_dir(&root)?;
         let path = root.join("engine.sock");
         fs::write(&path, b"not a socket")?;
 
@@ -1380,6 +1544,44 @@ mod tests {
         assert!(matches!(
             result,
             Err(EngineHostError::SocketPathOccupied { .. })
+        ));
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn ipc_bind_creates_private_parent_and_owner_only_socket() -> TestResult {
+        let root = unique_dir("private-socket")?;
+        remove_dir_if_exists(&root)?;
+        let socket_path = root.join("nested").join("engine.sock");
+        let server = EngineIpcServer::bind(&socket_path)?;
+        let parent = socket_path
+            .parent()
+            .ok_or("socket path unexpectedly has no parent")?;
+
+        assert_eq!(fs::metadata(parent)?.permissions().mode() & 0o777, 0o700);
+        assert_eq!(
+            fs::symlink_metadata(&socket_path)?.permissions().mode() & 0o777,
+            0o600
+        );
+
+        drop(server);
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn ipc_bind_rejects_insecure_existing_parent() -> TestResult {
+        let root = unique_dir("insecure-socket")?;
+        remove_dir_if_exists(&root)?;
+        fs::create_dir_all(&root)?;
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755))?;
+        let result = EngineIpcServer::bind(root.join("engine.sock"));
+
+        assert!(matches!(
+            result,
+            Err(EngineHostError::InsecureSocketDirectory { mode: 0o755, .. })
         ));
 
         remove_dir_if_exists(&root)?;
@@ -1462,6 +1664,11 @@ mod tests {
 
     fn patterned_bytes(len: usize) -> Vec<u8> {
         (0..len).map(|index| (index % 251) as u8).collect()
+    }
+
+    fn create_private_dir(path: &Path) -> Result<(), std::io::Error> {
+        fs::create_dir_all(path)?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
     }
 
     fn remove_dir_if_exists(path: &Path) -> Result<(), std::io::Error> {
