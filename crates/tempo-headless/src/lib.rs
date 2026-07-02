@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha1::{Digest, Sha1};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::OpenOptions;
@@ -31,6 +32,13 @@ use tempo_schema::{Action, ActionBatch, CompiledObservation, NodeId, Observation
 use thiserror::Error;
 
 const MAX_HTTP_BYTES: usize = 64 * 1024;
+const MAX_WS_PAYLOAD_BYTES: u64 = MAX_HTTP_BYTES as u64;
+const WS_ACCEPT_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+const WS_OPCODE_TEXT: u8 = 0x1;
+const WS_OPCODE_BINARY: u8 = 0x2;
+const WS_OPCODE_CLOSE: u8 = 0x8;
+const WS_OPCODE_PING: u8 = 0x9;
+const WS_OPCODE_PONG: u8 = 0xA;
 
 /// Stable tempod session id.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -629,6 +637,25 @@ pub fn serve_one(listener: TcpListener, pool: Arc<Mutex<SessionPool>>) -> Result
 
 fn handle_stream(mut stream: TcpStream, pool: &Arc<Mutex<SessionPool>>) -> Result<(), TempodError> {
     let request = read_http_request(&mut stream)?;
+    match websocket_upgrade_key(&request) {
+        Ok(Some(key)) => {
+            stream.write_all(websocket_upgrade_response(&key).as_slice())?;
+            stream.flush()?;
+            return serve_bidi_websocket(stream, pool);
+        }
+        Ok(None) => {}
+        Err(err) => {
+            let response = HttpResponse::json(
+                err.status(),
+                json!({
+                    "error": err.to_string(),
+                }),
+            );
+            stream.write_all(response.to_bytes().as_slice())?;
+            stream.flush()?;
+            return Ok(());
+        }
+    }
     let response = {
         let mut pool = pool.lock().map_err(|_| TempodError::PoolLock)?;
         handle_http_request(&mut pool, request)
@@ -741,6 +768,167 @@ fn after_seq(query: Option<&str>) -> Result<Option<u64>, TempodError> {
         }
     }
     Ok(None)
+}
+
+fn websocket_upgrade_key(request: &HttpRequest) -> Result<Option<String>, TempodError> {
+    if request.method != "GET" || request.path != "/bidi" {
+        return Ok(None);
+    }
+    let upgrade = request
+        .header("upgrade")
+        .map(|value| value.eq_ignore_ascii_case("websocket"))
+        .unwrap_or(false);
+    let connection_upgrade = request
+        .header("connection")
+        .map(|value| header_has_token(value, "upgrade"))
+        .unwrap_or(false);
+    if !upgrade && !connection_upgrade && request.header("sec-websocket-key").is_none() {
+        return Ok(None);
+    }
+    if !upgrade || !connection_upgrade {
+        return Err(TempodError::BadRequest(
+            "WebSocket upgrade requires Upgrade: websocket and Connection: Upgrade".into(),
+        ));
+    }
+    if request.header("sec-websocket-version") != Some("13") {
+        return Err(TempodError::BadRequest(
+            "WebSocket upgrade requires Sec-WebSocket-Version: 13".into(),
+        ));
+    }
+    let key = request
+        .header("sec-websocket-key")
+        .filter(|key| !key.trim().is_empty())
+        .ok_or_else(|| {
+            TempodError::BadRequest("WebSocket upgrade requires Sec-WebSocket-Key".into())
+        })?;
+    Ok(Some(key.to_string()))
+}
+
+fn header_has_token(value: &str, token: &str) -> bool {
+    value
+        .split(',')
+        .any(|entry| entry.trim().eq_ignore_ascii_case(token))
+}
+
+fn websocket_upgrade_response(key: &str) -> Vec<u8> {
+    let mut hasher = Sha1::new();
+    hasher.update(key.as_bytes());
+    hasher.update(WS_ACCEPT_GUID.as_bytes());
+    let accept = base64::engine::general_purpose::STANDARD.encode(hasher.finalize());
+    format!(
+        "HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\nconnection: Upgrade\r\nsec-websocket-accept: {accept}\r\n\r\n"
+    )
+    .into_bytes()
+}
+
+fn serve_bidi_websocket(
+    mut stream: TcpStream,
+    pool: &Arc<Mutex<SessionPool>>,
+) -> Result<(), TempodError> {
+    loop {
+        let Some(frame) = read_websocket_frame(&mut stream)? else {
+            return Ok(());
+        };
+        match frame.opcode {
+            WS_OPCODE_TEXT | WS_OPCODE_BINARY => {
+                let response = {
+                    let mut pool = pool.lock().map_err(|_| TempodError::PoolLock)?;
+                    route_bidi(&mut pool, frame.payload)
+                };
+                write_websocket_frame(&mut stream, WS_OPCODE_TEXT, &response.body)?;
+            }
+            WS_OPCODE_PING => {
+                write_websocket_frame(&mut stream, WS_OPCODE_PONG, &frame.payload)?;
+            }
+            WS_OPCODE_CLOSE => {
+                write_websocket_frame(&mut stream, WS_OPCODE_CLOSE, &[])?;
+                return Ok(());
+            }
+            _ => {
+                write_websocket_frame(&mut stream, WS_OPCODE_CLOSE, &[])?;
+                return Ok(());
+            }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct WebSocketFrame {
+    opcode: u8,
+    payload: Vec<u8>,
+}
+
+fn read_websocket_frame(stream: &mut TcpStream) -> Result<Option<WebSocketFrame>, TempodError> {
+    let mut header = [0_u8; 2];
+    match stream.read_exact(&mut header) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(err) => return Err(TempodError::Io(err)),
+    }
+    let fin = header[0] & 0x80 != 0;
+    if !fin {
+        return Err(TempodError::BadRequest(
+            "fragmented websocket frames are not supported".into(),
+        ));
+    }
+    if header[1] & 0x80 == 0 {
+        return Err(TempodError::BadRequest(
+            "client websocket frames must be masked".into(),
+        ));
+    }
+    let opcode = header[0] & 0x0f;
+    let mut len = u64::from(header[1] & 0x7f);
+    if len == 126 {
+        let mut ext = [0_u8; 2];
+        stream.read_exact(&mut ext)?;
+        len = u64::from(u16::from_be_bytes(ext));
+    } else if len == 127 {
+        let mut ext = [0_u8; 8];
+        stream.read_exact(&mut ext)?;
+        len = u64::from_be_bytes(ext);
+    }
+    if len > MAX_WS_PAYLOAD_BYTES {
+        return Err(TempodError::BadRequest(
+            "websocket payload is too large".into(),
+        ));
+    }
+    let payload_len = usize::try_from(len)
+        .map_err(|err| TempodError::BadRequest(format!("invalid websocket length: {err}")))?;
+    let mut mask = [0_u8; 4];
+    stream.read_exact(&mut mask)?;
+    let mut payload = vec![0_u8; payload_len];
+    stream.read_exact(&mut payload)?;
+    for (index, byte) in payload.iter_mut().enumerate() {
+        *byte ^= mask[index % mask.len()];
+    }
+    Ok(Some(WebSocketFrame { opcode, payload }))
+}
+
+fn write_websocket_frame(
+    stream: &mut TcpStream,
+    opcode: u8,
+    payload: &[u8],
+) -> Result<(), TempodError> {
+    let mut header = vec![0x80 | (opcode & 0x0f)];
+    if payload.len() < 126 {
+        let len = u8::try_from(payload.len())
+            .map_err(|err| TempodError::BadRequest(format!("invalid websocket length: {err}")))?;
+        header.push(len);
+    } else if u16::try_from(payload.len()).is_ok() {
+        let len = u16::try_from(payload.len())
+            .map_err(|err| TempodError::BadRequest(format!("invalid websocket length: {err}")))?;
+        header.push(126);
+        header.extend_from_slice(&len.to_be_bytes());
+    } else {
+        let len = u64::try_from(payload.len())
+            .map_err(|err| TempodError::BadRequest(format!("invalid websocket length: {err}")))?;
+        header.push(127);
+        header.extend_from_slice(&len.to_be_bytes());
+    }
+    stream.write_all(&header)?;
+    stream.write_all(payload)?;
+    stream.flush()?;
+    Ok(())
 }
 
 fn route_bidi(pool: &mut SessionPool, body: Vec<u8>) -> HttpResponse {
@@ -999,12 +1187,19 @@ fn session_id_from_path(path: &str) -> Result<TempodSessionId, TempodError> {
 struct HttpRequest {
     method: String,
     path: String,
+    headers: BTreeMap<String, String>,
     host: Option<String>,
     origin: Option<String>,
     body: Vec<u8>,
 }
 
 impl HttpRequest {
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .get(&name.to_ascii_lowercase())
+            .map(String::as_str)
+    }
+
     fn base_url(&self) -> String {
         let host = self
             .host
@@ -1043,8 +1238,9 @@ fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, TempodError>
         header_end(&bytes).ok_or_else(|| TempodError::BadRequest("missing HTTP headers".into()))?;
     let headers = String::from_utf8(bytes[..header_end].to_vec())
         .map_err(|err| TempodError::BadRequest(err.to_string()))?;
-    let origin = header_value(headers.lines(), "origin");
-    let host = header_value(headers.lines(), "host");
+    let header_map = header_map(headers.lines());
+    let origin = header_map.get("origin").cloned();
+    let host = header_map.get("host").cloned();
     let mut lines = headers.lines();
     let request_line = lines
         .next()
@@ -1058,7 +1254,7 @@ fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, TempodError>
         .next()
         .ok_or_else(|| TempodError::BadRequest("missing path".into()))?
         .to_string();
-    let content_len = content_length(headers.lines())?;
+    let content_len = content_length(&header_map)?;
     let body_start = header_end + 4;
     while bytes.len() < body_start + content_len {
         let read = stream.read(&mut buf)?;
@@ -1077,6 +1273,7 @@ fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, TempodError>
     Ok(HttpRequest {
         method,
         path,
+        headers: header_map,
         host,
         origin,
         body: bytes[body_start..body_start + content_len].to_vec(),
@@ -1087,32 +1284,25 @@ fn header_end(bytes: &[u8]) -> Option<usize> {
     bytes.windows(4).position(|window| window == b"\r\n\r\n")
 }
 
-fn content_length<'a>(lines: impl Iterator<Item = &'a str>) -> Result<usize, TempodError> {
-    for line in lines {
-        if let Some((name, value)) = line.split_once(':') {
-            if name.eq_ignore_ascii_case("content-length") {
-                return value
-                    .trim()
-                    .parse()
-                    .map_err(|err: std::num::ParseIntError| {
-                        TempodError::BadRequest(err.to_string())
-                    });
-            }
-        }
-    }
-    Ok(0)
-}
-
-fn header_value<'a>(lines: impl Iterator<Item = &'a str>, target: &str) -> Option<String> {
+fn header_map<'a>(lines: impl Iterator<Item = &'a str>) -> BTreeMap<String, String> {
+    let mut headers = BTreeMap::new();
     for line in lines {
         let Some((name, value)) = line.split_once(':') else {
             continue;
         };
-        if name.eq_ignore_ascii_case(target) {
-            return Some(value.trim().to_string());
-        }
+        headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
     }
-    None
+    headers
+}
+
+fn content_length(headers: &BTreeMap<String, String>) -> Result<usize, TempodError> {
+    match headers.get("content-length") {
+        Some(value) => value
+            .trim()
+            .parse()
+            .map_err(|err: std::num::ParseIntError| TempodError::BadRequest(err.to_string())),
+        None => Ok(0),
+    }
 }
 
 #[derive(Deserialize)]
@@ -1215,7 +1405,7 @@ mod tests {
     use std::net::TcpStream;
     use std::os::unix::net::UnixStream;
     use std::thread;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tempo_agent::{IdempotencyKey, StepTripleOutcome};
     use tempo_driver::TestDriver;
     use tempo_engine_host::{
@@ -1339,6 +1529,7 @@ mod tests {
             HttpRequest {
                 method: "GET".into(),
                 path: "/sessions/session-0/events".into(),
+                headers: BTreeMap::new(),
                 host: None,
                 origin: None,
                 body: Vec::new(),
@@ -1355,6 +1546,7 @@ mod tests {
             HttpRequest {
                 method: "GET".into(),
                 path: "/sessions/session-0/events?after_seq=0".into(),
+                headers: BTreeMap::new(),
                 host: None,
                 origin: None,
                 body: Vec::new(),
@@ -1378,6 +1570,7 @@ mod tests {
             HttpRequest {
                 method: "GET".into(),
                 path: "/sessions/session-0/events?after_seq=bad".into(),
+                headers: BTreeMap::new(),
                 host: None,
                 origin: None,
                 body: Vec::new(),
@@ -1388,6 +1581,7 @@ mod tests {
             HttpRequest {
                 method: "GET".into(),
                 path: "/sessions/session-0/events".into(),
+                headers: BTreeMap::new(),
                 host: None,
                 origin: None,
                 body: Vec::new(),
@@ -1438,6 +1632,7 @@ mod tests {
             HttpRequest {
                 method: "GET".into(),
                 path: tempo_mcp::A2A_AGENT_JSON_PATH.into(),
+                headers: BTreeMap::new(),
                 host: Some("localhost:8787".into()),
                 origin: None,
                 body: Vec::new(),
@@ -1462,6 +1657,7 @@ mod tests {
             HttpRequest {
                 method: "GET".into(),
                 path: tempo_mcp::A2A_AGENT_CARD_PATH.into(),
+                headers: BTreeMap::new(),
                 host: Some("localhost/path".into()),
                 origin: None,
                 body: Vec::new(),
@@ -1482,6 +1678,7 @@ mod tests {
             HttpRequest {
                 method: "POST".into(),
                 path: "/bidi".into(),
+                headers: BTreeMap::new(),
                 host: None,
                 origin: None,
                 body: br#"{"id":1,"method":"session.status","params":{}}"#.to_vec(),
@@ -1497,6 +1694,46 @@ mod tests {
     }
 
     #[test]
+    fn bidi_websocket_upgrade_routes_immediate_protocol_command() -> TestResult {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let pool = Arc::new(Mutex::new(SessionPool::default()));
+        let handle = thread::spawn(move || serve_one(listener, pool));
+        let mut stream = TcpStream::connect(addr)?;
+        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+
+        stream.write_all(
+            b"GET /bidi HTTP/1.1\r\n\
+              host: 127.0.0.1\r\n\
+              upgrade: websocket\r\n\
+              connection: Upgrade\r\n\
+              sec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+              sec-websocket-version: 13\r\n\r\n",
+        )?;
+        let response = read_http_head(&mut stream)?;
+        assert!(response.starts_with("HTTP/1.1 101 Switching Protocols"));
+        assert!(response.contains("sec-websocket-accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo="));
+
+        stream.write_all(&masked_client_frame(
+            WS_OPCODE_TEXT,
+            br#"{"id":1,"method":"session.status","params":{}}"#,
+        )?)?;
+        let (opcode, payload) = read_server_frame(&mut stream)?;
+        assert_eq!(opcode, WS_OPCODE_TEXT);
+        let value: Value = serde_json::from_slice(&payload)?;
+        assert_eq!(value["type"], "success");
+        assert_eq!(value["id"], 1);
+        assert_eq!(value["result"]["ready"], true);
+
+        stream.write_all(&masked_client_frame(WS_OPCODE_CLOSE, &[])?)?;
+        let (opcode, payload) = read_server_frame(&mut stream)?;
+        assert_eq!(opcode, WS_OPCODE_CLOSE);
+        assert!(payload.is_empty());
+        join_server(handle)?;
+        Ok(())
+    }
+
+    #[test]
     fn bidi_endpoint_requires_driver_for_engine_commands() -> TestResult {
         let mut pool = SessionPool::default();
         let response = route_http_request(
@@ -1504,6 +1741,7 @@ mod tests {
             HttpRequest {
                 method: "POST".into(),
                 path: "/bidi".into(),
+                headers: BTreeMap::new(),
                 host: None,
                 origin: None,
                 body: br#"{"id":7,"method":"browsingContext.navigate","params":{"context":"ctx","url":"https://example.test"}}"#.to_vec(),
@@ -1537,6 +1775,7 @@ mod tests {
             HttpRequest {
                 method: "POST".into(),
                 path: "/bidi".into(),
+                headers: BTreeMap::new(),
                 host: None,
                 origin: None,
                 body: br#"{"id":7,"method":"browsingContext.navigate","params":{"context":"ctx","url":"https://example.test"}}"#.to_vec(),
@@ -1574,6 +1813,7 @@ mod tests {
             HttpRequest {
                 method: "POST".into(),
                 path: "/bidi".into(),
+                headers: BTreeMap::new(),
                 host: None,
                 origin: None,
                 body: br#"{"id":8,"method":"script.evaluate","params":{"expression":"document.title","target":{"context":"ctx"},"awaitPromise":true}}"#.to_vec(),
@@ -1606,6 +1846,7 @@ mod tests {
             HttpRequest {
                 method: "POST".into(),
                 path: "/bidi".into(),
+                headers: BTreeMap::new(),
                 host: None,
                 origin: None,
                 body: br#"{"id":1,"method":"browsingContext.create","params":{"type":"tab"}}"#
@@ -1623,6 +1864,7 @@ mod tests {
             HttpRequest {
                 method: "POST".into(),
                 path: "/bidi".into(),
+                headers: BTreeMap::new(),
                 host: None,
                 origin: None,
                 body: br#"{"id":2,"method":"browsingContext.navigate","params":{"context":"tempo-root","url":"https://root.test"}}"#.to_vec(),
@@ -1633,6 +1875,7 @@ mod tests {
             HttpRequest {
                 method: "POST".into(),
                 path: "/bidi".into(),
+                headers: BTreeMap::new(),
                 host: None,
                 origin: None,
                 body: format!(
@@ -1646,6 +1889,7 @@ mod tests {
             HttpRequest {
                 method: "POST".into(),
                 path: "/bidi".into(),
+                headers: BTreeMap::new(),
                 host: None,
                 origin: None,
                 body:
@@ -1658,6 +1902,7 @@ mod tests {
             HttpRequest {
                 method: "POST".into(),
                 path: "/bidi".into(),
+                headers: BTreeMap::new(),
                 host: None,
                 origin: None,
                 body: format!(
@@ -1697,6 +1942,7 @@ mod tests {
             HttpRequest {
                 method: "GET".into(),
                 path: "/mcp".into(),
+                headers: BTreeMap::new(),
                 host: None,
                 origin: None,
                 body: Vec::new(),
@@ -1707,6 +1953,7 @@ mod tests {
             HttpRequest {
                 method: "POST".into(),
                 path: "/mcp".into(),
+                headers: BTreeMap::new(),
                 host: None,
                 origin: None,
                 body: br#"{"jsonrpc":"2.0","id":9,"method":"tools/list"}"#.to_vec(),
@@ -1717,6 +1964,7 @@ mod tests {
             HttpRequest {
                 method: "POST".into(),
                 path: "/mcp".into(),
+                headers: BTreeMap::new(),
                 host: None,
                 origin: None,
                 body: br#"{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"handshake","arguments":{"origin":"https://mcp.test","responses":[{"path":"/mcp/catalog.json","status":200,"content_type":"application/json","body":"{\"tools\":[]}"}]}}}"#.to_vec(),
@@ -1727,6 +1975,7 @@ mod tests {
             HttpRequest {
                 method: "POST".into(),
                 path: "/mcp".into(),
+                headers: BTreeMap::new(),
                 host: None,
                 origin: None,
                 body: br#"{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"observe","arguments":{}}}"#.to_vec(),
@@ -1772,6 +2021,7 @@ mod tests {
             HttpRequest {
                 method: "POST".into(),
                 path: "/mcp".into(),
+                headers: BTreeMap::new(),
                 host: None,
                 origin: Some("http://127.0.0.1".into()),
                 body: br#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"observe","arguments":{}}}"#.to_vec(),
@@ -1935,6 +2185,66 @@ mod tests {
         Ok(response)
     }
 
+    fn read_http_head(stream: &mut TcpStream) -> Result<String, Box<dyn Error>> {
+        let mut bytes = Vec::new();
+        let mut buffer = [0_u8; 128];
+        loop {
+            let read = stream.read(&mut buffer)?;
+            if read == 0 {
+                return Err("connection closed before HTTP headers".into());
+            }
+            bytes.extend_from_slice(&buffer[..read]);
+            if header_end(&bytes).is_some() {
+                return Ok(String::from_utf8(bytes)?);
+            }
+        }
+    }
+
+    fn masked_client_frame(opcode: u8, payload: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
+        let mask = [0x37, 0xfa, 0x21, 0x3d];
+        let mut frame = vec![0x80 | (opcode & 0x0f)];
+        if payload.len() < 126 {
+            frame.push(0x80 | u8::try_from(payload.len())?);
+        } else if u16::try_from(payload.len()).is_ok() {
+            frame.push(0x80 | 126);
+            frame.extend_from_slice(&u16::try_from(payload.len())?.to_be_bytes());
+        } else {
+            frame.push(0x80 | 127);
+            frame.extend_from_slice(&u64::try_from(payload.len())?.to_be_bytes());
+        }
+        frame.extend_from_slice(&mask);
+        frame.extend(
+            payload
+                .iter()
+                .enumerate()
+                .map(|(index, byte)| byte ^ mask[index % mask.len()]),
+        );
+        Ok(frame)
+    }
+
+    fn read_server_frame(stream: &mut TcpStream) -> Result<(u8, Vec<u8>), Box<dyn Error>> {
+        let mut header = [0_u8; 2];
+        stream.read_exact(&mut header)?;
+        let opcode = header[0] & 0x0f;
+        if header[1] & 0x80 != 0 {
+            return Err("server frame must not be masked".into());
+        }
+        let mut length = u64::from(header[1] & 0x7f);
+        if length == 126 {
+            let mut extended = [0_u8; 2];
+            stream.read_exact(&mut extended)?;
+            length = u64::from(u16::from_be_bytes(extended));
+        } else if length == 127 {
+            let mut extended = [0_u8; 8];
+            stream.read_exact(&mut extended)?;
+            length = u64::from_be_bytes(extended);
+        }
+        let payload_len = usize::try_from(length)?;
+        let mut payload = vec![0_u8; payload_len];
+        stream.read_exact(&mut payload)?;
+        Ok((opcode, payload))
+    }
+
     fn join_server(
         handle: thread::JoinHandle<Result<(), TempodError>>,
     ) -> Result<(), Box<dyn Error>> {
@@ -1979,6 +2289,7 @@ mod tests {
         Ok(HttpRequest {
             method: "POST".into(),
             path: "/mcp".into(),
+            headers: BTreeMap::new(),
             host: None,
             origin: Some("http://127.0.0.1".into()),
             body: serde_json::to_vec(&json!({
