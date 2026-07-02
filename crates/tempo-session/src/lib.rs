@@ -114,6 +114,7 @@ impl SessionJournal {
         OpenOptions::new().create(true).append(true).open(&path)?;
 
         let entries = read_journal_entries(&path)?;
+        validate_journal_entries(&entries, &run_id, &session_id)?;
         let next_seq = entries
             .iter()
             .map(|entry| entry.seq)
@@ -295,6 +296,22 @@ pub enum JournalError {
         line: usize,
         source: serde_json::Error,
     },
+    #[error(
+        "journal identity mismatch at seq {seq}: expected run={expected_run:?} session={expected_session:?}, got run={actual_run:?} session={actual_session:?}"
+    )]
+    IdentityMismatch {
+        seq: u64,
+        expected_run: RunId,
+        expected_session: SessionId,
+        actual_run: RunId,
+        actual_session: SessionId,
+    },
+    #[error("journal sequence gap at entry {index}: expected seq {expected}, got {actual}")]
+    SequenceGap {
+        index: usize,
+        expected: u64,
+        actual: u64,
+    },
     #[error("system clock is before unix epoch")]
     ClockBeforeEpoch,
 }
@@ -342,6 +359,33 @@ pub fn read_cassettes(path: impl AsRef<Path>) -> Result<Vec<ResponseCassette>, J
     }
 
     Ok(cassettes)
+}
+
+fn validate_journal_entries(
+    entries: &[JournalEntry],
+    run_id: &RunId,
+    session_id: &SessionId,
+) -> Result<(), JournalError> {
+    for (index, entry) in entries.iter().enumerate() {
+        if &entry.run_id != run_id || &entry.session_id != session_id {
+            return Err(JournalError::IdentityMismatch {
+                seq: entry.seq,
+                expected_run: run_id.clone(),
+                expected_session: session_id.clone(),
+                actual_run: entry.run_id.clone(),
+                actual_session: entry.session_id.clone(),
+            });
+        }
+        let expected = index as u64;
+        if entry.seq != expected {
+            return Err(JournalError::SequenceGap {
+                index,
+                expected,
+                actual: entry.seq,
+            });
+        }
+    }
+    Ok(())
 }
 
 fn current_timestamp_ms() -> Result<u128, JournalError> {
@@ -416,6 +460,125 @@ mod tests {
             assert_eq!(resumed.next_seq, (expected_len + 1) as u64);
             assert_eq!(resumed.entries[expected_len].seq, expected_len as u64);
         }
+
+        remove_if_exists(&path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn journal_resume_matrix_survives_crash_after_each_event() -> TestResult {
+        let path = unique_path("crash-matrix")?;
+        remove_if_exists(&path)?;
+        let run_id = RunId("run-crash".into());
+        let session_id = SessionId("session-crash".into());
+        let events = crash_matrix_events();
+
+        for crash_after in 0..=events.len() {
+            remove_if_exists(&path)?;
+            {
+                let mut journal = SessionJournal::open(&path, run_id.clone(), session_id.clone())?;
+                for event in events.iter().take(crash_after).cloned() {
+                    journal.append(event)?;
+                }
+            }
+
+            let resumed = SessionJournal::resume(&path, run_id.clone(), session_id.clone())?;
+            assert_eq!(
+                resumed.entries.len(),
+                crash_after,
+                "crash_after={crash_after}"
+            );
+            assert_eq!(resumed.next_seq, crash_after as u64);
+            for (index, entry) in resumed.entries.iter().enumerate() {
+                assert_eq!(entry.seq, index as u64);
+                assert_eq!(entry.run_id, run_id);
+                assert_eq!(entry.session_id, session_id);
+            }
+
+            let mut journal = SessionJournal::open(&path, run_id.clone(), session_id.clone())?;
+            for event in events.iter().skip(crash_after).cloned() {
+                journal.append(event)?;
+            }
+            let complete = SessionJournal::resume(&path, run_id.clone(), session_id.clone())?;
+            assert_eq!(complete.entries.len(), events.len());
+            assert_eq!(complete.next_seq, events.len() as u64);
+        }
+
+        remove_if_exists(&path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn journal_rejects_resume_with_wrong_identity() -> TestResult {
+        let path = unique_path("identity-mismatch")?;
+        remove_if_exists(&path)?;
+        let mut journal = SessionJournal::open(
+            &path,
+            RunId("original-run".into()),
+            SessionId("original-session".into()),
+        )?;
+        journal.append(JournalEvent::SessionStarted {
+            url: "https://example.com".into(),
+        })?;
+
+        let result = SessionJournal::resume(
+            &path,
+            RunId("different-run".into()),
+            SessionId("original-session".into()),
+        );
+        assert!(matches!(result, Err(JournalError::IdentityMismatch { .. })));
+
+        let result = SessionJournal::open(
+            &path,
+            RunId("original-run".into()),
+            SessionId("different-session".into()),
+        );
+        assert!(matches!(result, Err(JournalError::IdentityMismatch { .. })));
+
+        remove_if_exists(&path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn journal_rejects_sequence_gaps_on_resume() -> TestResult {
+        let path = unique_path("sequence-gap")?;
+        remove_if_exists(&path)?;
+        let run_id = RunId("run-gap".into());
+        let session_id = SessionId("session-gap".into());
+
+        write_entry(
+            &path,
+            JournalEntry {
+                schema_version: tempo_schema::SCHEMA_VERSION.into(),
+                run_id: run_id.clone(),
+                session_id: session_id.clone(),
+                seq: 0,
+                timestamp_ms: 1,
+                event: JournalEvent::SessionStarted {
+                    url: "https://example.com".into(),
+                },
+            },
+        )?;
+        write_entry(
+            &path,
+            JournalEntry {
+                schema_version: tempo_schema::SCHEMA_VERSION.into(),
+                run_id: run_id.clone(),
+                session_id: session_id.clone(),
+                seq: 2,
+                timestamp_ms: 2,
+                event: JournalEvent::SessionClosed,
+            },
+        )?;
+
+        assert!(matches!(
+            SessionJournal::resume(&path, run_id, session_id),
+            Err(JournalError::SequenceGap {
+                index: 1,
+                expected: 1,
+                actual: 2,
+            })
+        ));
 
         remove_if_exists(&path)?;
         Ok(())
@@ -548,5 +711,52 @@ mod tests {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(err) => Err(err),
         }
+    }
+
+    fn crash_matrix_events() -> Vec<JournalEvent> {
+        vec![
+            JournalEvent::SessionStarted {
+                url: "https://example.com".into(),
+            },
+            JournalEvent::Observation {
+                observation: CompiledObservation {
+                    schema_version: tempo_schema::SCHEMA_VERSION.into(),
+                    url: "https://example.com".into(),
+                    seq: 0,
+                    elements: vec![],
+                    marks: vec![],
+                },
+            },
+            JournalEvent::ActionPlanned {
+                action: Action::Click {
+                    node: NodeId("button.checkout".into()),
+                },
+            },
+            JournalEvent::StepApplied {
+                action: Action::Click {
+                    node: NodeId("button.checkout".into()),
+                },
+                diff: ObservationDiff {
+                    since_seq: 0,
+                    seq: 1,
+                    added: vec![],
+                    removed: vec![],
+                    changed: vec![],
+                },
+            },
+            JournalEvent::CassetteRecorded {
+                key: CassetteKey("checkout-response".into()),
+            },
+            JournalEvent::SessionClosed,
+        ]
+    }
+
+    fn write_entry(path: &Path, entry: JournalEntry) -> Result<(), JournalError> {
+        let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+        serde_json::to_writer(&mut file, &entry)?;
+        file.write_all(b"\n")?;
+        file.flush()?;
+        file.sync_data()?;
+        Ok(())
     }
 }
