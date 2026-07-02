@@ -361,16 +361,12 @@ impl DriverTrait for CdpTempoDriver {
     }
 
     async fn extract(&mut self, node: &NodeId) -> Result<serde_json::Value, TransportError> {
-        match self
-            .run_one(&Action::Extract { node: node.clone() })
-            .await?
-        {
-            StepOutcome::Applied { .. } => Ok(serde_json::json!({ "selector": node.0 })),
-            StepOutcome::StepError { reason } => Ok(serde_json::json!({
-                "selector": node.0,
-                "error": reason,
-            })),
-        }
+        self.page
+            .evaluate(extraction_script(&node.0)?)
+            .await
+            .map_err(map_cdp_error)?
+            .into_value::<serde_json::Value>()
+            .map_err(|error| TransportError::Other(error.to_string()))
     }
 
     async fn screenshot(&mut self) -> Result<Vec<u8>, TransportError> {
@@ -486,6 +482,129 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     hash
+}
+
+fn extraction_script(selector: &str) -> Result<String, TransportError> {
+    let selector_json = serde_json::to_string(selector)
+        .map_err(|error| TransportError::Other(error.to_string()))?;
+    Ok(format!(
+        r#"(() => {{
+  const selector = {selector_json};
+  function compact(value, max) {{
+    return String(value || '').replace(/\s+/g, ' ').trim().slice(0, max);
+  }}
+  function ownText(element) {{
+    return Array.from(element.childNodes)
+      .filter((node) => node.nodeType === Node.TEXT_NODE)
+      .map((node) => node.textContent || '')
+      .join(' ');
+  }}
+  function formLabels(element) {{
+    if (!element.labels) {{
+      return '';
+    }}
+    return Array.from(element.labels)
+      .map((label) => compact(label.textContent, 256))
+      .filter(Boolean)
+      .join(' ');
+  }}
+  function inferredRole(element) {{
+    const explicit = element.getAttribute('role');
+    if (explicit) {{
+      return explicit;
+    }}
+    const tag = element.tagName.toLowerCase();
+    if (tag === 'a' && element.hasAttribute('href')) {{
+      return 'link';
+    }}
+    if (tag === 'button') {{
+      return 'button';
+    }}
+    if (tag === 'select') {{
+      return 'combobox';
+    }}
+    if (tag === 'textarea') {{
+      return 'textbox';
+    }}
+    if (tag === 'input') {{
+      const type = (element.getAttribute('type') || 'text').toLowerCase();
+      if (type === 'checkbox') {{
+        return 'checkbox';
+      }}
+      if (type === 'radio') {{
+        return 'radio';
+      }}
+      if (type === 'submit' || type === 'button') {{
+        return 'button';
+      }}
+      return 'textbox';
+    }}
+    return tag;
+  }}
+  function accessibleName(element) {{
+    return compact(
+      element.getAttribute('aria-label') ||
+      element.getAttribute('title') ||
+      element.getAttribute('alt') ||
+      element.getAttribute('placeholder') ||
+      formLabels(element) ||
+      ownText(element) ||
+      element.textContent,
+      512
+    );
+  }}
+  function attributes(element) {{
+    const names = ['id', 'name', 'type', 'href', 'role', 'aria-label', 'title', 'placeholder', 'value', 'data-testid'];
+    const output = {{}};
+    for (const name of names) {{
+      if (element.hasAttribute(name)) {{
+        output[name] = element.getAttribute(name);
+      }}
+    }}
+    return output;
+  }}
+  function serialize(element, depth) {{
+    const children = depth >= 2
+      ? []
+      : Array.from(element.children)
+          .slice(0, 25)
+          .map((child) => serialize(child, depth + 1));
+    return {{
+      tag: element.tagName.toLowerCase(),
+      role: inferredRole(element),
+      name: accessibleName(element),
+      text: compact(element.innerText || element.textContent, 4096),
+      value: 'value' in element ? String(element.value) : null,
+      attributes: attributes(element),
+      visible: Boolean(element.offsetWidth || element.offsetHeight || element.getClientRects().length),
+      enabled: !Boolean(element.disabled),
+      children,
+    }};
+  }}
+  let root = null;
+  try {{
+    root = document.querySelector(selector);
+  }} catch (error) {{
+    return {{
+      selector,
+      found: false,
+      error: `invalid selector: ${{error && error.message ? error.message : error}}`,
+    }};
+  }}
+  if (!root) {{
+    return {{
+      selector,
+      found: false,
+      error: 'selector not found',
+    }};
+  }}
+  return {{
+    selector,
+    found: true,
+    node: serialize(root, 0),
+  }};
+}})()"#
+    ))
 }
 
 fn compile_observation(url: String, dom_html: String, seq: u64) -> CompiledObservation {
@@ -891,6 +1010,18 @@ mod tests {
     }
 
     #[test]
+    fn extraction_script_json_encodes_selector() -> Result<(), Box<dyn std::error::Error>> {
+        let selector = "[id=\"save\"]";
+        let script = extraction_script(selector)?;
+        let encoded = serde_json::to_string(selector)?;
+
+        assert!(script.contains(&format!("const selector = {encoded};")));
+        assert!(script.contains("document.querySelector(selector)"));
+        assert!(script.contains("serialize(root, 0)"));
+        Ok(())
+    }
+
+    #[test]
     fn blocks_private_navigation_by_default() {
         for url in [
             "http://127.0.0.1",
@@ -941,6 +1072,14 @@ mod tests {
         let screenshot = driver.screenshot().await?;
         assert!(screenshot.starts_with(b"\x89PNG\r\n\x1a\n"));
 
+        let extracted = driver.extract(&NodeId("[id=\"save\"]".into())).await?;
+        assert_eq!(extracted["selector"], "[id=\"save\"]");
+        assert_eq!(extracted["found"], true);
+        assert_eq!(extracted["node"]["tag"], "button");
+        assert_eq!(extracted["node"]["role"], "button");
+        assert_eq!(extracted["node"]["name"], "Save");
+        assert_eq!(extracted["node"]["attributes"]["id"], "save");
+
         driver.close().await?;
         Ok(())
     }
@@ -953,7 +1092,9 @@ mod tests {
             let body = r#"<!doctype html>
                 <html>
                   <body>
-                    <button id="save" onclick="document.body.dataset.clicked='yes'">Save</button>
+                    <button id="save" onclick="document.body.dataset.clicked='yes'">
+                      <span>Save</span>
+                    </button>
                   </body>
                 </html>"#;
             for stream in listener.incoming().take(16) {
