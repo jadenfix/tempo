@@ -37,6 +37,8 @@ jobs:
         run: cargo check --workspace --all-targets
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings -D clippy::unwrap_used -D clippy::expect_used
+      - name: servo public API boundary
+        run: bash scripts/check-servo-public-api.sh
       - name: cargo test (contracts + conformance)
         run: cargo test --workspace
       - name: cargo test (live CDP conformance)
