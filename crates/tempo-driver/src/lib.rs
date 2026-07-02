@@ -60,23 +60,20 @@ pub trait DriverTrait: Send + Sync {
     async fn observe(&mut self) -> Result<CompiledObservation, TransportError>;
 
     /// Diff-based re-observation: only what changed since `since_seq` (final.md §2.3).
-    async fn observe_diff(&mut self, since_seq: u64)
-        -> Result<ObservationDiff, TransportError>;
+    async fn observe_diff(&mut self, since_seq: u64) -> Result<ObservationDiff, TransportError>;
 
     /// Execute a single semantic action.
     async fn act(&mut self, action: &Action) -> Result<StepOutcome, TransportError>;
 
     /// Execute a batch and wait for the page to settle per the batch's quiescence policy.
-    async fn act_batch(&mut self, batch: &ActionBatch)
-        -> Result<StepOutcome, TransportError>;
+    async fn act_batch(&mut self, batch: &ActionBatch) -> Result<StepOutcome, TransportError>;
 
     /// Fork page state for speculative k-branch exploration (final.md §2.5). Engines that
     /// cannot fork natively return `Unsupported`; `tempo-speculate` falls back to replay-fork.
     async fn fork(&mut self) -> Result<Box<dyn DriverTrait>, Unsupported>;
 
     /// Typed extraction of a subtree rooted at `node`.
-    async fn extract(&mut self, node: &NodeId)
-        -> Result<serde_json::Value, TransportError>;
+    async fn extract(&mut self, node: &NodeId) -> Result<serde_json::Value, TransportError>;
 
     async fn screenshot(&mut self) -> Result<Vec<u8>, TransportError>;
 
@@ -93,7 +90,11 @@ pub struct MockDriver {
 
 impl MockDriver {
     pub fn new() -> Self {
-        Self { seq: 0, url: "about:blank".into(), elements: Vec::new() }
+        Self {
+            seq: 0,
+            url: "about:blank".into(),
+            elements: Vec::new(),
+        }
     }
 
     /// Seed the mock page with elements so tests can plan actions against known NodeIds.
@@ -139,9 +140,7 @@ impl DriverTrait for MockDriver {
         Ok(self.snapshot())
     }
 
-    async fn observe_diff(&mut self, since_seq: u64)
-        -> Result<ObservationDiff, TransportError>
-    {
+    async fn observe_diff(&mut self, since_seq: u64) -> Result<ObservationDiff, TransportError> {
         Ok(ObservationDiff {
             since_seq,
             seq: self.seq,
@@ -161,7 +160,9 @@ impl DriverTrait for MockDriver {
             _ => false,
         };
         if missing {
-            return Ok(StepOutcome::StepError { reason: "node not found".into() });
+            return Ok(StepOutcome::StepError {
+                reason: "node not found".into(),
+            });
         }
         self.seq += 1;
         Ok(StepOutcome::Applied {
@@ -175,11 +176,15 @@ impl DriverTrait for MockDriver {
         })
     }
 
-    async fn act_batch(&mut self, batch: &ActionBatch)
-        -> Result<StepOutcome, TransportError>
-    {
+    async fn act_batch(&mut self, batch: &ActionBatch) -> Result<StepOutcome, TransportError> {
         let mut last = StepOutcome::Applied {
-            diff: ObservationDiff { since_seq: self.seq, seq: self.seq, added: vec![], removed: vec![], changed: vec![] },
+            diff: ObservationDiff {
+                since_seq: self.seq,
+                seq: self.seq,
+                added: vec![],
+                removed: vec![],
+                changed: vec![],
+            },
         };
         for a in &batch.actions {
             last = self.act(a).await?;
@@ -199,9 +204,7 @@ impl DriverTrait for MockDriver {
         Ok(Box::new(forked))
     }
 
-    async fn extract(&mut self, node: &NodeId)
-        -> Result<serde_json::Value, TransportError>
-    {
+    async fn extract(&mut self, node: &NodeId) -> Result<serde_json::Value, TransportError> {
         if !self.has_node(node) {
             return Ok(serde_json::Value::Null);
         }
@@ -223,26 +226,34 @@ pub mod conformance {
     use super::*;
 
     /// Runs the portable conformance checks against any driver. Returns `Ok(())` on pass.
-    pub async fn assert_driver_conformance<D: DriverTrait>(driver: &mut D)
-        -> Result<(), String>
-    {
+    pub async fn assert_driver_conformance<D: DriverTrait>(driver: &mut D) -> Result<(), String> {
         // 1. goto returns an observation carrying the frozen schema version.
-        let obs = driver.goto("https://example.com").await.map_err(|e| e.to_string())?;
+        let obs = driver
+            .goto("https://example.com")
+            .await
+            .map_err(|e| e.to_string())?;
         if obs.schema_version != tempo_schema::SCHEMA_VERSION {
             return Err("schema version mismatch".into());
         }
 
         // 2. Grounding contract: acting on an unknown node is a StepError, NOT a transport error.
         let out = driver
-            .act(&Action::Click { node: NodeId("does-not-exist".into()) })
+            .act(&Action::Click {
+                node: NodeId("does-not-exist".into()),
+            })
             .await
-            .map_err(|_| "grounding miss surfaced as TransportError (contract violation)".to_string())?;
+            .map_err(|_| {
+                "grounding miss surfaced as TransportError (contract violation)".to_string()
+            })?;
         if !matches!(out, StepOutcome::StepError { .. }) {
             return Err("missing node did not yield StepError".into());
         }
 
         // 3. observe_diff is expressed relative to the requested seq.
-        let diff = driver.observe_diff(obs.seq).await.map_err(|e| e.to_string())?;
+        let diff = driver
+            .observe_diff(obs.seq)
+            .await
+            .map_err(|e| e.to_string())?;
         if diff.since_seq != obs.seq {
             return Err("observe_diff ignored since_seq".into());
         }
@@ -262,7 +273,9 @@ mod tests {
         fn block_on<F: std::future::Future>(mut f: F) -> F::Output {
             use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
             fn noop(_: *const ()) {}
-            fn clone(_: *const ()) -> RawWaker { RawWaker::new(std::ptr::null(), &VT) }
+            fn clone(_: *const ()) -> RawWaker {
+                RawWaker::new(std::ptr::null(), &VT)
+            }
             static VT: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
             let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VT)) };
             let mut cx = Context::from_waker(&waker);
