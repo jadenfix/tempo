@@ -5,6 +5,27 @@ on:
   pull_request:
 
 jobs:
+  pr-scope:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require agent and purpose in PR body
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          if ! printf '%s\n' "$PR_BODY" | grep -Eiq '(^|[[:space:]])1\.\)[[:space:]]*agent[[:space:]]+[0-9]+'; then
+            echo 'PR body must include: 1.) agent {agent number}'
+            exit 1
+          fi
+          if ! printf '%s\n' "$PR_BODY" | grep -Eiq '(^|[[:space:]])2\.\)[[:space:]]*purpose:[[:space:]]*.+'; then
+            echo 'PR body must include: 2.) purpose: {purpose}'
+            exit 1
+          fi
+          if printf '%s\n' "$PR_BODY" | grep -Eiq '(^|[[:space:]])2\.\)[[:space:]]*purpose:[[:space:]]*\{purpose\}[[:space:]]*($|[[:space:]])'; then
+            echo 'PR body must replace the purpose placeholder'
+            exit 1
+          fi
+
   check:
     runs-on: ubuntu-latest
     steps:
