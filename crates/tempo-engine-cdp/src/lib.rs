@@ -427,7 +427,11 @@ fn enforce_url_policy(url: &str, allow_private_networks: bool) -> Result<(), Tra
 
     let parsed = url::Url::parse(url)
         .map_err(|error| TransportError::Other(format!("invalid URL: {error}")))?;
-    if matches!(parsed.scheme(), "file" | "ftp") {
+    // Scheme allowlist (parity with tempo-net's `UrlPolicy::check`): only
+    // `http`/`https` may pass. A denylist misses opaque schemes such as
+    // `view-source:http://169.254.169.254/`, whose host parses as `None` and
+    // would otherwise be waved through.
+    if !matches!(parsed.scheme(), "http" | "https") {
         return Err(TransportError::UrlBlocked);
     }
     // Use the typed `Host` enum rather than `host_str()`. For IPv6 literals
@@ -437,10 +441,8 @@ fn enforce_url_policy(url: &str, allow_private_networks: bool) -> Result<(), Tra
     // through the guard entirely (issue #81).
     match parsed.host() {
         Some(url::Host::Domain(domain)) => {
-            if domain
-                .trim_end_matches('.')
-                .eq_ignore_ascii_case("localhost")
-            {
+            let domain = domain.trim_end_matches('.').to_ascii_lowercase();
+            if domain == "localhost" || domain.ends_with(".localhost") {
                 return Err(TransportError::UrlBlocked);
             }
         }
@@ -454,7 +456,9 @@ fn enforce_url_policy(url: &str, allow_private_networks: bool) -> Result<(), Tra
                 return Err(TransportError::UrlBlocked);
             }
         }
-        None => return Ok(()),
+        // An `http`/`https` URL with no host is malformed for navigation;
+        // block rather than allow.
+        None => return Err(TransportError::UrlBlocked),
     }
     Ok(())
 }
@@ -468,7 +472,10 @@ fn is_blocked_ip(ip: IpAddr) -> bool {
                 || ip.is_link_local()
                 || ip.is_broadcast()
                 || ip.is_documentation()
-                || ip.is_unspecified()
+                // Block the entire 0.0.0.0/8 (parity with tempo-net's
+                // `blocked_ipv4_reason`), not just the 0.0.0.0 unspecified
+                // address: `http://0.1.2.3/` must not slip through.
+                || octets[0] == 0
                 || ip.is_multicast()
                 // Carrier-grade NAT 100.64.0.0/10.
                 || (octets[0] == 100 && (64..=127).contains(&octets[1]))
@@ -1188,6 +1195,7 @@ mod tests {
         for url in [
             "http://127.0.0.1",
             "http://localhost",
+            "https://app.localhost/path",
             "http://10.0.0.1",
             "http://169.254.169.254/latest/meta-data",
             "file:///etc/passwd",
@@ -1241,6 +1249,47 @@ mod tests {
                 "expected URL policy block for {url}"
             );
         }
+    }
+
+    #[test]
+    fn blocks_non_http_schemes_via_allowlist() {
+        // GAP A: opaque / non-http(s) schemes must be blocked. Previously the
+        // denylist only caught `file`/`ftp`, and schemes whose host parses as
+        // `None` (e.g. `view-source:...`) were waved through.
+        for url in [
+            "view-source:http://169.254.169.254/",
+            "data:text/html,<h1>hi</h1>",
+            "javascript:alert(1)",
+            "file:///etc/passwd",
+            "ftp://example.com/",
+        ] {
+            assert!(
+                matches!(
+                    enforce_url_policy(url, false),
+                    Err(TransportError::UrlBlocked)
+                ),
+                "expected URL policy block for {url}"
+            );
+        }
+        // http/https remain allowed.
+        assert!(enforce_url_policy("http://example.com", false).is_ok());
+        assert!(enforce_url_policy("https://example.com", false).is_ok());
+    }
+
+    #[test]
+    fn blocks_full_zero_ipv4_block() {
+        // GAP B: the whole 0.0.0.0/8 must be blocked, not just 0.0.0.0.
+        for url in ["http://0.0.0.0/", "http://0.1.2.3/"] {
+            assert!(
+                matches!(
+                    enforce_url_policy(url, false),
+                    Err(TransportError::UrlBlocked)
+                ),
+                "expected URL policy block for {url}"
+            );
+        }
+        // A normal public IP is still permitted.
+        assert!(enforce_url_policy("http://93.184.216.34/", false).is_ok());
     }
 
     #[tokio::test]
