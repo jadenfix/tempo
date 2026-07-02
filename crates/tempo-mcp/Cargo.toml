@@ -13,11 +13,11 @@ tempo-observe = { path = "../tempo-observe" }
 tempo-schema = { path = "../tempo-schema" }
 tempo-driver = { path = "../tempo-driver" }
 thiserror.workspace = true
-tokio = { version = "1", features = ["rt"] }
 url = "2"
 
 [dev-dependencies]
 async-trait.workspace = true
+futures = "0.3"
 tempo-net = { path = "../tempo-net" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
