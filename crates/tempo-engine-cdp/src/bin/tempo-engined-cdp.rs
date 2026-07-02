@@ -28,9 +28,9 @@ async fn run() -> Result<(), String> {
     let mut driver = CdpTempoDriver::launch_with(config)
         .await
         .map_err(|error| error.to_string())?;
-    let mut connection =
+    let connection =
         EngineIpcConnection::connect(socket_path).map_err(|error| error.to_string())?;
-    serve_driver_connection(&mut connection, &mut driver)
+    serve_driver_connection(connection, &mut driver)
         .await
         .map_err(|error| error.to_string())
 }

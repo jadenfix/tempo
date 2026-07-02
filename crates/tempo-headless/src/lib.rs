@@ -1963,9 +1963,9 @@ mod tests {
     fn bidi_websocket_subscription_emits_browsing_context_load_event() -> TestResult {
         let (client_stream, server_stream) = UnixStream::pair()?;
         let server = thread::spawn(move || {
-            let mut connection = EngineIpcConnection::from_stream(server_stream);
+            let connection = EngineIpcConnection::from_stream(server_stream);
             let mut driver = TestDriver::new();
-            futures::executor::block_on(serve_driver_connection(&mut connection, &mut driver))
+            futures::executor::block_on(serve_driver_connection(connection, &mut driver))
         });
 
         let listener = TcpListener::bind("127.0.0.1:0")?;
@@ -2132,9 +2132,9 @@ mod tests {
     fn bidi_endpoint_routes_create_context_and_preserves_independent_context_state() -> TestResult {
         let (client_stream, server_stream) = UnixStream::pair()?;
         let server = thread::spawn(move || {
-            let mut connection = EngineIpcConnection::from_stream(server_stream);
+            let connection = EngineIpcConnection::from_stream(server_stream);
             let mut driver = TestDriver::new();
-            futures::executor::block_on(serve_driver_connection(&mut connection, &mut driver))
+            futures::executor::block_on(serve_driver_connection(connection, &mut driver))
         });
         let mut pool = SessionPool::default();
         pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
@@ -2393,9 +2393,9 @@ mod tests {
     fn mcp_endpoint_persists_fork_driver_ids_across_posts() -> TestResult {
         let (client_stream, server_stream) = UnixStream::pair()?;
         let server = thread::spawn(move || -> Result<(), EngineHostError> {
-            let mut connection = EngineIpcConnection::from_stream(server_stream);
+            let connection = EngineIpcConnection::from_stream(server_stream);
             let mut driver = TestDriver::new();
-            futures::executor::block_on(serve_driver_connection(&mut connection, &mut driver))
+            futures::executor::block_on(serve_driver_connection(connection, &mut driver))
         });
         let mut pool = SessionPool::default();
         pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
@@ -2527,9 +2527,9 @@ mod tests {
         let engine_closes = Arc::clone(&closes);
         let (client_stream, server_stream) = UnixStream::pair()?;
         let server = thread::spawn(move || -> Result<(), EngineHostError> {
-            let mut connection = EngineIpcConnection::from_stream(server_stream);
+            let connection = EngineIpcConnection::from_stream(server_stream);
             let mut driver = CloseCountingDriver::new(engine_closes);
-            futures::executor::block_on(serve_driver_connection(&mut connection, &mut driver))
+            futures::executor::block_on(serve_driver_connection(connection, &mut driver))
         });
 
         let mut pool = SessionPool::default();
@@ -2565,9 +2565,9 @@ mod tests {
     fn attached_engine_driver_fork_routes_to_forked_handle() -> TestResult {
         let (client_stream, server_stream) = UnixStream::pair()?;
         let server = thread::spawn(move || -> Result<(), EngineHostError> {
-            let mut connection = EngineIpcConnection::from_stream(server_stream);
+            let connection = EngineIpcConnection::from_stream(server_stream);
             let mut driver = TestDriver::new();
-            futures::executor::block_on(serve_driver_connection(&mut connection, &mut driver))
+            futures::executor::block_on(serve_driver_connection(connection, &mut driver))
         });
         let mut root_driver =
             AttachedEngineDriver::new(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
@@ -2804,9 +2804,9 @@ mod tests {
     fn bidi_create_context_is_capped() -> TestResult {
         let (client_stream, server_stream) = UnixStream::pair()?;
         let server = thread::spawn(move || {
-            let mut connection = EngineIpcConnection::from_stream(server_stream);
+            let connection = EngineIpcConnection::from_stream(server_stream);
             let mut driver = TestDriver::new();
-            futures::executor::block_on(serve_driver_connection(&mut connection, &mut driver))
+            futures::executor::block_on(serve_driver_connection(connection, &mut driver))
         });
         let mut pool = SessionPool::default();
         pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
@@ -2841,9 +2841,9 @@ mod tests {
     fn bidi_close_removes_context_and_releases_driver() -> TestResult {
         let (client_stream, server_stream) = UnixStream::pair()?;
         let server = thread::spawn(move || {
-            let mut connection = EngineIpcConnection::from_stream(server_stream);
+            let connection = EngineIpcConnection::from_stream(server_stream);
             let mut driver = TestDriver::new();
-            futures::executor::block_on(serve_driver_connection(&mut connection, &mut driver))
+            futures::executor::block_on(serve_driver_connection(connection, &mut driver))
         });
         let mut pool = SessionPool::default();
         pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));

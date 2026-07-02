@@ -579,8 +579,25 @@ impl EngineIpcConnection {
 
 /// Execute driver requests from a connected UDS stream until the peer disconnects
 /// or a `Close` command is handled.
+///
+/// `EngineIpcConnection` speaks a synchronous, blocking frame protocol over a
+/// `std::os::unix::net::UnixStream`. The real production caller
+/// (`tempo-engined-cdp`) drives this future under `#[tokio::main]`, so reading
+/// the next command frame or writing a response directly on the async worker
+/// would block a tokio worker thread for the whole time the daemon waits on the
+/// peer (issue #101). The blocking frame I/O is therefore offloaded to the
+/// dedicated blocking pool when a tokio runtime is present. Tests (and other
+/// callers) drive this via `futures::executor::block_on` with *no* tokio
+/// runtime, where `spawn_blocking` would panic — there the blocking call runs
+/// inline, which is correct because that executor is already a plain blocking
+/// thread. The runtime-detection pattern mirrors
+/// `tempo_engine_servo::ServoIpcDriver::request`.
+///
+/// The connection is taken by value because `spawn_blocking` needs a
+/// `Send + 'static` owned handle; each offloaded step moves the connection into
+/// the blocking task and returns it back out (own-and-return).
 pub async fn serve_driver_connection<D>(
-    connection: &mut EngineIpcConnection,
+    mut connection: EngineIpcConnection,
     driver: &mut D,
 ) -> Result<(), EngineHostError>
 where
@@ -590,11 +607,17 @@ where
     let mut next_fork_id = 1_u64;
 
     loop {
-        let request = match connection.read_driver_request() {
-            Ok(request) => request,
-            Err(EngineHostError::Io(err)) if is_disconnect(&err) => return Ok(()),
-            Err(err) => return Err(err),
-        };
+        let request =
+            match offload_connection_io(connection, |connection| connection.read_driver_request())
+                .await
+            {
+                Ok((returned, request)) => {
+                    connection = returned;
+                    request
+                }
+                Err(EngineHostError::Io(err)) if is_disconnect(&err) => return Ok(()),
+                Err(err) => return Err(err),
+            };
         let should_close_root =
             request.driver_id.is_none() && matches!(request.command, DriverCommand::Close);
         let response = execute_routed_driver_command(
@@ -605,9 +628,40 @@ where
             request.command,
         )
         .await;
-        connection.write_driver_response(request.id, response)?;
+        let request_id = request.id;
+        connection = offload_connection_io(connection, move |connection| {
+            connection.write_driver_response(request_id, response)
+        })
+        .await?
+        .0;
         if should_close_root {
             return Ok(());
+        }
+    }
+}
+
+/// Run one blocking frame operation on `connection` without stalling the async
+/// runtime, returning the connection so the caller can keep serving.
+///
+/// When a tokio runtime is present the blocking op is moved to the blocking pool
+/// via `spawn_blocking`; with no runtime (`futures::executor::block_on`) it runs
+/// inline, because calling `spawn_blocking` there would panic.
+async fn offload_connection_io<T, F>(
+    mut connection: EngineIpcConnection,
+    op: F,
+) -> Result<(EngineIpcConnection, T), EngineHostError>
+where
+    F: FnOnce(&mut EngineIpcConnection) -> Result<T, EngineHostError> + Send + 'static,
+    T: Send + 'static,
+{
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => handle
+            .spawn_blocking(move || op(&mut connection).map(|value| (connection, value)))
+            .await
+            .map_err(|error| EngineHostError::Io(std::io::Error::other(error.to_string())))?,
+        Err(_) => {
+            let value = op(&mut connection)?;
+            Ok((connection, value))
         }
     }
 }
@@ -1443,7 +1497,7 @@ mod tests {
     #[test]
     fn serve_driver_connection_executes_driver_commands_over_socket_pair() -> TestResult {
         let (client_stream, server_stream) = UnixStream::pair()?;
-        let mut connection = EngineIpcConnection::from_stream(server_stream);
+        let connection = EngineIpcConnection::from_stream(server_stream);
         let handle = thread::spawn(
             move || -> Result<(DriverResponse, DriverResponse, DriverResponse), EngineHostError> {
                 let mut client = EngineIpcClient::from_stream(client_stream);
@@ -1460,7 +1514,7 @@ mod tests {
         );
         let mut driver = TestDriver::new();
 
-        futures::executor::block_on(serve_driver_connection(&mut connection, &mut driver))?;
+        futures::executor::block_on(serve_driver_connection(connection, &mut driver))?;
         let (observed, evaluated, closed) = join_client_triple(handle)?;
 
         match observed {
@@ -1486,7 +1540,7 @@ mod tests {
     #[test]
     fn serve_driver_connection_routes_forked_driver_handles() -> TestResult {
         let (client_stream, server_stream) = UnixStream::pair()?;
-        let mut connection = EngineIpcConnection::from_stream(server_stream);
+        let connection = EngineIpcConnection::from_stream(server_stream);
         let handle = thread::spawn(move || -> Result<ForkClientResponses, EngineHostError> {
             let mut client = EngineIpcClient::from_stream(client_stream);
             let root_goto = client.request(DriverCommand::Goto {
@@ -1520,7 +1574,7 @@ mod tests {
         });
         let mut driver = TestDriver::new();
 
-        futures::executor::block_on(serve_driver_connection(&mut connection, &mut driver))?;
+        futures::executor::block_on(serve_driver_connection(connection, &mut driver))?;
         let (driver_id, root_goto, fork_goto, root_observe, fork_observe, fork_close, root_close) =
             join_fork_client(handle)?;
 
@@ -1531,6 +1585,62 @@ mod tests {
         assert_observation_response(fork_observe, "https://fork.test", 2)?;
         assert_eq!(fork_close, DriverResponse::Closed);
         assert_eq!(root_close, DriverResponse::Closed);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn serve_driver_connection_offloads_blocking_frame_io_on_current_thread_runtime(
+    ) -> TestResult {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{mpsc, Arc};
+
+        let (client_stream, server_stream) = UnixStream::pair()?;
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+
+        // The client runs on its own OS thread and refuses to send its first
+        // request until it receives a release signal. That signal is produced
+        // only by a *second* task sharing the single-threaded tokio runtime with
+        // the server. If `serve_driver_connection` performed its blocking
+        // `read_driver_request` inline on the runtime's only worker, that second
+        // task could never run, the release would never fire, and the whole test
+        // would deadlock. Offloading the blocking frame I/O via `spawn_blocking`
+        // frees the worker so both make progress (regression guard for #101).
+        let client = thread::spawn(
+            move || -> Result<(DriverResponse, DriverResponse), EngineHostError> {
+                let mut client = EngineIpcClient::from_stream(client_stream);
+                release_rx
+                    .recv()
+                    .map_err(|error| EngineHostError::Io(io::Error::other(error.to_string())))?;
+                let observed = client.request(DriverCommand::Goto {
+                    url: "https://engine.test".into(),
+                })?;
+                let closed = client.request(DriverCommand::Close)?;
+                Ok((observed, closed))
+            },
+        );
+
+        let connection = EngineIpcConnection::from_stream(server_stream);
+        let mut driver = TestDriver::new();
+
+        let ran_concurrently = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&ran_concurrently);
+        let releaser = async move {
+            flag.store(true, Ordering::SeqCst);
+            // Release the (otherwise blocked) client now that concurrency is proven.
+            let _ = release_tx.send(());
+        };
+
+        let (serve_result, ()) =
+            tokio::join!(serve_driver_connection(connection, &mut driver), releaser);
+        serve_result?;
+
+        let (observed, closed) = match client.join() {
+            Ok(result) => result?,
+            Err(_) => return Err("client thread panicked".into()),
+        };
+        assert!(ran_concurrently.load(Ordering::SeqCst));
+        assert_observation_response(observed, "https://engine.test", 1)?;
+        assert_eq!(closed, DriverResponse::Closed);
         Ok(())
     }
 

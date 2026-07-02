@@ -705,9 +705,9 @@ mod tests {
             .map_err(|_| "session pool lock failed")?
             .attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
         Ok(thread::spawn(move || {
-            let mut connection = EngineIpcConnection::from_stream(server_stream);
+            let connection = EngineIpcConnection::from_stream(server_stream);
             let mut driver = TestDriver::new();
-            futures::executor::block_on(serve_driver_connection(&mut connection, &mut driver))
+            futures::executor::block_on(serve_driver_connection(connection, &mut driver))
         }))
     }
 

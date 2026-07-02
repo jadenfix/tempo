@@ -28,8 +28,8 @@ async fn cdp_driver_serves_commands_over_engine_host_uds() -> Result<(), Box<dyn
     let mut driver = CdpTempoDriver::launch_with(config)
         .await?
         .allow_private_network_access();
-    let mut connection = EngineIpcConnection::from_stream(server_stream);
-    serve_driver_connection(&mut connection, &mut driver).await?;
+    let connection = EngineIpcConnection::from_stream(server_stream);
+    serve_driver_connection(connection, &mut driver).await?;
     let (observed, closed) = client.await??;
 
     match observed {

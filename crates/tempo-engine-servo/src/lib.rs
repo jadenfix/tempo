@@ -1114,8 +1114,8 @@ mod tests {
         let (client_stream, server_stream) = UnixStream::pair()?;
         let server = tokio::spawn(async move {
             let mut driver = TestDriver::new().with_elements(vec![button("submit")]);
-            let mut connection = EngineIpcConnection::from_stream(server_stream);
-            serve_driver_connection(&mut connection, &mut driver).await
+            let connection = EngineIpcConnection::from_stream(server_stream);
+            serve_driver_connection(connection, &mut driver).await
         });
         let mut driver = ServoIpcDriver::from_client(
             ServoEngineConfig::vanilla(),
@@ -1203,8 +1203,8 @@ mod tests {
         let (client_stream, server_stream) = UnixStream::pair()?;
         let server = tokio::spawn(async move {
             let mut driver = TestDriver::new();
-            let mut connection = EngineIpcConnection::from_stream(server_stream);
-            serve_driver_connection(&mut connection, &mut driver).await
+            let connection = EngineIpcConnection::from_stream(server_stream);
+            serve_driver_connection(connection, &mut driver).await
         });
         let mut root_driver = ServoIpcDriver::from_client(
             ServoEngineConfig::tempo_fork(),
