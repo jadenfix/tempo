@@ -11,7 +11,10 @@ thiserror.workspace = true
 tempo-schema = { path = "../tempo-schema" }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+axum = "0.8"
+beatbox-engine = { git = "https://github.com/jadenfix/beatbox.git", rev = "b2e7b18e95563bc95aea58583e40f23a455df19f" }
+beatbox-server = { git = "https://github.com/jadenfix/beatbox.git", rev = "b2e7b18e95563bc95aea58583e40f23a455df19f" }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "time"] }
 
 [lints]
 workspace = true
