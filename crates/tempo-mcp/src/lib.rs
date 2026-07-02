@@ -11,8 +11,8 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tempo_driver::{DriverTrait, Engine, StepOutcome};
 use tempo_handshake::{
-    decide_lane, probe_urls, Lane as HandshakeLane, ProbeHit, ProbeReport, ProbeResponse,
-    StructuredSignal,
+    decide_lane, probe_http_origin, probe_urls, HttpProbeConfig, HttpProbeFailure,
+    Lane as HandshakeLane, ProbeHit, ProbeReport, ProbeResponse, StructuredSignal,
 };
 use tempo_schema::{Action, NodeId};
 use thiserror::Error;
@@ -68,6 +68,7 @@ pub struct ToolDescriptor {
 pub struct TempoMcpServer<D> {
     driver: D,
     handshake_report: ProbeReport,
+    handshake_probe_config: HttpProbeConfig,
 }
 
 impl<D> TempoMcpServer<D> {
@@ -75,11 +76,17 @@ impl<D> TempoMcpServer<D> {
         Self {
             driver,
             handshake_report: ProbeReport::new(),
+            handshake_probe_config: HttpProbeConfig::default(),
         }
     }
 
     pub fn with_handshake_report(mut self, report: ProbeReport) -> Self {
         self.handshake_report = report;
+        self
+    }
+
+    pub fn with_handshake_probe_config(mut self, config: HttpProbeConfig) -> Self {
+        self.handshake_probe_config = config;
         self
     }
 
@@ -225,12 +232,45 @@ where
 
     fn handshake_json(&self, args: HandshakeArgs) -> Value {
         let mut report = ProbeReport::from_hits(self.handshake_report.hits().to_vec());
+        let live_http_requested = args
+            .live_http
+            .unwrap_or_else(|| args.origin.is_some() && args.responses.is_empty());
         let response_report =
             ProbeReport::from_responses(args.responses.into_iter().map(Into::into));
         for hit in response_report.hits() {
             report.add_hit(hit.clone());
         }
         report.record_web_mcp(args.web_mcp.unwrap_or(false));
+
+        let mut live_http = false;
+        let mut probe_responses = Vec::new();
+        let mut probe_failures = Vec::new();
+        let mut probe_error = None;
+        if live_http_requested {
+            if let Some(origin) = args.origin.as_deref() {
+                live_http = true;
+                match probe_http_origin_off_runtime(origin, self.handshake_probe_config.clone()) {
+                    Ok(run) => {
+                        for hit in run.report.hits() {
+                            report.add_hit(hit.clone());
+                        }
+                        probe_responses = run
+                            .responses
+                            .iter()
+                            .map(probe_response_json)
+                            .collect::<Vec<_>>();
+                        probe_failures = run
+                            .failures
+                            .iter()
+                            .map(probe_failure_json)
+                            .collect::<Vec<_>>();
+                    }
+                    Err(error) => {
+                        probe_error = Some(error.to_string());
+                    }
+                }
+            }
+        }
 
         let decision = decide_lane(&report);
         json!({
@@ -239,6 +279,10 @@ where
             "selected": decision.selected.as_ref().map(probe_hit_json),
             "hits": report.hits().iter().map(probe_hit_json).collect::<Vec<_>>(),
             "probe_urls": args.origin.as_deref().map(probe_urls).unwrap_or_default(),
+            "live_http": live_http,
+            "probe_responses": probe_responses,
+            "probe_failures": probe_failures,
+            "probe_error": probe_error,
         })
     }
 }
@@ -296,6 +340,7 @@ pub fn tools() -> Vec<ToolDescriptor> {
                 vec![
                     ("origin", json!({"type": "string"})),
                     ("web_mcp", json!({"type": "boolean"})),
+                    ("live_http", json!({"type": "boolean"})),
                     ("responses", json!({"type": "array"})),
                 ],
                 &[],
@@ -388,6 +433,8 @@ struct HandshakeArgs {
     #[serde(default)]
     web_mcp: Option<bool>,
     #[serde(default)]
+    live_http: Option<bool>,
+    #[serde(default)]
     responses: Vec<ProbeResponseInput>,
 }
 
@@ -413,6 +460,17 @@ impl From<ProbeResponseInput> for ProbeResponse {
 
 fn parse_args<T: serde::de::DeserializeOwned>(value: Value) -> Result<T, JsonRpcError> {
     serde_json::from_value(value).map_err(|error| JsonRpcError::invalid_params(error.to_string()))
+}
+
+fn probe_http_origin_off_runtime(
+    origin: &str,
+    config: HttpProbeConfig,
+) -> Result<tempo_handshake::HttpProbeRun, String> {
+    let origin = origin.to_string();
+    match std::thread::spawn(move || probe_http_origin(&origin, config)).join() {
+        Ok(result) => result.map_err(|error| error.to_string()),
+        Err(_) => Err("HTTP probe worker panicked".into()),
+    }
 }
 
 fn json_rpc_result(id: Value, result: Value) -> Value {
@@ -481,6 +539,23 @@ fn probe_hit_json(hit: &ProbeHit) -> Value {
     })
 }
 
+fn probe_response_json(response: &ProbeResponse) -> Value {
+    json!({
+        "path": &response.path,
+        "status": response.status,
+        "content_type": &response.content_type,
+        "body_bytes": response.body.len(),
+    })
+}
+
+fn probe_failure_json(failure: &HttpProbeFailure) -> Value {
+    json!({
+        "path": &failure.path,
+        "url": &failure.url,
+        "reason": &failure.reason,
+    })
+}
+
 fn signal_name(signal: StructuredSignal) -> &'static str {
     match signal {
         StructuredSignal::BeaterJson => "beater_json",
@@ -535,9 +610,15 @@ fn loopback_origin_allowed(origin: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{self, Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
     use async_trait::async_trait;
     use serde_json::json;
     use tempo_driver::{TransportError, Unsupported};
+    use tempo_net::UrlPolicy;
     use tempo_schema::{
         CompiledObservation, InteractiveElement, NodeId, ObservationDiff, Provenance, TaintSpan,
     };
@@ -642,6 +723,72 @@ mod tests {
             result["probe_urls"][0],
             "https://example.test/.well-known/beater.json"
         );
+        assert_eq!(result["live_http"], false);
+        assert!(result["probe_responses"]
+            .as_array()
+            .ok_or("probe_responses must be an array")?
+            .is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn handshake_tool_runs_live_http_probe_for_origin() -> Result<(), String> {
+        let (origin, server) = serve_handshake_fixture().map_err(|error| error.to_string())?;
+        let mut server_under_test = TempoMcpServer::new(MemoryDriver::new())
+            .with_handshake_probe_config(
+                HttpProbeConfig::default().with_url_policy(UrlPolicy::allow_all()),
+            );
+
+        let result = call_tool(
+            &mut server_under_test,
+            "handshake",
+            json!({"origin": origin}),
+        )
+        .await?;
+        join_server(server)?;
+
+        assert_eq!(result["live_http"], true);
+        assert_eq!(result["lane"], "mcp");
+        assert_eq!(result["selected"]["signal"], "mcp_catalog");
+        assert_eq!(
+            result["probe_responses"]
+                .as_array()
+                .ok_or("probe_responses must be an array")?
+                .len(),
+            tempo_handshake::DEFAULT_HTTP_PROBES.len()
+        );
+        assert!(result["probe_failures"]
+            .as_array()
+            .ok_or("probe_failures must be an array")?
+            .is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn handshake_tool_reports_url_policy_failures() -> Result<(), String> {
+        let mut server = TempoMcpServer::new(MemoryDriver::new());
+
+        let result = call_tool(
+            &mut server,
+            "handshake",
+            json!({"origin": "http://127.0.0.1:9"}),
+        )
+        .await?;
+
+        assert_eq!(result["live_http"], true);
+        assert_eq!(result["lane"], "render");
+        assert!(result["probe_responses"]
+            .as_array()
+            .ok_or("probe_responses must be an array")?
+            .is_empty());
+        let failures = result["probe_failures"]
+            .as_array()
+            .ok_or("probe_failures must be an array")?;
+        assert_eq!(failures.len(), tempo_handshake::DEFAULT_HTTP_PROBES.len());
+        assert!(failures.iter().all(|failure| failure["reason"]
+            .as_str()
+            .map(|reason| reason.contains("URL blocked"))
+            .unwrap_or(false)));
         Ok(())
     }
 
@@ -705,6 +852,92 @@ mod tests {
             return Err(value.to_string());
         }
         Ok(value["result"]["structuredContent"].clone())
+    }
+
+    fn serve_handshake_fixture(
+    ) -> Result<(String, thread::JoinHandle<Result<(), io::Error>>), io::Error> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
+        let addr = listener.local_addr()?;
+        let handle = thread::spawn(move || -> Result<(), io::Error> {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut handled = 0;
+            while handled < tempo_handshake::DEFAULT_HTTP_PROBES.len() {
+                match listener.accept() {
+                    Ok((stream, _addr)) => {
+                        handle_probe_stream(stream)?;
+                        handled += 1;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            return Err(io::Error::new(
+                                io::ErrorKind::TimedOut,
+                                "timed out waiting for live handshake probes",
+                            ));
+                        }
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok(())
+        });
+        Ok((format!("http://{addr}"), handle))
+    }
+
+    fn handle_probe_stream(mut stream: TcpStream) -> Result<(), io::Error> {
+        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 512];
+        loop {
+            let read = stream.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&buffer[..read]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+            if request.len() > 8192 {
+                return Err(io::Error::other("request headers exceeded fixture cap"));
+            }
+        }
+
+        let request = String::from_utf8_lossy(&request);
+        let first_line = request
+            .lines()
+            .next()
+            .ok_or_else(|| io::Error::other("missing request line"))?;
+        let path = first_line
+            .split_whitespace()
+            .nth(1)
+            .ok_or_else(|| io::Error::other("missing request path"))?;
+
+        let (status, content_type, body) = match path {
+            "/.well-known/beater.json" => (
+                "200 OK",
+                "application/json",
+                r#"{"version":"1","tools":[]}"#,
+            ),
+            "/agent-card.json" => ("404 Not Found", "text/plain", ""),
+            "/llms.txt" => ("200 OK", "text/plain", "# Fixture"),
+            "/openapi.json" => ("404 Not Found", "text/plain", ""),
+            "/mcp/catalog.json" => ("200 OK", "application/json", r#"{"tools":[]}"#),
+            _ => ("404 Not Found", "text/plain", ""),
+        };
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(response.as_bytes())?;
+        stream.flush()
+    }
+
+    fn join_server(handle: thread::JoinHandle<Result<(), io::Error>>) -> Result<(), String> {
+        match handle.join() {
+            Ok(result) => result.map_err(|error| error.to_string()),
+            Err(_) => Err("fixture server panicked".into()),
+        }
     }
 
     #[derive(Clone)]

@@ -16,6 +16,7 @@ url = "2"
 
 [dev-dependencies]
 async-trait.workspace = true
+tempo-net = { path = "../tempo-net" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [lints]

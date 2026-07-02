@@ -5,7 +5,10 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+tempo-net = { path = "../tempo-net" }
 tempo-schema = { path = "../tempo-schema" }
+thiserror.workspace = true
 
 [lints]
 workspace = true
