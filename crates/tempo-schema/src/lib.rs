@@ -6,6 +6,7 @@
 //! labels, and the diff format. Types here MUST stay serde-stable behind `SCHEMA_VERSION`.
 
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 
 /// Frozen schema version. Bumped only by a deliberate contract change (final.md §8.2 M0).
 pub const SCHEMA_VERSION: &str = "2.0.0-draft";
@@ -162,6 +163,266 @@ pub struct ActionBatch {
     pub quiescence: QuiescencePolicy,
 }
 
+/// JSON Schema draft used for the published C1/C2 contract.
+pub const JSON_SCHEMA_DRAFT: &str = "https://json-schema.org/draft/2020-12/schema";
+
+/// Emit a bundled JSON Schema for every frozen tempo wire type.
+pub fn schema_bundle_json_schema() -> Value {
+    let mut defs = serde_json::Map::new();
+    defs.insert("NodeId".into(), node_id_json_schema());
+    defs.insert("Provenance".into(), provenance_json_schema());
+    defs.insert("TaintSpan".into(), taint_span_json_schema());
+    defs.insert(
+        "InteractiveElement".into(),
+        interactive_element_json_schema(),
+    );
+    defs.insert(
+        "CompiledObservation".into(),
+        compiled_observation_json_schema(),
+    );
+    defs.insert("ObservationDiff".into(), observation_diff_json_schema());
+    defs.insert("SideEffect".into(), side_effect_json_schema());
+    defs.insert("Action".into(), action_json_schema());
+    defs.insert("QuiescencePolicy".into(), quiescence_policy_json_schema());
+    defs.insert("ActionBatch".into(), action_batch_json_schema());
+
+    json!({
+        "$schema": JSON_SCHEMA_DRAFT,
+        "$id": format!("https://tempo.dev/schemas/{SCHEMA_VERSION}/tempo.schema.json"),
+        "title": "tempo C1/C2 schema bundle",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "compiled_observation": { "$ref": "#/$defs/CompiledObservation" },
+            "observation_diff": { "$ref": "#/$defs/ObservationDiff" },
+            "action": { "$ref": "#/$defs/Action" },
+            "action_batch": { "$ref": "#/$defs/ActionBatch" }
+        },
+        "$defs": defs
+    })
+}
+
+/// JSON Schema for C1 `CompiledObservation`.
+pub fn compiled_observation_json_schema() -> Value {
+    json!({
+        "title": "CompiledObservation",
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["schema_version", "url", "seq", "elements", "marks"],
+        "properties": {
+            "schema_version": { "type": "string", "const": SCHEMA_VERSION },
+            "url": { "type": "string", "format": "uri-reference" },
+            "seq": { "type": "integer", "minimum": 0 },
+            "elements": {
+                "type": "array",
+                "items": { "$ref": "#/$defs/InteractiveElement" }
+            },
+            "marks": {
+                "type": "array",
+                "items": {
+                    "type": "array",
+                    "prefixItems": [
+                        { "$ref": "#/$defs/NodeId" },
+                        { "type": "integer", "minimum": 0 }
+                    ],
+                    "minItems": 2,
+                    "maxItems": 2
+                }
+            }
+        }
+    })
+}
+
+/// JSON Schema for C1 `ObservationDiff`.
+pub fn observation_diff_json_schema() -> Value {
+    json!({
+        "title": "ObservationDiff",
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["since_seq", "seq", "added", "removed", "changed"],
+        "properties": {
+            "since_seq": { "type": "integer", "minimum": 0 },
+            "seq": { "type": "integer", "minimum": 0 },
+            "added": {
+                "type": "array",
+                "items": { "$ref": "#/$defs/InteractiveElement" }
+            },
+            "removed": {
+                "type": "array",
+                "items": { "$ref": "#/$defs/NodeId" }
+            },
+            "changed": {
+                "type": "array",
+                "items": { "$ref": "#/$defs/InteractiveElement" }
+            }
+        }
+    })
+}
+
+/// JSON Schema for C2 `Action`.
+pub fn action_json_schema() -> Value {
+    json!({
+        "title": "Action",
+        "oneOf": [
+            action_variant_schema("goto", json!({
+                "url": { "type": "string", "format": "uri-reference" }
+            })),
+            action_variant_schema("click", json!({
+                "node": { "$ref": "#/$defs/NodeId" }
+            })),
+            action_variant_schema("type", json!({
+                "node": { "$ref": "#/$defs/NodeId" },
+                "text": { "type": "string" }
+            })),
+            action_variant_schema("select", json!({
+                "node": { "$ref": "#/$defs/NodeId" },
+                "value": { "type": "string" }
+            })),
+            action_variant_schema("scroll", json!({
+                "x": { "type": "number" },
+                "y": { "type": "number" }
+            })),
+            action_variant_schema("extract", json!({
+                "node": { "$ref": "#/$defs/NodeId" }
+            })),
+            action_variant_schema("skill", json!({
+                "name": { "type": "string", "minLength": 1 },
+                "input": true
+            }))
+        ]
+    })
+}
+
+/// JSON Schema for C2 `ActionBatch`.
+pub fn action_batch_json_schema() -> Value {
+    json!({
+        "title": "ActionBatch",
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["actions", "quiescence"],
+        "properties": {
+            "actions": {
+                "type": "array",
+                "items": { "$ref": "#/$defs/Action" }
+            },
+            "quiescence": { "$ref": "#/$defs/QuiescencePolicy" }
+        }
+    })
+}
+
+fn node_id_json_schema() -> Value {
+    json!({
+        "title": "NodeId",
+        "type": "string",
+        "minLength": 1
+    })
+}
+
+fn provenance_json_schema() -> Value {
+    json!({
+        "title": "Provenance",
+        "type": "string",
+        "enum": ["system", "user", "page"]
+    })
+}
+
+fn taint_span_json_schema() -> Value {
+    json!({
+        "title": "TaintSpan",
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["provenance", "text"],
+        "properties": {
+            "provenance": { "$ref": "#/$defs/Provenance" },
+            "text": { "type": "string" }
+        }
+    })
+}
+
+fn interactive_element_json_schema() -> Value {
+    json!({
+        "title": "InteractiveElement",
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["node_id", "role", "name", "value", "bounds", "rank"],
+        "properties": {
+            "node_id": { "$ref": "#/$defs/NodeId" },
+            "role": { "type": "string", "minLength": 1 },
+            "name": {
+                "type": "array",
+                "items": { "$ref": "#/$defs/TaintSpan" }
+            },
+            "value": {
+                "type": "array",
+                "items": { "$ref": "#/$defs/TaintSpan" }
+            },
+            "bounds": {
+                "anyOf": [
+                    { "type": "null" },
+                    {
+                        "type": "array",
+                        "items": { "type": "number" },
+                        "minItems": 4,
+                        "maxItems": 4
+                    }
+                ]
+            },
+            "rank": { "type": "number" }
+        }
+    })
+}
+
+fn side_effect_json_schema() -> Value {
+    json!({
+        "title": "SideEffect",
+        "type": "string",
+        "enum": ["read", "draft", "write", "send", "purchase", "delete"]
+    })
+}
+
+fn quiescence_policy_json_schema() -> Value {
+    json!({
+        "title": "QuiescencePolicy",
+        "oneOf": [
+            { "type": "string", "const": "composite" },
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["fixed_millis"],
+                "properties": {
+                    "fixed_millis": { "type": "integer", "minimum": 0 }
+                }
+            }
+        ]
+    })
+}
+
+fn action_variant_schema(kind: &'static str, properties: Value) -> Value {
+    let mut required = vec![Value::String("kind".into())];
+    let mut merged = serde_json::Map::new();
+    merged.insert(
+        "kind".into(),
+        json!({
+            "type": "string",
+            "const": kind
+        }),
+    );
+
+    if let Value::Object(map) = properties {
+        for (key, value) in map {
+            required.push(Value::String(key.clone()));
+            merged.insert(key, value);
+        }
+    }
+
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": required,
+        "properties": merged
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -209,5 +470,144 @@ mod tests {
         let back: CompiledObservation = serde_json::from_str(&s)?;
         assert_eq!(obs, back);
         Ok(())
+    }
+
+    #[test]
+    fn schema_bundle_exports_all_contract_defs() -> Result<(), String> {
+        let schema = schema_bundle_json_schema();
+        assert_eq!(schema["$schema"], JSON_SCHEMA_DRAFT);
+        assert_eq!(
+            schema["$id"],
+            format!("https://tempo.dev/schemas/{SCHEMA_VERSION}/tempo.schema.json")
+        );
+
+        let defs = schema["$defs"]
+            .as_object()
+            .ok_or_else(|| "schema defs missing".to_string())?;
+        for name in [
+            "NodeId",
+            "Provenance",
+            "TaintSpan",
+            "InteractiveElement",
+            "CompiledObservation",
+            "ObservationDiff",
+            "SideEffect",
+            "Action",
+            "QuiescencePolicy",
+            "ActionBatch",
+        ] {
+            assert!(defs.contains_key(name), "missing {name}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn observation_schema_freezes_current_version_tag() {
+        let schema = compiled_observation_json_schema();
+        assert_eq!(
+            schema["properties"]["schema_version"]["const"],
+            SCHEMA_VERSION
+        );
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(
+            schema["properties"]["elements"]["items"]["$ref"],
+            "#/$defs/InteractiveElement"
+        );
+    }
+
+    #[test]
+    fn action_schema_covers_real_serde_kinds() -> Result<(), String> {
+        let actions = [
+            Action::Goto {
+                url: "https://example.com".into(),
+            },
+            Action::Click {
+                node: NodeId("n1".into()),
+            },
+            Action::Type {
+                node: NodeId("n1".into()),
+                text: "hello".into(),
+            },
+            Action::Select {
+                node: NodeId("n1".into()),
+                value: "a".into(),
+            },
+            Action::Scroll { x: 1.0, y: 2.0 },
+            Action::Extract {
+                node: NodeId("n1".into()),
+            },
+            Action::Skill {
+                name: "checkout".into(),
+                input: serde_json::Value::Null,
+            },
+        ];
+
+        let schema = action_json_schema();
+        let variants = schema["oneOf"]
+            .as_array()
+            .ok_or_else(|| "action oneOf missing".to_string())?;
+        assert_eq!(variants.len(), actions.len());
+
+        for action in actions {
+            let value = serde_json::to_value(action).map_err(|error| error.to_string())?;
+            let kind = value["kind"]
+                .as_str()
+                .ok_or_else(|| "action kind missing".to_string())?;
+            let Some(schema_variant) = variants
+                .iter()
+                .find(|variant| variant["properties"]["kind"]["const"] == kind)
+            else {
+                return Err(format!("missing schema variant for {kind}"));
+            };
+            let fields = value
+                .as_object()
+                .ok_or_else(|| "action object missing".to_string())?;
+            let required = schema_variant["required"]
+                .as_array()
+                .ok_or_else(|| format!("required fields missing for {kind}"))?;
+            for field in fields.keys() {
+                assert!(
+                    required
+                        .iter()
+                        .any(|required| required.as_str() == Some(field.as_str())),
+                    "{kind} missing required field {field}"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn quiescence_schema_matches_real_serde_shape() -> Result<(), serde_json::Error> {
+        assert_eq!(
+            serde_json::to_value(QuiescencePolicy::Composite)?,
+            serde_json::Value::String("composite".into())
+        );
+        assert_eq!(
+            serde_json::to_value(QuiescencePolicy::FixedMillis(250))?,
+            serde_json::json!({ "fixed_millis": 250 })
+        );
+
+        let schema = quiescence_policy_json_schema();
+        assert_eq!(schema["oneOf"][0]["const"], "composite");
+        assert_eq!(
+            schema["oneOf"][1]["properties"]["fixed_millis"]["type"],
+            "integer"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn action_batch_schema_references_action_and_quiescence_contracts() {
+        let schema = action_batch_json_schema();
+        assert_eq!(
+            schema["properties"]["actions"]["items"]["$ref"],
+            "#/$defs/Action"
+        );
+        assert_eq!(
+            schema["properties"]["quiescence"]["$ref"],
+            "#/$defs/QuiescencePolicy"
+        );
     }
 }
