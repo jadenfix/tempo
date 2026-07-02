@@ -219,6 +219,8 @@ impl AgentLoop {
         let journal = SessionJournal::open(&journal_path, run_id, session_id)?;
         let entries = read_journal_entries(&journal_path)?;
         let cursor = ResumeCursor::from_entries(&plan, &entries)?;
+        let mut budget = TokenBudget::new(budget.max_tokens);
+        restore_completed_token_budget(&plan, cursor.completed_steps, &mut budget)?;
         Ok(Self {
             journal,
             plan,
@@ -297,6 +299,33 @@ impl AgentLoop {
         StepTriple::from_event(step.key, entry.seq, step.action, event)
     }
 
+    pub fn record_pending_interruption(
+        &mut self,
+        reason: impl Into<String>,
+    ) -> Result<StepTriple, AgentError> {
+        let step = self.next_step().ok_or(AgentError::PlanComplete)?.clone();
+        if self.cursor.pending_planned.as_ref() != Some(&step.key) {
+            return Err(AgentError::PlanComplete);
+        }
+
+        let reason = reason.into();
+        let event = JournalEvent::from_step_outcome(
+            step.action.clone(),
+            StepOutcome::StepError {
+                reason: reason.clone(),
+            },
+        );
+        let entry = self.journal.append(event.clone())?;
+        self.cursor
+            .last_step_error
+            .replace((self.cursor.completed_steps, reason));
+        self.cursor.completed_steps += 1;
+        self.cursor.next_step += 1;
+        self.cursor.pending_planned = None;
+
+        StepTriple::from_event(step.key, entry.seq, step.action, event)
+    }
+
     pub fn record_session_started(&mut self, url: impl Into<String>) -> Result<(), AgentError> {
         self.journal
             .append(JournalEvent::SessionStarted { url: url.into() })?;
@@ -337,6 +366,17 @@ impl AgentLoop {
             .map(|step| step.key.clone())
             .collect()
     }
+}
+
+fn restore_completed_token_budget(
+    plan: &TaskPlan,
+    completed_steps: usize,
+    budget: &mut TokenBudget,
+) -> Result<(), AgentError> {
+    for step in plan.steps.iter().take(completed_steps) {
+        budget.charge(step.estimated_tokens)?;
+    }
+    Ok(())
 }
 
 /// A live driver task: navigate to `start_url`, then execute each semantic
@@ -607,11 +647,38 @@ impl AgentRunner {
                 .steps
                 .get(index)
                 .ok_or(AgentError::JournalHasExtraStep { index })?;
-            let policy_origin = self.origin_for_step(driver_step, current_origin.as_ref())?;
+
+            // Resume safety (#99): a step whose intent was journaled in a prior run
+            // but never completed may already have run its side effect. Do not
+            // re-execute it, and do not let skill-store or policy recomputation
+            // failures mask the durable interruption marker.
+            if agent.next_step_already_attempted() {
+                let policy = self.step_policy(
+                    driver_step,
+                    &planned.key,
+                    current_origin.as_ref(),
+                    driver_step.action.side_effect(),
+                )?;
+                let reason = RESUME_INTERRUPTED_REASON.to_string();
+                let triple = agent.record_pending_interruption(reason.clone())?;
+                report.actions_completed += 1;
+                report.steps.push(AgentStepReport {
+                    index,
+                    policy,
+                    triple,
+                    observation_budget: None,
+                });
+                report.status = AgentRunStatus::Interrupted {
+                    action_index: index,
+                    reason,
+                };
+                return Ok(report);
+            }
 
             // Read the skill store once and derive both the policy side-effect and
             // the compiled batch from that single snapshot (#98): the gate and the
             // executed actions can no longer disagree due to a between-reads mutation.
+            let policy_origin = self.origin_for_step(driver_step, current_origin.as_ref())?;
             let compiled_skill = match &planned.action {
                 Action::Skill { name, input } => Some(self.compile_skill_snapshot(name, input)?),
                 _ => None,
@@ -640,28 +707,6 @@ impl AgentRunner {
                     observation_budget: None,
                 });
                 report.status = AgentRunStatus::PolicyDenied {
-                    action_index: index,
-                    reason,
-                };
-                return Ok(report);
-            }
-
-            // Resume safety (#99): a step whose intent was journaled in a prior run
-            // but never completed may already have run its side effect. Do not
-            // re-execute it; record the interruption and stop for inspection.
-            if agent.next_step_already_attempted() {
-                let reason = RESUME_INTERRUPTED_REASON.to_string();
-                let triple = agent.record_next_outcome(StepOutcome::StepError {
-                    reason: reason.clone(),
-                })?;
-                report.actions_completed += 1;
-                report.steps.push(AgentStepReport {
-                    index,
-                    policy,
-                    triple,
-                    observation_budget: None,
-                });
-                report.status = AgentRunStatus::Interrupted {
                     action_index: index,
                     reason,
                 };
@@ -1296,6 +1341,7 @@ mod tests {
         assert_eq!(agent.cursor().completed_steps, 1);
         assert_eq!(agent.next_step().map(|step| &step.action), Some(&second));
         assert!(agent.cursor().pending_planned.is_some());
+        assert_eq!(agent.budget().used_tokens, 5);
 
         agent.record_next_outcome(StepOutcome::StepError {
             reason: "not present".into(),
@@ -1304,6 +1350,168 @@ mod tests {
 
         assert_eq!(entries.len(), 4);
         assert!(matches!(entries[3].event, JournalEvent::StepError { .. }));
+        assert_eq!(agent.budget().used_tokens, 10);
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn resume_restores_completed_token_budget_and_rejects_overrun() -> TestResult {
+        let root = unique_dir("resume-budget-overrun")?;
+        remove_dir_if_exists(&root)?;
+        fs::create_dir_all(&root)?;
+        let journal_path = root.join("session.jsonl");
+        let first = Action::Scroll { x: 0.0, y: 1.0 };
+        let second = Action::Scroll { x: 0.0, y: 2.0 };
+        let plan = TaskPlan::from_actions(vec![first.clone(), second], 7)?;
+        let mut journal = SessionJournal::open(
+            &journal_path,
+            RunId("run".into()),
+            SessionId("session".into()),
+        )?;
+        journal.append(JournalEvent::ActionPlanned {
+            action: first.clone(),
+        })?;
+        journal.append(JournalEvent::StepApplied {
+            action: first,
+            diff: diff(0, 1),
+        })?;
+        drop(journal);
+
+        assert!(matches!(
+            AgentLoop::open(
+                &journal_path,
+                RunId("run".into()),
+                SessionId("session".into()),
+                plan,
+                TokenBudget::new(6),
+            ),
+            Err(AgentError::TokenBudgetExceeded {
+                attempted: 7,
+                max: 6,
+            })
+        ));
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn resume_restores_step_error_token_budget() -> TestResult {
+        let root = unique_dir("resume-budget-step-error")?;
+        remove_dir_if_exists(&root)?;
+        fs::create_dir_all(&root)?;
+        let journal_path = root.join("session.jsonl");
+        let action = Action::Scroll { x: 0.0, y: 1.0 };
+        let plan = TaskPlan::from_actions(vec![action.clone()], 6)?;
+        let mut journal = SessionJournal::open(
+            &journal_path,
+            RunId("run".into()),
+            SessionId("session".into()),
+        )?;
+        journal.append(JournalEvent::ActionPlanned {
+            action: action.clone(),
+        })?;
+        journal.append(JournalEvent::StepError {
+            action,
+            reason: "not present".into(),
+        })?;
+        drop(journal);
+
+        let agent = AgentLoop::open(
+            &journal_path,
+            RunId("run".into()),
+            SessionId("session".into()),
+            plan,
+            TokenBudget::new(10),
+        )?;
+
+        assert_eq!(agent.cursor().completed_steps, 1);
+        assert_eq!(agent.budget().used_tokens, 6);
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn resume_derives_budget_from_journal_not_incoming_used_tokens() -> TestResult {
+        let root = unique_dir("resume-budget-nonzero-input")?;
+        remove_dir_if_exists(&root)?;
+        fs::create_dir_all(&root)?;
+        let journal_path = root.join("session.jsonl");
+        let action = Action::Scroll { x: 0.0, y: 1.0 };
+        let plan = TaskPlan::from_actions(vec![action.clone()], 3)?;
+        let mut journal = SessionJournal::open(
+            &journal_path,
+            RunId("run".into()),
+            SessionId("session".into()),
+        )?;
+        journal.append(JournalEvent::ActionPlanned {
+            action: action.clone(),
+        })?;
+        journal.append(JournalEvent::StepApplied {
+            action,
+            diff: diff(0, 1),
+        })?;
+        drop(journal);
+
+        let agent = AgentLoop::open(
+            &journal_path,
+            RunId("run".into()),
+            SessionId("session".into()),
+            plan,
+            TokenBudget {
+                max_tokens: 10,
+                used_tokens: 5,
+            },
+        )?;
+
+        assert_eq!(agent.budget().used_tokens, 3);
+        assert_eq!(agent.budget().remaining(), 7);
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn resume_interruption_does_not_charge_dangling_planned_step() -> TestResult {
+        let root = unique_dir("resume-budget-pending")?;
+        remove_dir_if_exists(&root)?;
+        fs::create_dir_all(&root)?;
+        let journal_path = root.join("session.jsonl");
+        let first = Action::Scroll { x: 0.0, y: 1.0 };
+        let second = Action::Scroll { x: 0.0, y: 2.0 };
+        let plan = TaskPlan::from_actions(vec![first.clone(), second.clone()], 4)?;
+        let mut journal = SessionJournal::open(
+            &journal_path,
+            RunId("run".into()),
+            SessionId("session".into()),
+        )?;
+        journal.append(JournalEvent::ActionPlanned {
+            action: first.clone(),
+        })?;
+        journal.append(JournalEvent::StepApplied {
+            action: first,
+            diff: diff(0, 1),
+        })?;
+        journal.append(JournalEvent::ActionPlanned { action: second })?;
+        drop(journal);
+
+        let mut agent = AgentLoop::open(
+            &journal_path,
+            RunId("run".into()),
+            SessionId("session".into()),
+            plan,
+            TokenBudget::new(8),
+        )?;
+
+        assert_eq!(agent.budget().used_tokens, 4);
+        assert!(agent.next_step_already_attempted());
+
+        agent.record_pending_interruption(RESUME_INTERRUPTED_REASON)?;
+
+        assert_eq!(agent.budget().used_tokens, 4);
 
         remove_dir_if_exists(&root)?;
         Ok(())
@@ -2080,6 +2288,89 @@ mod tests {
             &entry.event,
             JournalEvent::StepError { reason, .. } if reason == RESUME_INTERRUPTED_REASON
         )));
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runner_resume_journals_interruption_when_budget_is_exhausted() -> TestResult {
+        let root = unique_dir("runner-resume-interrupted-budget")?;
+        remove_dir_if_exists(&root)?;
+        fs::create_dir_all(&root)?;
+        let journal_path = root.join("session.jsonl");
+        let action = Action::Click {
+            node: NodeId("submit".into()),
+        };
+        let task = DriverTask::new("https://example.com", vec![action.clone()]);
+        let mut journal = SessionJournal::open(
+            &journal_path,
+            RunId("run-resume-interrupted-budget".into()),
+            SessionId("session-resume-interrupted-budget".into()),
+        )?;
+        journal.append(JournalEvent::SessionStarted {
+            url: "https://example.com".into(),
+        })?;
+        journal.append(JournalEvent::ActionPlanned { action })?;
+        drop(journal);
+
+        let mut driver = TestDriver::new().with_elements(vec![button("submit")]);
+        let runner = AgentRunner::new(
+            &journal_path,
+            AgentRunIds::new(
+                "run-resume-interrupted-budget",
+                "session-resume-interrupted-budget",
+            ),
+        )
+        .with_token_budget(TokenBudget::new(0));
+
+        let report = runner.run_driver_task(&mut driver, &task).await?;
+
+        assert!(matches!(report.status, AgentRunStatus::Interrupted { .. }));
+        let entries = read_journal_entries(&journal_path)?;
+        assert!(entries.iter().any(|entry| matches!(
+            &entry.event,
+            JournalEvent::StepError { reason, .. } if reason == RESUME_INTERRUPTED_REASON
+        )));
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runner_resume_interruption_preempts_missing_skill_store() -> TestResult {
+        let root = unique_dir("runner-resume-interrupted-skill")?;
+        remove_dir_if_exists(&root)?;
+        fs::create_dir_all(&root)?;
+        let journal_path = root.join("session.jsonl");
+        let action = Action::Skill {
+            name: "missing".into(),
+            input: serde_json::json!({}),
+        };
+        let task = DriverTask::new("https://example.com", vec![action.clone()]);
+        let mut journal = SessionJournal::open(
+            &journal_path,
+            RunId("run-resume-interrupted-skill".into()),
+            SessionId("session-resume-interrupted-skill".into()),
+        )?;
+        journal.append(JournalEvent::SessionStarted {
+            url: "https://example.com".into(),
+        })?;
+        journal.append(JournalEvent::ActionPlanned { action })?;
+        drop(journal);
+
+        let mut driver = TestDriver::new();
+        let runner = AgentRunner::new(
+            &journal_path,
+            AgentRunIds::new(
+                "run-resume-interrupted-skill",
+                "session-resume-interrupted-skill",
+            ),
+        );
+
+        let report = runner.run_driver_task(&mut driver, &task).await?;
+
+        assert!(matches!(report.status, AgentRunStatus::Interrupted { .. }));
 
         remove_dir_if_exists(&root)?;
         Ok(())
