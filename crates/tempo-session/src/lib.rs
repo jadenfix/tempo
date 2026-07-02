@@ -4,9 +4,12 @@
 //! durable: every step is appended as a synced JSONL record, and every replayable
 //! response is stored in a deterministic cassette format that can move between hosts.
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use sha2::{Digest, Sha256};
+use std::fmt::Write as _;
+use std::fs::{File, OpenOptions, TryLockError};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tempo_driver::{StepOutcome, TransportError};
@@ -93,8 +96,17 @@ pub struct ResumeState {
 }
 
 /// Append-only session journal. Each append is flushed and synced before returning.
+///
+/// The journal holds a single file handle for its whole lifetime and takes an
+/// advisory exclusive lock on it at [`open`](SessionJournal::open). This prevents
+/// two writers from concurrently allocating the same sequence number (which would
+/// permanently brick future opens with a [`JournalError::SequenceGap`]) and avoids
+/// the reopen-per-append TOCTOU where a rotated/deleted file was silently recreated.
 pub struct SessionJournal {
     path: PathBuf,
+    /// Held for the journal's lifetime. Dropping the handle releases the advisory
+    /// lock, so `file` must outlive every append.
+    file: File,
     run_id: RunId,
     session_id: SessionId,
     next_seq: u64,
@@ -102,11 +114,57 @@ pub struct SessionJournal {
 
 impl SessionJournal {
     /// Open or create a journal and recover the next sequence number from existing entries.
+    ///
+    /// Takes an advisory exclusive lock on the journal file; if another live
+    /// [`SessionJournal`] already holds it, this fails with [`JournalError::Locked`]
+    /// rather than racing to allocate duplicate sequence numbers.
     pub fn open(
         path: impl AsRef<Path>,
         run_id: RunId,
         session_id: SessionId,
     ) -> Result<Self, JournalError> {
+        let path = path.as_ref().to_path_buf();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => return Err(JournalError::Locked { path }),
+            Err(TryLockError::Error(source)) => return Err(JournalError::Io(source)),
+        }
+
+        // Physically drop any torn final record left by a crash so that the next
+        // append does not concatenate onto it and create genuine mid-file corruption.
+        truncate_torn_tail(&path, &file)?;
+
+        let entries = read_journal_entries(&path)?;
+        validate_journal_entries(&entries, &run_id, &session_id)?;
+        let next_seq = entries
+            .iter()
+            .map(|entry| entry.seq)
+            .max()
+            .map(|seq| seq + 1)
+            .unwrap_or(0);
+
+        Ok(Self {
+            path,
+            file,
+            run_id,
+            session_id,
+            next_seq,
+        })
+    }
+
+    /// Read a journal's recovered state without holding it open.
+    ///
+    /// Unlike [`open`](SessionJournal::open), this takes no lock: it is a read-only
+    /// recovery snapshot and can be called while a writer holds the journal.
+    pub fn resume(
+        path: impl AsRef<Path>,
+        run_id: RunId,
+        session_id: SessionId,
+    ) -> Result<ResumeState, JournalError> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -122,27 +180,11 @@ impl SessionJournal {
             .map(|seq| seq + 1)
             .unwrap_or(0);
 
-        Ok(Self {
+        Ok(ResumeState {
             path,
             run_id,
             session_id,
             next_seq,
-        })
-    }
-
-    /// Reopen a journal and return all recovered entries.
-    pub fn resume(
-        path: impl AsRef<Path>,
-        run_id: RunId,
-        session_id: SessionId,
-    ) -> Result<ResumeState, JournalError> {
-        let journal = Self::open(path, run_id, session_id)?;
-        let entries = read_journal_entries(&journal.path)?;
-        Ok(ResumeState {
-            path: journal.path,
-            run_id: journal.run_id,
-            session_id: journal.session_id,
-            next_seq: journal.next_seq,
             entries,
         })
     }
@@ -158,14 +200,10 @@ impl SessionJournal {
             event,
         };
 
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
-        serde_json::to_writer(&mut file, &entry)?;
-        file.write_all(b"\n")?;
-        file.flush()?;
-        file.sync_data()?;
+        serde_json::to_writer(&mut self.file, &entry)?;
+        self.file.write_all(b"\n")?;
+        self.file.flush()?;
+        self.file.sync_data()?;
 
         self.next_seq += 1;
         Ok(entry)
@@ -185,14 +223,28 @@ impl SessionJournal {
 pub struct CassetteKey(pub String);
 
 impl CassetteKey {
+    /// Derive the cassette key from request identity using SHA-256.
+    ///
+    /// URLs and bodies are page-controlled, so a non-collision-resistant hash (the
+    /// former FNV-1a-64) let an attacker craft two distinct requests sharing one key
+    /// and thereby substitute a chosen recorded response during replay. SHA-256 is
+    /// collision-resistant and its 256-bit output removes birthday collisions on
+    /// large corpora. Fields are length-unambiguously separated by NUL bytes.
     pub fn from_request(method: &str, url: &str, body: &[u8]) -> Self {
-        let mut hash = Fnv1a64::new();
-        hash.update(method.as_bytes());
-        hash.update(&[0]);
-        hash.update(url.as_bytes());
-        hash.update(&[0]);
-        hash.update(body);
-        Self(format!("{:016x}", hash.finish()))
+        let mut hasher = Sha256::new();
+        hasher.update(method.as_bytes());
+        hasher.update([0]);
+        hasher.update(url.as_bytes());
+        hasher.update([0]);
+        hasher.update(body);
+        let digest = hasher.finalize();
+
+        let mut key = String::with_capacity(digest.len() * 2);
+        for byte in digest {
+            // Writing formatted hex into a String is infallible.
+            let _ = write!(key, "{byte:02x}");
+        }
+        Self(key)
     }
 }
 
@@ -289,6 +341,8 @@ impl CassetteStore {
 pub enum JournalError {
     #[error("journal io failed: {0}")]
     Io(#[from] std::io::Error),
+    #[error("journal is already locked by another session: {path:?}")]
+    Locked { path: PathBuf },
     #[error("journal serialization failed: {0}")]
     Serde(#[from] serde_json::Error),
     #[error("journal line {line} is corrupt: {source}")]
@@ -322,43 +376,71 @@ pub fn describe() -> &'static str {
 }
 
 pub fn read_journal_entries(path: impl AsRef<Path>) -> Result<Vec<JournalEntry>, JournalError> {
-    let file = File::open(path.as_ref())?;
-    let reader = BufReader::new(file);
-    let mut entries = Vec::new();
-
-    for (index, line) in reader.lines().enumerate() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let entry = serde_json::from_str(&line).map_err(|source| JournalError::Corrupt {
-            line: index + 1,
-            source,
-        })?;
-        entries.push(entry);
-    }
-
-    Ok(entries)
+    read_jsonl(path)
 }
 
 pub fn read_cassettes(path: impl AsRef<Path>) -> Result<Vec<ResponseCassette>, JournalError> {
-    let file = File::open(path.as_ref())?;
-    let reader = BufReader::new(file);
-    let mut cassettes = Vec::new();
+    read_jsonl(path)
+}
 
-    for (index, line) in reader.lines().enumerate() {
-        let line = line?;
-        if line.trim().is_empty() {
+/// Parse an append-only JSONL file into records.
+///
+/// A crash between the JSON write and the trailing newline+sync leaves a torn final
+/// line. To keep such a session resumable, a single unparsable trailing record is
+/// tolerated (dropped) **only** when the file does not end in a newline — i.e. it was
+/// never fully committed. A completed line (one followed by `\n`) that fails to parse
+/// is treated as genuine mid-file corruption and reported with its line number.
+fn read_jsonl<T: DeserializeOwned>(path: impl AsRef<Path>) -> Result<Vec<T>, JournalError> {
+    let bytes = std::fs::read(path.as_ref())?;
+    // A fully-committed record always ends in a newline. If the file does not, its
+    // last segment is a partially-written (torn) record that may be dropped.
+    let torn_tail_possible = bytes.last() != Some(&b'\n');
+    let lines: Vec<&[u8]> = bytes.split(|byte| *byte == b'\n').collect();
+    let last_index = lines.len().saturating_sub(1);
+
+    let mut records = Vec::new();
+    for (index, raw) in lines.iter().enumerate() {
+        if raw.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-        let cassette = serde_json::from_str(&line).map_err(|source| JournalError::Corrupt {
-            line: index + 1,
-            source,
-        })?;
-        cassettes.push(cassette);
+        // Parse from bytes so an invalid-UTF-8 torn tail is tolerated rather than
+        // surfacing as a hard IO error.
+        match serde_json::from_slice::<T>(raw) {
+            Ok(record) => records.push(record),
+            Err(source) => {
+                if torn_tail_possible && index == last_index {
+                    break;
+                }
+                return Err(JournalError::Corrupt {
+                    line: index + 1,
+                    source,
+                });
+            }
+        }
     }
 
-    Ok(cassettes)
+    Ok(records)
+}
+
+/// Truncate a torn trailing record (bytes after the last committed newline) so the
+/// journal file contains only fully-synced records before the next append.
+///
+/// Every committed append ends in `\n`, so any bytes past the final newline are an
+/// incomplete write from a crash and are safe to discard. A file that already ends in
+/// a newline (or is empty) is left untouched.
+fn truncate_torn_tail(path: &Path, file: &File) -> Result<(), JournalError> {
+    let bytes = std::fs::read(path)?;
+    if bytes.is_empty() || bytes.last() == Some(&b'\n') {
+        return Ok(());
+    }
+    let keep = bytes
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map(|idx| idx as u64 + 1)
+        .unwrap_or(0);
+    file.set_len(keep)?;
+    file.sync_all()?;
+    Ok(())
 }
 
 fn validate_journal_entries(
@@ -393,25 +475,6 @@ fn current_timestamp_ms() -> Result<u128, JournalError> {
         .duration_since(UNIX_EPOCH)
         .map_err(|_| JournalError::ClockBeforeEpoch)?;
     Ok(duration.as_millis())
-}
-
-struct Fnv1a64(u64);
-
-impl Fnv1a64 {
-    fn new() -> Self {
-        Self(0xcbf29ce484222325)
-    }
-
-    fn update(&mut self, bytes: &[u8]) {
-        for byte in bytes {
-            self.0 ^= u64::from(*byte);
-            self.0 = self.0.wrapping_mul(0x100000001b3);
-        }
-    }
-
-    fn finish(self) -> u64 {
-        self.0
-    }
 }
 
 #[cfg(test)]
@@ -527,6 +590,9 @@ mod tests {
             SessionId("original-session".into()),
         );
         assert!(matches!(result, Err(JournalError::IdentityMismatch { .. })));
+
+        // Reopening requires the advisory lock, so release the live journal first.
+        drop(journal);
 
         let result = SessionJournal::open(
             &path,
@@ -693,6 +759,132 @@ mod tests {
 
         remove_if_exists(&path)?;
         Ok(())
+    }
+
+    #[test]
+    fn torn_final_line_still_loads_earlier_entries_and_resumes() -> TestResult {
+        let path = unique_path("torn-tail")?;
+        remove_if_exists(&path)?;
+        let run_id = RunId("run-torn".into());
+        let session_id = SessionId("session-torn".into());
+
+        // Two fully-synced entries.
+        {
+            let mut journal = SessionJournal::open(&path, run_id.clone(), session_id.clone())?;
+            journal.append(JournalEvent::SessionStarted {
+                url: "https://example.com".into(),
+            })?;
+            journal.append(JournalEvent::ActionPlanned {
+                action: Action::Goto {
+                    url: "https://example.com".into(),
+                },
+            })?;
+        }
+
+        // Simulate a crash mid-write of a third record: a partial JSON fragment with
+        // no trailing newline is left after the last committed entry.
+        {
+            let mut file = OpenOptions::new().append(true).open(&path)?;
+            file.write_all(br#"{"schema_version":"0.1","seq":2,"even"#)?;
+            file.flush()?;
+        }
+
+        // A read still recovers the earlier valid entries (the torn tail is dropped).
+        let entries = read_journal_entries(&path)?;
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].seq, 0);
+        assert_eq!(entries[1].seq, 1);
+
+        // Resume reports a consistent recovery snapshot.
+        let resumed = SessionJournal::resume(&path, run_id.clone(), session_id.clone())?;
+        assert_eq!(resumed.entries.len(), 2);
+        assert_eq!(resumed.next_seq, 2);
+
+        // Reopening repairs the file so appends continue from the right sequence and
+        // the journal stays parseable afterwards.
+        let mut journal = SessionJournal::open(&path, run_id.clone(), session_id.clone())?;
+        let appended = journal.append(JournalEvent::SessionClosed)?;
+        assert_eq!(appended.seq, 2);
+        drop(journal);
+
+        let final_state = SessionJournal::resume(&path, run_id, session_id)?;
+        assert_eq!(final_state.entries.len(), 3);
+        assert_eq!(final_state.next_seq, 3);
+        assert_eq!(final_state.entries[2].seq, 2);
+
+        remove_if_exists(&path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_open_is_rejected_so_seq_numbers_cannot_collide() -> TestResult {
+        let path = unique_path("lock-contended")?;
+        remove_if_exists(&path)?;
+        let run_id = RunId("run-lock".into());
+        let session_id = SessionId("session-lock".into());
+
+        let mut first = SessionJournal::open(&path, run_id.clone(), session_id.clone())?;
+        first.append(JournalEvent::SessionStarted {
+            url: "https://example.com".into(),
+        })?;
+
+        // A second concurrent open of the same journal must fail rather than allocate
+        // a duplicate seq that would brick every future open with a SequenceGap.
+        let contended = SessionJournal::open(&path, run_id.clone(), session_id.clone());
+        assert!(matches!(contended, Err(JournalError::Locked { .. })));
+
+        // Once the first writer is dropped, the lock is released and reopening works.
+        drop(first);
+        let mut second = SessionJournal::open(&path, run_id.clone(), session_id.clone())?;
+        let entry = second.append(JournalEvent::SessionClosed)?;
+        assert_eq!(entry.seq, 1);
+        drop(second);
+
+        let resumed = SessionJournal::resume(&path, run_id, session_id)?;
+        assert_eq!(resumed.entries.len(), 2);
+        assert_eq!(resumed.next_seq, 2);
+        assert_eq!(resumed.entries[0].seq, 0);
+        assert_eq!(resumed.entries[1].seq, 1);
+
+        remove_if_exists(&path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn cassette_key_is_sha256_based_and_stable() {
+        let a = CassetteKey::from_request("GET", "https://example.com/api", b"payload");
+        let b = CassetteKey::from_request("GET", "https://example.com/api", b"payload");
+        // Deterministic: identical input yields an identical key.
+        assert_eq!(a, b);
+
+        // SHA-256 hex digest is 64 lowercase hex characters.
+        assert_eq!(a.0.len(), 64);
+        assert!(a
+            .0
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+
+        // Known SHA-256 of "GET\0https://example.com/api\0payload".
+        let expected = {
+            let mut hasher = Sha256::new();
+            hasher.update(b"GET\0https://example.com/api\0payload");
+            let digest = hasher.finalize();
+            let mut key = String::with_capacity(digest.len() * 2);
+            for byte in digest {
+                let _ = write!(key, "{byte:02x}");
+            }
+            key
+        };
+        assert_eq!(a.0, expected);
+
+        // Distinct request components produce distinct keys (field separation is
+        // unambiguous: "GET" + "x" must not collide with "GETx" + "").
+        let split = CassetteKey::from_request("GET", "x", b"");
+        let joined = CassetteKey::from_request("GETx", "", b"");
+        assert_ne!(split, joined);
+
+        let other_method = CassetteKey::from_request("POST", "https://example.com/api", b"payload");
+        assert_ne!(a, other_method);
     }
 
     fn unique_path(label: &str) -> Result<PathBuf, std::time::SystemTimeError> {
