@@ -312,6 +312,17 @@ impl AgentLoop {
         Ok(())
     }
 
+    /// Journal a driver transport failure before returning it to the caller.
+    pub fn record_transport_error(
+        &mut self,
+        context: impl Into<String>,
+        error: &TransportError,
+    ) -> Result<(), AgentError> {
+        self.journal
+            .append(JournalEvent::from_transport_error(context, error))?;
+        Ok(())
+    }
+
     pub fn close_session(&mut self) -> Result<(), AgentError> {
         self.journal.append(JournalEvent::SessionClosed)?;
         self.cursor.closed = true;
@@ -577,7 +588,7 @@ impl AgentRunner {
             let observation = driver
                 .goto(&task.start_url)
                 .await
-                .map_err(|source| AgentError::transport("initial goto", source))?;
+                .map_err(|source| journal_transport_error(&mut agent, "initial goto", source))?;
             current_origin = self.origin_for_url("initial observation", &observation.url)?;
             agent.record_session_started(task.start_url.clone())?;
             self.record_observation(&mut agent, &mut report, observation)?;
@@ -585,7 +596,7 @@ impl AgentRunner {
             let observation = driver
                 .observe()
                 .await
-                .map_err(|source| AgentError::transport("resume observe", source))?;
+                .map_err(|source| journal_transport_error(&mut agent, "resume observe", source))?;
             current_origin = self.origin_for_url("resume observation", &observation.url)?;
             self.record_observation(&mut agent, &mut report, observation)?;
         }
@@ -664,10 +675,14 @@ impl AgentRunner {
             let execution = match &compiled_skill {
                 Some(skill) => execute_batch(driver, &skill.batch)
                     .await
-                    .map_err(|source| AgentError::transport("execute skill", source))?,
+                    .map_err(|source| {
+                        journal_transport_error(&mut agent, "execute skill", source)
+                    })?,
                 None => execute_action(driver, &planned.action)
                     .await
-                    .map_err(|source| AgentError::transport("execute action", source))?,
+                    .map_err(|source| {
+                        journal_transport_error(&mut agent, "execute action", source)
+                    })?,
             };
             let outcome = match execution.status {
                 ExecutionStatus::Applied => StepOutcome::Applied {
@@ -678,10 +693,9 @@ impl AgentRunner {
             let triple = agent.record_next_outcome(outcome)?;
             report.actions_completed += 1;
 
-            let observation = driver
-                .observe()
-                .await
-                .map_err(|source| AgentError::transport("post-action observe", source))?;
+            let observation = driver.observe().await.map_err(|source| {
+                journal_transport_error(&mut agent, "post-action observe", source)
+            })?;
             current_origin = self.origin_for_url("post-action observation", &observation.url)?;
             let observation_budget =
                 self.record_observation(&mut agent, &mut report, observation)?;
@@ -1041,6 +1055,17 @@ pub fn step_triples_from_journal(
     Ok(triples)
 }
 
+fn journal_transport_error(
+    agent: &mut AgentLoop,
+    context: &'static str,
+    source: TransportError,
+) -> AgentError {
+    match agent.record_transport_error(context, &source) {
+        Ok(()) => AgentError::transport(context, source),
+        Err(error) => error,
+    }
+}
+
 fn has_session_started(entries: &[JournalEntry]) -> bool {
     entries
         .iter()
@@ -1380,6 +1405,139 @@ mod tests {
             entries.last().map(|entry| &entry.event),
             Some(JournalEvent::SessionClosed)
         ));
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runner_journals_initial_goto_transport_error() -> TestResult {
+        let root = unique_dir("runner-transport-goto")?;
+        remove_dir_if_exists(&root)?;
+        fs::create_dir_all(&root)?;
+        let journal_path = root.join("session.jsonl");
+        let task = DriverTask::new("https://example.com", vec![]);
+        let mut driver = FailingDriver::new(TransportFailurePoint::Goto);
+        let runner = AgentRunner::new(
+            &journal_path,
+            AgentRunIds::new("run-transport-goto", "session-transport-goto"),
+        );
+
+        let error = runner.run_driver_task(&mut driver, &task).await.err();
+
+        assert!(matches!(
+            error,
+            Some(AgentError::Transport {
+                context,
+                source: TransportError::NavTimeout,
+            }) if context == "initial goto"
+        ));
+        let entries = read_journal_entries(&journal_path)?;
+        assert_eq!(entries.len(), 1);
+        assert!(has_transport_error(
+            &entries,
+            "initial goto",
+            "navigation timed out"
+        ));
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runner_journals_execute_action_transport_error() -> TestResult {
+        let root = unique_dir("runner-transport-action")?;
+        remove_dir_if_exists(&root)?;
+        fs::create_dir_all(&root)?;
+        let journal_path = root.join("session.jsonl");
+        let task = DriverTask::new(
+            "https://example.com",
+            vec![Action::Click {
+                node: NodeId("submit".into()),
+            }],
+        );
+        let mut driver =
+            FailingDriver::new(TransportFailurePoint::Act).with_elements(vec![button("submit")]);
+        let runner = AgentRunner::new(
+            &journal_path,
+            AgentRunIds::new("run-transport-action", "session-transport-action"),
+        );
+
+        let error = runner.run_driver_task(&mut driver, &task).await.err();
+
+        assert!(matches!(
+            error,
+            Some(AgentError::Transport { context, .. }) if context == "execute action"
+        ));
+        let entries = read_journal_entries(&journal_path)?;
+        let planned_pos = entries
+            .iter()
+            .position(|entry| matches!(entry.event, JournalEvent::ActionPlanned { .. }));
+        let transport_pos = entries.iter().position(|entry| {
+            matches!(
+                &entry.event,
+                JournalEvent::TransportError { context, reason }
+                    if context == "execute action" && reason.contains("act failed")
+            )
+        });
+        assert!(matches!(
+            (planned_pos, transport_pos),
+            (Some(planned), Some(transport)) if planned < transport
+        ));
+        assert!(!entries
+            .iter()
+            .any(|entry| matches!(entry.event, JournalEvent::StepApplied { .. })));
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runner_journals_post_action_observe_transport_error() -> TestResult {
+        let root = unique_dir("runner-transport-post-observe")?;
+        remove_dir_if_exists(&root)?;
+        fs::create_dir_all(&root)?;
+        let journal_path = root.join("session.jsonl");
+        let task = DriverTask::new(
+            "https://example.com",
+            vec![Action::Click {
+                node: NodeId("submit".into()),
+            }],
+        );
+        let mut driver = FailingDriver::new(TransportFailurePoint::PostActionObserve)
+            .with_elements(vec![button("submit")]);
+        let runner = AgentRunner::new(
+            &journal_path,
+            AgentRunIds::new(
+                "run-transport-post-observe",
+                "session-transport-post-observe",
+            ),
+        );
+
+        let error = runner.run_driver_task(&mut driver, &task).await.err();
+
+        assert!(matches!(
+            error,
+            Some(AgentError::Transport { context, .. }) if context == "post-action observe"
+        ));
+        let entries = read_journal_entries(&journal_path)?;
+        let applied_pos = entries
+            .iter()
+            .position(|entry| matches!(entry.event, JournalEvent::StepApplied { .. }));
+        let transport_pos = entries.iter().position(|entry| {
+            matches!(
+                &entry.event,
+                JournalEvent::TransportError { context, reason }
+                    if context == "post-action observe" && reason.contains("engine crashed")
+            )
+        });
+        assert!(matches!(
+            (applied_pos, transport_pos),
+            (Some(applied), Some(transport)) if applied < transport
+        ));
+        assert!(!entries
+            .iter()
+            .any(|entry| matches!(entry.event, JournalEvent::SessionClosed)));
 
         remove_dir_if_exists(&root)?;
         Ok(())
@@ -1925,6 +2083,113 @@ mod tests {
 
         remove_dir_if_exists(&root)?;
         Ok(())
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum TransportFailurePoint {
+        Goto,
+        Act,
+        PostActionObserve,
+    }
+
+    struct FailingDriver {
+        inner: TestDriver,
+        failure: TransportFailurePoint,
+        observe_calls: usize,
+    }
+
+    impl FailingDriver {
+        fn new(failure: TransportFailurePoint) -> Self {
+            Self {
+                inner: TestDriver::new(),
+                failure,
+                observe_calls: 0,
+            }
+        }
+
+        fn with_elements(mut self, elements: Vec<InteractiveElement>) -> Self {
+            self.inner = self.inner.with_elements(elements);
+            self
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl DriverTrait for FailingDriver {
+        fn engine(&self) -> Engine {
+            Engine::Test
+        }
+
+        async fn goto(&mut self, url: &str) -> Result<CompiledObservation, TransportError> {
+            if self.failure == TransportFailurePoint::Goto {
+                return Err(TransportError::NavTimeout);
+            }
+            self.inner.goto(url).await
+        }
+
+        async fn observe(&mut self) -> Result<CompiledObservation, TransportError> {
+            self.observe_calls += 1;
+            if self.failure == TransportFailurePoint::PostActionObserve && self.observe_calls == 2 {
+                return Err(TransportError::EngineGone);
+            }
+            self.inner.observe().await
+        }
+
+        async fn observe_diff(
+            &mut self,
+            since_seq: u64,
+        ) -> Result<ObservationDiff, TransportError> {
+            self.inner.observe_diff(since_seq).await
+        }
+
+        async fn act(&mut self, action: &Action) -> Result<StepOutcome, TransportError> {
+            if self.failure == TransportFailurePoint::Act {
+                return Err(TransportError::Other("act failed".into()));
+            }
+            self.inner.act(action).await
+        }
+
+        async fn act_batch(&mut self, batch: &ActionBatch) -> Result<StepOutcome, TransportError> {
+            if self.failure == TransportFailurePoint::Act {
+                return Err(TransportError::Other("act failed".into()));
+            }
+            self.inner.act_batch(batch).await
+        }
+
+        async fn fork(&mut self) -> Result<Box<dyn DriverTrait>, tempo_driver::Unsupported> {
+            self.inner.fork().await
+        }
+
+        async fn extract(&mut self, node: &NodeId) -> Result<serde_json::Value, TransportError> {
+            self.inner.extract(node).await
+        }
+
+        async fn evaluate_script(
+            &mut self,
+            expression: &str,
+            await_promise: bool,
+        ) -> Result<serde_json::Value, TransportError> {
+            self.inner.evaluate_script(expression, await_promise).await
+        }
+
+        async fn screenshot(&mut self) -> Result<Vec<u8>, TransportError> {
+            self.inner.screenshot().await
+        }
+
+        async fn close(&mut self) -> Result<(), TransportError> {
+            self.inner.close().await
+        }
+    }
+
+    fn has_transport_error(entries: &[JournalEntry], context: &str, reason: &str) -> bool {
+        entries.iter().any(|entry| {
+            matches!(
+                &entry.event,
+                JournalEvent::TransportError {
+                    context: recorded_context,
+                    reason: recorded_reason,
+                } if recorded_context == context && recorded_reason.contains(reason)
+            )
+        })
     }
 
     fn diff(since_seq: u64, seq: u64) -> ObservationDiff {
