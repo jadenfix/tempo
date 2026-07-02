@@ -5,6 +5,7 @@
 //! length-prefixed JSON frame codec, and session journal recovery hook used when
 //! an engine child exits mid-task.
 
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs;
@@ -13,7 +14,7 @@ use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use tempo_driver::{StepOutcome, TransportError, Unsupported};
+use tempo_driver::{DriverTrait, Engine, StepOutcome, TransportError, Unsupported};
 use tempo_schema::{Action, ActionBatch, CompiledObservation, NodeId, ObservationDiff};
 use tempo_session::{JournalError, ResumeState, RunId, SessionId, SessionJournal};
 use thiserror::Error;
@@ -395,6 +396,172 @@ impl EngineIpcClient {
     }
 }
 
+/// `DriverTrait` implementation backed by an engine-host UDS connection.
+///
+/// This is the host-side adapter tempod and protocol servers can hold once an
+/// engine child has connected. Every method is translated to a length-prefixed
+/// `DriverCommand` frame and waits for the matching `DriverResponse`.
+pub struct EngineIpcDriver {
+    client: EngineIpcClient,
+    engine: Engine,
+}
+
+impl EngineIpcDriver {
+    pub fn new(client: EngineIpcClient, engine: Engine) -> Self {
+        Self { client, engine }
+    }
+
+    pub fn connect(path: impl AsRef<Path>, engine: Engine) -> Result<Self, EngineHostError> {
+        Ok(Self::new(EngineIpcClient::connect(path)?, engine))
+    }
+
+    pub fn client(&self) -> &EngineIpcClient {
+        &self.client
+    }
+
+    pub fn client_mut(&mut self) -> &mut EngineIpcClient {
+        &mut self.client
+    }
+
+    pub fn into_client(self) -> EngineIpcClient {
+        self.client
+    }
+
+    fn request(&mut self, command: DriverCommand) -> Result<DriverResponse, TransportError> {
+        self.client
+            .request(command)
+            .map_err(|error| TransportError::Other(error.to_string()))
+    }
+}
+
+#[async_trait]
+impl DriverTrait for EngineIpcDriver {
+    fn engine(&self) -> Engine {
+        self.engine
+    }
+
+    async fn goto(&mut self, url: &str) -> Result<CompiledObservation, TransportError> {
+        expect_observation(self.request(DriverCommand::Goto { url: url.into() })?)
+    }
+
+    async fn observe(&mut self) -> Result<CompiledObservation, TransportError> {
+        expect_observation(self.request(DriverCommand::Observe)?)
+    }
+
+    async fn observe_diff(&mut self, since_seq: u64) -> Result<ObservationDiff, TransportError> {
+        expect_diff(self.request(DriverCommand::ObserveDiff { since_seq })?)
+    }
+
+    async fn act(&mut self, action: &Action) -> Result<StepOutcome, TransportError> {
+        expect_step(self.request(DriverCommand::Act {
+            action: action.clone(),
+        })?)
+    }
+
+    async fn act_batch(&mut self, batch: &ActionBatch) -> Result<StepOutcome, TransportError> {
+        expect_step(self.request(DriverCommand::ActBatch {
+            batch: batch.clone(),
+        })?)
+    }
+
+    async fn fork(&mut self) -> Result<Box<dyn DriverTrait>, Unsupported> {
+        match self.client.request(DriverCommand::Fork) {
+            Ok(DriverResponse::Error { error }) => Err(unsupported_from_wire_error(error)),
+            Ok(DriverResponse::Forked { .. }) => Err(Unsupported(
+                "remote fork returned detached driver attachment",
+            )),
+            Ok(_) => Err(Unsupported("remote fork returned unexpected response")),
+            Err(_) => Err(Unsupported("remote fork request failed")),
+        }
+    }
+
+    async fn extract(&mut self, node: &NodeId) -> Result<Value, TransportError> {
+        expect_extracted(self.request(DriverCommand::Extract { node: node.clone() })?)
+    }
+
+    async fn screenshot(&mut self) -> Result<Vec<u8>, TransportError> {
+        expect_screenshot(self.request(DriverCommand::Screenshot)?)
+    }
+
+    async fn close(&mut self) -> Result<(), TransportError> {
+        expect_closed(self.request(DriverCommand::Close)?)
+    }
+}
+
+fn expect_observation(response: DriverResponse) -> Result<CompiledObservation, TransportError> {
+    match response {
+        DriverResponse::Observation { observation } => Ok(observation),
+        DriverResponse::Error { error } => Err(transport_from_wire_error(error)),
+        other => Err(unexpected_driver_response("observation", other)),
+    }
+}
+
+fn expect_diff(response: DriverResponse) -> Result<ObservationDiff, TransportError> {
+    match response {
+        DriverResponse::Diff { diff } => Ok(diff),
+        DriverResponse::Error { error } => Err(transport_from_wire_error(error)),
+        other => Err(unexpected_driver_response("diff", other)),
+    }
+}
+
+fn expect_step(response: DriverResponse) -> Result<StepOutcome, TransportError> {
+    match response {
+        DriverResponse::Step { outcome } => Ok(outcome.into()),
+        DriverResponse::Error { error } => Err(transport_from_wire_error(error)),
+        other => Err(unexpected_driver_response("step", other)),
+    }
+}
+
+fn expect_extracted(response: DriverResponse) -> Result<Value, TransportError> {
+    match response {
+        DriverResponse::Extracted { value } => Ok(value),
+        DriverResponse::Error { error } => Err(transport_from_wire_error(error)),
+        other => Err(unexpected_driver_response("extracted value", other)),
+    }
+}
+
+fn expect_screenshot(response: DriverResponse) -> Result<Vec<u8>, TransportError> {
+    match response {
+        DriverResponse::Screenshot { bytes } => Ok(bytes),
+        DriverResponse::Error { error } => Err(transport_from_wire_error(error)),
+        other => Err(unexpected_driver_response("screenshot", other)),
+    }
+}
+
+fn expect_closed(response: DriverResponse) -> Result<(), TransportError> {
+    match response {
+        DriverResponse::Closed => Ok(()),
+        DriverResponse::Error { error } => Err(transport_from_wire_error(error)),
+        other => Err(unexpected_driver_response("closed", other)),
+    }
+}
+
+fn transport_from_wire_error(error: DriverWireError) -> TransportError {
+    match error {
+        DriverWireError::Transport { message }
+        | DriverWireError::Unsupported {
+            capability: message,
+        }
+        | DriverWireError::Protocol { message } => TransportError::Other(message),
+    }
+}
+
+fn unsupported_from_wire_error(error: DriverWireError) -> Unsupported {
+    match error {
+        DriverWireError::Unsupported { .. } => {
+            Unsupported("remote engine reported unsupported fork")
+        }
+        DriverWireError::Transport { .. } => Unsupported("remote fork transport failed"),
+        DriverWireError::Protocol { .. } => Unsupported("remote fork protocol failed"),
+    }
+}
+
+fn unexpected_driver_response(expected: &'static str, response: DriverResponse) -> TransportError {
+    TransportError::Other(format!(
+        "expected {expected} driver response, got {response:?}"
+    ))
+}
+
 /// Accepted server-side engine connection.
 pub struct EngineIpcConnection {
     stream: UnixStream,
@@ -537,6 +704,7 @@ mod tests {
     use tempo_session::JournalEvent;
 
     type TestResult = Result<(), Box<dyn Error>>;
+    type DriverServerHandle = thread::JoinHandle<Result<Vec<DriverCommand>, EngineHostError>>;
 
     #[test]
     fn frame_codec_round_trips_json_payload() -> TestResult {
@@ -688,6 +856,64 @@ mod tests {
     }
 
     #[test]
+    fn ipc_driver_implements_driver_trait_over_uds() -> TestResult {
+        let diff = ObservationDiff {
+            since_seq: 4,
+            seq: 5,
+            added: vec![],
+            removed: vec![],
+            changed: vec![],
+        };
+        let (mut driver, server) = driver_pair(vec![
+            DriverResponse::Diff { diff: diff.clone() },
+            DriverResponse::Step {
+                outcome: WireStepOutcome::Applied { diff: diff.clone() },
+            },
+            DriverResponse::Screenshot {
+                bytes: vec![1, 2, 3],
+            },
+            DriverResponse::Closed,
+        ])?;
+
+        let observed = futures::executor::block_on(driver.observe_diff(4))?;
+        let acted = futures::executor::block_on(driver.act(&Action::Scroll { x: 0.0, y: 1.0 }))?;
+        let screenshot = futures::executor::block_on(driver.screenshot())?;
+        futures::executor::block_on(driver.close())?;
+        let commands = join_driver_server(server)?;
+
+        assert_eq!(driver.engine(), Engine::Cdp);
+        assert_eq!(observed, diff.clone());
+        assert!(matches!(acted, StepOutcome::Applied { diff: actual } if actual == diff));
+        assert_eq!(screenshot, vec![1, 2, 3]);
+        assert_eq!(
+            commands,
+            vec![
+                DriverCommand::ObserveDiff { since_seq: 4 },
+                DriverCommand::Act {
+                    action: Action::Scroll { x: 0.0, y: 1.0 },
+                },
+                DriverCommand::Screenshot,
+                DriverCommand::Close,
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ipc_driver_maps_wire_errors_to_transport_errors() -> TestResult {
+        let (mut driver, server) = driver_pair(vec![DriverResponse::Error {
+            error: DriverWireError::transport(&TransportError::NavTimeout),
+        }])?;
+
+        let error = futures::executor::block_on(driver.observe()).err();
+        let commands = join_driver_server(server)?;
+
+        assert!(matches!(error, Some(TransportError::Other(_))));
+        assert_eq!(commands, vec![DriverCommand::Observe]);
+        Ok(())
+    }
+
+    #[test]
     fn spawn_with_ipc_binds_socket_and_passes_path_to_child() -> TestResult {
         let root = unique_dir("spawn-ipc")?;
         remove_dir_if_exists(&root)?;
@@ -742,6 +968,33 @@ mod tests {
             Ok(result) => Ok(result?),
             Err(_) => Err("client thread panicked".into()),
         }
+    }
+
+    fn join_driver_server(
+        handle: DriverServerHandle,
+    ) -> Result<Vec<DriverCommand>, Box<dyn Error>> {
+        match handle.join() {
+            Ok(result) => Ok(result?),
+            Err(_) => Err("driver server thread panicked".into()),
+        }
+    }
+
+    fn driver_pair(
+        responses: Vec<DriverResponse>,
+    ) -> Result<(EngineIpcDriver, DriverServerHandle), std::io::Error> {
+        let (client_stream, server_stream) = UnixStream::pair()?;
+        let driver = EngineIpcDriver::new(EngineIpcClient::from_stream(client_stream), Engine::Cdp);
+        let handle = thread::spawn(move || -> Result<Vec<DriverCommand>, EngineHostError> {
+            let mut connection = EngineIpcConnection::from_stream(server_stream);
+            let mut commands = Vec::with_capacity(responses.len());
+            for response in responses {
+                let request = connection.read_driver_request()?;
+                commands.push(request.command);
+                connection.write_driver_response(request.id, response)?;
+            }
+            Ok(commands)
+        });
+        Ok((driver, handle))
     }
 
     fn shell_config(script: &str) -> EngineHostConfig {
