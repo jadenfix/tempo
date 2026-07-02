@@ -13,7 +13,8 @@ use serde_json::{json, Value};
 use tempo_driver::{DriverTrait, Engine, StepOutcome};
 use tempo_handshake::{
     decide_lane, probe_http_origin, probe_urls, HttpProbeConfig, HttpProbeFailure,
-    Lane as HandshakeLane, ProbeHit, ProbeReport, ProbeResponse, StructuredSignal,
+    Lane as HandshakeLane, ProbeHit, ProbeReport, ProbeResponse, StructuredSignal, WebMcpDetection,
+    WEB_MCP_DETECTION_SCRIPT,
 };
 use tempo_observe::composite_set_of_marks_png;
 use tempo_schema::{Action, ActionBatch, NodeId};
@@ -366,10 +367,15 @@ where
             "handshake" => {
                 let args: HandshakeArgs = parse_args(arguments)?;
                 let probe = run_handshake_probe(&args, &self.handshake_probe_config).await;
+                let web_mcp = {
+                    let driver = self.driver_for_mut(args.driver_id.as_deref())?;
+                    Some(run_web_mcp_detection(driver).await)
+                };
                 Ok(ToolCall::success(handshake_result_json(
                     &self.handshake_report,
                     args,
                     probe,
+                    web_mcp,
                 )))
             }
             _ => Err(JsonRpcError::invalid_params("unknown tool")),
@@ -545,8 +551,8 @@ pub fn tools() -> Vec<ToolDescriptor> {
             input_schema: object_schema(
                 vec![
                     ("origin", json!({"type": "string"})),
-                    ("web_mcp", json!({"type": "boolean"})),
                     ("live_http", json!({"type": "boolean"})),
+                    ("driver_id", json!({"type": "string"})),
                     ("responses", json!({"type": "array"})),
                 ],
                 &[],
@@ -680,7 +686,7 @@ struct HandshakeArgs {
     #[serde(default)]
     origin: Option<String>,
     #[serde(default)]
-    web_mcp: Option<bool>,
+    driver_id: Option<String>,
     #[serde(default)]
     live_http: Option<bool>,
     #[serde(default)]
@@ -740,6 +746,14 @@ async fn run_handshake_probe(
     config: &HttpProbeConfig,
 ) -> Option<Result<tempo_handshake::HttpProbeRun, String>> {
     run_handshake_probe_blocking(args, config)
+}
+
+async fn run_web_mcp_detection(driver: &mut dyn DriverTrait) -> Result<WebMcpDetection, String> {
+    let value = driver
+        .evaluate_script(WEB_MCP_DETECTION_SCRIPT, false)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(WebMcpDetection::from_script_result(&value))
 }
 
 fn run_handshake_probe_thread(
@@ -825,6 +839,7 @@ fn driverless_tools_call(
         &ProbeReport::new(),
         args,
         probe,
+        None,
     ))))
 }
 
@@ -835,6 +850,7 @@ fn handshake_result_json(
     handshake_report: &ProbeReport,
     args: HandshakeArgs,
     probe: Option<Result<tempo_handshake::HttpProbeRun, String>>,
+    web_mcp: Option<Result<WebMcpDetection, String>>,
 ) -> Value {
     let mut report = ProbeReport::from_hits(handshake_report.hits().to_vec());
     let origin = args.origin.clone();
@@ -842,7 +858,6 @@ fn handshake_result_json(
     for hit in response_report.hits() {
         report.add_hit(hit.clone());
     }
-    report.record_web_mcp(args.web_mcp.unwrap_or(false));
 
     let mut live_http = false;
     let mut probe_responses = Vec::new();
@@ -871,6 +886,25 @@ fn handshake_result_json(
             }
         }
     }
+    let mut web_mcp_checked = false;
+    let mut web_mcp_available = false;
+    let mut web_mcp_value_type = None;
+    let mut web_mcp_has_tools = false;
+    let mut web_mcp_error = None;
+    if let Some(result) = web_mcp {
+        web_mcp_checked = true;
+        match result {
+            Ok(detection) => {
+                report.record_web_mcp_detection(&detection);
+                web_mcp_available = detection.available;
+                web_mcp_value_type = detection.value_type;
+                web_mcp_has_tools = detection.has_tools;
+            }
+            Err(error) => {
+                web_mcp_error = Some(error);
+            }
+        }
+    }
 
     let decision = decide_lane(&report);
     json!({
@@ -883,6 +917,14 @@ fn handshake_result_json(
         "probe_responses": probe_responses,
         "probe_failures": probe_failures,
         "probe_error": probe_error,
+        "web_mcp": {
+            "checked": web_mcp_checked,
+            "available": web_mcp_available,
+            "source": "navigator.modelContext",
+            "type": web_mcp_value_type,
+            "has_tools": web_mcp_has_tools,
+            "error": web_mcp_error,
+        },
     })
 }
 
@@ -1361,10 +1403,53 @@ mod tests {
             "https://example.test/.well-known/beater.json"
         );
         assert_eq!(result["live_http"], false);
+        assert_eq!(result["web_mcp"]["checked"], true);
+        assert_eq!(result["web_mcp"]["available"], false);
         assert!(result["probe_responses"]
             .as_array()
             .ok_or("probe_responses must be an array")?
             .is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn handshake_tool_detects_web_mcp_from_driver_script() -> Result<(), String> {
+        let mut server = TempoMcpServer::new(MemoryDriver::new().with_web_mcp());
+        let result = call_tool(
+            &mut server,
+            "handshake",
+            json!({"origin": "https://example.test"}),
+        )
+        .await?;
+
+        assert_eq!(result["lane"], "mcp");
+        assert_eq!(result["skips_render"], true);
+        assert_eq!(result["selected"]["signal"], "web_mcp");
+        assert_eq!(result["selected"]["source"], "navigator.modelContext");
+        assert_eq!(result["web_mcp"]["checked"], true);
+        assert_eq!(result["web_mcp"]["available"], true);
+        assert_eq!(result["web_mcp"]["type"], "object");
+        assert_eq!(result["web_mcp"]["has_tools"], true);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn handshake_tool_does_not_select_unusable_web_mcp_object() -> Result<(), String> {
+        let mut server = TempoMcpServer::new(MemoryDriver::new().with_unusable_web_mcp());
+        let result = call_tool(
+            &mut server,
+            "handshake",
+            json!({"origin": "https://example.test", "live_http": false}),
+        )
+        .await?;
+
+        assert_ne!(result["selected"]["signal"], "web_mcp");
+        assert_eq!(result["lane"], "render");
+        assert_eq!(result["skips_render"], false);
+        assert_eq!(result["web_mcp"]["checked"], true);
+        assert_eq!(result["web_mcp"]["available"], true);
+        assert_eq!(result["web_mcp"]["type"], "object");
+        assert_eq!(result["web_mcp"]["has_tools"], false);
         Ok(())
     }
 
@@ -1667,6 +1752,8 @@ mod tests {
     #[derive(Clone)]
     struct MemoryDriver {
         observation: CompiledObservation,
+        web_mcp_available: bool,
+        web_mcp_has_tools: bool,
         // Shared across forks (fork() clones this handle) so tests can assert that
         // close() actually ran on a forked driver rather than it merely being dropped.
         closed: Arc<AtomicUsize>,
@@ -1676,6 +1763,8 @@ mod tests {
         fn new() -> Self {
             Self {
                 closed: Arc::new(AtomicUsize::new(0)),
+                web_mcp_available: false,
+                web_mcp_has_tools: false,
                 observation: CompiledObservation {
                     schema_version: tempo_schema::SCHEMA_VERSION.into(),
                     url: "https://example.test/".into(),
@@ -1694,6 +1783,18 @@ mod tests {
                     marks: vec![(NodeId("button.primary".into()), 1)],
                 },
             }
+        }
+
+        fn with_web_mcp(mut self) -> Self {
+            self.web_mcp_available = true;
+            self.web_mcp_has_tools = true;
+            self
+        }
+
+        fn with_unusable_web_mcp(mut self) -> Self {
+            self.web_mcp_available = true;
+            self.web_mcp_has_tools = false;
+            self
         }
     }
 
@@ -1759,6 +1860,13 @@ mod tests {
             expression: &str,
             await_promise: bool,
         ) -> Result<Value, TransportError> {
+            if expression == WEB_MCP_DETECTION_SCRIPT {
+                return Ok(json!({
+                    "available": self.web_mcp_available,
+                    "type": if self.web_mcp_available { Some("object") } else { None },
+                    "hasTools": self.web_mcp_has_tools,
+                }));
+            }
             Ok(json!({
                 "expression": expression,
                 "awaitPromise": await_promise,

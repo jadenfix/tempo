@@ -13,6 +13,22 @@ use thiserror::Error;
 /// Default response body cap for each pre-render HTTP probe.
 pub const DEFAULT_MAX_PROBE_BODY_BYTES: usize = 64 * 1024;
 
+/// Browser-side probe tempo evaluates before rendering when a live driver exists.
+///
+/// The result is intentionally small and origin-local: it proves whether the page
+/// exposes WebMCP without reading page text into the agent channel.
+pub const WEB_MCP_DETECTION_SCRIPT: &str = r#"
+(() => {
+  const nav = globalThis.navigator;
+  const value = nav && nav.modelContext;
+  return {
+    available: value !== undefined && value !== null,
+    type: value === undefined || value === null ? null : typeof value,
+    hasTools: !!(value && (value.tools || value.listTools || value.callTool))
+  };
+})()
+"#;
+
 /// HTTP endpoints tempo probes before rendering a page.
 pub const DEFAULT_HTTP_PROBES: &[HttpProbe] = &[
     HttpProbe {
@@ -248,6 +264,57 @@ impl ProbeHit {
     }
 }
 
+/// Browser-side WebMCP probe evidence returned by [`WEB_MCP_DETECTION_SCRIPT`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WebMcpDetection {
+    pub available: bool,
+    pub source: String,
+    pub value_type: Option<String>,
+    pub has_tools: bool,
+}
+
+impl WebMcpDetection {
+    pub fn unavailable() -> Self {
+        Self {
+            available: false,
+            source: "navigator.modelContext".into(),
+            value_type: None,
+            has_tools: false,
+        }
+    }
+
+    pub fn from_script_result(value: &serde_json::Value) -> Self {
+        if let Some(available) = value.as_bool() {
+            return Self {
+                available,
+                ..Self::unavailable()
+            };
+        }
+
+        let Some(object) = value.as_object() else {
+            return Self::unavailable();
+        };
+        let available = object
+            .get("available")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let value_type = object
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let has_tools = object
+            .get("hasTools")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        Self {
+            available,
+            source: "navigator.modelContext".into(),
+            value_type,
+            has_tools,
+        }
+    }
+}
+
 /// Complete handshake input gathered by the transport/browser layer.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ProbeReport {
@@ -292,6 +359,15 @@ impl ProbeReport {
             self.add_hit(ProbeHit::new(
                 StructuredSignal::WebMcp,
                 "navigator.modelContext",
+            ));
+        }
+    }
+
+    pub fn record_web_mcp_detection(&mut self, detection: &WebMcpDetection) {
+        if detection.available && detection.has_tools {
+            self.add_hit(ProbeHit::new(
+                StructuredSignal::WebMcp,
+                detection.source.clone(),
             ));
         }
     }
@@ -651,6 +727,45 @@ mod tests {
                 StructuredSignal::WebMcp,
             ]
         );
+    }
+
+    #[test]
+    fn web_mcp_detection_records_browser_side_evidence() {
+        let detected = WebMcpDetection::from_script_result(&serde_json::json!({
+            "available": true,
+            "type": "object",
+            "hasTools": true,
+        }));
+        let unusable = WebMcpDetection::from_script_result(&serde_json::json!({
+            "available": true,
+            "type": "object",
+            "hasTools": false,
+        }));
+        let missing = WebMcpDetection::from_script_result(&serde_json::json!({
+            "available": false,
+            "type": null,
+            "hasTools": false,
+        }));
+        let mut report = ProbeReport::new();
+
+        report.record_web_mcp_detection(&missing);
+        assert!(report.hits().is_empty());
+
+        report.record_web_mcp_detection(&unusable);
+        assert!(report.hits().is_empty());
+        assert!(unusable.available);
+        assert!(!unusable.has_tools);
+
+        report.record_web_mcp_detection(&detected);
+        assert_eq!(
+            report.hits(),
+            &[ProbeHit::new(
+                StructuredSignal::WebMcp,
+                "navigator.modelContext",
+            )]
+        );
+        assert_eq!(detected.value_type.as_deref(), Some("object"));
+        assert!(detected.has_tools);
     }
 
     #[test]
