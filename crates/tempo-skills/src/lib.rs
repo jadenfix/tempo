@@ -277,13 +277,16 @@ impl SkillStore {
             {
                 continue;
             }
-            // A single unparseable or invalid skill file must not brick resolution of
+            // A single malformed or invalid skill file must not brick resolution of
             // every other skill in the store; skip it (with a warning) and continue.
+            // IO errors (e.g. permission denied) are a real environmental problem, not
+            // a bad skill, so they still propagate.
             match Self::load_key(&path) {
                 Ok(key) => keys.push(key),
+                Err(err @ (SkillError::Io(_) | SkillError::OpenSkill { .. })) => return Err(err),
                 Err(err) => {
                     eprintln!(
-                        "tempo-skills: skipping unusable skill file {}: {err}",
+                        "tempo-skills: skipping malformed skill file {}: {err}",
                         path.display()
                     );
                 }
