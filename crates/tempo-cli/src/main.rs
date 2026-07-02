@@ -1230,11 +1230,11 @@ mod tests {
         assert_eq!(value["session_started"], true);
         assert_eq!(value["session_closed"], true);
         assert_eq!(value["applied_steps"], 1);
-        assert_eq!(value["step_triples"].as_array().unwrap().len(), 1);
+        assert_eq!(value["step_triples"].as_array().map(Vec::len), Some(1));
         assert_eq!(value["step_triples"][0]["seq"], 3);
         assert_eq!(value["step_triples"][0]["action"]["kind"], "scroll");
         assert_eq!(value["step_triples"][0]["outcome"]["kind"], "applied");
-        assert_eq!(value["steps"].as_array().unwrap().len(), 1);
+        assert_eq!(value["steps"].as_array().map(Vec::len), Some(1));
         assert_eq!(value["steps"][0]["index"], 0);
         assert_eq!(value["steps"][0]["journal_seq"], 3);
         assert_eq!(value["steps"][0]["action"]["kind"], "scroll");
@@ -1272,8 +1272,8 @@ mod tests {
         let value: Value = serde_json::from_slice(&stdout)?;
         assert_eq!(value["applied_steps"], 0);
         assert_eq!(value["step_errors"], 0);
-        assert_eq!(value["step_triples"].as_array().unwrap().len(), 0);
-        assert_eq!(value["steps"].as_array().unwrap().len(), 1);
+        assert_eq!(value["step_triples"].as_array().map(Vec::len), Some(0));
+        assert_eq!(value["steps"].as_array().map(Vec::len), Some(1));
         assert_eq!(value["steps"][0]["index"], 0);
         assert_eq!(value["steps"][0]["journal_seq"], 0);
         assert_eq!(value["steps"][0]["outcome"]["state"], "pending");
