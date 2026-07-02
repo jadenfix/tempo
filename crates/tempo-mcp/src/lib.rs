@@ -1298,6 +1298,7 @@ mod tests {
     }
 
     fn handle_probe_stream(mut stream: TcpStream) -> Result<(), io::Error> {
+        stream.set_nonblocking(false)?;
         stream.set_read_timeout(Some(Duration::from_secs(5)))?;
         let mut request = Vec::new();
         let mut buffer = [0_u8; 512];
