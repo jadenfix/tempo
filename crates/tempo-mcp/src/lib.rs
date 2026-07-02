@@ -14,6 +14,7 @@ use tempo_handshake::{
     decide_lane, probe_http_origin, probe_urls, HttpProbeConfig, HttpProbeFailure,
     Lane as HandshakeLane, ProbeHit, ProbeReport, ProbeResponse, StructuredSignal,
 };
+use tempo_observe::composite_set_of_marks_png;
 use tempo_schema::{Action, NodeId};
 use thiserror::Error;
 use url::{Host, Url};
@@ -214,14 +215,37 @@ where
                     Err(error) => Ok(ToolCall::error(error.to_string())),
                 }
             }
-            "screenshot" => match self.driver.screenshot().await {
-                Ok(bytes) => Ok(ToolCall::success(json!({
-                    "mime_type": "image/png",
-                    "encoding": "base64",
-                    "data": base64::engine::general_purpose::STANDARD.encode(bytes),
-                }))),
-                Err(error) => Ok(ToolCall::error(error.to_string())),
-            },
+            "screenshot" => {
+                let args: ScreenshotArgs = parse_args(arguments)?;
+                let observation = if args.set_of_marks {
+                    match self.driver.observe().await {
+                        Ok(observation) => Some(observation),
+                        Err(error) => return Ok(ToolCall::error(error.to_string())),
+                    }
+                } else {
+                    None
+                };
+                match self.driver.screenshot().await {
+                    Ok(bytes) => {
+                        let bytes = match observation {
+                            Some(observation) => {
+                                match composite_set_of_marks_png(&bytes, &observation) {
+                                    Ok(bytes) => bytes,
+                                    Err(error) => return Ok(ToolCall::error(error.to_string())),
+                                }
+                            }
+                            None => bytes,
+                        };
+                        Ok(ToolCall::success(json!({
+                            "mime_type": "image/png",
+                            "encoding": "base64",
+                            "set_of_marks": args.set_of_marks,
+                            "data": base64::engine::general_purpose::STANDARD.encode(bytes),
+                        })))
+                    }
+                    Err(error) => Ok(ToolCall::error(error.to_string())),
+                }
+            }
             "handshake" => {
                 let args: HandshakeArgs = parse_args(arguments)?;
                 Ok(ToolCall::success(self.handshake_json(args)))
@@ -331,7 +355,7 @@ pub fn tools() -> Vec<ToolDescriptor> {
         ToolDescriptor {
             name: "screenshot",
             description: "Capture a PNG screenshot as base64.",
-            input_schema: object_schema(vec![], &[]),
+            input_schema: object_schema(vec![("set_of_marks", json!({"type": "boolean"}))], &[]),
         },
         ToolDescriptor {
             name: "handshake",
@@ -424,6 +448,12 @@ impl NodeArgs {
             .or_else(|| self.node_id.map(NodeId))
             .ok_or_else(|| JsonRpcError::invalid_params("extract requires node_id"))
     }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ScreenshotArgs {
+    #[serde(default)]
+    set_of_marks: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -616,6 +646,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use async_trait::async_trait;
+    use base64::Engine as _;
     use serde_json::json;
     use tempo_driver::{TransportError, Unsupported};
     use tempo_net::UrlPolicy;
@@ -624,6 +655,15 @@ mod tests {
     };
 
     use super::*;
+
+    const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+    const TEST_SCREENSHOT_PNG: &[u8] = &[
+        0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, b'I', b'H', b'D',
+        b'R', 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f,
+        0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0a, b'I', b'D', b'A', b'T', 0x78, 0x9c, 0x63, 0x00,
+        0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, b'I',
+        b'E', b'N', b'D', 0xae, 0x42, 0x60, 0x82,
+    ];
 
     #[tokio::test]
     async fn initialize_and_tool_list_follow_mcp_shape() -> Result<(), String> {
@@ -685,7 +725,26 @@ mod tests {
 
         let screenshot = call_tool(&mut server, "screenshot", json!({})).await?;
         assert_eq!(screenshot["encoding"], "base64");
-        assert_eq!(screenshot["data"], "iVBORw==");
+        assert_eq!(screenshot["set_of_marks"], false);
+        let bytes = decode_base64_field(&screenshot, "data")?;
+        assert_eq!(bytes, TEST_SCREENSHOT_PNG);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn screenshot_tool_can_overlay_set_of_marks() -> Result<(), String> {
+        let mut server = TempoMcpServer::new(MemoryDriver::new());
+
+        let raw = call_tool(&mut server, "screenshot", json!({})).await?;
+        let marked = call_tool(&mut server, "screenshot", json!({"set_of_marks": true})).await?;
+
+        assert_eq!(marked["mime_type"], "image/png");
+        assert_eq!(marked["encoding"], "base64");
+        assert_eq!(marked["set_of_marks"], true);
+        let raw_bytes = decode_base64_field(&raw, "data")?;
+        let marked_bytes = decode_base64_field(&marked, "data")?;
+        assert!(marked_bytes.starts_with(PNG_SIGNATURE));
+        assert_ne!(marked_bytes, raw_bytes);
         Ok(())
     }
 
@@ -852,6 +911,15 @@ mod tests {
             return Err(value.to_string());
         }
         Ok(value["result"]["structuredContent"].clone())
+    }
+
+    fn decode_base64_field(value: &Value, field: &str) -> Result<Vec<u8>, String> {
+        let encoded = value[field]
+            .as_str()
+            .ok_or_else(|| format!("{field} must be a string"))?;
+        base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(|error| error.to_string())
     }
 
     fn serve_handshake_fixture(
@@ -1038,7 +1106,7 @@ mod tests {
         }
 
         async fn screenshot(&mut self) -> Result<Vec<u8>, TransportError> {
-            Ok(vec![137, 80, 78, 71])
+            Ok(TEST_SCREENSHOT_PNG.to_vec())
         }
 
         async fn close(&mut self) -> Result<(), TransportError> {
