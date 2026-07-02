@@ -13,3 +13,6 @@ tempo-schema = { path = "../tempo-schema" }
 tempo-driver = { path = "../tempo-driver" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 url = "2"
+
+[lints]
+workspace = true

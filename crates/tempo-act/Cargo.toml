@@ -12,3 +12,6 @@ tempo-driver = { path = "../tempo-driver" }
 async-trait.workspace = true
 futures = "0.3"
 serde_json.workspace = true
+
+[lints]
+workspace = true

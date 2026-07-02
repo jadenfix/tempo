@@ -10,3 +10,6 @@ tempo-driver = { path = "../tempo-driver" }
 tempo-session = { path = "../tempo-session" }
 serde.workspace = true
 thiserror.workspace = true
+
+[lints]
+workspace = true
