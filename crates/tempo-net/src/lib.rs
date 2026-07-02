@@ -620,6 +620,167 @@ pub enum IdentityMode {
     AgentDeclared,
 }
 
+/// Default maximum challenge rate before an origin falls back to user-driven identity.
+pub const DEFAULT_AGENT_CHALLENGE_RATE_LIMIT: f32 = 0.10;
+
+/// Per-origin identity strategy thresholds.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct IdentityStrategyConfig {
+    pub max_agent_challenge_rate: f32,
+}
+
+impl Default for IdentityStrategyConfig {
+    fn default() -> Self {
+        Self {
+            max_agent_challenge_rate: DEFAULT_AGENT_CHALLENGE_RATE_LIMIT,
+        }
+    }
+}
+
+/// Public snapshot of one origin's identity/challenge history.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OriginIdentityStats {
+    pub origin: String,
+    pub total_requests: u64,
+    pub challenged_requests: u64,
+    pub challenge_rate: f32,
+    pub selected_mode: IdentityMode,
+}
+
+/// Per-origin identity strategy driven by observed challenge rate.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct IdentityStrategyTable {
+    config: IdentityStrategyConfig,
+    counters: BTreeMap<String, IdentityOriginCounters>,
+}
+
+impl IdentityStrategyTable {
+    pub fn new(config: IdentityStrategyConfig) -> Self {
+        Self {
+            config,
+            counters: BTreeMap::new(),
+        }
+    }
+
+    pub fn config(&self) -> IdentityStrategyConfig {
+        self.config
+    }
+
+    /// Record the outcome of one request and return the updated origin snapshot.
+    pub fn record_request(
+        &mut self,
+        url: &str,
+        challenged: bool,
+    ) -> Result<OriginIdentityStats, IdentityStrategyError> {
+        let origin = identity_origin(url)?;
+        let counters = self.counters.entry(origin.clone()).or_default();
+        counters.total_requests = counters.total_requests.saturating_add(1);
+        if challenged {
+            counters.challenged_requests = counters.challenged_requests.saturating_add(1);
+        }
+        Ok(counters.stats(origin, self.config))
+    }
+
+    /// Return the currently selected mode for a URL's origin.
+    pub fn mode_for_url(&self, url: &str) -> Result<IdentityMode, IdentityStrategyError> {
+        let origin = identity_origin(url)?;
+        Ok(self.mode_for_origin(&origin))
+    }
+
+    /// Return the currently selected mode for a canonical origin string.
+    pub fn mode_for_origin(&self, origin: &str) -> IdentityMode {
+        self.counters
+            .get(origin)
+            .map(|counters| counters.selected_mode(self.config))
+            .unwrap_or(IdentityMode::AgentDeclared)
+    }
+
+    /// Return a snapshot for a URL's origin, if that origin has history.
+    pub fn stats_for_url(
+        &self,
+        url: &str,
+    ) -> Result<Option<OriginIdentityStats>, IdentityStrategyError> {
+        let origin = identity_origin(url)?;
+        Ok(self
+            .counters
+            .get(&origin)
+            .map(|counters| counters.stats(origin, self.config)))
+    }
+
+    pub fn all_stats(&self) -> Vec<OriginIdentityStats> {
+        self.counters
+            .iter()
+            .map(|(origin, counters)| counters.stats(origin.clone(), self.config))
+            .collect()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct IdentityOriginCounters {
+    total_requests: u64,
+    challenged_requests: u64,
+}
+
+impl IdentityOriginCounters {
+    fn challenge_rate(self) -> f32 {
+        if self.total_requests == 0 {
+            0.0
+        } else {
+            self.challenged_requests as f32 / self.total_requests as f32
+        }
+    }
+
+    fn selected_mode(self, config: IdentityStrategyConfig) -> IdentityMode {
+        if self.challenge_rate() > config.max_agent_challenge_rate {
+            IdentityMode::UserDriven
+        } else {
+            IdentityMode::AgentDeclared
+        }
+    }
+
+    fn stats(self, origin: String, config: IdentityStrategyConfig) -> OriginIdentityStats {
+        OriginIdentityStats {
+            origin,
+            total_requests: self.total_requests,
+            challenged_requests: self.challenged_requests,
+            challenge_rate: self.challenge_rate(),
+            selected_mode: self.selected_mode(config),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IdentityStrategyError {
+    pub reason: BlockReason,
+}
+
+impl fmt::Display for IdentityStrategyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "invalid identity strategy URL: {}", self.reason.detail)
+    }
+}
+
+impl Error for IdentityStrategyError {}
+
+fn identity_origin(url: &str) -> Result<String, IdentityStrategyError> {
+    let Some((scheme, _)) = url.split_once("://") else {
+        return Err(IdentityStrategyError {
+            reason: BlockReason::new(BlockCode::InvalidUrl, "URL has no scheme separator"),
+        });
+    };
+    let scheme = scheme.to_ascii_lowercase();
+    if scheme != "http" && scheme != "https" {
+        return Err(IdentityStrategyError {
+            reason: BlockReason::new(
+                BlockCode::UnsupportedScheme,
+                format!("scheme '{scheme}' is not http or https"),
+            ),
+        });
+    }
+    let parts = UrlParts::parse(url).map_err(|reason| IdentityStrategyError { reason })?;
+    Ok(parts.origin())
+}
+
 /// Request metadata accepted by tempo-net before engine/network dispatch.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NetworkRequest {
@@ -1592,6 +1753,14 @@ mod tests {
         }
     }
 
+    fn assert_close_f32(actual: f32, expected: f32) -> Result<(), String> {
+        if (actual - expected).abs() <= 0.0001 {
+            Ok(())
+        } else {
+            Err(format!("expected {expected}, got {actual}"))
+        }
+    }
+
     #[test]
     fn url_policy_blocks_private_metadata_and_local_targets() {
         let policy = UrlPolicy::block_private();
@@ -1741,6 +1910,92 @@ mod tests {
             "value",
         );
         assert!(matches!(err, Err(ProfileError::UnknownProfile(_))));
+    }
+
+    #[test]
+    fn identity_strategy_defaults_to_agent_declared_without_history() -> Result<(), String> {
+        let table = IdentityStrategyTable::default();
+
+        assert_eq!(
+            table
+                .mode_for_url("https://example.com/path?query=ignored")
+                .map_err(|error| error.to_string())?,
+            IdentityMode::AgentDeclared
+        );
+        assert_eq!(table.all_stats(), Vec::new());
+        Ok(())
+    }
+
+    #[test]
+    fn identity_strategy_tracks_challenge_rate_by_canonical_origin() -> Result<(), String> {
+        let mut table = IdentityStrategyTable::new(IdentityStrategyConfig {
+            max_agent_challenge_rate: 0.25,
+        });
+
+        let clean = table
+            .record_request("https://Shop.Example:443/path?token=secret", false)
+            .map_err(|error| error.to_string())?;
+        let challenged = table
+            .record_request("https://shop.example/checkout", true)
+            .map_err(|error| error.to_string())?;
+        let other = table
+            .record_request("https://docs.example/path", false)
+            .map_err(|error| error.to_string())?;
+
+        assert_eq!(clean.origin, "https://shop.example");
+        assert_eq!(challenged.origin, "https://shop.example");
+        assert_eq!(challenged.total_requests, 2);
+        assert_eq!(challenged.challenged_requests, 1);
+        assert_close_f32(challenged.challenge_rate, 0.5)?;
+        assert_eq!(challenged.selected_mode, IdentityMode::UserDriven);
+        assert_eq!(other.selected_mode, IdentityMode::AgentDeclared);
+        assert_eq!(
+            table
+                .mode_for_url("https://shop.example/account")
+                .map_err(|error| error.to_string())?,
+            IdentityMode::UserDriven
+        );
+        assert_eq!(
+            table
+                .mode_for_url("https://docs.example/")
+                .map_err(|error| error.to_string())?,
+            IdentityMode::AgentDeclared
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn identity_strategy_keeps_agent_mode_at_or_below_threshold() -> Result<(), String> {
+        let mut table = IdentityStrategyTable::new(IdentityStrategyConfig {
+            max_agent_challenge_rate: 0.50,
+        });
+
+        table
+            .record_request("https://example.com/a", false)
+            .map_err(|error| error.to_string())?;
+        let stats = table
+            .record_request("https://example.com/b", true)
+            .map_err(|error| error.to_string())?;
+
+        assert_close_f32(stats.challenge_rate, 0.5)?;
+        assert_eq!(stats.selected_mode, IdentityMode::AgentDeclared);
+        Ok(())
+    }
+
+    #[test]
+    fn identity_strategy_rejects_non_http_targets() {
+        let mut table = IdentityStrategyTable::default();
+
+        let result = table.record_request("file:///tmp/page.html", true);
+        assert!(matches!(
+            result,
+            Err(IdentityStrategyError {
+                reason: BlockReason {
+                    code: BlockCode::UnsupportedScheme,
+                    ..
+                },
+            })
+        ));
     }
 
     #[test]
