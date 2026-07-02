@@ -521,6 +521,9 @@ fn route_http_request(
 ) -> Result<HttpResponse, TempodError> {
     match (request.method.as_str(), request.path.as_str()) {
         ("GET", "/health") => Ok(HttpResponse::json(200, json!({"ok": true}))),
+        ("GET", tempo_mcp::A2A_AGENT_CARD_PATH) | ("GET", tempo_mcp::A2A_AGENT_JSON_PATH) => Ok(
+            HttpResponse::from_mcp(tempo_mcp::agent_card_response(&request.base_url())),
+        ),
         ("GET", "/mcp") => Ok(HttpResponse::from_mcp(tempo_mcp::handle_get())),
         ("POST", "/mcp") => Ok(route_mcp(pool, &request)),
         ("POST", "/bidi") => Ok(route_bidi(pool, request.body)),
@@ -738,8 +741,27 @@ fn session_id_from_path(path: &str) -> Result<TempodSessionId, TempodError> {
 struct HttpRequest {
     method: String,
     path: String,
+    host: Option<String>,
     origin: Option<String>,
     body: Vec<u8>,
+}
+
+impl HttpRequest {
+    fn base_url(&self) -> String {
+        let host = self
+            .host
+            .as_deref()
+            .filter(|host| valid_host_header(host))
+            .unwrap_or("localhost");
+        format!("http://{host}")
+    }
+}
+
+fn valid_host_header(host: &str) -> bool {
+    !host.is_empty()
+        && host
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic() && !matches!(byte, b'/' | b'\\'))
 }
 
 fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, TempodError> {
@@ -764,6 +786,7 @@ fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, TempodError>
     let headers = String::from_utf8(bytes[..header_end].to_vec())
         .map_err(|err| TempodError::BadRequest(err.to_string()))?;
     let origin = header_value(headers.lines(), "origin");
+    let host = header_value(headers.lines(), "host");
     let mut lines = headers.lines();
     let request_line = lines
         .next()
@@ -796,6 +819,7 @@ fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, TempodError>
     Ok(HttpRequest {
         method,
         path,
+        host,
         origin,
         body: bytes[body_start..body_start + content_len].to_vec(),
     })
@@ -987,6 +1011,81 @@ mod tests {
     }
 
     #[test]
+    fn tempod_serves_agent_card_over_well_known_http() -> TestResult {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let pool = Arc::new(Mutex::new(SessionPool::default()));
+        let handle = thread::spawn(move || serve_one(listener, pool));
+
+        let response = send_http(
+            addr,
+            "GET /.well-known/agent-card.json HTTP/1.1\r\nhost: tempod.test:7777\r\n\r\n",
+        )?;
+        join_server(handle)?;
+
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(response.contains("content-type: application/a2a+json"));
+        let body = response
+            .split("\r\n\r\n")
+            .nth(1)
+            .ok_or("missing HTTP response body")?;
+        let card: Value = serde_json::from_str(body)?;
+        assert_eq!(card["name"], "tempo");
+        assert_eq!(card["url"], "http://tempod.test:7777/mcp");
+        assert_eq!(card["preferredTransport"], "MCP");
+        assert!(card["skills"]
+            .as_array()
+            .ok_or("agent-card skills must be an array")?
+            .iter()
+            .any(|skill| skill["id"] == "handshake"));
+        Ok(())
+    }
+
+    #[test]
+    fn tempod_serves_a2a_agent_json_alias() -> TestResult {
+        let mut pool = SessionPool::default();
+        let response = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "GET".into(),
+                path: tempo_mcp::A2A_AGENT_JSON_PATH.into(),
+                host: Some("localhost:8787".into()),
+                origin: None,
+                body: Vec::new(),
+            },
+        )?;
+
+        assert_eq!(response.status, 200);
+        assert_eq!(
+            response.content_type,
+            tempo_mcp::A2A_AGENT_CARD_CONTENT_TYPE
+        );
+        let card: Value = serde_json::from_slice(&response.body)?;
+        assert_eq!(card["url"], "http://localhost:8787/mcp");
+        Ok(())
+    }
+
+    #[test]
+    fn agent_card_falls_back_when_host_header_is_not_authority() -> TestResult {
+        let mut pool = SessionPool::default();
+        let response = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "GET".into(),
+                path: tempo_mcp::A2A_AGENT_CARD_PATH.into(),
+                host: Some("localhost/path".into()),
+                origin: None,
+                body: Vec::new(),
+            },
+        )?;
+
+        assert_eq!(response.status, 200);
+        let card: Value = serde_json::from_slice(&response.body)?;
+        assert_eq!(card["url"], "http://localhost/mcp");
+        Ok(())
+    }
+
+    #[test]
     fn bidi_endpoint_routes_immediate_protocol_commands() -> TestResult {
         let mut pool = SessionPool::default();
         let response = route_http_request(
@@ -994,6 +1093,7 @@ mod tests {
             HttpRequest {
                 method: "POST".into(),
                 path: "/bidi".into(),
+                host: None,
                 origin: None,
                 body: br#"{"id":1,"method":"session.status","params":{}}"#.to_vec(),
             },
@@ -1015,6 +1115,7 @@ mod tests {
             HttpRequest {
                 method: "POST".into(),
                 path: "/bidi".into(),
+                host: None,
                 origin: None,
                 body: br#"{"id":7,"method":"browsingContext.navigate","params":{"context":"ctx","url":"https://example.test"}}"#.to_vec(),
             },
@@ -1047,6 +1148,7 @@ mod tests {
             HttpRequest {
                 method: "POST".into(),
                 path: "/bidi".into(),
+                host: None,
                 origin: None,
                 body: br#"{"id":7,"method":"browsingContext.navigate","params":{"context":"ctx","url":"https://example.test"}}"#.to_vec(),
             },
@@ -1083,6 +1185,7 @@ mod tests {
             HttpRequest {
                 method: "POST".into(),
                 path: "/bidi".into(),
+                host: None,
                 origin: None,
                 body: br#"{"id":8,"method":"script.evaluate","params":{"expression":"document.title","target":{"context":"ctx"},"awaitPromise":true}}"#.to_vec(),
             },
@@ -1106,6 +1209,7 @@ mod tests {
             HttpRequest {
                 method: "GET".into(),
                 path: "/mcp".into(),
+                host: None,
                 origin: None,
                 body: Vec::new(),
             },
@@ -1115,6 +1219,7 @@ mod tests {
             HttpRequest {
                 method: "POST".into(),
                 path: "/mcp".into(),
+                host: None,
                 origin: None,
                 body: br#"{"jsonrpc":"2.0","id":9,"method":"tools/list"}"#.to_vec(),
             },
@@ -1124,6 +1229,7 @@ mod tests {
             HttpRequest {
                 method: "POST".into(),
                 path: "/mcp".into(),
+                host: None,
                 origin: None,
                 body: br#"{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"handshake","arguments":{"origin":"https://mcp.test","responses":[{"path":"/mcp/catalog.json","status":200,"content_type":"application/json","body":"{\"tools\":[]}"}]}}}"#.to_vec(),
             },
@@ -1133,6 +1239,7 @@ mod tests {
             HttpRequest {
                 method: "POST".into(),
                 path: "/mcp".into(),
+                host: None,
                 origin: None,
                 body: br#"{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"observe","arguments":{}}}"#.to_vec(),
             },
@@ -1177,6 +1284,7 @@ mod tests {
             HttpRequest {
                 method: "POST".into(),
                 path: "/mcp".into(),
+                host: None,
                 origin: Some("http://127.0.0.1".into()),
                 body: br#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"observe","arguments":{}}}"#.to_vec(),
             },
