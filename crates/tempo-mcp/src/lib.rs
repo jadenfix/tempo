@@ -4,6 +4,7 @@
 //! module owns Streamable HTTP JSON-RPC semantics, Origin validation, tool
 //! descriptors, and calls into the real `DriverTrait` and handshake contracts.
 
+use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use base64::Engine as _;
@@ -72,6 +73,8 @@ pub struct ToolDescriptor {
 /// tempo's MCP session router over one driver instance.
 pub struct TempoMcpServer<D> {
     driver: D,
+    forks: BTreeMap<String, Box<dyn DriverTrait>>,
+    next_fork_id: u64,
     handshake_report: ProbeReport,
     handshake_probe_config: HttpProbeConfig,
 }
@@ -80,6 +83,8 @@ impl<D> TempoMcpServer<D> {
     pub fn new(driver: D) -> Self {
         Self {
             driver,
+            forks: BTreeMap::new(),
+            next_fork_id: 1,
             handshake_report: ProbeReport::new(),
             handshake_probe_config: HttpProbeConfig::default(),
         }
@@ -106,12 +111,40 @@ impl<D> TempoMcpServer<D> {
     pub fn handshake_report_mut(&mut self) -> &mut ProbeReport {
         &mut self.handshake_report
     }
+
+    fn register_fork(&mut self, forked: Box<dyn DriverTrait>) -> Result<String, JsonRpcError> {
+        let fork_id = self.next_fork_id;
+        let Some(next_id) = self.next_fork_id.checked_add(1) else {
+            return Err(JsonRpcError::invalid_request(
+                "MCP fork driver id counter exhausted",
+            ));
+        };
+        self.next_fork_id = next_id;
+        let driver_id = format!("fork-{fork_id}");
+        self.forks.insert(driver_id.clone(), forked);
+        Ok(driver_id)
+    }
 }
 
 impl<D> TempoMcpServer<D>
 where
     D: DriverTrait,
 {
+    fn driver_for_mut(
+        &mut self,
+        driver_id: Option<&str>,
+    ) -> Result<&mut (dyn DriverTrait + '_), JsonRpcError> {
+        let Some(driver_id) = driver_id else {
+            return Ok(&mut self.driver);
+        };
+        match self.forks.get_mut(driver_id) {
+            Some(driver) => Ok(driver.as_mut()),
+            None => Err(JsonRpcError::invalid_params(format!(
+                "unknown driver_id: {driver_id}"
+            ))),
+        }
+    }
+
     /// Handle one MCP POST body. `origin` is the HTTP Origin header when present.
     pub async fn handle_post(&mut self, origin: Option<&str>, body: &[u8]) -> McpHttpResponse {
         if !origin_allowed(origin) {
@@ -191,45 +224,66 @@ where
 
     async fn call_tool(&mut self, name: &str, arguments: Value) -> Result<ToolCall, JsonRpcError> {
         match name {
-            "observe" => match self.driver.observe().await {
-                Ok(observation) => Ok(ToolCall::success(json!(observation))),
-                Err(error) => Ok(ToolCall::error(error.to_string())),
-            },
+            "observe" => {
+                let args: DriverTargetArgs = parse_args(arguments)?;
+                let driver = self.driver_for_mut(args.driver_id.as_deref())?;
+                match driver.observe().await {
+                    Ok(observation) => Ok(ToolCall::success(json!(observation))),
+                    Err(error) => Ok(ToolCall::error(error.to_string())),
+                }
+            }
             "act" => {
                 let args: ActArgs = parse_args(arguments)?;
-                match self.driver.act(&args.action).await {
+                let driver = self.driver_for_mut(args.driver_id.as_deref())?;
+                match driver.act(&args.action).await {
                     Ok(outcome) => Ok(ToolCall::success(step_outcome_json(outcome))),
                     Err(error) => Ok(ToolCall::error(error.to_string())),
                 }
             }
-            "fork" => match self.driver.fork().await {
-                Ok(forked) => Ok(ToolCall::success(json!({
-                    "supported": true,
-                    "engine": engine_name(forked.engine()),
-                }))),
-                Err(error) => Ok(ToolCall::success(json!({
-                    "supported": false,
-                    "reason": error.to_string(),
-                }))),
-            },
+            "fork" => {
+                let args: ForkArgs = parse_args(arguments)?;
+                let forked = {
+                    let driver = self.driver_for_mut(args.driver_id.as_deref())?;
+                    driver.fork().await
+                };
+                match forked {
+                    Ok(forked) => {
+                        let engine = engine_name(forked.engine());
+                        let driver_id = self.register_fork(forked)?;
+                        Ok(ToolCall::success(json!({
+                            "supported": true,
+                            "driver_id": driver_id,
+                            "engine": engine,
+                        })))
+                    }
+                    Err(error) => Ok(ToolCall::success(json!({
+                        "supported": false,
+                        "reason": error.to_string(),
+                    }))),
+                }
+            }
             "extract" => {
                 let args: NodeArgs = parse_args(arguments)?;
-                match self.driver.extract(&args.node_id()?).await {
+                let driver_id = args.driver_id.clone();
+                let node = args.node_id()?;
+                let driver = self.driver_for_mut(driver_id.as_deref())?;
+                match driver.extract(&node).await {
                     Ok(value) => Ok(ToolCall::success(value)),
                     Err(error) => Ok(ToolCall::error(error.to_string())),
                 }
             }
             "screenshot" => {
                 let args: ScreenshotArgs = parse_args(arguments)?;
+                let driver = self.driver_for_mut(args.driver_id.as_deref())?;
                 let observation = if args.set_of_marks {
-                    match self.driver.observe().await {
+                    match driver.observe().await {
                         Ok(observation) => Some(observation),
                         Err(error) => return Ok(ToolCall::error(error.to_string())),
                     }
                 } else {
                     None
                 };
-                match self.driver.screenshot().await {
+                match driver.screenshot().await {
                     Ok(bytes) => {
                         let bytes = match observation {
                             Some(observation) => {
@@ -365,17 +419,23 @@ pub fn tools() -> Vec<ToolDescriptor> {
         ToolDescriptor {
             name: "observe",
             description: "Return the current compiled observation.",
-            input_schema: object_schema(vec![], &[]),
+            input_schema: object_schema(vec![("driver_id", json!({"type": "string"}))], &[]),
         },
         ToolDescriptor {
             name: "act",
             description: "Execute one tempo semantic action.",
-            input_schema: object_schema(vec![("action", json!({"type": "object"}))], &["action"]),
+            input_schema: object_schema(
+                vec![
+                    ("action", json!({"type": "object"})),
+                    ("driver_id", json!({"type": "string"})),
+                ],
+                &["action"],
+            ),
         },
         ToolDescriptor {
             name: "fork",
             description: "Fork the current page state when the active driver supports it.",
-            input_schema: object_schema(vec![], &[]),
+            input_schema: object_schema(vec![("driver_id", json!({"type": "string"}))], &[]),
         },
         ToolDescriptor {
             name: "extract",
@@ -384,6 +444,7 @@ pub fn tools() -> Vec<ToolDescriptor> {
                 vec![
                     ("node_id", json!({"type": "string"})),
                     ("node", json!({"type": "string"})),
+                    ("driver_id", json!({"type": "string"})),
                 ],
                 &[],
             ),
@@ -391,7 +452,13 @@ pub fn tools() -> Vec<ToolDescriptor> {
         ToolDescriptor {
             name: "screenshot",
             description: "Capture a PNG screenshot as base64.",
-            input_schema: object_schema(vec![("set_of_marks", json!({"type": "boolean"}))], &[]),
+            input_schema: object_schema(
+                vec![
+                    ("set_of_marks", json!({"type": "boolean"})),
+                    ("driver_id", json!({"type": "string"})),
+                ],
+                &[],
+            ),
         },
         ToolDescriptor {
             name: "handshake",
@@ -472,13 +539,29 @@ impl ToolCall {
     }
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct DriverTargetArgs {
+    #[serde(default)]
+    driver_id: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct ActArgs {
+    #[serde(default)]
+    driver_id: Option<String>,
     action: Action,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ForkArgs {
+    #[serde(default)]
+    driver_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct NodeArgs {
+    #[serde(default)]
+    driver_id: Option<String>,
     #[serde(default)]
     node_id: Option<String>,
     #[serde(default)]
@@ -495,6 +578,8 @@ impl NodeArgs {
 
 #[derive(Debug, Default, Deserialize)]
 struct ScreenshotArgs {
+    #[serde(default)]
+    driver_id: Option<String>,
     #[serde(default)]
     set_of_marks: bool,
 }
@@ -951,11 +1036,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fork_reports_driver_support_without_session_side_channel() -> Result<(), String> {
+    async fn fork_returns_driver_id_and_routes_targeted_tools() -> Result<(), String> {
         let mut server = TempoMcpServer::new(MemoryDriver::new());
+
         let fork = call_tool(&mut server, "fork", json!({})).await?;
+        let driver_id = fork["driver_id"]
+            .as_str()
+            .ok_or("fork response must include driver_id")?
+            .to_string();
         assert_eq!(fork["supported"], true);
+        assert_eq!(driver_id, "fork-1");
         assert_eq!(fork["engine"], "cdp");
+
+        let fork_act = call_tool(
+            &mut server,
+            "act",
+            json!({
+                "driver_id": driver_id.clone(),
+                "action": {"kind": "click", "node": "button.primary"},
+            }),
+        )
+        .await?;
+        let root_observe = call_tool(&mut server, "observe", json!({})).await?;
+        let fork_observe =
+            call_tool(&mut server, "observe", json!({"driver_id": driver_id})).await?;
+
+        assert_eq!(fork_act["status"], "applied");
+        assert_eq!(fork_act["diff"]["seq"], 2);
+        assert_eq!(root_observe["seq"], 1);
+        assert_eq!(fork_observe["seq"], 2);
         Ok(())
     }
 
