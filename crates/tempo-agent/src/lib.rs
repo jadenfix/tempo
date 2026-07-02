@@ -558,7 +558,7 @@ impl AgentRunner {
                 .get(index)
                 .ok_or(AgentError::JournalHasExtraStep { index })?;
             let policy_origin = self.origin_for_step(driver_step, current_origin.as_ref())?;
-            let policy = self.step_policy(driver_step, &planned.key, policy_origin.as_ref());
+            let policy = self.step_policy(driver_step, &planned.key, policy_origin.as_ref())?;
 
             if !policy.confirmed {
                 let reason = policy_denied_reason(&policy);
@@ -704,13 +704,14 @@ impl AgentRunner {
         step: &DriverStep,
         key: &IdempotencyKey,
         origin: Option<&Origin>,
-    ) -> StepPolicyReport {
+    ) -> Result<StepPolicyReport, AgentError> {
+        let side_effect = self.side_effect_for_action(&step.action)?;
         let scoped = self
             .origin_policy
-            .decide_action(origin, &step.action, step.input_taint);
+            .decide_effect(origin, side_effect, step.input_taint);
         let decision = scoped.decision;
         let denied = scoped.blocked();
-        StepPolicyReport {
+        Ok(StepPolicyReport {
             origin: scoped.origin.as_ref().map(origin_label),
             side_effect: decision.side_effect,
             input_tainted: decision.input_taint.is_tainted(),
@@ -728,7 +729,24 @@ impl AgentRunner {
             origin_rules_matched: scoped.matched_rules,
             origin_rule_mode: scoped.rule_mode,
             idempotency_key: key.clone(),
+        })
+    }
+
+    fn side_effect_for_action(&self, action: &Action) -> Result<SideEffect, AgentError> {
+        match action {
+            Action::Skill { name, .. } => self.skill_side_effect(name),
+            _ => Ok(action.side_effect()),
         }
+    }
+
+    fn skill_side_effect(&self, name: &str) -> Result<SideEffect, AgentError> {
+        let root = self
+            .skill_store_root
+            .as_ref()
+            .ok_or_else(|| AgentError::SkillStoreNotConfigured(name.to_string()))?;
+        let store = SkillStore::open(root)?;
+        let key = store.resolve(name)?;
+        Ok(store.get(&key)?.side_effect)
     }
 }
 
@@ -1304,6 +1322,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runner_denies_purchase_skill_before_driver_execution() -> TestResult {
+        let root = unique_dir("runner-purchase-skill-policy")?;
+        remove_dir_if_exists(&root)?;
+        fs::create_dir_all(&root)?;
+        let skills_root = root.join("skills");
+        let store = SkillStore::open(&skills_root)?;
+        let mut skill = click_skill("buy_saved_target", "1");
+        skill.side_effect = SideEffect::Purchase;
+        store.put(&skill)?;
+        let journal_path = root.join("session.jsonl");
+        let skill_action = Action::Skill {
+            name: "buy_saved_target".into(),
+            input: serde_json::json!({"target": "submit"}),
+        };
+        let task = DriverTask::new("https://example.com", vec![skill_action]);
+        let mut driver = TestDriver::new().with_elements(vec![button("submit")]);
+        let runner = AgentRunner::new(
+            &journal_path,
+            AgentRunIds::new("run-purchase-skill-policy", "session-purchase-skill-policy"),
+        )
+        .with_skill_store(&skills_root);
+
+        let report = runner.run_driver_task(&mut driver, &task).await?;
+
+        assert!(matches!(report.status, AgentRunStatus::PolicyDenied { .. }));
+        assert_eq!(report.actions_completed, 1);
+        assert_eq!(report.steps[0].policy.side_effect, SideEffect::Purchase);
+        assert_eq!(
+            report.steps[0].policy.confirmation_gate,
+            ConfirmationGate::Confirm
+        );
+        assert!(!report.steps[0].policy.confirmed);
+        assert!(matches!(
+            report.steps[0].triple.outcome,
+            StepTripleOutcome::StepError { .. }
+        ));
+        assert!(!read_journal_entries(&journal_path)?
+            .iter()
+            .any(|entry| matches!(entry.event, JournalEvent::StepApplied { .. })));
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn runner_reports_missing_skill_store_configuration() -> TestResult {
         let root = unique_dir("runner-skill-missing-store")?;
         remove_dir_if_exists(&root)?;
@@ -1606,6 +1669,7 @@ mod tests {
             name: name.into(),
             version: version.into(),
             description: "click a parameterized target".into(),
+            side_effect: SideEffect::Write,
             inputs: vec![SkillInput::required("target")],
             quiescence: QuiescencePolicy::Composite,
             steps: vec![ActionTemplate::Click {
@@ -1619,6 +1683,7 @@ mod tests {
             name: "click_saved_target".into(),
             version: version.into(),
             description: "delegate click to an inner skill".into(),
+            side_effect: SideEffect::Write,
             inputs: Vec::new(),
             quiescence: QuiescencePolicy::Composite,
             steps: vec![ActionTemplate::Skill {
