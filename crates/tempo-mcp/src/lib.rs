@@ -20,6 +20,9 @@ use thiserror::Error;
 use url::{Host, Url};
 
 pub const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
+pub const A2A_AGENT_CARD_PATH: &str = "/.well-known/agent-card.json";
+pub const A2A_AGENT_JSON_PATH: &str = "/.well-known/agent.json";
+pub const A2A_AGENT_CARD_CONTENT_TYPE: &str = "application/a2a+json";
 const DRIVER_REQUIRED_ERROR_CODE: i64 = -32002;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -265,6 +268,48 @@ pub fn handle_get() -> McpHttpResponse {
         405,
         "this MCP endpoint does not offer a server-initiated stream",
     )
+}
+
+/// Publish tempo as an addressable agent resource.
+///
+/// The card is intentionally honest about the transport tempo serves today:
+/// clients should connect through the MCP endpoint rather than unsupported A2A
+/// task methods.
+pub fn agent_card(base_url: &str) -> Value {
+    let base_url = base_url.trim_end_matches('/');
+    let mcp_url = format!("{base_url}/mcp");
+    json!({
+        "protocolVersion": "0.3.0",
+        "name": "tempo",
+        "description": "AI-agent-native browser control plane for live web sessions.",
+        "url": mcp_url,
+        "provider": {
+            "organization": "tempo",
+            "url": "https://github.com/jadenfix/tempo",
+        },
+        "version": env!("CARGO_PKG_VERSION"),
+        "preferredTransport": "MCP",
+        "additionalInterfaces": [{
+            "transport": "MCP",
+            "url": mcp_url,
+        }],
+        "capabilities": {
+            "streaming": false,
+            "pushNotifications": false,
+            "stateTransitionHistory": false,
+        },
+        "defaultInputModes": ["application/json"],
+        "defaultOutputModes": ["application/json", "image/png"],
+        "skills": tools().into_iter().map(agent_card_skill_json).collect::<Vec<_>>(),
+    })
+}
+
+pub fn agent_card_response(base_url: &str) -> McpHttpResponse {
+    McpHttpResponse {
+        status: 200,
+        content_type: A2A_AGENT_CARD_CONTENT_TYPE,
+        body: agent_card(base_url).to_string().into_bytes(),
+    }
 }
 
 /// Handle MCP POST messages that do not require a page driver.
@@ -653,6 +698,21 @@ fn tool_descriptor_json() -> Vec<Value> {
         .collect()
 }
 
+fn agent_card_skill_json(tool: ToolDescriptor) -> Value {
+    json!({
+        "id": tool.name,
+        "name": tool.name,
+        "description": tool.description,
+        "tags": ["browser", "mcp", "tempo"],
+        "inputModes": ["application/json"],
+        "outputModes": if tool.name == "screenshot" {
+            vec!["application/json", "image/png"]
+        } else {
+            vec!["application/json"]
+        },
+    })
+}
+
 fn object_schema(properties: Vec<(&'static str, Value)>, required: &[&'static str]) -> Value {
     let required = required
         .iter()
@@ -820,6 +880,28 @@ mod tests {
                 "handshake"
             ]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn agent_card_advertises_real_mcp_interface_and_tools() -> Result<(), String> {
+        let response = agent_card_response("http://127.0.0.1:8787/");
+        let card = response.json_value().map_err(|error| error.to_string())?;
+        let skills = card["skills"]
+            .as_array()
+            .ok_or("agent-card skills must be an array")?;
+
+        assert_eq!(response.status, 200);
+        assert_eq!(response.content_type, A2A_AGENT_CARD_CONTENT_TYPE);
+        assert_eq!(card["name"], "tempo");
+        assert_eq!(card["url"], "http://127.0.0.1:8787/mcp");
+        assert_eq!(card["preferredTransport"], "MCP");
+        assert_eq!(
+            card["additionalInterfaces"][0]["url"],
+            "http://127.0.0.1:8787/mcp"
+        );
+        assert!(skills.iter().any(|skill| skill["id"] == "observe"));
+        assert!(skills.iter().any(|skill| skill["id"] == "handshake"));
         Ok(())
     }
 
