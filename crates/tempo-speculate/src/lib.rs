@@ -7,7 +7,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use tempo_driver::{Engine, Unsupported};
+use tempo_act::{execute_action, execute_batch, ActionExecution, ExecutionStatus};
+use tempo_driver::{DriverTrait, Engine, TransportError, Unsupported};
 use tempo_schema::{Action, ActionBatch, ObservationDiff};
 use tempo_session::{
     read_cassettes, read_journal_entries, CassetteKey, JournalEntry, JournalError, JournalEvent,
@@ -40,6 +41,7 @@ pub struct ReplayBranch {
 pub struct ReplayForkPlan {
     pub journal_path: PathBuf,
     pub cassette_path: PathBuf,
+    pub start_url: String,
     pub branches: Vec<ReplayBranch>,
 }
 
@@ -64,6 +66,7 @@ impl ReplayForkPlan {
         branches: Vec<BranchRequest>,
     ) -> Result<Self, SpeculateError> {
         validate_branch_ids(&branches)?;
+        let start_url = session_start_url(&entries)?;
         let prefix = replay_steps(&entries);
         let required = required_cassette_keys(&entries);
         let available = cassette_map(cassettes);
@@ -89,6 +92,7 @@ impl ReplayForkPlan {
         Ok(Self {
             journal_path,
             cassette_path,
+            start_url,
             branches: replay_branches,
         })
     }
@@ -108,6 +112,63 @@ pub enum ReplayStep {
         action: Action,
         reason: String,
     },
+}
+
+impl ReplayStep {
+    pub fn seq(&self) -> u64 {
+        match self {
+            Self::Applied { seq, .. } | Self::StepError { seq, .. } => *seq,
+        }
+    }
+
+    pub fn action(&self) -> &Action {
+        match self {
+            Self::Applied { action, .. } | Self::StepError { action, .. } => action,
+        }
+    }
+
+    pub fn outcome(&self) -> ReplayStepOutcome {
+        match self {
+            Self::Applied { diff, .. } => ReplayStepOutcome::Applied { diff: diff.clone() },
+            Self::StepError { reason, .. } => ReplayStepOutcome::StepError {
+                reason: reason.clone(),
+            },
+        }
+    }
+}
+
+/// The replay-comparable part of a driver step. Journal sequence numbers are
+/// intentionally excluded because replay produces fresh journal records.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ReplayStepOutcome {
+    Applied { diff: ObservationDiff },
+    StepError { reason: String },
+}
+
+/// Verification result for one replayed historical step.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ReplayedPrefixStep {
+    pub expected_seq: u64,
+    pub action: Action,
+    pub outcome: ReplayStepOutcome,
+}
+
+/// Execution result for the speculative branch batch after the prefix replay.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BranchBatchExecution {
+    pub action_count: usize,
+    pub outcome: ReplayStepOutcome,
+}
+
+/// Concrete replay-fork execution report for one branch lane.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReplayBranchExecution {
+    pub id: BranchId,
+    pub engine: Engine,
+    pub start_url: String,
+    pub prefix: Vec<ReplayedPrefixStep>,
+    pub branch: BranchBatchExecution,
 }
 
 /// Replay output for one engine lane.
@@ -174,9 +235,90 @@ pub fn assert_identical_replay(
     }
 }
 
+/// Execute one replay-fork branch on a fresh driver lane.
+///
+/// The caller owns driver provisioning. For engines without native page-state
+/// fork, call this once per branch with a newly-created driver so each branch
+/// starts from the same durable session state.
+pub async fn execute_replay_branch<D>(
+    driver: &mut D,
+    plan: &ReplayForkPlan,
+    branch: &ReplayBranch,
+) -> Result<ReplayBranchExecution, SpeculateError>
+where
+    D: DriverTrait + ?Sized,
+{
+    let engine = driver.engine();
+    driver
+        .goto(&plan.start_url)
+        .await
+        .map_err(|source| SpeculateError::DriverTransport {
+            context: "replay goto",
+            source,
+        })?;
+
+    let mut prefix = Vec::with_capacity(branch.prefix.len());
+    for expected in &branch.prefix {
+        let execution = execute_action(driver, expected.action())
+            .await
+            .map_err(|source| SpeculateError::DriverTransport {
+                context: "replay action",
+                source,
+            })?;
+        let actual = replay_outcome_from_execution(execution);
+        let expected_outcome = expected.outcome();
+        if actual != expected_outcome {
+            return Err(SpeculateError::ReplayStepDiverged {
+                branch: branch.id.clone(),
+                seq: expected.seq(),
+            });
+        }
+        prefix.push(ReplayedPrefixStep {
+            expected_seq: expected.seq(),
+            action: expected.action().clone(),
+            outcome: actual,
+        });
+    }
+
+    let branch_execution = execute_batch(driver, &branch.batch)
+        .await
+        .map_err(|source| SpeculateError::DriverTransport {
+            context: "branch batch",
+            source,
+        })?;
+    let branch_result = BranchBatchExecution {
+        action_count: branch_execution.action_count,
+        outcome: replay_outcome_from_execution(branch_execution),
+    };
+
+    Ok(ReplayBranchExecution {
+        id: branch.id.clone(),
+        engine,
+        start_url: plan.start_url.clone(),
+        prefix,
+        branch: branch_result,
+    })
+}
+
 /// Human-readable crate summary.
 pub fn describe() -> &'static str {
-    "replay-fork planning from durable journals and deterministic k-branch fallback scheduling"
+    "replay-fork execution from durable journals and deterministic k-branch fallback scheduling"
+}
+
+fn session_start_url(entries: &[JournalEntry]) -> Result<String, SpeculateError> {
+    entries
+        .iter()
+        .find_map(|entry| match &entry.event {
+            JournalEvent::SessionStarted { url } => Some(url.clone()),
+            JournalEvent::Observation { .. }
+            | JournalEvent::ActionPlanned { .. }
+            | JournalEvent::StepApplied { .. }
+            | JournalEvent::StepError { .. }
+            | JournalEvent::TransportError { .. }
+            | JournalEvent::CassetteRecorded { .. }
+            | JournalEvent::SessionClosed => None,
+        })
+        .ok_or(SpeculateError::MissingSessionStart)
 }
 
 fn replay_steps(entries: &[JournalEntry]) -> Vec<ReplayStep> {
@@ -222,6 +364,15 @@ fn cassette_map(cassettes: Vec<ResponseCassette>) -> BTreeMap<String, ResponseCa
     map
 }
 
+fn replay_outcome_from_execution(execution: ActionExecution) -> ReplayStepOutcome {
+    match execution.status {
+        ExecutionStatus::Applied => ReplayStepOutcome::Applied {
+            diff: execution.diff,
+        },
+        ExecutionStatus::StepError { reason } => ReplayStepOutcome::StepError { reason },
+    }
+}
+
 fn sorted_branch_ids(branches: &[BranchRequest]) -> Vec<BranchId> {
     let mut ids: Vec<_> = branches.iter().map(|branch| branch.id.clone()).collect();
     ids.sort();
@@ -245,12 +396,22 @@ fn validate_branch_ids(branches: &[BranchRequest]) -> Result<(), SpeculateError>
 pub enum SpeculateError {
     #[error("session replay data failed: {0}")]
     Journal(#[from] JournalError),
+    #[error("journal has no session start URL")]
+    MissingSessionStart,
     #[error("missing cassette required by journal: {0:?}")]
     MissingCassette(CassetteKey),
     #[error("duplicate branch id: {0:?}")]
     DuplicateBranchId(BranchId),
     #[error("invalid branch id: {0:?}")]
     InvalidBranchId(BranchId),
+    #[error("{context} failed: {source}")]
+    DriverTransport {
+        context: &'static str,
+        #[source]
+        source: TransportError,
+    },
+    #[error("replay diverged in branch {branch:?} at journal seq {seq}")]
+    ReplayStepDiverged { branch: BranchId, seq: u64 },
     #[error("replay diverged between {left:?} and {right:?}")]
     ReplayDiverged { left: Engine, right: Engine },
 }
@@ -261,6 +422,7 @@ mod tests {
     use std::error::Error;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+    use tempo_driver::TestDriver;
     use tempo_schema::QuiescencePolicy;
     use tempo_session::{CassetteStore, RunId, SessionId, SessionJournal};
 
@@ -290,6 +452,9 @@ mod tests {
             RunId("run".into()),
             SessionId("session".into()),
         )?;
+        journal.append(JournalEvent::SessionStarted {
+            url: "https://example.com".into(),
+        })?;
         journal.append(JournalEvent::CassetteRecorded {
             key: cassette.key.clone(),
         })?;
@@ -309,11 +474,12 @@ mod tests {
         let plan = ReplayForkPlan::from_paths(&journal_path, &cassette_path, vec![branch])?;
 
         assert_eq!(plan.branches.len(), 1);
+        assert_eq!(plan.start_url, "https://example.com");
         assert_eq!(plan.branches[0].cassettes, vec![cassette]);
         assert_eq!(
             plan.branches[0].prefix,
             vec![ReplayStep::Applied {
-                seq: 1,
+                seq: 2,
                 action,
                 diff,
             }]
@@ -338,6 +504,9 @@ mod tests {
             RunId("run".into()),
             SessionId("session".into()),
         )?;
+        journal.append(JournalEvent::SessionStarted {
+            url: "https://example.com".into(),
+        })?;
         journal.append(JournalEvent::CassetteRecorded { key: key.clone() })?;
 
         let err = ReplayForkPlan::from_paths(
@@ -348,6 +517,145 @@ mod tests {
         assert!(matches!(err, Err(SpeculateError::MissingCassette(found)) if found == key));
 
         remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn missing_session_start_rejects_replay_plan() -> TestResult {
+        let root = unique_dir("missing-start")?;
+        remove_dir_if_exists(&root)?;
+        fs::create_dir_all(&root)?;
+        let journal_path = root.join("session.jsonl");
+        let cassette_path = root.join("cassettes.jsonl");
+        CassetteStore::open(&cassette_path)?;
+
+        let mut journal = SessionJournal::open(
+            &journal_path,
+            RunId("run".into()),
+            SessionId("session".into()),
+        )?;
+        journal.append(JournalEvent::SessionClosed)?;
+
+        let err = ReplayForkPlan::from_paths(
+            &journal_path,
+            &cassette_path,
+            vec![branch("branch-a", Action::Scroll { x: 0.0, y: 1.0 })],
+        );
+        assert!(matches!(err, Err(SpeculateError::MissingSessionStart)));
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn replay_branch_executes_prefix_and_branch_batch_on_driver() -> TestResult {
+        let prefix_action = Action::Scroll { x: 0.0, y: 1.0 };
+        let request = BranchRequest {
+            id: BranchId("branch-a".into()),
+            batch: ActionBatch {
+                actions: vec![Action::Scroll { x: 0.0, y: 2.0 }],
+                quiescence: QuiescencePolicy::Composite,
+            },
+        };
+        let plan = ReplayForkPlan::from_records(
+            PathBuf::from("session.jsonl"),
+            PathBuf::from("cassettes.jsonl"),
+            vec![
+                journal_entry(
+                    0,
+                    JournalEvent::SessionStarted {
+                        url: "https://example.com".into(),
+                    },
+                ),
+                journal_entry(
+                    1,
+                    JournalEvent::StepApplied {
+                        action: prefix_action.clone(),
+                        diff: empty_diff(1, 2),
+                    },
+                ),
+            ],
+            vec![],
+            vec![request],
+        )?;
+
+        let mut driver = TestDriver::new();
+        let report = futures::executor::block_on(execute_replay_branch(
+            &mut driver,
+            &plan,
+            &plan.branches[0],
+        ))?;
+
+        assert_eq!(report.id, BranchId("branch-a".into()));
+        assert_eq!(report.engine, Engine::Test);
+        assert_eq!(report.start_url, "https://example.com");
+        assert_eq!(
+            report.prefix,
+            vec![ReplayedPrefixStep {
+                expected_seq: 1,
+                action: prefix_action,
+                outcome: ReplayStepOutcome::Applied {
+                    diff: empty_diff(1, 2),
+                },
+            }]
+        );
+        assert_eq!(
+            report.branch,
+            BranchBatchExecution {
+                action_count: 1,
+                outcome: ReplayStepOutcome::Applied {
+                    diff: empty_diff(2, 3),
+                },
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn replay_branch_reports_prefix_divergence() -> TestResult {
+        let request = BranchRequest {
+            id: BranchId("branch-a".into()),
+            batch: ActionBatch {
+                actions: vec![Action::Scroll { x: 0.0, y: 2.0 }],
+                quiescence: QuiescencePolicy::Composite,
+            },
+        };
+        let plan = ReplayForkPlan::from_records(
+            PathBuf::from("session.jsonl"),
+            PathBuf::from("cassettes.jsonl"),
+            vec![
+                journal_entry(
+                    0,
+                    JournalEvent::SessionStarted {
+                        url: "https://example.com".into(),
+                    },
+                ),
+                journal_entry(
+                    7,
+                    JournalEvent::StepError {
+                        action: Action::Scroll { x: 0.0, y: 1.0 },
+                        reason: "historical error".into(),
+                    },
+                ),
+            ],
+            vec![],
+            vec![request],
+        )?;
+
+        let mut driver = TestDriver::new();
+        let err = futures::executor::block_on(execute_replay_branch(
+            &mut driver,
+            &plan,
+            &plan.branches[0],
+        ));
+
+        assert!(matches!(
+            err,
+            Err(SpeculateError::ReplayStepDiverged {
+                branch,
+                seq: 7
+            }) if branch == BranchId("branch-a".into())
+        ));
         Ok(())
     }
 
@@ -475,6 +783,17 @@ mod tests {
             added: vec![],
             removed: vec![],
             changed: vec![],
+        }
+    }
+
+    fn journal_entry(seq: u64, event: JournalEvent) -> JournalEntry {
+        JournalEntry {
+            schema_version: tempo_schema::SCHEMA_VERSION.into(),
+            run_id: RunId("run".into()),
+            session_id: SessionId("session".into()),
+            seq,
+            timestamp_ms: 0,
+            event,
         }
     }
 
