@@ -5,7 +5,7 @@
 //! renders session state against the live daemon protocol.
 
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
@@ -23,6 +23,7 @@ Commands:
   open URL
   adopt SESSION_ID
   close SESSION_ID
+  handshake ORIGIN
   drain
 
 Options:
@@ -81,6 +82,7 @@ pub enum ShellCommand {
     Open { url: String },
     Adopt { session_id: String },
     Close { session_id: String },
+    Handshake { origin: String },
     Drain,
 }
 
@@ -96,6 +98,7 @@ impl ShellCommand {
             Self::Open { url } => write_json(stdout, &client.open(url)?),
             Self::Adopt { session_id } => write_json(stdout, &client.adopt(session_id)?),
             Self::Close { session_id } => write_json(stdout, &client.close(session_id)?),
+            Self::Handshake { origin } => write_json(stdout, &client.handshake(origin)?),
             Self::Drain => write_json(stdout, &client.drain()?),
         }
     }
@@ -154,6 +157,36 @@ impl ShellClient {
 
     pub fn drain(&self) -> Result<DrainResponse, ShellError> {
         self.request_json("POST", "/drain", None::<serde_json::Value>)
+    }
+
+    pub fn handshake(&self, origin: &str) -> Result<Value, ShellError> {
+        if origin.trim().is_empty() {
+            return Err(ShellError::Usage("handshake ORIGIN is required".into()));
+        }
+        self.mcp_tool("handshake", json!({ "origin": origin }))
+    }
+
+    pub fn mcp_tool(&self, name: &str, arguments: Value) -> Result<Value, ShellError> {
+        let envelope: Value = self.request_json(
+            "POST",
+            "/mcp",
+            Some(json!({
+                "jsonrpc": "2.0",
+                "id": "tempo-shell",
+                "method": "tools/call",
+                "params": {
+                    "name": name,
+                    "arguments": arguments,
+                },
+            })),
+        )?;
+        if let Some(error) = envelope.get("error") {
+            return Err(ShellError::Mcp(error.to_string()));
+        }
+        envelope
+            .pointer("/result/structuredContent")
+            .cloned()
+            .ok_or_else(|| ShellError::Protocol("MCP response missing structuredContent".into()))
     }
 
     fn request_json<T, B>(&self, method: &str, path: &str, body: Option<B>) -> Result<T, ShellError>
@@ -224,6 +257,9 @@ fn parse_command(args: &[String]) -> Result<ShellCommand, ShellError> {
         }),
         "close" => one_arg(rest, "close SESSION_ID", |session_id| ShellCommand::Close {
             session_id,
+        }),
+        "handshake" => one_arg(rest, "handshake ORIGIN", |origin| ShellCommand::Handshake {
+            origin,
         }),
         "drain" => no_args(rest, ShellCommand::Drain),
         "-h" | "--help" | "help" => Ok(ShellCommand::Help),
@@ -299,6 +335,8 @@ pub enum ShellError {
     Json(#[from] serde_json::Error),
     #[error("tempod returned HTTP {status}: {body}")]
     Http { status: u16, body: String },
+    #[error("tempod MCP failed: {0}")]
+    Mcp(String),
     #[error("invalid tempod HTTP response: {0}")]
     Protocol(String),
 }
@@ -307,7 +345,7 @@ impl ShellError {
     pub fn exit_code(&self) -> u8 {
         match self {
             Self::Usage(_) => 2,
-            Self::Io(_) | Self::Json(_) | Self::Http { .. } | Self::Protocol(_) => 1,
+            Self::Io(_) | Self::Json(_) | Self::Http { .. } | Self::Mcp(_) | Self::Protocol(_) => 1,
         }
     }
 }
@@ -320,6 +358,7 @@ fn _assert_session_id_shape(id: &TempodSessionId) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use std::error::Error;
     use std::net::{SocketAddr, TcpListener};
     use std::sync::{Arc, Mutex};
@@ -338,6 +377,19 @@ mod tests {
             options.command,
             ShellCommand::Open {
                 url: "https://example.com".into()
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parses_handshake_command() -> TestResult {
+        let options = ShellOptions::parse(["handshake", "https://example.com"])?;
+
+        assert_eq!(
+            options.command,
+            ShellCommand::Handshake {
+                origin: "https://example.com".into(),
             }
         );
         Ok(())
@@ -372,6 +424,30 @@ mod tests {
         let drained = with_tempod(&pool, |addr| ShellClient::new(addr.to_string()).drain())?;
         assert!(drained.draining);
         assert_eq!(drained.sessions[0].state, TempodSessionState::Killed);
+        Ok(())
+    }
+
+    #[test]
+    fn client_runs_driverless_handshake_through_real_tempod_mcp() -> TestResult {
+        let pool = Arc::new(Mutex::new(SessionPool::default()));
+        let result = with_tempod(&pool, |addr| {
+            ShellClient::new(addr.to_string()).mcp_tool(
+                "handshake",
+                json!({
+                    "origin": "https://tempo.test",
+                    "responses": [{
+                        "path": "/mcp/catalog.json",
+                        "status": 200,
+                        "content_type": "application/json",
+                        "body": "{\"tools\":[]}",
+                    }],
+                }),
+            )
+        })?;
+
+        assert_eq!(result["lane"], "mcp");
+        assert_eq!(result["skips_render"], true);
+        assert_eq!(result["selected"]["signal"], "mcp_catalog");
         Ok(())
     }
 
