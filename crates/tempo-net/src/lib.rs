@@ -718,19 +718,54 @@ pub struct OriginIdentityStats {
     pub selected_mode: IdentityMode,
 }
 
+/// Default upper bound on the number of distinct origins tracked at once.
+///
+/// A single session can touch many distinct origins (wildcard subdomains,
+/// third-party subrequests); the counter table is bounded so it cannot grow
+/// without limit for the session lifetime. When full, the least-recently-used
+/// origin is evicted.
+pub const DEFAULT_IDENTITY_STRATEGY_CAPACITY: usize = 1024;
+
 /// Per-origin identity strategy driven by observed challenge rate.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct IdentityStrategyTable {
     config: IdentityStrategyConfig,
     counters: BTreeMap<String, IdentityOriginCounters>,
+    capacity: usize,
+    /// Monotonic tick used to order origins by recency of last record.
+    clock: u64,
+}
+
+impl Default for IdentityStrategyTable {
+    fn default() -> Self {
+        Self::new(IdentityStrategyConfig::default())
+    }
 }
 
 impl IdentityStrategyTable {
     pub fn new(config: IdentityStrategyConfig) -> Self {
+        Self::with_capacity(config, DEFAULT_IDENTITY_STRATEGY_CAPACITY)
+    }
+
+    /// Construct a table that tracks at most `capacity` distinct origins,
+    /// evicting the least-recently-recorded origin once full.
+    pub fn with_capacity(config: IdentityStrategyConfig, capacity: usize) -> Self {
         Self {
             config,
             counters: BTreeMap::new(),
+            capacity: capacity.max(1),
+            clock: 0,
         }
+    }
+
+    /// Number of origins currently tracked.
+    pub fn tracked_origins(&self) -> usize {
+        self.counters.len()
+    }
+
+    /// Maximum number of origins tracked before least-recently-used eviction.
+    pub fn capacity(&self) -> usize {
+        self.capacity
     }
 
     pub fn config(&self) -> IdentityStrategyConfig {
@@ -744,12 +779,32 @@ impl IdentityStrategyTable {
         challenged: bool,
     ) -> Result<OriginIdentityStats, IdentityStrategyError> {
         let origin = identity_origin(url)?;
+        self.clock = self.clock.saturating_add(1);
+        let tick = self.clock;
+        // Evict the least-recently-recorded origin before inserting a new one so
+        // the table stays bounded even under many distinct origins.
+        if !self.counters.contains_key(&origin) && self.counters.len() >= self.capacity {
+            self.evict_lru();
+        }
         let counters = self.counters.entry(origin.clone()).or_default();
         counters.total_requests = counters.total_requests.saturating_add(1);
         if challenged {
             counters.challenged_requests = counters.challenged_requests.saturating_add(1);
         }
+        counters.last_seen = tick;
         Ok(counters.stats(origin, self.config))
+    }
+
+    /// Remove the origin with the oldest `last_seen` tick (least recently recorded).
+    fn evict_lru(&mut self) {
+        if let Some(oldest) = self
+            .counters
+            .iter()
+            .min_by_key(|(_, counters)| counters.last_seen)
+            .map(|(origin, _)| origin.clone())
+        {
+            self.counters.remove(&oldest);
+        }
     }
 
     /// Return the currently selected mode for a URL's origin.
@@ -790,6 +845,8 @@ impl IdentityStrategyTable {
 struct IdentityOriginCounters {
     total_requests: u64,
     challenged_requests: u64,
+    /// Recency tick of the most recent `record_request` for this origin.
+    last_seen: u64,
 }
 
 impl IdentityOriginCounters {
@@ -1126,7 +1183,10 @@ impl DomainRule {
     }
 
     pub fn matches(&self, domain: &str) -> bool {
-        let domain = domain.to_ascii_lowercase();
+        // Canonicalize the input the same way the rule side is canonicalized
+        // (lowercase + trailing-dot stripped) so a fully-qualified
+        // `blocked.example.com.` cannot evade a `blocked.example.com` rule.
+        let domain = canonical_domain(domain);
         match self {
             Self::Exact(expected) => &domain == expected,
             Self::Suffix(suffix) => {
@@ -1213,7 +1273,7 @@ impl EgressPolicy {
     pub fn decide(&self, request: &NetworkRequest) -> Result<EgressDecision, EgressDenied> {
         let parts =
             UrlParts::parse(&request.url).map_err(|reason| EgressDenied::from_block(reason, ""))?;
-        let domain = parts.host.clone();
+        let domain = canonical_domain(parts.host.clone());
         let port = egress_port(&parts);
 
         if self.rule_matches(&self.blocked, &domain) {
@@ -2262,6 +2322,66 @@ mod tests {
     }
 
     #[test]
+    fn identity_strategy_table_stays_bounded_under_many_origins() -> Result<(), String> {
+        let capacity = 8;
+        let mut table =
+            IdentityStrategyTable::with_capacity(IdentityStrategyConfig::default(), capacity);
+
+        // Touch far more distinct origins than the capacity.
+        for i in 0..1_000 {
+            table
+                .record_request(&format!("https://origin-{i}.example/path"), false)
+                .map_err(|error| error.to_string())?;
+        }
+
+        assert_eq!(table.tracked_origins(), capacity);
+        assert!(table.tracked_origins() <= table.capacity());
+        Ok(())
+    }
+
+    #[test]
+    fn identity_strategy_table_preserves_recently_used_origins() -> Result<(), String> {
+        let capacity = 4;
+        let mut table =
+            IdentityStrategyTable::with_capacity(IdentityStrategyConfig::default(), capacity);
+
+        // Seed an origin whose counters we want to keep alive.
+        table
+            .record_request("https://keep.example/a", true)
+            .map_err(|error| error.to_string())?;
+
+        // Interleave: keep touching `keep.example` while flooding new origins so
+        // that `keep.example` is never the least-recently-used entry.
+        for i in 0..100 {
+            table
+                .record_request(&format!("https://flood-{i}.example/p"), false)
+                .map_err(|error| error.to_string())?;
+            table
+                .record_request("https://keep.example/b", false)
+                .map_err(|error| error.to_string())?;
+        }
+
+        // Bounded overall...
+        assert_eq!(table.tracked_origins(), capacity);
+        // ...but the actively-used origin retains its accumulated counters.
+        let stats = table
+            .stats_for_url("https://keep.example/x")
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "recently-used origin was evicted".to_string())?;
+        assert_eq!(stats.total_requests, 101);
+        assert_eq!(stats.challenged_requests, 1);
+
+        // A stale flooded origin was evicted along the way.
+        assert_eq!(
+            table
+                .stats_for_url("https://flood-0.example/x")
+                .map_err(|error| error.to_string())?,
+            None
+        );
+        Ok(())
+    }
+
+    #[test]
     fn audit_record_is_taint_free_and_origin_only() -> Result<(), UrlBlocked> {
         let profile = NetworkProfile::ephemeral("session-a");
         let request = NetworkRequest::new(
@@ -2472,6 +2592,70 @@ mod tests {
         let decision = policy.decide(&request);
 
         assert!(matches!(decision, Err(EgressDenied { .. })));
+    }
+
+    #[test]
+    fn domain_rule_matches_ignore_trailing_dot_fqdn() {
+        // Exact rule form.
+        assert!(DomainRule::exact("blocked.example.com").matches("blocked.example.com."));
+        assert!(DomainRule::exact("blocked.example.com").matches("Blocked.Example.Com."));
+        // Suffix rule form.
+        assert!(DomainRule::suffix("example.com").matches("blocked.example.com."));
+        assert!(DomainRule::suffix("example.com").matches("example.com."));
+        // Non-matching FQDN still does not match.
+        assert!(!DomainRule::exact("blocked.example.com").matches("safe.example.com."));
+    }
+
+    #[test]
+    fn egress_policy_blocks_trailing_dot_fqdn_exact_rule() {
+        let request = NetworkRequest::new(
+            "r1",
+            "GET",
+            "https://blocked.example.com./path",
+            "profile-a",
+            IdentityMode::AgentDeclared,
+        );
+        let policy =
+            EgressPolicy::allow_all().block_domain(DomainRule::exact("blocked.example.com"));
+
+        let decision = policy.decide(&request);
+
+        assert!(matches!(decision, Err(EgressDenied { .. })));
+    }
+
+    #[test]
+    fn egress_policy_blocks_trailing_dot_fqdn_suffix_rule() {
+        let request = NetworkRequest::new(
+            "r1",
+            "GET",
+            "https://blocked.example.com./path",
+            "profile-a",
+            IdentityMode::AgentDeclared,
+        );
+        let policy = EgressPolicy::allow_all().block_domain(DomainRule::suffix("example.com"));
+
+        let decision = policy.decide(&request);
+
+        assert!(matches!(decision, Err(EgressDenied { .. })));
+    }
+
+    #[test]
+    fn egress_policy_allowlist_treats_trailing_dot_fqdn_as_allowed() -> Result<(), EgressDenied> {
+        let request = NetworkRequest::new(
+            "r1",
+            "GET",
+            "https://api.example./data",
+            "profile-a",
+            IdentityMode::AgentDeclared,
+        );
+        let policy =
+            EgressPolicy::block_by_default().allow_domain(DomainRule::exact("api.example"));
+
+        let decision = policy.decide(&request)?;
+
+        // The FQDN passes the allowlist and the reported domain is canonicalized.
+        assert_eq!(decision.domain(), "api.example");
+        Ok(())
     }
 
     #[test]
