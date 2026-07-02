@@ -25,6 +25,10 @@ pub const A2A_AGENT_CARD_PATH: &str = "/.well-known/agent-card.json";
 pub const A2A_AGENT_JSON_PATH: &str = "/.well-known/agent.json";
 pub const A2A_AGENT_CARD_CONTENT_TYPE: &str = "application/a2a+json";
 const DRIVER_REQUIRED_ERROR_CODE: i64 = -32002;
+/// Upper bound on concurrently live forked drivers per session. Forks each hold a
+/// live browser context/target for real engines, so refuse to accumulate beyond
+/// this cap and require the client to `close_fork` before creating more.
+const MAX_LIVE_FORKS: usize = 32;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct McpHttpResponse {
@@ -123,6 +127,31 @@ impl<D> TempoMcpServer<D> {
         let driver_id = format!("fork-{fork_id}");
         self.forks.insert(driver_id.clone(), forked);
         Ok(driver_id)
+    }
+}
+
+impl<D> TempoMcpServer<D>
+where
+    D: DriverTrait,
+{
+    /// Close and forget a single forked driver, releasing its engine resources.
+    async fn close_fork(&mut self, driver_id: &str) -> Result<(), String> {
+        let Some(mut forked) = self.forks.remove(driver_id) else {
+            return Err(format!("unknown driver_id: {driver_id}"));
+        };
+        forked.close().await.map_err(|error| error.to_string())
+    }
+
+    /// Close and drop every live fork. Call when a session ends so forked engine
+    /// contexts do not leak for the process lifetime. Returns per-fork close errors.
+    pub async fn close_all_forks(&mut self) -> Vec<String> {
+        let mut errors = Vec::new();
+        for (driver_id, mut forked) in std::mem::take(&mut self.forks) {
+            if let Err(error) = forked.close().await {
+                errors.push(format!("{driver_id}: {error}"));
+            }
+        }
+        errors
     }
 }
 
@@ -255,7 +284,19 @@ where
                     driver.fork().await
                 };
                 match forked {
-                    Ok(forked) => {
+                    Ok(mut forked) => {
+                        if self.forks.len() >= MAX_LIVE_FORKS {
+                            // Refuse to accumulate: close the fork we just created so it
+                            // does not leak, and ask the client to reclaim one first.
+                            let mut reason = format!(
+                                "fork limit reached ({MAX_LIVE_FORKS} live forks); close_fork before creating another"
+                            );
+                            if let Err(error) = forked.close().await {
+                                reason
+                                    .push_str(&format!("; also failed to close new fork: {error}"));
+                            }
+                            return Ok(ToolCall::error(reason));
+                        }
                         let engine = engine_name(forked.engine());
                         let driver_id = self.register_fork(forked)?;
                         Ok(ToolCall::success(json!({
@@ -268,6 +309,16 @@ where
                         "supported": false,
                         "reason": error.to_string(),
                     }))),
+                }
+            }
+            "close_fork" => {
+                let args: CloseForkArgs = parse_args(arguments)?;
+                match self.close_fork(&args.driver_id).await {
+                    Ok(()) => Ok(ToolCall::success(json!({
+                        "closed": true,
+                        "driver_id": args.driver_id,
+                    }))),
+                    Err(error) => Ok(ToolCall::error(error)),
                 }
             }
             "extract" => {
@@ -314,10 +365,11 @@ where
             }
             "handshake" => {
                 let args: HandshakeArgs = parse_args(arguments)?;
+                let probe = run_handshake_probe(&args, &self.handshake_probe_config).await;
                 Ok(ToolCall::success(handshake_result_json(
                     &self.handshake_report,
-                    &self.handshake_probe_config,
                     args,
+                    probe,
                 )))
             }
             _ => Err(JsonRpcError::invalid_params("unknown tool")),
@@ -457,6 +509,14 @@ pub fn tools() -> Vec<ToolDescriptor> {
             input_schema: object_schema(vec![("driver_id", json!({"type": "string"}))], &[]),
         },
         ToolDescriptor {
+            name: "close_fork",
+            description: "Close a forked driver and release its engine resources.",
+            input_schema: object_schema(
+                vec![("driver_id", json!({"type": "string"}))],
+                &["driver_id"],
+            ),
+        },
+        ToolDescriptor {
             name: "extract",
             description: "Extract structured data rooted at a stable node id.",
             input_schema: object_schema(
@@ -496,7 +556,7 @@ pub fn tools() -> Vec<ToolDescriptor> {
 }
 
 pub fn describe() -> &'static str {
-    "tempo MCP server core: initialize/ping/tools/list/tools/call for observe, act, act_batch, fork, extract, screenshot, and handshake"
+    "tempo MCP server core: initialize/ping/tools/list/tools/call for observe, act, act_batch, fork, close_fork, extract, screenshot, and handshake"
 }
 
 #[derive(Debug, Error)]
@@ -585,6 +645,11 @@ struct ForkArgs {
 }
 
 #[derive(Debug, Deserialize)]
+struct CloseForkArgs {
+    driver_id: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct NodeArgs {
     #[serde(default)]
     driver_id: Option<String>,
@@ -646,15 +711,53 @@ fn parse_args<T: serde::de::DeserializeOwned>(value: Value) -> Result<T, JsonRpc
     serde_json::from_value(value).map_err(|error| JsonRpcError::invalid_params(error.to_string()))
 }
 
-fn probe_http_origin_off_runtime(
-    origin: &str,
-    config: HttpProbeConfig,
-) -> Result<tempo_handshake::HttpProbeRun, String> {
-    let origin = origin.to_string();
-    match std::thread::spawn(move || probe_http_origin(&origin, config)).join() {
+/// The origin to run a live HTTP probe against, if these handshake args request
+/// one. Live probing defaults on when an origin is supplied without inline
+/// responses, and can be forced on or off with the explicit `live_http` flag.
+fn handshake_probe_target(args: &HandshakeArgs) -> Option<String> {
+    let live_http_requested = args
+        .live_http
+        .unwrap_or_else(|| args.origin.is_some() && args.responses.is_empty());
+    if live_http_requested {
+        args.origin.clone()
+    } else {
+        None
+    }
+}
+
+/// Run the blocking HTTP probe without stalling the async executor.
+///
+/// `probe_http_origin` uses a blocking HTTP client, so it is dispatched to a
+/// dedicated blocking pool thread via `spawn_blocking` and awaited, rather than
+/// parking a runtime worker on a `std::thread` join for the probe duration.
+async fn run_handshake_probe(
+    args: &HandshakeArgs,
+    config: &HttpProbeConfig,
+) -> Option<Result<tempo_handshake::HttpProbeRun, String>> {
+    let origin = handshake_probe_target(args)?;
+    let config = config.clone();
+    let result = match tokio::task::spawn_blocking(move || probe_http_origin(&origin, config)).await
+    {
         Ok(result) => result.map_err(|error| error.to_string()),
         Err(_) => Err("HTTP probe worker panicked".into()),
-    }
+    };
+    Some(result)
+}
+
+/// Blocking-context variant of [`run_handshake_probe`] for the driverless path,
+/// which runs outside a tokio worker. The blocking HTTP client must not be
+/// driven from within an async runtime, so it is run on its own std thread.
+fn run_handshake_probe_blocking(
+    args: &HandshakeArgs,
+    config: &HttpProbeConfig,
+) -> Option<Result<tempo_handshake::HttpProbeRun, String>> {
+    let origin = handshake_probe_target(args)?;
+    let config = config.clone();
+    let result = match std::thread::spawn(move || probe_http_origin(&origin, config)).join() {
+        Ok(result) => result.map_err(|error| error.to_string()),
+        Err(_) => Err("HTTP probe worker panicked".into()),
+    };
+    Some(result)
 }
 
 fn handle_driverless_message(
@@ -713,22 +816,24 @@ fn driverless_tools_call(
     }
 
     let args: HandshakeArgs = parse_args(arguments)?;
+    let probe = run_handshake_probe_blocking(&args, &handshake_probe_config);
     Ok(tool_call_json(ToolCall::success(handshake_result_json(
         &ProbeReport::new(),
-        &handshake_probe_config,
         args,
+        probe,
     ))))
 }
 
+/// Build the handshake tool result. `probe` carries the outcome of the live HTTP
+/// probe (already run off the async executor by the caller), or `None` when no
+/// live probe was requested.
 fn handshake_result_json(
     handshake_report: &ProbeReport,
-    handshake_probe_config: &HttpProbeConfig,
     args: HandshakeArgs,
+    probe: Option<Result<tempo_handshake::HttpProbeRun, String>>,
 ) -> Value {
     let mut report = ProbeReport::from_hits(handshake_report.hits().to_vec());
-    let live_http_requested = args
-        .live_http
-        .unwrap_or_else(|| args.origin.is_some() && args.responses.is_empty());
+    let origin = args.origin.clone();
     let response_report = ProbeReport::from_responses(args.responses.into_iter().map(Into::into));
     for hit in response_report.hits() {
         report.add_hit(hit.clone());
@@ -739,28 +844,26 @@ fn handshake_result_json(
     let mut probe_responses = Vec::new();
     let mut probe_failures = Vec::new();
     let mut probe_error = None;
-    if live_http_requested {
-        if let Some(origin) = args.origin.as_deref() {
-            live_http = true;
-            match probe_http_origin_off_runtime(origin, handshake_probe_config.clone()) {
-                Ok(run) => {
-                    for hit in run.report.hits() {
-                        report.add_hit(hit.clone());
-                    }
-                    probe_responses = run
-                        .responses
-                        .iter()
-                        .map(probe_response_json)
-                        .collect::<Vec<_>>();
-                    probe_failures = run
-                        .failures
-                        .iter()
-                        .map(probe_failure_json)
-                        .collect::<Vec<_>>();
+    if let Some(result) = probe {
+        live_http = true;
+        match result {
+            Ok(run) => {
+                for hit in run.report.hits() {
+                    report.add_hit(hit.clone());
                 }
-                Err(error) => {
-                    probe_error = Some(error.to_string());
-                }
+                probe_responses = run
+                    .responses
+                    .iter()
+                    .map(probe_response_json)
+                    .collect::<Vec<_>>();
+                probe_failures = run
+                    .failures
+                    .iter()
+                    .map(probe_failure_json)
+                    .collect::<Vec<_>>();
+            }
+            Err(error) => {
+                probe_error = Some(error);
             }
         }
     }
@@ -771,7 +874,7 @@ fn handshake_result_json(
         "skips_render": decision.skips_render(),
         "selected": decision.selected.as_ref().map(probe_hit_json),
         "hits": report.hits().iter().map(probe_hit_json).collect::<Vec<_>>(),
-        "probe_urls": args.origin.as_deref().map(probe_urls).unwrap_or_default(),
+        "probe_urls": origin.as_deref().map(probe_urls).unwrap_or_default(),
         "live_http": live_http,
         "probe_responses": probe_responses,
         "probe_failures": probe_failures,
@@ -933,6 +1036,8 @@ fn loopback_origin_allowed(origin: &str) -> bool {
 mod tests {
     use std::io::{self, Read, Write};
     use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -987,6 +1092,7 @@ mod tests {
                 "act",
                 "act_batch",
                 "fork",
+                "close_fork",
                 "extract",
                 "screenshot",
                 "handshake"
@@ -1107,6 +1213,122 @@ mod tests {
         assert_eq!(root_observe["seq"], 1);
         assert_eq!(fork_observe["seq"], 2);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn close_fork_closes_and_removes_forked_driver() -> Result<(), String> {
+        let mut server = TempoMcpServer::new(MemoryDriver::new());
+
+        let fork = call_tool(&mut server, "fork", json!({})).await?;
+        let driver_id = fork["driver_id"]
+            .as_str()
+            .ok_or("fork response must include driver_id")?
+            .to_string();
+
+        let closed = call_tool(
+            &mut server,
+            "close_fork",
+            json!({"driver_id": driver_id.clone()}),
+        )
+        .await?;
+        assert_eq!(closed["closed"], true);
+        // The forked driver's close() ran (fork shares the counter handle).
+        assert_eq!(server.driver().closed.load(Ordering::SeqCst), 1);
+
+        // The fork is gone: targeting it now errors, and a repeat close reports it missing.
+        let reuse = call_tool(
+            &mut server,
+            "observe",
+            json!({"driver_id": driver_id.clone()}),
+        )
+        .await;
+        assert!(reuse.is_err(), "targeting a closed fork must fail");
+
+        let missing = call_tool(&mut server, "close_fork", json!({"driver_id": driver_id})).await?;
+        assert!(missing["error"]
+            .as_str()
+            .ok_or("close_fork on unknown id must return error text")?
+            .contains("unknown driver_id"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fork_limit_is_enforced_and_rejected_fork_is_closed() -> Result<(), String> {
+        let mut server = TempoMcpServer::new(MemoryDriver::new());
+        for _ in 0..MAX_LIVE_FORKS {
+            let fork = call_tool(&mut server, "fork", json!({})).await?;
+            assert_eq!(fork["supported"], true);
+        }
+
+        let over_limit = call_tool(&mut server, "fork", json!({})).await?;
+        let reason = over_limit["error"]
+            .as_str()
+            .ok_or("fork past the limit must return an error")?;
+        assert!(reason.contains("fork limit reached"), "{reason}");
+        // The rejected fork was closed instead of leaking.
+        assert_eq!(server.driver().closed.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn close_all_forks_closes_every_live_fork() -> Result<(), String> {
+        let mut server = TempoMcpServer::new(MemoryDriver::new());
+        for _ in 0..3 {
+            call_tool(&mut server, "fork", json!({})).await?;
+        }
+
+        let errors = server.close_all_forks().await;
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(server.driver().closed.load(Ordering::SeqCst), 3);
+
+        // Every fork was dropped from the session map.
+        let missing = call_tool(&mut server, "close_fork", json!({"driver_id": "fork-1"})).await?;
+        assert!(missing["error"]
+            .as_str()
+            .ok_or("expected error text")?
+            .contains("unknown driver_id"));
+        Ok(())
+    }
+
+    #[test]
+    fn handshake_probe_target_follows_live_http_intent() {
+        // An origin without inline responses probes live by default.
+        let default_on = HandshakeArgs {
+            origin: Some("https://example.test".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            handshake_probe_target(&default_on).as_deref(),
+            Some("https://example.test")
+        );
+
+        // Explicitly disabled: no probe even with an origin present.
+        let disabled = HandshakeArgs {
+            origin: Some("https://example.test".into()),
+            live_http: Some(false),
+            ..Default::default()
+        };
+        assert_eq!(handshake_probe_target(&disabled), None);
+
+        // Inline responses suppress the default live probe.
+        let with_responses = HandshakeArgs {
+            origin: Some("https://example.test".into()),
+            responses: vec![ProbeResponseInput {
+                path: "/openapi.json".into(),
+                status: 200,
+                content_type: None,
+                body: String::new(),
+            }],
+            ..Default::default()
+        };
+        assert_eq!(handshake_probe_target(&with_responses), None);
+
+        // No origin: nothing to probe even when forced on.
+        let forced = HandshakeArgs {
+            live_http: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(handshake_probe_target(&forced), None);
     }
 
     #[tokio::test]
@@ -1397,11 +1619,15 @@ mod tests {
     #[derive(Clone)]
     struct MemoryDriver {
         observation: CompiledObservation,
+        // Shared across forks (fork() clones this handle) so tests can assert that
+        // close() actually ran on a forked driver rather than it merely being dropped.
+        closed: Arc<AtomicUsize>,
     }
 
     impl MemoryDriver {
         fn new() -> Self {
             Self {
+                closed: Arc::new(AtomicUsize::new(0)),
                 observation: CompiledObservation {
                     schema_version: tempo_schema::SCHEMA_VERSION.into(),
                     url: "https://example.test/".into(),
@@ -1496,6 +1722,7 @@ mod tests {
         }
 
         async fn close(&mut self) -> Result<(), TransportError> {
+            self.closed.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
     }
