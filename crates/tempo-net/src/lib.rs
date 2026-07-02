@@ -9,10 +9,20 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+
+/// Default maximum age for Web Bot Auth signatures.
+///
+/// The `created` signature parameter is part of the signed base string. Tempo
+/// rejects older signatures so a captured request cannot be replayed forever.
+pub const DEFAULT_WEB_BOT_AUTH_MAX_SIGNATURE_AGE: Duration = Duration::from_secs(300);
+
+/// Default allowance for small verifier/signer clock skew.
+pub const DEFAULT_WEB_BOT_AUTH_CLOCK_SKEW: Duration = Duration::from_secs(60);
 
 /// Stable request identifier used by audit and quiescence records.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -339,6 +349,8 @@ impl WebBotAuthSigningKey {
         WebBotAuthVerifier {
             key_id: self.key_id.clone(),
             verifying_key: self.signing_key.verifying_key(),
+            max_signature_age: DEFAULT_WEB_BOT_AUTH_MAX_SIGNATURE_AGE,
+            allowed_clock_skew: DEFAULT_WEB_BOT_AUTH_CLOCK_SKEW,
         }
     }
 }
@@ -348,6 +360,8 @@ impl WebBotAuthSigningKey {
 pub struct WebBotAuthVerifier {
     key_id: String,
     verifying_key: VerifyingKey,
+    max_signature_age: Duration,
+    allowed_clock_skew: Duration,
 }
 
 impl WebBotAuthVerifier {
@@ -363,7 +377,27 @@ impl WebBotAuthVerifier {
         Ok(Self {
             key_id: key_id.into(),
             verifying_key,
+            max_signature_age: DEFAULT_WEB_BOT_AUTH_MAX_SIGNATURE_AGE,
+            allowed_clock_skew: DEFAULT_WEB_BOT_AUTH_CLOCK_SKEW,
         })
+    }
+
+    pub fn with_max_signature_age(mut self, max_signature_age: Duration) -> Self {
+        self.max_signature_age = max_signature_age;
+        self
+    }
+
+    pub fn with_allowed_clock_skew(mut self, allowed_clock_skew: Duration) -> Self {
+        self.allowed_clock_skew = allowed_clock_skew;
+        self
+    }
+
+    pub fn max_signature_age(&self) -> Duration {
+        self.max_signature_age
+    }
+
+    pub fn allowed_clock_skew(&self) -> Duration {
+        self.allowed_clock_skew
     }
 }
 
@@ -440,8 +474,23 @@ pub enum SignatureError {
     InvalidSignatureInput(String),
     MissingComponent(String),
     UnsupportedAlgorithm(String),
-    KeyIdMismatch { expected: String, actual: String },
+    KeyIdMismatch {
+        expected: String,
+        actual: String,
+    },
     InvalidSignature(String),
+    MissingRequiredComponent(String),
+    SignatureExpired {
+        created: u64,
+        now: u64,
+        max_age_secs: u64,
+    },
+    SignatureCreatedInFuture {
+        created: u64,
+        now: u64,
+        allowed_skew_secs: u64,
+    },
+    VerificationClockBeforeUnixEpoch,
     VerificationFailed,
     Url(BlockReason),
 }
@@ -460,6 +509,28 @@ impl fmt::Display for SignatureError {
                 )
             }
             Self::InvalidSignature(reason) => write!(f, "invalid signature: {reason}"),
+            Self::MissingRequiredComponent(name) => {
+                write!(f, "signature is missing required component: {name}")
+            }
+            Self::SignatureExpired {
+                created,
+                now,
+                max_age_secs,
+            } => write!(
+                f,
+                "signature expired: created={created}, now={now}, max_age={max_age_secs}s"
+            ),
+            Self::SignatureCreatedInFuture {
+                created,
+                now,
+                allowed_skew_secs,
+            } => write!(
+                f,
+                "signature created time is too far in the future: created={created}, now={now}, allowed_skew={allowed_skew_secs}s"
+            ),
+            Self::VerificationClockBeforeUnixEpoch => {
+                write!(f, "verification clock is before the Unix epoch")
+            }
             Self::VerificationFailed => write!(f, "signature verification failed"),
             Self::Url(reason) => write!(f, "invalid signed URL: {}", reason.detail),
         }
@@ -880,7 +951,24 @@ pub fn verify_request_signature(
     signature: &str,
     verifier: &WebBotAuthVerifier,
 ) -> Result<(), SignatureError> {
+    let now = unix_timestamp(SystemTime::now())?;
+    verify_request_signature_at(request, signature_input, signature, verifier, now)
+}
+
+/// Verify RFC 9421 headers against a request at a caller-supplied Unix timestamp.
+///
+/// This is useful for replay/audit verification and deterministic tests. The
+/// verifier's freshness policy is still applied to the supplied timestamp.
+pub fn verify_request_signature_at(
+    request: &NetworkRequest,
+    signature_input: &str,
+    signature: &str,
+    verifier: &WebBotAuthVerifier,
+    now: u64,
+) -> Result<(), SignatureError> {
     let params = parse_signature_input(signature_input)?;
+    validate_web_bot_auth_components(&params)?;
+    validate_signature_freshness(&params, verifier, now)?;
     if params.key_id != verifier.key_id {
         return Err(SignatureError::KeyIdMismatch {
             expected: verifier.key_id.clone(),
@@ -1442,6 +1530,65 @@ fn parse_signature_header(signature: &str, label: &str) -> Result<Vec<u8>, Signa
     BASE64
         .decode(encoded)
         .map_err(|err| SignatureError::InvalidSignature(err.to_string()))
+}
+
+fn validate_web_bot_auth_components(params: &SignatureParameters) -> Result<(), SignatureError> {
+    for required in [
+        CoveredComponent::Method,
+        CoveredComponent::Authority,
+        CoveredComponent::Scheme,
+        CoveredComponent::Path,
+    ] {
+        if !params
+            .components
+            .iter()
+            .any(|component| component == &required)
+        {
+            return Err(SignatureError::MissingRequiredComponent(
+                required.identifier(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_signature_freshness(
+    params: &SignatureParameters,
+    verifier: &WebBotAuthVerifier,
+    now: u64,
+) -> Result<(), SignatureError> {
+    let max_age_secs = verifier.max_signature_age.as_secs();
+    let allowed_skew_secs = verifier.allowed_clock_skew.as_secs();
+
+    if params.created > now {
+        let skew = params.created - now;
+        if skew > allowed_skew_secs {
+            return Err(SignatureError::SignatureCreatedInFuture {
+                created: params.created,
+                now,
+                allowed_skew_secs,
+            });
+        }
+        return Ok(());
+    }
+
+    let age = now - params.created;
+    if age > max_age_secs {
+        return Err(SignatureError::SignatureExpired {
+            created: params.created,
+            now,
+            max_age_secs,
+        });
+    }
+
+    Ok(())
+}
+
+fn unix_timestamp(time: SystemTime) -> Result<u64, SignatureError> {
+    Ok(time
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| SignatureError::VerificationClockBeforeUnixEpoch)?
+        .as_secs())
 }
 
 fn escape_sf_string(value: &str) -> String {
@@ -2265,11 +2412,34 @@ mod tests {
             "\"@method\": GET\n\"@authority\": example.com\n\"@scheme\": https\n\"@path\": /agent/path\n\"@signature-params\": (\"@method\" \"@authority\" \"@scheme\" \"@path\");created=1800000000;keyid=\"tempo-agent\";alg=\"ed25519\""
         );
 
-        verify_request_signature(
+        verify_request_signature_at(
             &request,
             &headers.signature_input,
             &headers.signature,
             &verifier,
+            1_800_000_000,
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn web_bot_auth_verifies_fresh_headers_with_system_clock() -> Result<(), SignatureError> {
+        let key = WebBotAuthSigningKey::from_seed("tempo-agent", &[7u8; 32])?;
+        let request = NetworkRequest::new(
+            "r1",
+            "GET",
+            "https://example.com/agent/path",
+            "profile-a",
+            IdentityMode::AgentDeclared,
+        );
+        let created = unix_timestamp(SystemTime::now())?;
+        let headers = request.sign_web_bot_auth(&key, created)?;
+
+        verify_request_signature(
+            &request,
+            &headers.signature_input,
+            &headers.signature,
+            &key.verifier(),
         )?;
         Ok(())
     }
@@ -2294,26 +2464,156 @@ mod tests {
             IdentityMode::AgentDeclared,
         );
 
-        let tampered_result = verify_request_signature(
+        let tampered_result = verify_request_signature_at(
             &tampered,
             &headers.signature_input,
             &headers.signature,
             &key.verifier(),
+            1_800_000_000,
         );
         assert!(matches!(
             tampered_result,
             Err(SignatureError::VerificationFailed)
         ));
 
-        let wrong_key_result = verify_request_signature(
+        let wrong_key_result = verify_request_signature_at(
             &request,
             &headers.signature_input,
             &headers.signature,
             &wrong,
+            1_800_000_000,
         );
         assert!(matches!(
             wrong_key_result,
             Err(SignatureError::KeyIdMismatch { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn web_bot_auth_rejects_stale_and_future_created_times() -> Result<(), SignatureError> {
+        let key = WebBotAuthSigningKey::from_seed("tempo-agent", &[7u8; 32])?;
+        let verifier = key.verifier();
+        let request = NetworkRequest::new(
+            "r1",
+            "GET",
+            "https://example.com/agent/path",
+            "profile-a",
+            IdentityMode::AgentDeclared,
+        );
+
+        let stale_headers = request.sign_web_bot_auth(&key, 1_800_000_000)?;
+        let stale_result = verify_request_signature_at(
+            &request,
+            &stale_headers.signature_input,
+            &stale_headers.signature,
+            &verifier,
+            1_800_000_301,
+        );
+        assert!(matches!(
+            stale_result,
+            Err(SignatureError::SignatureExpired {
+                created: 1_800_000_000,
+                now: 1_800_000_301,
+                max_age_secs: 300
+            })
+        ));
+
+        let future_headers = request.sign_web_bot_auth(&key, 1_800_001_000)?;
+        let future_result = verify_request_signature_at(
+            &request,
+            &future_headers.signature_input,
+            &future_headers.signature,
+            &verifier,
+            1_800_000_000,
+        );
+        assert!(matches!(
+            future_result,
+            Err(SignatureError::SignatureCreatedInFuture {
+                created: 1_800_001_000,
+                now: 1_800_000_000,
+                allowed_skew_secs: 60
+            })
+        ));
+
+        let skewed_headers = request.sign_web_bot_auth(&key, 1_800_000_060)?;
+        verify_request_signature_at(
+            &request,
+            &skewed_headers.signature_input,
+            &skewed_headers.signature,
+            &verifier,
+            1_800_000_000,
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn web_bot_auth_honors_custom_freshness_policy() -> Result<(), SignatureError> {
+        let key = WebBotAuthSigningKey::from_seed("tempo-agent", &[7u8; 32])?;
+        let verifier = key
+            .verifier()
+            .with_max_signature_age(Duration::from_secs(600))
+            .with_allowed_clock_skew(Duration::from_secs(120));
+        let request = NetworkRequest::new(
+            "r1",
+            "GET",
+            "https://example.com/agent/path",
+            "profile-a",
+            IdentityMode::AgentDeclared,
+        );
+
+        let old_headers = request.sign_web_bot_auth(&key, 1_800_000_000)?;
+        verify_request_signature_at(
+            &request,
+            &old_headers.signature_input,
+            &old_headers.signature,
+            &verifier,
+            1_800_000_600,
+        )?;
+
+        let future_headers = request.sign_web_bot_auth(&key, 1_800_000_120)?;
+        verify_request_signature_at(
+            &request,
+            &future_headers.signature_input,
+            &future_headers.signature,
+            &verifier,
+            1_800_000_000,
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn web_bot_auth_requires_method_authority_scheme_and_path() -> Result<(), SignatureError> {
+        let key = WebBotAuthSigningKey::from_seed("tempo-agent", &[7u8; 32])?;
+        let request = NetworkRequest::new(
+            "r1",
+            "GET",
+            "https://example.com/agent/path",
+            "profile-a",
+            IdentityMode::AgentDeclared,
+        );
+        let params = SignatureParameters {
+            label: "sig1".into(),
+            key_id: "tempo-agent".into(),
+            created: 1_800_000_000,
+            components: vec![
+                CoveredComponent::Method,
+                CoveredComponent::Authority,
+                CoveredComponent::Scheme,
+            ],
+        };
+        let headers = sign_request(&request, &params, &key)?;
+
+        let result = verify_request_signature_at(
+            &request,
+            &headers.signature_input,
+            &headers.signature,
+            &key.verifier(),
+            1_800_000_000,
+        );
+        assert!(matches!(
+            result,
+            Err(SignatureError::MissingRequiredComponent(component)) if component == "@path"
         ));
         Ok(())
     }
