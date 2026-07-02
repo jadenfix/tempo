@@ -2,7 +2,7 @@
 //!
 //! The binary intentionally exposes only operations backed by implemented crates:
 //! schema emission, eval scorecards, session journal adaptation, compat lane
-//! tables, and replay summaries.
+//! tables, injection gates, and replay summaries.
 
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -11,7 +11,7 @@ use std::fs::File;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use tempo_compat::{CompatScorecard, CompatThresholds};
+use tempo_compat::{run_injection_gate, CompatScorecard, CompatThresholds, InjectionCaseResult};
 use tempo_evals::{
     eval_record_from_session_journal, read_eval_records, write_scorecard, EvalBudget, EvalError,
     Lane, Scorecard, SessionEvalDescriptor,
@@ -32,6 +32,7 @@ Commands:
             [--output PATH]
   compat-lanes --input PATH [--output PATH]
             [--min-observation-quality N] [--max-challenge-rate N]
+  injection-gate --input PATH [--output PATH]
   replay --journal PATH [--output PATH]
 ";
 
@@ -77,6 +78,10 @@ enum Command {
         output: Output,
         thresholds: CompatThresholds,
     },
+    InjectionGate {
+        input: PathBuf,
+        output: Output,
+    },
     Replay {
         journal: PathBuf,
         output: Output,
@@ -100,6 +105,7 @@ impl Command {
             "scorecard" => parse_scorecard(options),
             "session-eval" => parse_session_eval(options),
             "compat-lanes" => parse_compat_lanes(options),
+            "injection-gate" => parse_injection_gate(options),
             "replay" => parse_replay(options),
             other => Err(CliError::Usage(format!(
                 "unknown command: {other}\n\n{USAGE}"
@@ -152,6 +158,18 @@ impl Command {
                 let scorecard: CompatScorecard = read_json(&input)?;
                 let lane_table = scorecard.lane_table(thresholds);
                 write_json(&output, &lane_table, stdout)
+            }
+            Self::InjectionGate { input, output } => {
+                let cases: Vec<InjectionCaseResult> = read_json(&input)?;
+                let report = run_injection_gate(&cases);
+                write_json(&output, &report, stdout)?;
+                if report.passed() {
+                    Ok(())
+                } else {
+                    Err(CliError::GateFailed {
+                        violations: report.violations.len(),
+                    })
+                }
             }
             Self::Replay { journal, output } => {
                 let entries = read_journal_entries(&journal)?;
@@ -308,6 +326,27 @@ fn parse_compat_lanes(options: &[String]) -> Result<Command, CliError> {
         input: required_path("--input", input)?,
         output,
         thresholds,
+    })
+}
+
+fn parse_injection_gate(options: &[String]) -> Result<Command, CliError> {
+    let mut input = None;
+    let mut output = Output::Stdout;
+    let mut index = 0;
+
+    while index < options.len() {
+        match options[index].as_str() {
+            "--input" => input = Some(PathBuf::from(take_value(options, &mut index)?)),
+            "--output" => output = Output::Path(PathBuf::from(take_value(options, &mut index)?)),
+            "-h" | "--help" => return Ok(Command::Help),
+            flag => return Err(unknown_flag(flag)),
+        }
+        index += 1;
+    }
+
+    Ok(Command::InjectionGate {
+        input: required_path("--input", input)?,
+        output,
     })
 }
 
@@ -562,7 +601,7 @@ mod tests {
     use tempo_compat::{EngineProbe, OriginScore};
     use tempo_schema::{
         Action, CompiledObservation, InteractiveElement, NodeId, ObservationDiff, Provenance,
-        TaintSpan, SCHEMA_VERSION,
+        SideEffect, TaintSpan, SCHEMA_VERSION,
     };
     use tempo_session::{RunId, SessionId, SessionJournal};
 
@@ -681,6 +720,43 @@ mod tests {
         let value: Value = serde_json::from_reader(File::open(&output)?)?;
         assert_eq!(value["fallback_rate"], 0.5);
         assert_eq!(value["rows"][0]["primary"], "cdp");
+        remove_dir(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn injection_gate_command_writes_report_and_fails_on_violations() -> TestResult {
+        let dir = unique_dir("injection-gate")?;
+        let input = dir.join("cases.json");
+        let output = dir.join("report.json");
+        let cases = vec![
+            InjectionCaseResult::new("read", "https://safe.test", SideEffect::Read),
+            InjectionCaseResult::new("send", "https://mail.test", SideEffect::Send),
+            InjectionCaseResult::new("buy", "https://shop.test", SideEffect::Purchase).blocked(),
+        ];
+        write_json_file(&input, &cases)?;
+        let mut stdout = Vec::new();
+
+        let result = run_with_writer(
+            [
+                "injection-gate".to_string(),
+                "--input".into(),
+                input_string(&input),
+                "--output".into(),
+                input_string(&output),
+            ],
+            &mut stdout,
+        );
+
+        match result {
+            Err(CliError::GateFailed { violations }) => assert_eq!(violations, 1),
+            other => return Err(unexpected_result(other)),
+        }
+        assert!(stdout.is_empty());
+        let value: Value = serde_json::from_reader(File::open(&output)?)?;
+        assert_eq!(value["total_cases"], 3);
+        assert_eq!(value["violations"].as_array().map(Vec::len), Some(1));
+        assert_eq!(value["violations"][0]["id"], "send");
         remove_dir(&dir)?;
         Ok(())
     }
