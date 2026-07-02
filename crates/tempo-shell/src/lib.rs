@@ -25,6 +25,7 @@ Commands:
   close SESSION_ID
   agent-card
   handshake ORIGIN
+  tool NAME [ARGS_JSON]
   drain
 
 Options:
@@ -85,6 +86,7 @@ pub enum ShellCommand {
     Close { session_id: String },
     AgentCard,
     Handshake { origin: String },
+    Tool { name: String, arguments: Value },
     Drain,
 }
 
@@ -102,6 +104,9 @@ impl ShellCommand {
             Self::Close { session_id } => write_json(stdout, &client.close(session_id)?),
             Self::AgentCard => write_json(stdout, &client.agent_card()?),
             Self::Handshake { origin } => write_json(stdout, &client.handshake(origin)?),
+            Self::Tool { name, arguments } => {
+                write_json(stdout, &client.mcp_tool(name, arguments.clone())?)
+            }
             Self::Drain => write_json(stdout, &client.drain()?),
         }
     }
@@ -273,11 +278,29 @@ fn parse_command(args: &[String]) -> Result<ShellCommand, ShellError> {
         "handshake" => one_arg(rest, "handshake ORIGIN", |origin| ShellCommand::Handshake {
             origin,
         }),
+        "tool" => parse_tool_command(rest),
         "drain" => no_args(rest, ShellCommand::Drain),
         "-h" | "--help" | "help" => Ok(ShellCommand::Help),
         other => Err(ShellError::Usage(format!(
             "unknown command: {other}\n\n{USAGE}"
         ))),
+    }
+}
+
+fn parse_tool_command(rest: &[String]) -> Result<ShellCommand, ShellError> {
+    match rest {
+        [name] => Ok(ShellCommand::Tool {
+            name: name.clone(),
+            arguments: json!({}),
+        }),
+        [name, arguments] => Ok(ShellCommand::Tool {
+            name: name.clone(),
+            arguments: serde_json::from_str(arguments)?,
+        }),
+        [] => Err(ShellError::Usage(
+            "tool NAME [ARGS_JSON] requires a tool name".into(),
+        )),
+        [_, _, extra, ..] => Err(ShellError::Usage(format!("unexpected argument: {extra}"))),
     }
 }
 
@@ -373,8 +396,13 @@ mod tests {
     use serde_json::json;
     use std::error::Error;
     use std::net::{SocketAddr, TcpListener};
+    use std::os::unix::net::UnixStream;
     use std::sync::{Arc, Mutex};
     use std::thread;
+    use tempo_driver::{Engine, TestDriver};
+    use tempo_engine_host::{
+        serve_driver_connection, EngineHostError, EngineIpcClient, EngineIpcConnection,
+    };
     use tempo_headless::{serve_one, SessionPool, TempodError, TempodSessionState};
 
     type TestResult = Result<(), Box<dyn Error>>;
@@ -412,6 +440,20 @@ mod tests {
         let options = ShellOptions::parse(["agent-card"])?;
 
         assert_eq!(options.command, ShellCommand::AgentCard);
+        Ok(())
+    }
+
+    #[test]
+    fn parses_mcp_tool_command_with_json_arguments() -> TestResult {
+        let options = ShellOptions::parse(["tool", "screenshot", r#"{"set_of_marks":true}"#])?;
+
+        assert_eq!(
+            options.command,
+            ShellCommand::Tool {
+                name: "screenshot".into(),
+                arguments: json!({"set_of_marks": true}),
+            }
+        );
         Ok(())
     }
 
@@ -486,6 +528,29 @@ mod tests {
     }
 
     #[test]
+    fn run_cli_invokes_attached_driver_mcp_tool_through_real_tempod() -> TestResult {
+        let pool = Arc::new(Mutex::new(SessionPool::default()));
+        let driver_handle = attach_test_driver(&pool)?;
+        let mut output = Vec::new();
+
+        with_tempod(&pool, |addr| {
+            run_cli(
+                ["--tempod", &addr.to_string(), "tool", "observe"],
+                &mut output,
+            )
+        })?;
+        pool.lock()
+            .map_err(|_| "session pool lock failed")?
+            .detach_engine_driver();
+        join_driver(driver_handle)?;
+
+        let value: Value = serde_json::from_slice(&output)?;
+        assert_eq!(value["url"], "about:blank");
+        assert_eq!(value["seq"], 0);
+        Ok(())
+    }
+
+    #[test]
     fn run_cli_writes_json_from_real_tempod() -> TestResult {
         let pool = Arc::new(Mutex::new(SessionPool::default()));
         let mut output = Vec::new();
@@ -525,6 +590,29 @@ mod tests {
         match handle.join() {
             Ok(result) => Ok(result?),
             Err(_) => Err("server thread failed".into()),
+        }
+    }
+
+    fn attach_test_driver(
+        pool: &Arc<Mutex<SessionPool>>,
+    ) -> Result<thread::JoinHandle<Result<(), EngineHostError>>, Box<dyn Error>> {
+        let (client_stream, server_stream) = UnixStream::pair()?;
+        pool.lock()
+            .map_err(|_| "session pool lock failed")?
+            .attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+        Ok(thread::spawn(move || {
+            let mut connection = EngineIpcConnection::from_stream(server_stream);
+            let mut driver = TestDriver::new();
+            futures::executor::block_on(serve_driver_connection(&mut connection, &mut driver))
+        }))
+    }
+
+    fn join_driver(
+        handle: thread::JoinHandle<Result<(), EngineHostError>>,
+    ) -> Result<(), Box<dyn Error>> {
+        match handle.join() {
+            Ok(result) => Ok(result?),
+            Err(_) => Err("driver thread failed".into()),
         }
     }
 }
