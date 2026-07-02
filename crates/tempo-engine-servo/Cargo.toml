@@ -7,9 +7,15 @@ license.workspace = true
 [dependencies]
 tempo-schema = { path = "../tempo-schema" }
 tempo-driver = { path = "../tempo-driver" }
+tempo-engine-host = { path = "../tempo-engine-host" }
+async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+tempo-driver = { path = "../tempo-driver", features = ["test-driver"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [lints]
 workspace = true

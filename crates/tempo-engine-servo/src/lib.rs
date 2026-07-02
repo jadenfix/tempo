@@ -4,9 +4,15 @@
 //! tempo contracts only: semantic actions, stable node ids, network interception
 //! records, screenshot requests, and capability flags.
 
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use tempo_driver::Unsupported;
-use tempo_schema::{Action, NodeId};
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+use tempo_driver::{DriverTrait, Engine, StepOutcome, TransportError, Unsupported};
+use tempo_engine_host::{
+    DriverCommand, DriverResponse, DriverWireError, EngineHostError, EngineIpcClient,
+};
+use tempo_schema::{Action, ActionBatch, CompiledObservation, NodeId, ObservationDiff};
 use thiserror::Error;
 
 /// Which Servo build is backing this engine.
@@ -65,6 +71,158 @@ impl ServoEngineConfig {
         match self.build_flavor {
             ServoBuildFlavor::TempoFork => Ok(()),
             ServoBuildFlavor::Vanilla => Err(Unsupported("native servo fork requires tempo fork")),
+        }
+    }
+}
+
+/// Servo-backed driver handle connected to an out-of-process Servo engine.
+///
+/// The libservo embedder stays in the engine process. This client speaks the
+/// same DriverTrait wire protocol used by tempod and other engines.
+#[derive(Clone)]
+pub struct ServoIpcDriver {
+    config: ServoEngineConfig,
+    client: Arc<Mutex<EngineIpcClient>>,
+}
+
+impl ServoIpcDriver {
+    pub fn connect(
+        config: ServoEngineConfig,
+        socket_path: impl AsRef<Path>,
+    ) -> Result<Self, ServoEngineError> {
+        Ok(Self::from_client(
+            config,
+            EngineIpcClient::connect(socket_path)?,
+        ))
+    }
+
+    pub fn from_client(config: ServoEngineConfig, client: EngineIpcClient) -> Self {
+        Self {
+            config,
+            client: Arc::new(Mutex::new(client)),
+        }
+    }
+
+    pub fn config(&self) -> &ServoEngineConfig {
+        &self.config
+    }
+
+    fn request(&self, command: DriverCommand) -> Result<DriverResponse, ServoEngineError> {
+        let mut client = self
+            .client
+            .lock()
+            .map_err(|_| ServoEngineError::DriverLockFailed)?;
+        Ok(client.request(command)?)
+    }
+}
+
+#[async_trait]
+impl DriverTrait for ServoIpcDriver {
+    fn engine(&self) -> Engine {
+        Engine::Servo
+    }
+
+    async fn goto(&mut self, url: &str) -> Result<CompiledObservation, TransportError> {
+        match self
+            .request(DriverCommand::Goto { url: url.into() })
+            .map_err(servo_host_transport_error)?
+        {
+            DriverResponse::Observation { observation } => Ok(observation),
+            DriverResponse::Error { error } => Err(driver_wire_transport_error(error)),
+            other => Err(unexpected_driver_response(other, "goto")),
+        }
+    }
+
+    async fn observe(&mut self) -> Result<CompiledObservation, TransportError> {
+        match self
+            .request(DriverCommand::Observe)
+            .map_err(servo_host_transport_error)?
+        {
+            DriverResponse::Observation { observation } => Ok(observation),
+            DriverResponse::Error { error } => Err(driver_wire_transport_error(error)),
+            other => Err(unexpected_driver_response(other, "observe")),
+        }
+    }
+
+    async fn observe_diff(&mut self, since_seq: u64) -> Result<ObservationDiff, TransportError> {
+        match self
+            .request(DriverCommand::ObserveDiff { since_seq })
+            .map_err(servo_host_transport_error)?
+        {
+            DriverResponse::Diff { diff } => Ok(diff),
+            DriverResponse::Error { error } => Err(driver_wire_transport_error(error)),
+            other => Err(unexpected_driver_response(other, "observe_diff")),
+        }
+    }
+
+    async fn act(&mut self, action: &Action) -> Result<StepOutcome, TransportError> {
+        match self
+            .request(DriverCommand::Act {
+                action: action.clone(),
+            })
+            .map_err(servo_host_transport_error)?
+        {
+            DriverResponse::Step { outcome } => Ok(outcome.into()),
+            DriverResponse::Error { error } => Err(driver_wire_transport_error(error)),
+            other => Err(unexpected_driver_response(other, "act")),
+        }
+    }
+
+    async fn act_batch(&mut self, batch: &ActionBatch) -> Result<StepOutcome, TransportError> {
+        match self
+            .request(DriverCommand::ActBatch {
+                batch: batch.clone(),
+            })
+            .map_err(servo_host_transport_error)?
+        {
+            DriverResponse::Step { outcome } => Ok(outcome.into()),
+            DriverResponse::Error { error } => Err(driver_wire_transport_error(error)),
+            other => Err(unexpected_driver_response(other, "act_batch")),
+        }
+    }
+
+    async fn fork(&mut self) -> Result<Box<dyn DriverTrait>, Unsupported> {
+        self.config.native_fork()?;
+        match self.request(DriverCommand::Fork) {
+            Ok(DriverResponse::Forked { .. }) => {
+                Err(Unsupported("engine IPC fork handle allocation"))
+            }
+            Ok(DriverResponse::Error { error }) => Err(driver_wire_unsupported(error)),
+            Ok(_) => Err(Unsupported("unexpected engine IPC fork response")),
+            Err(_) => Err(Unsupported("engine IPC fork failed")),
+        }
+    }
+
+    async fn extract(&mut self, node: &NodeId) -> Result<serde_json::Value, TransportError> {
+        match self
+            .request(DriverCommand::Extract { node: node.clone() })
+            .map_err(servo_host_transport_error)?
+        {
+            DriverResponse::Extracted { value } => Ok(value),
+            DriverResponse::Error { error } => Err(driver_wire_transport_error(error)),
+            other => Err(unexpected_driver_response(other, "extract")),
+        }
+    }
+
+    async fn screenshot(&mut self) -> Result<Vec<u8>, TransportError> {
+        match self
+            .request(DriverCommand::Screenshot)
+            .map_err(servo_host_transport_error)?
+        {
+            DriverResponse::Screenshot { bytes } => Ok(bytes),
+            DriverResponse::Error { error } => Err(driver_wire_transport_error(error)),
+            other => Err(unexpected_driver_response(other, "screenshot")),
+        }
+    }
+
+    async fn close(&mut self) -> Result<(), TransportError> {
+        match self
+            .request(DriverCommand::Close)
+            .map_err(servo_host_transport_error)?
+        {
+            DriverResponse::Closed => Ok(()),
+            DriverResponse::Error { error } => Err(driver_wire_transport_error(error)),
+            other => Err(unexpected_driver_response(other, "close")),
         }
     }
 }
@@ -209,16 +367,52 @@ pub enum ServoEngineError {
         symbol: String,
         fragment: &'static str,
     },
+    #[error("servo engine host failed: {0}")]
+    Host(#[from] EngineHostError),
+    #[error("servo IPC driver lock failed")]
+    DriverLockFailed,
+}
+
+fn servo_host_transport_error(error: ServoEngineError) -> TransportError {
+    TransportError::Other(error.to_string())
+}
+
+fn driver_wire_transport_error(error: DriverWireError) -> TransportError {
+    match error {
+        DriverWireError::Transport { message } | DriverWireError::Protocol { message } => {
+            TransportError::Other(message)
+        }
+        DriverWireError::Unsupported { capability } => TransportError::Other(capability),
+    }
+}
+
+fn driver_wire_unsupported(error: DriverWireError) -> Unsupported {
+    match error {
+        DriverWireError::Unsupported { .. } => Unsupported("servo IPC capability unsupported"),
+        DriverWireError::Transport { .. } | DriverWireError::Protocol { .. } => {
+            Unsupported("servo IPC fork failed")
+        }
+    }
+}
+
+fn unexpected_driver_response(response: DriverResponse, expected: &'static str) -> TransportError {
+    TransportError::Other(format!(
+        "servo engine returned unexpected response for {expected}: {response:?}"
+    ))
 }
 
 /// Human-readable crate summary.
 pub fn describe() -> &'static str {
-    "Servo engine boundary types, action translation, network interception records, and capability gates"
+    "Servo engine boundary types, UDS DriverTrait client, action translation, network interception records, and capability gates"
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::net::UnixStream;
+    use tempo_driver::{DriverTrait, Engine, TestDriver};
+    use tempo_engine_host::{serve_driver_connection, EngineIpcConnection};
+    use tempo_schema::{InteractiveElement, Provenance, TaintSpan};
 
     #[test]
     fn vanilla_config_enables_access_tree_and_network_interception() {
@@ -324,5 +518,50 @@ mod tests {
 
         assert_eq!(request.request_id, response.request_id);
         assert_eq!(response.body, br#"{"ok":true}"#.to_vec());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn servo_ipc_driver_round_trips_driver_trait_over_uds(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (client_stream, server_stream) = UnixStream::pair()?;
+        let server = tokio::spawn(async move {
+            let mut driver = TestDriver::new().with_elements(vec![button("submit")]);
+            let mut connection = EngineIpcConnection::from_stream(server_stream);
+            serve_driver_connection(&mut connection, &mut driver).await
+        });
+        let mut driver = ServoIpcDriver::from_client(
+            ServoEngineConfig::vanilla(),
+            tempo_engine_host::EngineIpcClient::from_stream(client_stream),
+        );
+
+        let observation = driver.goto("https://servo.test").await?;
+        let outcome = driver
+            .act(&Action::Click {
+                node: NodeId("submit".into()),
+            })
+            .await?;
+        let extracted = driver.extract(&NodeId("submit".into())).await?;
+        driver.close().await?;
+        server.await??;
+
+        assert_eq!(driver.engine(), Engine::Servo);
+        assert_eq!(observation.url, "https://servo.test");
+        assert!(matches!(outcome, StepOutcome::Applied { .. }));
+        assert_eq!(extracted["node"], "submit");
+        Ok(())
+    }
+
+    fn button(id: &str) -> InteractiveElement {
+        InteractiveElement {
+            node_id: NodeId(id.into()),
+            role: "button".into(),
+            name: vec![TaintSpan {
+                provenance: Provenance::Page,
+                text: "Submit".into(),
+            }],
+            value: vec![],
+            bounds: Some([0.0, 0.0, 100.0, 30.0]),
+            rank: 1.0,
+        }
     }
 }
