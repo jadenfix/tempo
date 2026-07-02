@@ -12,13 +12,19 @@ Engine strategy is **Rust-first**: [Servo](https://servo.org) is the primary ren
 
 ## Layout
 
-Cargo workspace under `crates/`. The two **freeze-first contracts** are implemented:
+Cargo workspace under `crates/`. The implementation is split into contract, engine,
+observation, action, network, runtime, protocol, shell, eval, and compatibility crates:
 
-- `tempo-schema` — **C1/C2**: `CompiledObservation`, `Action`/`ActionBatch`, taint spans, diffs.
-- `tempo-driver` — **C3**: the engine-agnostic `DriverTrait` v2 + `MockDriver` + conformance suite.
-
-Everything else is a scaffolded stub with its responsibility and Definition of Done documented in `final.md`.
+- `tempo-schema` and `tempo-driver` define the C1/C2/C3 contracts, conformance suite,
+  and gated test-driver support.
+- `tempo-engine-cdp`, `tempo-engine-servo`, `tempo-engine-host`, and `tempo-headless`
+  provide the current engine boundaries, CDP lane, host supervision, UDS transport,
+  tempod control plane, MCP, and BiDi routing.
+- `tempo-observe`, `tempo-taint`, `tempo-act`, `tempo-policy`, `tempo-net`,
+  `tempo-session`, `tempo-agent`, `tempo-skills`, `tempo-speculate`, `tempo-toolexec`,
+  `tempo-shell`, `tempo-evals`, `tempo-compat`, and `tempo-cli` carry the supporting
+  browser, agent, security, replay, shell, evaluation, and operations layers.
 
 ```
-cargo test --workspace   # contracts + MockDriver conformance
+cargo test --workspace   # contracts, conformance, runtime, protocol, and shell tests
 ```
