@@ -54,6 +54,26 @@ pub struct TempodSession {
     pub created_ms: u128,
 }
 
+/// One event in tempod's per-session control-plane log.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TempodSessionEvent {
+    pub session_id: TempodSessionId,
+    pub seq: u64,
+    pub timestamp_ms: u128,
+    pub event: TempodSessionEventKind,
+}
+
+/// Typed events clients can attach to for session logs and StepTriple telemetry.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TempodSessionEventKind {
+    SessionCreated { url: String },
+    SessionAdopted,
+    SessionKilled,
+    SessionDrained,
+    StepTriple { triple: StepTriple },
+}
+
 /// Driver handle attached to tempod through the engine-host UDS protocol.
 #[derive(Clone)]
 pub struct AttachedEngineDriver {
@@ -275,6 +295,7 @@ enum DriverClientError {
 #[derive(Clone, Default)]
 pub struct SessionPool {
     sessions: BTreeMap<TempodSessionId, TempodSession>,
+    events: BTreeMap<TempodSessionId, Vec<TempodSessionEvent>>,
     bidi: BidiRouter,
     driver: Option<AttachedEngineDriver>,
     mcp: Option<Arc<Mutex<tempo_mcp::TempoMcpServer<AttachedEngineDriver>>>>,
@@ -287,6 +308,7 @@ impl fmt::Debug for SessionPool {
         formatter
             .debug_struct("SessionPool")
             .field("sessions", &self.sessions)
+            .field("event_sessions", &self.events.len())
             .field("bidi", &self.bidi)
             .field("driver", &self.driver)
             .field("mcp_attached", &self.mcp.is_some())
@@ -307,6 +329,12 @@ impl SessionPool {
             created_ms: current_time_ms(),
         };
         self.sessions.insert(id, session.clone());
+        self.record_event(
+            &session.id,
+            TempodSessionEventKind::SessionCreated {
+                url: session.url.clone(),
+            },
+        );
         session
     }
 
@@ -315,29 +343,42 @@ impl SessionPool {
     }
 
     pub fn adopt(&mut self, id: &TempodSessionId) -> Result<TempodSession, TempodError> {
-        let session = self
-            .sessions
-            .get_mut(id)
-            .ok_or_else(|| TempodError::SessionNotFound(id.clone()))?;
-        session.state = TempodSessionState::Adopted;
+        let session = {
+            let session = self
+                .sessions
+                .get_mut(id)
+                .ok_or_else(|| TempodError::SessionNotFound(id.clone()))?;
+            session.state = TempodSessionState::Adopted;
+            session.clone()
+        };
+        self.record_event(id, TempodSessionEventKind::SessionAdopted);
         Ok(session.clone())
     }
 
     pub fn kill(&mut self, id: &TempodSessionId) -> Result<TempodSession, TempodError> {
-        let session = self
-            .sessions
-            .get_mut(id)
-            .ok_or_else(|| TempodError::SessionNotFound(id.clone()))?;
-        session.state = TempodSessionState::Killed;
+        let session = {
+            let session = self
+                .sessions
+                .get_mut(id)
+                .ok_or_else(|| TempodError::SessionNotFound(id.clone()))?;
+            session.state = TempodSessionState::Killed;
+            session.clone()
+        };
+        self.record_event(id, TempodSessionEventKind::SessionKilled);
         Ok(session.clone())
     }
 
     pub fn drain(&mut self) {
         self.draining = true;
+        let mut drained = Vec::new();
         for session in self.sessions.values_mut() {
             if session.state == TempodSessionState::Running {
                 session.state = TempodSessionState::Killed;
+                drained.push(session.id.clone());
             }
+        }
+        for id in drained {
+            self.record_event(&id, TempodSessionEventKind::SessionDrained);
         }
     }
 
@@ -356,6 +397,49 @@ impl SessionPool {
     pub fn detach_engine_driver(&mut self) {
         self.driver = None;
         self.mcp = None;
+    }
+
+    pub fn record_step(
+        &mut self,
+        id: &TempodSessionId,
+        triple: StepTriple,
+    ) -> Result<TempodSessionEvent, TempodError> {
+        if !self.sessions.contains_key(id) {
+            return Err(TempodError::SessionNotFound(id.clone()));
+        }
+        Ok(self.record_event(id, TempodSessionEventKind::StepTriple { triple }))
+    }
+
+    pub fn events(
+        &self,
+        id: &TempodSessionId,
+        after_seq: Option<u64>,
+    ) -> Result<Vec<TempodSessionEvent>, TempodError> {
+        if !self.sessions.contains_key(id) {
+            return Err(TempodError::SessionNotFound(id.clone()));
+        }
+        let events = self.events.get(id).map(Vec::as_slice).unwrap_or_default();
+        Ok(events
+            .iter()
+            .filter(|event| after_seq.is_none_or(|after| event.seq > after))
+            .cloned()
+            .collect())
+    }
+
+    fn record_event(
+        &mut self,
+        id: &TempodSessionId,
+        event: TempodSessionEventKind,
+    ) -> TempodSessionEvent {
+        let events = self.events.entry(id.clone()).or_default();
+        let record = TempodSessionEvent {
+            session_id: id.clone(),
+            seq: events.len() as u64,
+            timestamp_ms: current_time_ms(),
+            event,
+        };
+        events.push(record.clone());
+        record
     }
 }
 
@@ -571,6 +655,11 @@ fn route_http_request(
             ))
         }
         _ => {
+            if request.method == "GET" {
+                if let Some((id, after_seq)) = session_events_from_path(&request.path)? {
+                    return Ok(HttpResponse::json(200, pool.events(&id, after_seq)?));
+                }
+            }
             if request.method == "POST" && request.path.ends_with("/adopt") {
                 let id = session_id_from_action_path(&request.path, "adopt")?;
                 return Ok(HttpResponse::json(200, pool.adopt(&id)?));
@@ -585,6 +674,47 @@ fn route_http_request(
             )))
         }
     }
+}
+
+fn session_events_from_path(
+    path: &str,
+) -> Result<Option<(TempodSessionId, Option<u64>)>, TempodError> {
+    let (path, query) = split_path_query(path);
+    let Some(session_path) = path.strip_suffix("/events") else {
+        return Ok(None);
+    };
+    if !session_path.starts_with("/sessions/") {
+        return Ok(None);
+    }
+    Ok(Some((
+        session_id_from_path(session_path)?,
+        after_seq(query)?,
+    )))
+}
+
+fn split_path_query(path: &str) -> (&str, Option<&str>) {
+    match path.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (path, None),
+    }
+}
+
+fn after_seq(query: Option<&str>) -> Result<Option<u64>, TempodError> {
+    let Some(query) = query else {
+        return Ok(None);
+    };
+    for pair in query.split('&') {
+        let Some((name, value)) = pair.split_once('=') else {
+            continue;
+        };
+        if name == "after_seq" {
+            let parsed = value.parse::<u64>().map_err(|error| {
+                TempodError::BadRequest(format!("invalid after_seq cursor: {error}"))
+            })?;
+            return Ok(Some(parsed));
+        }
+    }
+    Ok(None)
 }
 
 fn route_bidi(pool: &mut SessionPool, body: Vec<u8>) -> HttpResponse {
@@ -1016,6 +1146,62 @@ mod tests {
     }
 
     #[test]
+    fn session_pool_records_lifecycle_and_step_events() -> TestResult {
+        let mut pool = SessionPool::default();
+        let session = pool.create("https://events.test");
+        pool.adopt(&session.id)?;
+        let step = sample_step_triple(7);
+        let step_event = pool.record_step(&session.id, step.clone())?;
+        pool.kill(&session.id)?;
+
+        assert_eq!(step_event.seq, 2);
+        assert_eq!(
+            step_event.event,
+            TempodSessionEventKind::StepTriple { triple: step }
+        );
+
+        let events = pool.events(&session.id, None)?;
+        assert_eq!(events.len(), 4);
+        assert!(matches!(
+            events[0].event,
+            TempodSessionEventKind::SessionCreated { .. }
+        ));
+        assert_eq!(events[1].event, TempodSessionEventKind::SessionAdopted);
+        assert!(matches!(
+            events[2].event,
+            TempodSessionEventKind::StepTriple { .. }
+        ));
+        assert_eq!(events[3].event, TempodSessionEventKind::SessionKilled);
+
+        let after_adopt = pool.events(&session.id, Some(1))?;
+        assert_eq!(after_adopt.len(), 2);
+        assert_eq!(after_adopt[0].seq, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn session_pool_records_drain_events_for_running_sessions() -> TestResult {
+        let mut pool = SessionPool::default();
+        let running = pool.create("https://running.test");
+        let adopted = pool.create("https://adopted.test");
+        pool.adopt(&adopted.id)?;
+
+        pool.drain();
+
+        let running_events = pool.events(&running.id, None)?;
+        let adopted_events = pool.events(&adopted.id, None)?;
+        assert_eq!(
+            running_events.last().map(|event| event.event.clone()),
+            Some(TempodSessionEventKind::SessionDrained)
+        );
+        assert_eq!(
+            adopted_events.last().map(|event| event.event.clone()),
+            Some(TempodSessionEventKind::SessionAdopted)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn http_create_and_list_sessions_over_tcp() -> TestResult {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let addr = listener.local_addr()?;
@@ -1042,6 +1228,78 @@ mod tests {
 
         assert!(response.starts_with("HTTP/1.1 200 OK"));
         assert!(response.contains("https://one.test"));
+        Ok(())
+    }
+
+    #[test]
+    fn http_session_events_endpoint_returns_logs_and_cursor_window() -> TestResult {
+        let mut pool = SessionPool::default();
+        let session = pool.create("https://events.test");
+        pool.record_step(&session.id, sample_step_triple(1))?;
+        pool.kill(&session.id)?;
+
+        let response = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "GET".into(),
+                path: "/sessions/session-0/events".into(),
+                host: None,
+                origin: None,
+                body: Vec::new(),
+            },
+        )?;
+        assert_eq!(response.status, 200);
+        let events: Vec<TempodSessionEvent> = serde_json::from_slice(&response.body)?;
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].seq, 0);
+        assert_eq!(events[2].event, TempodSessionEventKind::SessionKilled);
+
+        let response = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "GET".into(),
+                path: "/sessions/session-0/events?after_seq=0".into(),
+                host: None,
+                origin: None,
+                body: Vec::new(),
+            },
+        )?;
+        let events: Vec<TempodSessionEvent> = serde_json::from_slice(&response.body)?;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].seq, 1);
+        assert!(matches!(
+            events[0].event,
+            TempodSessionEventKind::StepTriple { .. }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn http_session_events_endpoint_rejects_bad_cursor_and_missing_session() -> TestResult {
+        let mut pool = SessionPool::default();
+        let bad_cursor = handle_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "GET".into(),
+                path: "/sessions/session-0/events?after_seq=bad".into(),
+                host: None,
+                origin: None,
+                body: Vec::new(),
+            },
+        );
+        let missing_session = handle_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "GET".into(),
+                path: "/sessions/session-0/events".into(),
+                host: None,
+                origin: None,
+                body: Vec::new(),
+            },
+        );
+
+        assert_eq!(bad_cursor.status, 400);
+        assert_eq!(missing_session.status, 404);
         Ok(())
     }
 
@@ -1547,6 +1805,23 @@ mod tests {
             seq,
             elements: Vec::new(),
             marks: Vec::new(),
+        }
+    }
+
+    fn sample_step_triple(seq: u64) -> StepTriple {
+        StepTriple {
+            key: IdempotencyKey(format!("step-{seq}")),
+            seq,
+            action: Action::Scroll { x: 0.0, y: 1.0 },
+            outcome: StepTripleOutcome::Applied {
+                diff: ObservationDiff {
+                    since_seq: seq.saturating_sub(1),
+                    seq,
+                    added: vec![],
+                    removed: vec![],
+                    changed: vec![],
+                },
+            },
         }
     }
 
