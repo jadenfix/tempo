@@ -1,0 +1,13 @@
+[package]
+name = "tempo-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "tempo-cli"
+path = "src/main.rs"
+
+[dependencies]
+tempo-schema = { path = "../tempo-schema" }
+tempo-driver = { path = "../tempo-driver" }

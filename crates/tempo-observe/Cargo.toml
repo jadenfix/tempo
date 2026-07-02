@@ -1,0 +1,8 @@
+[package]
+name = "tempo-observe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tempo-schema = { path = "../tempo-schema" }

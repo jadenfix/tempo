@@ -1,0 +1,21 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: cargo fmt
+        run: cargo fmt --all --check
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: cargo test (contracts + conformance)
+        run: cargo test --workspace
+      # Always-green invariant (final.md §8.3): tempo-engine-servo must build against
+      # pinned VANILLA servo. Enabled once the engine crate carries the servo dep.
+      # - run: cargo check -p tempo-engine-servo --no-default-features --features servo-vanilla
