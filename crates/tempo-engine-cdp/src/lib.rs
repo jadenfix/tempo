@@ -729,9 +729,24 @@ fn diff_from_base(
 }
 
 fn extract_interactive_elements(html: &str) -> Vec<InteractiveElement> {
+    // Track the open-element stack so `:nth-of-type` fallback indices are scoped
+    // to siblings under the same parent (issue #104), not a document-global
+    // counter. Each frame records how many of each tag have opened directly
+    // under it so far.
+    struct Frame {
+        tag: String,
+        child_counts: BTreeMap<String, usize>,
+        selector_path: String,
+    }
+
     let mut elements = Vec::new();
     let mut search_from = 0;
-    let mut tag_counts: BTreeMap<String, usize> = BTreeMap::new();
+    // Sentinel document-root frame; its empty tag never matches a real close tag.
+    let mut stack: Vec<Frame> = vec![Frame {
+        tag: String::new(),
+        child_counts: BTreeMap::new(),
+        selector_path: String::new(),
+    }];
 
     while let Some(start_offset) = html[search_from..].find('<') {
         let start = search_from + start_offset;
@@ -742,27 +757,57 @@ fn extract_interactive_elements(html: &str) -> Vec<InteractiveElement> {
         let raw_tag = html[start + 1..end].trim();
         search_from = end + 1;
 
-        if raw_tag.is_empty()
-            || raw_tag.starts_with('/')
-            || raw_tag.starts_with('!')
-            || raw_tag.starts_with('?')
-        {
+        if raw_tag.is_empty() || raw_tag.starts_with('!') || raw_tag.starts_with('?') {
             continue;
         }
 
+        // Close tag: pop the stack back to the matching open element so sibling
+        // counting resumes in the correct parent scope.
+        if let Some(name) = raw_tag.strip_prefix('/') {
+            let name = name.trim().to_ascii_lowercase();
+            if let Some(position) = stack.iter().rposition(|frame| frame.tag == name) {
+                if position > 0 {
+                    stack.truncate(position);
+                }
+            }
+            continue;
+        }
+
+        let self_closing = raw_tag.ends_with('/');
         let raw_tag = raw_tag.trim_end_matches('/').trim();
         let Some((tag, attrs_raw)) = split_tag(raw_tag) else {
             continue;
         };
         let tag = tag.to_ascii_lowercase();
         let attrs = parse_attrs(attrs_raw);
+
+        // Count this element among its same-tag siblings under the current
+        // parent; this is the element's 1-based `:nth-of-type` index.
+        let (nth_of_type, parent_selector_path) = {
+            let Some(parent) = stack.last_mut() else {
+                break;
+            };
+            let count = parent.child_counts.entry(tag.clone()).or_insert(0);
+            *count += 1;
+            (*count, parent.selector_path.clone())
+        };
+        let selector_segment = format!("{tag}:nth-of-type({nth_of_type})");
+        let fallback_selector = child_structural_selector(&parent_selector_path, &selector_segment);
+
+        // Container elements open a new sibling scope; void/self-closing ones
+        // never have children and are not pushed.
+        if !(self_closing || is_void_element(&tag)) {
+            stack.push(Frame {
+                tag: tag.clone(),
+                child_counts: BTreeMap::new(),
+                selector_path: fallback_selector.clone(),
+            });
+        }
+
         let role_attr = attrs.get("role").map(String::as_str);
         if !is_interactive(&tag, role_attr, &attrs) {
             continue;
         }
-
-        let count = tag_counts.entry(tag.clone()).or_insert(0);
-        *count += 1;
 
         let text = element_text(html, search_from, &tag).unwrap_or_default();
         let name = attrs
@@ -772,8 +817,7 @@ fn extract_interactive_elements(html: &str) -> Vec<InteractiveElement> {
             .cloned()
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| text.trim().to_string());
-        let selector =
-            selector_for(&tag, &attrs).unwrap_or_else(|| format!("{tag}:nth-of-type({count})"));
+        let selector = selector_for(&tag, &attrs).unwrap_or(fallback_selector);
         let role = role_attr
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| implicit_role(&tag, &attrs));
@@ -800,6 +844,34 @@ fn extract_interactive_elements(html: &str) -> Vec<InteractiveElement> {
     }
 
     elements
+}
+
+fn is_void_element(tag: &str) -> bool {
+    matches!(
+        tag,
+        "area"
+            | "base"
+            | "br"
+            | "col"
+            | "embed"
+            | "hr"
+            | "img"
+            | "input"
+            | "link"
+            | "meta"
+            | "param"
+            | "source"
+            | "track"
+            | "wbr"
+    )
+}
+
+fn child_structural_selector(parent_path: &str, segment: &str) -> String {
+    if parent_path.is_empty() {
+        segment.to_string()
+    } else {
+        format!("{parent_path} > {segment}")
+    }
 }
 
 fn split_tag(raw_tag: &str) -> Option<(&str, &str)> {
@@ -1001,12 +1073,46 @@ mod tests {
                 "[id=\"save\"]",
                 "input[name=\"email\"]",
                 "a[href=\"/next\"]",
-                "div:nth-of-type(1)"
+                "main:nth-of-type(1) > div:nth-of-type(1)"
             ]
         );
         assert_eq!(elements[0].name[0].text, "Save");
         assert_eq!(elements[1].value[0].text, "me@example.com");
         assert_eq!(elements[3].role, "button");
+    }
+
+    #[test]
+    fn nth_of_type_fallback_selectors_are_scoped_per_parent() {
+        // Spans have no id/name/href, so they fall back to a structural path.
+        // The selector must include the parent path and sibling-scoped index so
+        // two matching subtrees do not produce duplicate node ids.
+        let html = r#"
+            <section>
+              <p>intro</p>
+              <span tabindex="0">a</span>
+              <span tabindex="0">b</span>
+            </section>
+            <section>
+              <span tabindex="0">c</span>
+            </section>
+        "#;
+
+        let elements = extract_interactive_elements(html);
+        let ids: Vec<_> = elements
+            .iter()
+            .map(|element| element.node_id.0.as_str())
+            .collect();
+
+        assert_eq!(
+            ids,
+            vec![
+                "section:nth-of-type(1) > span:nth-of-type(1)",
+                "section:nth-of-type(1) > span:nth-of-type(2)",
+                "section:nth-of-type(2) > span:nth-of-type(1)",
+            ]
+        );
+        let unique_ids: std::collections::HashSet<_> = ids.iter().copied().collect();
+        assert_eq!(unique_ids.len(), ids.len());
     }
 
     #[test]
