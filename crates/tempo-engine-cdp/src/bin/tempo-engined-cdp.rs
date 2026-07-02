@@ -19,10 +19,10 @@ async fn run() -> Result<(), String> {
     let socket_path = std::env::var(ENGINE_HOST_SOCKET_ENV)
         .map_err(|_| format!("{ENGINE_HOST_SOCKET_ENV} is required"))?;
     let mut config = CdpConfig::default();
-    if let Ok(chrome) = std::env::var(CDP_CHROME_ENV) {
-        if !chrome.trim().is_empty() {
-            config = config.with_executable(chrome);
-        }
+    if let Ok(chrome) = std::env::var(CDP_CHROME_ENV)
+        && !chrome.trim().is_empty()
+    {
+        config = config.with_executable(chrome);
     }
 
     let mut driver = CdpTempoDriver::launch_with(config)
