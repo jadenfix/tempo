@@ -6,6 +6,7 @@
 //! requirements. Execution, UI, and persistence stay outside this crate.
 
 use tempo_schema::{Action, SideEffect, TaintSpan};
+use thiserror::Error;
 
 /// Stable table of side-effect levels handled by this policy crate.
 pub const SIDE_EFFECTS: [SideEffect; 6] = [
@@ -88,6 +89,164 @@ pub struct PolicyDecision {
     pub gate: ConfirmationGate,
     /// Whether callers must attach an idempotency key.
     pub idempotency_required: bool,
+}
+
+/// Canonical web origin used for origin-scoped policy rules.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Origin {
+    pub scheme: String,
+    pub host: String,
+    pub port: Option<u16>,
+}
+
+impl Origin {
+    pub fn parse(url: &str) -> Result<Self, OriginError> {
+        let parsed = url::Url::parse(url)?;
+        let scheme = parsed.scheme().to_ascii_lowercase();
+        let host = parsed
+            .host_str()
+            .ok_or(OriginError::MissingHost)?
+            .to_ascii_lowercase();
+        let port = parsed.port_or_known_default();
+        Ok(Self { scheme, host, port })
+    }
+
+    pub fn matches_url(&self, url: &str) -> Result<bool, OriginError> {
+        Ok(&Self::parse(url)? == self)
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum OriginError {
+    #[error("invalid URL for origin policy: {0}")]
+    Url(#[from] url::ParseError),
+    #[error("URL has no host for origin policy")]
+    MissingHost,
+}
+
+/// Per-origin action taken for effects at or above a configured side-effect level.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum OriginRuleMode {
+    /// Apply normal side-effect and taint rules.
+    Default,
+    /// Require a human confirmation even for lower-risk effects.
+    RequireConfirmation,
+    /// Require the confirmation UI to expose page-derived input provenance.
+    RequireTaintReview,
+    /// Reject the action before execution.
+    Block,
+}
+
+/// One deterministic origin-scoped policy rule.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OriginRule {
+    pub origin: Origin,
+    pub applies_from: SideEffect,
+    pub mode: OriginRuleMode,
+}
+
+impl OriginRule {
+    pub fn new(origin: Origin, applies_from: SideEffect, mode: OriginRuleMode) -> Self {
+        Self {
+            origin,
+            applies_from,
+            mode,
+        }
+    }
+
+    pub fn applies_to(&self, origin: &Origin, effect: SideEffect) -> bool {
+        &self.origin == origin && effect >= self.applies_from
+    }
+}
+
+/// Pure rule table for origin-specific policy decisions.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OriginPolicy {
+    rules: Vec<OriginRule>,
+}
+
+impl OriginPolicy {
+    pub fn new(rules: Vec<OriginRule>) -> Self {
+        Self { rules }
+    }
+
+    pub fn rules(&self) -> &[OriginRule] {
+        &self.rules
+    }
+
+    pub fn push(&mut self, rule: OriginRule) {
+        self.rules.push(rule);
+    }
+
+    pub fn decide_effect(
+        &self,
+        origin: Option<&Origin>,
+        effect: SideEffect,
+        input_taint: InputTaint,
+    ) -> ScopedPolicyDecision {
+        let mut decision = decide_effect(effect, InputTaint::CLEAN);
+        let mut strongest_rule = OriginRuleMode::Default;
+        let mut matched_rules = 0_usize;
+
+        if let Some(origin) = origin {
+            for rule in &self.rules {
+                if rule.applies_to(origin, effect) {
+                    matched_rules += 1;
+                    strongest_rule = strongest_rule.max(rule.mode);
+                }
+            }
+        }
+
+        match strongest_rule {
+            OriginRuleMode::Default => {}
+            OriginRuleMode::RequireConfirmation => {
+                decision.gate = decision.gate.max(ConfirmationGate::Confirm);
+            }
+            OriginRuleMode::RequireTaintReview => {
+                decision.gate = decision.gate.max(ConfirmationGate::ConfirmWithTaintReview);
+            }
+            OriginRuleMode::Block => {}
+        }
+        if input_taint.is_tainted() {
+            decision.gate = decision.gate.escalate_for_taint();
+        }
+        decision.input_taint = input_taint;
+
+        ScopedPolicyDecision {
+            decision,
+            origin: origin.cloned(),
+            matched_rules,
+            rule_mode: strongest_rule,
+        }
+    }
+
+    pub fn decide_action(
+        &self,
+        origin: Option<&Origin>,
+        action: &Action,
+        input_taint: InputTaint,
+    ) -> ScopedPolicyDecision {
+        self.decide_effect(origin, action.side_effect(), input_taint)
+    }
+}
+
+/// Policy decision after origin-scoped rules have been applied.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScopedPolicyDecision {
+    pub decision: PolicyDecision,
+    pub origin: Option<Origin>,
+    pub matched_rules: usize,
+    pub rule_mode: OriginRuleMode,
+}
+
+impl ScopedPolicyDecision {
+    pub fn blocked(&self) -> bool {
+        self.rule_mode == OriginRuleMode::Block
+    }
+
+    pub fn requires_confirmation(&self) -> bool {
+        !self.blocked() && self.decision.requires_confirmation()
+    }
 }
 
 impl PolicyDecision {
@@ -309,5 +468,105 @@ mod tests {
             let second = decide_effect(effect, InputTaint::TAINTED);
             assert_eq!(first, second, "{effect:?}");
         }
+    }
+
+    #[test]
+    fn origin_parsing_canonicalizes_scheme_host_and_default_port() -> Result<(), OriginError> {
+        let origin = Origin::parse("HTTPS://Example.COM/path?x=1")?;
+
+        assert_eq!(
+            origin,
+            Origin {
+                scheme: "https".into(),
+                host: "example.com".into(),
+                port: Some(443),
+            }
+        );
+        assert!(origin.matches_url("https://example.com:443/other")?);
+        Ok(())
+    }
+
+    #[test]
+    fn origin_rule_can_require_confirmation_for_write_actions() -> Result<(), OriginError> {
+        let origin = Origin::parse("https://accounts.example")?;
+        let policy = OriginPolicy::new(vec![OriginRule::new(
+            origin.clone(),
+            SideEffect::Write,
+            OriginRuleMode::RequireConfirmation,
+        )]);
+
+        let decision = policy.decide_effect(Some(&origin), SideEffect::Write, InputTaint::CLEAN);
+
+        assert_eq!(decision.matched_rules, 1);
+        assert_eq!(decision.rule_mode, OriginRuleMode::RequireConfirmation);
+        assert_eq!(decision.decision.gate, ConfirmationGate::Confirm);
+        assert!(decision.requires_confirmation());
+        Ok(())
+    }
+
+    #[test]
+    fn origin_rule_can_block_high_risk_effects() -> Result<(), OriginError> {
+        let origin = Origin::parse("https://shop.example")?;
+        let policy = OriginPolicy::new(vec![OriginRule::new(
+            origin.clone(),
+            SideEffect::Purchase,
+            OriginRuleMode::Block,
+        )]);
+
+        let decision = policy.decide_effect(Some(&origin), SideEffect::Purchase, InputTaint::CLEAN);
+
+        assert!(decision.blocked());
+        assert!(!decision.requires_confirmation());
+        assert!(decision.decision.idempotency_required);
+        Ok(())
+    }
+
+    #[test]
+    fn taint_and_origin_rules_compose_to_taint_review() -> Result<(), OriginError> {
+        let origin = Origin::parse("https://mail.example")?;
+        let policy = OriginPolicy::new(vec![OriginRule::new(
+            origin.clone(),
+            SideEffect::Write,
+            OriginRuleMode::RequireConfirmation,
+        )]);
+
+        let decision = policy.decide_effect(Some(&origin), SideEffect::Write, InputTaint::TAINTED);
+
+        assert_eq!(
+            decision.decision.gate,
+            ConfirmationGate::ConfirmWithTaintReview
+        );
+        assert!(decision.decision.requires_taint_review());
+        Ok(())
+    }
+
+    #[test]
+    fn strongest_matching_origin_rule_wins_independent_of_order() -> Result<(), OriginError> {
+        let origin = Origin::parse("https://bank.example")?;
+        let weaker = OriginRule::new(
+            origin.clone(),
+            SideEffect::Write,
+            OriginRuleMode::RequireConfirmation,
+        );
+        let stronger = OriginRule::new(
+            origin.clone(),
+            SideEffect::Write,
+            OriginRuleMode::RequireTaintReview,
+        );
+        let first = OriginPolicy::new(vec![weaker.clone(), stronger.clone()]);
+        let second = OriginPolicy::new(vec![stronger, weaker]);
+
+        let first_decision =
+            first.decide_effect(Some(&origin), SideEffect::Send, InputTaint::CLEAN);
+        let second_decision =
+            second.decide_effect(Some(&origin), SideEffect::Send, InputTaint::CLEAN);
+
+        assert_eq!(first_decision, second_decision);
+        assert_eq!(
+            first_decision.decision.gate,
+            ConfirmationGate::ConfirmWithTaintReview
+        );
+        assert_eq!(first_decision.matched_rules, 2);
+        Ok(())
     }
 }
