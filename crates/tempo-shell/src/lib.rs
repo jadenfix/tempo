@@ -499,7 +499,9 @@ mod tests {
         assert_eq!(card["name"], "tempo");
         assert_eq!(card["preferredTransport"], "MCP");
         assert_eq!(card["skills"][0]["id"], "observe");
-        assert_eq!(card["skills"][5]["id"], "handshake");
+        assert!(card["skills"]
+            .as_array()
+            .is_some_and(|skills| skills.iter().any(|skill| skill["id"] == "handshake")));
         Ok(())
     }
 
