@@ -496,7 +496,26 @@ fn looks_like_text(response: &ProbeResponse, body: &str) -> bool {
                 || content_type.starts_with("application/octet-stream")
         })
         .unwrap_or(true);
-    content_type_allows_text && body.is_char_boundary(body.len())
+    content_type_allows_text && is_probably_text(body)
+}
+
+/// Heuristic guard that a probe body is real text rather than binary that
+/// merely survived lossy UTF-8 decoding. Rejects bodies containing a NUL byte
+/// or dominated by non-whitespace control characters.
+fn is_probably_text(body: &str) -> bool {
+    if body.contains('\0') {
+        return false;
+    }
+    let total = body.chars().count();
+    if total == 0 {
+        return false;
+    }
+    let control = body
+        .chars()
+        .filter(|ch| ch.is_control() && !matches!(ch, '\t' | '\n' | '\r'))
+        .count();
+    // Allow up to 10% control characters; more strongly implies binary content.
+    control.saturating_mul(10) <= total
 }
 
 #[cfg(test)]
@@ -614,6 +633,30 @@ mod tests {
 
         assert!(report.hits().is_empty());
         assert_eq!(decide_lane(&report).lane, Lane::Render);
+    }
+
+    #[test]
+    fn llms_txt_rejects_binary_and_nul_bodies() {
+        // Plain text is accepted.
+        let text = ProbeResponse::new("/llms.txt", 200, "# Site\nUse the API at /v1.");
+        assert_eq!(
+            detect_http_signal(&text).map(|hit| hit.signal),
+            Some(StructuredSignal::LlmsTxt)
+        );
+
+        // A NUL byte (classic binary marker) is rejected even though lossy
+        // UTF-8 decoding keeps it and the content-type allows text.
+        let with_nul =
+            ProbeResponse::new("/llms.txt", 200, "text\u{0}more").with_content_type("text/plain");
+        assert_eq!(detect_http_signal(&with_nul), None);
+
+        // A body dominated by control bytes is rejected.
+        let control_heavy = ProbeResponse::new("/llms.txt", 200, "\u{1}\u{2}\u{3}\u{4}\u{5}\u{6}a");
+        assert_eq!(detect_http_signal(&control_heavy), None);
+
+        // Whitespace controls (tab/newline/CR) do not count against text.
+        assert!(is_probably_text("line one\tcol\r\nline two\n"));
+        assert!(!is_probably_text("has\u{0}nul"));
     }
 
     #[test]

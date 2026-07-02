@@ -33,8 +33,11 @@ pub struct EvalRecord {
     pub fallback_used: bool,
     pub max_observation_bytes: u64,
     pub max_observation_tokens: u64,
-    pub observe_latency_ms: u64,
-    pub action_latency_ms: u64,
+    /// Raw per-observation observe latencies (ms). Retained (not collapsed to a
+    /// per-case p95) so scorecard percentiles are computed over real samples.
+    pub observe_latencies_ms: Vec<u64>,
+    /// Raw per-action apply latencies (ms), retained for the same reason.
+    pub action_latencies_ms: Vec<u64>,
     pub wall_clock_ms: u64,
     #[serde(default)]
     pub baseline_wall_clock_ms: Option<u64>,
@@ -165,12 +168,27 @@ impl Scorecard {
             records.iter().map(|record| record.max_observation_tokens),
             0.50,
         );
-        let observe_latency_ms_p50 =
-            percentile_u64(records.iter().map(|record| record.observe_latency_ms), 0.50);
-        let observe_latency_ms_p95 =
-            percentile_u64(records.iter().map(|record| record.observe_latency_ms), 0.95);
-        let action_latency_ms_p50 =
-            percentile_u64(records.iter().map(|record| record.action_latency_ms), 0.50);
+        // Pool raw per-observation samples across every record, then take true
+        // percentiles. Percentiling the already-collapsed per-case p95s would
+        // make "p50" a median-of-p95s (see issue #115).
+        let observe_latency_ms_p50 = percentile_u64(
+            records
+                .iter()
+                .flat_map(|record| record.observe_latencies_ms.iter().copied()),
+            0.50,
+        );
+        let observe_latency_ms_p95 = percentile_u64(
+            records
+                .iter()
+                .flat_map(|record| record.observe_latencies_ms.iter().copied()),
+            0.95,
+        );
+        let action_latency_ms_p50 = percentile_u64(
+            records
+                .iter()
+                .flat_map(|record| record.action_latencies_ms.iter().copied()),
+            0.50,
+        );
         let max_unconfirmed_high_risk_actions = records
             .iter()
             .map(|record| record.unconfirmed_high_risk_actions)
@@ -300,6 +318,14 @@ pub fn eval_record_from_session_journal(
         }
     }
 
+    // A journal without a `SessionStarted` event has no wall-clock anchor.
+    // Treat that as an error rather than silently emitting `wall_clock_ms = 0`,
+    // which would fake a 100% speculation reduction against a baseline (#115).
+    let wall_clock_ms = match (session_start_ms, end_ms) {
+        (Some(start), Some(end)) => duration_ms(start, end),
+        _ => return Err(EvalError::MissingSessionStart),
+    };
+
     Ok(EvalRecord {
         suite: descriptor.suite,
         case_id: descriptor.case_id,
@@ -309,12 +335,10 @@ pub fn eval_record_from_session_journal(
         fallback_used: descriptor.fallback_used,
         max_observation_bytes: observation_bytes.into_iter().max().unwrap_or(0),
         max_observation_tokens: observation_tokens.into_iter().max().unwrap_or(0),
-        observe_latency_ms: percentile_u64(observe_latencies, 0.95),
-        action_latency_ms: percentile_u64(action_latencies, 0.95),
-        wall_clock_ms: match (session_start_ms, end_ms) {
-            (Some(start), Some(end)) => duration_ms(start, end),
-            _ => 0,
-        },
+        // Retain every raw sample; percentiles are computed downstream.
+        observe_latencies_ms: observe_latencies,
+        action_latencies_ms: action_latencies,
+        wall_clock_ms,
         baseline_wall_clock_ms: descriptor.baseline_wall_clock_ms,
         unconfirmed_high_risk_actions: descriptor.unconfirmed_high_risk_actions,
         step_count,
@@ -475,6 +499,9 @@ fn percentile_u64(values: impl IntoIterator<Item = u64>, percentile: f64) -> u64
 fn speculation_reduction_p50(records: &[EvalRecord]) -> Option<f64> {
     let reductions: Vec<_> = records
         .iter()
+        // A zero wall clock (e.g. a journal missing `SessionStarted`) would
+        // compute a fake 100% reduction; exclude such records entirely (#115).
+        .filter(|record| record.wall_clock_ms > 0)
         .filter_map(|record| {
             record
                 .baseline_wall_clock_ms
@@ -519,6 +546,8 @@ fn default_speculation_reduction() -> Option<f64> {
 pub enum EvalError {
     #[error("eval run contains no records")]
     EmptyRun,
+    #[error("session journal has no SessionStarted event; cannot derive wall-clock latency")]
+    MissingSessionStart,
     #[error("eval artifact I/O failed at {path:?}: {source}")]
     Io {
         path: PathBuf,
@@ -817,6 +846,84 @@ mod tests {
     }
 
     #[test]
+    fn latency_percentiles_pool_raw_samples_not_per_case_p95() -> TestResult {
+        // Two cases, each with a tail spike. Pooling the raw samples yields a
+        // p50 of 20; percentiling the per-case p95s (the bug) would yield 1000.
+        let mut a = record("a", "https://one.test", Lane::Servo, true, false, 1_000, 0);
+        a.observe_latencies_ms = vec![10, 10, 10, 1_000];
+        a.action_latencies_ms = vec![10, 10, 10, 1_000];
+        let mut b = record("b", "https://two.test", Lane::Cdp, true, false, 1_000, 0);
+        b.observe_latencies_ms = vec![20, 20, 20, 2_000];
+        b.action_latencies_ms = vec![20, 20, 20, 2_000];
+        let budget = EvalBudget {
+            min_speculation_reduction: None,
+            ..EvalBudget::default()
+        };
+
+        let scorecard = Scorecard::from_records(&[a, b], &budget)?;
+
+        assert_eq!(scorecard.observe_latency_ms_p50, 20);
+        assert_eq!(scorecard.observe_latency_ms_p95, 2_000);
+        assert_eq!(scorecard.action_latency_ms_p50, 20);
+        Ok(())
+    }
+
+    #[test]
+    fn speculation_reduction_excludes_zero_wall_clock_records() -> TestResult {
+        let zero_a = spec_record(0, Some(1_000));
+        let zero_b = spec_record(0, Some(1_000));
+        let real = spec_record(800, Some(1_000));
+
+        // Only the real 0.2 reduction counts; the zero-wall records must not
+        // contribute a fake 1.0 reduction.
+        let reduction = speculation_reduction_p50(&[zero_a, zero_b, real])
+            .ok_or("expected a speculation reduction")?;
+        assert!((reduction - 0.2).abs() < 1e-9, "got {reduction}");
+
+        // With no positive-wall-clock records, there is simply no data.
+        assert_eq!(
+            speculation_reduction_p50(&[spec_record(0, Some(1_000))]),
+            None
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn journal_without_session_start_is_error() -> TestResult {
+        let root = unique_dir("no-start")?;
+        remove_dir_if_exists(&root)?;
+        fs::create_dir_all(&root)?;
+        let journal_path = root.join("session.jsonl");
+        let mut journal = SessionJournal::open(
+            &journal_path,
+            RunId("run".into()),
+            SessionId("session".into()),
+        )?;
+        // No SessionStarted event: only an observation.
+        journal.append(JournalEvent::Observation {
+            observation: observation(),
+        })?;
+
+        let result = eval_record_from_session_journal(
+            &journal_path,
+            SessionEvalDescriptor {
+                suite: "s".into(),
+                case_id: "c".into(),
+                origin: "https://journal.test".into(),
+                lane: Lane::Servo,
+                success: true,
+                fallback_used: false,
+                baseline_wall_clock_ms: Some(200),
+                unconfirmed_high_risk_actions: 0,
+            },
+        );
+        assert!(matches!(result, Err(EvalError::MissingSessionStart)));
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[test]
     fn empty_run_is_rejected() {
         assert!(matches!(
             Scorecard::from_records(&[], &EvalBudget::default()),
@@ -842,13 +949,28 @@ mod tests {
             fallback_used,
             max_observation_bytes,
             max_observation_tokens: estimated_tokens(max_observation_bytes),
-            observe_latency_ms: latency,
-            action_latency_ms: latency,
+            observe_latencies_ms: vec![latency],
+            action_latencies_ms: vec![latency],
             wall_clock_ms: latency.saturating_mul(2),
             baseline_wall_clock_ms: None,
             unconfirmed_high_risk_actions: 0,
             step_count: 1,
         }
+    }
+
+    fn spec_record(wall_clock_ms: u64, baseline_wall_clock_ms: Option<u64>) -> EvalRecord {
+        let mut record = record(
+            "spec",
+            "https://spec.test",
+            Lane::Servo,
+            true,
+            false,
+            100,
+            10,
+        );
+        record.wall_clock_ms = wall_clock_ms;
+        record.baseline_wall_clock_ms = baseline_wall_clock_ms;
+        record
     }
 
     fn observation() -> CompiledObservation {
