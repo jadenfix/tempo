@@ -93,7 +93,7 @@ Layer → crate → responsibility (beater reuse in italics).
 
 **L0 — Contracts (freeze these first; see §5)**
 - `tempo-schema` — `CompiledObservation` (ranked interactive elements, stable `NodeId`s, taint spans, diff format, set-of-marks map) and `ActionSchema` (semantic actions on NodeIds, macro refs, batches, quiescence policy). Emits JSON Schema. *Provides `From`/`Into` for `beater_browser::{Observation, BrowserAction, StepTriple}`.*
-- `tempo-driver` — `DriverTrait` v2, an engine-agnostic superset of *`beater_browser::BrowserDriver`* (keeps goto/act/observe/screenshot/dom/close; adds `observe_diff(since)`, `act_batch(actions, quiescence)`, `fork() -> Result<Session, Unsupported>`, `extract(schema)`, event subscription). Ships `MockDriver` v2 + conformance suite v2 (extends *`assert_browser_driver_conformance`*). Grounding contract preserved: **a NodeId/selector miss is a step error, never a transport error.** *Reuses beater's `UrlPolicy` + SSRF guard verbatim.*
+- `tempo-driver` — `DriverTrait` v2, an engine-agnostic superset of *`beater_browser::BrowserDriver`* (keeps goto/act/observe/screenshot/dom/close; adds `observe_diff(since)`, `act_batch(actions, quiescence)`, `fork() -> Result<Session, Unsupported>`, `extract(schema)`, event subscription). Ships the test-only `TestDriver` + conformance suite v2 (extends *`assert_browser_driver_conformance`*). Grounding contract preserved: **a NodeId/selector miss is a step error, never a transport error.** *Reuses beater's `UrlPolicy` + SSRF guard verbatim.*
 
 **L1 — Engines**
 - `tempo-engine-servo` — libservo embedding: `WebViewBuilder` + our `WebViewDelegate`, offscreen `RenderingContext`, `take_screenshot`, `evaluate_javascript`, `notify_input_event`, `load_web_resource` → tempo-net, AccessKit stream intake. Cargo features `servo-vanilla` (pinned upstream) vs `servo-tempo` (our fork branch APIs).
@@ -185,7 +185,7 @@ These are the *only* global synchronization points. Freeze them and 7 of 10 engi
 
 - **C1 — ObservationSchema v2** (`CompiledObservation`, `NodeId`, taint spans, diff format, set-of-marks map).
 - **C2 — ActionSchema v2** (semantic actions, batches, SideEffect metadata, quiescence policy).
-- **C3 — DriverTrait v2 + IPC wire protocol + MockDriver v2 + conformance suite v2.** The **MockDriver ships the same moment C3 freezes** — it is the substrate every non-engine team develops against, so nobody waits on Servo.
+- **C3 — DriverTrait v2 + IPC wire protocol + test-only TestDriver + conformance suite v2.** The **TestDriver ships the same moment C3 freezes** — it is the substrate for conformance and non-engine contract tests, so nobody waits on Servo.
 
 (Soft: **C4** session/journal event schema — mostly inherited from beater `StepTriple` / `Journal`; freeze only the deltas.)
 
@@ -193,13 +193,13 @@ These are the *only* global synchronization points. Freeze them and 7 of 10 engi
 
 | WS | Scope | Eng | Starts day 1 against… |
 |---|---|---|---|
-| **WS1** Contracts & Mock | tempo-schema, tempo-driver, MockDriver v2, conformance v2 | E1 | nothing — this *is* C1–C3 |
+| **WS1** Contracts & Test Driver | tempo-schema, tempo-driver, TestDriver, conformance v2 | E1 | nothing — this *is* C1–C3 |
 | **WS2** Servo engine host | tempo-engine-servo + tempo-engine-host; E3 = upstream-patch liaison | E2, E3 | libservo directly (milestone **M-vanilla** = goto/screenshot/input/js-eval over IPC) |
 | **WS3** CDP fallback lane | tempo-engine-cdp over beater-browser-cdp | E4 | beater-browser-cdp today; draft C3 |
-| **WS4** Observation compiler + taint | tempo-observe, tempo-taint | E1(later), E5 | MockDriver **+ recorded AccessKit fixtures captured from servoshell** — zero dependence on WS2's schedule |
-| **WS5** Action / quiescence / policy | tempo-act, tempo-policy | E6 | MockDriver + CDP lane immediately |
+| **WS4** Observation compiler + taint | tempo-observe, tempo-taint | E1(later), E5 | TestDriver **+ recorded AccessKit fixtures captured from servoshell** — zero dependence on WS2's schedule |
+| **WS5** Action / quiescence / policy | tempo-act, tempo-policy | E6 | TestDriver + CDP lane immediately |
 | **WS6** Net + fast path | tempo-net (Web Bot Auth, profiles), tempo-handshake | E7 | pure network code; only interceptor *wiring* waits on WS2 |
-| **WS7** Runtime + protocols | tempod, tempo-session, tempo-mcp, tempo-bidi, tempo-toolexec | E8 | MockDriver |
+| **WS7** Runtime + protocols | tempod, tempo-session, tempo-mcp, tempo-bidi, tempo-toolexec | E8 | TestDriver |
 | **WS8** Human shell | tempo-shell + in-proc webview + confirm/taint UX + shared sessions | E9 (+E4 later) | vanilla libservo (servoshell/Verso reference); agent panel needs C1/C2 |
 | **WS9** Skills / speculation / fork | tempo-skills, tempo-speculate, replay-fork v1 | E10 | replay-fork v1 is engine-agnostic — starts now |
 | **WS10** Evals + compat CI | tempo-evals, tempo-compat | E5(30%), E10(20%) | CDP lane is the day-1 oracle |
@@ -207,7 +207,7 @@ These are the *only* global synchronization points. Freeze them and 7 of 10 engi
 ### 5.3 The only hard edges (everything else is soft / parallel)
 
 ```
-   C1,C2,C3 ──▶ final shapes of WS4, WS5, WS7   (they start on drafts + Mock, refit on freeze)
+   C1,C2,C3 ──▶ final shapes of WS4, WS5, WS7   (they start on drafts + TestDriver, refit on freeze)
 
    WS2:M-vanilla ──▶ WS6 interceptor wiring
                  ──▶ WS10 Servo lane onboarding
@@ -220,23 +220,23 @@ These are the *only* global synchronization points. Freeze them and 7 of 10 engi
    upstream patch acceptance ──▶ (nothing)        the fork branch is the pressure valve
 ```
 
-Read this as: **everything is parallel from day one.** The contracts (C1–C3) are a two-week convergence, not a blocker — teams start on drafts and the MockDriver. The engine (WS2) is the longest pole, but the observation team (WS4) sidesteps it with recorded AccessKit fixtures, the action/runtime/eval teams (WS5/WS7/WS10) run on the CDP lane and Mock, and the shell (WS8) needs only vanilla libservo for human browsing. Nothing waits on a Servo upstream PR landing, ever — that's why the fork branch exists.
+Read this as: **everything is parallel from day one.** The contracts (C1–C3) are a two-week convergence, not a blocker — teams start on drafts and the TestDriver. The engine (WS2) is the longest pole, but the observation team (WS4) sidesteps it with recorded AccessKit fixtures, the action/runtime/eval teams (WS5/WS7/WS10) run on the CDP lane and contract fixtures, and the shell (WS8) needs only vanilla libservo for human browsing. Nothing waits on a Servo upstream PR landing, ever — that's why the fork branch exists.
 
 ### 5.4 Mapping to 10 engineers
 
-E1 contracts→observation · E2 Servo engine · E3 Servo + upstream liaison · E4 CDP lane→shell · E5 observation/taint + evals · E6 action/quiescence/policy · E7 net/identity/handshake · E8 runtime/protocols · E9 human shell · E10 skills/speculation + compat. Only E2/E3 live deep in libservo; the contracts-first + Mock approach is precisely what keeps the other eight productive while the engine matures, and E4/E9 pair into libservo through the shell.
+E1 contracts→observation · E2 Servo engine · E3 Servo + upstream liaison · E4 CDP lane→shell · E5 observation/taint + evals · E6 action/quiescence/policy · E7 net/identity/handshake · E8 runtime/protocols · E9 human shell · E10 skills/speculation + compat. Only E2/E3 live deep in libservo; the contracts-first + TestDriver approach is precisely what keeps the other eight productive while the engine matures, and E4/E9 pair into libservo through the shell.
 
 ### 5.5 Intra-workstream ordering — sequential spine vs parallelizable work
 
 The cross-team DAG above is coarse. Inside each workstream there is a *sequential spine* (task N cannot begin until N−1 lands) and *parallel fan-out* (independent tasks). Legend: **→ = sequential (blocks)**, **∥ = parallel (independent)**. Every task's exit bar is its Definition of Done in §8.
 
-- **WS1 Contracts (E1).** `tempo-schema` types → JSON-Schema emission → beater `From/Into` converters, then **∥** { `tempo-driver` trait signatures → MockDriver v2 → conformance-suite harness }. **Sequential and short by design** — the whole org's parallelism is unlocked the moment MockDriver + conformance compile, so this spine is the single highest-priority path in the project. Nothing here fans out until the trait shape is drafted.
+- **WS1 Contracts (E1).** `tempo-schema` types → JSON-Schema emission → beater `From/Into` converters, then **∥** { `tempo-driver` trait signatures → TestDriver → conformance-suite harness }. **Sequential and short by design** — the whole org's parallelism is unlocked the moment TestDriver + conformance compile, so this spine is the single highest-priority path in the project. Nothing here fans out until the trait shape is drafted.
 - **WS2 Servo engine (E2, E3).** Spine: libservo build + pinned commit → single WebView up + offscreen paint → `notify_input_event` + `evaluate_javascript` wired → `load_web_resource` hooked to a stub net → **M-vanilla gate**. After M-vanilla, three tracks run **∥**: (a) E2 → AccessKit stream intake → observation-core hosted engine-side; (b) E3 → out-of-proc `tempo-engined` + UDS wire protocol + crash-supervision; (c) E3 → upstream patch queue (AX completeness, stable IDs, `notify_quiescent`). Native fork is **∥** but gated on WS2 maturity, not on M-vanilla.
 - **WS3 CDP lane (E4).** Adapt beater-browser-cdp to draft DriverTrait → pass conformance suite → **∥** { MutationObserver diff injector ∥ CDP AX extractor ∥ `fork()`→Unsupported wiring }. This lane must reach conformance *first of all engines* because it is the day-1 oracle for WS5/WS7/WS10.
 - **WS4 Observation compiler (E1-later, E5).** Runs against **recorded AccessKit fixtures**, so fully parallel to WS2. Spine: fixture corpus captured from servoshell → stable-ID mapper → ranker → diff engine → token budgeter. **∥** to that spine: `tempo-taint` provenance labeling + serializer (separate crate, separate owner). Live-engine integration is the only step gated on WS2:AX-stream; everything before it is fixture-driven.
-- **WS5 Action/policy (E6).** Spine: `tempo-act` executor against Mock → quiescence detector (composed signal) → grounding-verify via diff. **∥**: `tempo-policy` SideEffect classifier + confirm gates + taint-escalation rule (pure logic, testable on synthetic inputs). Runs on Mock + CDP from day 1; refits to real quiescence when WS2:`notify_quiescent` (or the composed fallback) lands.
+- **WS5 Action/policy (E6).** Spine: `tempo-act` executor against TestDriver → quiescence detector (composed signal) → grounding-verify via diff. **∥**: `tempo-policy` SideEffect classifier + confirm gates + taint-escalation rule (pure logic, testable on synthetic inputs). Runs on TestDriver + CDP from day 1; refits to real quiescence when WS2:`notify_quiescent` (or the composed fallback) lands.
 - **WS6 Net/fast-path (E7).** Almost entirely parallel — it is standalone network code. **∥**: { Web Bot Auth signer (RFC 9421) ∥ ephemeral-profile/cookie-jar manager ∥ SSRF UrlPolicy port ∥ `tempo-handshake` probers for each protocol }. The **only** sequential dependency is wiring the interceptor to real engine traffic, gated on WS2:M-vanilla; until then it re-issues requests for a test harness.
-- **WS7 Runtime/protocols (E8).** Spine: `tempo-session` (journal port from beater-agent) → session pool → tempod HTTP skeleton. **∥** on top: { `tempo-mcp` ∥ `tempo-bidi` ∥ `tempo-toolexec`→beatbox }. All develop against MockDriver; no Servo dependency at all.
+- **WS7 Runtime/protocols (E8).** Spine: `tempo-session` (journal port from beater-agent) → session pool → tempod HTTP skeleton. **∥** on top: { `tempo-mcp` ∥ `tempo-bidi` ∥ `tempo-toolexec`→beatbox }. All develop against TestDriver-backed contracts; no Servo dependency at all.
 - **WS8 Shell (E9, +E4).** Spine: vanilla libservo window (servoshell/Verso reference) → tabs/omnibox → foreground WebView registered with tempod. **∥**: agent panel + confirm/taint UX (needs C1/C2 only) ∥ set-of-marks debug overlay. Human browsing needs no tempo engine work; agent-driven shared tabs are gated on WS2:M-vanilla.
 - **WS9 Skills/speculation (E10).** Spine: `tempo-skills` macro model → skill store → replay-fork v1 (engine-agnostic, cassette-backed) → k-branch orchestrator. **∥**: Accio-style offline site-graph builder. Native fork v2 is a **∥** track gated on WS2 maturity; the sequential product spine never depends on it.
 - **WS10 Eval/compat (E5, E10).** **∥** from day 1 on the CDP oracle: { WebVoyager/WebArena/Mind2Web-Live adapters ∥ budget-evaluator harness ∥ compat scorecard runner ∥ injection red-team corpus }. Servo lane is added to each as an extra target at M-vanilla — no rework, just a second engine in the differential matrix.
@@ -246,7 +246,7 @@ The cross-team DAG above is coarse. Inside each workstream there is a *sequentia
 Strip away all the parallelism and exactly one chain is load-bearing:
 
 ```
-C1/C2/C3 frozen + MockDriver compiles   (WS1)
+C1/C2/C3 frozen + TestDriver compiles   (WS1)
         └─▶ every non-engine team is unblocked   (WS4,5,6,7,8,9,10 proceed ∥)
 WS2 M-vanilla  (Servo goto/screenshot/input/js-eval over IPC)
         └─▶ WS6 interceptor · WS8 agent tabs · WS10 Servo lane   (proceed ∥)
@@ -254,7 +254,7 @@ WS2 AX-stream live
         └─▶ WS4 live integration → first end-to-end Servo agent session
 ```
 
-Everything not on that chain is parallel. The project's schedule risk is therefore concentrated in exactly two artifacts — **MockDriver (cheap, front-loaded)** and **Servo M-vanilla (the long pole)** — and the CDP lane exists specifically so the entire product (agent loop, policy, eval, shell UX) is demonstrably working *before* Servo M-vanilla lands.
+Everything not on that chain is parallel. The project's schedule risk is therefore concentrated in exactly two artifacts — **TestDriver-backed contracts (cheap, front-loaded)** and **Servo M-vanilla (the long pole)** — and the CDP lane exists specifically so the entire product (agent loop, policy, eval, shell UX) is demonstrably working *before* Servo M-vanilla lands.
 
 ---
 
@@ -348,19 +348,19 @@ tempo is not just a faster automation target — it is designed so the capabilit
 | Crate | Done when… (all must hold) |
 |---|---|
 | `tempo-schema` | JSON Schema emitted for `CompiledObservation` + `ActionSchema`; round-trip serde property tests pass; `From/Into` beater `Observation`/`BrowserAction`/`StepTriple` proven by tests; **schema version tag frozen** and referenced by every other crate |
-| `tempo-driver` | trait compiles; **MockDriver v2 passes 100% of conformance suite v2**; grounding contract test proves NodeId-miss → step error (not transport error); SSRF `UrlPolicy` test blocks metadata/loopback/private ranges |
+| `tempo-driver` | trait compiles; **TestDriver passes 100% of conformance suite v2**; grounding contract test proves NodeId-miss → step error (not transport error); SSRF `UrlPolicy` test blocks metadata/loopback/private ranges |
 | `tempo-engine-servo` | **M-vanilla gate** (§8.2) green; libservo types do not appear in any public signature outside this crate (enforced by a CI grep/`cargo-public-api` check); builds against pinned vanilla Servo in CI |
 | `tempo-engine-host` | N-webview process starts, survives a forced child crash without taking down tempod, resumes the affected session from journal; UDS wire protocol fuzz-tested for malformed frames |
 | `tempo-engine-cdp` | **passes conformance suite v2** (first engine to do so); `fork()` returns `Unsupported`; diff + AX extraction validated against a fixture site set |
 | `tempo-observe` | compiled observation ≤ 4KB / ≤ 1.5K tokens p50 on the fixture corpus; **stable-ID survival ≥ 99%** across a mutation test battery (relayout, re-render, list reorder); diff engine emits only changed subtrees (verified byte-for-byte vs full recompute) |
 | `tempo-taint` | 100% of page-derived spans labeled on the fixture corpus (no unlabeled leaks); serializer wraps tainted spans; exposes the C1 taint predicate; red-team corpus shows injected instructions are never emitted as system/user provenance |
-| `tempo-act` | executes single + batched actions on Mock and CDP; quiescence detector has **< 1% false-settle** on a timing-torture fixture set; every action produces a post-action diff and a journaled StepOutcome |
+| `tempo-act` | executes single + batched actions on TestDriver and CDP; quiescence detector has **< 1% false-settle** on a timing-torture fixture set; every action produces a post-action diff and a journaled StepOutcome |
 | `tempo-policy` | SideEffect classification table has 100% branch coverage; **taint-escalation rule proven** (tainted params bump confirmation level) by property test; Send/Purchase/Delete require confirm by default; policy decisions are pure + deterministic |
 | `tempo-skills` / `tempo-speculate` | a macro replays deterministically from the skill store; replay-fork v1 reproduces a forked branch to identical StepTriples on **both** engines; k-branch orchestrator degrades to sequential when `fork()` is Unsupported |
 | `tempo-net` | Web Bot Auth signatures verify against a reference verifier (RFC 9421 test vectors); ephemeral profiles are fully isolated (cross-session cookie-leak test passes); every request carries a taint-free audit record; SSRF enforced at socket level |
 | `tempo-handshake` | detects each of beater.json / agent-card / llms.txt / openapi / WebMCP on fixture servers; **chooses the API lane (skips render) when present** and the render lane otherwise, proven by a decision-table test |
 | `tempo-session` | journal port passes beater-agent's kill-9-resume test (crash between any two steps loses nothing); cassette record→replay is byte-stable; portable across hosts (resume on host B from host A's journal) |
-| `tempo-agent` | completes a scripted multi-step task end-to-end on Mock, CDP, and (post-AX) Servo; token-budget manager enforced; idempotent resume verified |
+| `tempo-agent` | completes a scripted multi-step task end-to-end on TestDriver, CDP, and (post-AX) Servo; token-budget manager enforced; idempotent resume verified |
 | `tempo-mcp` / `tempo-bidi` | MCP tools (`observe/act/fork/extract/screenshot/handshake`) pass an MCP-inspector session; BiDi subset passes a standard-client smoke (session/browsingContext/script/network) |
 | `tempo-toolexec` | round-trips `execute()` + async job to a live `beatboxd`; **the taint⋈sandbox test** proves a tainted transform runs with `net:Deny`+`secrets:[]` and cannot reach a canary exfil endpoint; maps `ExecutionResult` → StepOutcome/audit; `Denied` → step error |
 | `tempo-shell` | renders a real site via vanilla libservo; human can browse (tabs/omnibox/back-forward); **agent-in-shared-session works** (watch agent drive, take over, hand back); confirm dialogs fire on Send/Purchase/Delete; taint indicator visible |
@@ -371,7 +371,7 @@ tempo is not just a faster automation target — it is designed so the capabilit
 
 Milestones are **capability gates**, not calendar points. Each lists the objective proof.
 
-- **M0 — Contracts frozen.** *Evidence:* `tempo-schema` version tag published; `tempo-driver` + MockDriver v2 compile; conformance suite v2 exists and MockDriver passes it 100%. *Effect:* WS4–WS10 formally unblocked.
+- **M0 — Contracts frozen.** *Evidence:* `tempo-schema` version tag published; `tempo-driver` + TestDriver compile; conformance suite v2 exists and TestDriver passes it 100%. *Effect:* WS4–WS10 formally unblocked.
 - **M1 — CDP lane live (the oracle).** *Evidence:* `tempo-engine-cdp` passes conformance suite v2; `tempo-agent` completes a 5-step scripted task through it end-to-end, journaled + replayable. *Effect:* whole product loop demonstrable *without Servo*.
 - **M2 — Servo M-vanilla.** *Evidence:* one libservo WebView navigates, screenshots, receives input, evaluates JS, and re-issues all requests through `tempo-net` — driven over the UDS wire protocol; passes the goto/screenshot/input/js-eval slice of conformance. *Effect:* WS6 interceptor, WS8 agent tabs, WS10 Servo lane unblocked.
 - **M3 — Servo observation live.** *Evidence:* AccessKit stream → `tempo-observe` produces a compiled observation meeting the ≤4KB/≤1.5K-token budget on ≥ 20 live sites; stable-ID survival ≥ 99% on those sites. *Effect:* first fully-native Servo agent session.
@@ -401,7 +401,7 @@ Milestones are **capability gates**, not calendar points. Each lists the objecti
 | 7 | **Quiescence false-positives → acting on half-loaded pages** | Composite signal + timeout ladder + post-action diff verification (grounding contract catches misfires as step errors); upstream `notify_quiescent` as the long-term fix |
 | 8 | **Web Bot Auth-signed traffic challenged/blocked** | Dual-mode identity per origin; user-driven mode in the shell as fallback; per-origin challenge-rate feeds the lane table |
 
-Team-shape risk (only E2/E3 deep in Servo) is mitigated structurally by contracts-first + MockDriver and by E4/E9 pairing into libservo through the shell.
+Team-shape risk (only E2/E3 deep in Servo) is mitigated structurally by contracts-first + TestDriver and by E4/E9 pairing into libservo through the shell.
 
 ---
 
