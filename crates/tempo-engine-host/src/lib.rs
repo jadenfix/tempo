@@ -227,13 +227,27 @@ pub fn read_frame(reader: &mut impl Read) -> Result<WireFrame, EngineHostError> 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DriverCommand {
-    Goto { url: String },
+    Goto {
+        url: String,
+    },
     Observe,
-    ObserveDiff { since_seq: u64 },
-    Act { action: Action },
-    ActBatch { batch: ActionBatch },
+    ObserveDiff {
+        since_seq: u64,
+    },
+    Act {
+        action: Action,
+    },
+    ActBatch {
+        batch: ActionBatch,
+    },
     Fork,
-    Extract { node: NodeId },
+    Extract {
+        node: NodeId,
+    },
+    EvaluateScript {
+        expression: String,
+        await_promise: bool,
+    },
     Screenshot,
     Close,
 }
@@ -309,6 +323,7 @@ pub enum DriverResponse {
     Step { outcome: WireStepOutcome },
     Forked { driver_id: String },
     Extracted { value: Value },
+    Evaluated { value: Value },
     Screenshot { bytes: Vec<u8> },
     Closed,
     Error { error: DriverWireError },
@@ -500,6 +515,13 @@ where
         },
         DriverCommand::Extract { node } => match driver.extract(&node).await {
             Ok(value) => DriverResponse::Extracted { value },
+            Err(error) => driver_error(error),
+        },
+        DriverCommand::EvaluateScript {
+            expression,
+            await_promise,
+        } => match driver.evaluate_script(&expression, await_promise).await {
+            Ok(value) => DriverResponse::Evaluated { value },
             Err(error) => driver_error(error),
         },
         DriverCommand::Screenshot => match driver.screenshot().await {
@@ -791,19 +813,23 @@ mod tests {
         let (client_stream, server_stream) = UnixStream::pair()?;
         let mut connection = EngineIpcConnection::from_stream(server_stream);
         let handle = thread::spawn(
-            move || -> Result<(DriverResponse, DriverResponse), EngineHostError> {
+            move || -> Result<(DriverResponse, DriverResponse, DriverResponse), EngineHostError> {
                 let mut client = EngineIpcClient::from_stream(client_stream);
                 let observed = client.request(DriverCommand::Goto {
                     url: "https://example.com".into(),
                 })?;
+                let evaluated = client.request(DriverCommand::EvaluateScript {
+                    expression: "document.title".into(),
+                    await_promise: true,
+                })?;
                 let closed = client.request(DriverCommand::Close)?;
-                Ok((observed, closed))
+                Ok((observed, evaluated, closed))
             },
         );
         let mut driver = TestDriver::new();
 
         futures::executor::block_on(serve_driver_connection(&mut connection, &mut driver))?;
-        let (observed, closed) = join_client_pair(handle)?;
+        let (observed, evaluated, closed) = join_client_triple(handle)?;
 
         match observed {
             DriverResponse::Observation { observation } => {
@@ -812,6 +838,15 @@ mod tests {
             }
             other => return Err(format!("unexpected driver response: {other:?}").into()),
         }
+        assert_eq!(
+            evaluated,
+            DriverResponse::Evaluated {
+                value: serde_json::json!({
+                    "expression": "document.title",
+                    "awaitPromise": true,
+                }),
+            }
+        );
         assert_eq!(closed, DriverResponse::Closed);
         Ok(())
     }
@@ -873,9 +908,11 @@ mod tests {
         }
     }
 
-    fn join_client_pair(
-        handle: thread::JoinHandle<Result<(DriverResponse, DriverResponse), EngineHostError>>,
-    ) -> Result<(DriverResponse, DriverResponse), Box<dyn Error>> {
+    fn join_client_triple(
+        handle: thread::JoinHandle<
+            Result<(DriverResponse, DriverResponse, DriverResponse), EngineHostError>,
+        >,
+    ) -> Result<(DriverResponse, DriverResponse, DriverResponse), Box<dyn Error>> {
         match handle.join() {
             Ok(result) => Ok(result?),
             Err(_) => Err("client thread panicked".into()),
