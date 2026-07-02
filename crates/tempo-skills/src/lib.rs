@@ -1,8 +1,595 @@
-//! tempo-skills — macro-actions/skills, Accio-style offline site-structure graphs, skill store
+//! tempo-skills — persisted macro-actions and deterministic skill expansion.
 //!
-//! Status: scaffold. See ../../final.md for the component contract and Definition of Done.
+//! Skills are parameterized procedures stored as JSON files. Runtime callers load a
+//! definition from the store, provide input values, and receive a concrete `ActionBatch`
+//! that can be handed to `tempo-act` or a driver.
 
-/// Placeholder so the crate compiles; replaced by the real implementation per final.md §8.
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use tempo_schema::{Action, ActionBatch, NodeId, QuiescencePolicy};
+use thiserror::Error;
+
+/// Stored skill definition. The `(name, version)` pair is the stable key.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SkillDefinition {
+    pub name: String,
+    pub version: String,
+    pub description: String,
+    #[serde(default)]
+    pub inputs: Vec<SkillInput>,
+    pub quiescence: QuiescencePolicy,
+    pub steps: Vec<ActionTemplate>,
+}
+
+impl SkillDefinition {
+    pub fn key(&self) -> SkillKey {
+        SkillKey {
+            name: self.name.clone(),
+            version: self.version.clone(),
+        }
+    }
+
+    pub fn compile(&self, input: &Value) -> Result<ActionBatch, SkillError> {
+        validate_definition(self)?;
+        let bindings = InputBindings::new(&self.inputs, input)?;
+        let mut actions = Vec::with_capacity(self.steps.len());
+        for step in &self.steps {
+            actions.push(step.render(&bindings)?);
+        }
+        Ok(ActionBatch {
+            actions,
+            quiescence: self.quiescence,
+        })
+    }
+}
+
+/// Stable skill key.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct SkillKey {
+    pub name: String,
+    pub version: String,
+}
+
+/// One named input a skill requires.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillInput {
+    pub name: String,
+    pub required: bool,
+}
+
+impl SkillInput {
+    pub fn required(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            required: true,
+        }
+    }
+
+    pub fn optional(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            required: false,
+        }
+    }
+}
+
+/// String interpolation surface. Only whole-field parameters are supported; this keeps
+/// expansion deterministic and prevents accidental prompt-style substitution.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TemplateString {
+    Literal { value: String },
+    Param { name: String },
+}
+
+impl TemplateString {
+    pub fn literal(value: impl Into<String>) -> Self {
+        Self::Literal {
+            value: value.into(),
+        }
+    }
+
+    pub fn param(name: impl Into<String>) -> Self {
+        Self::Param { name: name.into() }
+    }
+
+    fn render(&self, bindings: &InputBindings) -> Result<String, SkillError> {
+        match self {
+            Self::Literal { value } => Ok(value.clone()),
+            Self::Param { name } => bindings.string(name),
+        }
+    }
+
+    fn referenced_params(&self, params: &mut BTreeSet<String>) {
+        if let Self::Param { name } = self {
+            params.insert(name.clone());
+        }
+    }
+}
+
+/// Parameterized action shape.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ActionTemplate {
+    Goto {
+        url: TemplateString,
+    },
+    Click {
+        node: TemplateString,
+    },
+    Type {
+        node: TemplateString,
+        text: TemplateString,
+    },
+    Select {
+        node: TemplateString,
+        value: TemplateString,
+    },
+    Scroll {
+        x: f32,
+        y: f32,
+    },
+    Extract {
+        node: TemplateString,
+    },
+    Skill {
+        name: TemplateString,
+        input: Value,
+    },
+}
+
+impl ActionTemplate {
+    fn render(&self, bindings: &InputBindings) -> Result<Action, SkillError> {
+        match self {
+            Self::Goto { url } => Ok(Action::Goto {
+                url: url.render(bindings)?,
+            }),
+            Self::Click { node } => Ok(Action::Click {
+                node: NodeId(node.render(bindings)?),
+            }),
+            Self::Type { node, text } => Ok(Action::Type {
+                node: NodeId(node.render(bindings)?),
+                text: text.render(bindings)?,
+            }),
+            Self::Select { node, value } => Ok(Action::Select {
+                node: NodeId(node.render(bindings)?),
+                value: value.render(bindings)?,
+            }),
+            Self::Scroll { x, y } => Ok(Action::Scroll { x: *x, y: *y }),
+            Self::Extract { node } => Ok(Action::Extract {
+                node: NodeId(node.render(bindings)?),
+            }),
+            Self::Skill { name, input } => Ok(Action::Skill {
+                name: name.render(bindings)?,
+                input: input.clone(),
+            }),
+        }
+    }
+
+    fn referenced_params(&self, params: &mut BTreeSet<String>) {
+        match self {
+            Self::Goto { url } => url.referenced_params(params),
+            Self::Click { node } | Self::Extract { node } => node.referenced_params(params),
+            Self::Type { node, text } => {
+                node.referenced_params(params);
+                text.referenced_params(params);
+            }
+            Self::Select { node, value } => {
+                node.referenced_params(params);
+                value.referenced_params(params);
+            }
+            Self::Scroll { .. } => {}
+            Self::Skill { name, .. } => name.referenced_params(params),
+        }
+    }
+}
+
+/// Directory-backed skill store.
+pub struct SkillStore {
+    root: PathBuf,
+}
+
+impl SkillStore {
+    pub fn open(root: impl AsRef<Path>) -> Result<Self, SkillError> {
+        let root = root.as_ref().to_path_buf();
+        std::fs::create_dir_all(&root)?;
+        Ok(Self { root })
+    }
+
+    pub fn put(&self, definition: &SkillDefinition) -> Result<(), SkillError> {
+        validate_definition(definition)?;
+        let path = self.path_for(&definition.key())?;
+        let tmp = path.with_extension("json.tmp");
+        let bytes = serde_json::to_vec_pretty(definition)?;
+
+        {
+            let mut file = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&tmp)?;
+            file.write_all(&bytes)?;
+            file.write_all(b"\n")?;
+            file.flush()?;
+            file.sync_data()?;
+        }
+
+        std::fs::rename(&tmp, &path)?;
+        sync_parent(&path)?;
+        Ok(())
+    }
+
+    pub fn get(&self, key: &SkillKey) -> Result<SkillDefinition, SkillError> {
+        let path = self.path_for(key)?;
+        let mut file = File::open(&path).map_err(|source| SkillError::OpenSkill {
+            path: path.clone(),
+            source,
+        })?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        let definition = serde_json::from_slice(&bytes)?;
+        validate_definition(&definition)?;
+        Ok(definition)
+    }
+
+    pub fn compile(&self, key: &SkillKey, input: &Value) -> Result<ActionBatch, SkillError> {
+        self.get(key)?.compile(input)
+    }
+
+    pub fn list(&self) -> Result<Vec<SkillKey>, SkillError> {
+        let mut keys = Vec::new();
+        for entry in std::fs::read_dir(&self.root)? {
+            let entry = entry?;
+            if entry.file_type()?.is_file()
+                && entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "json")
+            {
+                let mut file = File::open(entry.path())?;
+                let mut bytes = Vec::new();
+                file.read_to_end(&mut bytes)?;
+                let definition: SkillDefinition = serde_json::from_slice(&bytes)?;
+                validate_definition(&definition)?;
+                keys.push(definition.key());
+            }
+        }
+        keys.sort();
+        Ok(keys)
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    fn path_for(&self, key: &SkillKey) -> Result<PathBuf, SkillError> {
+        Ok(self.root.join(format!(
+            "{}@{}.json",
+            safe_segment(&key.name)?,
+            safe_segment(&key.version)?
+        )))
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum SkillError {
+    #[error("skill io failed: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("skill serialization failed: {0}")]
+    Serde(#[from] serde_json::Error),
+    #[error("could not open skill file {path}: {source}")]
+    OpenSkill {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("invalid skill key segment: {0}")]
+    InvalidKeySegment(String),
+    #[error("duplicate input: {0}")]
+    DuplicateInput(String),
+    #[error("missing required input: {0}")]
+    MissingInput(String),
+    #[error("input {0} must be a string, number, boolean, or null")]
+    UnsupportedInputValue(String),
+    #[error("step references undeclared input: {0}")]
+    UndeclaredInput(String),
+    #[error("skill must contain at least one step")]
+    EmptySkill,
+}
+
+/// Human-readable crate summary.
 pub fn describe() -> &'static str {
-    "macro-actions/skills, Accio-style offline site-structure graphs, skill store"
+    "persisted macro-actions with deterministic parameter expansion into ActionBatch"
+}
+
+fn validate_definition(definition: &SkillDefinition) -> Result<(), SkillError> {
+    safe_segment(&definition.name)?;
+    safe_segment(&definition.version)?;
+    if definition.steps.is_empty() {
+        return Err(SkillError::EmptySkill);
+    }
+
+    let mut declared = BTreeSet::new();
+    for input in &definition.inputs {
+        safe_segment(&input.name)?;
+        if !declared.insert(input.name.clone()) {
+            return Err(SkillError::DuplicateInput(input.name.clone()));
+        }
+    }
+
+    let mut referenced = BTreeSet::new();
+    for step in &definition.steps {
+        step.referenced_params(&mut referenced);
+    }
+
+    for param in referenced {
+        if !declared.contains(&param) {
+            return Err(SkillError::UndeclaredInput(param));
+        }
+    }
+
+    Ok(())
+}
+
+fn safe_segment(segment: &str) -> Result<&str, SkillError> {
+    let valid = !segment.is_empty()
+        && segment
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'));
+    if valid {
+        Ok(segment)
+    } else {
+        Err(SkillError::InvalidKeySegment(segment.to_string()))
+    }
+}
+
+fn sync_parent(path: &Path) -> Result<(), SkillError> {
+    if let Some(parent) = path.parent() {
+        File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+struct InputBindings {
+    values: BTreeMap<String, Value>,
+}
+
+impl InputBindings {
+    fn new(inputs: &[SkillInput], input: &Value) -> Result<Self, SkillError> {
+        let object = input.as_object();
+        let mut values = BTreeMap::new();
+
+        for spec in inputs {
+            match object.and_then(|map| map.get(&spec.name)) {
+                Some(value) => {
+                    values.insert(spec.name.clone(), value.clone());
+                }
+                None if spec.required => return Err(SkillError::MissingInput(spec.name.clone())),
+                None => {}
+            }
+        }
+
+        Ok(Self { values })
+    }
+
+    fn string(&self, name: &str) -> Result<String, SkillError> {
+        let value = self
+            .values
+            .get(name)
+            .ok_or_else(|| SkillError::MissingInput(name.to_string()))?;
+        match value {
+            Value::String(value) => Ok(value.clone()),
+            Value::Number(value) => Ok(value.to_string()),
+            Value::Bool(value) => Ok(value.to_string()),
+            Value::Null => Ok(String::new()),
+            Value::Array(_) | Value::Object(_) => {
+                Err(SkillError::UnsupportedInputValue(name.to_string()))
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::error::Error;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    type TestResult = Result<(), Box<dyn Error>>;
+
+    #[test]
+    fn persisted_skill_replays_to_identical_action_batches() -> TestResult {
+        let root = unique_dir("replay")?;
+        remove_dir_if_exists(&root)?;
+        let store = SkillStore::open(&root)?;
+        let skill = checkout_skill();
+        let key = skill.key();
+        store.put(&skill)?;
+
+        let input = serde_json::json!({
+            "url": "https://shop.example/item",
+            "buy_button": "node-buy",
+            "note_box": "node-note",
+            "note": "ship to side door"
+        });
+
+        let first = store.compile(&key, &input)?;
+        let reopened = SkillStore::open(&root)?;
+        let second = reopened.compile(&key, &input)?;
+
+        assert_eq!(first, second);
+        assert_eq!(
+            first.actions,
+            vec![
+                Action::Goto {
+                    url: "https://shop.example/item".into(),
+                },
+                Action::Type {
+                    node: NodeId("node-note".into()),
+                    text: "ship to side door".into(),
+                },
+                Action::Click {
+                    node: NodeId("node-buy".into()),
+                },
+            ]
+        );
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn store_list_is_sorted_and_stable() -> TestResult {
+        let root = unique_dir("list")?;
+        remove_dir_if_exists(&root)?;
+        let store = SkillStore::open(&root)?;
+        let mut a = checkout_skill();
+        a.name = "zeta".into();
+        let mut b = checkout_skill();
+        b.name = "alpha".into();
+
+        store.put(&a)?;
+        store.put(&b)?;
+
+        assert_eq!(
+            store.list()?,
+            vec![
+                SkillKey {
+                    name: "alpha".into(),
+                    version: "1".into(),
+                },
+                SkillKey {
+                    name: "zeta".into(),
+                    version: "1".into(),
+                },
+            ]
+        );
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn missing_required_input_is_rejected() {
+        let skill = checkout_skill();
+        let err = skill.compile(&serde_json::json!({"url": "https://example.com"}));
+        assert!(matches!(err, Err(SkillError::MissingInput(name)) if name == "buy_button"));
+    }
+
+    #[test]
+    fn undeclared_template_parameters_are_rejected() {
+        let mut skill = checkout_skill();
+        skill.steps.push(ActionTemplate::Click {
+            node: TemplateString::param("not_declared"),
+        });
+
+        assert!(matches!(
+            validate_definition(&skill),
+            Err(SkillError::UndeclaredInput(name)) if name == "not_declared"
+        ));
+    }
+
+    #[test]
+    fn object_values_do_not_render_as_strings() {
+        let skill = SkillDefinition {
+            name: "object-value".into(),
+            version: "1".into(),
+            description: "reject object input".into(),
+            inputs: vec![SkillInput::required("node")],
+            quiescence: QuiescencePolicy::Composite,
+            steps: vec![ActionTemplate::Click {
+                node: TemplateString::param("node"),
+            }],
+        };
+
+        let err = skill.compile(&serde_json::json!({"node": {"bad": true}}));
+        assert!(matches!(
+            err,
+            Err(SkillError::UnsupportedInputValue(name)) if name == "node"
+        ));
+    }
+
+    #[test]
+    fn invalid_names_do_not_escape_store_root() -> TestResult {
+        let root = unique_dir("invalid")?;
+        remove_dir_if_exists(&root)?;
+        let store = SkillStore::open(&root)?;
+        let mut skill = checkout_skill();
+        skill.name = "../escape".into();
+
+        assert!(matches!(
+            store.put(&skill),
+            Err(SkillError::InvalidKeySegment(name)) if name == "../escape"
+        ));
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn persisted_file_has_no_host_local_paths_or_timestamps() -> TestResult {
+        let root = unique_dir("portable")?;
+        remove_dir_if_exists(&root)?;
+        let store = SkillStore::open(&root)?;
+        let skill = checkout_skill();
+        store.put(&skill)?;
+
+        let path = store.path_for(&skill.key())?;
+        let content = fs::read_to_string(path)?;
+        assert!(!content.contains(root.to_string_lossy().as_ref()));
+        assert!(!content.contains("target/debug"));
+        assert!(!content.contains("timestamp"));
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    fn checkout_skill() -> SkillDefinition {
+        SkillDefinition {
+            name: "checkout".into(),
+            version: "1".into(),
+            description: "open a page, type a note, and click buy".into(),
+            inputs: vec![
+                SkillInput::required("url"),
+                SkillInput::required("buy_button"),
+                SkillInput::required("note_box"),
+                SkillInput::optional("note"),
+            ],
+            quiescence: QuiescencePolicy::Composite,
+            steps: vec![
+                ActionTemplate::Goto {
+                    url: TemplateString::param("url"),
+                },
+                ActionTemplate::Type {
+                    node: TemplateString::param("note_box"),
+                    text: TemplateString::param("note"),
+                },
+                ActionTemplate::Click {
+                    node: TemplateString::param("buy_button"),
+                },
+            ],
+        }
+    }
+
+    fn unique_dir(label: &str) -> Result<PathBuf, std::time::SystemTimeError> {
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "tempo-skills-{label}-{}-{nanos}",
+            std::process::id()
+        ));
+        Ok(path)
+    }
+
+    fn remove_dir_if_exists(path: &Path) -> Result<(), std::io::Error> {
+        match fs::remove_dir_all(path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err),
+        }
+    }
 }
