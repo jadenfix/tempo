@@ -189,6 +189,7 @@ impl ObservationCompiler {
     /// Compile one raw snapshot into the frozen schema observation.
     pub fn compile(&mut self, input: ObservationInput) -> CompiledObservation {
         self.seq += 1;
+        self.mapper.begin_snapshot(self.seq);
 
         let mut elements: Vec<_> = input
             .elements
@@ -208,6 +209,8 @@ impl ObservationCompiler {
             })
             .collect();
 
+        self.mapper.evict_stale();
+
         elements.sort_by(|left, right| {
             right
                 .rank
@@ -223,12 +226,33 @@ impl ObservationCompiler {
     }
 }
 
+/// Number of snapshots an unseen mapping is retained before eviction. Keeps the
+/// mapper bounded on long-lived sessions over dynamic pages (issue #107) while
+/// still surviving elements that flicker out of a few intermediate snapshots.
+const RETENTION_SNAPSHOTS: u64 = 8;
+
+/// A NodeId together with the last snapshot sequence it was observed in, used to
+/// drive generation-based eviction.
+#[derive(Debug, Clone)]
+struct MappedId {
+    node_id: NodeId,
+    last_seen: u64,
+}
+
 /// Map source IDs and stable fingerprints to schema NodeIds.
+///
+/// Mappings are generation-stamped with the snapshot sequence they were last seen
+/// in and pruned by [`StableIdMapper::evict_stale`], so the maps stay bounded
+/// across a long-lived session (issue #107). Within a single snapshot, identical
+/// fingerprints are disambiguated by occurrence index so distinct elements never
+/// collapse onto one NodeId (issue #105).
 #[derive(Debug, Default)]
 pub struct StableIdMapper {
-    by_source: HashMap<String, NodeId>,
-    by_fingerprint: HashMap<String, NodeId>,
+    by_source: HashMap<String, MappedId>,
+    by_fingerprint: HashMap<String, MappedId>,
     allocated: HashSet<String>,
+    seq: u64,
+    occurrences: HashMap<String, usize>,
 }
 
 impl StableIdMapper {
@@ -236,27 +260,93 @@ impl StableIdMapper {
         Self::default()
     }
 
+    /// Begin a new snapshot generation. Resets the per-snapshot occurrence
+    /// counters used to disambiguate colliding fingerprints.
+    fn begin_snapshot(&mut self, seq: u64) {
+        self.seq = seq;
+        self.occurrences.clear();
+    }
+
     pub fn node_id_for(&mut self, raw: &RawElement) -> NodeId {
+        let seq = self.seq;
+
+        // Disambiguate elements that share a fingerprint within this snapshot: the
+        // Nth occurrence gets its own lookup key so two genuinely distinct
+        // elements never resolve to the same NodeId (issue #105).
+        let base_fingerprint = raw.fingerprint_key();
+        let occurrence = {
+            let counter = self
+                .occurrences
+                .entry(base_fingerprint.clone())
+                .or_insert(0);
+            let current = *counter;
+            *counter += 1;
+            current
+        };
+        let fingerprint = format!("{base_fingerprint}#{occurrence}");
+
         if let Some(source_key) = raw.source_key() {
-            if let Some(node_id) = self.by_source.get(&source_key) {
-                return node_id.clone();
+            if let Some(entry) = self.by_source.get_mut(&source_key) {
+                entry.last_seen = seq;
+                let node_id = entry.node_id.clone();
+                if let Some(entry) = self.by_fingerprint.get_mut(&fingerprint) {
+                    entry.last_seen = seq;
+                }
+                return node_id;
             }
         }
 
-        let fingerprint = raw.fingerprint_key();
-        if let Some(node_id) = self.by_fingerprint.get(&fingerprint) {
+        if let Some(entry) = self.by_fingerprint.get_mut(&fingerprint) {
+            entry.last_seen = seq;
+            let node_id = entry.node_id.clone();
             if let Some(source_key) = raw.source_key() {
-                self.by_source.insert(source_key, node_id.clone());
+                self.by_source.insert(
+                    source_key,
+                    MappedId {
+                        node_id: node_id.clone(),
+                        last_seen: seq,
+                    },
+                );
             }
-            return node_id.clone();
+            return node_id;
         }
 
         let node_id = self.allocate(&raw.allocation_key());
         if let Some(source_key) = raw.source_key() {
-            self.by_source.insert(source_key, node_id.clone());
+            self.by_source.insert(
+                source_key,
+                MappedId {
+                    node_id: node_id.clone(),
+                    last_seen: seq,
+                },
+            );
         }
-        self.by_fingerprint.insert(fingerprint, node_id.clone());
+        self.by_fingerprint.insert(
+            fingerprint,
+            MappedId {
+                node_id: node_id.clone(),
+                last_seen: seq,
+            },
+        );
         node_id
+    }
+
+    /// Drop mappings not seen within the last [`RETENTION_SNAPSHOTS`] snapshots and
+    /// rebuild the allocated-id set from the survivors so it never grows without
+    /// bound (issue #107).
+    fn evict_stale(&mut self) {
+        let seq = self.seq;
+        let retained = |entry: &MappedId| seq.saturating_sub(entry.last_seen) < RETENTION_SNAPSHOTS;
+        self.by_source.retain(|_, entry| retained(entry));
+        self.by_fingerprint.retain(|_, entry| retained(entry));
+
+        self.allocated.clear();
+        for entry in self.by_source.values() {
+            self.allocated.insert(entry.node_id.0.clone());
+        }
+        for entry in self.by_fingerprint.values() {
+            self.allocated.insert(entry.node_id.0.clone());
+        }
     }
 
     fn allocate(&mut self, key: &str) -> NodeId {
@@ -447,22 +537,44 @@ pub fn describe() -> &'static str {
 fn apply_budget(
     url: String,
     seq: u64,
-    mut elements: Vec<InteractiveElement>,
+    elements: Vec<InteractiveElement>,
     options: CompileOptions,
 ) -> CompiledObservation {
-    loop {
-        let observation = make_observation(&url, seq, elements.clone(), options.max_marks);
-        let within_byte_budget =
-            options.max_bytes == 0 || serialized_len(&observation) <= options.max_bytes;
-        let within_token_budget =
-            options.max_tokens == 0 || estimated_tokens(&observation) <= options.max_tokens;
-
-        if elements.is_empty() || (within_byte_budget && within_token_budget) {
-            return observation;
-        }
-
-        elements.pop();
+    // Elements are pre-sorted by rank descending, so the kept set is always a
+    // prefix and serialized size grows monotonically with prefix length. Rather
+    // than re-serializing after popping one element at a time (O(n^2), issue
+    // #106), binary-search for the longest prefix that fits the budget: O(log n)
+    // serializations, each computed once and reused for both the byte and token
+    // gate.
+    let full = make_observation(&url, seq, elements.clone(), options.max_marks);
+    if elements.is_empty() || within_budget(&full, &options) {
+        return full;
     }
+
+    // Invariant: prefix of length `hi` is known not to fit; `lo` tracks the
+    // longest prefix confirmed to fit (0 as a fallback when nothing fits).
+    let mut lo = 0usize;
+    let mut hi = elements.len();
+    while lo + 1 < hi {
+        let mid = lo + (hi - lo) / 2;
+        let candidate = make_observation(&url, seq, elements[..mid].to_vec(), options.max_marks);
+        if within_budget(&candidate, &options) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+
+    make_observation(&url, seq, elements[..lo].to_vec(), options.max_marks)
+}
+
+/// Whether a compiled observation fits both the byte and token budgets, computing
+/// the serialized length exactly once (previously serialized twice per gate).
+fn within_budget(observation: &CompiledObservation, options: &CompileOptions) -> bool {
+    let serialized = serialized_len(observation);
+    let within_bytes = options.max_bytes == 0 || serialized <= options.max_bytes;
+    let within_tokens = options.max_tokens == 0 || serialized.div_ceil(4) <= options.max_tokens;
+    within_bytes && within_tokens
 }
 
 fn make_observation(
@@ -1049,6 +1161,132 @@ mod tests {
             assert!(serialized_len(&observation) <= DEFAULT_MAX_BYTES);
             assert!(estimated_tokens(&observation) <= DEFAULT_MAX_TOKENS);
         }
+    }
+
+    #[test]
+    fn colliding_fingerprints_get_distinct_node_ids_within_snapshot() {
+        // Two per-row "Delete" buttons share role/name/value and carry no stable
+        // hint; only their engine source ids differ (issue #105).
+        let mut compiler = ObservationCompiler::new();
+        let observation = compiler.compile(ObservationInput::new(
+            "https://rows.example/list",
+            vec![
+                RawElement::new("button", "Delete")
+                    .source_id("row-1-delete")
+                    .bounds([0.0, 0.0, 60.0, 24.0]),
+                RawElement::new("button", "Delete")
+                    .source_id("row-2-delete")
+                    .bounds([0.0, 30.0, 60.0, 24.0]),
+            ],
+        ));
+
+        assert_eq!(observation.elements.len(), 2);
+        assert_ne!(
+            observation.elements[0].node_id, observation.elements[1].node_id,
+            "distinct elements must not collapse onto one NodeId"
+        );
+
+        // Set-of-marks must label both elements distinctly, not the first twice.
+        assert_eq!(observation.marks.len(), 2);
+        let marked: HashSet<_> = observation
+            .marks
+            .iter()
+            .map(|(node_id, _)| node_id.clone())
+            .collect();
+        assert_eq!(marked.len(), 2);
+
+        // The distinct identities persist across snapshots via their source ids.
+        let next = compiler.compile(ObservationInput::new(
+            "https://rows.example/list",
+            vec![
+                RawElement::new("button", "Delete")
+                    .source_id("row-1-delete")
+                    .bounds([0.0, 0.0, 60.0, 24.0]),
+                RawElement::new("button", "Delete")
+                    .source_id("row-2-delete")
+                    .bounds([0.0, 30.0, 60.0, 24.0]),
+            ],
+        ));
+        assert_ne!(next.elements[0].node_id, next.elements[1].node_id);
+    }
+
+    #[test]
+    fn budget_scales_to_many_elements_and_preserves_ranking() {
+        // A page with thousands of interactive elements must not force O(n^2)
+        // re-serialization (issue #106) and must still keep the highest-ranked
+        // elements under budget in rank order.
+        let mut elements = vec![RawElement::new("textbox", "Search entire catalog")
+            .stable_hint("search")
+            .bounds([0.0, 0.0, 420.0, 36.0])];
+        for index in 0..5_000 {
+            elements.push(
+                RawElement::new("link", format!("Footer navigation link {index}"))
+                    .stable_hint(format!("footer-{index}"))
+                    .bounds([0.0, index as f32, 80.0, 18.0]),
+            );
+        }
+
+        let mut compiler = ObservationCompiler::with_options(CompileOptions {
+            max_bytes: 2_000,
+            max_tokens: 500,
+            max_marks: 8,
+        });
+        let observation = compiler.compile(ObservationInput::new("https://big.example", elements));
+
+        assert!(
+            serialized_len(&observation) <= 2_000,
+            "{}",
+            serialized_len(&observation)
+        );
+        assert!(estimated_tokens(&observation) <= 500);
+        // Highest-ranked element survives truncation and stays first.
+        assert_eq!(observation.elements[0].role, "textbox");
+        assert!(!observation.elements.is_empty());
+        assert!(observation.elements.len() < 5_001);
+        // Relative ordering is preserved: ranks are non-increasing.
+        for pair in observation.elements.windows(2) {
+            assert!(pair[0].rank >= pair[1].rank);
+        }
+        assert_eq!(observation.marks.len(), 8.min(observation.elements.len()));
+    }
+
+    #[test]
+    fn stable_id_mapper_evicts_stale_entries_and_stays_bounded() {
+        // A long-lived session over a page whose text changes every render (issue
+        // #107): every snapshot renders entirely fresh source ids and fingerprints.
+        let mut compiler = ObservationCompiler::new();
+        let per_snapshot = 4usize;
+        let snapshots = (RETENTION_SNAPSHOTS as usize) * 6;
+        for snapshot in 0..snapshots {
+            let elements = (0..per_snapshot)
+                .map(|slot| {
+                    RawElement::new("button", format!("tick {snapshot}-{slot}"))
+                        .source_id(format!("src-{snapshot}-{slot}"))
+                })
+                .collect();
+            compiler.compile(ObservationInput::new("https://ticker.example", elements));
+        }
+
+        // Only mappings from the most recent RETENTION_SNAPSHOTS survive, so the
+        // maps stay bounded instead of growing with the number of snapshots.
+        let bound = per_snapshot * RETENTION_SNAPSHOTS as usize;
+        assert!(
+            compiler.mapper.by_source.len() <= bound,
+            "by_source={}",
+            compiler.mapper.by_source.len()
+        );
+        assert!(
+            compiler.mapper.by_fingerprint.len() <= bound,
+            "by_fingerprint={}",
+            compiler.mapper.by_fingerprint.len()
+        );
+        assert!(
+            compiler.mapper.allocated.len() <= bound,
+            "allocated={}",
+            compiler.mapper.allocated.len()
+        );
+        // Without eviction this would hold snapshots * per_snapshot entries.
+        assert!(compiler.mapper.by_source.len() < snapshots * per_snapshot);
     }
 
     #[test]
