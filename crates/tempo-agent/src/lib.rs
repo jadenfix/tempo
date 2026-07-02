@@ -1100,6 +1100,46 @@ pub fn step_triples_from_journal(
     Ok(triples)
 }
 
+/// Rebuild StepTriples from journaled step outcomes without requiring the
+/// original task plan artifact.
+pub fn step_triples_from_journal_entries(
+    entries: &[JournalEntry],
+) -> Result<Vec<StepTriple>, AgentError> {
+    let mut triples = Vec::new();
+
+    for entry in entries {
+        match &entry.event {
+            JournalEvent::StepApplied { action, .. } | JournalEvent::StepError { action, .. } => {
+                let index = triples.len();
+                let key = IdempotencyKey::for_action(index, action)?;
+                triples.push(StepTriple::from_event(
+                    key,
+                    entry.seq,
+                    action.clone(),
+                    entry.event.clone(),
+                )?);
+            }
+            JournalEvent::SessionStarted { .. }
+            | JournalEvent::Observation { .. }
+            | JournalEvent::ActionPlanned { .. }
+            | JournalEvent::TransportError { .. }
+            | JournalEvent::CassetteRecorded { .. }
+            | JournalEvent::SessionClosed => {}
+        }
+    }
+
+    Ok(triples)
+}
+
+/// Rebuild StepTriples from a journal path without requiring the original task
+/// plan artifact.
+pub fn step_triples_from_journal_without_plan(
+    journal_path: impl AsRef<Path>,
+) -> Result<Vec<StepTriple>, AgentError> {
+    let entries = read_journal_entries(journal_path)?;
+    step_triples_from_journal_entries(&entries)
+}
+
 fn journal_transport_error(
     agent: &mut AgentLoop,
     context: &'static str,
@@ -1299,6 +1339,97 @@ mod tests {
         assert_eq!(triple.seq, 1);
         assert_eq!(triples, vec![triple]);
         assert_eq!(agent.budget().used_tokens, 12);
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn journal_entries_rebuild_step_triples_without_plan() -> TestResult {
+        let root = unique_dir("journal-step-triples")?;
+        remove_dir_if_exists(&root)?;
+        fs::create_dir_all(&root)?;
+        let journal_path = root.join("session.jsonl");
+        let first = Action::Scroll { x: 0.0, y: 1.0 };
+        let second = Action::Scroll { x: 0.0, y: 2.0 };
+        let mut journal = SessionJournal::open(
+            &journal_path,
+            RunId("run".into()),
+            SessionId("session".into()),
+        )?;
+        journal.append(JournalEvent::SessionStarted {
+            url: "https://session.test".into(),
+        })?;
+        journal.append(JournalEvent::ActionPlanned {
+            action: first.clone(),
+        })?;
+        journal.append(JournalEvent::StepApplied {
+            action: first.clone(),
+            diff: diff(0, 1),
+        })?;
+        journal.append(JournalEvent::ActionPlanned {
+            action: second.clone(),
+        })?;
+        journal.append(JournalEvent::StepError {
+            action: second.clone(),
+            reason: "not present".into(),
+        })?;
+        journal.append(JournalEvent::SessionClosed)?;
+        drop(journal);
+
+        let entries = read_journal_entries(&journal_path)?;
+        let triples = step_triples_from_journal_entries(&entries)?;
+        let path_triples = step_triples_from_journal_without_plan(&journal_path)?;
+
+        assert_eq!(triples, path_triples);
+        assert_eq!(triples.len(), 2);
+        assert_eq!(triples[0].seq, 2);
+        assert_eq!(triples[0].key, IdempotencyKey::for_action(0, &first)?);
+        assert_eq!(triples[0].action, first);
+        assert!(matches!(
+            triples[0].outcome,
+            StepTripleOutcome::Applied { .. }
+        ));
+        assert_eq!(triples[1].seq, 4);
+        assert_eq!(triples[1].key, IdempotencyKey::for_action(1, &second)?);
+        assert_eq!(triples[1].action, second);
+        assert!(matches!(
+            triples[1].outcome,
+            StepTripleOutcome::StepError { .. }
+        ));
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn journal_entries_ignore_pending_planned_action() -> TestResult {
+        let root = unique_dir("journal-pending-plan")?;
+        remove_dir_if_exists(&root)?;
+        fs::create_dir_all(&root)?;
+        let journal_path = root.join("session.jsonl");
+        let completed = Action::Scroll { x: 0.0, y: 1.0 };
+        let pending = Action::Scroll { x: 0.0, y: 2.0 };
+        let mut journal = SessionJournal::open(
+            &journal_path,
+            RunId("run".into()),
+            SessionId("session".into()),
+        )?;
+        journal.append(JournalEvent::ActionPlanned {
+            action: completed.clone(),
+        })?;
+        journal.append(JournalEvent::StepApplied {
+            action: completed.clone(),
+            diff: diff(0, 1),
+        })?;
+        journal.append(JournalEvent::ActionPlanned { action: pending })?;
+        drop(journal);
+
+        let triples = step_triples_from_journal_without_plan(&journal_path)?;
+
+        assert_eq!(triples.len(), 1);
+        assert_eq!(triples[0].key, IdempotencyKey::for_action(0, &completed)?);
+        assert_eq!(triples[0].action, completed);
 
         remove_dir_if_exists(&root)?;
         Ok(())

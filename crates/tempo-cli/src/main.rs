@@ -12,8 +12,8 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use tempo_agent::{
-    AgentRunIds, AgentRunReport, AgentRunStatus, AgentRunner, ConfirmationMode, DriverTask,
-    StepTripleOutcome,
+    step_triples_from_journal_entries, AgentRunIds, AgentRunReport, AgentRunStatus, AgentRunner,
+    ConfirmationMode, DriverTask, IdempotencyKey, StepTriple, StepTripleOutcome,
 };
 use tempo_compat::{run_injection_gate, CompatScorecard, CompatThresholds, InjectionCaseResult};
 use tempo_driver::{DriverTrait, TransportError};
@@ -208,7 +208,7 @@ impl Command {
             }
             Self::Replay { journal, output } => {
                 let entries = read_journal_entries(&journal)?;
-                let summary = ReplaySummary::from_entries(&journal, &entries);
+                let summary = ReplaySummary::from_entries(&journal, &entries)?;
                 write_json(&output, &summary, stdout)
             }
             Self::RunCdpTask {
@@ -593,7 +593,7 @@ fn write_json<T: Serialize>(
     Ok(())
 }
 
-#[derive(Debug, PartialEq, Eq, Serialize)]
+#[derive(Debug, PartialEq, Serialize)]
 struct ReplaySummary {
     journal: String,
     entries: usize,
@@ -606,10 +606,14 @@ struct ReplaySummary {
     step_errors: usize,
     transport_errors: usize,
     cassettes: usize,
+    step_triples: Vec<StepTriple>,
+    steps: Vec<ReplayStep>,
 }
 
 impl ReplaySummary {
-    fn from_entries(path: &Path, entries: &[JournalEntry]) -> Self {
+    fn from_entries(path: &Path, entries: &[JournalEntry]) -> Result<Self, CliError> {
+        let step_triples = step_triples_from_journal_entries(entries)?;
+        let steps = replay_steps_from_entries(entries)?;
         let mut summary = Self {
             journal: path.display().to_string(),
             entries: entries.len(),
@@ -622,6 +626,8 @@ impl ReplaySummary {
             step_errors: 0,
             transport_errors: 0,
             cassettes: 0,
+            step_triples,
+            steps,
         };
 
         for entry in entries {
@@ -637,8 +643,86 @@ impl ReplaySummary {
             }
         }
 
-        summary
+        Ok(summary)
     }
+}
+
+#[derive(Debug, PartialEq, Serialize)]
+struct ReplayStep {
+    index: usize,
+    idempotency_key: IdempotencyKey,
+    journal_seq: u64,
+    action: Action,
+    outcome: ReplayStepOutcome,
+}
+
+#[derive(Debug, PartialEq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+enum ReplayStepOutcome {
+    Applied { diff_since_seq: u64, diff_seq: u64 },
+    StepError { reason: String },
+    Pending,
+}
+
+fn replay_steps_from_entries(entries: &[JournalEntry]) -> Result<Vec<ReplayStep>, CliError> {
+    let mut steps = Vec::new();
+    let mut completed_steps = 0_usize;
+    let mut pending: Option<ReplayStep> = None;
+
+    for entry in entries {
+        match &entry.event {
+            JournalEvent::ActionPlanned { action } => {
+                if let Some(step) = pending.take() {
+                    steps.push(step);
+                }
+                pending = Some(ReplayStep {
+                    index: completed_steps,
+                    idempotency_key: IdempotencyKey::for_action(completed_steps, action)?,
+                    journal_seq: entry.seq,
+                    action: action.clone(),
+                    outcome: ReplayStepOutcome::Pending,
+                });
+            }
+            JournalEvent::StepApplied { action, diff } => {
+                pending = None;
+                steps.push(ReplayStep {
+                    index: completed_steps,
+                    idempotency_key: IdempotencyKey::for_action(completed_steps, action)?,
+                    journal_seq: entry.seq,
+                    action: action.clone(),
+                    outcome: ReplayStepOutcome::Applied {
+                        diff_since_seq: diff.since_seq,
+                        diff_seq: diff.seq,
+                    },
+                });
+                completed_steps += 1;
+            }
+            JournalEvent::StepError { action, reason } => {
+                pending = None;
+                steps.push(ReplayStep {
+                    index: completed_steps,
+                    idempotency_key: IdempotencyKey::for_action(completed_steps, action)?,
+                    journal_seq: entry.seq,
+                    action: action.clone(),
+                    outcome: ReplayStepOutcome::StepError {
+                        reason: reason.clone(),
+                    },
+                });
+                completed_steps += 1;
+            }
+            JournalEvent::SessionStarted { .. }
+            | JournalEvent::Observation { .. }
+            | JournalEvent::TransportError { .. }
+            | JournalEvent::CassetteRecorded { .. }
+            | JournalEvent::SessionClosed => {}
+        }
+    }
+
+    if let Some(step) = pending {
+        steps.push(step);
+    }
+
+    Ok(steps)
 }
 
 struct RunCdpTaskConfig {
@@ -1146,6 +1230,53 @@ mod tests {
         assert_eq!(value["session_started"], true);
         assert_eq!(value["session_closed"], true);
         assert_eq!(value["applied_steps"], 1);
+        assert_eq!(value["step_triples"].as_array().map(Vec::len), Some(1));
+        assert_eq!(value["step_triples"][0]["seq"], 3);
+        assert_eq!(value["step_triples"][0]["action"]["kind"], "scroll");
+        assert_eq!(value["step_triples"][0]["outcome"]["kind"], "applied");
+        assert_eq!(value["steps"].as_array().map(Vec::len), Some(1));
+        assert_eq!(value["steps"][0]["index"], 0);
+        assert_eq!(value["steps"][0]["journal_seq"], 3);
+        assert_eq!(value["steps"][0]["action"]["kind"], "scroll");
+        assert_eq!(value["steps"][0]["outcome"]["state"], "applied");
+        assert_eq!(value["steps"][0]["outcome"]["diff_since_seq"], 0);
+        assert_eq!(value["steps"][0]["outcome"]["diff_seq"], 1);
+        remove_dir(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn replay_command_reports_pending_planned_step() -> TestResult {
+        let dir = unique_dir("replay-pending")?;
+        let journal = dir.join("session.jsonl");
+        let mut session = SessionJournal::open(
+            &journal,
+            RunId("run-a".into()),
+            SessionId("session-a".into()),
+        )?;
+        session.append(JournalEvent::ActionPlanned {
+            action: Action::Scroll { x: 0.0, y: 10.0 },
+        })?;
+        drop(session);
+        let mut stdout = Vec::new();
+
+        run_with_writer(
+            [
+                "replay".to_string(),
+                "--journal".into(),
+                input_string(&journal),
+            ],
+            &mut stdout,
+        )?;
+
+        let value: Value = serde_json::from_slice(&stdout)?;
+        assert_eq!(value["applied_steps"], 0);
+        assert_eq!(value["step_errors"], 0);
+        assert_eq!(value["step_triples"].as_array().map(Vec::len), Some(0));
+        assert_eq!(value["steps"].as_array().map(Vec::len), Some(1));
+        assert_eq!(value["steps"][0]["index"], 0);
+        assert_eq!(value["steps"][0]["journal_seq"], 0);
+        assert_eq!(value["steps"][0]["outcome"]["state"], "pending");
         remove_dir(&dir)?;
         Ok(())
     }
