@@ -5,17 +5,29 @@
 //! it uses the standard library so the control surface works before a larger web
 //! framework is selected for production packaging.
 
+use async_trait::async_trait;
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::BTreeMap;
+use std::fmt;
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tempo_agent::StepTriple;
-use tempo_bidi::{BidiErrorCode, BidiMessage, BidiRouter, RoutedCommand};
-use tempo_engine_host::{EngineHost, EngineHostConfig, EngineHostError};
+use tempo_bidi::{
+    BidiErrorCode, BidiMessage, BidiRouter, BrowsingContextId, BrowsingContextInfo,
+    CaptureScreenshotResult, DriverCommand as BidiDriverCommand, GetTreeResult, NavigateResult,
+    RoutedCommand,
+};
+use tempo_driver::{DriverTrait, Engine, StepOutcome, TransportError, Unsupported};
+use tempo_engine_host::{
+    DriverCommand as HostDriverCommand, DriverResponse, DriverWireError, EngineHost,
+    EngineHostConfig, EngineHostError, EngineIpcClient,
+};
+use tempo_schema::{Action, ActionBatch, CompiledObservation, NodeId, ObservationDiff};
 use thiserror::Error;
 
 const MAX_HTTP_BYTES: usize = 64 * 1024;
@@ -42,11 +54,195 @@ pub struct TempodSession {
     pub created_ms: u128,
 }
 
+/// Driver handle attached to tempod through the engine-host UDS protocol.
+#[derive(Clone)]
+pub struct AttachedEngineDriver {
+    engine: Engine,
+    client: Arc<Mutex<EngineIpcClient>>,
+}
+
+impl AttachedEngineDriver {
+    pub fn new(engine: Engine, client: EngineIpcClient) -> Self {
+        Self {
+            engine,
+            client: Arc::new(Mutex::new(client)),
+        }
+    }
+
+    fn request(&self, command: HostDriverCommand) -> Result<DriverResponse, DriverClientError> {
+        let mut client = self
+            .client
+            .lock()
+            .map_err(|_| DriverClientError::LockFailed)?;
+        Ok(client.request(command)?)
+    }
+
+    fn request_observation(
+        &self,
+        command: HostDriverCommand,
+        expected: &'static str,
+    ) -> Result<CompiledObservation, TransportError> {
+        match self
+            .request(command)
+            .map_err(driver_client_transport_error)?
+        {
+            DriverResponse::Observation { observation } => Ok(observation),
+            DriverResponse::Error { error } => Err(driver_wire_transport_error(error)),
+            other => Err(unexpected_driver_response(other, expected)),
+        }
+    }
+
+    fn request_diff(
+        &self,
+        command: HostDriverCommand,
+        expected: &'static str,
+    ) -> Result<ObservationDiff, TransportError> {
+        match self
+            .request(command)
+            .map_err(driver_client_transport_error)?
+        {
+            DriverResponse::Diff { diff } => Ok(diff),
+            DriverResponse::Error { error } => Err(driver_wire_transport_error(error)),
+            other => Err(unexpected_driver_response(other, expected)),
+        }
+    }
+
+    fn request_step(
+        &self,
+        command: HostDriverCommand,
+        expected: &'static str,
+    ) -> Result<StepOutcome, TransportError> {
+        match self
+            .request(command)
+            .map_err(driver_client_transport_error)?
+        {
+            DriverResponse::Step { outcome } => Ok(outcome.into()),
+            DriverResponse::Error { error } => Err(driver_wire_transport_error(error)),
+            other => Err(unexpected_driver_response(other, expected)),
+        }
+    }
+
+    fn request_value(
+        &self,
+        command: HostDriverCommand,
+        expected: &'static str,
+    ) -> Result<serde_json::Value, TransportError> {
+        match self
+            .request(command)
+            .map_err(driver_client_transport_error)?
+        {
+            DriverResponse::Extracted { value } => Ok(value),
+            DriverResponse::Error { error } => Err(driver_wire_transport_error(error)),
+            other => Err(unexpected_driver_response(other, expected)),
+        }
+    }
+
+    fn request_bytes(
+        &self,
+        command: HostDriverCommand,
+        expected: &'static str,
+    ) -> Result<Vec<u8>, TransportError> {
+        match self
+            .request(command)
+            .map_err(driver_client_transport_error)?
+        {
+            DriverResponse::Screenshot { bytes } => Ok(bytes),
+            DriverResponse::Error { error } => Err(driver_wire_transport_error(error)),
+            other => Err(unexpected_driver_response(other, expected)),
+        }
+    }
+}
+
+impl fmt::Debug for AttachedEngineDriver {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AttachedEngineDriver")
+            .field("engine", &self.engine)
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl DriverTrait for AttachedEngineDriver {
+    fn engine(&self) -> Engine {
+        self.engine
+    }
+
+    async fn goto(&mut self, url: &str) -> Result<CompiledObservation, TransportError> {
+        self.request_observation(HostDriverCommand::Goto { url: url.into() }, "goto")
+    }
+
+    async fn observe(&mut self) -> Result<CompiledObservation, TransportError> {
+        self.request_observation(HostDriverCommand::Observe, "observe")
+    }
+
+    async fn observe_diff(&mut self, since_seq: u64) -> Result<ObservationDiff, TransportError> {
+        self.request_diff(HostDriverCommand::ObserveDiff { since_seq }, "observe_diff")
+    }
+
+    async fn act(&mut self, action: &Action) -> Result<StepOutcome, TransportError> {
+        self.request_step(
+            HostDriverCommand::Act {
+                action: action.clone(),
+            },
+            "act",
+        )
+    }
+
+    async fn act_batch(&mut self, batch: &ActionBatch) -> Result<StepOutcome, TransportError> {
+        self.request_step(
+            HostDriverCommand::ActBatch {
+                batch: batch.clone(),
+            },
+            "act_batch",
+        )
+    }
+
+    async fn fork(&mut self) -> Result<Box<dyn DriverTrait>, Unsupported> {
+        match self.request(HostDriverCommand::Fork) {
+            Ok(DriverResponse::Forked { .. }) => {
+                Err(Unsupported("engine IPC fork attachment unavailable"))
+            }
+            Ok(DriverResponse::Error { error }) => Err(driver_wire_unsupported(error)),
+            Ok(_) => Err(Unsupported("unexpected engine IPC fork response")),
+            Err(_) => Err(Unsupported("engine IPC fork failed")),
+        }
+    }
+
+    async fn extract(&mut self, node: &NodeId) -> Result<serde_json::Value, TransportError> {
+        self.request_value(HostDriverCommand::Extract { node: node.clone() }, "extract")
+    }
+
+    async fn screenshot(&mut self) -> Result<Vec<u8>, TransportError> {
+        self.request_bytes(HostDriverCommand::Screenshot, "screenshot")
+    }
+
+    async fn close(&mut self) -> Result<(), TransportError> {
+        match self
+            .request(HostDriverCommand::Close)
+            .map_err(driver_client_transport_error)?
+        {
+            DriverResponse::Closed => Ok(()),
+            DriverResponse::Error { error } => Err(driver_wire_transport_error(error)),
+            other => Err(unexpected_driver_response(other, "close")),
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+enum DriverClientError {
+    #[error("attached engine driver lock failed")]
+    LockFailed,
+    #[error("engine host failed: {0}")]
+    Host(#[from] EngineHostError),
+}
+
 /// In-memory session pool for a tempod process.
 #[derive(Clone, Debug, Default)]
 pub struct SessionPool {
     sessions: BTreeMap<TempodSessionId, TempodSession>,
     bidi: BidiRouter,
+    driver: Option<AttachedEngineDriver>,
     next_id: u64,
     draining: bool,
 }
@@ -99,6 +295,42 @@ impl SessionPool {
     pub fn draining(&self) -> bool {
         self.draining
     }
+
+    pub fn attach_engine_driver(&mut self, engine: Engine, client: EngineIpcClient) {
+        self.driver = Some(AttachedEngineDriver::new(engine, client));
+    }
+
+    pub fn detach_engine_driver(&mut self) {
+        self.driver = None;
+    }
+}
+
+fn driver_client_transport_error(error: DriverClientError) -> TransportError {
+    TransportError::Other(error.to_string())
+}
+
+fn driver_wire_transport_error(error: DriverWireError) -> TransportError {
+    match error {
+        DriverWireError::Transport { message } | DriverWireError::Protocol { message } => {
+            TransportError::Other(message)
+        }
+        DriverWireError::Unsupported { capability } => TransportError::Other(capability),
+    }
+}
+
+fn driver_wire_unsupported(error: DriverWireError) -> Unsupported {
+    match error {
+        DriverWireError::Unsupported { .. } => Unsupported("engine IPC capability unsupported"),
+        DriverWireError::Transport { .. } | DriverWireError::Protocol { .. } => {
+            Unsupported("engine IPC fork failed")
+        }
+    }
+}
+
+fn unexpected_driver_response(response: DriverResponse, expected: &'static str) -> TransportError {
+    TransportError::Other(format!(
+        "engine returned unexpected response for {expected}: {response:?}"
+    ))
 }
 
 /// Supervised engine host registry used by tempod.
@@ -202,6 +434,18 @@ pub fn run_tempod(addr: &str) -> Result<(), TempodError> {
     serve_forever(listener, pool)
 }
 
+/// Run tempod with an already-running engine reachable through the UDS driver protocol.
+pub fn run_tempod_with_attached_driver(
+    addr: &str,
+    engine: Engine,
+    socket_path: impl AsRef<Path>,
+) -> Result<(), TempodError> {
+    let listener = TcpListener::bind(addr)?;
+    let mut pool = SessionPool::default();
+    pool.attach_engine_driver(engine, EngineIpcClient::connect(socket_path)?);
+    serve_forever(listener, Arc::new(Mutex::new(pool)))
+}
+
 /// Serve requests until the listener fails or the process is stopped.
 pub fn serve_forever(
     listener: TcpListener,
@@ -249,7 +493,7 @@ fn route_http_request(
     match (request.method.as_str(), request.path.as_str()) {
         ("GET", "/health") => Ok(HttpResponse::json(200, json!({"ok": true}))),
         ("GET", "/mcp") => Ok(HttpResponse::from_mcp(tempo_mcp::handle_get())),
-        ("POST", "/mcp") => Ok(mcp_requires_driver(&request.body)),
+        ("POST", "/mcp") => Ok(route_mcp(pool, &request)),
         ("POST", "/bidi") => Ok(route_bidi(pool, request.body)),
         ("GET", "/sessions") => Ok(HttpResponse::json(200, pool.list())),
         ("POST", "/sessions") => {
@@ -289,19 +533,114 @@ fn route_http_request(
 fn route_bidi(pool: &mut SessionPool, body: Vec<u8>) -> HttpResponse {
     match pool.bidi.route_json(&body) {
         Ok(RoutedCommand::Immediate(message)) => bidi_response(200, message),
-        Ok(RoutedCommand::Driver { id, .. }) => bidi_response(
-            503,
-            BidiMessage::error(
-                Some(id),
-                BidiErrorCode::UnknownError,
-                "driver command requires an attached engine driver",
+        Ok(RoutedCommand::Driver { id, command }) => match pool.driver.clone() {
+            Some(driver) => route_bidi_driver(driver, id, command),
+            None => bidi_response(
+                503,
+                BidiMessage::error(
+                    Some(id),
+                    BidiErrorCode::UnknownError,
+                    "driver command requires an attached engine driver",
+                ),
             ),
-        ),
+        },
         Err(error) => bidi_response(
             400,
             BidiMessage::error(None, BidiErrorCode::InvalidArgument, error.to_string()),
         ),
     }
+}
+
+fn route_bidi_driver(
+    driver: AttachedEngineDriver,
+    id: tempo_bidi::CommandId,
+    command: BidiDriverCommand,
+) -> HttpResponse {
+    let message = match command {
+        BidiDriverCommand::Navigate(command) => {
+            let url = command.url.clone();
+            match futures::executor::block_on({
+                let mut driver = driver.clone();
+                let url = url.clone();
+                async move { driver.goto(&url).await }
+            }) {
+                Ok(_) => BidiRouter::driver_success(
+                    id,
+                    NavigateResult {
+                        navigation: Some(format!("tempo-navigation-{id}")),
+                        url: command.url,
+                    },
+                ),
+                Err(error) => Ok(BidiMessage::error(
+                    Some(id),
+                    BidiErrorCode::UnknownError,
+                    error.to_string(),
+                )),
+            }
+        }
+        BidiDriverCommand::GetTree(command) => {
+            match futures::executor::block_on({
+                let mut driver = driver.clone();
+                async move { driver.observe().await }
+            }) {
+                Ok(observation) => BidiRouter::driver_success(
+                    id,
+                    GetTreeResult {
+                        contexts: vec![BrowsingContextInfo {
+                            context: command.root.unwrap_or_else(default_context_id),
+                            url: observation.url,
+                            children: Vec::new(),
+                        }],
+                    },
+                ),
+                Err(error) => Ok(BidiMessage::error(
+                    Some(id),
+                    BidiErrorCode::UnknownError,
+                    error.to_string(),
+                )),
+            }
+        }
+        BidiDriverCommand::CaptureScreenshot(_) => {
+            match futures::executor::block_on({
+                let mut driver = driver.clone();
+                async move { driver.screenshot().await }
+            }) {
+                Ok(bytes) => BidiRouter::driver_success(
+                    id,
+                    CaptureScreenshotResult {
+                        data: base64::engine::general_purpose::STANDARD.encode(bytes),
+                    },
+                ),
+                Err(error) => Ok(BidiMessage::error(
+                    Some(id),
+                    BidiErrorCode::UnknownError,
+                    error.to_string(),
+                )),
+            }
+        }
+        BidiDriverCommand::CreateContext(_) => Ok(BidiMessage::error(
+            Some(id),
+            BidiErrorCode::UnknownError,
+            "browsingContext.create is not exposed by tempo DriverTrait",
+        )),
+        BidiDriverCommand::EvaluateScript(_) => Ok(BidiMessage::error(
+            Some(id),
+            BidiErrorCode::UnknownError,
+            "script.evaluate is not exposed by tempo DriverTrait",
+        )),
+    };
+
+    match message {
+        Ok(message) => bidi_response(200, message),
+        Err(error) => bidi_response(
+            500,
+            BidiMessage::error(None, BidiErrorCode::UnknownError, error.to_string()),
+        ),
+    }
+}
+
+fn default_context_id() -> BrowsingContextId {
+    BrowsingContextId("tempo-root".into())
 }
 
 fn bidi_response(status: u16, message: BidiMessage) -> HttpResponse {
@@ -314,6 +653,16 @@ fn bidi_response(status: u16, message: BidiMessage) -> HttpResponse {
             }),
         ),
     }
+}
+
+fn route_mcp(pool: &mut SessionPool, request: &HttpRequest) -> HttpResponse {
+    let Some(driver) = pool.driver.clone() else {
+        return mcp_requires_driver(&request.body);
+    };
+    let mut server = tempo_mcp::TempoMcpServer::new(driver);
+    HttpResponse::from_mcp(futures::executor::block_on(
+        server.handle_post(request.origin.as_deref(), &request.body),
+    ))
 }
 
 fn mcp_requires_driver(body: &[u8]) -> HttpResponse {
@@ -356,6 +705,7 @@ fn session_id_from_path(path: &str) -> Result<TempodSessionId, TempodError> {
 struct HttpRequest {
     method: String,
     path: String,
+    origin: Option<String>,
     body: Vec<u8>,
 }
 
@@ -380,6 +730,7 @@ fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, TempodError>
         header_end(&bytes).ok_or_else(|| TempodError::BadRequest("missing HTTP headers".into()))?;
     let headers = String::from_utf8(bytes[..header_end].to_vec())
         .map_err(|err| TempodError::BadRequest(err.to_string()))?;
+    let origin = header_value(headers.lines(), "origin");
     let mut lines = headers.lines();
     let request_line = lines
         .next()
@@ -412,6 +763,7 @@ fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, TempodError>
     Ok(HttpRequest {
         method,
         path,
+        origin,
         body: bytes[body_start..body_start + content_len].to_vec(),
     })
 }
@@ -434,6 +786,18 @@ fn content_length<'a>(lines: impl Iterator<Item = &'a str>) -> Result<usize, Tem
         }
     }
     Ok(0)
+}
+
+fn header_value<'a>(lines: impl Iterator<Item = &'a str>, target: &str) -> Option<String> {
+    for line in lines {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.eq_ignore_ascii_case(target) {
+            return Some(value.trim().to_string());
+        }
+    }
+    None
 }
 
 #[derive(Deserialize)]
@@ -534,10 +898,11 @@ mod tests {
     use std::error::Error;
     use std::io::{Read, Write};
     use std::net::TcpStream;
+    use std::os::unix::net::UnixStream;
     use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
     use tempo_agent::{IdempotencyKey, StepTripleOutcome};
-    use tempo_engine_host::RestartPolicy;
+    use tempo_engine_host::{DriverRequest, EngineIpcConnection, RestartPolicy};
     use tempo_schema::{Action, ObservationDiff};
 
     type TestResult = Result<(), Box<dyn Error>>;
@@ -596,6 +961,7 @@ mod tests {
             HttpRequest {
                 method: "POST".into(),
                 path: "/bidi".into(),
+                origin: None,
                 body: br#"{"id":1,"method":"session.status","params":{}}"#.to_vec(),
             },
         )?;
@@ -616,6 +982,7 @@ mod tests {
             HttpRequest {
                 method: "POST".into(),
                 path: "/bidi".into(),
+                origin: None,
                 body: br#"{"id":7,"method":"browsingContext.navigate","params":{"context":"ctx","url":"https://example.test"}}"#.to_vec(),
             },
         )?;
@@ -628,6 +995,41 @@ mod tests {
     }
 
     #[test]
+    fn bidi_endpoint_routes_navigation_to_attached_engine_driver() -> TestResult {
+        let mut pool = SessionPool::default();
+        let handle = attach_driver_handler(&mut pool, |request| {
+            assert_eq!(
+                request.command,
+                HostDriverCommand::Goto {
+                    url: "https://example.test".into(),
+                }
+            );
+            DriverResponse::Observation {
+                observation: observation("https://example.test", 1),
+            }
+        })?;
+
+        let response = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/bidi".into(),
+                origin: None,
+                body: br#"{"id":7,"method":"browsingContext.navigate","params":{"context":"ctx","url":"https://example.test"}}"#.to_vec(),
+            },
+        )?;
+        join_driver_handler(handle)?;
+
+        assert_eq!(response.status, 200);
+        let value: Value = serde_json::from_slice(&response.body)?;
+        assert_eq!(value["type"], "success");
+        assert_eq!(value["id"], 7);
+        assert_eq!(value["result"]["url"], "https://example.test");
+        assert_eq!(value["result"]["navigation"], "tempo-navigation-7");
+        Ok(())
+    }
+
+    #[test]
     fn mcp_endpoint_exposes_http_semantics_without_driver() -> TestResult {
         let mut pool = SessionPool::default();
         let get_response = route_http_request(
@@ -635,6 +1037,7 @@ mod tests {
             HttpRequest {
                 method: "GET".into(),
                 path: "/mcp".into(),
+                origin: None,
                 body: Vec::new(),
             },
         )?;
@@ -643,6 +1046,7 @@ mod tests {
             HttpRequest {
                 method: "POST".into(),
                 path: "/mcp".into(),
+                origin: None,
                 body: br#"{"jsonrpc":"2.0","id":9,"method":"tools/list"}"#.to_vec(),
             },
         )?;
@@ -653,6 +1057,39 @@ mod tests {
         let value: Value = serde_json::from_slice(&post_response.body)?;
         assert_eq!(value["jsonrpc"], "2.0");
         assert_eq!(value["id"], 9);
+        Ok(())
+    }
+
+    #[test]
+    fn mcp_endpoint_routes_tools_call_to_attached_engine_driver() -> TestResult {
+        let mut pool = SessionPool::default();
+        let handle = attach_driver_handler(&mut pool, |request| {
+            assert_eq!(request.command, HostDriverCommand::Observe);
+            DriverResponse::Observation {
+                observation: observation("https://mcp.test", 4),
+            }
+        })?;
+
+        let response = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/mcp".into(),
+                origin: Some("http://127.0.0.1".into()),
+                body: br#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"observe","arguments":{}}}"#.to_vec(),
+            },
+        )?;
+        join_driver_handler(handle)?;
+
+        assert_eq!(response.status, 200);
+        let value: Value = serde_json::from_slice(&response.body)?;
+        assert_eq!(value["jsonrpc"], "2.0");
+        assert_eq!(value["id"], 3);
+        assert_eq!(
+            value["result"]["structuredContent"]["url"],
+            "https://mcp.test"
+        );
+        assert_eq!(value["result"]["structuredContent"]["seq"], 4);
         Ok(())
     }
 
@@ -723,6 +1160,43 @@ mod tests {
         match handle.join() {
             Ok(result) => Ok(result?),
             Err(_) => Err("server thread failed".into()),
+        }
+    }
+
+    fn attach_driver_handler<F>(
+        pool: &mut SessionPool,
+        handler: F,
+    ) -> Result<thread::JoinHandle<Result<(), EngineHostError>>, std::io::Error>
+    where
+        F: FnOnce(DriverRequest) -> DriverResponse + Send + 'static,
+    {
+        let (client_stream, server_stream) = UnixStream::pair()?;
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+        Ok(thread::spawn(move || {
+            let mut connection = EngineIpcConnection::from_stream(server_stream);
+            let request = connection.read_driver_request()?;
+            let request_id = request.id;
+            let response = handler(request);
+            connection.write_driver_response(request_id, response)
+        }))
+    }
+
+    fn join_driver_handler(
+        handle: thread::JoinHandle<Result<(), EngineHostError>>,
+    ) -> Result<(), Box<dyn Error>> {
+        match handle.join() {
+            Ok(result) => Ok(result?),
+            Err(_) => Err("driver handler thread failed".into()),
+        }
+    }
+
+    fn observation(url: &str, seq: u64) -> CompiledObservation {
+        CompiledObservation {
+            schema_version: tempo_schema::SCHEMA_VERSION.into(),
+            url: url.into(),
+            seq,
+            elements: Vec::new(),
+            marks: Vec::new(),
         }
     }
 
