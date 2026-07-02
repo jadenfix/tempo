@@ -152,28 +152,41 @@ impl BidiRouter {
             "session.subscribe" => self.session_subscribe(command.id, command.params),
             "session.unsubscribe" => self.session_unsubscribe(command.id, command.params),
             "browsingContext.create" => {
-                let params = parse_params(command.params)?;
+                let params = match parse_command_params(command.id, command.params) {
+                    Ok(params) => params,
+                    Err(routed) => return Ok(routed),
+                };
                 Ok(RoutedCommand::Driver {
                     id: command.id,
                     command: DriverCommand::CreateContext(params),
                 })
             }
             "browsingContext.close" => {
-                let params = parse_params(command.params)?;
+                let params = match parse_command_params(command.id, command.params) {
+                    Ok(params) => params,
+                    Err(routed) => return Ok(routed),
+                };
                 Ok(RoutedCommand::Driver {
                     id: command.id,
                     command: DriverCommand::Close(params),
                 })
             }
             "browsingContext.getTree" => {
-                let params = parse_params(command.params)?;
+                let params = match parse_command_params(command.id, command.params) {
+                    Ok(params) => params,
+                    Err(routed) => return Ok(routed),
+                };
                 Ok(RoutedCommand::Driver {
                     id: command.id,
                     command: DriverCommand::GetTree(params),
                 })
             }
             "browsingContext.navigate" => {
-                let params: NavigateParameters = parse_params(command.params)?;
+                let params: NavigateParameters =
+                    match parse_command_params(command.id, command.params) {
+                        Ok(params) => params,
+                        Err(routed) => return Ok(routed),
+                    };
                 if params.url.trim().is_empty() {
                     return Ok(RoutedCommand::Immediate(BidiMessage::error(
                         Some(command.id),
@@ -195,14 +208,20 @@ impl BidiRouter {
                 })
             }
             "browsingContext.captureScreenshot" => {
-                let params = parse_params(command.params)?;
+                let params = match parse_command_params(command.id, command.params) {
+                    Ok(params) => params,
+                    Err(routed) => return Ok(routed),
+                };
                 Ok(RoutedCommand::Driver {
                     id: command.id,
                     command: DriverCommand::CaptureScreenshot(params),
                 })
             }
             "script.evaluate" => {
-                let params = parse_params(command.params)?;
+                let params = match parse_command_params(command.id, command.params) {
+                    Ok(params) => params,
+                    Err(routed) => return Ok(routed),
+                };
                 Ok(RoutedCommand::Driver {
                     id: command.id,
                     command: DriverCommand::EvaluateScript(params),
@@ -252,7 +271,10 @@ impl BidiRouter {
         id: CommandId,
         params: Value,
     ) -> Result<RoutedCommand, BidiProtocolError> {
-        let params: SessionNewParameters = parse_params(params)?;
+        let params: SessionNewParameters = match parse_command_params(id, params) {
+            Ok(params) => params,
+            Err(routed) => return Ok(routed),
+        };
         let session_id = format!("tempo-bidi-{}", self.next_session);
         self.next_session = self.next_session.saturating_add(1);
         Ok(RoutedCommand::Immediate(BidiMessage::success(
@@ -277,7 +299,10 @@ impl BidiRouter {
         id: CommandId,
         params: Value,
     ) -> Result<RoutedCommand, BidiProtocolError> {
-        let params: SessionSubscribeParameters = parse_params(params)?;
+        let params: SessionSubscribeParameters = match parse_command_params(id, params) {
+            Ok(params) => params,
+            Err(routed) => return Ok(routed),
+        };
         let event_names = match expand_event_names(&params.events, "session.subscribe") {
             Ok(event_names) => event_names,
             Err(message) => {
@@ -332,7 +357,10 @@ impl BidiRouter {
         id: CommandId,
         params: Value,
     ) -> Result<RoutedCommand, BidiProtocolError> {
-        let params: SessionUnsubscribeParameters = parse_params(params)?;
+        let params: SessionUnsubscribeParameters = match parse_command_params(id, params) {
+            Ok(params) => params,
+            Err(routed) => return Ok(routed),
+        };
         if params.subscriptions.is_some() && params.events.is_some() {
             return Ok(RoutedCommand::Immediate(BidiMessage::error(
                 Some(id),
@@ -792,6 +820,26 @@ where
     Ok(serde_json::from_value(params)?)
 }
 
+/// Build an `invalid argument` error envelope that preserves the command id, so
+/// a structurally invalid `params` never bubbles a transport-level Rust error
+/// and loses id correlation (issue #102).
+fn invalid_params_error(id: CommandId, error: impl std::fmt::Display) -> RoutedCommand {
+    RoutedCommand::Immediate(BidiMessage::error(
+        Some(id),
+        BidiErrorCode::InvalidArgument,
+        format!("invalid parameters: {error}"),
+    ))
+}
+
+/// Parse command params, converting a parse failure into an `invalid argument`
+/// BiDi error response (correlated to `id`) rather than a `BidiProtocolError`.
+fn parse_command_params<T>(id: CommandId, params: Value) -> Result<T, RoutedCommand>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    parse_params(params).map_err(|error| invalid_params_error(id, error))
+}
+
 fn expand_event_names(events: &[String], command: &str) -> Result<BTreeSet<String>, String> {
     if events.is_empty() {
         return Err(format!("{command} requires at least one event"));
@@ -1030,6 +1078,43 @@ mod tests {
                 message: "browsingContext.navigate requires a non-empty url".into(),
             })
         );
+        Ok(())
+    }
+
+    #[test]
+    fn driver_command_param_parse_failure_returns_invalid_argument_with_id() -> TestResult {
+        let mut router = BidiRouter::new();
+
+        // browsingContext.create requires a `type` field; omitting it is a
+        // structural param failure that must still correlate to the command id.
+        let routed =
+            router.route_json(br#"{"id":21,"method":"browsingContext.create","params":{}}"#)?;
+
+        match routed {
+            RoutedCommand::Immediate(BidiMessage::Error { id, error, .. }) => {
+                assert_eq!(id, Some(21));
+                assert_eq!(error, "invalid argument");
+            }
+            other => return Err(format!("expected invalid-argument error, got {other:?}").into()),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn session_command_param_parse_failure_returns_invalid_argument_with_id() -> TestResult {
+        let mut router = BidiRouter::new();
+
+        // session.subscribe expects `events` to be an array of strings.
+        let routed = router
+            .route_json(br#"{"id":22,"method":"session.subscribe","params":{"events":5}}"#)?;
+
+        match routed {
+            RoutedCommand::Immediate(BidiMessage::Error { id, error, .. }) => {
+                assert_eq!(id, Some(22));
+                assert_eq!(error, "invalid argument");
+            }
+            other => return Err(format!("expected invalid-argument error, got {other:?}").into()),
+        }
         Ok(())
     }
 

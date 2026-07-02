@@ -434,6 +434,7 @@ impl EngineIpcServer {
 
     pub fn accept(&self) -> Result<EngineIpcConnection, EngineHostError> {
         let (mut stream, _) = self.listener.accept()?;
+        authorize_peer(&stream)?;
         verify_control_token(&mut stream, &self.auth_token)?;
         Ok(EngineIpcConnection { stream })
     }
@@ -993,6 +994,35 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     diff == 0
 }
 
+/// Verify the connecting peer's uid matches the server's own uid via
+/// `SO_PEERCRED` before serving it. On non-Linux targets (where `SO_PEERCRED`
+/// is unavailable through the safe `nix` wrapper) this is a no-op.
+#[cfg(target_os = "linux")]
+fn authorize_peer(stream: &UnixStream) -> Result<(), EngineHostError> {
+    let creds = nix::sys::socket::getsockopt(stream, nix::sys::socket::sockopt::PeerCredentials)
+        .map_err(|errno| EngineHostError::PeerCredentials(errno.to_string()))?;
+    authorize_peer_uid(creds.uid(), nix::unistd::geteuid().as_raw())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn authorize_peer(_stream: &UnixStream) -> Result<(), EngineHostError> {
+    Ok(())
+}
+
+/// Pure uid comparison extracted for testing: the peer is authorized only when
+/// its uid matches the server's uid.
+#[cfg(any(target_os = "linux", test))]
+fn authorize_peer_uid(peer_uid: u32, server_uid: u32) -> Result<(), EngineHostError> {
+    if peer_uid == server_uid {
+        Ok(())
+    } else {
+        Err(EngineHostError::UnauthorizedPeer {
+            peer_uid,
+            server_uid,
+        })
+    }
+}
+
 fn remove_stale_socket(path: &Path) -> Result<(), EngineHostError> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_socket() => match UnixStream::connect(path) {
@@ -1042,6 +1072,10 @@ pub enum EngineHostError {
     ControlTokenGeneration(String),
     #[error("engine host control authentication failed")]
     ControlAuthFailed,
+    #[error("engine control socket peer uid {peer_uid} does not match owner uid {server_uid}")]
+    UnauthorizedPeer { peer_uid: u32, server_uid: u32 },
+    #[error("engine control socket peer credential check failed: {0}")]
+    PeerCredentials(String),
     #[error("unexpected engine frame method: expected {expected}, got {actual}")]
     UnexpectedFrameMethod {
         expected: &'static str,
@@ -1533,6 +1567,47 @@ mod tests {
     }
 
     #[test]
+    fn authorize_peer_uid_accepts_owner_and_rejects_other_users() {
+        assert!(authorize_peer_uid(1000, 1000).is_ok());
+        assert!(matches!(
+            authorize_peer_uid(1001, 1000),
+            Err(EngineHostError::UnauthorizedPeer {
+                peer_uid: 1001,
+                server_uid: 1000,
+            })
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn accept_authorizes_same_uid_peer_and_restricts_socket_permissions() -> TestResult {
+        let root = unique_dir("peercred")?;
+        remove_dir_if_exists(&root)?;
+        let socket_path = root.join("engine.sock");
+        let server = EngineIpcServer::bind(&socket_path)?;
+
+        // The socket must be owner-only (0600) and its directory owner-only (0700).
+        let socket_mode = fs::symlink_metadata(&socket_path)?.permissions().mode() & 0o777;
+        let dir_mode = fs::symlink_metadata(&root)?.permissions().mode() & 0o777;
+        assert_eq!(socket_mode, 0o600, "socket mode was {socket_mode:o}");
+        assert_eq!(dir_mode, 0o700, "dir mode was {dir_mode:o}");
+
+        // A same-uid connection (this test process) must be authorized.
+        let client_path = socket_path.clone();
+        let auth_token = server.auth_token().to_string();
+        let handle =
+            thread::spawn(move || EngineIpcClient::connect_with_token(client_path, &auth_token));
+        let accepted = server.accept();
+        let _client = join_connect(handle)?;
+        if let Err(error) = accepted {
+            return Err(format!("same-uid peer was rejected: {error}").into());
+        }
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[test]
     fn ipc_bind_rejects_non_socket_path() -> TestResult {
         let root = unique_dir("occupied")?;
         remove_dir_if_exists(&root)?;
@@ -1603,6 +1678,16 @@ mod tests {
         match handle.join() {
             Ok(result) => Ok(result?),
             Err(_) => Err("client thread panicked".into()),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn join_connect(
+        handle: thread::JoinHandle<Result<EngineIpcClient, EngineHostError>>,
+    ) -> Result<EngineIpcClient, Box<dyn Error>> {
+        match handle.join() {
+            Ok(result) => Ok(result?),
+            Err(_) => Err("connect thread panicked".into()),
         }
     }
 

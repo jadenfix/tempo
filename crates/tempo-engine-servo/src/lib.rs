@@ -118,12 +118,35 @@ impl ServoIpcDriver {
         &self.config
     }
 
-    fn request(&self, command: DriverCommand) -> Result<DriverResponse, ServoEngineError> {
-        let mut client = self
-            .client
-            .lock()
-            .map_err(|_| ServoEngineError::DriverLockFailed)?;
-        Ok(client.request_for(self.driver_id.as_deref(), command)?)
+    /// Perform one blocking UDS request/response round-trip without stalling the
+    /// async runtime (issue #101).
+    ///
+    /// `EngineIpcClient` speaks a synchronous, blocking frame protocol over a
+    /// `std::os::unix::net::UnixStream`. Calling it directly inside an async
+    /// method would block a tokio worker for the whole round-trip (which
+    /// includes real navigation). When a tokio runtime is present (tempod) we
+    /// offload the blocking work to the dedicated blocking pool. On the
+    /// `futures::executor::block_on` paths (tempo-headless / tempo-shell) there
+    /// is no tokio runtime, so `spawn_blocking` would panic — there we run the
+    /// blocking call inline, which is correct because that executor is already a
+    /// plain blocking thread.
+    async fn request(&self, command: DriverCommand) -> Result<DriverResponse, ServoEngineError> {
+        let client = Arc::clone(&self.client);
+        let driver_id = self.driver_id.clone();
+        let call = move || -> Result<DriverResponse, ServoEngineError> {
+            let mut client = client
+                .lock()
+                .map_err(|_| ServoEngineError::DriverLockFailed)?;
+            Ok(client.request_for(driver_id.as_deref(), command)?)
+        };
+
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => handle
+                .spawn_blocking(call)
+                .await
+                .map_err(|error| ServoEngineError::DriverTask(error.to_string()))?,
+            Err(_) => call(),
+        }
     }
 }
 
@@ -136,6 +159,7 @@ impl DriverTrait for ServoIpcDriver {
     async fn goto(&mut self, url: &str) -> Result<CompiledObservation, TransportError> {
         match self
             .request(DriverCommand::Goto { url: url.into() })
+            .await
             .map_err(servo_host_transport_error)?
         {
             DriverResponse::Observation { observation } => Ok(observation),
@@ -147,6 +171,7 @@ impl DriverTrait for ServoIpcDriver {
     async fn observe(&mut self) -> Result<CompiledObservation, TransportError> {
         match self
             .request(DriverCommand::Observe)
+            .await
             .map_err(servo_host_transport_error)?
         {
             DriverResponse::Observation { observation } => Ok(observation),
@@ -158,6 +183,7 @@ impl DriverTrait for ServoIpcDriver {
     async fn observe_diff(&mut self, since_seq: u64) -> Result<ObservationDiff, TransportError> {
         match self
             .request(DriverCommand::ObserveDiff { since_seq })
+            .await
             .map_err(servo_host_transport_error)?
         {
             DriverResponse::Diff { diff } => Ok(diff),
@@ -171,6 +197,7 @@ impl DriverTrait for ServoIpcDriver {
             .request(DriverCommand::Act {
                 action: action.clone(),
             })
+            .await
             .map_err(servo_host_transport_error)?
         {
             DriverResponse::Step { outcome } => Ok(outcome.into()),
@@ -184,6 +211,7 @@ impl DriverTrait for ServoIpcDriver {
             .request(DriverCommand::ActBatch {
                 batch: batch.clone(),
             })
+            .await
             .map_err(servo_host_transport_error)?
         {
             DriverResponse::Step { outcome } => Ok(outcome.into()),
@@ -194,7 +222,7 @@ impl DriverTrait for ServoIpcDriver {
 
     async fn fork(&mut self) -> Result<Box<dyn DriverTrait>, Unsupported> {
         self.config.native_fork()?;
-        match self.request(DriverCommand::Fork) {
+        match self.request(DriverCommand::Fork).await {
             Ok(DriverResponse::Forked { driver_id }) => Ok(Box::new(Self {
                 config: self.config.clone(),
                 client: Arc::clone(&self.client),
@@ -209,6 +237,7 @@ impl DriverTrait for ServoIpcDriver {
     async fn extract(&mut self, node: &NodeId) -> Result<serde_json::Value, TransportError> {
         match self
             .request(DriverCommand::Extract { node: node.clone() })
+            .await
             .map_err(servo_host_transport_error)?
         {
             DriverResponse::Extracted { value } => Ok(value),
@@ -227,6 +256,7 @@ impl DriverTrait for ServoIpcDriver {
                 expression: expression.into(),
                 await_promise,
             })
+            .await
             .map_err(servo_host_transport_error)?
         {
             DriverResponse::Evaluated { value } => Ok(value),
@@ -238,6 +268,7 @@ impl DriverTrait for ServoIpcDriver {
     async fn screenshot(&mut self) -> Result<Vec<u8>, TransportError> {
         match self
             .request(DriverCommand::Screenshot)
+            .await
             .map_err(servo_host_transport_error)?
         {
             DriverResponse::Screenshot { bytes } => Ok(bytes),
@@ -249,6 +280,7 @@ impl DriverTrait for ServoIpcDriver {
     async fn close(&mut self) -> Result<(), TransportError> {
         match self
             .request(DriverCommand::Close)
+            .await
             .map_err(servo_host_transport_error)?
         {
             DriverResponse::Closed => Ok(()),
@@ -656,6 +688,8 @@ pub enum ServoEngineError {
     Host(#[from] EngineHostError),
     #[error("servo IPC driver lock failed")]
     DriverLockFailed,
+    #[error("servo IPC driver blocking task failed: {0}")]
+    DriverTask(String),
 }
 
 #[derive(Debug, Error)]
@@ -1105,6 +1139,61 @@ mod tests {
         assert_eq!(extracted["node"], "submit");
         assert_eq!(evaluated["expression"], "document.title");
         assert_eq!(evaluated["awaitPromise"], true);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn request_is_offloaded_from_the_current_thread_runtime(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (client_stream, server_stream) = UnixStream::pair()?;
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+
+        // The server runs on its own OS thread. It reads the request, then waits
+        // for a release signal that is only produced by a *second* task on the
+        // same single-threaded tokio runtime. If `request` blocked the runtime's
+        // only worker inline, that second task could never run and this would
+        // deadlock; offloading via spawn_blocking lets both make progress.
+        let server = thread::spawn(move || -> Result<(), EngineHostError> {
+            let mut connection = EngineIpcConnection::from_stream(server_stream);
+            let request = connection.read_driver_request()?;
+            release_rx
+                .recv()
+                .map_err(|error| EngineHostError::Io(io::Error::other(error.to_string())))?;
+            let observation = CompiledObservation {
+                schema_version: tempo_schema::SCHEMA_VERSION.into(),
+                url: "https://servo.test".into(),
+                seq: 1,
+                elements: Vec::new(),
+                marks: Vec::new(),
+            };
+            connection
+                .write_driver_response(request.id, DriverResponse::Observation { observation })?;
+            Ok(())
+        });
+
+        let mut driver = ServoIpcDriver::from_client(
+            ServoEngineConfig::vanilla(),
+            EngineIpcClient::from_stream(client_stream),
+        );
+
+        let ran_concurrently = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&ran_concurrently);
+        let releaser = async move {
+            flag.store(true, Ordering::SeqCst);
+            // Release the (otherwise blocked) server now that concurrency is proven.
+            let _ = release_tx.send(());
+        };
+
+        let (observation, ()) = tokio::join!(driver.goto("https://servo.test"), releaser);
+        let observation = observation?;
+        server
+            .join()
+            .map_err(|_| Box::<dyn std::error::Error>::from("server thread panicked"))??;
+
+        assert!(ran_concurrently.load(Ordering::SeqCst));
+        assert_eq!(observation.url, "https://servo.test");
         Ok(())
     }
 

@@ -14,6 +14,7 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+tokio = { version = "1", features = ["rt"] }
 
 [dev-dependencies]
 tempo-driver = { path = "../tempo-driver", features = ["test-driver"] }
