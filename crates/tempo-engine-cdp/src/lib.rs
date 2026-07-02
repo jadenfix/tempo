@@ -1110,6 +1110,28 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn live_cdp_driver_passes_conformance_v2() -> Result<(), Box<dyn std::error::Error>> {
+        let Some(chrome) = std::env::var_os("TEMPO_CDP_CHROME") else {
+            eprintln!("skipping live CDP conformance test; TEMPO_CDP_CHROME is unset");
+            return Ok(());
+        };
+        let url = serve_fixture()?;
+        let config = CdpConfig::default().with_executable(chrome.to_string_lossy());
+        let mut driver = CdpTempoDriver::launch_with(config)
+            .await?
+            .allow_private_network_access();
+
+        tempo_driver::conformance::assert_driver_conformance_with(
+            &mut driver,
+            tempo_driver::conformance::ConformanceConfig::new(url)
+                .with_fork(tempo_driver::conformance::ForkExpectation::Unsupported),
+        )
+        .await
+        .map_err(std::io::Error::other)?;
+        Ok(())
+    }
+
     fn serve_fixture() -> Result<String, std::io::Error> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let addr = listener.local_addr()?;
