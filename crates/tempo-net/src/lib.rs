@@ -725,6 +725,250 @@ impl AuditRecord {
     }
 }
 
+/// Match rule for egress domain controls.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum DomainRule {
+    Exact(String),
+    Suffix(String),
+}
+
+impl DomainRule {
+    pub fn exact(domain: impl Into<String>) -> Self {
+        Self::Exact(canonical_domain(domain))
+    }
+
+    pub fn suffix(domain: impl Into<String>) -> Self {
+        Self::Suffix(canonical_domain(domain))
+    }
+
+    pub fn matches(&self, domain: &str) -> bool {
+        let domain = domain.to_ascii_lowercase();
+        match self {
+            Self::Exact(expected) => &domain == expected,
+            Self::Suffix(suffix) => {
+                let suffix_with_boundary = format!(".{suffix}");
+                domain == *suffix || domain.ends_with(&suffix_with_boundary)
+            }
+        }
+    }
+
+    fn specificity(&self) -> usize {
+        match self {
+            Self::Exact(domain) => domain.len() + 1_000,
+            Self::Suffix(domain) => domain.len(),
+        }
+    }
+}
+
+/// Proxy route selected by egress policy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProxyRoute {
+    pub id: String,
+    pub endpoint: String,
+}
+
+impl ProxyRoute {
+    pub fn new(id: impl Into<String>, endpoint: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            endpoint: endpoint.into(),
+        }
+    }
+}
+
+/// Default egress behavior when no domain rule matches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EgressDefault {
+    AllowDirect,
+    Block,
+}
+
+/// Pure egress/proxy policy evaluated before dispatching a network request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EgressPolicy {
+    default: EgressDefault,
+    allowed: BTreeSet<DomainRule>,
+    blocked: BTreeSet<DomainRule>,
+    proxies: BTreeMap<DomainRule, ProxyRoute>,
+}
+
+impl EgressPolicy {
+    pub fn allow_all() -> Self {
+        Self {
+            default: EgressDefault::AllowDirect,
+            allowed: BTreeSet::new(),
+            blocked: BTreeSet::new(),
+            proxies: BTreeMap::new(),
+        }
+    }
+
+    pub fn block_by_default() -> Self {
+        Self {
+            default: EgressDefault::Block,
+            allowed: BTreeSet::new(),
+            blocked: BTreeSet::new(),
+            proxies: BTreeMap::new(),
+        }
+    }
+
+    pub fn allow_domain(mut self, rule: DomainRule) -> Self {
+        self.allowed.insert(rule);
+        self
+    }
+
+    pub fn block_domain(mut self, rule: DomainRule) -> Self {
+        self.blocked.insert(rule);
+        self
+    }
+
+    pub fn proxy_domain(mut self, rule: DomainRule, route: ProxyRoute) -> Self {
+        self.proxies.insert(rule, route);
+        self
+    }
+
+    pub fn decide(&self, request: &NetworkRequest) -> Result<EgressDecision, EgressDenied> {
+        let parts =
+            UrlParts::parse(&request.url).map_err(|reason| EgressDenied::from_block(reason, ""))?;
+        let domain = parts.host.clone();
+        let port = egress_port(&parts);
+
+        if self.rule_matches(&self.blocked, &domain) {
+            return Err(EgressDenied {
+                domain,
+                port,
+                reason: "domain is blocked by egress policy".into(),
+            });
+        }
+
+        if let Some(proxy) = self.proxy_for(&domain) {
+            return Ok(EgressDecision::Proxied {
+                domain,
+                port,
+                proxy: proxy.clone(),
+            });
+        }
+
+        if self.default == EgressDefault::AllowDirect || self.rule_matches(&self.allowed, &domain) {
+            return Ok(EgressDecision::Direct { domain, port });
+        }
+
+        Err(EgressDenied {
+            domain,
+            port,
+            reason: "domain is not allowed by egress policy".into(),
+        })
+    }
+
+    fn rule_matches(&self, rules: &BTreeSet<DomainRule>, domain: &str) -> bool {
+        rules.iter().any(|rule| rule.matches(domain))
+    }
+
+    fn proxy_for(&self, domain: &str) -> Option<&ProxyRoute> {
+        let mut best: Option<(&DomainRule, &ProxyRoute)> = None;
+        for (rule, route) in &self.proxies {
+            if !rule.matches(domain) {
+                continue;
+            }
+            let replace = best
+                .as_ref()
+                .map(|(best_rule, _)| rule.specificity() > best_rule.specificity())
+                .unwrap_or(true);
+            if replace {
+                best = Some((rule, route));
+            }
+        }
+        best.map(|(_, route)| route)
+    }
+}
+
+impl Default for EgressPolicy {
+    fn default() -> Self {
+        Self::allow_all()
+    }
+}
+
+/// Egress routing decision for one request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EgressDecision {
+    Direct {
+        domain: String,
+        port: u16,
+    },
+    Proxied {
+        domain: String,
+        port: u16,
+        proxy: ProxyRoute,
+    },
+}
+
+impl EgressDecision {
+    pub fn domain(&self) -> &str {
+        match self {
+            Self::Direct { domain, .. } | Self::Proxied { domain, .. } => domain,
+        }
+    }
+
+    pub fn port(&self) -> u16 {
+        match self {
+            Self::Direct { port, .. } | Self::Proxied { port, .. } => *port,
+        }
+    }
+
+    pub fn proxy_id(&self) -> Option<&str> {
+        match self {
+            Self::Direct { .. } => None,
+            Self::Proxied { proxy, .. } => Some(proxy.id.as_str()),
+        }
+    }
+}
+
+/// Egress policy rejection for one request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EgressDenied {
+    pub domain: String,
+    pub port: u16,
+    pub reason: String,
+}
+
+impl EgressDenied {
+    fn from_block(reason: BlockReason, domain: &str) -> Self {
+        Self {
+            domain: domain.into(),
+            port: 0,
+            reason: reason.detail,
+        }
+    }
+}
+
+/// Sanitized egress record suitable for session audit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EgressRecord {
+    pub request_id: RequestId,
+    pub domain: String,
+    pub port: u16,
+    pub proxy_id: Option<String>,
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
+}
+
+impl EgressRecord {
+    pub fn from_decision(
+        request_id: impl Into<RequestId>,
+        decision: &EgressDecision,
+        bytes_sent: u64,
+        bytes_received: u64,
+    ) -> Self {
+        Self {
+            request_id: request_id.into(),
+            domain: decision.domain().into(),
+            port: decision.port(),
+            proxy_id: decision.proxy_id().map(str::to_string),
+            bytes_sent,
+            bytes_received,
+        }
+    }
+}
+
 /// Outcome used by network quiescence accounting.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RequestOutcome {
@@ -1182,6 +1426,18 @@ fn stable_partition_suffix(input: &str) -> String {
     format!("{hash:016x}")
 }
 
+fn canonical_domain(domain: impl Into<String>) -> String {
+    domain.into().trim_end_matches('.').to_ascii_lowercase()
+}
+
+fn egress_port(parts: &UrlParts) -> u16 {
+    parts.port.unwrap_or(match parts.scheme.as_str() {
+        "http" => 80,
+        "https" => 443,
+        _ => 0,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1337,6 +1593,125 @@ mod tests {
 
         let audit = AuditRecord::from_request(&request, &UrlPolicy::block_private());
         assert!(audit.is_err(), "{audit:?}");
+    }
+
+    #[test]
+    fn egress_policy_allows_direct_public_request_by_default() -> Result<(), EgressDenied> {
+        let request = NetworkRequest::new(
+            "r1",
+            "GET",
+            "https://example.com/path?q=secret",
+            "profile-a",
+            IdentityMode::AgentDeclared,
+        );
+
+        let decision = EgressPolicy::allow_all().decide(&request)?;
+
+        assert_eq!(
+            decision,
+            EgressDecision::Direct {
+                domain: "example.com".into(),
+                port: 443,
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn egress_policy_blocks_default_except_allowed_domains() -> Result<(), EgressDenied> {
+        let allowed = NetworkRequest::new(
+            "r1",
+            "GET",
+            "https://api.example/data",
+            "profile-a",
+            IdentityMode::AgentDeclared,
+        );
+        let blocked = NetworkRequest::new(
+            "r2",
+            "GET",
+            "https://other.example/data",
+            "profile-a",
+            IdentityMode::AgentDeclared,
+        );
+        let policy =
+            EgressPolicy::block_by_default().allow_domain(DomainRule::exact("api.example"));
+
+        let allowed_decision = policy.decide(&allowed)?;
+        let blocked_decision = policy.decide(&blocked);
+
+        assert_eq!(allowed_decision.domain(), "api.example");
+        assert!(matches!(blocked_decision, Err(EgressDenied { .. })));
+        Ok(())
+    }
+
+    #[test]
+    fn egress_policy_selects_most_specific_proxy_route() -> Result<(), EgressDenied> {
+        let request = NetworkRequest::new(
+            "r1",
+            "GET",
+            "https://payments.example.com/charge",
+            "profile-a",
+            IdentityMode::AgentDeclared,
+        );
+        let policy = EgressPolicy::block_by_default()
+            .proxy_domain(
+                DomainRule::suffix("example.com"),
+                ProxyRoute::new("general", "socks5://proxy.example:1080"),
+            )
+            .proxy_domain(
+                DomainRule::exact("payments.example.com"),
+                ProxyRoute::new("payments", "socks5://payments-proxy.example:1080"),
+            );
+
+        let decision = policy.decide(&request)?;
+
+        assert_eq!(decision.proxy_id(), Some("payments"));
+        assert_eq!(decision.port(), 443);
+        Ok(())
+    }
+
+    #[test]
+    fn egress_policy_explicit_block_precedes_proxy_route() {
+        let request = NetworkRequest::new(
+            "r1",
+            "GET",
+            "https://blocked.example.com/path",
+            "profile-a",
+            IdentityMode::AgentDeclared,
+        );
+        let policy = EgressPolicy::allow_all()
+            .proxy_domain(
+                DomainRule::suffix("example.com"),
+                ProxyRoute::new("general", "socks5://proxy.example:1080"),
+            )
+            .block_domain(DomainRule::exact("blocked.example.com"));
+
+        let decision = policy.decide(&request);
+
+        assert!(matches!(decision, Err(EgressDenied { .. })));
+    }
+
+    #[test]
+    fn egress_record_is_joinable_and_sanitized() -> Result<(), EgressDenied> {
+        let request = NetworkRequest::new(
+            "r1",
+            "POST",
+            "https://api.example/upload?token=page-derived",
+            "profile-a",
+            IdentityMode::AgentDeclared,
+        );
+        let decision = EgressPolicy::allow_all().decide(&request)?;
+
+        let record = EgressRecord::from_decision(request.id.clone(), &decision, 123, 456);
+
+        assert_eq!(record.request_id, request.id);
+        assert_eq!(record.domain, "api.example");
+        assert_eq!(record.port, 443);
+        assert_eq!(record.proxy_id, None);
+        assert_eq!(record.bytes_sent, 123);
+        assert_eq!(record.bytes_received, 456);
+        assert!(!record.domain.contains("token"));
+        Ok(())
     }
 
     #[test]
