@@ -923,6 +923,25 @@ mod tests {
     }
 
     #[test]
+    fn servo_network_adapter_blocks_percent_encoded_metadata_before_network() -> TestResult {
+        // Issue #79 follow-up: the fetch path passes request.url verbatim to
+        // both the URL policy and reqwest. A percent-encoded metadata host must
+        // be rejected by the guard (which now shares the WHATWG host parser),
+        // never reaching the network.
+        let adapter = ServoNetworkAdapter::new("profile-a", IdentityMode::AgentDeclared);
+        let request =
+            ServoNetworkRequest::new("req-1", "GET", "https://169%2e254%2e169%2e254/latest");
+
+        let error = adapter
+            .fetch(&request)
+            .err()
+            .ok_or_else(|| io::Error::other("expected URL policy failure"))?;
+
+        assert!(matches!(error, ServoNetworkError::Url(_)));
+        Ok(())
+    }
+
+    #[test]
     fn servo_network_adapter_blocks_egress_before_network() -> TestResult {
         let adapter = ServoNetworkAdapter::new("profile-a", IdentityMode::AgentDeclared)
             .with_url_policy(UrlPolicy::allow_all())
