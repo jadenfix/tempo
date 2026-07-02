@@ -13,7 +13,7 @@ use chromiumoxide::page::{Page, ScreenshotParams};
 use futures::StreamExt;
 use std::collections::{BTreeMap, HashMap};
 use std::net::IpAddr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tempo_driver::{DriverTrait, Engine, StepOutcome, TransportError, Unsupported};
 use tempo_schema::{
     Action, ActionBatch, CompiledObservation, InteractiveElement, NodeId, ObservationDiff,
@@ -249,6 +249,33 @@ impl CdpTempoDriver {
             }),
         }
     }
+
+    async fn wait_for_composite_quiescence(&self) -> Result<(), TransportError> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut tracker = CompositeQuiescenceTracker::new(3);
+
+        loop {
+            let ready_state = self
+                .page
+                .evaluate("document.readyState")
+                .await
+                .map_err(map_cdp_error)?
+                .into_value::<String>()
+                .map_err(|error| TransportError::Other(error.to_string()))?;
+            let dom_html = self.page.content().await.map_err(map_cdp_error)?;
+            let sample = PageStabilitySample {
+                ready: ready_state != "loading",
+                dom_hash: fnv1a64(dom_html.as_bytes()),
+            };
+            if tracker.observe(sample) {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(TransportError::NavTimeout);
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
 }
 
 impl Drop for CdpTempoDriver {
@@ -295,6 +322,7 @@ impl DriverTrait for CdpTempoDriver {
     }
 
     async fn act_batch(&mut self, batch: &ActionBatch) -> Result<StepOutcome, TransportError> {
+        let batch_base_seq = self.seq;
         for action in &batch.actions {
             let outcome = self.run_one(action).await?;
             if matches!(outcome, StepOutcome::StepError { .. }) {
@@ -304,16 +332,27 @@ impl DriverTrait for CdpTempoDriver {
 
         match batch.quiescence {
             QuiescencePolicy::FixedMillis(millis) => {
-                let previous_seq = self.seq;
                 tokio::time::sleep(Duration::from_millis(millis)).await;
                 let compiled = self.record_current_observation().await?;
                 Ok(StepOutcome::Applied {
-                    diff: diff_from_base(self.history.get(&previous_seq), &compiled, previous_seq),
+                    diff: diff_from_base(
+                        self.history.get(&batch_base_seq),
+                        &compiled,
+                        batch_base_seq,
+                    ),
                 })
             }
-            QuiescencePolicy::Composite => Err(TransportError::Other(
-                "composite quiescence requires tempo-net and engine frame/JS signals".into(),
-            )),
+            QuiescencePolicy::Composite => {
+                self.wait_for_composite_quiescence().await?;
+                let compiled = self.record_current_observation().await?;
+                Ok(StepOutcome::Applied {
+                    diff: diff_from_base(
+                        self.history.get(&batch_base_seq),
+                        &compiled,
+                        batch_base_seq,
+                    ),
+                })
+            }
         }
     }
 
@@ -399,6 +438,54 @@ fn is_blocked_ip(ip: IpAddr) -> bool {
                 || ip.is_unicast_link_local()
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PageStabilitySample {
+    ready: bool,
+    dom_hash: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CompositeQuiescenceTracker {
+    required_stable_samples: u8,
+    last_dom_hash: Option<u64>,
+    stable_samples: u8,
+}
+
+impl CompositeQuiescenceTracker {
+    fn new(required_stable_samples: u8) -> Self {
+        Self {
+            required_stable_samples: required_stable_samples.max(1),
+            last_dom_hash: None,
+            stable_samples: 0,
+        }
+    }
+
+    fn observe(&mut self, sample: PageStabilitySample) -> bool {
+        if !sample.ready {
+            self.last_dom_hash = Some(sample.dom_hash);
+            self.stable_samples = 0;
+            return false;
+        }
+
+        self.stable_samples = if self.last_dom_hash == Some(sample.dom_hash) {
+            self.stable_samples.saturating_add(1)
+        } else {
+            1
+        };
+        self.last_dom_hash = Some(sample.dom_hash);
+        self.stable_samples >= self.required_stable_samples
+    }
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
 }
 
 fn compile_observation(url: String, dom_html: String, seq: u64) -> CompiledObservation {
@@ -773,6 +860,34 @@ mod tests {
         assert_eq!(diff.removed, vec![NodeId("a[href=\"/a\"]".into())]);
         assert_eq!(diff.changed.len(), 1);
         assert_eq!(diff.changed[0].node_id, NodeId("[id=\"save\"]".into()));
+    }
+
+    #[test]
+    fn composite_quiescence_requires_ready_and_stable_dom() {
+        let hash_a = fnv1a64(b"<button>A</button>");
+        let hash_b = fnv1a64(b"<button>B</button>");
+        let mut tracker = CompositeQuiescenceTracker::new(3);
+
+        assert!(!tracker.observe(PageStabilitySample {
+            ready: false,
+            dom_hash: hash_a,
+        }));
+        assert!(!tracker.observe(PageStabilitySample {
+            ready: true,
+            dom_hash: hash_a,
+        }));
+        assert!(!tracker.observe(PageStabilitySample {
+            ready: true,
+            dom_hash: hash_b,
+        }));
+        assert!(!tracker.observe(PageStabilitySample {
+            ready: true,
+            dom_hash: hash_b,
+        }));
+        assert!(tracker.observe(PageStabilitySample {
+            ready: true,
+            dom_hash: hash_b,
+        }));
     }
 
     #[test]
