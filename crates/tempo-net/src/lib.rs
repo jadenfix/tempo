@@ -8,12 +8,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
+use std::fmt::Write as _;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use sha2::{Digest, Sha256};
 
 /// Default maximum age for Web Bot Auth signatures.
 ///
@@ -562,7 +564,7 @@ impl NetworkProfile {
     /// Deterministic ephemeral profile for one session.
     pub fn ephemeral(session_id: impl Into<SessionId>) -> Self {
         let session_id = session_id.into();
-        let suffix = stable_partition_suffix(&session_id.0);
+        let suffix = stable_partition_suffix(&[&session_id.0]);
         Self {
             id: ProfileId(format!("ephemeral-{suffix}")),
             session_id,
@@ -576,7 +578,7 @@ impl NetworkProfile {
     pub fn durable(session_id: impl Into<SessionId>, name: impl Into<String>) -> Self {
         let session_id = session_id.into();
         let name = name.into();
-        let suffix = stable_partition_suffix(&format!("{}:{name}", session_id.0));
+        let suffix = stable_partition_suffix(&[&session_id.0, &name]);
         Self {
             id: ProfileId(format!("durable-{suffix}")),
             session_id,
@@ -1975,13 +1977,31 @@ fn blocked_ipv6_reason(ip: &Ipv6Addr) -> Option<String> {
     None
 }
 
-fn stable_partition_suffix(input: &str) -> String {
-    let mut hash = 0xcbf29ce484222325u64;
-    for byte in input.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
+/// Derive a stable, collision-resistant hex suffix used to name a session's
+/// isolated cookie/storage partitions.
+///
+/// Profile names may be caller-supplied (and thus agent/attacker-influenced),
+/// so a non-collision-resistant hash (the former FNV-1a-64) could be forced to
+/// map two distinct profiles onto the same partition, breaking cross-profile
+/// cookie/storage isolation. SHA-256 is collision-resistant; each part is
+/// length-prefixed before hashing so component boundaries are unambiguous. The digest is
+/// truncated to 32 lowercase-hex chars (128 bits) — a stable, filesystem-safe
+/// identifier with ample margin against accidental collisions.
+fn stable_partition_suffix(parts: &[&str]) -> String {
+    let mut hasher = Sha256::new();
+    for part in parts {
+        let bytes = part.as_bytes();
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(bytes);
     }
-    format!("{hash:016x}")
+    let digest = hasher.finalize();
+
+    let mut suffix = String::with_capacity(32);
+    for byte in digest.iter().take(16) {
+        // Writing formatted hex into a String is infallible.
+        let _ = write!(suffix, "{byte:02x}");
+    }
+    suffix
 }
 
 fn canonical_domain(domain: impl Into<String>) -> String {
@@ -2221,6 +2241,64 @@ mod tests {
                 value: "b".into(),
             }]
         );
+    }
+
+    #[test]
+    fn partition_suffix_is_deterministic() {
+        let a = stable_partition_suffix(&["session-a", "work"]);
+        let b = stable_partition_suffix(&["session-a", "work"]);
+        assert_eq!(a, b);
+
+        // Same inputs must flow deterministically through the public constructor.
+        let first = NetworkProfile::durable("session-a", "work");
+        let second = NetworkProfile::durable("session-a", "work");
+        assert_eq!(first.id, second.id);
+        assert_eq!(first.cookie_partition, second.cookie_partition);
+        assert_eq!(first.storage_partition, second.storage_partition);
+    }
+
+    #[test]
+    fn partition_suffix_is_fixed_length_lowercase_hex() {
+        let suffix = stable_partition_suffix(&["session-a", "work"]);
+        assert_eq!(suffix.len(), 32);
+        assert!(
+            suffix
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "unexpected charset: {suffix}"
+        );
+    }
+
+    #[test]
+    fn partition_suffix_differs_by_profile_name() {
+        let a = stable_partition_suffix(&["session-a", "work"]);
+        let b = stable_partition_suffix(&["session-a", "play"]);
+        assert_ne!(a, b);
+
+        let first = NetworkProfile::durable("session-a", "work");
+        let second = NetworkProfile::durable("session-a", "play");
+        assert_ne!(first.cookie_partition, second.cookie_partition);
+        assert_ne!(first.storage_partition, second.storage_partition);
+    }
+
+    #[test]
+    fn partition_suffix_differs_by_session_id() {
+        let a = stable_partition_suffix(&["session-a", "work"]);
+        let b = stable_partition_suffix(&["session-b", "work"]);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn partition_suffix_component_boundaries_are_unambiguous() {
+        // Length prefixes must prevent boundary-shifting collisions: two profiles
+        // whose concatenated inputs match but whose component splits differ must
+        // still land on distinct partitions, even when inputs contain NUL bytes.
+        let a = stable_partition_suffix(&["session-a", "work"]);
+        let b = stable_partition_suffix(&["session", "a-work"]);
+        let embedded_nul = stable_partition_suffix(&["session\0work"]);
+        let split_at_nul = stable_partition_suffix(&["session", "work"]);
+        assert_ne!(a, b);
+        assert_ne!(embedded_nul, split_at_nul);
     }
 
     #[test]
