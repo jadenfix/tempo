@@ -225,7 +225,7 @@ impl DriverTrait for TestDriver {
 }
 
 /// Conformance suite v2 (final.md §8.1). Every engine must pass this; it is the gate for
-/// M0 (Mock), M1 (CDP), and part of M2 (Servo slice). Extend, never weaken.
+/// M0 (TestDriver), M1 (CDP), and part of M2 (Servo slice). Extend, never weaken.
 pub mod conformance {
     use super::*;
 
