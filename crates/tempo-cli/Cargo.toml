@@ -13,9 +13,13 @@ serde.workspace = true
 serde_json.workspace = true
 tempo-compat = { path = "../tempo-compat" }
 tempo-evals = { path = "../tempo-evals" }
+tempo-agent = { path = "../tempo-agent" }
+tempo-engine-cdp = { path = "../tempo-engine-cdp" }
+tempo-driver = { path = "../tempo-driver" }
 tempo-schema = { path = "../tempo-schema" }
 tempo-session = { path = "../tempo-session" }
 thiserror.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread"] }
 
 [lints]
 workspace = true
