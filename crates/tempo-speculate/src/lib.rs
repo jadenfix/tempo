@@ -171,6 +171,13 @@ pub struct ReplayBranchExecution {
     pub branch: BranchBatchExecution,
 }
 
+/// Concrete k-branch execution report from the replay-fork orchestrator.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReplayForkExecution {
+    pub schedule: BranchSchedule,
+    pub branches: Vec<ReplayBranchExecution>,
+}
+
 /// Replay output for one engine lane.
 #[derive(Clone, Debug, PartialEq)]
 pub struct EngineReplay {
@@ -300,9 +307,97 @@ where
     })
 }
 
+/// Execute every branch in a replay-fork plan.
+///
+/// Drivers with native `fork()` support get one branch-local driver per branch and
+/// run the replay jobs concurrently. Engines that return `Unsupported` degrade to
+/// deterministic sequential replay on the provided driver; each branch still
+/// starts from `plan.start_url` and replays the same journaled prefix.
+pub async fn execute_replay_fork<D>(
+    driver: &mut D,
+    plan: &ReplayForkPlan,
+) -> Result<ReplayForkExecution, SpeculateError>
+where
+    D: DriverTrait + ?Sized,
+{
+    let requests = branch_requests(&plan.branches);
+    validate_branch_ids(&requests)?;
+    let branch_count = requests.len();
+
+    match fork_branch_drivers(driver, branch_count).await {
+        Ok(branch_drivers) => {
+            let schedule = schedule_branches(&requests, Ok(()))?;
+            let branches =
+                execute_parallel_replay_branches(plan, schedule.branches(), branch_drivers).await?;
+            Ok(ReplayForkExecution { schedule, branches })
+        }
+        Err(err) => {
+            let schedule = schedule_branches(&requests, Err(err))?;
+            let branches =
+                execute_sequential_replay_branches(driver, plan, schedule.branches()).await?;
+            Ok(ReplayForkExecution { schedule, branches })
+        }
+    }
+}
+
 /// Human-readable crate summary.
 pub fn describe() -> &'static str {
     "replay-fork execution from durable journals and deterministic k-branch fallback scheduling"
+}
+
+async fn fork_branch_drivers<D>(
+    driver: &mut D,
+    count: usize,
+) -> Result<Vec<Box<dyn DriverTrait>>, Unsupported>
+where
+    D: DriverTrait + ?Sized,
+{
+    let mut drivers = Vec::with_capacity(count);
+    for _ in 0..count {
+        drivers.push(driver.fork().await?);
+    }
+    Ok(drivers)
+}
+
+async fn execute_parallel_replay_branches(
+    plan: &ReplayForkPlan,
+    branch_ids: &[BranchId],
+    branch_drivers: Vec<Box<dyn DriverTrait>>,
+) -> Result<Vec<ReplayBranchExecution>, SpeculateError> {
+    let mut branches = replay_branch_map(&plan.branches)?;
+    let mut jobs = Vec::with_capacity(branch_ids.len());
+
+    for (id, mut branch_driver) in branch_ids.iter().cloned().zip(branch_drivers) {
+        let branch = branches
+            .remove(&id)
+            .ok_or_else(|| SpeculateError::MissingBranch(id.clone()))?;
+        jobs.push(
+            async move { execute_replay_branch(branch_driver.as_mut(), plan, &branch).await },
+        );
+    }
+
+    futures::future::try_join_all(jobs).await
+}
+
+async fn execute_sequential_replay_branches<D>(
+    driver: &mut D,
+    plan: &ReplayForkPlan,
+    branch_ids: &[BranchId],
+) -> Result<Vec<ReplayBranchExecution>, SpeculateError>
+where
+    D: DriverTrait + ?Sized,
+{
+    let branches = replay_branch_map(&plan.branches)?;
+    let mut executions = Vec::with_capacity(branch_ids.len());
+
+    for id in branch_ids {
+        let branch = branches
+            .get(id)
+            .ok_or_else(|| SpeculateError::MissingBranch(id.clone()))?;
+        executions.push(execute_replay_branch(driver, plan, branch).await?);
+    }
+
+    Ok(executions)
 }
 
 fn session_start_url(entries: &[JournalEntry]) -> Result<String, SpeculateError> {
@@ -379,6 +474,28 @@ fn sorted_branch_ids(branches: &[BranchRequest]) -> Vec<BranchId> {
     ids
 }
 
+fn branch_requests(branches: &[ReplayBranch]) -> Vec<BranchRequest> {
+    branches
+        .iter()
+        .map(|branch| BranchRequest {
+            id: branch.id.clone(),
+            batch: branch.batch.clone(),
+        })
+        .collect()
+}
+
+fn replay_branch_map(
+    branches: &[ReplayBranch],
+) -> Result<BTreeMap<BranchId, ReplayBranch>, SpeculateError> {
+    let mut by_id = BTreeMap::new();
+    for branch in branches {
+        if by_id.insert(branch.id.clone(), branch.clone()).is_some() {
+            return Err(SpeculateError::DuplicateBranchId(branch.id.clone()));
+        }
+    }
+    Ok(by_id)
+}
+
 fn validate_branch_ids(branches: &[BranchRequest]) -> Result<(), SpeculateError> {
     let mut ids = BTreeSet::new();
     for branch in branches {
@@ -404,6 +521,8 @@ pub enum SpeculateError {
     DuplicateBranchId(BranchId),
     #[error("invalid branch id: {0:?}")]
     InvalidBranchId(BranchId),
+    #[error("replay plan is missing branch: {0:?}")]
+    MissingBranch(BranchId),
     #[error("{context} failed: {source}")]
     DriverTransport {
         context: &'static str,
@@ -419,6 +538,7 @@ pub enum SpeculateError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use std::error::Error;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -703,6 +823,88 @@ mod tests {
     }
 
     #[test]
+    fn replay_fork_orchestrator_runs_parallel_when_fork_supported() -> TestResult {
+        let plan = ReplayForkPlan::from_records(
+            PathBuf::from("session.jsonl"),
+            PathBuf::from("cassettes.jsonl"),
+            vec![journal_entry(
+                0,
+                JournalEvent::SessionStarted {
+                    url: "https://example.com".into(),
+                },
+            )],
+            vec![],
+            vec![
+                branch("branch-b", Action::Scroll { x: 0.0, y: 2.0 }),
+                branch("branch-a", Action::Scroll { x: 0.0, y: 1.0 }),
+            ],
+        )?;
+        let mut driver = TestDriver::new();
+
+        let report = futures::executor::block_on(execute_replay_fork(&mut driver, &plan))?;
+
+        assert_eq!(
+            report.schedule,
+            BranchSchedule::Parallel {
+                branches: vec![BranchId("branch-a".into()), BranchId("branch-b".into())],
+            }
+        );
+        assert_eq!(
+            execution_ids(&report.branches),
+            vec!["branch-a", "branch-b"]
+        );
+        assert!(report
+            .branches
+            .iter()
+            .all(|branch| branch.engine == Engine::Test && branch.branch.action_count == 1));
+        Ok(())
+    }
+
+    #[test]
+    fn replay_fork_orchestrator_degrades_unsupported_driver_to_sequential() -> TestResult {
+        let plan = ReplayForkPlan::from_records(
+            PathBuf::from("session.jsonl"),
+            PathBuf::from("cassettes.jsonl"),
+            vec![journal_entry(
+                0,
+                JournalEvent::SessionStarted {
+                    url: "https://example.com".into(),
+                },
+            )],
+            vec![],
+            vec![
+                branch("branch-c", Action::Scroll { x: 0.0, y: 3.0 }),
+                branch("branch-a", Action::Scroll { x: 0.0, y: 1.0 }),
+                branch("branch-b", Action::Scroll { x: 0.0, y: 2.0 }),
+            ],
+        )?;
+        let mut driver = NoForkDriver::new();
+
+        let report = futures::executor::block_on(execute_replay_fork(&mut driver, &plan))?;
+
+        assert_eq!(
+            report.schedule,
+            BranchSchedule::Sequential {
+                branches: vec![
+                    BranchId("branch-a".into()),
+                    BranchId("branch-b".into()),
+                    BranchId("branch-c".into()),
+                ],
+                reason: "capability unsupported by this engine: native fork".into(),
+            }
+        );
+        assert_eq!(
+            execution_ids(&report.branches),
+            vec!["branch-a", "branch-b", "branch-c"]
+        );
+        assert!(report
+            .branches
+            .iter()
+            .all(|branch| branch.engine == Engine::Test && branch.branch.action_count == 1));
+        Ok(())
+    }
+
+    #[test]
     fn replay_comparison_accepts_identical_steps_across_engines() -> TestResult {
         let steps = vec![ReplayStep::Applied {
             seq: 7,
@@ -794,6 +996,91 @@ mod tests {
             seq,
             timestamp_ms: 0,
             event,
+        }
+    }
+
+    fn execution_ids(executions: &[ReplayBranchExecution]) -> Vec<&str> {
+        executions
+            .iter()
+            .map(|execution| execution.id.0.as_str())
+            .collect()
+    }
+
+    struct NoForkDriver {
+        inner: TestDriver,
+    }
+
+    impl NoForkDriver {
+        fn new() -> Self {
+            Self {
+                inner: TestDriver::new(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl DriverTrait for NoForkDriver {
+        fn engine(&self) -> Engine {
+            self.inner.engine()
+        }
+
+        async fn goto(
+            &mut self,
+            url: &str,
+        ) -> Result<tempo_schema::CompiledObservation, TransportError> {
+            self.inner.goto(url).await
+        }
+
+        async fn observe(&mut self) -> Result<tempo_schema::CompiledObservation, TransportError> {
+            self.inner.observe().await
+        }
+
+        async fn observe_diff(
+            &mut self,
+            since_seq: u64,
+        ) -> Result<ObservationDiff, TransportError> {
+            self.inner.observe_diff(since_seq).await
+        }
+
+        async fn act(
+            &mut self,
+            action: &Action,
+        ) -> Result<tempo_driver::StepOutcome, TransportError> {
+            self.inner.act(action).await
+        }
+
+        async fn act_batch(
+            &mut self,
+            batch: &ActionBatch,
+        ) -> Result<tempo_driver::StepOutcome, TransportError> {
+            self.inner.act_batch(batch).await
+        }
+
+        async fn fork(&mut self) -> Result<Box<dyn DriverTrait>, Unsupported> {
+            Err(Unsupported("native fork"))
+        }
+
+        async fn extract(
+            &mut self,
+            node: &tempo_schema::NodeId,
+        ) -> Result<serde_json::Value, TransportError> {
+            self.inner.extract(node).await
+        }
+
+        async fn evaluate_script(
+            &mut self,
+            expression: &str,
+            await_promise: bool,
+        ) -> Result<serde_json::Value, TransportError> {
+            self.inner.evaluate_script(expression, await_promise).await
+        }
+
+        async fn screenshot(&mut self) -> Result<Vec<u8>, TransportError> {
+            self.inner.screenshot().await
+        }
+
+        async fn close(&mut self) -> Result<(), TransportError> {
+            self.inner.close().await
         }
     }
 
