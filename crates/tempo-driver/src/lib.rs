@@ -76,6 +76,13 @@ pub trait DriverTrait: Send + Sync {
     /// Typed extraction of a subtree rooted at `node`.
     async fn extract(&mut self, node: &NodeId) -> Result<serde_json::Value, TransportError>;
 
+    /// Evaluate a JavaScript expression in the active browsing context.
+    async fn evaluate_script(
+        &mut self,
+        expression: &str,
+        await_promise: bool,
+    ) -> Result<serde_json::Value, TransportError>;
+
     async fn screenshot(&mut self) -> Result<Vec<u8>, TransportError>;
 
     async fn close(&mut self) -> Result<(), TransportError>;
@@ -213,6 +220,17 @@ impl DriverTrait for TestDriver {
             return Ok(serde_json::Value::Null);
         }
         Ok(serde_json::json!({ "node": node.0 }))
+    }
+
+    async fn evaluate_script(
+        &mut self,
+        expression: &str,
+        await_promise: bool,
+    ) -> Result<serde_json::Value, TransportError> {
+        Ok(serde_json::json!({
+            "expression": expression,
+            "awaitPromise": await_promise,
+        }))
     }
 
     async fn screenshot(&mut self) -> Result<Vec<u8>, TransportError> {

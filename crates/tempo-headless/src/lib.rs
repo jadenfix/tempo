@@ -20,7 +20,7 @@ use tempo_agent::StepTriple;
 use tempo_bidi::{
     BidiErrorCode, BidiMessage, BidiRouter, BrowsingContextId, BrowsingContextInfo,
     CaptureScreenshotResult, DriverCommand as BidiDriverCommand, GetTreeResult, NavigateResult,
-    RoutedCommand,
+    RoutedCommand, ScriptEvaluateResult,
 };
 use tempo_driver::{DriverTrait, Engine, StepOutcome, TransportError, Unsupported};
 use tempo_engine_host::{
@@ -137,6 +137,21 @@ impl AttachedEngineDriver {
         }
     }
 
+    fn request_evaluation(
+        &self,
+        command: HostDriverCommand,
+        expected: &'static str,
+    ) -> Result<serde_json::Value, TransportError> {
+        match self
+            .request(command)
+            .map_err(driver_client_transport_error)?
+        {
+            DriverResponse::Evaluated { value } => Ok(value),
+            DriverResponse::Error { error } => Err(driver_wire_transport_error(error)),
+            other => Err(unexpected_driver_response(other, expected)),
+        }
+    }
+
     fn request_bytes(
         &self,
         command: HostDriverCommand,
@@ -211,6 +226,20 @@ impl DriverTrait for AttachedEngineDriver {
 
     async fn extract(&mut self, node: &NodeId) -> Result<serde_json::Value, TransportError> {
         self.request_value(HostDriverCommand::Extract { node: node.clone() }, "extract")
+    }
+
+    async fn evaluate_script(
+        &mut self,
+        expression: &str,
+        await_promise: bool,
+    ) -> Result<serde_json::Value, TransportError> {
+        self.request_evaluation(
+            HostDriverCommand::EvaluateScript {
+                expression: expression.into(),
+                await_promise,
+            },
+            "evaluate_script",
+        )
     }
 
     async fn screenshot(&mut self) -> Result<Vec<u8>, TransportError> {
@@ -623,11 +652,30 @@ fn route_bidi_driver(
             BidiErrorCode::UnknownError,
             "browsingContext.create is not exposed by tempo DriverTrait",
         )),
-        BidiDriverCommand::EvaluateScript(_) => Ok(BidiMessage::error(
-            Some(id),
-            BidiErrorCode::UnknownError,
-            "script.evaluate is not exposed by tempo DriverTrait",
-        )),
+        BidiDriverCommand::EvaluateScript(command) => {
+            match futures::executor::block_on({
+                let mut driver = driver.clone();
+                let expression = command.expression.clone();
+                async move {
+                    driver
+                        .evaluate_script(&expression, command.await_promise)
+                        .await
+                }
+            }) {
+                Ok(value) => BidiRouter::driver_success(
+                    id,
+                    ScriptEvaluateResult {
+                        result: value,
+                        realm: Some(command.target.context.0),
+                    },
+                ),
+                Err(error) => Ok(BidiMessage::error(
+                    Some(id),
+                    BidiErrorCode::UnknownError,
+                    error.to_string(),
+                )),
+            }
+        }
     };
 
     match message {
@@ -1026,6 +1074,42 @@ mod tests {
         assert_eq!(value["id"], 7);
         assert_eq!(value["result"]["url"], "https://example.test");
         assert_eq!(value["result"]["navigation"], "tempo-navigation-7");
+        Ok(())
+    }
+
+    #[test]
+    fn bidi_endpoint_routes_script_evaluate_to_attached_engine_driver() -> TestResult {
+        let mut pool = SessionPool::default();
+        let handle = attach_driver_handler(&mut pool, |request| {
+            assert_eq!(
+                request.command,
+                HostDriverCommand::EvaluateScript {
+                    expression: "document.title".into(),
+                    await_promise: true,
+                }
+            );
+            DriverResponse::Evaluated {
+                value: json!("Tempo"),
+            }
+        })?;
+
+        let response = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/bidi".into(),
+                origin: None,
+                body: br#"{"id":8,"method":"script.evaluate","params":{"expression":"document.title","target":{"context":"ctx"},"awaitPromise":true}}"#.to_vec(),
+            },
+        )?;
+        join_driver_handler(handle)?;
+
+        assert_eq!(response.status, 200);
+        let value: Value = serde_json::from_slice(&response.body)?;
+        assert_eq!(value["type"], "success");
+        assert_eq!(value["id"], 8);
+        assert_eq!(value["result"]["result"], "Tempo");
+        assert_eq!(value["result"]["realm"], "ctx");
         Ok(())
     }
 
