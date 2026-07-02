@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use tempo_act::{execute_action, execute_batch, ActionExecution, ExecutionStatus};
+use tempo_act::{execute_action, execute_batch, ExecutionStatus};
 use tempo_driver::{DriverTrait, Engine, StepOutcome, TransportError};
 use tempo_policy::{
     ConfirmationGate, InputTaint, Origin, OriginError, OriginPolicy, OriginRuleMode,
@@ -25,6 +25,19 @@ pub const DEFAULT_MAX_OBSERVATION_BYTES: usize = 8 * 1024;
 
 /// Default p50 token budget from `final.md` §10.
 pub const DEFAULT_MAX_OBSERVATION_TOKENS: usize = 1_500;
+
+/// Maximum nesting depth allowed while expanding a skill into concrete actions.
+/// Bounds unbounded recursion independently of the total-action cap.
+pub const MAX_SKILL_EXPANSION_DEPTH: usize = 8;
+
+/// Maximum number of concrete (non-skill) actions a single top-level skill may
+/// expand into. Caps billion-laughs–style width×depth amplification before the
+/// flattened action vector can exhaust memory.
+pub const MAX_SKILL_EXPANSION_ACTIONS: usize = 1_024;
+
+/// Reason recorded when resume refuses to re-run a step that was planned but not
+/// completed in a prior run, whose side effect may already have happened (#99).
+pub const RESUME_INTERRUPTED_REASON: &str = "resume: step was planned but its outcome was not journaled; not re-executed to avoid duplicating a side effect";
 
 /// Stable key for retrying a planned step without duplicating side effects.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -232,6 +245,32 @@ impl AgentLoop {
 
     pub fn is_complete(&self) -> bool {
         self.cursor.next_step >= self.plan.len() && self.cursor.pending_planned.is_none()
+    }
+
+    /// Journal the intent to execute the next step *before* the side effect runs.
+    ///
+    /// Writing `ActionPlanned` up front means a crash between the driver call and
+    /// the outcome record leaves a durable marker (`pending_planned`) that resume
+    /// detects, so the step is not blindly re-executed and its side effect is not
+    /// duplicated. Idempotent: re-planning an already-pending step is a no-op.
+    pub fn plan_next_step(&mut self) -> Result<(), AgentError> {
+        let step = self.next_step().ok_or(AgentError::PlanComplete)?.clone();
+        if self.cursor.pending_planned.as_ref() != Some(&step.key) {
+            self.journal.append(JournalEvent::ActionPlanned {
+                action: step.action.clone(),
+            })?;
+            self.cursor.pending_planned = Some(step.key);
+        }
+        Ok(())
+    }
+
+    /// Whether the next step was already planned (intent journaled) in a prior run
+    /// but never completed — meaning its side effect may already have happened.
+    pub fn next_step_already_attempted(&self) -> bool {
+        match self.next_step() {
+            Some(step) => self.cursor.pending_planned.as_ref() == Some(&step.key),
+            None => false,
+        }
     }
 
     pub fn record_next_outcome(&mut self, outcome: StepOutcome) -> Result<StepTriple, AgentError> {
@@ -558,7 +597,24 @@ impl AgentRunner {
                 .get(index)
                 .ok_or(AgentError::JournalHasExtraStep { index })?;
             let policy_origin = self.origin_for_step(driver_step, current_origin.as_ref())?;
-            let policy = self.step_policy(driver_step, &planned.key, policy_origin.as_ref())?;
+
+            // Read the skill store once and derive both the policy side-effect and
+            // the compiled batch from that single snapshot (#98): the gate and the
+            // executed actions can no longer disagree due to a between-reads mutation.
+            let compiled_skill = match &planned.action {
+                Action::Skill { name, input } => Some(self.compile_skill_snapshot(name, input)?),
+                _ => None,
+            };
+            let side_effect = match &compiled_skill {
+                Some(skill) => skill.side_effect,
+                None => driver_step.action.side_effect(),
+            };
+            let policy = self.step_policy(
+                driver_step,
+                &planned.key,
+                policy_origin.as_ref(),
+                side_effect,
+            )?;
 
             if !policy.confirmed {
                 let reason = policy_denied_reason(&policy);
@@ -579,7 +635,40 @@ impl AgentRunner {
                 return Ok(report);
             }
 
-            let execution = self.execute_driver_step(driver, &planned.action).await?;
+            // Resume safety (#99): a step whose intent was journaled in a prior run
+            // but never completed may already have run its side effect. Do not
+            // re-execute it; record the interruption and stop for inspection.
+            if agent.next_step_already_attempted() {
+                let reason = RESUME_INTERRUPTED_REASON.to_string();
+                let triple = agent.record_next_outcome(StepOutcome::StepError {
+                    reason: reason.clone(),
+                })?;
+                report.actions_completed += 1;
+                report.steps.push(AgentStepReport {
+                    index,
+                    policy,
+                    triple,
+                    observation_budget: None,
+                });
+                report.status = AgentRunStatus::Interrupted {
+                    action_index: index,
+                    reason,
+                };
+                return Ok(report);
+            }
+
+            // Journal intent before the side effect runs (#99) so an interrupted
+            // execution is detected — rather than silently repeated — on resume.
+            agent.plan_next_step()?;
+
+            let execution = match &compiled_skill {
+                Some(skill) => execute_batch(driver, &skill.batch)
+                    .await
+                    .map_err(|source| AgentError::transport("execute skill", source))?,
+                None => execute_action(driver, &planned.action)
+                    .await
+                    .map_err(|source| AgentError::transport("execute action", source))?,
+            };
             let outcome = match execution.status {
                 ExecutionStatus::Applied => StepOutcome::Applied {
                     diff: execution.diff,
@@ -621,39 +710,32 @@ impl AgentRunner {
         Ok(report)
     }
 
-    async fn execute_driver_step<D>(
-        &self,
-        driver: &mut D,
-        action: &Action,
-    ) -> Result<ActionExecution, AgentError>
-    where
-        D: DriverTrait + ?Sized,
-    {
-        match action {
-            Action::Skill { name, input } => {
-                let batch = self.compile_skill(name, input)?;
-                execute_batch(driver, &batch)
-                    .await
-                    .map_err(|source| AgentError::transport("execute skill", source))
-            }
-            _ => execute_action(driver, action)
-                .await
-                .map_err(|source| AgentError::transport("execute action", source)),
-        }
-    }
-
-    fn compile_skill(
+    /// Read a skill from the store exactly once and return both its declared
+    /// side-effect (for the policy gate) and its fully expanded action batch (for
+    /// execution). Single snapshot closes the TOCTOU gap between gate and compile
+    /// (#98) and enforces the expansion bounds (#97).
+    fn compile_skill_snapshot(
         &self,
         name: &str,
         input: &serde_json::Value,
-    ) -> Result<ActionBatch, AgentError> {
+    ) -> Result<CompiledSkill, AgentError> {
         let root = self
             .skill_store_root
             .as_ref()
             .ok_or_else(|| AgentError::SkillStoreNotConfigured(name.to_string()))?;
         let store = SkillStore::open(root)?;
-        let mut stack = Vec::new();
-        compile_skill_from_store(&store, name, input, &mut stack)
+        let key = store.resolve(name)?;
+        let definition = store.get(&key)?;
+        let side_effect = definition.side_effect;
+        let mut stack = vec![name.to_string()];
+        let mut total_actions = 0_usize;
+        let batch = expand_skill_batch(
+            &store,
+            definition.compile(input)?,
+            &mut stack,
+            &mut total_actions,
+        )?;
+        Ok(CompiledSkill { side_effect, batch })
     }
 
     fn record_observation(
@@ -704,8 +786,8 @@ impl AgentRunner {
         step: &DriverStep,
         key: &IdempotencyKey,
         origin: Option<&Origin>,
+        side_effect: SideEffect,
     ) -> Result<StepPolicyReport, AgentError> {
-        let side_effect = self.side_effect_for_action(&step.action)?;
         let scoped = self
             .origin_policy
             .decide_effect(origin, side_effect, step.input_taint);
@@ -731,57 +813,67 @@ impl AgentRunner {
             idempotency_key: key.clone(),
         })
     }
-
-    fn side_effect_for_action(&self, action: &Action) -> Result<SideEffect, AgentError> {
-        match action {
-            Action::Skill { name, .. } => self.skill_side_effect(name),
-            _ => Ok(action.side_effect()),
-        }
-    }
-
-    fn skill_side_effect(&self, name: &str) -> Result<SideEffect, AgentError> {
-        let root = self
-            .skill_store_root
-            .as_ref()
-            .ok_or_else(|| AgentError::SkillStoreNotConfigured(name.to_string()))?;
-        let store = SkillStore::open(root)?;
-        let key = store.resolve(name)?;
-        Ok(store.get(&key)?.side_effect)
-    }
 }
 
-fn compile_skill_from_store(
-    store: &SkillStore,
-    name: &str,
-    input: &serde_json::Value,
-    stack: &mut Vec<String>,
-) -> Result<ActionBatch, AgentError> {
-    if stack.iter().any(|active| active == name) {
-        return Err(AgentError::SkillCycle(name.to_string()));
-    }
-    stack.push(name.to_string());
+/// One skill read as a single snapshot: its declared side-effect and its fully
+/// expanded, bounded action batch. Both are derived from one store read so the
+/// policy gate and the executed actions cannot diverge (#98).
+struct CompiledSkill {
+    side_effect: SideEffect,
+    batch: ActionBatch,
+}
 
-    let result = (|| {
-        let key = store.resolve(name)?;
-        let batch = store.compile(&key, input)?;
-        let mut actions = Vec::new();
-        for action in batch.actions {
-            match action {
-                Action::Skill { name, input } => {
-                    let nested = compile_skill_from_store(store, &name, &input, stack)?;
-                    actions.extend(nested.actions);
+/// Recursively expand nested `Action::Skill` entries in `batch` into concrete
+/// actions, enforcing both bounds from #97:
+///
+/// * `stack` (the active expansion path) caps recursion depth and still detects
+///   cycles, and
+/// * `total_actions` caps the number of concrete actions produced across the
+///   whole expansion, aborting billion-laughs–style width×depth amplification
+///   before the flattened vector can exhaust memory.
+fn expand_skill_batch(
+    store: &SkillStore,
+    batch: ActionBatch,
+    stack: &mut Vec<String>,
+    total_actions: &mut usize,
+) -> Result<ActionBatch, AgentError> {
+    if stack.len() > MAX_SKILL_EXPANSION_DEPTH {
+        return Err(AgentError::SkillExpansionTooDeep {
+            depth: stack.len(),
+            max: MAX_SKILL_EXPANSION_DEPTH,
+        });
+    }
+
+    let mut actions = Vec::new();
+    for action in batch.actions {
+        match action {
+            Action::Skill { name, input } => {
+                if stack.iter().any(|active| active == &name) {
+                    return Err(AgentError::SkillCycle(name));
                 }
-                other => actions.push(other),
+                let key = store.resolve(&name)?;
+                let nested_batch = store.compile(&key, &input)?;
+                stack.push(name);
+                let nested = expand_skill_batch(store, nested_batch, stack, total_actions)?;
+                stack.pop();
+                actions.extend(nested.actions);
+            }
+            other => {
+                *total_actions += 1;
+                if *total_actions > MAX_SKILL_EXPANSION_ACTIONS {
+                    return Err(AgentError::SkillExpansionTooLarge {
+                        max: MAX_SKILL_EXPANSION_ACTIONS,
+                    });
+                }
+                actions.push(other);
             }
         }
-        Ok(ActionBatch {
-            actions,
-            quiescence: batch.quiescence,
-        })
-    })();
+    }
 
-    stack.pop();
-    result
+    Ok(ActionBatch {
+        actions,
+        quiescence: batch.quiescence,
+    })
 }
 
 /// Durable report for one live-driver run attempt.
@@ -832,8 +924,20 @@ pub enum AgentRunStatus {
     Running,
     Completed,
     AlreadyComplete,
-    StepError { action_index: usize, reason: String },
-    PolicyDenied { action_index: usize, reason: String },
+    StepError {
+        action_index: usize,
+        reason: String,
+    },
+    PolicyDenied {
+        action_index: usize,
+        reason: String,
+    },
+    /// A prior run planned this step but never journaled its outcome; resume
+    /// declined to re-execute it to avoid duplicating a side effect (#99).
+    Interrupted {
+        action_index: usize,
+        reason: String,
+    },
 }
 
 /// One live action's policy and durable outcome.
@@ -995,6 +1099,10 @@ pub enum AgentError {
     SkillStoreNotConfigured(String),
     #[error("skill expansion cycle detected at: {0}")]
     SkillCycle(String),
+    #[error("skill expansion exceeded max depth {max} (reached {depth})")]
+    SkillExpansionTooDeep { depth: usize, max: usize },
+    #[error("skill expansion exceeded max of {max} total actions")]
+    SkillExpansionTooLarge { max: usize },
     #[error("transport error during {context}: {source}")]
     Transport {
         context: String,
@@ -1635,6 +1743,183 @@ mod tests {
         assert!(read_journal_entries(&journal_path)?
             .iter()
             .any(|entry| matches!(entry.event, JournalEvent::StepApplied { .. })));
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runner_bounds_billion_laughs_skill_expansion() -> TestResult {
+        let root = unique_dir("runner-billion-laughs")?;
+        remove_dir_if_exists(&root)?;
+        fs::create_dir_all(&root)?;
+        let skills_root = root.join("skills");
+        let store = SkillStore::open(&skills_root)?;
+
+        // Each level fans out `fanout` times into the next skill; concrete actions
+        // grow as fanout^depth (6^5 = 7776), far above MAX_SKILL_EXPANSION_ACTIONS
+        // while the nesting depth (5) stays under MAX_SKILL_EXPANSION_DEPTH.
+        let fanout = 6;
+        let depth = 5;
+        for level in 0..depth {
+            let steps = if level + 1 == depth {
+                (0..fanout)
+                    .map(|_| ActionTemplate::Click {
+                        node: TemplateString::literal("submit"),
+                    })
+                    .collect()
+            } else {
+                let child = format!("laugh_{}", level + 1);
+                (0..fanout)
+                    .map(|_| ActionTemplate::Skill {
+                        name: TemplateString::literal(child.clone()),
+                        input: serde_json::json!({}),
+                    })
+                    .collect()
+            };
+            store.put(&SkillDefinition {
+                name: format!("laugh_{level}"),
+                version: "1".into(),
+                description: "billion laughs".into(),
+                side_effect: SideEffect::Write,
+                inputs: Vec::new(),
+                quiescence: QuiescencePolicy::Composite,
+                steps,
+            })?;
+        }
+
+        let journal_path = root.join("session.jsonl");
+        let task = DriverTask::new(
+            "https://example.com",
+            vec![Action::Skill {
+                name: "laugh_0".into(),
+                input: serde_json::json!({}),
+            }],
+        );
+        let mut driver = TestDriver::new().with_elements(vec![button("submit")]);
+        let runner = AgentRunner::new(
+            &journal_path,
+            AgentRunIds::new("run-billion-laughs", "session-billion-laughs"),
+        )
+        .with_skill_store(&skills_root);
+
+        let error = runner.run_driver_task(&mut driver, &task).await.err();
+        assert!(matches!(
+            error,
+            Some(AgentError::SkillExpansionTooLarge {
+                max: MAX_SKILL_EXPANSION_ACTIONS
+            })
+        ));
+
+        // The run aborted before any driver call: no live step was applied.
+        assert!(!read_journal_entries(&journal_path)?
+            .iter()
+            .any(|entry| matches!(entry.event, JournalEvent::StepApplied { .. })));
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn skill_gate_and_compile_use_one_consistent_snapshot() -> TestResult {
+        let root = unique_dir("snapshot")?;
+        remove_dir_if_exists(&root)?;
+        fs::create_dir_all(&root)?;
+        let skills_root = root.join("skills");
+        let store = SkillStore::open(&skills_root)?;
+        store.put(&click_skill("gated", "1"))?;
+        let journal_path = root.join("session.jsonl");
+        let runner = AgentRunner::new(&journal_path, AgentRunIds::new("run-snap", "session-snap"))
+            .with_skill_store(&skills_root);
+        let input = serde_json::json!({"target": "submit"});
+
+        // A single read yields both the gate side-effect and the compiled batch.
+        let snapshot = runner.compile_skill_snapshot("gated", &input)?;
+        assert_eq!(snapshot.side_effect, SideEffect::Write);
+        assert_eq!(snapshot.batch.actions.len(), 1);
+
+        // Mutate the on-disk skill AFTER the snapshot: raise its side-effect and add
+        // a second concrete step. A TOCTOU gate/compile split would let the gate
+        // decide on the old low side-effect while a larger batch executes.
+        let mut mutated = click_skill("gated", "1");
+        mutated.side_effect = SideEffect::Purchase;
+        mutated.steps = vec![
+            ActionTemplate::Click {
+                node: TemplateString::param("target"),
+            },
+            ActionTemplate::Click {
+                node: TemplateString::param("target"),
+            },
+        ];
+        store.put(&mutated)?;
+
+        // The already-taken snapshot's gate side-effect and batch stay mutually
+        // consistent, because both were derived from the same read.
+        assert_eq!(snapshot.side_effect, SideEffect::Write);
+        assert_eq!(snapshot.batch.actions.len(), 1);
+
+        // A fresh snapshot observes the mutation atomically: gate and batch move
+        // together (Purchase side-effect alongside the two-action batch).
+        let after = runner.compile_skill_snapshot("gated", &input)?;
+        assert_eq!(after.side_effect, SideEffect::Purchase);
+        assert_eq!(after.batch.actions.len(), 2);
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runner_resume_does_not_reexecute_planned_but_unjournaled_step() -> TestResult {
+        let root = unique_dir("runner-resume-interrupted")?;
+        remove_dir_if_exists(&root)?;
+        fs::create_dir_all(&root)?;
+        let journal_path = root.join("session.jsonl");
+        let action = Action::Click {
+            node: NodeId("submit".into()),
+        };
+        let task = DriverTask::new("https://example.com", vec![action.clone()]);
+
+        // Simulate a crash after intent was journaled (and the side effect may have
+        // already fired) but before the outcome was recorded: SessionStarted plus a
+        // dangling ActionPlanned, with no StepApplied.
+        let mut journal = SessionJournal::open(
+            &journal_path,
+            RunId("run-resume-interrupted".into()),
+            SessionId("session-resume-interrupted".into()),
+        )?;
+        journal.append(JournalEvent::SessionStarted {
+            url: "https://example.com".into(),
+        })?;
+        journal.append(JournalEvent::ActionPlanned {
+            action: action.clone(),
+        })?;
+        drop(journal);
+
+        let mut driver = TestDriver::new().with_elements(vec![button("submit")]);
+        let runner = AgentRunner::new(
+            &journal_path,
+            AgentRunIds::new("run-resume-interrupted", "session-resume-interrupted"),
+        );
+
+        let report = runner.run_driver_task(&mut driver, &task).await?;
+
+        // Resume declines to re-run the step; had it re-executed, TestDriver would
+        // have produced a StepApplied and completed the run.
+        assert!(matches!(
+            report.status,
+            AgentRunStatus::Interrupted {
+                action_index: 0,
+                ..
+            }
+        ));
+        let entries = read_journal_entries(&journal_path)?;
+        assert!(!entries
+            .iter()
+            .any(|entry| matches!(entry.event, JournalEvent::StepApplied { .. })));
+        assert!(entries.iter().any(|entry| matches!(
+            &entry.event,
+            JournalEvent::StepError { reason, .. } if reason == RESUME_INTERRUPTED_REASON
+        )));
 
         remove_dir_if_exists(&root)?;
         Ok(())

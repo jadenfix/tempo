@@ -772,6 +772,14 @@ fn run_status(status: &AgentRunStatus) -> RunCdpTaskStatus {
             action_index: Some(*action_index),
             reason: Some(reason.clone()),
         },
+        AgentRunStatus::Interrupted {
+            action_index,
+            reason,
+        } => RunCdpTaskStatus {
+            state: "interrupted",
+            action_index: Some(*action_index),
+            reason: Some(reason.clone()),
+        },
     }
 }
 
