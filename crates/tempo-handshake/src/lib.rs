@@ -364,7 +364,7 @@ impl ProbeReport {
     }
 
     pub fn record_web_mcp_detection(&mut self, detection: &WebMcpDetection) {
-        if detection.available {
+        if detection.available && detection.has_tools {
             self.add_hit(ProbeHit::new(
                 StructuredSignal::WebMcp,
                 detection.source.clone(),
@@ -736,6 +736,11 @@ mod tests {
             "type": "object",
             "hasTools": true,
         }));
+        let unusable = WebMcpDetection::from_script_result(&serde_json::json!({
+            "available": true,
+            "type": "object",
+            "hasTools": false,
+        }));
         let missing = WebMcpDetection::from_script_result(&serde_json::json!({
             "available": false,
             "type": null,
@@ -745,6 +750,11 @@ mod tests {
 
         report.record_web_mcp_detection(&missing);
         assert!(report.hits().is_empty());
+
+        report.record_web_mcp_detection(&unusable);
+        assert!(report.hits().is_empty());
+        assert!(unusable.available);
+        assert!(!unusable.has_tools);
 
         report.record_web_mcp_detection(&detected);
         assert_eq!(
