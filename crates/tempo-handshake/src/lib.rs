@@ -177,20 +177,22 @@ impl HttpProbeRun {
 pub enum HttpProbeError {
     #[error("failed to build HTTP probe client: {0}")]
     ClientBuild(String),
+    #[error("invalid HTTP probe target: {0}")]
+    InvalidTarget(String),
     #[error("HTTP probe worker panicked")]
     WorkerPanicked,
 }
 
-/// Probe the default structured-web URLs for an origin with real HTTP requests.
+/// Probe the default structured-web URLs for a target URL's origin with real HTTP requests.
 pub fn probe_http_origin(
-    origin: &str,
+    target: &str,
     config: HttpProbeConfig,
 ) -> Result<HttpProbeRun, HttpProbeError> {
     let client = reqwest::blocking::Client::builder()
         .timeout(config.timeout)
         .build()
         .map_err(|error| HttpProbeError::ClientBuild(error.to_string()))?;
-    let origin = origin.trim_end_matches('/').to_string();
+    let origin = canonical_probe_origin(target)?;
 
     let mut handles = Vec::with_capacity(DEFAULT_HTTP_PROBES.len());
     for (index, probe) in DEFAULT_HTTP_PROBES.iter().copied().enumerate() {
@@ -335,6 +337,23 @@ pub fn probe_urls(origin: &str) -> Vec<String> {
         .iter()
         .map(|probe| format!("{origin}{}", probe.path))
         .collect()
+}
+
+/// Build absolute probe URLs for the origin of a navigation target.
+pub fn probe_urls_for_target(target: &str) -> Result<Vec<String>, HttpProbeError> {
+    Ok(probe_urls(&canonical_probe_origin(target)?))
+}
+
+/// Canonicalize an arbitrary navigation target to the HTTP(S) origin tempo should probe.
+pub fn canonical_probe_origin(target: &str) -> Result<String, HttpProbeError> {
+    let parsed = url::Url::parse(target)
+        .map_err(|error| HttpProbeError::InvalidTarget(error.to_string()))?;
+    match parsed.scheme() {
+        "http" | "https" => Ok(parsed.origin().ascii_serialization()),
+        scheme => Err(HttpProbeError::InvalidTarget(format!(
+            "scheme '{scheme}' is not http or https"
+        ))),
+    }
 }
 
 /// Select the structured lane when any supported signal is present, otherwise render.
@@ -522,6 +541,38 @@ mod tests {
     }
 
     #[test]
+    fn target_probe_plan_uses_origin_not_path_query_or_fragment() -> TestResult {
+        let urls =
+            probe_urls_for_target("https://Example.COM:443/app/page?token=page-derived#frag")?;
+        assert_eq!(
+            urls,
+            vec![
+                "https://example.com/.well-known/beater.json",
+                "https://example.com/agent-card.json",
+                "https://example.com/llms.txt",
+                "https://example.com/openapi.json",
+                "https://example.com/mcp/catalog.json",
+            ]
+        );
+
+        let custom_port = probe_urls_for_target("http://example.com:8080/deep/path")?;
+        assert_eq!(
+            custom_port[0],
+            "http://example.com:8080/.well-known/beater.json"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn target_probe_plan_rejects_non_http_targets() {
+        let result = canonical_probe_origin("file:///tmp/page.html");
+        assert!(
+            matches!(result, Err(HttpProbeError::InvalidTarget(_))),
+            "file target should not be probed: {result:?}"
+        );
+    }
+
+    #[test]
     fn detects_each_fixture_signal() {
         let responses = vec![
             ProbeResponse::new(
@@ -616,9 +667,10 @@ mod tests {
     #[test]
     fn live_http_probe_fetches_structured_surfaces() -> TestResult {
         let (origin, server) = serve_probe_fixture("# Fixture")?;
+        let target = format!("{origin}/app/page?query=ignored#fragment");
 
         let run = probe_http_origin(
-            &origin,
+            &target,
             HttpProbeConfig::default().with_url_policy(UrlPolicy::allow_all()),
         )?;
         join_server(server)?;
