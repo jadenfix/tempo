@@ -14,6 +14,7 @@ serde_json = { workspace = true }
 tempo-schema = { path = "../tempo-schema" }
 tempo-driver = { path = "../tempo-driver" }
 tempo-headless = { path = "../tempo-headless" }
+tempo-mcp = { path = "../tempo-mcp" }
 thiserror = { workspace = true }
 
 [lints]

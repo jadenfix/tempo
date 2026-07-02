@@ -23,6 +23,7 @@ Commands:
   open URL
   adopt SESSION_ID
   close SESSION_ID
+  agent-card
   handshake ORIGIN
   drain
 
@@ -82,6 +83,7 @@ pub enum ShellCommand {
     Open { url: String },
     Adopt { session_id: String },
     Close { session_id: String },
+    AgentCard,
     Handshake { origin: String },
     Drain,
 }
@@ -98,6 +100,7 @@ impl ShellCommand {
             Self::Open { url } => write_json(stdout, &client.open(url)?),
             Self::Adopt { session_id } => write_json(stdout, &client.adopt(session_id)?),
             Self::Close { session_id } => write_json(stdout, &client.close(session_id)?),
+            Self::AgentCard => write_json(stdout, &client.agent_card()?),
             Self::Handshake { origin } => write_json(stdout, &client.handshake(origin)?),
             Self::Drain => write_json(stdout, &client.drain()?),
         }
@@ -157,6 +160,14 @@ impl ShellClient {
 
     pub fn drain(&self) -> Result<DrainResponse, ShellError> {
         self.request_json("POST", "/drain", None::<serde_json::Value>)
+    }
+
+    pub fn agent_card(&self) -> Result<Value, ShellError> {
+        self.request_json(
+            "GET",
+            tempo_mcp::A2A_AGENT_CARD_PATH,
+            None::<serde_json::Value>,
+        )
     }
 
     pub fn handshake(&self, origin: &str) -> Result<Value, ShellError> {
@@ -258,6 +269,7 @@ fn parse_command(args: &[String]) -> Result<ShellCommand, ShellError> {
         "close" => one_arg(rest, "close SESSION_ID", |session_id| ShellCommand::Close {
             session_id,
         }),
+        "agent-card" => no_args(rest, ShellCommand::AgentCard),
         "handshake" => one_arg(rest, "handshake ORIGIN", |origin| ShellCommand::Handshake {
             origin,
         }),
@@ -396,6 +408,14 @@ mod tests {
     }
 
     #[test]
+    fn parses_agent_card_command() -> TestResult {
+        let options = ShellOptions::parse(["agent-card"])?;
+
+        assert_eq!(options.command, ShellCommand::AgentCard);
+        Ok(())
+    }
+
+    #[test]
     fn client_drives_real_tempod_session_lifecycle() -> TestResult {
         let pool = Arc::new(Mutex::new(SessionPool::default()));
 
@@ -424,6 +444,20 @@ mod tests {
         let drained = with_tempod(&pool, |addr| ShellClient::new(addr.to_string()).drain())?;
         assert!(drained.draining);
         assert_eq!(drained.sessions[0].state, TempodSessionState::Killed);
+        Ok(())
+    }
+
+    #[test]
+    fn client_reads_real_tempod_agent_card() -> TestResult {
+        let pool = Arc::new(Mutex::new(SessionPool::default()));
+        let card = with_tempod(&pool, |addr| {
+            ShellClient::new(addr.to_string()).agent_card()
+        })?;
+
+        assert_eq!(card["name"], "tempo");
+        assert_eq!(card["preferredTransport"], "MCP");
+        assert_eq!(card["skills"][0]["id"], "observe");
+        assert_eq!(card["skills"][5]["id"], "handshake");
         Ok(())
     }
 
