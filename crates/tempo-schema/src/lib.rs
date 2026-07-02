@@ -611,8 +611,11 @@ pub fn compiled_observation_json_schema() -> Value {
     json!({
         "title": "CompiledObservation",
         "type": "object",
-        "additionalProperties": false,
-        "required": ["schema_version", "url", "seq", "elements", "marks"],
+        // `CompiledObservation` does not use `#[serde(deny_unknown_fields)]`, so
+        // unknown keys are ignored on deserialization — mirror that here.
+        "additionalProperties": true,
+        // `marks` carries `#[serde(default)]`, so it is optional on the wire.
+        "required": ["schema_version", "url", "seq", "elements"],
         "properties": {
             "schema_version": { "type": "string", "const": SCHEMA_VERSION },
             "url": { "type": "string", "format": "uri-reference" },
@@ -627,7 +630,9 @@ pub fn compiled_observation_json_schema() -> Value {
                     "type": "array",
                     "prefixItems": [
                         { "$ref": "#/$defs/NodeId" },
-                        { "type": "integer", "minimum": 0 }
+                        // Mark labels are `u32` in Rust; bound the schema so it
+                        // rejects values that would fail deserialization.
+                        { "type": "integer", "minimum": 0, "maximum": u32::MAX }
                     ],
                     "minItems": 2,
                     "maxItems": 2
@@ -642,7 +647,7 @@ pub fn observation_diff_json_schema() -> Value {
     json!({
         "title": "ObservationDiff",
         "type": "object",
-        "additionalProperties": false,
+        "additionalProperties": true,
         "required": ["since_seq", "seq", "added", "removed", "changed"],
         "properties": {
             "since_seq": { "type": "integer", "minimum": 0 },
@@ -693,7 +698,7 @@ pub fn action_json_schema() -> Value {
                 "node": { "$ref": "#/$defs/NodeId" }
             })),
             action_variant_schema("skill", json!({
-                "name": { "type": "string", "minLength": 1 },
+                "name": { "type": "string" },
                 "input": true
             }))
         ]
@@ -774,7 +779,7 @@ pub fn action_batch_json_schema() -> Value {
     json!({
         "title": "ActionBatch",
         "type": "object",
-        "additionalProperties": false,
+        "additionalProperties": true,
         "required": ["actions", "quiescence"],
         "properties": {
             "actions": {
@@ -789,8 +794,8 @@ pub fn action_batch_json_schema() -> Value {
 fn node_id_json_schema() -> Value {
     json!({
         "title": "NodeId",
-        "type": "string",
-        "minLength": 1
+        // `NodeId(pub String)` deserializes from any string, empty included.
+        "type": "string"
     })
 }
 
@@ -806,7 +811,7 @@ fn taint_span_json_schema() -> Value {
     json!({
         "title": "TaintSpan",
         "type": "object",
-        "additionalProperties": false,
+        "additionalProperties": true,
         "required": ["provenance", "text"],
         "properties": {
             "provenance": { "$ref": "#/$defs/Provenance" },
@@ -819,11 +824,14 @@ fn interactive_element_json_schema() -> Value {
     json!({
         "title": "InteractiveElement",
         "type": "object",
-        "additionalProperties": false,
-        "required": ["node_id", "role", "name", "value", "bounds", "rank"],
+        // No `#[serde(deny_unknown_fields)]`: unknown keys are ignored.
+        "additionalProperties": true,
+        // `value` and `bounds` carry `#[serde(default)]`, so both are optional.
+        "required": ["node_id", "role", "name", "rank"],
         "properties": {
             "node_id": { "$ref": "#/$defs/NodeId" },
-            "role": { "type": "string", "minLength": 1 },
+            // serde accepts empty strings; do not impose `minLength`.
+            "role": { "type": "string" },
             "name": {
                 "type": "array",
                 "items": { "$ref": "#/$defs/TaintSpan" }
@@ -863,10 +871,10 @@ fn quiescence_policy_json_schema() -> Value {
             { "type": "string", "const": "composite" },
             {
                 "type": "object",
-                "additionalProperties": false,
+                "additionalProperties": true,
                 "required": ["fixed_millis"],
                 "properties": {
-                    "fixed_millis": { "type": "integer", "minimum": 0 }
+                    "fixed_millis": { "type": "integer", "minimum": 0, "maximum": u64::MAX }
                 }
             }
         ]
@@ -893,7 +901,8 @@ fn action_variant_schema(kind: &'static str, properties: Value) -> Value {
 
     json!({
         "type": "object",
-        "additionalProperties": false,
+        // Internally-tagged `Action` variants ignore unknown fields on the wire.
+        "additionalProperties": true,
         "required": required,
         "properties": merged
     })
@@ -988,11 +997,89 @@ mod tests {
             schema["properties"]["schema_version"]["const"],
             SCHEMA_VERSION
         );
-        assert_eq!(schema["additionalProperties"], false);
+        // serde ignores unknown fields, so the schema must not forbid them.
+        assert_eq!(schema["additionalProperties"], true);
         assert_eq!(
             schema["properties"]["elements"]["items"]["$ref"],
             "#/$defs/InteractiveElement"
         );
+    }
+
+    #[test]
+    fn schema_optionality_matches_serde_defaults() {
+        // Fields carrying `#[serde(default)]` must not be schema-`required`.
+        let element = interactive_element_json_schema();
+        let element_required: Vec<&str> = element["required"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(element_required, ["node_id", "role", "name", "rank"]);
+        assert!(!element_required.contains(&"value"));
+        assert!(!element_required.contains(&"bounds"));
+
+        let observation = compiled_observation_json_schema();
+        let observation_required: Vec<&str> = observation["required"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(!observation_required.contains(&"marks"));
+    }
+
+    #[test]
+    fn schema_does_not_reject_serde_accepted_payloads() -> Result<(), serde_json::Error> {
+        // serde ignores unknown fields, accepts empty strings, and defaults
+        // `value`/`bounds`/`marks`. The published schema must reflect that:
+        // no `additionalProperties: false`, no `minLength`.
+        assert_eq!(node_id_json_schema().get("minLength"), None);
+        assert_eq!(
+            interactive_element_json_schema()["properties"]["role"].get("minLength"),
+            None
+        );
+        for schema in [
+            interactive_element_json_schema(),
+            compiled_observation_json_schema(),
+            observation_diff_json_schema(),
+            action_batch_json_schema(),
+            taint_span_json_schema(),
+        ] {
+            assert_eq!(
+                schema["additionalProperties"], true,
+                "{} must allow unknown fields",
+                schema["title"]
+            );
+        }
+
+        // These payloads all deserialize under the serde contract, proving the
+        // loosened schema is not narrower than the reference implementation.
+        let element: InteractiveElement = serde_json::from_str(
+            r#"{"node_id":"n1","role":"","name":[],"rank":0.5,"unknown_field":true}"#,
+        )?;
+        assert!(element.value.is_empty());
+        assert!(element.bounds.is_none());
+
+        let observation: CompiledObservation = serde_json::from_str(&format!(
+            r#"{{"schema_version":"{SCHEMA_VERSION}","url":"u","seq":1,"elements":[],"extra":42}}"#
+        ))?;
+        assert!(observation.marks.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn schema_bounds_mark_labels_to_u32() {
+        // The schema must reject mark labels serde would reject (`u32` overflow).
+        let observation = compiled_observation_json_schema();
+        let label = &observation["properties"]["marks"]["items"]["prefixItems"][1];
+        assert_eq!(label["maximum"], u32::MAX);
+
+        let overflow = format!(
+            r#"{{"schema_version":"{SCHEMA_VERSION}","url":"u","seq":1,"elements":[],"marks":[["n",{}]]}}"#,
+            u64::from(u32::MAX) + 1
+        );
+        assert!(serde_json::from_str::<CompiledObservation>(&overflow).is_err());
     }
 
     #[test]
