@@ -240,6 +240,14 @@ impl SkillStore {
         self.get(key)?.compile(input)
     }
 
+    pub fn resolve(&self, name: &str) -> Result<SkillKey, SkillError> {
+        safe_segment(name)?;
+        self.list()?
+            .into_iter()
+            .rfind(|key| key.name == name)
+            .ok_or_else(|| SkillError::SkillNotFound(name.to_string()))
+    }
+
     pub fn list(&self) -> Result<Vec<SkillKey>, SkillError> {
         let mut keys = Vec::new();
         for entry in std::fs::read_dir(&self.root)? {
@@ -298,6 +306,8 @@ pub enum SkillError {
     UndeclaredInput(String),
     #[error("skill must contain at least one step")]
     EmptySkill,
+    #[error("skill not found: {0}")]
+    SkillNotFound(String),
 }
 
 /// Human-readable crate summary.
@@ -468,6 +478,38 @@ mod tests {
                 },
             ]
         );
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_selects_highest_stored_version_for_name() -> TestResult {
+        let root = unique_dir("resolve")?;
+        remove_dir_if_exists(&root)?;
+        let store = SkillStore::open(&root)?;
+        let mut first = checkout_skill();
+        first.version = "1".into();
+        let mut second = checkout_skill();
+        second.version = "2".into();
+        let mut other = checkout_skill();
+        other.name = "other".into();
+
+        store.put(&first)?;
+        store.put(&second)?;
+        store.put(&other)?;
+
+        assert_eq!(
+            store.resolve("checkout")?,
+            SkillKey {
+                name: "checkout".into(),
+                version: "2".into(),
+            }
+        );
+        assert!(matches!(
+            store.resolve("missing"),
+            Err(SkillError::SkillNotFound(name)) if name == "missing"
+        ));
 
         remove_dir_if_exists(&root)?;
         Ok(())
