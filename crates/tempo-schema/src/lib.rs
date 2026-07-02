@@ -871,7 +871,10 @@ fn quiescence_policy_json_schema() -> Value {
             { "type": "string", "const": "composite" },
             {
                 "type": "object",
-                "additionalProperties": true,
+                // Externally-tagged `QuiescencePolicy` deserializes exactly one
+                // key and then requires end-of-object: serde denies unknown
+                // fields, so the schema must too (see #114).
+                "additionalProperties": false,
                 "required": ["fixed_millis"],
                 "properties": {
                     "fixed_millis": { "type": "integer", "minimum": 0, "maximum": u64::MAX }
@@ -1162,6 +1165,29 @@ mod tests {
         assert_eq!(
             schema["oneOf"][1]["properties"]["fixed_millis"]["type"],
             "integer"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn quiescence_schema_denies_unknown_fields_like_serde() -> Result<(), serde_json::Error> {
+        // `QuiescencePolicy` is externally tagged: serde reads exactly one key
+        // and then requires end-of-object, so an extra key is a deserialize
+        // error. The published schema must forbid unknown fields to match (#114).
+        let schema = quiescence_policy_json_schema();
+        assert_eq!(
+            schema["oneOf"][1]["additionalProperties"], false,
+            "QuiescencePolicy object variant must forbid unknown fields"
+        );
+
+        // serde agrees: the extra key is rejected, the exact shape is accepted.
+        assert!(serde_json::from_value::<QuiescencePolicy>(
+            json!({"fixed_millis": 100, "extra": 1})
+        )
+        .is_err());
+        assert_eq!(
+            serde_json::from_value::<QuiescencePolicy>(json!({"fixed_millis": 100}))?,
+            QuiescencePolicy::FixedMillis(100)
         );
         Ok(())
     }
