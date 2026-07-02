@@ -8,6 +8,7 @@ license.workspace = true
 base64 = "0.22"
 ed25519-dalek = "2"
 tempo-schema = { path = "../tempo-schema" }
+url = "2"
 
 [lints]
 workspace = true

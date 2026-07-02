@@ -1758,20 +1758,41 @@ fn parse_authority(authority: &str) -> Result<(String, String, Option<u16>), Blo
         return Ok((host.clone(), format!("[{host}]"), port));
     }
 
-    if authority.contains(':') {
-        let (host, port_raw) = authority
-            .rsplit_once(':')
-            .ok_or_else(|| BlockReason::new(BlockCode::InvalidUrl, "malformed authority"))?;
-        if port_raw.chars().all(|ch| ch.is_ascii_digit()) {
-            return Ok((
-                host.to_string(),
-                host.to_string(),
-                port_raw.parse::<u16>().ok(),
-            ));
+    let (host_part, port) = match authority.rsplit_once(':') {
+        Some((host, port_raw)) if port_raw.chars().all(|ch| ch.is_ascii_digit()) => {
+            (host, port_raw.parse::<u16>().ok())
         }
-    }
+        _ => (authority, None),
+    };
 
-    Ok((authority.to_string(), authority.to_string(), None))
+    let (host, audit_host) = classify_host(host_part)?;
+    Ok((host, audit_host, port))
+}
+
+/// Classify a non-bracketed authority host with the WHATWG host parser used by
+/// the real fetch path (`url` crate → reqwest / Servo). This collapses
+/// percent-decoding and IDNA normalization into the same parser rust-url uses,
+/// so the guard's host provably matches the host reqwest will connect to
+/// (issue #79). Without it, `169%2e254%2e169%2e254` and `169。254。169。254`
+/// are seen here as opaque domains (allowed) while reqwest decodes/normalizes
+/// them to the metadata IP `169.254.169.254`. A host the WHATWG parser rejects
+/// is denied conservatively rather than allowed.
+fn classify_host(host: &str) -> Result<(String, String), BlockReason> {
+    match url::Host::parse(host) {
+        Ok(url::Host::Domain(domain)) => Ok((domain.clone(), domain)),
+        Ok(url::Host::Ipv4(ip)) => {
+            let rendered = ip.to_string();
+            Ok((rendered.clone(), rendered))
+        }
+        Ok(url::Host::Ipv6(ip)) => {
+            let rendered = ip.to_string();
+            Ok((rendered.clone(), format!("[{rendered}]")))
+        }
+        Err(error) => Err(BlockReason::new(
+            BlockCode::InvalidUrl,
+            format!("WHATWG host parse rejected authority: {error}"),
+        )),
+    }
 }
 
 fn strip_ipv6_zone(host: &str) -> &str {
@@ -1996,6 +2017,29 @@ mod tests {
         // backslash form above only differs because `\` terminates the authority.
         assert_allowed(&policy, "https://user:pass@example.com/path");
         assert_allowed(&policy, "https://allowed.example\\@example.com/");
+    }
+
+    #[test]
+    fn url_policy_blocks_percent_encoded_and_idna_host_bypasses() {
+        // Issue #79 follow-up: the guard must classify the host with the same
+        // WHATWG parser reqwest uses, so percent-encoded / IDNA-normalized hosts
+        // that decode to the metadata IP cannot slip through as opaque domains.
+        let policy = UrlPolicy::block_private();
+        for url in [
+            // Percent-encoded dots -> 169.254.169.254 after decoding.
+            "https://169%2e254%2e169%2e254/",
+            "https://169%2E254%2E169%2E254/latest/meta-data",
+            // Percent-encoded loopback.
+            "https://127%2e0%2e0%2e1/",
+            // IDNA: U+3002 ideographic full stops map to '.'.
+            "https://169。254。169。254/",
+        ] {
+            assert_blocked(&policy, url, BlockCode::BlockedIp);
+        }
+        // enforce() (the production entry point) must also reject it.
+        assert!(policy.enforce("https://169%2e254%2e169%2e254/").is_err());
+        // A genuine public host is still allowed after WHATWG normalization.
+        assert_allowed(&policy, "https://ex%61mple.com/");
     }
 
     #[test]
