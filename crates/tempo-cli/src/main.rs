@@ -180,7 +180,19 @@ impl Command {
             } => {
                 let scorecard: CompatScorecard = read_json(&input)?;
                 let lane_table = scorecard.lane_table(thresholds);
-                write_json(&output, &lane_table, stdout)
+                let missing_primary_lanes = lane_table
+                    .rows
+                    .iter()
+                    .filter(|row| row.primary.is_none())
+                    .count();
+                write_json(&output, &lane_table, stdout)?;
+                if missing_primary_lanes == 0 {
+                    Ok(())
+                } else {
+                    Err(CliError::GateFailed {
+                        violations: missing_primary_lanes,
+                    })
+                }
             }
             Self::InjectionGate { input, output } => {
                 let cases: Vec<InjectionCaseResult> = read_json(&input)?;
@@ -1000,6 +1012,39 @@ mod tests {
         let value: Value = serde_json::from_reader(File::open(&output)?)?;
         assert_eq!(value["fallback_rate"], 0.5);
         assert_eq!(value["rows"][0]["primary"], "cdp");
+        remove_dir(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn compat_lanes_command_fails_when_no_primary_lane_exists() -> TestResult {
+        let dir = unique_dir("compat-fail")?;
+        let input = dir.join("compat.json");
+        let output = dir.join("lanes.json");
+        let scorecard = CompatScorecard::new(vec![OriginScore::new(
+            "https://down.test",
+            EngineProbe::servo(false, 0.0, false, 200),
+            EngineProbe::cdp(false, 0.0, false, 200),
+        )]);
+        write_json_file(&input, &scorecard)?;
+        let mut stdout = Vec::new();
+
+        let result = run_with_writer(
+            [
+                "compat-lanes".to_string(),
+                "--input".into(),
+                input_string(&input),
+                "--output".into(),
+                input_string(&output),
+            ],
+            &mut stdout,
+        );
+
+        match result {
+            Err(CliError::GateFailed { violations }) => assert_eq!(violations, 1),
+            other => return Err(unexpected_result(other)),
+        }
+        assert!(output.exists());
         remove_dir(&dir)?;
         Ok(())
     }

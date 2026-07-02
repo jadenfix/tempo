@@ -1,0 +1,61 @@
+{
+  "entries": [
+    {
+      "origin": "https://api.example",
+      "structured_surface": "api",
+      "servo": {
+        "engine": "servo",
+        "load_ok": true,
+        "observation_quality": 0.94,
+        "scripted_action_success": true,
+        "latency_ms": 130
+      },
+      "cdp": {
+        "engine": "cdp",
+        "load_ok": true,
+        "observation_quality": 0.99,
+        "scripted_action_success": true,
+        "latency_ms": 170
+      },
+      "challenge_rate": 0.01
+    },
+    {
+      "origin": "https://servo.example",
+      "structured_surface": null,
+      "servo": {
+        "engine": "servo",
+        "load_ok": true,
+        "observation_quality": 0.96,
+        "scripted_action_success": true,
+        "latency_ms": 120
+      },
+      "cdp": {
+        "engine": "cdp",
+        "load_ok": true,
+        "observation_quality": 0.99,
+        "scripted_action_success": true,
+        "latency_ms": 160
+      },
+      "challenge_rate": 0.02
+    },
+    {
+      "origin": "https://fallback.example",
+      "structured_surface": null,
+      "servo": {
+        "engine": "servo",
+        "load_ok": true,
+        "observation_quality": 0.62,
+        "scripted_action_success": true,
+        "latency_ms": 210
+      },
+      "cdp": {
+        "engine": "cdp",
+        "load_ok": true,
+        "observation_quality": 0.98,
+        "scripted_action_success": true,
+        "latency_ms": 180
+      },
+      "challenge_rate": 0.02
+    }
+  ]
+}

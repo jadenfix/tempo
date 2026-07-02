@@ -285,15 +285,15 @@ impl StableIdMapper {
         };
         let fingerprint = format!("{base_fingerprint}#{occurrence}");
 
-        if let Some(source_key) = raw.source_key() {
-            if let Some(entry) = self.by_source.get_mut(&source_key) {
+        if let Some(source_key) = raw.source_key()
+            && let Some(entry) = self.by_source.get_mut(&source_key)
+        {
+            entry.last_seen = seq;
+            let node_id = entry.node_id.clone();
+            if let Some(entry) = self.by_fingerprint.get_mut(&fingerprint) {
                 entry.last_seen = seq;
-                let node_id = entry.node_id.clone();
-                if let Some(entry) = self.by_fingerprint.get_mut(&fingerprint) {
-                    entry.last_seen = seq;
-                }
-                return node_id;
             }
+            return node_id;
         }
 
         if let Some(entry) = self.by_fingerprint.get_mut(&fingerprint) {

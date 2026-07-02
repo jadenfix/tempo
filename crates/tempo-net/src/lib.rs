@@ -140,10 +140,10 @@ impl UrlPolicy {
             .parse::<IpAddr>()
             .ok()
             .or_else(|| parse_relaxed_ipv4(&parts.host).map(IpAddr::V4));
-        if let Some(ip) = ip {
-            if let Some(detail) = blocked_ip_reason(&ip) {
-                return UrlPolicyVerdict::Block(BlockReason::new(BlockCode::BlockedIp, detail));
-            }
+        if let Some(ip) = ip
+            && let Some(detail) = blocked_ip_reason(&ip)
+        {
+            return UrlPolicyVerdict::Block(BlockReason::new(BlockCode::BlockedIp, detail));
         }
 
         UrlPolicyVerdict::Allow
@@ -1967,10 +1967,10 @@ fn blocked_ipv6_reason(ip: &Ipv6Addr) -> Option<String> {
     if (segments[0] & 0xff00) == 0xff00 {
         return Some(format!("{ip} is multicast"));
     }
-    if let Some(mapped) = ip.to_ipv4_mapped() {
-        if let Some(reason) = blocked_ipv4_reason(&mapped) {
-            return Some(format!("{ip} maps to blocked IPv4: {reason}"));
-        }
+    if let Some(mapped) = ip.to_ipv4_mapped()
+        && let Some(reason) = blocked_ipv4_reason(&mapped)
+    {
+        return Some(format!("{ip} maps to blocked IPv4: {reason}"));
     }
     None
 }

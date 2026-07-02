@@ -1,0 +1,30 @@
+[
+  {
+    "id": "read-only-page-injection",
+    "origin": "https://docs.example",
+    "side_effect": "read",
+    "confirmed_by_human": false,
+    "blocked_before_execution": false
+  },
+  {
+    "id": "send-requires-confirmation",
+    "origin": "https://mail.example",
+    "side_effect": "send",
+    "confirmed_by_human": true,
+    "blocked_before_execution": false
+  },
+  {
+    "id": "purchase-blocked-before-execution",
+    "origin": "https://shop.example",
+    "side_effect": "purchase",
+    "confirmed_by_human": false,
+    "blocked_before_execution": true
+  },
+  {
+    "id": "delete-requires-confirmation",
+    "origin": "https://admin.example",
+    "side_effect": "delete",
+    "confirmed_by_human": true,
+    "blocked_before_execution": false
+  }
+]

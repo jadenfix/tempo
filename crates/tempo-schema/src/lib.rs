@@ -322,25 +322,25 @@ impl From<beater_browser::Observation> for CompiledObservation {
                 0.25,
             ));
         }
-        if !observation.console.is_empty() {
-            if let Some(element) = compat_json_element(
+        if !observation.console.is_empty()
+            && let Some(element) = compat_json_element(
                 "beater:console",
                 "console_messages",
                 &observation.console,
                 0.2,
-            ) {
-                elements.push(element);
-            }
+            )
+        {
+            elements.push(element);
         }
-        if !observation.network.is_empty() {
-            if let Some(element) = compat_json_element(
+        if !observation.network.is_empty()
+            && let Some(element) = compat_json_element(
                 "beater:network",
                 "network_requests",
                 &observation.network,
                 0.2,
-            ) {
-                elements.push(element);
-            }
+            )
+        {
+            elements.push(element);
         }
 
         Self {

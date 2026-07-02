@@ -765,10 +765,10 @@ fn extract_interactive_elements(html: &str) -> Vec<InteractiveElement> {
         // counting resumes in the correct parent scope.
         if let Some(name) = raw_tag.strip_prefix('/') {
             let name = name.trim().to_ascii_lowercase();
-            if let Some(position) = stack.iter().rposition(|frame| frame.tag == name) {
-                if position > 0 {
-                    stack.truncate(position);
-                }
+            if let Some(position) = stack.iter().rposition(|frame| frame.tag == name)
+                && position > 0
+            {
+                stack.truncate(position);
             }
             continue;
         }
@@ -958,10 +958,10 @@ fn selector_for(tag: &str, attrs: &BTreeMap<String, String>) -> Option<String> {
     if let Some(name) = attrs.get("name").filter(|value| !value.is_empty()) {
         return Some(format!("{tag}[name=\"{}\"]", css_attr_escape(name)));
     }
-    if tag == "a" {
-        if let Some(href) = attrs.get("href").filter(|value| !value.is_empty()) {
-            return Some(format!("a[href=\"{}\"]", css_attr_escape(href)));
-        }
+    if tag == "a"
+        && let Some(href) = attrs.get("href").filter(|value| !value.is_empty())
+    {
+        return Some(format!("a[href=\"{}\"]", css_attr_escape(href)));
     }
     None
 }

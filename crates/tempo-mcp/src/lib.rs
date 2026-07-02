@@ -742,6 +742,16 @@ async fn run_handshake_probe(
     run_handshake_probe_blocking(args, config)
 }
 
+fn run_handshake_probe_thread(
+    origin: String,
+    config: HttpProbeConfig,
+) -> Result<tempo_handshake::HttpProbeRun, String> {
+    match std::thread::spawn(move || probe_http_origin(&origin, config)).join() {
+        Ok(result) => result.map_err(|error| error.to_string()),
+        Err(_) => Err("HTTP probe worker panicked".into()),
+    }
+}
+
 /// Blocking-context variant of [`run_handshake_probe`] for the driverless path,
 /// which runs outside a tokio worker. The blocking HTTP client must not be
 /// driven from within an async runtime, so it is run on its own std thread.
@@ -751,11 +761,7 @@ fn run_handshake_probe_blocking(
 ) -> Option<Result<tempo_handshake::HttpProbeRun, String>> {
     let origin = handshake_probe_target(args)?;
     let config = config.clone();
-    let result = match std::thread::spawn(move || probe_http_origin(&origin, config)).join() {
-        Ok(result) => result.map_err(|error| error.to_string()),
-        Err(_) => Err("HTTP probe worker panicked".into()),
-    };
-    Some(result)
+    Some(run_handshake_probe_thread(origin, config))
 }
 
 fn handle_driverless_message(

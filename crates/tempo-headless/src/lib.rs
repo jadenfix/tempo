@@ -820,10 +820,10 @@ fn route_http_request(
             ))
         }
         _ => {
-            if request.method == "GET" {
-                if let Some((id, after_seq)) = session_events_from_path(&request.path)? {
-                    return Ok(HttpResponse::json(200, pool.events(&id, after_seq)?));
-                }
+            if request.method == "GET"
+                && let Some((id, after_seq)) = session_events_from_path(&request.path)?
+            {
+                return Ok(HttpResponse::json(200, pool.events(&id, after_seq)?));
             }
             if request.method == "POST" && request.path.ends_with("/adopt") {
                 let id = session_id_from_action_path(&request.path, "adopt")?;
