@@ -501,10 +501,12 @@ fn handshake_lane_name(lane: HandshakeLane) -> &'static str {
 }
 
 fn engine_name(engine: Engine) -> &'static str {
-    match engine {
-        Engine::Servo => "servo",
-        Engine::Cdp => "cdp",
-        _ => "contract",
+    if engine == Engine::Servo {
+        "servo"
+    } else if engine == Engine::Cdp {
+        "cdp"
+    } else {
+        "test"
     }
 }
 
