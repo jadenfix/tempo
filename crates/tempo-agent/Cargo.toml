@@ -10,6 +10,7 @@ tempo-schema = { path = "../tempo-schema" }
 tempo-driver = { path = "../tempo-driver" }
 tempo-policy = { path = "../tempo-policy" }
 tempo-session = { path = "../tempo-session" }
+tempo-skills = { path = "../tempo-skills" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

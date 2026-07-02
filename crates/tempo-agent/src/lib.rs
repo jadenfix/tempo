@@ -7,14 +7,15 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use tempo_act::{execute_action, ExecutionStatus};
+use tempo_act::{execute_action, execute_batch, ActionExecution, ExecutionStatus};
 use tempo_driver::{DriverTrait, Engine, StepOutcome, TransportError};
 use tempo_policy::{decide_action, ConfirmationGate, InputTaint};
-use tempo_schema::{Action, CompiledObservation, ObservationDiff, SideEffect};
+use tempo_schema::{Action, ActionBatch, CompiledObservation, ObservationDiff, SideEffect};
 use tempo_session::{
     read_journal_entries, JournalEntry, JournalError, JournalEvent, RunId, SessionId,
     SessionJournal,
 };
+use tempo_skills::{SkillError, SkillStore};
 use thiserror::Error;
 
 /// Default p95 observation budget from `final.md` §10.
@@ -444,6 +445,7 @@ pub struct AgentRunner {
     token_budget: TokenBudget,
     observation_budget: ObservationBudgetLimit,
     confirmation_mode: ConfirmationMode,
+    skill_store_root: Option<PathBuf>,
 }
 
 impl AgentRunner {
@@ -454,6 +456,7 @@ impl AgentRunner {
             token_budget: TokenBudget::new(DEFAULT_MAX_OBSERVATION_TOKENS as u64),
             observation_budget: ObservationBudgetLimit::default(),
             confirmation_mode: ConfirmationMode::default(),
+            skill_store_root: None,
         }
     }
 
@@ -469,6 +472,11 @@ impl AgentRunner {
 
     pub fn with_confirmation_mode(mut self, confirmation_mode: ConfirmationMode) -> Self {
         self.confirmation_mode = confirmation_mode;
+        self
+    }
+
+    pub fn with_skill_store(mut self, root: impl AsRef<Path>) -> Self {
+        self.skill_store_root = Some(root.as_ref().to_path_buf());
         self
     }
 
@@ -561,9 +569,7 @@ impl AgentRunner {
                 return Ok(report);
             }
 
-            let execution = execute_action(driver, &planned.action)
-                .await
-                .map_err(|source| AgentError::transport("execute action", source))?;
+            let execution = self.execute_driver_step(driver, &planned.action).await?;
             let outcome = match execution.status {
                 ExecutionStatus::Applied => StepOutcome::Applied {
                     diff: execution.diff,
@@ -604,6 +610,41 @@ impl AgentRunner {
         Ok(report)
     }
 
+    async fn execute_driver_step<D>(
+        &self,
+        driver: &mut D,
+        action: &Action,
+    ) -> Result<ActionExecution, AgentError>
+    where
+        D: DriverTrait + ?Sized,
+    {
+        match action {
+            Action::Skill { name, input } => {
+                let batch = self.compile_skill(name, input)?;
+                execute_batch(driver, &batch)
+                    .await
+                    .map_err(|source| AgentError::transport("execute skill", source))
+            }
+            _ => execute_action(driver, action)
+                .await
+                .map_err(|source| AgentError::transport("execute action", source)),
+        }
+    }
+
+    fn compile_skill(
+        &self,
+        name: &str,
+        input: &serde_json::Value,
+    ) -> Result<ActionBatch, AgentError> {
+        let root = self
+            .skill_store_root
+            .as_ref()
+            .ok_or_else(|| AgentError::SkillStoreNotConfigured(name.to_string()))?;
+        let store = SkillStore::open(root)?;
+        let mut stack = Vec::new();
+        compile_skill_from_store(&store, name, input, &mut stack)
+    }
+
     fn record_observation(
         &self,
         agent: &mut AgentLoop,
@@ -628,6 +669,40 @@ impl AgentRunner {
             idempotency_key: key.clone(),
         }
     }
+}
+
+fn compile_skill_from_store(
+    store: &SkillStore,
+    name: &str,
+    input: &serde_json::Value,
+    stack: &mut Vec<String>,
+) -> Result<ActionBatch, AgentError> {
+    if stack.iter().any(|active| active == name) {
+        return Err(AgentError::SkillCycle(name.to_string()));
+    }
+    stack.push(name.to_string());
+
+    let result = (|| {
+        let key = store.resolve(name)?;
+        let batch = store.compile(&key, input)?;
+        let mut actions = Vec::new();
+        for action in batch.actions {
+            match action {
+                Action::Skill { name, input } => {
+                    let nested = compile_skill_from_store(store, &name, &input, stack)?;
+                    actions.extend(nested.actions);
+                }
+                other => actions.push(other),
+            }
+        }
+        Ok(ActionBatch {
+            actions,
+            quiescence: batch.quiescence,
+        })
+    })();
+
+    stack.pop();
+    result
 }
 
 /// Durable report for one live-driver run attempt.
@@ -800,6 +875,12 @@ pub enum AgentError {
     Journal(#[from] JournalError),
     #[error("agent JSON failed: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("skill store failed: {0}")]
+    Skill(#[from] SkillError),
+    #[error("skill store is not configured for skill action: {0}")]
+    SkillStoreNotConfigured(String),
+    #[error("skill expansion cycle detected at: {0}")]
+    SkillCycle(String),
     #[error("transport error during {context}: {source}")]
     Transport {
         context: String,
@@ -869,7 +950,10 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
     use tempo_driver::TestDriver;
     use tempo_engine_cdp::{CdpConfig, CdpTempoDriver};
-    use tempo_schema::{InteractiveElement, NodeId, ObservationDiff, Provenance, TaintSpan};
+    use tempo_schema::{
+        InteractiveElement, NodeId, ObservationDiff, Provenance, QuiescencePolicy, TaintSpan,
+    };
+    use tempo_skills::{ActionTemplate, SkillDefinition, SkillInput, SkillStore, TemplateString};
 
     type TestResult = Result<(), Box<dyn Error>>;
 
@@ -1071,6 +1155,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runner_expands_persisted_skill_and_journals_original_action() -> TestResult {
+        let root = unique_dir("runner-skill")?;
+        remove_dir_if_exists(&root)?;
+        fs::create_dir_all(&root)?;
+        let skills_root = root.join("skills");
+        let store = SkillStore::open(&skills_root)?;
+        store.put(&click_skill("click_saved_target", "1"))?;
+        store.put(&nested_click_skill("2"))?;
+        store.put(&click_skill("click_inner", "1"))?;
+        let journal_path = root.join("session.jsonl");
+        let skill_action = Action::Skill {
+            name: "click_saved_target".into(),
+            input: serde_json::json!({"target": "submit"}),
+        };
+        let task = DriverTask::new("https://example.com", vec![skill_action.clone()]);
+        let mut driver = TestDriver::new().with_elements(vec![button("submit")]);
+        let runner = AgentRunner::new(
+            &journal_path,
+            AgentRunIds::new("run-skill", "session-skill"),
+        )
+        .with_skill_store(&skills_root);
+
+        let report = runner.run_driver_task(&mut driver, &task).await?;
+
+        assert_eq!(report.status, AgentRunStatus::Completed);
+        assert_eq!(report.actions_completed, 1);
+        assert!(matches!(
+            report.steps[0].triple.outcome,
+            StepTripleOutcome::Applied { .. }
+        ));
+
+        let entries = read_journal_entries(&journal_path)?;
+        assert!(entries.iter().any(|entry| matches!(
+            &entry.event,
+            JournalEvent::ActionPlanned { action } if action == &skill_action
+        )));
+        assert!(entries.iter().any(|entry| matches!(
+            &entry.event,
+            JournalEvent::StepApplied { action, .. } if action == &skill_action
+        )));
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runner_reports_missing_skill_store_configuration() -> TestResult {
+        let root = unique_dir("runner-skill-missing-store")?;
+        remove_dir_if_exists(&root)?;
+        fs::create_dir_all(&root)?;
+        let journal_path = root.join("session.jsonl");
+        let task = DriverTask::new(
+            "https://example.com",
+            vec![Action::Skill {
+                name: "click_saved_target".into(),
+                input: serde_json::json!({"target": "submit"}),
+            }],
+        );
+        let mut driver = TestDriver::new().with_elements(vec![button("submit")]);
+        let runner = AgentRunner::new(
+            &journal_path,
+            AgentRunIds::new("run-missing-skill-store", "session-missing-skill-store"),
+        );
+
+        let error = runner.run_driver_task(&mut driver, &task).await.err();
+
+        assert!(matches!(
+            error,
+            Some(AgentError::SkillStoreNotConfigured(name)) if name == "click_saved_target"
+        ));
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn runner_resume_does_not_duplicate_completed_live_steps() -> TestResult {
         let root = unique_dir("runner-resume")?;
         remove_dir_if_exists(&root)?;
@@ -1234,6 +1394,33 @@ mod tests {
             value: vec![],
             bounds: Some([0.0, 0.0, 100.0, 30.0]),
             rank: 1.0,
+        }
+    }
+
+    fn click_skill(name: &str, version: &str) -> SkillDefinition {
+        SkillDefinition {
+            name: name.into(),
+            version: version.into(),
+            description: "click a parameterized target".into(),
+            inputs: vec![SkillInput::required("target")],
+            quiescence: QuiescencePolicy::Composite,
+            steps: vec![ActionTemplate::Click {
+                node: TemplateString::param("target"),
+            }],
+        }
+    }
+
+    fn nested_click_skill(version: &str) -> SkillDefinition {
+        SkillDefinition {
+            name: "click_saved_target".into(),
+            version: version.into(),
+            description: "delegate click to an inner skill".into(),
+            inputs: Vec::new(),
+            quiescence: QuiescencePolicy::Composite,
+            steps: vec![ActionTemplate::Skill {
+                name: TemplateString::literal("click_inner"),
+                input: serde_json::json!({"target": "submit"}),
+            }],
         }
     }
 
