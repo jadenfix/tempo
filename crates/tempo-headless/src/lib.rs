@@ -19,8 +19,8 @@ use std::sync::{Arc, Mutex};
 use tempo_agent::StepTriple;
 use tempo_bidi::{
     BidiErrorCode, BidiMessage, BidiRouter, BrowsingContextId, BrowsingContextInfo,
-    CaptureScreenshotResult, DriverCommand as BidiDriverCommand, GetTreeResult, NavigateResult,
-    RoutedCommand, ScriptEvaluateResult,
+    CaptureScreenshotResult, CreateContextResult, DriverCommand as BidiDriverCommand,
+    GetTreeResult, NavigateResult, RoutedCommand, ScriptEvaluateResult,
 };
 use tempo_driver::{DriverTrait, Engine, StepOutcome, TransportError, Unsupported};
 use tempo_engine_host::{
@@ -168,6 +168,19 @@ impl AttachedEngineDriver {
             other => Err(unexpected_driver_response(other, expected)),
         }
     }
+
+    async fn fork_attached(&mut self) -> Result<Self, Unsupported> {
+        match self.request(HostDriverCommand::Fork) {
+            Ok(DriverResponse::Forked { driver_id }) => Ok(Self {
+                engine: self.engine,
+                client: Arc::clone(&self.client),
+                driver_id: Some(driver_id),
+            }),
+            Ok(DriverResponse::Error { error }) => Err(driver_wire_unsupported(error)),
+            Ok(_) => Err(Unsupported("unexpected engine IPC fork response")),
+            Err(_) => Err(Unsupported("engine IPC fork failed")),
+        }
+    }
 }
 
 impl fmt::Debug for AttachedEngineDriver {
@@ -217,16 +230,7 @@ impl DriverTrait for AttachedEngineDriver {
     }
 
     async fn fork(&mut self) -> Result<Box<dyn DriverTrait>, Unsupported> {
-        match self.request(HostDriverCommand::Fork) {
-            Ok(DriverResponse::Forked { driver_id }) => Ok(Box::new(Self {
-                engine: self.engine,
-                client: Arc::clone(&self.client),
-                driver_id: Some(driver_id),
-            })),
-            Ok(DriverResponse::Error { error }) => Err(driver_wire_unsupported(error)),
-            Ok(_) => Err(Unsupported("unexpected engine IPC fork response")),
-            Err(_) => Err(Unsupported("engine IPC fork failed")),
-        }
+        Ok(Box::new(self.fork_attached().await?))
     }
 
     async fn extract(&mut self, node: &NodeId) -> Result<serde_json::Value, TransportError> {
@@ -277,6 +281,8 @@ pub struct SessionPool {
     sessions: BTreeMap<TempodSessionId, TempodSession>,
     bidi: BidiRouter,
     driver: Option<AttachedEngineDriver>,
+    bidi_contexts: BTreeMap<BrowsingContextId, AttachedEngineDriver>,
+    next_bidi_context_id: u64,
     next_id: u64,
     draining: bool,
 }
@@ -331,11 +337,32 @@ impl SessionPool {
     }
 
     pub fn attach_engine_driver(&mut self, engine: Engine, client: EngineIpcClient) {
-        self.driver = Some(AttachedEngineDriver::new(engine, client));
+        let driver = AttachedEngineDriver::new(engine, client);
+        self.bidi_contexts.clear();
+        self.next_bidi_context_id = 1;
+        self.bidi_contexts
+            .insert(default_context_id(), driver.clone());
+        self.driver = Some(driver);
     }
 
     pub fn detach_engine_driver(&mut self) {
         self.driver = None;
+        self.bidi_contexts.clear();
+        self.next_bidi_context_id = 1;
+    }
+
+    fn bidi_driver_for(&self, context: &BrowsingContextId) -> Option<AttachedEngineDriver> {
+        self.bidi_contexts
+            .get(context)
+            .cloned()
+            .or_else(|| self.bidi_contexts.get(&default_context_id()).cloned())
+    }
+
+    fn register_bidi_context(&mut self, driver: AttachedEngineDriver) -> BrowsingContextId {
+        let context = BrowsingContextId(format!("tempo-bidi-{}", self.next_bidi_context_id));
+        self.next_bidi_context_id = self.next_bidi_context_id.saturating_add(1);
+        self.bidi_contexts.insert(context.clone(), driver);
+        context
     }
 }
 
@@ -570,17 +597,19 @@ fn route_http_request(
 fn route_bidi(pool: &mut SessionPool, body: Vec<u8>) -> HttpResponse {
     match pool.bidi.route_json(&body) {
         Ok(RoutedCommand::Immediate(message)) => bidi_response(200, message),
-        Ok(RoutedCommand::Driver { id, command }) => match pool.driver.clone() {
-            Some(driver) => route_bidi_driver(driver, id, command),
-            None => bidi_response(
-                503,
-                BidiMessage::error(
-                    Some(id),
-                    BidiErrorCode::UnknownError,
-                    "driver command requires an attached engine driver",
-                ),
-            ),
-        },
+        Ok(RoutedCommand::Driver { id, command }) => {
+            if pool.driver.is_none() {
+                return bidi_response(
+                    503,
+                    BidiMessage::error(
+                        Some(id),
+                        BidiErrorCode::UnknownError,
+                        "driver command requires an attached engine driver",
+                    ),
+                );
+            }
+            route_bidi_driver(pool, id, command)
+        }
         Err(error) => bidi_response(
             400,
             BidiMessage::error(None, BidiErrorCode::InvalidArgument, error.to_string()),
@@ -589,25 +618,34 @@ fn route_bidi(pool: &mut SessionPool, body: Vec<u8>) -> HttpResponse {
 }
 
 fn route_bidi_driver(
-    driver: AttachedEngineDriver,
+    pool: &mut SessionPool,
     id: tempo_bidi::CommandId,
     command: BidiDriverCommand,
 ) -> HttpResponse {
     let message = match command {
         BidiDriverCommand::Navigate(command) => {
+            let Some(mut driver) = pool.bidi_driver_for(&command.context) else {
+                return bidi_response(
+                    503,
+                    BidiMessage::error(
+                        Some(id),
+                        BidiErrorCode::UnknownError,
+                        "driver command requires an attached engine driver",
+                    ),
+                );
+            };
             let url = command.url.clone();
-            match futures::executor::block_on({
-                let mut driver = driver.clone();
-                let url = url.clone();
-                async move { driver.goto(&url).await }
-            }) {
-                Ok(_) => BidiRouter::driver_success(
-                    id,
-                    NavigateResult {
-                        navigation: Some(format!("tempo-navigation-{id}")),
-                        url: command.url,
-                    },
-                ),
+            match futures::executor::block_on(driver.goto(&url)) {
+                Ok(_) => {
+                    pool.bidi_contexts.insert(command.context.clone(), driver);
+                    BidiRouter::driver_success(
+                        id,
+                        NavigateResult {
+                            navigation: Some(format!("tempo-navigation-{id}")),
+                            url: command.url,
+                        },
+                    )
+                }
                 Err(error) => Ok(BidiMessage::error(
                     Some(id),
                     BidiErrorCode::UnknownError,
@@ -616,20 +654,31 @@ fn route_bidi_driver(
             }
         }
         BidiDriverCommand::GetTree(command) => {
-            match futures::executor::block_on({
-                let mut driver = driver.clone();
-                async move { driver.observe().await }
-            }) {
-                Ok(observation) => BidiRouter::driver_success(
-                    id,
-                    GetTreeResult {
-                        contexts: vec![BrowsingContextInfo {
-                            context: command.root.unwrap_or_else(default_context_id),
-                            url: observation.url,
-                            children: Vec::new(),
-                        }],
-                    },
-                ),
+            let root = command.root.unwrap_or_else(default_context_id);
+            let Some(mut driver) = pool.bidi_driver_for(&root) else {
+                return bidi_response(
+                    503,
+                    BidiMessage::error(
+                        Some(id),
+                        BidiErrorCode::UnknownError,
+                        "driver command requires an attached engine driver",
+                    ),
+                );
+            };
+            match futures::executor::block_on(driver.observe()) {
+                Ok(observation) => {
+                    pool.bidi_contexts.insert(root.clone(), driver);
+                    BidiRouter::driver_success(
+                        id,
+                        GetTreeResult {
+                            contexts: vec![BrowsingContextInfo {
+                                context: root,
+                                url: observation.url,
+                                children: Vec::new(),
+                            }],
+                        },
+                    )
+                }
                 Err(error) => Ok(BidiMessage::error(
                     Some(id),
                     BidiErrorCode::UnknownError,
@@ -638,16 +687,27 @@ fn route_bidi_driver(
             }
         }
         BidiDriverCommand::CaptureScreenshot(_) => {
-            match futures::executor::block_on({
-                let mut driver = driver.clone();
-                async move { driver.screenshot().await }
-            }) {
-                Ok(bytes) => BidiRouter::driver_success(
-                    id,
-                    CaptureScreenshotResult {
-                        data: base64::engine::general_purpose::STANDARD.encode(bytes),
-                    },
-                ),
+            let context = screenshot_context(&command);
+            let Some(mut driver) = pool.bidi_driver_for(&context) else {
+                return bidi_response(
+                    503,
+                    BidiMessage::error(
+                        Some(id),
+                        BidiErrorCode::UnknownError,
+                        "driver command requires an attached engine driver",
+                    ),
+                );
+            };
+            match futures::executor::block_on(driver.screenshot()) {
+                Ok(bytes) => {
+                    pool.bidi_contexts.insert(context.clone(), driver);
+                    BidiRouter::driver_success(
+                        id,
+                        CaptureScreenshotResult {
+                            data: base64::engine::general_purpose::STANDARD.encode(bytes),
+                        },
+                    )
+                }
                 Err(error) => Ok(BidiMessage::error(
                     Some(id),
                     BidiErrorCode::UnknownError,
@@ -655,28 +715,58 @@ fn route_bidi_driver(
                 )),
             }
         }
-        BidiDriverCommand::CreateContext(_) => Ok(BidiMessage::error(
-            Some(id),
-            BidiErrorCode::UnknownError,
-            "browsingContext.create is not exposed by tempo DriverTrait",
-        )),
-        BidiDriverCommand::EvaluateScript(command) => {
-            match futures::executor::block_on({
-                let mut driver = driver.clone();
-                let expression = command.expression.clone();
-                async move {
-                    driver
-                        .evaluate_script(&expression, command.await_promise)
-                        .await
+        BidiDriverCommand::CreateContext(command) => {
+            let reference = command.reference_context.unwrap_or_else(default_context_id);
+            let Some(mut driver) = pool.bidi_driver_for(&reference) else {
+                return bidi_response(
+                    503,
+                    BidiMessage::error(
+                        Some(id),
+                        BidiErrorCode::UnknownError,
+                        "driver command requires an attached engine driver",
+                    ),
+                );
+            };
+            let created = futures::executor::block_on(driver.fork_attached());
+            match created {
+                Ok(forked) => {
+                    pool.bidi_contexts.insert(reference.clone(), driver);
+                    let context = pool.register_bidi_context(forked);
+                    BidiRouter::driver_success(id, CreateContextResult { context })
                 }
-            }) {
-                Ok(value) => BidiRouter::driver_success(
-                    id,
-                    ScriptEvaluateResult {
-                        result: value,
-                        realm: Some(command.target.context.0),
-                    },
-                ),
+                Err(error) => Ok(BidiMessage::error(
+                    Some(id),
+                    BidiErrorCode::UnknownError,
+                    error.to_string(),
+                )),
+            }
+        }
+        BidiDriverCommand::EvaluateScript(command) => {
+            let Some(mut driver) = pool.bidi_driver_for(&command.target.context) else {
+                return bidi_response(
+                    503,
+                    BidiMessage::error(
+                        Some(id),
+                        BidiErrorCode::UnknownError,
+                        "driver command requires an attached engine driver",
+                    ),
+                );
+            };
+            let expression = command.expression.clone();
+            match futures::executor::block_on(
+                driver.evaluate_script(&expression, command.await_promise),
+            ) {
+                Ok(value) => {
+                    pool.bidi_contexts
+                        .insert(command.target.context.clone(), driver);
+                    BidiRouter::driver_success(
+                        id,
+                        ScriptEvaluateResult {
+                            result: value,
+                            realm: Some(command.target.context.0),
+                        },
+                    )
+                }
                 Err(error) => Ok(BidiMessage::error(
                     Some(id),
                     BidiErrorCode::UnknownError,
@@ -697,6 +787,13 @@ fn route_bidi_driver(
 
 fn default_context_id() -> BrowsingContextId {
     BrowsingContextId("tempo-root".into())
+}
+
+fn screenshot_context(command: &BidiDriverCommand) -> BrowsingContextId {
+    match command {
+        BidiDriverCommand::CaptureScreenshot(params) => params.context.clone(),
+        _ => default_context_id(),
+    }
 }
 
 fn bidi_response(status: u16, message: BidiMessage) -> HttpResponse {
@@ -1206,6 +1303,105 @@ mod tests {
         assert_eq!(value["id"], 8);
         assert_eq!(value["result"]["result"], "Tempo");
         assert_eq!(value["result"]["realm"], "ctx");
+        Ok(())
+    }
+
+    #[test]
+    fn bidi_endpoint_routes_create_context_and_preserves_independent_context_state() -> TestResult {
+        let (client_stream, server_stream) = UnixStream::pair()?;
+        let server = thread::spawn(move || {
+            let mut connection = EngineIpcConnection::from_stream(server_stream);
+            let mut driver = TestDriver::new();
+            futures::executor::block_on(serve_driver_connection(&mut connection, &mut driver))
+        });
+        let mut pool = SessionPool::default();
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+
+        let created = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/bidi".into(),
+                host: None,
+                origin: None,
+                body: br#"{"id":1,"method":"browsingContext.create","params":{"type":"tab"}}"#
+                    .to_vec(),
+            },
+        )?;
+        let created: Value = serde_json::from_slice(&created.body)?;
+        let created_context = created["result"]["context"]
+            .as_str()
+            .ok_or("create result must include context")?
+            .to_string();
+
+        let root_nav = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/bidi".into(),
+                host: None,
+                origin: None,
+                body: br#"{"id":2,"method":"browsingContext.navigate","params":{"context":"tempo-root","url":"https://root.test"}}"#.to_vec(),
+            },
+        )?;
+        let fork_nav = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/bidi".into(),
+                host: None,
+                origin: None,
+                body: format!(
+                    r#"{{"id":3,"method":"browsingContext.navigate","params":{{"context":"{created_context}","url":"https://fork.test"}}}}"#
+                )
+                .into_bytes(),
+            },
+        )?;
+        let root_tree = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/bidi".into(),
+                host: None,
+                origin: None,
+                body:
+                    br#"{"id":4,"method":"browsingContext.getTree","params":{"root":"tempo-root"}}"#
+                        .to_vec(),
+            },
+        )?;
+        let fork_tree = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/bidi".into(),
+                host: None,
+                origin: None,
+                body: format!(
+                    r#"{{"id":5,"method":"browsingContext.getTree","params":{{"root":"{created_context}"}}}}"#
+                )
+                .into_bytes(),
+            },
+        )?;
+        drop(pool);
+        join_driver_handler(server)?;
+
+        let root_nav: Value = serde_json::from_slice(&root_nav.body)?;
+        let fork_nav: Value = serde_json::from_slice(&fork_nav.body)?;
+        let root_tree: Value = serde_json::from_slice(&root_tree.body)?;
+        let fork_tree: Value = serde_json::from_slice(&fork_tree.body)?;
+
+        assert_eq!(created["type"], "success");
+        assert_eq!(created["result"]["context"], created_context);
+        assert_eq!(root_nav["type"], "success");
+        assert_eq!(fork_nav["type"], "success");
+        assert_eq!(
+            root_tree["result"]["contexts"][0]["url"],
+            "https://root.test"
+        );
+        assert_eq!(
+            fork_tree["result"]["contexts"][0]["url"],
+            "https://fork.test"
+        );
         Ok(())
     }
 
