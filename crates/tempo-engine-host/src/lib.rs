@@ -7,6 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::fs::FileTypeExt;
@@ -256,7 +257,17 @@ pub enum DriverCommand {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DriverRequest {
     pub id: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub driver_id: Option<String>,
     pub command: DriverCommand,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct DriverRequestPayload {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    driver_id: Option<String>,
+    #[serde(flatten)]
+    command: DriverCommand,
 }
 
 /// Serializable step outcome mirroring `tempo_driver::StepOutcome`.
@@ -384,12 +395,23 @@ impl EngineIpcClient {
     }
 
     pub fn request(&mut self, command: DriverCommand) -> Result<DriverResponse, EngineHostError> {
+        self.request_for(None, command)
+    }
+
+    pub fn request_for(
+        &mut self,
+        driver_id: Option<&str>,
+        command: DriverCommand,
+    ) -> Result<DriverResponse, EngineHostError> {
         let id = self.next_id;
         self.next_id = self
             .next_id
             .checked_add(1)
             .ok_or(EngineHostError::RequestIdExhausted)?;
-        let payload = serde_json::to_value(command)?;
+        let payload = serde_json::to_value(DriverRequestPayload {
+            driver_id: driver_id.map(str::to_string),
+            command,
+        })?;
         write_frame(
             &mut self.stream,
             &WireFrame::new(id, DRIVER_REQUEST_METHOD, payload),
@@ -428,9 +450,11 @@ impl EngineIpcConnection {
 
     pub fn read_driver_request(&mut self) -> Result<DriverRequest, EngineHostError> {
         let request = read_expected_frame(&mut self.stream, DRIVER_REQUEST_METHOD)?;
+        let payload: DriverRequestPayload = serde_json::from_value(request.payload)?;
         Ok(DriverRequest {
             id: request.id,
-            command: serde_json::from_value(request.payload)?,
+            driver_id: payload.driver_id,
+            command: payload.command,
         })
     }
 
@@ -460,19 +484,96 @@ pub async fn serve_driver_connection<D>(
 where
     D: DriverTrait + ?Sized,
 {
+    let mut forks = BTreeMap::new();
+    let mut next_fork_id = 1_u64;
+
     loop {
         let request = match connection.read_driver_request() {
             Ok(request) => request,
             Err(EngineHostError::Io(err)) if is_disconnect(&err) => return Ok(()),
             Err(err) => return Err(err),
         };
-        let should_close = matches!(request.command, DriverCommand::Close);
-        let response = execute_driver_command(driver, request.command).await;
+        let should_close_root =
+            request.driver_id.is_none() && matches!(request.command, DriverCommand::Close);
+        let response = execute_routed_driver_command(
+            driver,
+            &mut forks,
+            &mut next_fork_id,
+            request.driver_id.as_deref(),
+            request.command,
+        )
+        .await;
         connection.write_driver_response(request.id, response)?;
-        if should_close {
+        if should_close_root {
             return Ok(());
         }
     }
+}
+
+async fn execute_routed_driver_command<D>(
+    root_driver: &mut D,
+    forks: &mut BTreeMap<String, Box<dyn DriverTrait>>,
+    next_fork_id: &mut u64,
+    driver_id: Option<&str>,
+    command: DriverCommand,
+) -> DriverResponse
+where
+    D: DriverTrait + ?Sized,
+{
+    let Some(driver_id) = driver_id else {
+        return execute_driver_command_with_forks(root_driver, forks, next_fork_id, command).await;
+    };
+
+    let Some(mut forked_driver) = forks.remove(driver_id) else {
+        return DriverResponse::Error {
+            error: DriverWireError::protocol(format!("unknown forked driver: {driver_id}")),
+        };
+    };
+    let should_remove = matches!(command, DriverCommand::Close);
+    let response =
+        execute_driver_command_with_forks(forked_driver.as_mut(), forks, next_fork_id, command)
+            .await;
+    if !(should_remove && matches!(response, DriverResponse::Closed)) {
+        forks.insert(driver_id.to_string(), forked_driver);
+    }
+    response
+}
+
+async fn execute_driver_command_with_forks<D>(
+    driver: &mut D,
+    forks: &mut BTreeMap<String, Box<dyn DriverTrait>>,
+    next_fork_id: &mut u64,
+    command: DriverCommand,
+) -> DriverResponse
+where
+    D: DriverTrait + ?Sized,
+{
+    match command {
+        DriverCommand::Fork => match driver.fork().await {
+            Ok(forked_driver) => register_fork_driver(forks, next_fork_id, forked_driver),
+            Err(error) => DriverResponse::Error {
+                error: DriverWireError::unsupported(&error),
+            },
+        },
+        command => execute_driver_command(driver, command).await,
+    }
+}
+
+fn register_fork_driver(
+    forks: &mut BTreeMap<String, Box<dyn DriverTrait>>,
+    next_fork_id: &mut u64,
+    forked_driver: Box<dyn DriverTrait>,
+) -> DriverResponse {
+    let fork_id = *next_fork_id;
+    let Some(next_id) = next_fork_id.checked_add(1) else {
+        return DriverResponse::Error {
+            error: DriverWireError::protocol("fork driver id counter exhausted"),
+        };
+    };
+    *next_fork_id = next_id;
+    let driver_id = format!("fork-{fork_id}");
+    forks.insert(driver_id.clone(), forked_driver);
+    DriverResponse::Forked { driver_id }
 }
 
 /// Execute one typed driver command and convert driver failures into wire-safe responses.
@@ -505,13 +606,8 @@ where
             },
             Err(error) => driver_error(error),
         },
-        DriverCommand::Fork => match driver.fork().await {
-            Ok(_) => DriverResponse::Error {
-                error: DriverWireError::unsupported(&Unsupported("UDS fork handle allocation")),
-            },
-            Err(error) => DriverResponse::Error {
-                error: DriverWireError::unsupported(&error),
-            },
+        DriverCommand::Fork => DriverResponse::Error {
+            error: DriverWireError::protocol("fork requires a persistent driver connection"),
         },
         DriverCommand::Extract { node } => match driver.extract(&node).await {
             Ok(value) => DriverResponse::Extracted { value },
@@ -651,13 +747,22 @@ mod tests {
     use serde_json::json;
     use std::error::Error;
     use std::fs;
-    use std::io::Cursor;
+    use std::io::{self, Cursor};
     use std::thread;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tempo_driver::TestDriver;
     use tempo_session::JournalEvent;
 
     type TestResult = Result<(), Box<dyn Error>>;
+    type ForkClientResponses = (
+        String,
+        DriverResponse,
+        DriverResponse,
+        DriverResponse,
+        DriverResponse,
+        DriverResponse,
+        DriverResponse,
+    );
 
     #[test]
     fn frame_codec_round_trips_json_payload() -> TestResult {
@@ -878,6 +983,7 @@ mod tests {
         let mut connection = server.accept()?;
         let request = connection.read_driver_request()?;
         assert_eq!(request.id, 1);
+        assert_eq!(request.driver_id, None);
         assert_eq!(
             request.command,
             DriverCommand::ObserveDiff { since_seq: 41 }
@@ -940,6 +1046,57 @@ mod tests {
             }
         );
         assert_eq!(closed, DriverResponse::Closed);
+        Ok(())
+    }
+
+    #[test]
+    fn serve_driver_connection_routes_forked_driver_handles() -> TestResult {
+        let (client_stream, server_stream) = UnixStream::pair()?;
+        let mut connection = EngineIpcConnection::from_stream(server_stream);
+        let handle = thread::spawn(move || -> Result<ForkClientResponses, EngineHostError> {
+            let mut client = EngineIpcClient::from_stream(client_stream);
+            let root_goto = client.request(DriverCommand::Goto {
+                url: "https://root.test".into(),
+            })?;
+            let forked = client.request(DriverCommand::Fork)?;
+            let DriverResponse::Forked { driver_id } = forked else {
+                return Err(EngineHostError::Io(io::Error::other(format!(
+                    "unexpected fork response: {forked:?}"
+                ))));
+            };
+            let fork_goto = client.request_for(
+                Some(&driver_id),
+                DriverCommand::Goto {
+                    url: "https://fork.test".into(),
+                },
+            )?;
+            let root_observe = client.request(DriverCommand::Observe)?;
+            let fork_observe = client.request_for(Some(&driver_id), DriverCommand::Observe)?;
+            let fork_close = client.request_for(Some(&driver_id), DriverCommand::Close)?;
+            let root_close = client.request(DriverCommand::Close)?;
+            Ok((
+                driver_id,
+                root_goto,
+                fork_goto,
+                root_observe,
+                fork_observe,
+                fork_close,
+                root_close,
+            ))
+        });
+        let mut driver = TestDriver::new();
+
+        futures::executor::block_on(serve_driver_connection(&mut connection, &mut driver))?;
+        let (driver_id, root_goto, fork_goto, root_observe, fork_observe, fork_close, root_close) =
+            join_fork_client(handle)?;
+
+        assert_eq!(driver_id, "fork-1");
+        assert_observation_response(root_goto, "https://root.test", 1)?;
+        assert_observation_response(fork_goto, "https://fork.test", 2)?;
+        assert_observation_response(root_observe, "https://root.test", 1)?;
+        assert_observation_response(fork_observe, "https://fork.test", 2)?;
+        assert_eq!(fork_close, DriverResponse::Closed);
+        assert_eq!(root_close, DriverResponse::Closed);
         Ok(())
     }
 
@@ -1008,6 +1165,30 @@ mod tests {
         match handle.join() {
             Ok(result) => Ok(result?),
             Err(_) => Err("client thread panicked".into()),
+        }
+    }
+
+    fn join_fork_client(
+        handle: thread::JoinHandle<Result<ForkClientResponses, EngineHostError>>,
+    ) -> Result<ForkClientResponses, Box<dyn Error>> {
+        match handle.join() {
+            Ok(result) => Ok(result?),
+            Err(_) => Err("client thread panicked".into()),
+        }
+    }
+
+    fn assert_observation_response(
+        response: DriverResponse,
+        expected_url: &str,
+        expected_seq: u64,
+    ) -> TestResult {
+        match response {
+            DriverResponse::Observation { observation } => {
+                assert_eq!(observation.url, expected_url);
+                assert_eq!(observation.seq, expected_seq);
+                Ok(())
+            }
+            other => Err(format!("unexpected driver response: {other:?}").into()),
         }
     }
 

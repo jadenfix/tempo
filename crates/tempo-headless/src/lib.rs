@@ -59,6 +59,7 @@ pub struct TempodSession {
 pub struct AttachedEngineDriver {
     engine: Engine,
     client: Arc<Mutex<EngineIpcClient>>,
+    driver_id: Option<String>,
 }
 
 impl AttachedEngineDriver {
@@ -66,6 +67,7 @@ impl AttachedEngineDriver {
         Self {
             engine,
             client: Arc::new(Mutex::new(client)),
+            driver_id: None,
         }
     }
 
@@ -74,7 +76,7 @@ impl AttachedEngineDriver {
             .client
             .lock()
             .map_err(|_| DriverClientError::LockFailed)?;
-        Ok(client.request(command)?)
+        Ok(client.request_for(self.driver_id.as_deref(), command)?)
     }
 
     fn request_observation(
@@ -173,6 +175,7 @@ impl fmt::Debug for AttachedEngineDriver {
         formatter
             .debug_struct("AttachedEngineDriver")
             .field("engine", &self.engine)
+            .field("driver_id", &self.driver_id)
             .finish_non_exhaustive()
     }
 }
@@ -215,9 +218,11 @@ impl DriverTrait for AttachedEngineDriver {
 
     async fn fork(&mut self) -> Result<Box<dyn DriverTrait>, Unsupported> {
         match self.request(HostDriverCommand::Fork) {
-            Ok(DriverResponse::Forked { .. }) => {
-                Err(Unsupported("engine IPC fork attachment unavailable"))
-            }
+            Ok(DriverResponse::Forked { driver_id }) => Ok(Box::new(Self {
+                engine: self.engine,
+                client: Arc::clone(&self.client),
+                driver_id: Some(driver_id),
+            })),
             Ok(DriverResponse::Error { error }) => Err(driver_wire_unsupported(error)),
             Ok(_) => Err(Unsupported("unexpected engine IPC fork response")),
             Err(_) => Err(Unsupported("engine IPC fork failed")),
@@ -959,7 +964,10 @@ mod tests {
     use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
     use tempo_agent::{IdempotencyKey, StepTripleOutcome};
-    use tempo_engine_host::{DriverRequest, EngineIpcConnection, RestartPolicy};
+    use tempo_driver::TestDriver;
+    use tempo_engine_host::{
+        serve_driver_connection, DriverRequest, EngineIpcConnection, RestartPolicy,
+    };
     use tempo_schema::{Action, ObservationDiff};
 
     type TestResult = Result<(), Box<dyn Error>>;
@@ -1300,6 +1308,39 @@ mod tests {
             "https://mcp.test"
         );
         assert_eq!(value["result"]["structuredContent"]["seq"], 4);
+        Ok(())
+    }
+
+    #[test]
+    fn attached_engine_driver_fork_routes_to_forked_handle() -> TestResult {
+        let (client_stream, server_stream) = UnixStream::pair()?;
+        let server = thread::spawn(move || -> Result<(), EngineHostError> {
+            let mut connection = EngineIpcConnection::from_stream(server_stream);
+            let mut driver = TestDriver::new();
+            futures::executor::block_on(serve_driver_connection(&mut connection, &mut driver))
+        });
+        let mut root_driver =
+            AttachedEngineDriver::new(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+
+        let (root_observation, fork_observation) = futures::executor::block_on(async {
+            root_driver.goto("https://root.test").await?;
+            let mut forked_driver = root_driver
+                .fork()
+                .await
+                .map_err(|error| Box::new(error) as Box<dyn Error>)?;
+            forked_driver.goto("https://fork.test").await?;
+            let root_observation = root_driver.observe().await?;
+            let fork_observation = forked_driver.observe().await?;
+            forked_driver.close().await?;
+            root_driver.close().await?;
+            Ok::<_, Box<dyn Error>>((root_observation, fork_observation))
+        })?;
+        join_driver_handler(server)?;
+
+        assert_eq!(root_observation.url, "https://root.test");
+        assert_eq!(root_observation.seq, 1);
+        assert_eq!(fork_observation.url, "https://fork.test");
+        assert_eq!(fork_observation.seq, 2);
         Ok(())
     }
 

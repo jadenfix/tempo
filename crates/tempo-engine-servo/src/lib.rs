@@ -92,6 +92,7 @@ impl ServoEngineConfig {
 pub struct ServoIpcDriver {
     config: ServoEngineConfig,
     client: Arc<Mutex<EngineIpcClient>>,
+    driver_id: Option<String>,
 }
 
 impl ServoIpcDriver {
@@ -109,6 +110,7 @@ impl ServoIpcDriver {
         Self {
             config,
             client: Arc::new(Mutex::new(client)),
+            driver_id: None,
         }
     }
 
@@ -121,7 +123,7 @@ impl ServoIpcDriver {
             .client
             .lock()
             .map_err(|_| ServoEngineError::DriverLockFailed)?;
-        Ok(client.request(command)?)
+        Ok(client.request_for(self.driver_id.as_deref(), command)?)
     }
 }
 
@@ -193,9 +195,11 @@ impl DriverTrait for ServoIpcDriver {
     async fn fork(&mut self) -> Result<Box<dyn DriverTrait>, Unsupported> {
         self.config.native_fork()?;
         match self.request(DriverCommand::Fork) {
-            Ok(DriverResponse::Forked { .. }) => {
-                Err(Unsupported("engine IPC fork handle allocation"))
-            }
+            Ok(DriverResponse::Forked { driver_id }) => Ok(Box::new(Self {
+                config: self.config.clone(),
+                client: Arc::clone(&self.client),
+                driver_id: Some(driver_id),
+            })),
             Ok(DriverResponse::Error { error }) => Err(driver_wire_unsupported(error)),
             Ok(_) => Err(Unsupported("unexpected engine IPC fork response")),
             Err(_) => Err(Unsupported("engine IPC fork failed")),
@@ -1048,6 +1052,39 @@ mod tests {
         assert_eq!(extracted["node"], "submit");
         assert_eq!(evaluated["expression"], "document.title");
         assert_eq!(evaluated["awaitPromise"], true);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tempo_fork_servo_ipc_driver_routes_fork_handles(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (client_stream, server_stream) = UnixStream::pair()?;
+        let server = tokio::spawn(async move {
+            let mut driver = TestDriver::new();
+            let mut connection = EngineIpcConnection::from_stream(server_stream);
+            serve_driver_connection(&mut connection, &mut driver).await
+        });
+        let mut root_driver = ServoIpcDriver::from_client(
+            ServoEngineConfig::tempo_fork(),
+            tempo_engine_host::EngineIpcClient::from_stream(client_stream),
+        );
+
+        root_driver.goto("https://root.test").await?;
+        let mut forked_driver = root_driver
+            .fork()
+            .await
+            .map_err(|error| Box::new(error) as Box<dyn Error>)?;
+        forked_driver.goto("https://fork.test").await?;
+        let root_observation = root_driver.observe().await?;
+        let fork_observation = forked_driver.observe().await?;
+        forked_driver.close().await?;
+        root_driver.close().await?;
+        server.await??;
+
+        assert_eq!(root_observation.url, "https://root.test");
+        assert_eq!(root_observation.seq, 1);
+        assert_eq!(fork_observation.url, "https://fork.test");
+        assert_eq!(fork_observation.seq, 2);
         Ok(())
     }
 
