@@ -702,6 +702,98 @@ mod tests {
     }
 
     #[test]
+    fn malformed_frame_corpus_is_rejected() {
+        enum ExpectedFailure {
+            Io,
+            Json,
+            TooLarge,
+        }
+
+        let cases = [
+            ("empty stream", Vec::new(), ExpectedFailure::Io),
+            ("short length prefix", vec![0, 0], ExpectedFailure::Io),
+            (
+                "declared body is truncated",
+                framed_bytes(16, b"{\"id\":1"),
+                ExpectedFailure::Io,
+            ),
+            (
+                "non-object json body",
+                framed_bytes(4, b"null"),
+                ExpectedFailure::Json,
+            ),
+            (
+                "object missing required frame fields",
+                framed_bytes(2, b"{}"),
+                ExpectedFailure::Json,
+            ),
+            (
+                "invalid json body",
+                framed_bytes(5, b"abcde"),
+                ExpectedFailure::Json,
+            ),
+            (
+                "length prefix exceeds cap",
+                (MAX_FRAME_BYTES + 1).to_be_bytes().to_vec(),
+                ExpectedFailure::TooLarge,
+            ),
+        ];
+
+        for (name, bytes, expected) in cases {
+            let result = read_frame(&mut Cursor::new(bytes));
+            match expected {
+                ExpectedFailure::Io => assert!(
+                    matches!(result, Err(EngineHostError::Io(_))),
+                    "{name}: {result:?}"
+                ),
+                ExpectedFailure::Json => assert!(
+                    matches!(result, Err(EngineHostError::Json(_))),
+                    "{name}: {result:?}"
+                ),
+                ExpectedFailure::TooLarge => assert!(
+                    matches!(result, Err(EngineHostError::FrameTooLarge { .. })),
+                    "{name}: {result:?}"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn unexpected_frame_method_is_rejected_before_payload_decode() -> TestResult {
+        let mut bytes = Vec::new();
+        write_frame(
+            &mut bytes,
+            &WireFrame::new(1, DRIVER_RESPONSE_METHOD, json!({})),
+        )?;
+
+        assert!(matches!(
+            read_expected_frame(&mut Cursor::new(bytes), DRIVER_REQUEST_METHOD),
+            Err(EngineHostError::UnexpectedFrameMethod { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn driver_request_rejects_invalid_command_payload_over_uds() -> TestResult {
+        let (mut client_stream, server_stream) = UnixStream::pair()?;
+        let mut connection = EngineIpcConnection::from_stream(server_stream);
+        write_frame(
+            &mut client_stream,
+            &WireFrame::new(
+                1,
+                DRIVER_REQUEST_METHOD,
+                json!({"kind": "definitely_not_a_driver_command"}),
+            ),
+        )?;
+
+        assert!(matches!(
+            connection.read_driver_request(),
+            Err(EngineHostError::Json(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn child_process_starts_and_reports_pid() -> TestResult {
         let mut host = EngineHost::spawn(shell_config("sleep 2"))?;
         let pid = host.pid();
@@ -946,5 +1038,12 @@ mod tests {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(err) => Err(err),
         }
+    }
+
+    fn framed_bytes(len: u32, body: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(4 + body.len());
+        bytes.extend_from_slice(&len.to_be_bytes());
+        bytes.extend_from_slice(body);
+        bytes
     }
 }
