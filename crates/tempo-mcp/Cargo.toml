@@ -13,6 +13,7 @@ tempo-observe = { path = "../tempo-observe" }
 tempo-schema = { path = "../tempo-schema" }
 tempo-driver = { path = "../tempo-driver" }
 thiserror.workspace = true
+tokio = { version = "1", features = ["rt"] }
 url = "2"
 
 [dev-dependencies]
