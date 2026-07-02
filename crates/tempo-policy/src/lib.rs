@@ -413,6 +413,7 @@ mod tests {
                 SideEffect::Write,
             ),
             (Action::Scroll { x: 0.0, y: 100.0 }, SideEffect::Read),
+            (Action::Wait { millis: 250 }, SideEffect::Read),
             (
                 Action::Extract {
                     node: NodeId("main".into()),

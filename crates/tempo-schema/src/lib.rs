@@ -7,9 +7,11 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::error::Error;
+use std::fmt;
 
 /// Frozen schema version. Bumped only by a deliberate contract change (final.md §8.2 M0).
-pub const SCHEMA_VERSION: &str = "2.0.0-draft";
+pub const SCHEMA_VERSION: &str = "2.0.0";
 
 /// Stable identifier for a page element that survives relayout / re-render.
 ///
@@ -122,6 +124,11 @@ pub enum Action {
         x: f32,
         y: f32,
     },
+    /// Fixed wait fallback. Prefer `QuiescencePolicy::Composite`; this exists
+    /// to preserve compatibility with beater's legacy `BrowserAction::Wait`.
+    Wait {
+        millis: u64,
+    },
     Extract {
         node: NodeId,
     },
@@ -136,14 +143,406 @@ impl Action {
     /// Static side-effect class for this action (before argument-derived escalation).
     pub fn side_effect(&self) -> SideEffect {
         match self {
-            Action::Goto { .. } | Action::Scroll { .. } | Action::Extract { .. } => {
-                SideEffect::Read
-            }
+            Action::Goto { .. }
+            | Action::Scroll { .. }
+            | Action::Wait { .. }
+            | Action::Extract { .. } => SideEffect::Read,
             Action::Click { .. } | Action::Type { .. } | Action::Select { .. } => SideEffect::Write,
             // Skills declare their own class; default to the safe-but-gated Write.
             Action::Skill { .. } => SideEffect::Write,
         }
     }
+}
+
+/// Step status preserved when converting beater `StepTriple`s into tempo's schema layer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StepStatus {
+    Ok,
+    Error,
+}
+
+/// Grounding evidence for a semantic action.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Grounding {
+    #[serde(default)]
+    pub node: Option<NodeId>,
+    pub selector_existed: bool,
+    pub matched_element: bool,
+}
+
+/// Outcome of one action after execution.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ActionOutcome {
+    pub status: StepStatus,
+    #[serde(default)]
+    pub error: Option<String>,
+    pub grounding: Grounding,
+    pub observation: CompiledObservation,
+    #[serde(default)]
+    pub diff: Option<ObservationDiff>,
+}
+
+/// Contract-level observe → decide → act record used for beater StepTriple interop.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct StepTriple {
+    pub seq: u64,
+    pub observation_before: CompiledObservation,
+    #[serde(default)]
+    pub decision: Option<Value>,
+    pub action: Action,
+    pub outcome: ActionOutcome,
+}
+
+/// Error returned when a tempo action or StepTriple cannot be expressed in beater's
+/// legacy browser contract without losing meaning.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BeaterCompatError {
+    UnsupportedSkillAction { name: String },
+    UnsupportedScrollCoordinates { x: String, y: String },
+    UnsupportedDiff { since_seq: u64, seq: u64 },
+    InvalidDecision { reason: String },
+}
+
+impl fmt::Display for BeaterCompatError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedSkillAction { name } => {
+                write!(
+                    f,
+                    "tempo skill action cannot convert to beater BrowserAction: {name}"
+                )
+            }
+            Self::UnsupportedScrollCoordinates { x, y } => {
+                write!(
+                    f,
+                    "tempo scroll coordinates cannot convert losslessly to beater BrowserAction: x={x}, y={y}"
+                )
+            }
+            Self::UnsupportedDiff { since_seq, seq } => {
+                write!(
+                    f,
+                    "tempo ActionOutcome diff cannot convert to beater StepOutcome: since_seq={since_seq}, seq={seq}"
+                )
+            }
+            Self::InvalidDecision { reason } => {
+                write!(
+                    f,
+                    "tempo StepTriple decision is not a beater LlmDecision: {reason}"
+                )
+            }
+        }
+    }
+}
+
+impl Error for BeaterCompatError {}
+
+impl From<beater_browser::BrowserAction> for Action {
+    fn from(action: beater_browser::BrowserAction) -> Self {
+        match action {
+            beater_browser::BrowserAction::Goto { url } => Self::Goto { url },
+            beater_browser::BrowserAction::Click { selector } => Self::Click {
+                node: NodeId(selector),
+            },
+            beater_browser::BrowserAction::Type { selector, text } => Self::Type {
+                node: NodeId(selector),
+                text,
+            },
+            beater_browser::BrowserAction::Scroll { x, y } => Self::Scroll {
+                x: x as f32,
+                y: y as f32,
+            },
+            beater_browser::BrowserAction::Select { selector, value } => Self::Select {
+                node: NodeId(selector),
+                value,
+            },
+            beater_browser::BrowserAction::Wait { millis } => Self::Wait { millis },
+            beater_browser::BrowserAction::Extract { selector } => Self::Extract {
+                node: NodeId(selector),
+            },
+        }
+    }
+}
+
+impl TryFrom<Action> for beater_browser::BrowserAction {
+    type Error = BeaterCompatError;
+
+    fn try_from(action: Action) -> Result<Self, Self::Error> {
+        match action {
+            Action::Goto { url } => Ok(Self::Goto { url }),
+            Action::Click { node } => Ok(Self::Click { selector: node.0 }),
+            Action::Type { node, text } => Ok(Self::Type {
+                selector: node.0,
+                text,
+            }),
+            Action::Select { node, value } => Ok(Self::Select {
+                selector: node.0,
+                value,
+            }),
+            Action::Scroll { x, y } => Ok(Self::Scroll {
+                x: scroll_component_to_i64(x).ok_or_else(|| {
+                    BeaterCompatError::UnsupportedScrollCoordinates {
+                        x: x.to_string(),
+                        y: y.to_string(),
+                    }
+                })?,
+                y: scroll_component_to_i64(y).ok_or_else(|| {
+                    BeaterCompatError::UnsupportedScrollCoordinates {
+                        x: x.to_string(),
+                        y: y.to_string(),
+                    }
+                })?,
+            }),
+            Action::Wait { millis } => Ok(Self::Wait { millis }),
+            Action::Extract { node } => Ok(Self::Extract { selector: node.0 }),
+            Action::Skill { name, .. } => Err(BeaterCompatError::UnsupportedSkillAction { name }),
+        }
+    }
+}
+
+impl From<beater_browser::Observation> for CompiledObservation {
+    fn from(observation: beater_browser::Observation) -> Self {
+        let mut elements = Vec::new();
+        if let Some(title) = observation.title.filter(|title| !title.is_empty()) {
+            elements.push(compat_element("beater:title", "document_title", title, 1.0));
+        }
+        if let Some(accessibility_tree) = observation.accessibility_tree {
+            elements.push(compat_element(
+                "beater:accessibility_tree",
+                "accessibility_tree",
+                accessibility_tree.to_string(),
+                0.8,
+            ));
+        }
+        if let Some(dom_html) = observation.dom_html.filter(|dom_html| !dom_html.is_empty()) {
+            elements.push(compat_element(
+                "beater:dom_html",
+                "document",
+                dom_html,
+                0.25,
+            ));
+        }
+        if !observation.console.is_empty() {
+            if let Some(element) = compat_json_element(
+                "beater:console",
+                "console_messages",
+                &observation.console,
+                0.2,
+            ) {
+                elements.push(element);
+            }
+        }
+        if !observation.network.is_empty() {
+            if let Some(element) = compat_json_element(
+                "beater:network",
+                "network_requests",
+                &observation.network,
+                0.2,
+            ) {
+                elements.push(element);
+            }
+        }
+
+        Self {
+            schema_version: SCHEMA_VERSION.into(),
+            url: observation.url,
+            seq: 0,
+            elements,
+            marks: vec![],
+        }
+    }
+}
+
+impl From<CompiledObservation> for beater_browser::Observation {
+    fn from(observation: CompiledObservation) -> Self {
+        let title = compat_text_from(&observation.elements, "beater:title");
+        let dom_html = compat_text_from(&observation.elements, "beater:dom_html");
+        let accessibility_tree =
+            compat_json_from(&observation.elements, "beater:accessibility_tree")
+                .or_else(|| serde_json::to_value(&observation.elements).ok());
+        let console = compat_json_from(&observation.elements, "beater:console").unwrap_or_default();
+        let network = compat_json_from(&observation.elements, "beater:network").unwrap_or_default();
+
+        Self {
+            url: observation.url,
+            title,
+            dom_html,
+            accessibility_tree,
+            console,
+            network,
+        }
+    }
+}
+
+impl From<beater_browser::StepStatus> for StepStatus {
+    fn from(status: beater_browser::StepStatus) -> Self {
+        match status {
+            beater_browser::StepStatus::Ok => Self::Ok,
+            beater_browser::StepStatus::Error => Self::Error,
+        }
+    }
+}
+
+impl From<StepStatus> for beater_browser::StepStatus {
+    fn from(status: StepStatus) -> Self {
+        match status {
+            StepStatus::Ok => Self::Ok,
+            StepStatus::Error => Self::Error,
+        }
+    }
+}
+
+impl From<beater_browser::Grounding> for Grounding {
+    fn from(grounding: beater_browser::Grounding) -> Self {
+        Self {
+            node: grounding.selector.map(NodeId),
+            selector_existed: grounding.selector_existed,
+            matched_element: grounding.matched_element,
+        }
+    }
+}
+
+impl From<Grounding> for beater_browser::Grounding {
+    fn from(grounding: Grounding) -> Self {
+        Self {
+            selector: grounding.node.map(|node| node.0),
+            selector_existed: grounding.selector_existed,
+            matched_element: grounding.matched_element,
+        }
+    }
+}
+
+impl From<beater_browser::StepOutcome> for ActionOutcome {
+    fn from(outcome: beater_browser::StepOutcome) -> Self {
+        Self {
+            status: outcome.status.into(),
+            error: outcome.error,
+            grounding: outcome.grounding.into(),
+            observation: outcome.observation.into(),
+            diff: None,
+        }
+    }
+}
+
+impl TryFrom<ActionOutcome> for beater_browser::StepOutcome {
+    type Error = BeaterCompatError;
+
+    fn try_from(outcome: ActionOutcome) -> Result<Self, Self::Error> {
+        if let Some(diff) = outcome.diff {
+            return Err(BeaterCompatError::UnsupportedDiff {
+                since_seq: diff.since_seq,
+                seq: diff.seq,
+            });
+        }
+
+        Ok(Self {
+            status: outcome.status.into(),
+            error: outcome.error,
+            grounding: outcome.grounding.into(),
+            observation: outcome.observation.into(),
+        })
+    }
+}
+
+impl From<beater_browser::StepTriple> for StepTriple {
+    fn from(triple: beater_browser::StepTriple) -> Self {
+        let decision = triple
+            .decision
+            .and_then(|decision| serde_json::to_value(decision).ok());
+        Self {
+            seq: triple.seq,
+            observation_before: triple.observation_before.into(),
+            decision,
+            action: triple.action.into(),
+            outcome: triple.outcome.into(),
+        }
+    }
+}
+
+impl TryFrom<StepTriple> for beater_browser::StepTriple {
+    type Error = BeaterCompatError;
+
+    fn try_from(triple: StepTriple) -> Result<Self, Self::Error> {
+        let decision = match triple.decision {
+            Some(value) => Some(serde_json::from_value(value).map_err(|error| {
+                BeaterCompatError::InvalidDecision {
+                    reason: error.to_string(),
+                }
+            })?),
+            None => None,
+        };
+
+        Ok(Self {
+            seq: triple.seq,
+            observation_before: triple.observation_before.into(),
+            decision,
+            action: beater_browser::BrowserAction::try_from(triple.action)?,
+            outcome: beater_browser::StepOutcome::try_from(triple.outcome)?,
+        })
+    }
+}
+
+fn scroll_component_to_i64(value: f32) -> Option<i64> {
+    let value = f64::from(value);
+    if !value.is_finite() || value.fract() != 0.0 {
+        return None;
+    }
+    if value < i64::MIN as f64 || value > i64::MAX as f64 {
+        return None;
+    }
+    Some(value as i64)
+}
+
+fn compat_element(
+    node_id: impl Into<String>,
+    role: impl Into<String>,
+    text: impl Into<String>,
+    rank: f32,
+) -> InteractiveElement {
+    InteractiveElement {
+        node_id: NodeId(node_id.into()),
+        role: role.into(),
+        name: vec![TaintSpan {
+            provenance: Provenance::Page,
+            text: text.into(),
+        }],
+        value: vec![],
+        bounds: None,
+        rank,
+    }
+}
+
+fn compat_json_element<T: Serialize>(
+    node_id: impl Into<String>,
+    role: impl Into<String>,
+    value: &T,
+    rank: f32,
+) -> Option<InteractiveElement> {
+    serde_json::to_string(value)
+        .ok()
+        .map(|text| compat_element(node_id, role, text, rank))
+}
+
+fn compat_text_from(elements: &[InteractiveElement], node_id: &str) -> Option<String> {
+    elements
+        .iter()
+        .find(|element| element.node_id.0 == node_id)
+        .map(|element| flatten_spans(&element.name))
+}
+
+fn compat_json_from<T: for<'de> Deserialize<'de>>(
+    elements: &[InteractiveElement],
+    node_id: &str,
+) -> Option<T> {
+    compat_text_from(elements, node_id).and_then(|text| serde_json::from_str(&text).ok())
+}
+
+fn flatten_spans(spans: &[TaintSpan]) -> String {
+    spans
+        .iter()
+        .map(|span| span.text.as_str())
+        .collect::<Vec<_>>()
+        .join("")
 }
 
 /// How the executor decides a page has settled after a batch (final.md §2.4).
@@ -185,6 +584,10 @@ pub fn schema_bundle_json_schema() -> Value {
     defs.insert("Action".into(), action_json_schema());
     defs.insert("QuiescencePolicy".into(), quiescence_policy_json_schema());
     defs.insert("ActionBatch".into(), action_batch_json_schema());
+    defs.insert("StepStatus".into(), step_status_json_schema());
+    defs.insert("Grounding".into(), grounding_json_schema());
+    defs.insert("ActionOutcome".into(), action_outcome_json_schema());
+    defs.insert("StepTriple".into(), step_triple_json_schema());
 
     json!({
         "$schema": JSON_SCHEMA_DRAFT,
@@ -196,7 +599,8 @@ pub fn schema_bundle_json_schema() -> Value {
             "compiled_observation": { "$ref": "#/$defs/CompiledObservation" },
             "observation_diff": { "$ref": "#/$defs/ObservationDiff" },
             "action": { "$ref": "#/$defs/Action" },
-            "action_batch": { "$ref": "#/$defs/ActionBatch" }
+            "action_batch": { "$ref": "#/$defs/ActionBatch" },
+            "step_triple": { "$ref": "#/$defs/StepTriple" }
         },
         "$defs": defs
     })
@@ -282,6 +686,9 @@ pub fn action_json_schema() -> Value {
                 "x": { "type": "number" },
                 "y": { "type": "number" }
             })),
+            action_variant_schema("wait", json!({
+                "millis": { "type": "integer", "minimum": 0 }
+            })),
             action_variant_schema("extract", json!({
                 "node": { "$ref": "#/$defs/NodeId" }
             })),
@@ -290,6 +697,75 @@ pub fn action_json_schema() -> Value {
                 "input": true
             }))
         ]
+    })
+}
+
+fn step_status_json_schema() -> Value {
+    json!({
+        "title": "StepStatus",
+        "type": "string",
+        "enum": ["ok", "error"]
+    })
+}
+
+fn grounding_json_schema() -> Value {
+    json!({
+        "title": "Grounding",
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["node", "selector_existed", "matched_element"],
+        "properties": {
+            "node": {
+                "anyOf": [
+                    { "type": "null" },
+                    { "$ref": "#/$defs/NodeId" }
+                ]
+            },
+            "selector_existed": { "type": "boolean" },
+            "matched_element": { "type": "boolean" }
+        }
+    })
+}
+
+fn action_outcome_json_schema() -> Value {
+    json!({
+        "title": "ActionOutcome",
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["status", "error", "grounding", "observation", "diff"],
+        "properties": {
+            "status": { "$ref": "#/$defs/StepStatus" },
+            "error": {
+                "anyOf": [
+                    { "type": "null" },
+                    { "type": "string" }
+                ]
+            },
+            "grounding": { "$ref": "#/$defs/Grounding" },
+            "observation": { "$ref": "#/$defs/CompiledObservation" },
+            "diff": {
+                "anyOf": [
+                    { "type": "null" },
+                    { "$ref": "#/$defs/ObservationDiff" }
+                ]
+            }
+        }
+    })
+}
+
+fn step_triple_json_schema() -> Value {
+    json!({
+        "title": "StepTriple",
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["seq", "observation_before", "decision", "action", "outcome"],
+        "properties": {
+            "seq": { "type": "integer", "minimum": 0 },
+            "observation_before": { "$ref": "#/$defs/CompiledObservation" },
+            "decision": true,
+            "action": { "$ref": "#/$defs/Action" },
+            "outcome": { "$ref": "#/$defs/ActionOutcome" }
+        }
     })
 }
 
@@ -495,6 +971,10 @@ mod tests {
             "Action",
             "QuiescencePolicy",
             "ActionBatch",
+            "StepStatus",
+            "Grounding",
+            "ActionOutcome",
+            "StepTriple",
         ] {
             assert!(defs.contains_key(name), "missing {name}");
         }
@@ -533,6 +1013,7 @@ mod tests {
                 value: "a".into(),
             },
             Action::Scroll { x: 1.0, y: 2.0 },
+            Action::Wait { millis: 250 },
             Action::Extract {
                 node: NodeId("n1".into()),
             },
@@ -609,5 +1090,192 @@ mod tests {
             schema["properties"]["quiescence"]["$ref"],
             "#/$defs/QuiescencePolicy"
         );
+    }
+
+    #[test]
+    fn beater_browser_actions_round_trip_through_tempo_actions() -> Result<(), BeaterCompatError> {
+        let actions = [
+            beater_browser::BrowserAction::Goto {
+                url: "https://example.com".into(),
+            },
+            beater_browser::BrowserAction::Click {
+                selector: "#submit".into(),
+            },
+            beater_browser::BrowserAction::Type {
+                selector: "#q".into(),
+                text: "tempo".into(),
+            },
+            beater_browser::BrowserAction::Scroll { x: 1, y: 2 },
+            beater_browser::BrowserAction::Select {
+                selector: "#kind".into(),
+                value: "agent".into(),
+            },
+            beater_browser::BrowserAction::Wait { millis: 125 },
+            beater_browser::BrowserAction::Extract {
+                selector: "main".into(),
+            },
+        ];
+
+        for original in actions {
+            let tempo = Action::from(original.clone());
+            let back = beater_browser::BrowserAction::try_from(tempo)?;
+            assert_eq!(back, original);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn skill_actions_do_not_silently_convert_to_beater_browser_actions() {
+        let err = beater_browser::BrowserAction::try_from(Action::Skill {
+            name: "checkout".into(),
+            input: serde_json::Value::Null,
+        });
+        assert!(matches!(
+            err,
+            Err(BeaterCompatError::UnsupportedSkillAction { name }) if name == "checkout"
+        ));
+    }
+
+    #[test]
+    fn lossy_scroll_actions_do_not_silently_convert_to_beater_browser_actions() {
+        let err = beater_browser::BrowserAction::try_from(Action::Scroll { x: 1.5, y: 2.0 });
+        assert!(matches!(
+            err,
+            Err(BeaterCompatError::UnsupportedScrollCoordinates { .. })
+        ));
+    }
+
+    #[test]
+    fn beater_observation_converts_to_tainted_compiled_observation() {
+        let beater = beater_browser::Observation {
+            url: "https://example.com".into(),
+            title: Some("Example".into()),
+            dom_html: Some("<button>Buy</button>".into()),
+            accessibility_tree: Some(json!({"role": "button", "name": "Buy"})),
+            console: vec![],
+            network: vec![],
+        };
+
+        let compiled = CompiledObservation::from(beater);
+        assert_eq!(compiled.schema_version, SCHEMA_VERSION);
+        assert_eq!(compiled.url, "https://example.com");
+        assert!(compiled
+            .elements
+            .iter()
+            .flat_map(|element| &element.name)
+            .all(TaintSpan::is_tainted));
+        assert!(compiled
+            .elements
+            .iter()
+            .any(|element| element.node_id.0 == "beater:dom_html"));
+    }
+
+    #[test]
+    fn beater_observation_round_trip_preserves_console_network_and_ax() {
+        let original = beater_browser::Observation {
+            url: "https://example.com".into(),
+            title: Some("Example".into()),
+            dom_html: Some("<button>Buy</button>".into()),
+            accessibility_tree: Some(json!({"role": "button", "name": "Buy"})),
+            console: vec![beater_browser::ConsoleMessage {
+                level: "error".into(),
+                text: "boom".into(),
+            }],
+            network: vec![beater_browser::NetworkRequest {
+                method: "POST".into(),
+                url: "https://example.com/api".into(),
+                status: Some(500),
+                resource_type: Some("fetch".into()),
+                failed: false,
+            }],
+        };
+
+        let compiled = CompiledObservation::from(original.clone());
+        assert!(compiled
+            .elements
+            .iter()
+            .any(|element| element.node_id.0 == "beater:console"));
+        assert!(compiled
+            .elements
+            .iter()
+            .any(|element| element.node_id.0 == "beater:network"));
+
+        let back = beater_browser::Observation::from(compiled);
+        assert_eq!(back, original);
+    }
+
+    #[test]
+    fn tempo_outcome_with_diff_does_not_silently_convert_to_beater_outcome() {
+        let outcome = ActionOutcome {
+            status: StepStatus::Ok,
+            error: None,
+            grounding: Grounding {
+                node: Some(NodeId("#go".into())),
+                selector_existed: true,
+                matched_element: true,
+            },
+            observation: CompiledObservation {
+                schema_version: SCHEMA_VERSION.into(),
+                url: "https://example.com".into(),
+                seq: 3,
+                elements: vec![],
+                marks: vec![],
+            },
+            diff: Some(ObservationDiff {
+                since_seq: 2,
+                seq: 3,
+                added: vec![],
+                removed: vec![],
+                changed: vec![],
+            }),
+        };
+
+        let err = beater_browser::StepOutcome::try_from(outcome);
+        assert!(matches!(
+            err,
+            Err(BeaterCompatError::UnsupportedDiff {
+                since_seq: 2,
+                seq: 3
+            })
+        ));
+    }
+
+    #[test]
+    fn beater_step_triple_round_trip_preserves_supported_action() -> Result<(), BeaterCompatError> {
+        let before = beater_browser::Observation {
+            url: "https://example.com".into(),
+            title: Some("Example".into()),
+            dom_html: Some("<button id=\"go\">Go</button>".into()),
+            accessibility_tree: None,
+            console: vec![],
+            network: vec![],
+        };
+        let outcome = beater_browser::StepOutcome {
+            status: beater_browser::StepStatus::Ok,
+            error: None,
+            grounding: beater_browser::Grounding {
+                selector: Some("#go".into()),
+                selector_existed: true,
+                matched_element: true,
+            },
+            observation: before.clone(),
+        };
+        let original = beater_browser::StepTriple {
+            seq: 7,
+            observation_before: before,
+            decision: None,
+            action: beater_browser::BrowserAction::Click {
+                selector: "#go".into(),
+            },
+            outcome,
+        };
+
+        let tempo = StepTriple::from(original.clone());
+        let back = beater_browser::StepTriple::try_from(tempo)?;
+        assert_eq!(back.seq, original.seq);
+        assert_eq!(back.action, original.action);
+        assert_eq!(back.outcome.status, original.outcome.status);
+        assert_eq!(back.outcome.grounding, original.outcome.grounding);
+        Ok(())
     }
 }

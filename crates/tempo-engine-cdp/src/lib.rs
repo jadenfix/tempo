@@ -237,6 +237,13 @@ impl CdpTempoDriver {
                     diff: diff_from_base(self.history.get(&previous_seq), &compiled, previous_seq),
                 })
             }
+            Action::Wait { millis } => {
+                tokio::time::sleep(Duration::from_millis(*millis)).await;
+                let compiled = self.record_current_observation().await?;
+                Ok(StepOutcome::Applied {
+                    diff: diff_from_base(self.history.get(&previous_seq), &compiled, previous_seq),
+                })
+            }
             Action::Extract { node } => {
                 let selector = node.0.clone();
                 let grounded = self
