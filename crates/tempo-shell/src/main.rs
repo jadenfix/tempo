@@ -1,7 +1,15 @@
-//! tempo-shell — windowed human browser: winit+egui chrome; in-proc Servo webviews; shared human<->agent session
-//!
-//! Status: scaffold. See ../../final.md.
+use std::io::{self, Write};
+use std::process::ExitCode;
 
-fn main() {
-    println!("tempo-shell: scaffold — see final.md for the design");
+fn main() -> ExitCode {
+    let mut stdout = io::stdout().lock();
+    let mut stderr = io::stderr().lock();
+
+    match tempo_shell::run_cli(std::env::args().skip(1), &mut stdout) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            let _ = writeln!(stderr, "{err}");
+            ExitCode::from(err.exit_code())
+        }
+    }
 }

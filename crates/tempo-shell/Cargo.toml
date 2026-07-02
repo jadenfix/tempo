@@ -9,5 +9,9 @@ name = "tempo"
 path = "src/main.rs"
 
 [dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
 tempo-schema = { path = "../tempo-schema" }
 tempo-driver = { path = "../tempo-driver" }
+tempo-headless = { path = "../tempo-headless" }
+thiserror = { workspace = true }
