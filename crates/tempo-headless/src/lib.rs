@@ -425,6 +425,17 @@ impl SessionPool {
     }
 
     pub fn detach_engine_driver(&mut self) {
+        self.close_engine_resources();
+    }
+
+    /// Best-effort close of every live engine-backed resource: forked BiDi
+    /// contexts and MCP forks. Shared by `detach_engine_driver` and `Drop` so
+    /// both use the exact same teardown. Idempotent and double-close-safe: it
+    /// takes/clears the collections it closes (`close_mcp_forks` takes
+    /// `self.mcp`; the context map is cleared), so a later call — e.g. `Drop`
+    /// after an explicit `detach_engine_driver` — finds them empty and closes
+    /// nothing again.
+    fn close_engine_resources(&mut self) {
         self.close_forked_contexts();
         self.driver = None;
         self.close_mcp_forks();
@@ -519,6 +530,41 @@ impl SessionPool {
         };
         events.push(record.clone());
         record
+    }
+}
+
+impl Drop for SessionPool {
+    /// Best-effort graceful close of any still-live engine forks / BiDi contexts
+    /// when the pool is dropped (e.g. on normal daemon shutdown), so remote
+    /// engine contexts are reclaimed promptly instead of only when the engine
+    /// child process exits.
+    ///
+    /// CAVEAT: `Drop` runs only on a normal unwind/return — NOT on
+    /// `SIGKILL`, nor a `SIGTERM` that terminates the process without unwinding.
+    /// A full graceful-shutdown signal handler is a larger follow-up (out of
+    /// scope here). Retention is already bounded by `MAX_LIVE_FORKS` /
+    /// `MAX_BIDI_CONTEXTS`, and engine child processes are killed via
+    /// `EngineHost::drop` at process exit, so this Drop mainly reclaims contexts
+    /// promptly on graceful drop.
+    ///
+    /// `close_engine_resources` takes/clears the collections, so this cannot
+    /// double-close a driver already closed by an explicit
+    /// `detach_engine_driver`. Cleanup is best-effort: the close helpers already
+    /// swallow and log their own errors, and we catch any panic so `Drop` never
+    /// unwinds.
+    fn drop(&mut self) {
+        // Nothing engine-backed to close (never attached, or already detached).
+        if self.mcp.is_none() && self.bidi_contexts.is_empty() {
+            return;
+        }
+        let closed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.close_engine_resources();
+        }));
+        if closed.is_err() {
+            eprintln!(
+                "tempod: panic while closing engine resources during SessionPool drop; ignoring"
+            );
+        }
     }
 }
 
@@ -788,6 +834,16 @@ fn route_http_request(
     pool: &mut SessionPool,
     request: HttpRequest,
 ) -> Result<HttpResponse, TempodError> {
+    // DNS-rebinding defence (issue #83 follow-up): the session/control-plane
+    // routes mutate or expose browser state, so they get the same loopback-Origin
+    // guard already applied to /mcp and /bidi. Without this a malicious page could
+    // DNS-rebind to the loopback listener and drive/observe the browser via
+    // /sessions, /drain, /adopt, DELETE, or the session-events routes.
+    if control_route_requires_origin_check(&request.method, &request.path)
+        && !bidi_origin_allowed(&request)
+    {
+        return Err(TempodError::Forbidden("origin not allowed".into()));
+    }
     match (request.method.as_str(), request.path.as_str()) {
         ("GET", "/health") => Ok(HttpResponse::json(200, json!({"ok": true}))),
         ("GET", tempo_mcp::A2A_AGENT_CARD_PATH) | ("GET", tempo_mcp::A2A_AGENT_JSON_PATH) => Ok(
@@ -929,6 +985,28 @@ fn websocket_upgrade_key(request: &HttpRequest) -> Result<Option<String>, Tempod
 /// accepted, blocking DNS-rebinding driven WebSocket/POST access.
 fn bidi_origin_allowed(request: &HttpRequest) -> bool {
     tempo_mcp::origin_allowed(request.origin.as_deref())
+}
+
+/// Whether a route served by `route_http_request` must pass the loopback-Origin
+/// guard. Session/control-plane routes (create, drain, adopt, delete, list,
+/// session events, and any unrecognised — hence potentially state-changing —
+/// route) are guarded. Exempt are the public idempotent metadata routes
+/// (`/health`, the A2A agent card, `GET /mcp`) and the routes that already run
+/// their own Origin check (`POST /mcp` via `route_mcp`, `POST /bidi`, and the
+/// `GET /bidi` WebSocket upgrade handled before this function). The guard relies
+/// on `origin_allowed` returning `true` when no Origin header is present, so
+/// non-browser/CLI clients keep working.
+fn control_route_requires_origin_check(method: &str, path: &str) -> bool {
+    !matches!(
+        (method, path),
+        ("GET", "/health")
+            | ("GET", tempo_mcp::A2A_AGENT_CARD_PATH)
+            | ("GET", tempo_mcp::A2A_AGENT_JSON_PATH)
+            | ("GET", "/mcp")
+            | ("POST", "/mcp")
+            | ("GET", "/bidi")
+            | ("POST", "/bidi")
+    )
 }
 
 fn header_has_token(value: &str, token: &str) -> bool {
@@ -2562,6 +2640,42 @@ mod tests {
     }
 
     #[test]
+    fn dropping_pool_closes_live_forks() -> TestResult {
+        // Drop must run the same teardown as `detach_engine_driver`, so a pool
+        // that is simply dropped (normal daemon shutdown, no explicit detach)
+        // still closes its live engine forks instead of leaking them.
+        let closes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let engine_closes = Arc::clone(&closes);
+        let (client_stream, server_stream) = UnixStream::pair()?;
+        let server = thread::spawn(move || -> Result<(), EngineHostError> {
+            let mut connection = EngineIpcConnection::from_stream(server_stream);
+            let mut driver = CloseCountingDriver::new(engine_closes);
+            futures::executor::block_on(serve_driver_connection(&mut connection, &mut driver))
+        });
+
+        let mut pool = SessionPool::default();
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+        for id in 0..3 {
+            let response = route_http_request(&mut pool, mcp_tool_request(id, "fork", json!({}))?)?;
+            let fork: Value = serde_json::from_slice(&response.body)?;
+            assert!(
+                fork["result"]["structuredContent"]["driver_id"].is_string(),
+                "fork {id} did not return a driver_id: {fork}"
+            );
+        }
+
+        // No explicit detach: rely solely on `Drop` to close the forks.
+        drop(pool);
+        join_driver_handler(server)?;
+        assert_eq!(
+            closes.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "dropping the pool must close every live fork"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn attached_engine_driver_fork_routes_to_forked_handle() -> TestResult {
         let (client_stream, server_stream) = UnixStream::pair()?;
         let server = thread::spawn(move || -> Result<(), EngineHostError> {
@@ -2703,6 +2817,80 @@ mod tests {
             Err(TempodError::Forbidden(_)) => Ok(()),
             other => Err(format!("expected Forbidden, got {other:?}").into()),
         }
+    }
+
+    fn control_request(method: &str, path: &str, origin: Option<&str>, body: &[u8]) -> HttpRequest {
+        HttpRequest {
+            method: method.into(),
+            path: path.into(),
+            headers: BTreeMap::new(),
+            host: None,
+            origin: origin.map(str::to_string),
+            body: body.to_vec(),
+        }
+    }
+
+    #[test]
+    fn control_routes_reject_cross_origin_requests() -> TestResult {
+        // #83 follow-up: session/control-plane routes must share the loopback
+        // Origin guard so a DNS-rebinding page cannot create/drive sessions.
+        let create_body = br#"{"url":"https://example.test"}"#;
+
+        // Cross-origin POST /sessions is blocked before the handler runs (no
+        // session is created).
+        let mut pool = SessionPool::default();
+        let blocked = handle_http_request(
+            &mut pool,
+            control_request(
+                "POST",
+                "/sessions",
+                Some("http://evil.example"),
+                create_body,
+            ),
+        );
+        assert_eq!(blocked.status, 403);
+        assert!(
+            pool.list().is_empty(),
+            "cross-origin request must not create a session"
+        );
+
+        // A second, non-idempotent route is likewise blocked.
+        let blocked_drain = handle_http_request(
+            &mut pool,
+            control_request("POST", "/drain", Some("http://evil.example"), b""),
+        );
+        assert_eq!(blocked_drain.status, 403);
+        assert!(
+            !pool.draining(),
+            "cross-origin /drain must not drain the pool"
+        );
+
+        // GET /sessions (observes state) is also guarded.
+        let blocked_list = handle_http_request(
+            &mut pool,
+            control_request("GET", "/sessions", Some("http://evil.example"), b""),
+        );
+        assert_eq!(blocked_list.status, 403);
+
+        // No Origin header (non-browser/CLI client) still reaches the handler.
+        let no_origin = handle_http_request(
+            &mut pool,
+            control_request("POST", "/sessions", None, create_body),
+        );
+        assert_eq!(no_origin.status, 201);
+
+        // A loopback Origin is accepted.
+        let loopback = handle_http_request(
+            &mut pool,
+            control_request(
+                "POST",
+                "/sessions",
+                Some("http://127.0.0.1:8787"),
+                create_body,
+            ),
+        );
+        assert_eq!(loopback.status, 201);
+        Ok(())
     }
 
     // ---- Issue #84: Content-Length overflow must not panic ----
