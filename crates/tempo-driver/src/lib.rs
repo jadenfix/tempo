@@ -273,26 +273,8 @@ mod tests {
 
     #[test]
     fn test_driver_passes_conformance() {
-        // Minimal executor to avoid pulling a full async runtime into the driver crate.
-        fn block_on<F: std::future::Future>(mut f: F) -> F::Output {
-            use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-            fn noop(_: *const ()) {}
-            fn clone(_: *const ()) -> RawWaker {
-                RawWaker::new(std::ptr::null(), &VT)
-            }
-            static VT: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
-            let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VT)) };
-            let mut cx = Context::from_waker(&waker);
-            let mut f = unsafe { std::pin::Pin::new_unchecked(&mut f) };
-            loop {
-                if let Poll::Ready(v) = f.as_mut().poll(&mut cx) {
-                    return v;
-                }
-            }
-        }
-
         let mut d = TestDriver::new();
-        let res = block_on(conformance::assert_driver_conformance(&mut d));
+        let res = futures::executor::block_on(conformance::assert_driver_conformance(&mut d));
         assert!(res.is_ok(), "conformance failed: {res:?}");
     }
 }

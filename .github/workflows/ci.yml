@@ -33,8 +33,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.96.1
       - name: cargo fmt
         run: cargo fmt --all --check
+      - name: cargo check (workspace lints)
+        run: cargo check --workspace --all-targets
       - name: cargo clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings -D clippy::unwrap_used -D clippy::expect_used
       - name: cargo test (contracts + conformance)
         run: cargo test --workspace
       # Always-green invariant (final.md §8.3): tempo-engine-servo must build against

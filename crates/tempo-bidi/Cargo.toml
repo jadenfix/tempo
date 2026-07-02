@@ -9,3 +9,6 @@ tempo-schema = { path = "../tempo-schema" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+
+[lints]
+workspace = true

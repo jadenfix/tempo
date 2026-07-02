@@ -16,3 +16,6 @@ tempo-evals = { path = "../tempo-evals" }
 tempo-schema = { path = "../tempo-schema" }
 tempo-session = { path = "../tempo-session" }
 thiserror.workspace = true
+
+[lints]
+workspace = true
