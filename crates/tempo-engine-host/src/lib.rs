@@ -5,7 +5,9 @@
 //! length-prefixed JSON frame codec, and session journal recovery hook used when
 //! an engine child exits mid-task.
 
-use serde::{Deserialize, Serialize};
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;
@@ -23,6 +25,28 @@ pub const MAX_FRAME_BYTES: u32 = 1024 * 1024;
 pub const ENGINE_HOST_SOCKET_ENV: &str = "TEMPO_ENGINE_HOST_SOCKET";
 pub const DRIVER_REQUEST_METHOD: &str = "driver.request";
 pub const DRIVER_RESPONSE_METHOD: &str = "driver.response";
+const SCREENSHOT_FRAME_OVERHEAD_RESERVE: usize = 4096;
+
+mod base64_bytes {
+    use super::{Deserialize, Deserializer, Serializer, BASE64};
+    use base64::Engine as _;
+    use serde::de::Error as _;
+
+    pub fn serialize<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&BASE64.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let encoded = String::deserialize(deserializer)?;
+        BASE64.decode(encoded).map_err(D::Error::custom)
+    }
+}
 
 /// Restart behavior for an engine child.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -329,15 +353,43 @@ impl DriverWireError {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DriverResponse {
-    Observation { observation: CompiledObservation },
-    Diff { diff: ObservationDiff },
-    Step { outcome: WireStepOutcome },
-    Forked { driver_id: String },
-    Extracted { value: Value },
-    Evaluated { value: Value },
-    Screenshot { bytes: Vec<u8> },
+    Observation {
+        observation: CompiledObservation,
+    },
+    Diff {
+        diff: ObservationDiff,
+    },
+    Step {
+        outcome: WireStepOutcome,
+    },
+    Forked {
+        driver_id: String,
+    },
+    Extracted {
+        value: Value,
+    },
+    Evaluated {
+        value: Value,
+    },
+    Screenshot {
+        #[serde(with = "base64_bytes")]
+        bytes: Vec<u8>,
+    },
     Closed,
-    Error { error: DriverWireError },
+    Error {
+        error: DriverWireError,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum ScreenshotChunkPayload {
+    ScreenshotChunk {
+        chunk_index: u64,
+        final_chunk: bool,
+        #[serde(with = "base64_bytes")]
+        bytes: Vec<u8>,
+    },
 }
 
 /// Bound Unix-domain-socket listener for engine child connections.
@@ -424,7 +476,7 @@ impl EngineIpcClient {
                 actual: response.id,
             });
         }
-        Ok(serde_json::from_value(response.payload)?)
+        read_driver_response_payload(&mut self.stream, id, response.payload)
     }
 
     pub fn into_inner(self) -> UnixStream {
@@ -463,6 +515,9 @@ impl EngineIpcConnection {
         request_id: u64,
         response: DriverResponse,
     ) -> Result<(), EngineHostError> {
+        if let DriverResponse::Screenshot { bytes } = response {
+            return write_screenshot_response(&mut self.stream, request_id, bytes);
+        }
         let payload = serde_json::to_value(response)?;
         write_frame(
             &mut self.stream,
@@ -645,6 +700,126 @@ pub fn describe() -> &'static str {
     "out-of-process engine child supervision, UDS driver transport, wire frames, and session journal recovery"
 }
 
+fn read_driver_response_payload(
+    reader: &mut impl Read,
+    request_id: u64,
+    payload: Value,
+) -> Result<DriverResponse, EngineHostError> {
+    if payload_kind(&payload) == Some("screenshot_chunk") {
+        return read_chunked_screenshot_response(reader, request_id, payload);
+    }
+    Ok(serde_json::from_value(payload)?)
+}
+
+fn read_chunked_screenshot_response(
+    reader: &mut impl Read,
+    request_id: u64,
+    first_payload: Value,
+) -> Result<DriverResponse, EngineHostError> {
+    let mut expected_index = 0_u64;
+    let mut payload = first_payload;
+    let mut bytes = Vec::new();
+
+    loop {
+        if payload_kind(&payload) != Some("screenshot_chunk") {
+            return Err(EngineHostError::InvalidScreenshotChunk {
+                reason: "expected screenshot_chunk continuation".into(),
+            });
+        }
+        let ScreenshotChunkPayload::ScreenshotChunk {
+            chunk_index,
+            final_chunk,
+            bytes: chunk_bytes,
+        } = serde_json::from_value(payload)?;
+        if chunk_index != expected_index {
+            return Err(EngineHostError::InvalidScreenshotChunk {
+                reason: format!("expected chunk {expected_index}, got {chunk_index}"),
+            });
+        }
+        bytes.extend_from_slice(&chunk_bytes);
+        if final_chunk {
+            return Ok(DriverResponse::Screenshot { bytes });
+        }
+
+        expected_index = expected_index
+            .checked_add(1)
+            .ok_or(EngineHostError::ScreenshotChunkIndexExhausted)?;
+        let frame = read_expected_frame(reader, DRIVER_RESPONSE_METHOD)?;
+        if frame.id != request_id {
+            return Err(EngineHostError::ResponseIdMismatch {
+                expected: request_id,
+                actual: frame.id,
+            });
+        }
+        payload = frame.payload;
+    }
+}
+
+fn write_driver_response_payload(
+    writer: &mut impl Write,
+    request_id: u64,
+    payload: Value,
+) -> Result<(), EngineHostError> {
+    write_frame(
+        writer,
+        &WireFrame::new(request_id, DRIVER_RESPONSE_METHOD, payload),
+    )
+}
+
+fn write_screenshot_response(
+    writer: &mut impl Write,
+    request_id: u64,
+    bytes: Vec<u8>,
+) -> Result<(), EngineHostError> {
+    if bytes.len() <= max_screenshot_chunk_bytes() {
+        let payload = screenshot_payload_value(&bytes);
+        let frame = WireFrame::new(request_id, DRIVER_RESPONSE_METHOD, payload);
+        match write_frame(writer, &frame) {
+            Err(EngineHostError::FrameTooLarge { .. }) => {}
+            result => return result,
+        }
+    }
+    write_screenshot_chunks(writer, request_id, &bytes)
+}
+
+fn write_screenshot_chunks(
+    writer: &mut impl Write,
+    request_id: u64,
+    bytes: &[u8],
+) -> Result<(), EngineHostError> {
+    let chunk_size = max_screenshot_chunk_bytes();
+    for (chunk_index, chunk) in bytes.chunks(chunk_size).enumerate() {
+        let chunk_index = u64::try_from(chunk_index)
+            .map_err(|_| EngineHostError::ScreenshotChunkIndexExhausted)?;
+        let final_chunk = (chunk_index as usize + 1) * chunk_size >= bytes.len();
+        let payload = serde_json::to_value(ScreenshotChunkPayload::ScreenshotChunk {
+            chunk_index,
+            final_chunk,
+            bytes: chunk.to_vec(),
+        })?;
+        write_driver_response_payload(writer, request_id, payload)?;
+    }
+    Ok(())
+}
+
+fn screenshot_payload_value(bytes: &[u8]) -> Value {
+    serde_json::json!({
+        "kind": "screenshot",
+        "bytes": BASE64.encode(bytes),
+    })
+}
+
+fn payload_kind(payload: &Value) -> Option<&str> {
+    payload.get("kind").and_then(Value::as_str)
+}
+
+fn max_screenshot_chunk_bytes() -> usize {
+    let base64_budget =
+        (MAX_FRAME_BYTES as usize).saturating_sub(SCREENSHOT_FRAME_OVERHEAD_RESERVE);
+    let chunk_bytes = (base64_budget / 4).saturating_mul(3);
+    chunk_bytes.max(1)
+}
+
 fn spawn_child(config: &EngineHostConfig) -> Result<Child, EngineHostError> {
     let mut command = Command::new(&config.program);
     command
@@ -737,6 +912,10 @@ pub enum EngineHostError {
     ResponseIdMismatch { expected: u64, actual: u64 },
     #[error("engine request id counter exhausted")]
     RequestIdExhausted,
+    #[error("engine screenshot chunk stream is invalid: {reason}")]
+    InvalidScreenshotChunk { reason: String },
+    #[error("engine screenshot chunk index counter exhausted")]
+    ScreenshotChunkIndexExhausted,
     #[error("session journal failed: {0}")]
     Journal(#[from] JournalError),
 }
@@ -780,6 +959,29 @@ mod tests {
         let decoded = read_frame(&mut Cursor::new(bytes))?;
 
         assert_eq!(decoded, frame);
+        Ok(())
+    }
+
+    #[test]
+    fn driver_response_screenshot_uses_base64_payload() -> TestResult {
+        let payload = serde_json::to_value(DriverResponse::Screenshot {
+            bytes: vec![0, 1, 2, 255],
+        })?;
+
+        assert_eq!(
+            payload,
+            json!({
+                "kind": "screenshot",
+                "bytes": "AAEC/w==",
+            })
+        );
+        let decoded: DriverResponse = serde_json::from_value(payload)?;
+        assert_eq!(
+            decoded,
+            DriverResponse::Screenshot {
+                bytes: vec![0, 1, 2, 255]
+            }
+        );
         Ok(())
     }
 
@@ -895,6 +1097,42 @@ mod tests {
             connection.read_driver_request(),
             Err(EngineHostError::Json(_))
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn large_screenshot_response_chunks_and_keeps_connection_open() -> TestResult {
+        let screenshot = patterned_bytes(MAX_FRAME_BYTES as usize + 256 * 1024);
+        let expected = screenshot.clone();
+        let full_payload = screenshot_payload_value(&screenshot);
+        let full_frame = WireFrame::new(1, DRIVER_RESPONSE_METHOD, full_payload);
+        assert!(serde_json::to_vec(&full_frame)?.len() > MAX_FRAME_BYTES as usize);
+
+        let (client_stream, server_stream) = UnixStream::pair()?;
+        let mut connection = EngineIpcConnection::from_stream(server_stream);
+        let handle = thread::spawn(
+            move || -> Result<(DriverResponse, DriverResponse), EngineHostError> {
+                let mut client = EngineIpcClient::from_stream(client_stream);
+                let screenshot = client.request(DriverCommand::Screenshot)?;
+                let closed = client.request(DriverCommand::Close)?;
+                Ok((screenshot, closed))
+            },
+        );
+
+        let screenshot_request = connection.read_driver_request()?;
+        assert_eq!(screenshot_request.command, DriverCommand::Screenshot);
+        connection.write_driver_response(
+            screenshot_request.id,
+            DriverResponse::Screenshot { bytes: screenshot },
+        )?;
+
+        let close_request = connection.read_driver_request()?;
+        assert_eq!(close_request.command, DriverCommand::Close);
+        connection.write_driver_response(close_request.id, DriverResponse::Closed)?;
+
+        let (response, closed) = join_client_pair(handle)?;
+        assert_eq!(response, DriverResponse::Screenshot { bytes: expected });
+        assert_eq!(closed, DriverResponse::Closed);
         Ok(())
     }
 
@@ -1157,6 +1395,15 @@ mod tests {
         }
     }
 
+    fn join_client_pair(
+        handle: thread::JoinHandle<Result<(DriverResponse, DriverResponse), EngineHostError>>,
+    ) -> Result<(DriverResponse, DriverResponse), Box<dyn Error>> {
+        match handle.join() {
+            Ok(result) => Ok(result?),
+            Err(_) => Err("client thread panicked".into()),
+        }
+    }
+
     fn join_client_triple(
         handle: thread::JoinHandle<
             Result<(DriverResponse, DriverResponse, DriverResponse), EngineHostError>,
@@ -1211,6 +1458,10 @@ mod tests {
         let mut path = PathBuf::from("/tmp");
         path.push(format!("teh-{label}-{}-{nanos:x}", std::process::id()));
         Ok(path)
+    }
+
+    fn patterned_bytes(len: usize) -> Vec<u8> {
+        (0..len).map(|index| (index % 251) as u8).collect()
     }
 
     fn remove_dir_if_exists(path: &Path) -> Result<(), std::io::Error> {
