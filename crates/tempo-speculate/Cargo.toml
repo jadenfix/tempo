@@ -7,3 +7,6 @@ license.workspace = true
 [dependencies]
 tempo-schema = { path = "../tempo-schema" }
 tempo-driver = { path = "../tempo-driver" }
+tempo-session = { path = "../tempo-session" }
+serde.workspace = true
+thiserror.workspace = true
