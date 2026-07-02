@@ -507,7 +507,9 @@ impl ServoNetworkAdapter {
         &self,
         decision: &EgressDecision,
     ) -> Result<reqwest::blocking::Client, ServoNetworkError> {
-        let mut builder = reqwest::blocking::Client::builder().timeout(self.timeout);
+        let mut builder = reqwest::blocking::Client::builder()
+            .timeout(self.timeout)
+            .redirect(url_policy_redirect(self.url_policy.clone()));
         if let EgressDecision::Proxied { proxy, .. } = decision {
             let proxy = reqwest::Proxy::all(&proxy.endpoint)
                 .map_err(|error| ServoNetworkError::Proxy(error.to_string()))?;
@@ -695,6 +697,32 @@ impl From<EgressDenied> for ServoNetworkError {
 fn servo_host_transport_error(error: ServoEngineError) -> TransportError {
     TransportError::Other(error.to_string())
 }
+
+/// Redirect policy that re-validates every hop against the URL policy so a
+/// remote origin cannot redirect the fetch into an internal/loopback target
+/// (issue #80). Blocks any hop the policy would block and caps the hop count.
+fn url_policy_redirect(url_policy: UrlPolicy) -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(move |attempt| {
+        if attempt.previous().len() >= 10 {
+            return attempt.error(ServoRedirectBlocked("too many redirects".to_string()));
+        }
+        match url_policy.enforce(attempt.url().as_str()) {
+            Ok(()) => attempt.follow(),
+            Err(error) => attempt.error(ServoRedirectBlocked(error.to_string())),
+        }
+    })
+}
+
+#[derive(Debug)]
+struct ServoRedirectBlocked(String);
+
+impl std::fmt::Display for ServoRedirectBlocked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "redirect blocked by URL policy: {}", self.0)
+    }
+}
+
+impl std::error::Error for ServoRedirectBlocked {}
 
 fn driver_wire_transport_error(error: DriverWireError) -> TransportError {
     match error {

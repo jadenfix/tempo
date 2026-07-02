@@ -423,16 +423,31 @@ fn enforce_url_policy(url: &str, allow_private_networks: bool) -> Result<(), Tra
     if matches!(parsed.scheme(), "file" | "ftp") {
         return Err(TransportError::UrlBlocked);
     }
-    let Some(host) = parsed.host_str() else {
-        return Ok(());
-    };
-    if host.eq_ignore_ascii_case("localhost") {
-        return Err(TransportError::UrlBlocked);
-    }
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        if is_blocked_ip(ip) {
-            return Err(TransportError::UrlBlocked);
+    // Use the typed `Host` enum rather than `host_str()`. For IPv6 literals
+    // `host_str()` returns the bracketed form (e.g. `"[::1]"`) which never
+    // parses as an `IpAddr`, so IPv6 loopback / ULA / link-local and
+    // IPv4-mapped metadata targets (`[::ffff:169.254.169.254]`) would slip
+    // through the guard entirely (issue #81).
+    match parsed.host() {
+        Some(url::Host::Domain(domain)) => {
+            if domain
+                .trim_end_matches('.')
+                .eq_ignore_ascii_case("localhost")
+            {
+                return Err(TransportError::UrlBlocked);
+            }
         }
+        Some(url::Host::Ipv4(ip)) => {
+            if is_blocked_ip(IpAddr::V4(ip)) {
+                return Err(TransportError::UrlBlocked);
+            }
+        }
+        Some(url::Host::Ipv6(ip)) => {
+            if is_blocked_ip(IpAddr::V6(ip)) {
+                return Err(TransportError::UrlBlocked);
+            }
+        }
+        None => return Ok(()),
     }
     Ok(())
 }
@@ -440,16 +455,29 @@ fn enforce_url_policy(url: &str, allow_private_networks: bool) -> Result<(), Tra
 fn is_blocked_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => {
+            let octets = ip.octets();
             ip.is_private()
                 || ip.is_loopback()
                 || ip.is_link_local()
                 || ip.is_broadcast()
                 || ip.is_documentation()
                 || ip.is_unspecified()
+                || ip.is_multicast()
+                // Carrier-grade NAT 100.64.0.0/10.
+                || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+                // Reserved 240.0.0.0/4.
+                || octets[0] >= 240
         }
         IpAddr::V6(ip) => {
+            // Canonicalize IPv4-mapped IPv6 (`::ffff:a.b.c.d`) to its embedded
+            // IPv4 so metadata / private targets cannot be reached via the
+            // mapped form.
+            if let Some(mapped) = ip.to_ipv4_mapped() {
+                return is_blocked_ip(IpAddr::V4(mapped));
+            }
             ip.is_loopback()
                 || ip.is_unspecified()
+                || ip.is_multicast()
                 || ip.is_unique_local()
                 || ip.is_unicast_link_local()
         }
@@ -1061,6 +1089,45 @@ mod tests {
         }
         assert!(enforce_url_policy("https://example.com", false).is_ok());
         assert!(enforce_url_policy("http://127.0.0.1", true).is_ok());
+    }
+
+    #[test]
+    fn blocks_ipv6_and_ipv4_mapped_navigation() {
+        // Issue #81: bracketed IPv6 literals and IPv4-mapped IPv6 must be
+        // guarded, including the metadata endpoint reached via `::ffff:`.
+        for url in [
+            "http://[::1]/",
+            "http://[::ffff:169.254.169.254]/",
+            "http://[::ffff:127.0.0.1]/",
+            "http://[fc00::1]/",
+            "http://[fe80::1]/",
+            "http://[ff02::1]/",
+            "http://[::]/",
+        ] {
+            assert!(
+                matches!(
+                    enforce_url_policy(url, false),
+                    Err(TransportError::UrlBlocked)
+                ),
+                "expected URL policy block for {url}"
+            );
+        }
+        // A global-unicast IPv6 literal is still permitted.
+        assert!(enforce_url_policy("http://[2606:4700:4700::1111]/", false).is_ok());
+    }
+
+    #[test]
+    fn blocks_cgnat_and_reserved_ipv4_navigation() {
+        // Issue #82 parity in the CDP guard.
+        for url in ["http://100.64.0.1/", "http://240.0.0.1/"] {
+            assert!(
+                matches!(
+                    enforce_url_policy(url, false),
+                    Err(TransportError::UrlBlocked)
+                ),
+                "expected URL policy block for {url}"
+            );
+        }
     }
 
     #[tokio::test]
