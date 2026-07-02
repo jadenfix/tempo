@@ -590,6 +590,7 @@ pub struct NetworkRequest {
     pub profile_id: ProfileId,
     pub identity_mode: IdentityMode,
     headers: BTreeMap<String, Vec<String>>,
+    body_size: u64,
 }
 
 impl NetworkRequest {
@@ -607,6 +608,7 @@ impl NetworkRequest {
             profile_id: profile_id.into(),
             identity_mode,
             headers: BTreeMap::new(),
+            body_size: 0,
         }
     }
 
@@ -616,6 +618,23 @@ impl NetworkRequest {
             .or_default()
             .push(value.into());
         self
+    }
+
+    pub fn with_body_size(mut self, body_size: u64) -> Self {
+        self.body_size = body_size;
+        self
+    }
+
+    pub fn body_size(&self) -> u64 {
+        self.body_size
+    }
+
+    pub fn headers(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.headers.iter().flat_map(|(name, values)| {
+            values
+                .iter()
+                .map(move |value| (name.as_str(), value.as_str()))
+        })
     }
 
     pub fn header_values(&self, name: &str) -> Option<&[String]> {
@@ -695,6 +714,59 @@ pub fn signature_base(
         params.signature_params_value()
     ));
     Ok(lines.join("\n"))
+}
+
+/// Response metadata accepted back from the network layer for protocol events.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NetworkResponseRecord {
+    pub request_id: RequestId,
+    pub url: String,
+    pub status: u16,
+    headers: BTreeMap<String, Vec<String>>,
+    body_size: u64,
+}
+
+impl NetworkResponseRecord {
+    pub fn new(request_id: impl Into<RequestId>, url: impl Into<String>, status: u16) -> Self {
+        Self {
+            request_id: request_id.into(),
+            url: url.into(),
+            status,
+            headers: BTreeMap::new(),
+            body_size: 0,
+        }
+    }
+
+    pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.headers
+            .entry(name.into().to_ascii_lowercase())
+            .or_default()
+            .push(value.into());
+        self
+    }
+
+    pub fn with_body_size(mut self, body_size: u64) -> Self {
+        self.body_size = body_size;
+        self
+    }
+
+    pub fn body_size(&self) -> u64 {
+        self.body_size
+    }
+
+    pub fn headers(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.headers.iter().flat_map(|(name, values)| {
+            values
+                .iter()
+                .map(move |value| (name.as_str(), value.as_str()))
+        })
+    }
+
+    pub fn header_values(&self, name: &str) -> Option<&[String]> {
+        self.headers
+            .get(&name.to_ascii_lowercase())
+            .map(Vec::as_slice)
+    }
 }
 
 /// Audit record safe to persist in the session journal. It intentionally omits
@@ -1593,6 +1665,53 @@ mod tests {
 
         let audit = AuditRecord::from_request(&request, &UrlPolicy::block_private());
         assert!(audit.is_err(), "{audit:?}");
+    }
+
+    #[test]
+    fn network_request_exposes_dispatch_metadata_for_protocol_events() {
+        let request = NetworkRequest::new(
+            "r1",
+            "post",
+            "https://example.com/upload",
+            "profile-a",
+            IdentityMode::AgentDeclared,
+        )
+        .with_header("Content-Type", "application/json")
+        .with_header("Accept", "application/json")
+        .with_body_size(512);
+
+        let headers = request.headers().collect::<Vec<_>>();
+
+        assert_eq!(request.body_size(), 512);
+        assert_eq!(
+            request
+                .header_values("content-type")
+                .map(<[String]>::to_vec),
+            Some(vec!["application/json".to_string()])
+        );
+        assert_eq!(
+            headers,
+            vec![
+                ("accept", "application/json"),
+                ("content-type", "application/json")
+            ]
+        );
+    }
+
+    #[test]
+    fn network_response_record_exposes_response_metadata_for_protocol_events() {
+        let response = NetworkResponseRecord::new("r1", "https://example.com/data", 200)
+            .with_header("Content-Type", "application/json")
+            .with_body_size(17);
+
+        assert_eq!(response.request_id, RequestId("r1".into()));
+        assert_eq!(response.url, "https://example.com/data");
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body_size(), 17);
+        assert_eq!(
+            response.headers().collect::<Vec<_>>(),
+            vec![("content-type", "application/json")]
+        );
     }
 
     #[test]

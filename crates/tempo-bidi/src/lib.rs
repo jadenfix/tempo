@@ -425,6 +425,18 @@ pub struct NetworkRequest {
     pub body_size: u64,
 }
 
+impl NetworkRequest {
+    pub fn from_tempo_request(request: &tempo_net::NetworkRequest) -> Self {
+        Self {
+            request: RequestId(request.id.0.clone()),
+            url: request.url.clone(),
+            method: request.method.to_ascii_uppercase(),
+            headers: headers_from_iter(request.headers()),
+            body_size: request.body_size(),
+        }
+    }
+}
+
 /// BiDi network response payload.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -434,6 +446,18 @@ pub struct NetworkResponse {
     pub status: u16,
     pub headers: Vec<Header>,
     pub body_size: u64,
+}
+
+impl NetworkResponse {
+    pub fn from_tempo_response(response: &tempo_net::NetworkResponseRecord) -> Self {
+        Self {
+            request: RequestId(response.request_id.0.clone()),
+            url: response.url.clone(),
+            status: response.status,
+            headers: headers_from_iter(response.headers()),
+            body_size: response.body_size(),
+        }
+    }
 }
 
 /// Supported event methods.
@@ -480,6 +504,15 @@ pub fn network_response_completed(
     response: NetworkResponse,
 ) -> Result<BidiMessage, BidiProtocolError> {
     BidiMessage::event(BidiEventMethod::NetworkResponseCompleted, response)
+}
+
+fn headers_from_iter<'a>(headers: impl Iterator<Item = (&'a str, &'a str)>) -> Vec<Header> {
+    headers
+        .map(|(name, value)| Header {
+            name: name.into(),
+            value: value.into(),
+        })
+        .collect()
 }
 
 /// Standard BiDi error code subset used by this endpoint.
@@ -655,17 +688,47 @@ mod tests {
     }
 
     #[test]
-    fn network_response_completed_serializes_as_standard_event() -> TestResult {
-        let event = network_response_completed(NetworkResponse {
-            request: RequestId("request-1".into()),
-            url: "https://example.test/data".into(),
-            status: 200,
-            headers: vec![Header {
-                name: "content-type".into(),
-                value: "application/json".into(),
-            }],
-            body_size: 17,
-        })?;
+    fn network_before_request_sent_uses_tempo_net_request_metadata() -> TestResult {
+        let tempo_request = tempo_net::NetworkRequest::new(
+            "request-1",
+            "post",
+            "https://example.test/upload",
+            "profile-a",
+            tempo_net::IdentityMode::AgentDeclared,
+        )
+        .with_header("Content-Type", "application/json")
+        .with_body_size(128);
+
+        let event =
+            network_before_request_sent(NetworkRequest::from_tempo_request(&tempo_request))?;
+
+        assert_eq!(
+            serde_json::to_value(event)?,
+            json!({
+                "type": "event",
+                "method": "network.beforeRequestSent",
+                "params": {
+                    "request": "request-1",
+                    "url": "https://example.test/upload",
+                    "method": "POST",
+                    "headers": [
+                        {"name": "content-type", "value": "application/json"}
+                    ],
+                    "bodySize": 128,
+                }
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn network_response_completed_uses_tempo_net_response_metadata() -> TestResult {
+        let tempo_response =
+            tempo_net::NetworkResponseRecord::new("request-1", "https://example.test/data", 200)
+                .with_header("Content-Type", "application/json")
+                .with_body_size(17);
+        let event =
+            network_response_completed(NetworkResponse::from_tempo_response(&tempo_response))?;
 
         assert_eq!(
             serde_json::to_value(event)?,

@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+tempo-net = { path = "../tempo-net" }
 tempo-schema = { path = "../tempo-schema" }
 serde.workspace = true
 serde_json.workspace = true
