@@ -8,7 +8,9 @@ license.workspace = true
 tempo-schema = { path = "../tempo-schema" }
 tempo-driver = { path = "../tempo-driver" }
 tempo-engine-host = { path = "../tempo-engine-host" }
+tempo-net = { path = "../tempo-net" }
 async-trait.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

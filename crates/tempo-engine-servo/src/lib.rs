@@ -6,14 +6,23 @@
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::io::Read;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tempo_driver::{DriverTrait, Engine, StepOutcome, TransportError, Unsupported};
 use tempo_engine_host::{
     DriverCommand, DriverResponse, DriverWireError, EngineHostError, EngineIpcClient,
 };
+use tempo_net::{
+    AuditRecord, EgressDecision, EgressDenied, EgressPolicy, EgressRecord, IdentityMode,
+    NetworkRequest, ProfileId, SignatureError, UrlBlocked, UrlPolicy, WebBotAuthSigningKey,
+};
 use tempo_schema::{Action, ActionBatch, CompiledObservation, NodeId, ObservationDiff};
 use thiserror::Error;
+
+/// Default cap for a Servo-intercepted network response body reissued through tempo-net.
+pub const DEFAULT_MAX_SERVO_RESPONSE_BODY_BYTES: usize = 10 * 1024 * 1024;
 
 /// Which Servo build is backing this engine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -309,6 +318,74 @@ pub struct ServoNetworkRequest {
     pub url: String,
     pub headers: Vec<(String, String)>,
     pub body_len: u64,
+    #[serde(default)]
+    pub body: Vec<u8>,
+}
+
+impl ServoNetworkRequest {
+    pub fn new(
+        request_id: impl Into<String>,
+        method: impl Into<String>,
+        url: impl Into<String>,
+    ) -> Self {
+        Self {
+            request_id: request_id.into(),
+            method: method.into(),
+            url: url.into(),
+            headers: Vec::new(),
+            body_len: 0,
+            body: Vec::new(),
+        }
+    }
+
+    pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.headers.push((name.into(), value.into()));
+        self
+    }
+
+    pub fn with_body(mut self, body: impl Into<Vec<u8>>) -> Self {
+        self.body = body.into();
+        self.body_len = self.body.len() as u64;
+        self
+    }
+
+    fn effective_body_len(&self) -> Result<u64, ServoNetworkError> {
+        let actual = self.body.len() as u64;
+        if actual == 0 {
+            if self.body_len > 0 {
+                return Err(ServoNetworkError::MissingBodyBytes {
+                    declared: self.body_len,
+                });
+            }
+            return Ok(0);
+        }
+        if self.body_len != 0 && self.body_len != actual {
+            return Err(ServoNetworkError::BodyLengthMismatch {
+                declared: self.body_len,
+                actual,
+            });
+        }
+        Ok(actual)
+    }
+
+    fn to_network_request(
+        &self,
+        profile_id: &ProfileId,
+        identity_mode: IdentityMode,
+    ) -> Result<NetworkRequest, ServoNetworkError> {
+        let mut request = NetworkRequest::new(
+            self.request_id.clone(),
+            self.method.clone(),
+            self.url.clone(),
+            profile_id.clone(),
+            identity_mode,
+        )
+        .with_body_size(self.effective_body_len()?);
+        for (name, value) in &self.headers {
+            request = request.with_header(name.clone(), value.clone());
+        }
+        Ok(request)
+    }
 }
 
 /// Response returned to the engine after tempo-net policy/signing.
@@ -318,6 +395,186 @@ pub struct ServoNetworkResponse {
     pub status: u16,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+}
+
+/// Result of reissuing one Servo-intercepted request through tempo-net.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServoNetworkFetch {
+    pub response: ServoNetworkResponse,
+    pub audit: AuditRecord,
+    pub egress_decision: EgressDecision,
+    pub egress_record: EgressRecord,
+    pub signed_headers: Vec<(String, String)>,
+}
+
+/// Reissues Servo `load_web_resource` requests through tempo-net policies.
+pub struct ServoNetworkAdapter {
+    profile_id: ProfileId,
+    identity_mode: IdentityMode,
+    url_policy: UrlPolicy,
+    egress_policy: EgressPolicy,
+    signing: Option<ServoSigningConfig>,
+    timeout: Duration,
+    max_response_body_bytes: usize,
+}
+
+impl ServoNetworkAdapter {
+    pub fn new(profile_id: impl Into<ProfileId>, identity_mode: IdentityMode) -> Self {
+        Self {
+            profile_id: profile_id.into(),
+            identity_mode,
+            url_policy: UrlPolicy::block_private(),
+            egress_policy: EgressPolicy::allow_all(),
+            signing: None,
+            timeout: Duration::from_secs(30),
+            max_response_body_bytes: DEFAULT_MAX_SERVO_RESPONSE_BODY_BYTES,
+        }
+    }
+
+    pub fn with_url_policy(mut self, url_policy: UrlPolicy) -> Self {
+        self.url_policy = url_policy;
+        self
+    }
+
+    pub fn with_egress_policy(mut self, egress_policy: EgressPolicy) -> Self {
+        self.egress_policy = egress_policy;
+        self
+    }
+
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    pub fn with_max_response_body_bytes(mut self, max_response_body_bytes: usize) -> Self {
+        self.max_response_body_bytes = max_response_body_bytes;
+        self
+    }
+
+    pub fn with_web_bot_auth_key(mut self, key: WebBotAuthSigningKey, created: u64) -> Self {
+        self.signing = Some(ServoSigningConfig { key, created });
+        self
+    }
+
+    pub fn fetch(
+        &self,
+        request: &ServoNetworkRequest,
+    ) -> Result<ServoNetworkFetch, ServoNetworkError> {
+        let network_request = request.to_network_request(&self.profile_id, self.identity_mode)?;
+        let audit = AuditRecord::from_request(&network_request, &self.url_policy)?;
+        let egress_decision = self
+            .egress_policy
+            .decide(&network_request)
+            .map_err(ServoNetworkError::from)?;
+        let signed_headers = self.signed_headers(&network_request)?;
+        let client = self.client_for(&egress_decision)?;
+        let response = self.send_request(&client, request, &egress_decision, &signed_headers)?;
+        let egress_record = EgressRecord::from_decision(
+            request.request_id.clone(),
+            &egress_decision,
+            network_request.body_size(),
+            response.body.len() as u64,
+        );
+        Ok(ServoNetworkFetch {
+            response,
+            audit,
+            egress_decision,
+            egress_record,
+            signed_headers,
+        })
+    }
+
+    fn signed_headers(
+        &self,
+        request: &NetworkRequest,
+    ) -> Result<Vec<(String, String)>, ServoNetworkError> {
+        let Some(signing) = &self.signing else {
+            return Ok(Vec::new());
+        };
+        let headers = request.sign_web_bot_auth(&signing.key, signing.created)?;
+        Ok(headers
+            .as_header_pairs()
+            .into_iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect())
+    }
+
+    fn client_for(
+        &self,
+        decision: &EgressDecision,
+    ) -> Result<reqwest::blocking::Client, ServoNetworkError> {
+        let mut builder = reqwest::blocking::Client::builder().timeout(self.timeout);
+        if let EgressDecision::Proxied { proxy, .. } = decision {
+            let proxy = reqwest::Proxy::all(&proxy.endpoint)
+                .map_err(|error| ServoNetworkError::Proxy(error.to_string()))?;
+            builder = builder.proxy(proxy);
+        }
+        builder
+            .build()
+            .map_err(|error| ServoNetworkError::ClientBuild(error.to_string()))
+    }
+
+    fn send_request(
+        &self,
+        client: &reqwest::blocking::Client,
+        request: &ServoNetworkRequest,
+        _decision: &EgressDecision,
+        signed_headers: &[(String, String)],
+    ) -> Result<ServoNetworkResponse, ServoNetworkError> {
+        let method = reqwest::Method::from_bytes(request.method.as_bytes())
+            .map_err(|error| ServoNetworkError::InvalidMethod(error.to_string()))?;
+        let mut builder = client.request(method, &request.url);
+        for (name, value) in request.headers.iter().chain(signed_headers.iter()) {
+            builder = builder.header(
+                reqwest::header::HeaderName::from_bytes(name.as_bytes()).map_err(|error| {
+                    ServoNetworkError::InvalidHeader {
+                        name: name.clone(),
+                        reason: error.to_string(),
+                    }
+                })?,
+                reqwest::header::HeaderValue::from_str(value).map_err(|error| {
+                    ServoNetworkError::InvalidHeader {
+                        name: name.clone(),
+                        reason: error.to_string(),
+                    }
+                })?,
+            );
+        }
+        if !request.body.is_empty() {
+            builder = builder.body(request.body.clone());
+        }
+
+        let response = builder
+            .send()
+            .map_err(|error| ServoNetworkError::Fetch(error.to_string()))?;
+        let status = response.status().as_u16();
+        let headers = response
+            .headers()
+            .iter()
+            .filter_map(|(name, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|value| (name.as_str().to_string(), value.to_string()))
+            })
+            .collect();
+        let mut body = Vec::new();
+        response
+            .take(self.max_response_body_bytes as u64)
+            .read_to_end(&mut body)
+            .map_err(|error| ServoNetworkError::ResponseRead(error.to_string()))?;
+        Ok(ServoNetworkResponse {
+            request_id: request.request_id.clone(),
+            status,
+            headers,
+            body,
+        })
+    }
+}
+
+struct ServoSigningConfig {
+    key: WebBotAuthSigningKey,
+    created: u64,
 }
 
 /// Engine readiness gates that must be satisfied before a page is agent-drivable.
@@ -391,6 +648,46 @@ pub enum ServoEngineError {
     DriverLockFailed,
 }
 
+#[derive(Debug, Error)]
+pub enum ServoNetworkError {
+    #[error(transparent)]
+    Url(#[from] UrlBlocked),
+    #[error("egress denied for {domain}:{port}: {reason}")]
+    EgressDenied {
+        domain: String,
+        port: u16,
+        reason: String,
+    },
+    #[error(transparent)]
+    Signature(#[from] SignatureError),
+    #[error("failed to build HTTP client: {0}")]
+    ClientBuild(String),
+    #[error("failed to configure proxy: {0}")]
+    Proxy(String),
+    #[error("invalid HTTP method: {0}")]
+    InvalidMethod(String),
+    #[error("invalid HTTP header {name}: {reason}")]
+    InvalidHeader { name: String, reason: String },
+    #[error("request body declares {declared} bytes but no body bytes were provided")]
+    MissingBodyBytes { declared: u64 },
+    #[error("request body length mismatch: declared {declared} bytes, got {actual}")]
+    BodyLengthMismatch { declared: u64, actual: u64 },
+    #[error("HTTP fetch failed: {0}")]
+    Fetch(String),
+    #[error("failed to read HTTP response: {0}")]
+    ResponseRead(String),
+}
+
+impl From<EgressDenied> for ServoNetworkError {
+    fn from(value: EgressDenied) -> Self {
+        Self::EgressDenied {
+            domain: value.domain,
+            port: value.port,
+            reason: value.reason,
+        }
+    }
+}
+
 fn servo_host_transport_error(error: ServoEngineError) -> TransportError {
     TransportError::Other(error.to_string())
 }
@@ -427,10 +724,23 @@ pub fn describe() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::error::Error;
+    use std::io::{self, Read, Write};
+    use std::net::{TcpListener, TcpStream};
     use std::os::unix::net::UnixStream;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration as StdDuration;
     use tempo_driver::{DriverTrait, Engine, TestDriver};
     use tempo_engine_host::{serve_driver_connection, EngineIpcConnection};
     use tempo_schema::{InteractiveElement, Provenance, TaintSpan};
+
+    type TestResult = Result<(), Box<dyn Error>>;
+    type HttpFixture = (
+        String,
+        mpsc::Receiver<String>,
+        thread::JoinHandle<Result<(), io::Error>>,
+    );
 
     #[test]
     fn vanilla_config_enables_access_tree_and_network_interception() {
@@ -520,13 +830,8 @@ mod tests {
 
     #[test]
     fn network_interception_records_request_and_response_bytes() {
-        let request = ServoNetworkRequest {
-            request_id: "req-1".into(),
-            method: "GET".into(),
-            url: "https://example.test/data".into(),
-            headers: vec![("accept".into(), "application/json".into())],
-            body_len: 0,
-        };
+        let request = ServoNetworkRequest::new("req-1", "GET", "https://example.test/data")
+            .with_header("accept", "application/json");
         let response = ServoNetworkResponse {
             request_id: request.request_id.clone(),
             status: 200,
@@ -536,6 +841,180 @@ mod tests {
 
         assert_eq!(request.request_id, response.request_id);
         assert_eq!(response.body, br#"{"ok":true}"#.to_vec());
+    }
+
+    #[test]
+    fn servo_network_adapter_reissues_request_through_tempo_net() -> TestResult {
+        let (origin, captured_request, server) = serve_http_once(br#"{"ok":true}"#.to_vec())?;
+        let adapter = ServoNetworkAdapter::new("profile-a", IdentityMode::AgentDeclared)
+            .with_url_policy(UrlPolicy::allow_all())
+            .with_timeout(StdDuration::from_secs(5));
+        let request = ServoNetworkRequest::new("req-1", "GET", format!("{origin}/data"))
+            .with_header("accept", "application/json");
+
+        let fetch = adapter.fetch(&request)?;
+        join_server(server)?;
+        let captured = captured_request.recv_timeout(StdDuration::from_secs(1))?;
+
+        assert!(captured.starts_with("GET /data HTTP/1.1"));
+        assert_eq!(fetch.response.status, 200);
+        assert_eq!(fetch.response.body, br#"{"ok":true}"#.to_vec());
+        assert_eq!(fetch.audit.origin, origin);
+        assert_eq!(fetch.egress_record.request_id.0, "req-1");
+        assert_eq!(fetch.egress_record.bytes_sent, 0);
+        assert_eq!(
+            fetch.egress_record.bytes_received,
+            fetch.response.body.len() as u64
+        );
+        assert!(fetch.signed_headers.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn servo_network_adapter_blocks_private_urls_before_network() -> TestResult {
+        let adapter = ServoNetworkAdapter::new("profile-a", IdentityMode::AgentDeclared);
+        let request = ServoNetworkRequest::new("req-1", "GET", "http://127.0.0.1:9/data");
+
+        let error = adapter
+            .fetch(&request)
+            .err()
+            .ok_or_else(|| io::Error::other("expected URL policy failure"))?;
+
+        assert!(matches!(error, ServoNetworkError::Url(_)));
+        Ok(())
+    }
+
+    #[test]
+    fn servo_network_adapter_blocks_egress_before_network() -> TestResult {
+        let adapter = ServoNetworkAdapter::new("profile-a", IdentityMode::AgentDeclared)
+            .with_url_policy(UrlPolicy::allow_all())
+            .with_egress_policy(EgressPolicy::block_by_default());
+        let request = ServoNetworkRequest::new("req-1", "GET", "http://127.0.0.1:9/data");
+
+        let error = adapter
+            .fetch(&request)
+            .err()
+            .ok_or_else(|| io::Error::other("expected egress policy failure"))?;
+
+        assert!(matches!(error, ServoNetworkError::EgressDenied { .. }));
+        Ok(())
+    }
+
+    #[test]
+    fn servo_network_adapter_adds_web_bot_auth_headers() -> TestResult {
+        let (origin, captured_request, server) = serve_http_once(b"ok".to_vec())?;
+        let signing_key = WebBotAuthSigningKey::from_seed("tempo-key", &[7_u8; 32])?;
+        let adapter = ServoNetworkAdapter::new("profile-a", IdentityMode::AgentDeclared)
+            .with_url_policy(UrlPolicy::allow_all())
+            .with_web_bot_auth_key(signing_key, 123);
+        let request = ServoNetworkRequest::new("req-1", "GET", format!("{origin}/signed"));
+
+        let fetch = adapter.fetch(&request)?;
+        join_server(server)?;
+        let captured = captured_request
+            .recv_timeout(StdDuration::from_secs(1))?
+            .to_ascii_lowercase();
+
+        assert_eq!(fetch.signed_headers.len(), 2);
+        assert!(captured.contains("\r\nsignature-input:"));
+        assert!(captured.contains("\r\nsignature:"));
+        Ok(())
+    }
+
+    #[test]
+    fn servo_network_adapter_caps_response_body_bytes() -> TestResult {
+        let (origin, _captured_request, server) = serve_http_once(b"0123456789abcdef".to_vec())?;
+        let adapter = ServoNetworkAdapter::new("profile-a", IdentityMode::AgentDeclared)
+            .with_url_policy(UrlPolicy::allow_all())
+            .with_max_response_body_bytes(8);
+        let request = ServoNetworkRequest::new("req-1", "GET", format!("{origin}/large"));
+
+        let fetch = adapter.fetch(&request)?;
+        join_server(server)?;
+
+        assert_eq!(fetch.response.body, b"01234567".to_vec());
+        assert_eq!(fetch.egress_record.bytes_received, 8);
+        Ok(())
+    }
+
+    fn serve_http_once(body: Vec<u8>) -> Result<HttpFixture, io::Error> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let (request_tx, request_rx) = mpsc::channel();
+        let handle = thread::spawn(move || -> Result<(), io::Error> {
+            let (stream, _addr) = listener.accept()?;
+            handle_http_stream(stream, body, request_tx)
+        });
+        Ok((format!("http://{addr}"), request_rx, handle))
+    }
+
+    fn handle_http_stream(
+        mut stream: TcpStream,
+        body: Vec<u8>,
+        request_tx: mpsc::Sender<String>,
+    ) -> Result<(), io::Error> {
+        stream.set_read_timeout(Some(StdDuration::from_secs(5)))?;
+        let request = read_http_request(&mut stream)?;
+        request_tx
+            .send(String::from_utf8_lossy(&request).into_owned())
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(&body);
+        stream.write_all(&response)?;
+        stream.flush()
+    }
+
+    fn read_http_request(stream: &mut TcpStream) -> Result<Vec<u8>, io::Error> {
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 512];
+        loop {
+            let read = stream.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&buffer[..read]);
+            if let Some(header_end) = header_end(&request) {
+                let body_len = content_length(&request[..header_end])?;
+                if request.len() >= header_end + 4 + body_len {
+                    break;
+                }
+            }
+            if request.len() > 64 * 1024 {
+                return Err(io::Error::other("request exceeded fixture cap"));
+            }
+        }
+        Ok(request)
+    }
+
+    fn header_end(bytes: &[u8]) -> Option<usize> {
+        bytes.windows(4).position(|window| window == b"\r\n\r\n")
+    }
+
+    fn content_length(headers: &[u8]) -> Result<usize, io::Error> {
+        let headers = String::from_utf8_lossy(headers);
+        for line in headers.lines() {
+            let Some((name, value)) = line.split_once(':') else {
+                continue;
+            };
+            if name.eq_ignore_ascii_case("content-length") {
+                return value
+                    .trim()
+                    .parse()
+                    .map_err(|error: std::num::ParseIntError| io::Error::other(error.to_string()));
+            }
+        }
+        Ok(0)
+    }
+
+    fn join_server(handle: thread::JoinHandle<Result<(), io::Error>>) -> TestResult {
+        match handle.join() {
+            Ok(result) => result.map_err(|error| Box::new(error) as Box<dyn Error>),
+            Err(_) => Err(Box::new(io::Error::other("fixture server panicked"))),
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
