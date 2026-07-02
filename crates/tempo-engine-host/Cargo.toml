@@ -12,5 +12,9 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 
+[dev-dependencies]
+futures = "0.3"
+tempo-driver = { path = "../tempo-driver", features = ["test-driver"] }
+
 [lints]
 workspace = true

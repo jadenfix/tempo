@@ -13,7 +13,7 @@ use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use tempo_driver::{StepOutcome, TransportError, Unsupported};
+use tempo_driver::{DriverTrait, StepOutcome, TransportError, Unsupported};
 use tempo_schema::{Action, ActionBatch, CompiledObservation, NodeId, ObservationDiff};
 use tempo_session::{JournalError, ResumeState, RunId, SessionId, SessionJournal};
 use thiserror::Error;
@@ -401,6 +401,12 @@ pub struct EngineIpcConnection {
 }
 
 impl EngineIpcConnection {
+    pub fn connect(path: impl AsRef<Path>) -> Result<Self, EngineHostError> {
+        Ok(Self {
+            stream: UnixStream::connect(path)?,
+        })
+    }
+
     pub fn from_stream(stream: UnixStream) -> Self {
         Self { stream }
     }
@@ -427,6 +433,83 @@ impl EngineIpcConnection {
 
     pub fn into_inner(self) -> UnixStream {
         self.stream
+    }
+}
+
+/// Execute driver requests from a connected UDS stream until the peer disconnects
+/// or a `Close` command is handled.
+pub async fn serve_driver_connection<D>(
+    connection: &mut EngineIpcConnection,
+    driver: &mut D,
+) -> Result<(), EngineHostError>
+where
+    D: DriverTrait + ?Sized,
+{
+    loop {
+        let request = match connection.read_driver_request() {
+            Ok(request) => request,
+            Err(EngineHostError::Io(err)) if is_disconnect(&err) => return Ok(()),
+            Err(err) => return Err(err),
+        };
+        let should_close = matches!(request.command, DriverCommand::Close);
+        let response = execute_driver_command(driver, request.command).await;
+        connection.write_driver_response(request.id, response)?;
+        if should_close {
+            return Ok(());
+        }
+    }
+}
+
+/// Execute one typed driver command and convert driver failures into wire-safe responses.
+pub async fn execute_driver_command<D>(driver: &mut D, command: DriverCommand) -> DriverResponse
+where
+    D: DriverTrait + ?Sized,
+{
+    match command {
+        DriverCommand::Goto { url } => match driver.goto(&url).await {
+            Ok(observation) => DriverResponse::Observation { observation },
+            Err(error) => driver_error(error),
+        },
+        DriverCommand::Observe => match driver.observe().await {
+            Ok(observation) => DriverResponse::Observation { observation },
+            Err(error) => driver_error(error),
+        },
+        DriverCommand::ObserveDiff { since_seq } => match driver.observe_diff(since_seq).await {
+            Ok(diff) => DriverResponse::Diff { diff },
+            Err(error) => driver_error(error),
+        },
+        DriverCommand::Act { action } => match driver.act(&action).await {
+            Ok(outcome) => DriverResponse::Step {
+                outcome: outcome.into(),
+            },
+            Err(error) => driver_error(error),
+        },
+        DriverCommand::ActBatch { batch } => match driver.act_batch(&batch).await {
+            Ok(outcome) => DriverResponse::Step {
+                outcome: outcome.into(),
+            },
+            Err(error) => driver_error(error),
+        },
+        DriverCommand::Fork => match driver.fork().await {
+            Ok(_) => DriverResponse::Error {
+                error: DriverWireError::unsupported(&Unsupported("UDS fork handle allocation")),
+            },
+            Err(error) => DriverResponse::Error {
+                error: DriverWireError::unsupported(&error),
+            },
+        },
+        DriverCommand::Extract { node } => match driver.extract(&node).await {
+            Ok(value) => DriverResponse::Extracted { value },
+            Err(error) => driver_error(error),
+        },
+        DriverCommand::Screenshot => match driver.screenshot().await {
+            Ok(bytes) => DriverResponse::Screenshot { bytes },
+            Err(error) => driver_error(error),
+        },
+        DriverCommand::Close => match driver.close().await {
+            Ok(()) => DriverResponse::Closed,
+            Err(error) => driver_error(error),
+        },
     }
 }
 
@@ -469,6 +552,21 @@ fn read_expected_frame(
         });
     }
     Ok(frame)
+}
+
+fn driver_error(error: TransportError) -> DriverResponse {
+    DriverResponse::Error {
+        error: DriverWireError::transport(&error),
+    }
+}
+
+fn is_disconnect(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::UnexpectedEof
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::ConnectionReset
+    )
 }
 
 fn remove_stale_socket(path: &Path) -> Result<(), EngineHostError> {
@@ -534,6 +632,7 @@ mod tests {
     use std::io::Cursor;
     use std::thread;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use tempo_driver::TestDriver;
     use tempo_session::JournalEvent;
 
     type TestResult = Result<(), Box<dyn Error>>;
@@ -688,6 +787,36 @@ mod tests {
     }
 
     #[test]
+    fn serve_driver_connection_executes_driver_commands_over_socket_pair() -> TestResult {
+        let (client_stream, server_stream) = UnixStream::pair()?;
+        let mut connection = EngineIpcConnection::from_stream(server_stream);
+        let handle = thread::spawn(
+            move || -> Result<(DriverResponse, DriverResponse), EngineHostError> {
+                let mut client = EngineIpcClient::from_stream(client_stream);
+                let observed = client.request(DriverCommand::Goto {
+                    url: "https://example.com".into(),
+                })?;
+                let closed = client.request(DriverCommand::Close)?;
+                Ok((observed, closed))
+            },
+        );
+        let mut driver = TestDriver::new();
+
+        futures::executor::block_on(serve_driver_connection(&mut connection, &mut driver))?;
+        let (observed, closed) = join_client_pair(handle)?;
+
+        match observed {
+            DriverResponse::Observation { observation } => {
+                assert_eq!(observation.url, "https://example.com");
+                assert_eq!(observation.seq, 1);
+            }
+            other => return Err(format!("unexpected driver response: {other:?}").into()),
+        }
+        assert_eq!(closed, DriverResponse::Closed);
+        Ok(())
+    }
+
+    #[test]
     fn spawn_with_ipc_binds_socket_and_passes_path_to_child() -> TestResult {
         let root = unique_dir("spawn-ipc")?;
         remove_dir_if_exists(&root)?;
@@ -738,6 +867,15 @@ mod tests {
     fn join_client(
         handle: thread::JoinHandle<Result<DriverResponse, EngineHostError>>,
     ) -> Result<DriverResponse, Box<dyn Error>> {
+        match handle.join() {
+            Ok(result) => Ok(result?),
+            Err(_) => Err("client thread panicked".into()),
+        }
+    }
+
+    fn join_client_pair(
+        handle: thread::JoinHandle<Result<(DriverResponse, DriverResponse), EngineHostError>>,
+    ) -> Result<(DriverResponse, DriverResponse), Box<dyn Error>> {
         match handle.join() {
             Ok(result) => Ok(result?),
             Err(_) => Err("client thread panicked".into()),
