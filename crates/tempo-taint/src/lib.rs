@@ -107,7 +107,7 @@ const fn provenance_name(provenance: Provenance) -> &'static str {
     }
 }
 
-/// Stable crate summary used by scaffold smoke tests and binaries.
+/// Stable crate summary used by smoke tests and binaries.
 pub fn describe() -> &'static str {
     "trust boundary: provenance labels on every observation span; injection-safe serializer"
 }

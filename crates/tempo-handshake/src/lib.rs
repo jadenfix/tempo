@@ -262,7 +262,7 @@ pub fn detect_http_signal(response: &ProbeResponse) -> Option<ProbeHit> {
     Some(ProbeHit::new(signal, path.to_string()))
 }
 
-/// Human-readable crate summary retained for scaffold callers.
+/// Human-readable crate summary for probes and diagnostics.
 pub fn describe() -> &'static str {
     "structured-web probe: beater.json/agent-card/llms.txt/openapi/WebMCP; API/MCP-lane vs render decision"
 }

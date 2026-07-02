@@ -2,7 +2,7 @@
 //!
 //! The GUI chrome will sit above this crate. This layer is already real: it
 //! speaks tempod's HTTP control API over TCP, opens/adopts/closes sessions, and
-//! renders session state without mocked daemons.
+//! renders session state against the live daemon protocol.
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
