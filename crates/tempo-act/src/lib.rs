@@ -527,6 +527,17 @@ mod tests {
             Ok(serde_json::Value::Null)
         }
 
+        async fn evaluate_script(
+            &mut self,
+            expression: &str,
+            await_promise: bool,
+        ) -> Result<serde_json::Value, TransportError> {
+            Ok(serde_json::json!({
+                "expression": expression,
+                "awaitPromise": await_promise,
+            }))
+        }
+
         async fn screenshot(&mut self) -> Result<Vec<u8>, TransportError> {
             Ok(Vec::new())
         }

@@ -793,6 +793,17 @@ mod tests {
             Ok(json!({"node": node.0, "text": "Continue"}))
         }
 
+        async fn evaluate_script(
+            &mut self,
+            expression: &str,
+            await_promise: bool,
+        ) -> Result<Value, TransportError> {
+            Ok(json!({
+                "expression": expression,
+                "awaitPromise": await_promise,
+            }))
+        }
+
         async fn screenshot(&mut self) -> Result<Vec<u8>, TransportError> {
             Ok(vec![137, 80, 78, 71])
         }
