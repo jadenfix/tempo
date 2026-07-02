@@ -101,6 +101,7 @@ pub enum RoutedCommand {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DriverCommand {
     CreateContext(CreateContextParameters),
+    Close(CloseParameters),
     GetTree(GetTreeParameters),
     Navigate(NavigateCommand),
     CaptureScreenshot(CaptureScreenshotParameters),
@@ -155,6 +156,13 @@ impl BidiRouter {
                 Ok(RoutedCommand::Driver {
                     id: command.id,
                     command: DriverCommand::CreateContext(params),
+                })
+            }
+            "browsingContext.close" => {
+                let params = parse_params(command.params)?;
+                Ok(RoutedCommand::Driver {
+                    id: command.id,
+                    command: DriverCommand::Close(params),
                 })
             }
             "browsingContext.getTree" => {
@@ -495,6 +503,15 @@ pub struct CreateContextParameters {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateContextResult {
     pub context: BrowsingContextId,
+}
+
+/// browsingContext.close parameters.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloseParameters {
+    pub context: BrowsingContextId,
+    #[serde(default)]
+    pub prompt_unload: bool,
 }
 
 /// browsingContext.getTree parameters.

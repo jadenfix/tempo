@@ -17,6 +17,8 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 use tempo_agent::StepTriple;
 use tempo_bidi::{
     browsing_context_load, BidiErrorCode, BidiEventMethod, BidiMessage, BidiRouter,
@@ -34,6 +36,13 @@ use thiserror::Error;
 
 const MAX_HTTP_BYTES: usize = 64 * 1024;
 const MAX_WS_PAYLOAD_BYTES: u64 = MAX_HTTP_BYTES as u64;
+/// Maximum number of live BiDi browsing contexts (forked drivers) held at once.
+const MAX_BIDI_CONTEXTS: usize = 64;
+/// Per-connection socket read/write timeout, bounding slowloris-style stalls.
+const SOCKET_TIMEOUT: Duration = Duration::from_secs(30);
+/// Timeout applied to engine-host IPC round-trips so a stalled engine cannot
+/// wedge the daemon indefinitely.
+const ENGINE_IPC_TIMEOUT: Duration = Duration::from_secs(30);
 const WS_ACCEPT_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const WS_OPCODE_TEXT: u8 = 0x1;
 const WS_OPCODE_BINARY: u8 = 0x2;
@@ -402,6 +411,7 @@ impl SessionPool {
     }
 
     pub fn attach_engine_driver(&mut self, engine: Engine, client: EngineIpcClient) {
+        self.close_forked_contexts();
         let driver = AttachedEngineDriver::new(engine, client);
         self.mcp = Some(Arc::new(Mutex::new(tempo_mcp::TempoMcpServer::new(
             driver.clone(),
@@ -414,10 +424,21 @@ impl SessionPool {
     }
 
     pub fn detach_engine_driver(&mut self) {
+        self.close_forked_contexts();
         self.driver = None;
         self.mcp = None;
         self.bidi_contexts.clear();
         self.next_bidi_context_id = 1;
+    }
+
+    /// Best-effort close of every forked BiDi context driver so engine-side
+    /// resources are released instead of leaking when contexts/sessions end.
+    fn close_forked_contexts(&mut self) {
+        for driver in self.bidi_contexts.values_mut() {
+            if driver.driver_id.is_some() {
+                let _ = futures::executor::block_on(driver.close());
+            }
+        }
     }
 
     fn bidi_driver_for(&self, context: &BrowsingContextId) -> Option<AttachedEngineDriver> {
@@ -615,17 +636,43 @@ pub fn run_tempod_with_attached_driver(
 ) -> Result<(), TempodError> {
     let listener = TcpListener::bind(addr)?;
     let mut pool = SessionPool::default();
-    pool.attach_engine_driver(engine, EngineIpcClient::connect(socket_path)?);
+    pool.attach_engine_driver(engine, connect_engine_ipc(socket_path)?);
     serve_forever(listener, Arc::new(Mutex::new(pool)))
 }
 
+/// Connect to the engine host UDS and apply an IPC read/write timeout so a
+/// stalled engine cannot wedge the daemon indefinitely.
+fn connect_engine_ipc(socket_path: impl AsRef<Path>) -> Result<EngineIpcClient, TempodError> {
+    let stream = std::os::unix::net::UnixStream::connect(socket_path)?;
+    stream.set_read_timeout(Some(ENGINE_IPC_TIMEOUT))?;
+    stream.set_write_timeout(Some(ENGINE_IPC_TIMEOUT))?;
+    Ok(EngineIpcClient::from_stream(stream))
+}
+
 /// Serve requests until the listener fails or the process is stopped.
+///
+/// Each connection is handled on its own thread so that a slow, stalled, or
+/// failing client is isolated to that connection: per-connection I/O errors and
+/// transient `accept` errors are logged and the accept loop keeps running.
 pub fn serve_forever(
     listener: TcpListener,
     pool: Arc<Mutex<SessionPool>>,
 ) -> Result<(), TempodError> {
     for stream in listener.incoming() {
-        handle_stream(stream?, &pool)?;
+        match stream {
+            Ok(stream) => {
+                let pool = Arc::clone(&pool);
+                thread::spawn(move || {
+                    if let Err(err) = handle_connection(stream, &pool) {
+                        log_connection_error(&err);
+                    }
+                });
+            }
+            Err(err) => {
+                // A transient accept error (e.g. EMFILE) must not kill the daemon.
+                log_connection_error(&TempodError::Io(err));
+            }
+        }
     }
     Ok(())
 }
@@ -633,11 +680,47 @@ pub fn serve_forever(
 /// Serve exactly one HTTP request. Tests use this against a real TCP listener.
 pub fn serve_one(listener: TcpListener, pool: Arc<Mutex<SessionPool>>) -> Result<(), TempodError> {
     let (stream, _addr) = listener.accept()?;
-    handle_stream(stream, &pool)
+    handle_connection(stream, &pool)
+}
+
+/// Apply per-connection socket timeouts, then handle the connection. Timeouts
+/// bound how long a stalled client can occupy a handler thread (slowloris).
+fn handle_connection(stream: TcpStream, pool: &Arc<Mutex<SessionPool>>) -> Result<(), TempodError> {
+    apply_socket_timeouts(&stream)?;
+    handle_stream(stream, pool)
+}
+
+/// Apply read and write timeouts to an accepted connection. A stalled client
+/// (slowloris) is aborted after `SOCKET_TIMEOUT` instead of occupying a handler
+/// thread forever.
+fn apply_socket_timeouts(stream: &TcpStream) -> Result<(), TempodError> {
+    stream.set_read_timeout(Some(SOCKET_TIMEOUT))?;
+    stream.set_write_timeout(Some(SOCKET_TIMEOUT))?;
+    Ok(())
+}
+
+fn log_connection_error(err: &TempodError) {
+    eprintln!("tempod connection error: {err}");
 }
 
 fn handle_stream(mut stream: TcpStream, pool: &Arc<Mutex<SessionPool>>) -> Result<(), TempodError> {
-    let request = read_http_request(&mut stream)?;
+    let request = match read_http_request(&mut stream) {
+        Ok(request) => request,
+        Err(err) => {
+            // Reject a malformed/oversized request with an error response rather
+            // than dropping the connection (issue #84); the connection error, if
+            // any, stays isolated to this handler (issue #85).
+            let response = HttpResponse::json(
+                err.status(),
+                json!({
+                    "error": err.to_string(),
+                }),
+            );
+            stream.write_all(response.to_bytes().as_slice())?;
+            stream.flush()?;
+            return Ok(());
+        }
+    };
     match websocket_upgrade_key(&request) {
         Ok(Some(key)) => {
             stream.write_all(websocket_upgrade_response(&key).as_slice())?;
@@ -689,7 +772,12 @@ fn route_http_request(
         ),
         ("GET", "/mcp") => Ok(HttpResponse::from_mcp(tempo_mcp::handle_get())),
         ("POST", "/mcp") => Ok(route_mcp(pool, &request)),
-        ("POST", "/bidi") => Ok(route_bidi(pool, request.body)),
+        ("POST", "/bidi") => {
+            if !bidi_origin_allowed(&request) {
+                return Err(TempodError::Forbidden("origin not allowed".into()));
+            }
+            Ok(route_bidi(pool, request.body))
+        }
         ("GET", "/sessions") => Ok(HttpResponse::json(200, pool.list())),
         ("POST", "/sessions") => {
             let body: CreateSessionRequest = serde_json::from_slice(&request.body)?;
@@ -796,6 +884,14 @@ fn websocket_upgrade_key(request: &HttpRequest) -> Result<Option<String>, Tempod
             "WebSocket upgrade requires Sec-WebSocket-Version: 13".into(),
         ));
     }
+    // Reject cross-origin WebSocket handshakes (DNS-rebinding defence). Browsers
+    // always send Origin on WS upgrades, so this blocks a malicious page from
+    // driving the automated browser; non-browser clients omit Origin and pass.
+    if !bidi_origin_allowed(request) {
+        return Err(TempodError::Forbidden(
+            "WebSocket origin not allowed".into(),
+        ));
+    }
     let key = request
         .header("sec-websocket-key")
         .filter(|key| !key.trim().is_empty())
@@ -803,6 +899,13 @@ fn websocket_upgrade_key(request: &HttpRequest) -> Result<Option<String>, Tempod
             TempodError::BadRequest("WebSocket upgrade requires Sec-WebSocket-Key".into())
         })?;
     Ok(Some(key.to_string()))
+}
+
+/// Origin policy for the BiDi control endpoint. Mirrors the MCP route: Origin is
+/// optional for non-browser clients, but when present only loopback origins are
+/// accepted, blocking DNS-rebinding driven WebSocket/POST access.
+fn bidi_origin_allowed(request: &HttpRequest) -> bool {
+    tempo_mcp::origin_allowed(request.origin.as_deref())
 }
 
 fn header_has_token(value: &str, token: &str) -> bool {
@@ -1056,6 +1159,16 @@ fn route_bidi_driver(
             }
         }
         BidiDriverCommand::CreateContext(command) => {
+            if pool.bidi_contexts.len() >= MAX_BIDI_CONTEXTS {
+                return BidiDispatchResult::new(
+                    200,
+                    BidiMessage::error(
+                        Some(id),
+                        BidiErrorCode::UnknownError,
+                        "browsing context limit reached",
+                    ),
+                );
+            }
             let reference = command.reference_context.unwrap_or_else(default_context_id);
             let Some(mut driver) = pool.bidi_driver_for(&reference) else {
                 return driver_required_result(id);
@@ -1072,6 +1185,36 @@ fn route_bidi_driver(
                 Err(error) => BidiDispatchResult::new(
                     200,
                     BidiMessage::error(Some(id), BidiErrorCode::UnknownError, error.to_string()),
+                ),
+            }
+        }
+        BidiDriverCommand::Close(command) => {
+            let context = command.context.clone();
+            if context == default_context_id() {
+                return BidiDispatchResult::new(
+                    200,
+                    BidiMessage::error(
+                        Some(id),
+                        BidiErrorCode::InvalidArgument,
+                        "the root browsing context cannot be closed",
+                    ),
+                );
+            }
+            match pool.bidi_contexts.remove(&context) {
+                Some(mut driver) => {
+                    // Release the forked engine-side driver so it is not leaked.
+                    if driver.driver_id.is_some() {
+                        let _ = futures::executor::block_on(driver.close());
+                    }
+                    BidiDispatchResult::new(200, bidi_success_or_error(id, json!({})))
+                }
+                None => BidiDispatchResult::new(
+                    200,
+                    BidiMessage::error(
+                        Some(id),
+                        BidiErrorCode::InvalidArgument,
+                        "unknown browsing context",
+                    ),
                 ),
             }
         }
@@ -1295,7 +1438,16 @@ fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, TempodError>
         .to_string();
     let content_len = content_length(&header_map)?;
     let body_start = header_end + 4;
-    while bytes.len() < body_start + content_len {
+    // `content_len` is already bounded by MAX_HTTP_BYTES, but compute the end
+    // offset with a checked add so a malicious Content-Length can never overflow
+    // and panic (issue #84).
+    let body_end = body_start
+        .checked_add(content_len)
+        .ok_or_else(|| TempodError::BadRequest("HTTP body length overflow".into()))?;
+    if body_end > MAX_HTTP_BYTES {
+        return Err(TempodError::BadRequest("HTTP request is too large".into()));
+    }
+    while bytes.len() < body_end {
         let read = stream.read(&mut buf)?;
         if read == 0 {
             break;
@@ -1305,7 +1457,7 @@ fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, TempodError>
             return Err(TempodError::BadRequest("HTTP request is too large".into()));
         }
     }
-    if bytes.len() < body_start + content_len {
+    if bytes.len() < body_end {
         return Err(TempodError::BadRequest("incomplete HTTP body".into()));
     }
 
@@ -1315,7 +1467,7 @@ fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, TempodError>
         headers: header_map,
         host,
         origin,
-        body: bytes[body_start..body_start + content_len].to_vec(),
+        body: bytes[body_start..body_end].to_vec(),
     })
 }
 
@@ -1336,10 +1488,18 @@ fn header_map<'a>(lines: impl Iterator<Item = &'a str>) -> BTreeMap<String, Stri
 
 fn content_length(headers: &BTreeMap<String, String>) -> Result<usize, TempodError> {
     match headers.get("content-length") {
-        Some(value) => value
-            .trim()
-            .parse()
-            .map_err(|err: std::num::ParseIntError| TempodError::BadRequest(err.to_string())),
+        Some(value) => {
+            let length: usize = value
+                .trim()
+                .parse()
+                .map_err(|err: std::num::ParseIntError| TempodError::BadRequest(err.to_string()))?;
+            if length > MAX_HTTP_BYTES {
+                return Err(TempodError::BadRequest(
+                    "Content-Length exceeds maximum allowed size".into(),
+                ));
+            }
+            Ok(length)
+        }
         None => Ok(0),
     }
 }
@@ -1382,6 +1542,7 @@ impl HttpResponse {
             200 => "OK",
             201 => "Created",
             400 => "Bad Request",
+            403 => "Forbidden",
             404 => "Not Found",
             405 => "Method Not Allowed",
             500 => "Internal Server Error",
@@ -1408,6 +1569,8 @@ pub enum TempodError {
     Json(#[from] serde_json::Error),
     #[error("bad request: {0}")]
     BadRequest(String),
+    #[error("forbidden: {0}")]
+    Forbidden(String),
     #[error("session not found: {0:?}")]
     SessionNotFound(TempodSessionId),
     #[error("engine not found: {0}")]
@@ -1422,6 +1585,7 @@ impl TempodError {
     fn status(&self) -> u16 {
         match self {
             Self::BadRequest(_) => 400,
+            Self::Forbidden(_) => 403,
             Self::SessionNotFound(_) | Self::EngineNotFound(_) => 404,
             Self::Io(_) | Self::Json(_) | Self::PoolLock | Self::Engine(_) => 500,
         }
@@ -2334,6 +2498,270 @@ mod tests {
         assert!(restarted);
         assert_ne!(first_pid, second_pid);
         supervisor.kill("engine-a")?;
+        Ok(())
+    }
+
+    // ---- Issue #83: BiDi Origin / DNS-rebinding defence ----
+
+    #[test]
+    fn bidi_post_rejects_cross_origin_requests() -> TestResult {
+        let mut pool = SessionPool::default();
+        let response = handle_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/bidi".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: Some("http://evil.example".into()),
+                body: br#"{"id":1,"method":"session.status","params":{}}"#.to_vec(),
+            },
+        );
+        assert_eq!(response.status, 403);
+
+        // Loopback origin is accepted.
+        let allowed = handle_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/bidi".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: Some("http://127.0.0.1:8787".into()),
+                body: br#"{"id":1,"method":"session.status","params":{}}"#.to_vec(),
+            },
+        );
+        assert_eq!(allowed.status, 200);
+        Ok(())
+    }
+
+    #[test]
+    fn bidi_websocket_upgrade_rejects_cross_origin() -> TestResult {
+        let request = HttpRequest {
+            method: "GET".into(),
+            path: "/bidi".into(),
+            headers: BTreeMap::from([
+                ("upgrade".into(), "websocket".into()),
+                ("connection".into(), "Upgrade".into()),
+                ("sec-websocket-version".into(), "13".into()),
+                (
+                    "sec-websocket-key".into(),
+                    "dGhlIHNhbXBsZSBub25jZQ==".into(),
+                ),
+                ("origin".into(), "http://evil.example".into()),
+            ]),
+            host: None,
+            origin: Some("http://evil.example".into()),
+            body: Vec::new(),
+        };
+        match websocket_upgrade_key(&request) {
+            Err(TempodError::Forbidden(_)) => Ok(()),
+            other => Err(format!("expected Forbidden, got {other:?}").into()),
+        }
+    }
+
+    // ---- Issue #84: Content-Length overflow must not panic ----
+
+    #[test]
+    fn overflowing_content_length_is_rejected_without_panic() -> TestResult {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let pool = Arc::new(Mutex::new(SessionPool::default()));
+        let handle = thread::spawn(move || serve_one(listener, pool));
+
+        let response = send_http(
+            addr,
+            "POST /sessions HTTP/1.1\r\ncontent-length: 18446744073709551615\r\n\r\n",
+        )?;
+        // The daemon thread must return cleanly (no panic / process death).
+        join_server(handle)?;
+        assert!(response.starts_with("HTTP/1.1 400"));
+        Ok(())
+    }
+
+    #[test]
+    fn content_length_helper_rejects_oversized_and_overflow_values() {
+        let mut over = BTreeMap::new();
+        over.insert(
+            "content-length".to_string(),
+            "18446744073709551615".to_string(),
+        );
+        assert!(content_length(&over).is_err());
+
+        let mut big = BTreeMap::new();
+        big.insert(
+            "content-length".to_string(),
+            (MAX_HTTP_BYTES + 1).to_string(),
+        );
+        assert!(content_length(&big).is_err());
+
+        let mut ok = BTreeMap::new();
+        ok.insert("content-length".to_string(), "12".to_string());
+        assert_eq!(content_length(&ok).ok(), Some(12));
+    }
+
+    // ---- Issue #85: per-connection errors do not kill the listener ----
+
+    #[test]
+    fn connection_error_does_not_terminate_accept_loop() -> TestResult {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let pool = Arc::new(Mutex::new(SessionPool::default()));
+        let server_pool = Arc::clone(&pool);
+        // serve_forever must keep accepting after a faulty connection.
+        let handle = thread::spawn(move || serve_forever(listener, server_pool));
+
+        // First client connects and disconnects immediately without sending a
+        // request (client-side reset), which previously bubbled an Io error out
+        // of the accept loop.
+        {
+            let stream = TcpStream::connect(addr)?;
+            drop(stream);
+        }
+
+        // A subsequent well-formed request must still be served, proving the
+        // listener survived the faulty connection.
+        let response = send_http(
+            addr,
+            "POST /sessions HTTP/1.1\r\ncontent-length: 26\r\n\r\n{\"url\":\"https://two.test\"}",
+        )?;
+        assert!(response.starts_with("HTTP/1.1 201 Created"));
+
+        // The accept loop is still running; shut it down by dropping the listener
+        // via process teardown (thread is detached-like). We just confirm it has
+        // not returned an error yet.
+        assert!(!handle.is_finished());
+        Ok(())
+    }
+
+    // ---- Issue #86: read timeout is applied per connection ----
+
+    #[test]
+    fn apply_socket_timeouts_sets_read_and_write_deadlines() -> TestResult {
+        // Real 30s slowloris timeouts are impractical to exercise in a unit test,
+        // so verify deterministically that the helper installs both deadlines on
+        // the accepted socket; serve_forever/serve_one call it per connection.
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let client = TcpStream::connect(addr)?;
+        let (server, _addr) = listener.accept()?;
+
+        apply_socket_timeouts(&server)?;
+        assert_eq!(server.read_timeout()?, Some(SOCKET_TIMEOUT));
+        assert_eq!(server.write_timeout()?, Some(SOCKET_TIMEOUT));
+        drop(client);
+        Ok(())
+    }
+
+    // ---- Issue #87: bidi context cap + close cleanup ----
+
+    #[test]
+    fn bidi_create_context_is_capped() -> TestResult {
+        let (client_stream, server_stream) = UnixStream::pair()?;
+        let server = thread::spawn(move || {
+            let mut connection = EngineIpcConnection::from_stream(server_stream);
+            let mut driver = TestDriver::new();
+            futures::executor::block_on(serve_driver_connection(&mut connection, &mut driver))
+        });
+        let mut pool = SessionPool::default();
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+
+        // Repeatedly create contexts; once the cap is reached, further creates
+        // must be rejected instead of growing the map without bound.
+        let mut saw_error = false;
+        for _ in 0..(MAX_BIDI_CONTEXTS + 2) {
+            let response = route_bidi_driver(
+                &mut pool,
+                999,
+                BidiDriverCommand::CreateContext(tempo_bidi::CreateContextParameters {
+                    context_type: tempo_bidi::ContextType::Tab,
+                    reference_context: None,
+                    background: false,
+                }),
+            );
+            let value: Value = serde_json::from_slice(&response.response.body)?;
+            if value["type"] == "error" {
+                saw_error = true;
+                break;
+            }
+        }
+        assert!(saw_error, "create must be rejected once the cap is reached");
+        assert!(pool.bidi_contexts.len() <= MAX_BIDI_CONTEXTS);
+        drop(pool);
+        join_driver_handler(server)?;
+        Ok(())
+    }
+
+    #[test]
+    fn bidi_close_removes_context_and_releases_driver() -> TestResult {
+        let (client_stream, server_stream) = UnixStream::pair()?;
+        let server = thread::spawn(move || {
+            let mut connection = EngineIpcConnection::from_stream(server_stream);
+            let mut driver = TestDriver::new();
+            futures::executor::block_on(serve_driver_connection(&mut connection, &mut driver))
+        });
+        let mut pool = SessionPool::default();
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+
+        let created = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/bidi".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: br#"{"id":1,"method":"browsingContext.create","params":{"type":"tab"}}"#
+                    .to_vec(),
+            },
+        )?;
+        let created: Value = serde_json::from_slice(&created.body)?;
+        let created_context = created["result"]["context"]
+            .as_str()
+            .ok_or("create result must include context")?
+            .to_string();
+        assert_eq!(pool.bidi_contexts.len(), 2);
+
+        let closed = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/bidi".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: format!(
+                    r#"{{"id":2,"method":"browsingContext.close","params":{{"context":"{created_context}"}}}}"#
+                )
+                .into_bytes(),
+            },
+        )?;
+        let closed: Value = serde_json::from_slice(&closed.body)?;
+        assert_eq!(closed["type"], "success");
+        // The forked context is removed, so the map is back to just the root.
+        assert_eq!(pool.bidi_contexts.len(), 1);
+        assert!(!pool
+            .bidi_contexts
+            .contains_key(&BrowsingContextId(created_context)));
+
+        drop(pool);
+        join_driver_handler(server)?;
+        Ok(())
+    }
+
+    #[test]
+    fn bidi_close_rejects_root_context() -> TestResult {
+        let mut pool = SessionPool::default();
+        let result = route_bidi_driver(
+            &mut pool,
+            5,
+            BidiDriverCommand::Close(tempo_bidi::CloseParameters {
+                context: default_context_id(),
+                prompt_unload: false,
+            }),
+        );
+        let value: Value = serde_json::from_slice(&result.response.body)?;
+        assert_eq!(value["type"], "error");
         Ok(())
     }
 
