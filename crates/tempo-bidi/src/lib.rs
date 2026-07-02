@@ -4,6 +4,8 @@
 //! the protocol contract: parse BiDi commands, route engine-backed operations,
 //! and emit standard success, error, and event envelopes.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tempo_schema::Action;
@@ -19,6 +21,10 @@ pub struct BrowsingContextId(pub String);
 /// Network request identifier used by BiDi network events.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct RequestId(pub String);
+
+/// WebDriver BiDi session subscription identifier.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct SessionSubscription(pub String);
 
 /// Parsed client command envelope.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -115,6 +121,8 @@ pub struct NavigateCommand {
 pub struct BidiRouter {
     ready: bool,
     next_session: u64,
+    next_subscription: u64,
+    subscriptions: BTreeMap<SessionSubscription, BidiSubscription>,
 }
 
 impl BidiRouter {
@@ -122,6 +130,8 @@ impl BidiRouter {
         Self {
             ready: true,
             next_session: 1,
+            next_subscription: 1,
+            subscriptions: BTreeMap::new(),
         }
     }
 
@@ -138,6 +148,8 @@ impl BidiRouter {
             "session.status" => self.session_status(command.id),
             "session.new" => self.session_new(command.id, command.params),
             "session.end" => self.session_end(command.id),
+            "session.subscribe" => self.session_subscribe(command.id, command.params),
+            "session.unsubscribe" => self.session_unsubscribe(command.id, command.params),
             "browsingContext.create" => {
                 let params = parse_params(command.params)?;
                 Ok(RoutedCommand::Driver {
@@ -203,6 +215,16 @@ impl BidiRouter {
         BidiMessage::success(id, result)
     }
 
+    pub fn event_subscribed(
+        &self,
+        event: BidiEventMethod,
+        context: Option<&BrowsingContextId>,
+    ) -> bool {
+        self.subscriptions
+            .values()
+            .any(|subscription| subscription.matches(event.as_str(), context))
+    }
+
     fn session_status(&self, id: CommandId) -> Result<RoutedCommand, BidiProtocolError> {
         Ok(RoutedCommand::Immediate(BidiMessage::success(
             id,
@@ -241,6 +263,156 @@ impl BidiRouter {
             json!({}),
         )?))
     }
+
+    fn session_subscribe(
+        &mut self,
+        id: CommandId,
+        params: Value,
+    ) -> Result<RoutedCommand, BidiProtocolError> {
+        let params: SessionSubscribeParameters = parse_params(params)?;
+        let event_names = match expand_event_names(&params.events, "session.subscribe") {
+            Ok(event_names) => event_names,
+            Err(message) => {
+                return Ok(RoutedCommand::Immediate(BidiMessage::error(
+                    Some(id),
+                    BidiErrorCode::InvalidArgument,
+                    message,
+                )));
+            }
+        };
+        if !params.contexts.is_empty() && !params.user_contexts.is_empty() {
+            return Ok(RoutedCommand::Immediate(BidiMessage::error(
+                Some(id),
+                BidiErrorCode::InvalidArgument,
+                "session.subscribe accepts either contexts or userContexts, not both",
+            )));
+        }
+        if !params.user_contexts.is_empty() {
+            return Ok(RoutedCommand::Immediate(BidiMessage::error(
+                Some(id),
+                BidiErrorCode::InvalidArgument,
+                "tempo BiDi endpoint has no browser user contexts",
+            )));
+        }
+
+        let subscription =
+            SessionSubscription(format!("tempo-subscription-{}", self.next_subscription));
+        let Some(next_subscription) = self.next_subscription.checked_add(1) else {
+            return Ok(RoutedCommand::Immediate(BidiMessage::error(
+                Some(id),
+                BidiErrorCode::InvalidArgument,
+                "BiDi subscription id counter exhausted",
+            )));
+        };
+        self.next_subscription = next_subscription;
+        self.subscriptions.insert(
+            subscription.clone(),
+            BidiSubscription {
+                event_names,
+                contexts: params.contexts,
+            },
+        );
+
+        Ok(RoutedCommand::Immediate(BidiMessage::success(
+            id,
+            SessionSubscribeResult { subscription },
+        )?))
+    }
+
+    fn session_unsubscribe(
+        &mut self,
+        id: CommandId,
+        params: Value,
+    ) -> Result<RoutedCommand, BidiProtocolError> {
+        let params: SessionUnsubscribeParameters = parse_params(params)?;
+        if params.subscriptions.is_some() && params.events.is_some() {
+            return Ok(RoutedCommand::Immediate(BidiMessage::error(
+                Some(id),
+                BidiErrorCode::InvalidArgument,
+                "session.unsubscribe accepts either subscriptions or events, not both",
+            )));
+        }
+
+        if let Some(subscriptions) = params.subscriptions {
+            if subscriptions.is_empty() {
+                return Ok(RoutedCommand::Immediate(BidiMessage::error(
+                    Some(id),
+                    BidiErrorCode::InvalidArgument,
+                    "session.unsubscribe requires at least one subscription id",
+                )));
+            }
+            let unknown = subscriptions
+                .iter()
+                .filter(|subscription| !self.subscriptions.contains_key(*subscription))
+                .map(|subscription| subscription.0.as_str())
+                .collect::<Vec<_>>();
+            if !unknown.is_empty() {
+                return Ok(RoutedCommand::Immediate(BidiMessage::error(
+                    Some(id),
+                    BidiErrorCode::InvalidArgument,
+                    format!("unknown BiDi subscription id: {}", unknown.join(", ")),
+                )));
+            }
+            for subscription in subscriptions {
+                self.subscriptions.remove(&subscription);
+            }
+            return Ok(RoutedCommand::Immediate(BidiMessage::success(
+                id,
+                json!({}),
+            )?));
+        }
+
+        let Some(events) = params.events else {
+            return Ok(RoutedCommand::Immediate(BidiMessage::error(
+                Some(id),
+                BidiErrorCode::InvalidArgument,
+                "session.unsubscribe requires subscriptions or events",
+            )));
+        };
+        let event_names = match expand_event_names(&events, "session.unsubscribe") {
+            Ok(event_names) => event_names,
+            Err(message) => {
+                return Ok(RoutedCommand::Immediate(BidiMessage::error(
+                    Some(id),
+                    BidiErrorCode::InvalidArgument,
+                    message,
+                )));
+            }
+        };
+
+        let mut updated = self.subscriptions.clone();
+        let mut matched = BTreeSet::new();
+        let mut empty_subscriptions = Vec::new();
+        for (subscription_id, subscription) in &mut updated {
+            if !subscription.is_global() {
+                continue;
+            }
+            for event_name in &event_names {
+                if subscription.event_names.remove(event_name) {
+                    matched.insert(event_name.clone());
+                }
+            }
+            if subscription.event_names.is_empty() {
+                empty_subscriptions.push(subscription_id.clone());
+            }
+        }
+        if matched != event_names {
+            return Ok(RoutedCommand::Immediate(BidiMessage::error(
+                Some(id),
+                BidiErrorCode::InvalidArgument,
+                "session.unsubscribe events do not match an active global subscription",
+            )));
+        }
+        for subscription_id in empty_subscriptions {
+            updated.remove(&subscription_id);
+        }
+        self.subscriptions = updated;
+
+        Ok(RoutedCommand::Immediate(BidiMessage::success(
+            id,
+            json!({}),
+        )?))
+    }
 }
 
 impl Default for BidiRouter {
@@ -270,6 +442,33 @@ pub struct SessionNewParameters {
 pub struct SessionNewResult {
     pub session_id: String,
     pub capabilities: Value,
+}
+
+/// session.subscribe parameters.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionSubscribeParameters {
+    pub events: Vec<String>,
+    #[serde(default)]
+    pub contexts: Vec<BrowsingContextId>,
+    #[serde(default)]
+    pub user_contexts: Vec<String>,
+}
+
+/// session.subscribe result.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSubscribeResult {
+    pub subscription: SessionSubscription,
+}
+
+/// session.unsubscribe parameters. The spec accepts either subscription ids or
+/// global event attributes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionUnsubscribeParameters {
+    #[serde(default)]
+    pub subscriptions: Option<Vec<SessionSubscription>>,
+    #[serde(default)]
+    pub events: Option<Vec<String>>,
 }
 
 /// browsingContext.create context type.
@@ -506,6 +705,30 @@ pub fn network_response_completed(
     BidiMessage::event(BidiEventMethod::NetworkResponseCompleted, response)
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BidiSubscription {
+    event_names: BTreeSet<String>,
+    contexts: Vec<BrowsingContextId>,
+}
+
+impl BidiSubscription {
+    fn is_global(&self) -> bool {
+        self.contexts.is_empty()
+    }
+
+    fn matches(&self, event_name: &str, context: Option<&BrowsingContextId>) -> bool {
+        if !self.event_names.contains(event_name) {
+            return false;
+        }
+        if self.contexts.is_empty() {
+            return true;
+        }
+        context
+            .map(|context| self.contexts.iter().any(|entry| entry == context))
+            .unwrap_or(false)
+    }
+}
+
 fn headers_from_iter<'a>(headers: impl Iterator<Item = (&'a str, &'a str)>) -> Vec<Header> {
     headers
         .map(|(name, value)| Header {
@@ -552,6 +775,38 @@ where
     Ok(serde_json::from_value(params)?)
 }
 
+fn expand_event_names(events: &[String], command: &str) -> Result<BTreeSet<String>, String> {
+    if events.is_empty() {
+        return Err(format!("{command} requires at least one event"));
+    }
+
+    let mut expanded = BTreeSet::new();
+    for event in events {
+        match event.as_str() {
+            "browsingContext" => {
+                expanded.insert(BidiEventMethod::BrowsingContextLoad.as_str().to_string());
+            }
+            "network" => {
+                expanded.insert(
+                    BidiEventMethod::NetworkBeforeRequestSent
+                        .as_str()
+                        .to_string(),
+                );
+                expanded.insert(
+                    BidiEventMethod::NetworkResponseCompleted
+                        .as_str()
+                        .to_string(),
+                );
+            }
+            "browsingContext.load" | "network.beforeRequestSent" | "network.responseCompleted" => {
+                expanded.insert(event.clone());
+            }
+            _ => return Err(format!("unsupported BiDi event: {event}")),
+        }
+    }
+    Ok(expanded)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -596,6 +851,97 @@ mod tests {
                         "acceptInsecureCerts": false,
                     },
                 }),
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn session_subscribe_tracks_supported_event_modules() -> TestResult {
+        let mut router = BidiRouter::new();
+        let context = BrowsingContextId("ctx-1".into());
+
+        let routed = router.route_json(
+            br#"{"id":3,"method":"session.subscribe","params":{"events":["network","browsingContext.load"],"contexts":["ctx-1"]}}"#,
+        )?;
+
+        assert_eq!(
+            routed,
+            RoutedCommand::Immediate(BidiMessage::Success {
+                id: 3,
+                result: json!({"subscription": "tempo-subscription-1"}),
+            })
+        );
+        assert!(router.event_subscribed(BidiEventMethod::NetworkBeforeRequestSent, Some(&context)));
+        assert!(router.event_subscribed(BidiEventMethod::NetworkResponseCompleted, Some(&context)));
+        assert!(router.event_subscribed(BidiEventMethod::BrowsingContextLoad, Some(&context)));
+        assert!(!router.event_subscribed(
+            BidiEventMethod::NetworkBeforeRequestSent,
+            Some(&BrowsingContextId("ctx-2".into()))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn session_unsubscribe_by_subscription_id_removes_events() -> TestResult {
+        let mut router = BidiRouter::new();
+        let context = BrowsingContextId("ctx-1".into());
+
+        router.route_json(
+            br#"{"id":3,"method":"session.subscribe","params":{"events":["network.beforeRequestSent"],"contexts":["ctx-1"]}}"#,
+        )?;
+        let routed = router.route_json(
+            br#"{"id":4,"method":"session.unsubscribe","params":{"subscriptions":["tempo-subscription-1"]}}"#,
+        )?;
+
+        assert_eq!(
+            routed,
+            RoutedCommand::Immediate(BidiMessage::Success {
+                id: 4,
+                result: json!({}),
+            })
+        );
+        assert!(!router.event_subscribed(BidiEventMethod::NetworkBeforeRequestSent, Some(&context)));
+        Ok(())
+    }
+
+    #[test]
+    fn session_unsubscribe_by_event_removes_global_subscription() -> TestResult {
+        let mut router = BidiRouter::new();
+
+        router.route_json(
+            br#"{"id":3,"method":"session.subscribe","params":{"events":["network"]}}"#,
+        )?;
+        let routed = router.route_json(
+            br#"{"id":4,"method":"session.unsubscribe","params":{"events":["network.beforeRequestSent"]}}"#,
+        )?;
+
+        assert_eq!(
+            routed,
+            RoutedCommand::Immediate(BidiMessage::Success {
+                id: 4,
+                result: json!({}),
+            })
+        );
+        assert!(!router.event_subscribed(BidiEventMethod::NetworkBeforeRequestSent, None));
+        assert!(router.event_subscribed(BidiEventMethod::NetworkResponseCompleted, None));
+        Ok(())
+    }
+
+    #[test]
+    fn session_subscribe_rejects_unknown_events() -> TestResult {
+        let mut router = BidiRouter::new();
+
+        let routed = router.route_json(
+            br#"{"id":5,"method":"session.subscribe","params":{"events":["script.message"]}}"#,
+        )?;
+
+        assert_eq!(
+            routed,
+            RoutedCommand::Immediate(BidiMessage::Error {
+                id: Some(5),
+                error: "invalid argument".into(),
+                message: "unsupported BiDi event: script.message".into(),
             })
         );
         Ok(())
