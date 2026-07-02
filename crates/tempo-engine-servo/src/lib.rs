@@ -204,6 +204,24 @@ impl DriverTrait for ServoIpcDriver {
         }
     }
 
+    async fn evaluate_script(
+        &mut self,
+        expression: &str,
+        await_promise: bool,
+    ) -> Result<serde_json::Value, TransportError> {
+        match self
+            .request(DriverCommand::EvaluateScript {
+                expression: expression.into(),
+                await_promise,
+            })
+            .map_err(servo_host_transport_error)?
+        {
+            DriverResponse::Evaluated { value } => Ok(value),
+            DriverResponse::Error { error } => Err(driver_wire_transport_error(error)),
+            other => Err(unexpected_driver_response(other, "evaluate_script")),
+        }
+    }
+
     async fn screenshot(&mut self) -> Result<Vec<u8>, TransportError> {
         match self
             .request(DriverCommand::Screenshot)
@@ -541,6 +559,7 @@ mod tests {
             })
             .await?;
         let extracted = driver.extract(&NodeId("submit".into())).await?;
+        let evaluated = driver.evaluate_script("document.title", true).await?;
         driver.close().await?;
         server.await??;
 
@@ -548,6 +567,8 @@ mod tests {
         assert_eq!(observation.url, "https://servo.test");
         assert!(matches!(outcome, StepOutcome::Applied { .. }));
         assert_eq!(extracted["node"], "submit");
+        assert_eq!(evaluated["expression"], "document.title");
+        assert_eq!(evaluated["awaitPromise"], true);
         Ok(())
     }
 
