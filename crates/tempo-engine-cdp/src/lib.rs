@@ -8,6 +8,7 @@
 use async_trait::async_trait;
 use chromiumoxide::browser::{Browser, BrowserConfig, HeadlessMode};
 use chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotFormat;
+use chromiumoxide::cdp::js_protocol::runtime::EvaluateParams;
 use chromiumoxide::error::CdpError;
 use chromiumoxide::page::{Page, ScreenshotParams};
 use futures::StreamExt;
@@ -369,6 +370,25 @@ impl DriverTrait for CdpTempoDriver {
             .map_err(|error| TransportError::Other(error.to_string()))
     }
 
+    async fn evaluate_script(
+        &mut self,
+        expression: &str,
+        await_promise: bool,
+    ) -> Result<serde_json::Value, TransportError> {
+        let params = EvaluateParams::builder()
+            .expression(expression)
+            .return_by_value(true)
+            .await_promise(await_promise)
+            .build()
+            .map_err(TransportError::Other)?;
+        self.page
+            .evaluate(params)
+            .await
+            .map_err(map_cdp_error)?
+            .into_value::<serde_json::Value>()
+            .map_err(|error| TransportError::Other(error.to_string()))
+    }
+
     async fn screenshot(&mut self) -> Result<Vec<u8>, TransportError> {
         let params = ScreenshotParams::builder()
             .format(CaptureScreenshotFormat::Png)
@@ -496,7 +516,8 @@ fn extraction_script(selector: &str) -> Result<String, TransportError> {
   function ownText(element) {{
     return Array.from(element.childNodes)
       .filter((node) => node.nodeType === Node.TEXT_NODE)
-      .map((node) => node.textContent || '')
+      .map((node) => compact(node.textContent, 512))
+      .filter(Boolean)
       .join(' ');
   }}
   function formLabels(element) {{
@@ -1062,16 +1083,6 @@ mod tests {
             .iter()
             .any(|element| element.node_id == NodeId("[id=\"save\"]".into())));
 
-        let outcome = driver
-            .act(&Action::Click {
-                node: NodeId("[id=\"save\"]".into()),
-            })
-            .await?;
-        assert!(matches!(outcome, StepOutcome::Applied { .. }));
-
-        let screenshot = driver.screenshot().await?;
-        assert!(screenshot.starts_with(b"\x89PNG\r\n\x1a\n"));
-
         let extracted = driver.extract(&NodeId("[id=\"save\"]".into())).await?;
         assert_eq!(extracted["selector"], "[id=\"save\"]");
         assert_eq!(extracted["found"], true);
@@ -1079,6 +1090,21 @@ mod tests {
         assert_eq!(extracted["node"]["role"], "button");
         assert_eq!(extracted["node"]["name"], "Save");
         assert_eq!(extracted["node"]["attributes"]["id"], "save");
+
+        let outcome = driver
+            .act(&Action::Click {
+                node: NodeId("[id=\"save\"]".into()),
+            })
+            .await?;
+        assert!(matches!(outcome, StepOutcome::Applied { .. }));
+
+        let evaluated = driver
+            .evaluate_script("Promise.resolve(document.body.dataset.clicked)", true)
+            .await?;
+        assert_eq!(evaluated, serde_json::json!("yes"));
+
+        let screenshot = driver.screenshot().await?;
+        assert!(screenshot.starts_with(b"\x89PNG\r\n\x1a\n"));
 
         driver.close().await?;
         Ok(())
