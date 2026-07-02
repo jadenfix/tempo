@@ -6,6 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
@@ -259,7 +260,8 @@ impl SkillStore {
         safe_segment(name)?;
         self.list()?
             .into_iter()
-            .rfind(|key| key.name == name)
+            .filter(|key| key.name == name)
+            .max_by(|a, b| compare_versions(&a.version, &b.version))
             .ok_or_else(|| SkillError::SkillNotFound(name.to_string()))
     }
 
@@ -267,22 +269,37 @@ impl SkillStore {
         let mut keys = Vec::new();
         for entry in std::fs::read_dir(&self.root)? {
             let entry = entry?;
-            if entry.file_type()?.is_file()
-                && entry
-                    .path()
+            let path = entry.path();
+            if !(entry.file_type()?.is_file()
+                && path
                     .extension()
-                    .is_some_and(|extension| extension == "json")
+                    .is_some_and(|extension| extension == "json"))
             {
-                let mut file = File::open(entry.path())?;
-                let mut bytes = Vec::new();
-                file.read_to_end(&mut bytes)?;
-                let definition: SkillDefinition = serde_json::from_slice(&bytes)?;
-                validate_definition(&definition)?;
-                keys.push(definition.key());
+                continue;
+            }
+            // A single unparseable or invalid skill file must not brick resolution of
+            // every other skill in the store; skip it (with a warning) and continue.
+            match Self::load_key(&path) {
+                Ok(key) => keys.push(key),
+                Err(err) => {
+                    eprintln!(
+                        "tempo-skills: skipping unusable skill file {}: {err}",
+                        path.display()
+                    );
+                }
             }
         }
         keys.sort();
         Ok(keys)
+    }
+
+    fn load_key(path: &Path) -> Result<SkillKey, SkillError> {
+        let mut file = File::open(path)?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        let definition: SkillDefinition = serde_json::from_slice(&bytes)?;
+        validate_definition(&definition)?;
+        Ok(definition.key())
     }
 
     pub fn root(&self) -> &Path {
@@ -382,6 +399,62 @@ fn safe_segment(segment: &str) -> Result<&str, SkillError> {
         Ok(segment)
     } else {
         Err(SkillError::InvalidKeySegment(segment.to_string()))
+    }
+}
+
+/// Compare two skill version strings by semantic precedence rather than lexically, so
+/// that e.g. `"10"` ranks above `"9"`. A version is split into `.`/`_`-separated release
+/// parts and an optional `-`-delimited pre-release; numeric parts compare numerically,
+/// and a plain release outranks any pre-release sharing the same release parts.
+fn compare_versions(a: &str, b: &str) -> Ordering {
+    let (a_release, a_pre) = split_version(a);
+    let (b_release, b_pre) = split_version(b);
+    compare_version_parts(&a_release, &b_release).then_with(|| {
+        match (a_pre.is_empty(), b_pre.is_empty()) {
+            (true, true) => Ordering::Equal,
+            (true, false) => Ordering::Greater,
+            (false, true) => Ordering::Less,
+            (false, false) => compare_version_parts(&a_pre, &b_pre),
+        }
+    })
+}
+
+fn split_version(version: &str) -> (Vec<&str>, Vec<&str>) {
+    let (release, pre) = version.split_once('-').unwrap_or((version, ""));
+    (split_parts(release), split_parts(pre))
+}
+
+fn split_parts(segment: &str) -> Vec<&str> {
+    if segment.is_empty() {
+        Vec::new()
+    } else {
+        segment.split(['.', '_']).collect()
+    }
+}
+
+fn compare_version_parts(a: &[&str], b: &[&str]) -> Ordering {
+    let len = a.len().max(b.len());
+    for index in 0..len {
+        let ordering = match (a.get(index), b.get(index)) {
+            (Some(a), Some(b)) => compare_part(a, b),
+            (Some(_), None) => Ordering::Greater,
+            (None, Some(_)) => Ordering::Less,
+            (None, None) => Ordering::Equal,
+        };
+        if ordering != Ordering::Equal {
+            return ordering;
+        }
+    }
+    Ordering::Equal
+}
+
+fn compare_part(a: &str, b: &str) -> Ordering {
+    match (a.parse::<u64>(), b.parse::<u64>()) {
+        (Ok(a), Ok(b)) => a.cmp(&b),
+        // A numeric identifier has lower precedence than a textual one (semver rule).
+        (Ok(_), Err(_)) => Ordering::Less,
+        (Err(_), Ok(_)) => Ordering::Greater,
+        (Err(_), Err(_)) => a.cmp(b),
     }
 }
 
@@ -660,6 +733,71 @@ mod tests {
                 required: SideEffect::Write,
             })
         ));
+    }
+
+    #[test]
+    fn resolve_uses_semantic_version_ordering_not_lexical() -> TestResult {
+        let root = unique_dir("semver")?;
+        remove_dir_if_exists(&root)?;
+        let store = SkillStore::open(&root)?;
+        for version in ["2", "9", "10"] {
+            let mut skill = checkout_skill();
+            skill.version = version.into();
+            store.put(&skill)?;
+        }
+
+        // Lexically "10" < "9" < "2"; semantically "10" is the highest.
+        assert_eq!(
+            store.resolve("checkout")?,
+            SkillKey {
+                name: "checkout".into(),
+                version: "10".into(),
+            }
+        );
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn compare_versions_orders_numeric_and_prerelease() {
+        assert_eq!(compare_versions("10", "9"), Ordering::Greater);
+        assert_eq!(compare_versions("2", "10"), Ordering::Less);
+        assert_eq!(compare_versions("1_2_0", "1_10_0"), Ordering::Less);
+        // A plain release outranks a pre-release of the same version.
+        assert_eq!(compare_versions("1", "1-beta"), Ordering::Greater);
+        assert_eq!(compare_versions("1-alpha", "1-beta"), Ordering::Less);
+        assert_eq!(compare_versions("1", "1"), Ordering::Equal);
+    }
+
+    #[test]
+    fn malformed_skill_file_is_skipped_and_valid_skills_still_resolve() -> TestResult {
+        let root = unique_dir("malformed")?;
+        remove_dir_if_exists(&root)?;
+        let store = SkillStore::open(&root)?;
+        store.put(&checkout_skill())?;
+
+        // A single corrupt/unparseable .json file dropped into the store must not
+        // abort resolution of the valid skills alongside it.
+        fs::write(root.join("broken.json"), b"{ this is not valid json ")?;
+
+        assert_eq!(
+            store.list()?,
+            vec![SkillKey {
+                name: "checkout".into(),
+                version: "1".into(),
+            }]
+        );
+        assert_eq!(
+            store.resolve("checkout")?,
+            SkillKey {
+                name: "checkout".into(),
+                version: "1".into(),
+            }
+        );
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
     }
 
     fn checkout_skill() -> SkillDefinition {
