@@ -557,6 +557,20 @@ impl EngineIpcConnection {
         })
     }
 
+    pub async fn read_driver_request_async(&mut self) -> Result<DriverRequest, EngineHostError> {
+        let mut stream = self.stream.try_clone()?;
+        run_blocking_ipc(move || {
+            let request = read_expected_frame(&mut stream, DRIVER_REQUEST_METHOD)?;
+            let payload: DriverRequestPayload = serde_json::from_value(request.payload)?;
+            Ok(DriverRequest {
+                id: request.id,
+                driver_id: payload.driver_id,
+                command: payload.command,
+            })
+        })
+        .await
+    }
+
     pub fn write_driver_response(
         &mut self,
         request_id: u64,
@@ -570,6 +584,25 @@ impl EngineIpcConnection {
             &mut self.stream,
             &WireFrame::new(request_id, DRIVER_RESPONSE_METHOD, payload),
         )
+    }
+
+    pub async fn write_driver_response_async(
+        &mut self,
+        request_id: u64,
+        response: DriverResponse,
+    ) -> Result<(), EngineHostError> {
+        let mut stream = self.stream.try_clone()?;
+        run_blocking_ipc(move || {
+            if let DriverResponse::Screenshot { bytes } = response {
+                return write_screenshot_response(&mut stream, request_id, bytes);
+            }
+            let payload = serde_json::to_value(response)?;
+            write_frame(
+                &mut stream,
+                &WireFrame::new(request_id, DRIVER_RESPONSE_METHOD, payload),
+            )
+        })
+        .await
     }
 
     pub fn into_inner(self) -> UnixStream {
@@ -590,7 +623,7 @@ where
     let mut next_fork_id = 1_u64;
 
     loop {
-        let request = match connection.read_driver_request() {
+        let request = match connection.read_driver_request_async().await {
             Ok(request) => request,
             Err(EngineHostError::Io(err)) if is_disconnect(&err) => return Ok(()),
             Err(err) => return Err(err),
@@ -605,10 +638,26 @@ where
             request.command,
         )
         .await;
-        connection.write_driver_response(request.id, response)?;
+        connection
+            .write_driver_response_async(request.id, response)
+            .await?;
         if should_close_root {
             return Ok(());
         }
+    }
+}
+
+async fn run_blocking_ipc<T, F>(call: F) -> Result<T, EngineHostError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, EngineHostError> + Send + 'static,
+{
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => handle
+            .spawn_blocking(call)
+            .await
+            .map_err(|error| EngineHostError::BlockingTask(error.to_string()))?,
+        Err(_) => call(),
     }
 }
 
@@ -1089,6 +1138,8 @@ pub enum EngineHostError {
     InvalidScreenshotChunk { reason: String },
     #[error("engine screenshot chunk index counter exhausted")]
     ScreenshotChunkIndexExhausted,
+    #[error("engine host blocking IPC task failed: {0}")]
+    BlockingTask(String),
     #[error("session journal failed: {0}")]
     Journal(#[from] JournalError),
 }
@@ -1101,7 +1152,7 @@ mod tests {
     use std::fs;
     use std::io::{self, Cursor};
     use std::thread;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
     use tempo_driver::TestDriver;
     use tempo_session::JournalEvent;
 
@@ -1480,6 +1531,43 @@ mod tests {
             }
         );
         assert_eq!(closed, DriverResponse::Closed);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn serve_driver_connection_offloads_uds_read_on_tokio_runtime() -> TestResult {
+        let (client_stream, server_stream) = UnixStream::pair()?;
+        let server = tokio::spawn(async move {
+            let mut connection = EngineIpcConnection::from_stream(server_stream);
+            let mut driver = TestDriver::new();
+            serve_driver_connection(&mut connection, &mut driver).await
+        });
+        let client = thread::spawn(move || -> Result<DriverResponse, EngineHostError> {
+            thread::sleep(Duration::from_millis(100));
+            let mut client = EngineIpcClient::from_stream(client_stream);
+            client.request(DriverCommand::Close)
+        });
+
+        let started = Instant::now();
+        let yielded = tokio::time::timeout(Duration::from_millis(50), tokio::task::yield_now())
+            .await
+            .is_ok();
+        assert!(
+            yielded,
+            "blocking UDS read held the current-thread runtime for {:?}",
+            started.elapsed()
+        );
+
+        let client_response = tokio::task::spawn_blocking(move || match client.join() {
+            Ok(result) => result,
+            Err(_) => Err(EngineHostError::Io(io::Error::other(
+                "client thread panicked",
+            ))),
+        })
+        .await
+        .map_err(|error| EngineHostError::BlockingTask(error.to_string()))??;
+        assert_eq!(client_response, DriverResponse::Closed);
+        server.await??;
         Ok(())
     }
 

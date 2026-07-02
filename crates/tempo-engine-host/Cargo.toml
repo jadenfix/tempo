@@ -14,6 +14,7 @@ tempo-session = { path = "../tempo-session" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+tokio = { version = "1", features = ["rt"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { version = "0.29", features = ["socket", "user"] }
@@ -21,6 +22,7 @@ nix = { version = "0.29", features = ["socket", "user"] }
 [dev-dependencies]
 futures = "0.3"
 tempo-driver = { path = "../tempo-driver", features = ["test-driver"] }
+tokio = { version = "1", features = ["macros", "rt", "time"] }
 
 [lints]
 workspace = true
