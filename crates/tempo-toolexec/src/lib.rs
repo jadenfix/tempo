@@ -100,6 +100,13 @@ impl ToolExecClient {
         Ok(self.client.get_job(job_id).await?)
     }
 
+    /// Fetch an async beatbox job and map it into Tempo's tool-step status and
+    /// audit model when the job has produced an execution result.
+    pub async fn get_tool_job(&self, job_id: &str) -> Result<ToolJob, ToolExecError> {
+        let record = self.get_job(job_id).await?;
+        Ok(ToolJob::from_record(record))
+    }
+
     pub async fn cancel_job(&self, job_id: &str) -> Result<(), ToolExecError> {
         Ok(self.client.cancel_job(job_id).await?)
     }
@@ -164,6 +171,77 @@ impl ToolStepStatus {
             .unwrap_or_else(|| fallback.into());
         Self::StepError { reason }
     }
+}
+
+/// Tempo-facing async job record. The raw beatbox record is preserved, while
+/// `state` exposes the step/audit interpretation callers need for journaling.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ToolJob {
+    pub record: JobRecord,
+    pub state: ToolJobState,
+}
+
+impl ToolJob {
+    pub fn from_record(record: JobRecord) -> Self {
+        let state = ToolJobState::from_record(&record);
+        Self { record, state }
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        self.state.is_terminal()
+    }
+}
+
+/// Async beatbox job state after translating terminal records into Tempo's
+/// tool-step model.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ToolJobState {
+    Pending { status: JobStatus },
+    Finished { execution: Box<ToolExecution> },
+    StepError { status: JobStatus, reason: String },
+}
+
+impl ToolJobState {
+    pub fn from_record(record: &JobRecord) -> Self {
+        match record.status {
+            JobStatus::Queued | JobStatus::Running => Self::Pending {
+                status: record.status.clone(),
+            },
+            JobStatus::Succeeded => match record.result.clone() {
+                Some(result) => Self::Finished {
+                    execution: Box::new(ToolExecution::from_result(result)),
+                },
+                None => Self::StepError {
+                    status: JobStatus::Succeeded,
+                    reason: "beatbox job succeeded without an execution result".into(),
+                },
+            },
+            JobStatus::Failed => Self::StepError {
+                status: JobStatus::Failed,
+                reason: job_error_reason(
+                    record,
+                    "beatbox job failed before an execution result was produced",
+                ),
+            },
+            JobStatus::Canceled => Self::StepError {
+                status: JobStatus::Canceled,
+                reason: job_error_reason(record, "beatbox job was canceled"),
+            },
+        }
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        !matches!(self, Self::Pending { .. })
+    }
+}
+
+fn job_error_reason(record: &JobRecord, fallback: &str) -> String {
+    record
+        .error
+        .as_ref()
+        .map(|error| error.message.clone())
+        .filter(|message| !message.is_empty())
+        .unwrap_or_else(|| fallback.into())
 }
 
 /// Audit subset tempo joins with session and network records.
@@ -567,6 +645,73 @@ mod tests {
         assert_eq!(execution.audit.inputs_digest, "sha256:test");
     }
 
+    #[test]
+    fn succeeded_job_maps_result_to_tool_execution() {
+        let record = job_record(
+            JobStatus::Succeeded,
+            Some(execution_result(ExecutionStatus::Ok, None, Vec::new())),
+            None,
+        );
+        let job = ToolJob::from_record(record);
+
+        assert!(job.is_terminal());
+        match job.state {
+            ToolJobState::Finished { execution } => {
+                assert_eq!(execution.step_status, ToolStepStatus::Applied);
+                assert_eq!(execution.audit.inputs_digest, "sha256:test");
+            }
+            other => panic!("expected finished job, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn running_job_remains_pending() {
+        let record = job_record(JobStatus::Running, None, None);
+        let job = ToolJob::from_record(record);
+
+        assert!(!job.is_terminal());
+        assert_eq!(
+            job.state,
+            ToolJobState::Pending {
+                status: JobStatus::Running
+            }
+        );
+    }
+
+    #[test]
+    fn failed_job_maps_error_body_to_step_error() {
+        let record = job_record(
+            JobStatus::Failed,
+            None,
+            Some(ErrorBody::new("worker", "worker crashed")),
+        );
+        let job = ToolJob::from_record(record);
+
+        assert!(job.is_terminal());
+        assert_eq!(
+            job.state,
+            ToolJobState::StepError {
+                status: JobStatus::Failed,
+                reason: "worker crashed".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn succeeded_job_without_result_is_step_error() {
+        let record = job_record(JobStatus::Succeeded, None, None);
+        let job = ToolJob::from_record(record);
+
+        assert!(job.is_terminal());
+        assert_eq!(
+            job.state,
+            ToolJobState::StepError {
+                status: JobStatus::Succeeded,
+                reason: "beatbox job succeeded without an execution result".into(),
+            }
+        );
+    }
+
     #[tokio::test]
     async fn real_beatboxd_execute_smoke_uses_http_client() -> TestResult {
         let beatboxd = RealBeatboxd::spawn().await?;
@@ -589,20 +734,25 @@ mod tests {
         let created = executor.create_trusted_job(&request).await?;
 
         for _ in 0..50 {
-            let record = executor.get_job(&created.job_id).await?;
+            let job = executor.get_tool_job(&created.job_id).await?;
 
-            match record.status {
-                JobStatus::Succeeded => {
-                    let Some(result) = record.result else {
-                        return Err("succeeded job did not include ExecutionResult".into());
-                    };
-                    assert_eq!(result.status, ExecutionStatus::Ok);
+            match &job.state {
+                ToolJobState::Finished { execution } => {
+                    assert!(job.is_terminal());
+                    assert_eq!(job.record.status, JobStatus::Succeeded);
+                    assert_eq!(execution.result.status, ExecutionStatus::Ok);
+                    assert_eq!(execution.step_status, ToolStepStatus::Applied);
+                    assert_eq!(
+                        execution.audit.inputs_digest,
+                        execution.result.inputs_digest
+                    );
+                    assert!(!execution.audit.inputs_digest.is_empty());
                     return Ok(());
                 }
-                JobStatus::Failed | JobStatus::Canceled => {
-                    return Err(format!("job ended unsuccessfully: {:?}", record.error).into());
+                ToolJobState::StepError { reason, .. } => {
+                    return Err(format!("job ended unsuccessfully: {reason}").into());
                 }
-                JobStatus::Queued | JobStatus::Running => {
+                ToolJobState::Pending { .. } => {
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
             }
@@ -873,6 +1023,22 @@ mod tests {
                 downgrades: Vec::new(),
             },
             egress,
+        }
+    }
+
+    fn job_record(
+        status: JobStatus,
+        result: Option<ExecutionResult>,
+        error: Option<ErrorBody>,
+    ) -> JobRecord {
+        JobRecord {
+            job_id: "job-test".into(),
+            status,
+            request: live_smoke_request("tempo-toolexec-job-record"),
+            result,
+            error,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:01Z".into(),
         }
     }
 }
