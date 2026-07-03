@@ -17,7 +17,7 @@ use tempo_handshake::{
     WEB_MCP_DETECTION_SCRIPT,
 };
 use tempo_observe::composite_set_of_marks_png;
-use tempo_policy::{decide_action, InputTaint};
+use tempo_policy::{decide_action, InputTaint, Origin};
 use tempo_schema::{Action, ActionBatch, NodeId};
 use thiserror::Error;
 use url::{Host, Url};
@@ -389,7 +389,7 @@ where
                 let probe = run_handshake_probe(&args, &self.handshake_probe_config).await;
                 let web_mcp = {
                     let driver = self.driver_for_mut(args.driver_id.as_deref())?;
-                    Some(run_web_mcp_detection(driver).await)
+                    Some(run_origin_bound_web_mcp_detection(&args, driver).await)
                 };
                 Ok(ToolCall::success(handshake_result_json(
                     &self.handshake_report,
@@ -754,6 +754,30 @@ struct HandshakeArgs {
     responses: Vec<ProbeResponseInput>,
 }
 
+#[derive(Debug, Default)]
+struct WebMcpOriginBinding {
+    requested_origin: Option<String>,
+    page_origin: Option<String>,
+}
+
+#[derive(Debug)]
+enum WebMcpEvidence {
+    Checked {
+        result: Result<WebMcpDetection, String>,
+        binding: WebMcpOriginBinding,
+    },
+    Skipped {
+        reason: String,
+        binding: WebMcpOriginBinding,
+    },
+}
+
+#[derive(Debug)]
+struct CanonicalWebOrigin {
+    origin: Origin,
+    label: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct ProbeResponseInput {
     path: String,
@@ -838,6 +862,97 @@ async fn run_web_mcp_detection(driver: &mut dyn DriverTrait) -> Result<WebMcpDet
         .await
         .map_err(|error| error.to_string())?;
     Ok(WebMcpDetection::from_script_result(&value))
+}
+
+async fn run_origin_bound_web_mcp_detection(
+    args: &HandshakeArgs,
+    driver: &mut dyn DriverTrait,
+) -> WebMcpEvidence {
+    let Some(requested_origin) = args.origin.as_deref() else {
+        return WebMcpEvidence::Checked {
+            result: run_web_mcp_detection(driver).await,
+            binding: WebMcpOriginBinding::default(),
+        };
+    };
+
+    let requested_origin = match canonical_web_origin(requested_origin) {
+        Ok(origin) => origin,
+        Err(error) => {
+            return WebMcpEvidence::Skipped {
+                reason: format!("requested origin is not a canonical web origin: {error}"),
+                binding: WebMcpOriginBinding::default(),
+            };
+        }
+    };
+
+    let observation = match driver.observe().await {
+        Ok(observation) => observation,
+        Err(error) => {
+            return WebMcpEvidence::Skipped {
+                reason: format!("current page URL unavailable: {error}"),
+                binding: WebMcpOriginBinding {
+                    requested_origin: Some(requested_origin.label),
+                    page_origin: None,
+                },
+            };
+        }
+    };
+
+    let page_origin = match canonical_web_origin(&observation.url) {
+        Ok(origin) => origin,
+        Err(error) => {
+            return WebMcpEvidence::Skipped {
+                reason: format!("current page URL is not a canonical web origin: {error}"),
+                binding: WebMcpOriginBinding {
+                    requested_origin: Some(requested_origin.label),
+                    page_origin: None,
+                },
+            };
+        }
+    };
+
+    let binding = WebMcpOriginBinding {
+        requested_origin: Some(requested_origin.label.clone()),
+        page_origin: Some(page_origin.label.clone()),
+    };
+
+    if requested_origin.origin != page_origin.origin {
+        return WebMcpEvidence::Skipped {
+            reason: "current page origin does not match requested origin".into(),
+            binding,
+        };
+    }
+
+    WebMcpEvidence::Checked {
+        result: run_web_mcp_detection(driver).await,
+        binding,
+    }
+}
+
+fn canonical_web_origin(url: &str) -> Result<CanonicalWebOrigin, String> {
+    let origin = Origin::parse(url).map_err(|error| error.to_string())?;
+    if !matches!(origin.scheme.as_str(), "http" | "https") {
+        return Err(format!("unsupported scheme: {}", origin.scheme));
+    }
+    let label = canonical_origin_label(&origin);
+    Ok(CanonicalWebOrigin { origin, label })
+}
+
+fn canonical_origin_label(origin: &Origin) -> String {
+    let default_port = matches!(
+        (origin.scheme.as_str(), origin.port),
+        ("http", Some(80)) | ("https", Some(443)) | (_, None)
+    );
+    if default_port {
+        format!("{}://{}", origin.scheme, origin.host)
+    } else {
+        format!(
+            "{}://{}:{}",
+            origin.scheme,
+            origin.host,
+            origin.port.unwrap_or_default()
+        )
+    }
 }
 
 fn run_handshake_probe_thread(
@@ -934,7 +1049,7 @@ fn handshake_result_json(
     handshake_report: &ProbeReport,
     args: HandshakeArgs,
     probe: Option<Result<tempo_handshake::HttpProbeRun, String>>,
-    web_mcp: Option<Result<WebMcpDetection, String>>,
+    web_mcp: Option<WebMcpEvidence>,
 ) -> Value {
     let mut report = ProbeReport::from_hits(handshake_report.hits().to_vec());
     let origin = args.origin.clone();
@@ -975,17 +1090,31 @@ fn handshake_result_json(
     let mut web_mcp_value_type = None;
     let mut web_mcp_has_tools = false;
     let mut web_mcp_error = None;
-    if let Some(result) = web_mcp {
-        web_mcp_checked = true;
-        match result {
-            Ok(detection) => {
-                report.record_web_mcp_detection(&detection);
-                web_mcp_available = detection.available;
-                web_mcp_value_type = detection.value_type;
-                web_mcp_has_tools = detection.has_tools;
+    let mut web_mcp_skipped_reason = None;
+    let mut web_mcp_requested_origin = None;
+    let mut web_mcp_page_origin = None;
+    if let Some(evidence) = web_mcp {
+        match evidence {
+            WebMcpEvidence::Checked { result, binding } => {
+                web_mcp_checked = true;
+                web_mcp_requested_origin = binding.requested_origin;
+                web_mcp_page_origin = binding.page_origin;
+                match result {
+                    Ok(detection) => {
+                        report.record_web_mcp_detection(&detection);
+                        web_mcp_available = detection.available;
+                        web_mcp_value_type = detection.value_type;
+                        web_mcp_has_tools = detection.has_tools;
+                    }
+                    Err(error) => {
+                        web_mcp_error = Some(error);
+                    }
+                }
             }
-            Err(error) => {
-                web_mcp_error = Some(error);
+            WebMcpEvidence::Skipped { reason, binding } => {
+                web_mcp_skipped_reason = Some(reason);
+                web_mcp_requested_origin = binding.requested_origin;
+                web_mcp_page_origin = binding.page_origin;
             }
         }
     }
@@ -1008,6 +1137,9 @@ fn handshake_result_json(
             "type": web_mcp_value_type,
             "has_tools": web_mcp_has_tools,
             "error": web_mcp_error,
+            "skipped_reason": web_mcp_skipped_reason,
+            "requested_origin": web_mcp_requested_origin,
+            "page_origin": web_mcp_page_origin,
         },
     })
 }
@@ -1631,7 +1763,7 @@ mod tests {
         let result = call_tool(
             &mut server,
             "handshake",
-            json!({"origin": "https://example.test"}),
+            json!({"origin": "https://example.test", "live_http": false}),
         )
         .await?;
 
@@ -1643,6 +1775,67 @@ mod tests {
         assert_eq!(result["web_mcp"]["available"], true);
         assert_eq!(result["web_mcp"]["type"], "object");
         assert_eq!(result["web_mcp"]["has_tools"], true);
+        assert_eq!(result["web_mcp"]["skipped_reason"], Value::Null);
+        assert_eq!(
+            result["web_mcp"]["requested_origin"],
+            "https://example.test"
+        );
+        assert_eq!(result["web_mcp"]["page_origin"], "https://example.test");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn handshake_tool_skips_web_mcp_when_driver_origin_mismatches() -> Result<(), String> {
+        let mut server = TempoMcpServer::new(
+            MemoryDriver::new()
+                .with_url("https://current.example/app")
+                .with_web_mcp(),
+        );
+        let result = call_tool(
+            &mut server,
+            "handshake",
+            json!({
+                "origin": "https://api.example",
+                "responses": [{
+                    "path": "/openapi.json",
+                    "status": 200,
+                    "content_type": "application/json",
+                    "body": "{\"openapi\":\"3.1.0\"}"
+                }]
+            }),
+        )
+        .await?;
+
+        assert_eq!(result["lane"], "api");
+        assert_eq!(result["skips_render"], true);
+        assert_eq!(result["selected"]["signal"], "openapi");
+        assert_eq!(result["web_mcp"]["checked"], false);
+        assert_eq!(result["web_mcp"]["available"], false);
+        assert_eq!(
+            result["web_mcp"]["skipped_reason"],
+            "current page origin does not match requested origin"
+        );
+        assert_eq!(result["web_mcp"]["requested_origin"], "https://api.example");
+        assert_eq!(result["web_mcp"]["page_origin"], "https://current.example");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn handshake_tool_without_origin_preserves_current_page_web_mcp() -> Result<(), String> {
+        let mut server = TempoMcpServer::new(
+            MemoryDriver::new()
+                .with_url("https://current.example/app")
+                .with_web_mcp(),
+        );
+        let result = call_tool(&mut server, "handshake", json!({})).await?;
+
+        assert_eq!(result["lane"], "mcp");
+        assert_eq!(result["selected"]["signal"], "web_mcp");
+        assert_eq!(result["web_mcp"]["checked"], true);
+        assert_eq!(result["web_mcp"]["available"], true);
+        assert_eq!(result["web_mcp"]["skipped_reason"], Value::Null);
+        assert_eq!(result["web_mcp"]["requested_origin"], Value::Null);
+        assert_eq!(result["web_mcp"]["page_origin"], Value::Null);
         Ok(())
     }
 
@@ -2023,6 +2216,11 @@ mod tests {
         fn with_web_mcp(mut self) -> Self {
             self.web_mcp_available = true;
             self.web_mcp_has_tools = true;
+            self
+        }
+
+        fn with_url(mut self, url: impl Into<String>) -> Self {
+            self.observation.url = url.into();
             self
         }
 
