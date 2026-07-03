@@ -3392,7 +3392,7 @@ mod tests {
                 "isError": false
             }
         }))
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?;
+        .map_err(std::io::Error::other)?;
 
         assert!(!call.is_error);
         assert_eq!(
@@ -3412,7 +3412,7 @@ mod tests {
                 "isError": true
             }
         }))
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?;
+        .map_err(std::io::Error::other)?;
 
         assert!(call.is_error);
         assert_eq!(call.error_reason(), "permission denied");
@@ -3425,7 +3425,7 @@ mod tests {
             "text/event-stream",
             "event: message\ndata: {\"jsonrpc\":\"2.0\",\"result\":{\"content\":[]}}\n\n",
         )
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?;
+        .map_err(std::io::Error::other)?;
 
         assert_eq!(
             parsed,
