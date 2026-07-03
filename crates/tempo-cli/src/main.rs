@@ -16,7 +16,10 @@ use tempo_agent::{
     AgentRunner, ConfirmationMode, DriverTask, IdempotencyKey, StepTriple, StepTripleOutcome,
     StructuredFastPath,
 };
-use tempo_compat::{run_injection_gate, CompatScorecard, CompatThresholds, InjectionCaseResult};
+use tempo_compat::{
+    read_compat_scorecard, run_injection_gate, write_compat_gate_report, write_lane_table,
+    CompatGateBudget, CompatThresholds, InjectionCaseResult,
+};
 use tempo_driver::{DriverTrait, TransportError};
 use tempo_engine_cdp::{CdpConfig, CdpTempoDriver};
 use tempo_evals::{
@@ -42,8 +45,9 @@ Commands:
             --lane api|servo|cdp --success BOOL --fallback-used BOOL
             [--baseline-wall-clock-ms N] [--unconfirmed-high-risk-actions N]
             [--output PATH]
-  compat-lanes --input PATH [--output PATH]
+  compat-lanes --input PATH [--output PATH] [--gate-output PATH]
             [--min-observation-quality N] [--max-challenge-rate N]
+            [--max-fallback-rate N] [--max-challenge-rate-exceeded-rate N]
   observe-gate --input PATH [--output PATH]
   injection-gate --input PATH [--output PATH]
   taint-gate --input PATH [--output PATH]
@@ -94,7 +98,9 @@ enum Command {
     CompatLanes {
         input: PathBuf,
         output: Output,
+        gate_output: Option<PathBuf>,
         thresholds: CompatThresholds,
+        gate: CompatGateBudget,
     },
     ObserveGate {
         input: PathBuf,
@@ -193,21 +199,25 @@ impl Command {
             Self::CompatLanes {
                 input,
                 output,
+                gate_output,
                 thresholds,
+                gate,
             } => {
-                let scorecard: CompatScorecard = read_json(&input)?;
+                let scorecard = read_compat_scorecard(&input)?;
                 let lane_table = scorecard.lane_table(thresholds);
-                let missing_primary_lanes = lane_table
-                    .rows
-                    .iter()
-                    .filter(|row| row.primary.is_none())
-                    .count();
-                write_json(&output, &lane_table, stdout)?;
-                if missing_primary_lanes == 0 {
+                let report = lane_table.gate_report(gate);
+                match &output {
+                    Output::Stdout => write_json(&output, &lane_table, stdout)?,
+                    Output::Path(path) => write_lane_table(path, &lane_table)?,
+                }
+                if let Some(path) = gate_output {
+                    write_compat_gate_report(path, &report)?;
+                }
+                if report.passed() {
                     Ok(())
                 } else {
                     Err(CliError::GateFailed {
-                        violations: missing_primary_lanes,
+                        violations: report.violations.len(),
                     })
                 }
             }
@@ -399,13 +409,18 @@ fn parse_session_eval(options: &[String]) -> Result<Command, CliError> {
 fn parse_compat_lanes(options: &[String]) -> Result<Command, CliError> {
     let mut input = None;
     let mut output = Output::Stdout;
+    let mut gate_output = None;
     let mut thresholds = CompatThresholds::default();
+    let mut gate = CompatGateBudget::default();
     let mut index = 0;
 
     while index < options.len() {
         match options[index].as_str() {
             "--input" => input = Some(PathBuf::from(take_value(options, &mut index)?)),
             "--output" => output = Output::Path(PathBuf::from(take_value(options, &mut index)?)),
+            "--gate-output" => {
+                gate_output = Some(PathBuf::from(take_value(options, &mut index)?));
+            }
             "--min-observation-quality" => {
                 thresholds.min_observation_quality = parse_f32(
                     "--min-observation-quality",
@@ -416,6 +431,16 @@ fn parse_compat_lanes(options: &[String]) -> Result<Command, CliError> {
                 thresholds.max_challenge_rate =
                     parse_f32("--max-challenge-rate", take_value(options, &mut index)?)?;
             }
+            "--max-fallback-rate" => {
+                gate.max_fallback_rate =
+                    parse_f32("--max-fallback-rate", take_value(options, &mut index)?)?;
+            }
+            "--max-challenge-rate-exceeded-rate" => {
+                gate.max_challenge_rate_exceeded_rate = parse_f32(
+                    "--max-challenge-rate-exceeded-rate",
+                    take_value(options, &mut index)?,
+                )?;
+            }
             "-h" | "--help" => return Ok(Command::Help),
             flag => return Err(unknown_flag(flag)),
         }
@@ -425,7 +450,9 @@ fn parse_compat_lanes(options: &[String]) -> Result<Command, CliError> {
     Ok(Command::CompatLanes {
         input: required_path("--input", input)?,
         output,
+        gate_output,
         thresholds,
+        gate,
     })
 }
 
@@ -1085,6 +1112,8 @@ enum CliError {
     },
     #[error("eval operation failed: {0}")]
     Eval(#[from] EvalError),
+    #[error("compat artifact operation failed: {0}")]
+    Compat(#[from] tempo_compat::CompatArtifactError),
     #[error("journal operation failed: {0}")]
     Journal(#[from] JournalError),
     #[error("agent operation failed: {0}")]
@@ -1124,6 +1153,7 @@ impl CliError {
             | Self::JsonRead { .. }
             | Self::JsonWrite { .. }
             | Self::Eval(_)
+            | Self::Compat(_)
             | Self::Journal(_)
             | Self::Agent(_)
             | Self::Transport(_) => 1,
@@ -1142,7 +1172,7 @@ mod tests {
     use std::thread;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tempo_agent::{StructuredFastPathDecision, StructuredLane, StructuredSignal};
-    use tempo_compat::{EngineProbe, OriginScore};
+    use tempo_compat::{CompatScorecard, EngineProbe, OriginScore};
     use tempo_observe::RawElement;
     use tempo_schema::{
         Action, CompiledObservation, InteractiveElement, NodeId, ObservationDiff, Provenance,
@@ -1298,6 +1328,54 @@ mod tests {
             other => return Err(unexpected_result(other)),
         }
         assert!(output.exists());
+        remove_dir(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn compat_lanes_command_fails_when_fallback_rate_exceeds_gate() -> TestResult {
+        let dir = unique_dir("compat-fallback-fail")?;
+        let input = dir.join("compat.json");
+        let output = dir.join("lanes.json");
+        let gate_output = dir.join("gate.json");
+        let scorecard = CompatScorecard::new(vec![
+            OriginScore::new(
+                "https://fallback.test",
+                EngineProbe::servo(false, 0.0, false, 200),
+                EngineProbe::cdp(true, 0.99, true, 120),
+            ),
+            OriginScore::new(
+                "https://servo.test",
+                EngineProbe::servo(true, 0.99, true, 100),
+                EngineProbe::cdp(true, 0.99, true, 120),
+            ),
+        ]);
+        write_json_file(&input, &scorecard)?;
+        let mut stdout = Vec::new();
+
+        let result = run_with_writer(
+            [
+                "compat-lanes".to_string(),
+                "--input".into(),
+                input_string(&input),
+                "--output".into(),
+                input_string(&output),
+                "--gate-output".into(),
+                input_string(&gate_output),
+                "--max-fallback-rate".into(),
+                "0.25".into(),
+            ],
+            &mut stdout,
+        );
+
+        match result {
+            Err(CliError::GateFailed { violations }) => assert_eq!(violations, 1),
+            other => return Err(unexpected_result(other)),
+        }
+        assert!(output.exists());
+        let gate: serde_json::Value = serde_json::from_reader(File::open(&gate_output)?)?;
+        assert_eq!(gate["violations"].as_array().map(Vec::len), Some(1));
+        assert_eq!(gate["violations"][0]["gate"], "fallback_rate");
         remove_dir(&dir)?;
         Ok(())
     }

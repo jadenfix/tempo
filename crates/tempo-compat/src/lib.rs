@@ -5,6 +5,10 @@
 //! enforce the injection corpus gate that protects dangerous side effects.
 
 use serde::{Deserialize, Serialize};
+use std::error::Error;
+use std::fmt;
+use std::fs::File;
+use std::path::{Path, PathBuf};
 use tempo_schema::SideEffect;
 
 /// Runtime lane selected for an origin.
@@ -291,6 +295,242 @@ impl LaneTable {
             .iter()
             .find(|entry| entry.reason == reason)
             .map_or(0, |entry| entry.count)
+    }
+
+    /// Build the CI/nightly compat gate report for this lane table.
+    pub fn gate_report(&self, budget: CompatGateBudget) -> CompatGateReport {
+        run_compat_gate(self, budget)
+    }
+}
+
+/// Thresholds for the WS10 compat lane-table gate.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CompatGateBudget {
+    pub max_fallback_rate: f32,
+    pub max_missing_primary_count: usize,
+    pub max_challenge_rate_exceeded_rate: f32,
+}
+
+impl CompatGateBudget {
+    pub fn with_max_fallback_rate(mut self, max_fallback_rate: f32) -> Self {
+        self.max_fallback_rate = max_fallback_rate;
+        self
+    }
+
+    pub fn with_max_challenge_rate_exceeded_rate(
+        mut self,
+        max_challenge_rate_exceeded_rate: f32,
+    ) -> Self {
+        self.max_challenge_rate_exceeded_rate = max_challenge_rate_exceeded_rate;
+        self
+    }
+
+    pub fn with_max_missing_primary_count(mut self, max_missing_primary_count: usize) -> Self {
+        self.max_missing_primary_count = max_missing_primary_count;
+        self
+    }
+}
+
+impl Default for CompatGateBudget {
+    fn default() -> Self {
+        Self {
+            // A branch may be intentionally Servo-conservative while the pinned
+            // engine matures. CI jobs can tighten this without changing code.
+            max_fallback_rate: 1.0,
+            max_missing_primary_count: 0,
+            max_challenge_rate_exceeded_rate: 1.0,
+        }
+    }
+}
+
+/// CI-ready report for the compatibility regression gate.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CompatGateReport {
+    pub budget: CompatGateBudget,
+    pub total_origins: usize,
+    pub fallback_rate: f32,
+    pub missing_primary_count: usize,
+    pub challenge_rate_threshold: f32,
+    pub challenge_rate_exceeded_rate: f32,
+    pub violations: Vec<CompatGateViolation>,
+}
+
+impl CompatGateReport {
+    pub fn passed(&self) -> bool {
+        self.violations.is_empty()
+    }
+}
+
+/// A typed compatibility gate violation.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "gate", rename_all = "snake_case")]
+pub enum CompatGateViolation {
+    FallbackRate {
+        observed: f32,
+        max: f32,
+    },
+    MissingPrimaryLanes {
+        observed: usize,
+        max: usize,
+        origins: Vec<String>,
+    },
+    ChallengeRateExceededRate {
+        observed: f32,
+        max: f32,
+        challenge_rate_threshold: f32,
+        origins: Vec<String>,
+    },
+}
+
+/// Run the compat scorecard gate over a per-origin lane table.
+pub fn run_compat_gate(table: &LaneTable, budget: CompatGateBudget) -> CompatGateReport {
+    let mut violations = Vec::new();
+
+    if table.fallback_rate > budget.max_fallback_rate {
+        violations.push(CompatGateViolation::FallbackRate {
+            observed: table.fallback_rate,
+            max: budget.max_fallback_rate,
+        });
+    }
+
+    if table.missing_primary_count > budget.max_missing_primary_count {
+        violations.push(CompatGateViolation::MissingPrimaryLanes {
+            observed: table.missing_primary_count,
+            max: budget.max_missing_primary_count,
+            origins: table
+                .rows
+                .iter()
+                .filter(|row| row.primary.is_none())
+                .map(|row| row.origin.clone())
+                .collect(),
+        });
+    }
+
+    if table.challenge_rate_exceeded_rate > budget.max_challenge_rate_exceeded_rate {
+        violations.push(CompatGateViolation::ChallengeRateExceededRate {
+            observed: table.challenge_rate_exceeded_rate,
+            max: budget.max_challenge_rate_exceeded_rate,
+            challenge_rate_threshold: table.challenge_rate_threshold,
+            origins: table
+                .rows
+                .iter()
+                .filter(|row| row.challenge_rate > table.challenge_rate_threshold)
+                .map(|row| row.origin.clone())
+                .collect(),
+        });
+    }
+
+    CompatGateReport {
+        budget,
+        total_origins: table.rows.len(),
+        fallback_rate: table.fallback_rate,
+        missing_primary_count: table.missing_primary_count,
+        challenge_rate_threshold: table.challenge_rate_threshold,
+        challenge_rate_exceeded_rate: table.challenge_rate_exceeded_rate,
+        violations,
+    }
+}
+
+/// Read a persisted compat scorecard artifact.
+pub fn read_compat_scorecard(
+    path: impl AsRef<Path>,
+) -> Result<CompatScorecard, CompatArtifactError> {
+    read_json(path)
+}
+
+/// Write the lane table consumed by runtime fallback selection.
+pub fn write_lane_table(
+    path: impl AsRef<Path>,
+    table: &LaneTable,
+) -> Result<(), CompatArtifactError> {
+    write_json(path, table)
+}
+
+/// Write a compat gate report artifact for CI/nightly evidence.
+pub fn write_compat_gate_report(
+    path: impl AsRef<Path>,
+    report: &CompatGateReport,
+) -> Result<(), CompatArtifactError> {
+    write_json(path, report)
+}
+
+fn read_json<T: for<'de> Deserialize<'de>>(
+    path: impl AsRef<Path>,
+) -> Result<T, CompatArtifactError> {
+    let path = path.as_ref().to_path_buf();
+    let file = File::open(&path).map_err(|source| CompatArtifactError::Io {
+        path: path.clone(),
+        source,
+    })?;
+    serde_json::from_reader(file).map_err(|source| CompatArtifactError::JsonRead { path, source })
+}
+
+fn write_json<T: Serialize>(path: impl AsRef<Path>, value: &T) -> Result<(), CompatArtifactError> {
+    let path = path.as_ref().to_path_buf();
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent).map_err(|source| CompatArtifactError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+    let file = File::create(&path).map_err(|source| CompatArtifactError::Io {
+        path: path.clone(),
+        source,
+    })?;
+    serde_json::to_writer_pretty(file, value)
+        .map_err(|source| CompatArtifactError::JsonWrite { path, source })
+}
+
+#[derive(Debug)]
+pub enum CompatArtifactError {
+    Io {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    JsonRead {
+        path: PathBuf,
+        source: serde_json::Error,
+    },
+    JsonWrite {
+        path: PathBuf,
+        source: serde_json::Error,
+    },
+}
+
+impl fmt::Display for CompatArtifactError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io { path, source } => {
+                write!(
+                    formatter,
+                    "compat artifact I/O failed at {path:?}: {source}"
+                )
+            }
+            Self::JsonRead { path, source } => {
+                write!(
+                    formatter,
+                    "compat artifact JSON parse failed at {path:?}: {source}"
+                )
+            }
+            Self::JsonWrite { path, source } => {
+                write!(
+                    formatter,
+                    "compat artifact JSON write failed at {path:?}: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl Error for CompatArtifactError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Io { source, .. } => Some(source),
+            Self::JsonRead { source, .. } | Self::JsonWrite { source, .. } => Some(source),
+        }
     }
 }
 
@@ -638,6 +878,94 @@ mod tests {
     }
 
     #[test]
+    fn compat_gate_reports_fallback_missing_lane_and_challenge_violations() {
+        let table = LaneTable::new(vec![
+            decide_lane(
+                &OriginScore::new(
+                    "https://fallback.example",
+                    EngineProbe::servo(false, 0.0, false, 500),
+                    cdp_oracle(),
+                ),
+                CompatThresholds::default(),
+            ),
+            decide_lane(
+                &healthy_origin("https://challenge.example").challenge_rate(0.42),
+                CompatThresholds::default(),
+            ),
+            decide_lane(
+                &OriginScore::new(
+                    "https://down.example",
+                    EngineProbe::servo(false, 0.0, false, 900),
+                    EngineProbe::cdp(false, 0.0, false, 900),
+                ),
+                CompatThresholds::default(),
+            ),
+        ]);
+        let budget = CompatGateBudget {
+            max_fallback_rate: 0.25,
+            max_missing_primary_count: 0,
+            max_challenge_rate_exceeded_rate: 0.25,
+        };
+
+        let report = run_compat_gate(&table, budget);
+
+        assert!(!report.passed());
+        assert_eq!(
+            report.violations,
+            vec![
+                CompatGateViolation::FallbackRate {
+                    observed: 2.0 / 3.0,
+                    max: 0.25,
+                },
+                CompatGateViolation::MissingPrimaryLanes {
+                    observed: 1,
+                    max: 0,
+                    origins: vec!["https://down.example".into()],
+                },
+                CompatGateViolation::ChallengeRateExceededRate {
+                    observed: 1.0 / 3.0,
+                    max: 0.25,
+                    challenge_rate_threshold: 0.10,
+                    origins: vec!["https://challenge.example".into()],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn compat_artifact_io_round_trips_scorecard_lane_table_and_gate_report() -> Result<(), String> {
+        let root = unique_dir("compat-artifacts");
+        remove_dir_if_exists(&root).map_err(|error| error.to_string())?;
+        std::fs::create_dir_all(&root).map_err(|error| error.to_string())?;
+        let scorecard_path = root.join("scorecard.json");
+        let lane_table_path = root.join("out").join("lanes.json");
+        let gate_report_path = root.join("out").join("gate.json");
+        let scorecard = CompatScorecard::new(vec![healthy_origin("https://servo.example")]);
+        write_scorecard_fixture(&scorecard_path, &scorecard).map_err(|error| error.to_string())?;
+
+        let loaded = read_compat_scorecard(&scorecard_path).map_err(|error| error.to_string())?;
+        let table = loaded.lane_table(CompatThresholds::default());
+        let report = table.gate_report(CompatGateBudget {
+            max_fallback_rate: 0.0,
+            ..CompatGateBudget::default()
+        });
+
+        write_lane_table(&lane_table_path, &table).map_err(|error| error.to_string())?;
+        write_compat_gate_report(&gate_report_path, &report).map_err(|error| error.to_string())?;
+
+        assert!(report.passed());
+        let lane_bytes =
+            std::fs::read_to_string(&lane_table_path).map_err(|error| error.to_string())?;
+        let gate_bytes =
+            std::fs::read_to_string(&gate_report_path).map_err(|error| error.to_string())?;
+        assert!(lane_bytes.contains("\"servo_rate\""));
+        assert!(gate_bytes.contains("\"violations\""));
+
+        remove_dir_if_exists(&root).map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    #[test]
     fn lane_table_reports_missing_lanes_as_ci_evidence() {
         let table = LaneTable::new(vec![LaneTableRow {
             origin: "https://down.example".to_string(),
@@ -705,5 +1033,29 @@ mod tests {
         } else {
             Err(format!("expected {expected}, got {actual}"))
         }
+    }
+
+    fn unique_dir(name: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("tempo-compat-{name}-{nanos}"))
+    }
+
+    fn remove_dir_if_exists(path: &std::path::Path) -> std::io::Result<()> {
+        match std::fs::remove_dir_all(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn write_scorecard_fixture(
+        path: &std::path::Path,
+        scorecard: &CompatScorecard,
+    ) -> Result<(), serde_json::Error> {
+        let file = std::fs::File::create(path).map_err(serde_json::Error::io)?;
+        serde_json::to_writer_pretty(file, scorecard)
     }
 }
