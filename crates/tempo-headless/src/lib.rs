@@ -1373,7 +1373,10 @@ fn enforce_bidi_action_policy(
     input_tainted: Option<bool>,
     confirmed: bool,
 ) -> Option<BidiDispatchResult> {
-    let decision = decide_action(action, InputTaint::new(input_tainted.unwrap_or(false)));
+    let Some(input_tainted) = input_tainted else {
+        return Some(missing_bidi_input_taint_result(id));
+    };
+    let decision = decide_action(action, InputTaint::new(input_tainted));
     bidi_policy_denial(id, decision, confirmed)
 }
 
@@ -1383,8 +1386,22 @@ fn enforce_bidi_effect_policy(
     input_tainted: Option<bool>,
     confirmed: bool,
 ) -> Option<BidiDispatchResult> {
-    let decision = decide_effect(effect, InputTaint::new(input_tainted.unwrap_or(false)));
+    let Some(input_tainted) = input_tainted else {
+        return Some(missing_bidi_input_taint_result(id));
+    };
+    let decision = decide_effect(effect, InputTaint::new(input_tainted));
     bidi_policy_denial(id, decision, confirmed)
+}
+
+fn missing_bidi_input_taint_result(id: tempo_bidi::CommandId) -> BidiDispatchResult {
+    BidiDispatchResult::new(
+        200,
+        BidiMessage::error(
+            Some(id),
+            BidiErrorCode::InvalidArgument,
+            "inputTainted/input_tainted is required for policy-gated BiDi commands",
+        ),
+    )
 }
 
 fn bidi_policy_denial(
@@ -2142,7 +2159,7 @@ mod tests {
 
         stream.write_all(&masked_client_frame(
             WS_OPCODE_TEXT,
-            br#"{"id":2,"method":"browsingContext.navigate","params":{"context":"tempo-root","url":"https://event.test"}}"#,
+            br#"{"id":2,"method":"browsingContext.navigate","params":{"context":"tempo-root","url":"https://event.test","inputTainted":false}}"#,
         )?)?;
         let (opcode, payload) = read_server_frame(&mut stream)?;
         assert_eq!(opcode, WS_OPCODE_TEXT);
@@ -2181,7 +2198,7 @@ mod tests {
                 headers: BTreeMap::new(),
                 host: None,
                 origin: None,
-                body: br#"{"id":7,"method":"browsingContext.navigate","params":{"context":"ctx","url":"https://example.test"}}"#.to_vec(),
+                body: br#"{"id":7,"method":"browsingContext.navigate","params":{"context":"ctx","url":"https://example.test","inputTainted":false}}"#.to_vec(),
             },
         )?;
 
@@ -2215,7 +2232,7 @@ mod tests {
                 headers: BTreeMap::new(),
                 host: None,
                 origin: None,
-                body: br#"{"id":7,"method":"browsingContext.navigate","params":{"context":"ctx","url":"https://example.test"}}"#.to_vec(),
+                body: br#"{"id":7,"method":"browsingContext.navigate","params":{"context":"ctx","url":"https://example.test","inputTainted":false}}"#.to_vec(),
             },
         )?;
         join_driver_handler(handle)?;
@@ -2226,6 +2243,38 @@ mod tests {
         assert_eq!(value["id"], 7);
         assert_eq!(value["result"]["url"], "https://example.test");
         assert_eq!(value["result"]["navigation"], "tempo-navigation-7");
+        Ok(())
+    }
+
+    #[test]
+    fn bidi_endpoint_rejects_navigation_without_input_taint_evidence() -> TestResult {
+        let (client_stream, mut server_stream) = UnixStream::pair()?;
+        server_stream.set_nonblocking(true)?;
+        let mut pool = SessionPool::default();
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+
+        let response = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/bidi".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: br#"{"id":21,"method":"browsingContext.navigate","params":{"context":"ctx","url":"https://example.test"}}"#.to_vec(),
+            },
+        )?;
+
+        assert_eq!(response.status, 200);
+        let value: Value = serde_json::from_slice(&response.body)?;
+        assert_eq!(value["type"], "error");
+        assert_eq!(value["id"], 21);
+        assert_eq!(value["error"], "invalid argument");
+        let message = value["message"]
+            .as_str()
+            .ok_or("BiDi error response should include a message")?;
+        assert!(message.contains("inputTainted/input_tainted is required"));
+        assert_no_driver_ipc(&mut server_stream)?;
         Ok(())
     }
 
@@ -2322,7 +2371,7 @@ mod tests {
                 headers: BTreeMap::new(),
                 host: None,
                 origin: None,
-                body: br#"{"id":8,"method":"script.evaluate","params":{"expression":"document.title","target":{"context":"ctx"},"awaitPromise":true}}"#.to_vec(),
+                body: br#"{"id":8,"method":"script.evaluate","params":{"expression":"document.title","target":{"context":"ctx"},"awaitPromise":true,"inputTainted":false}}"#.to_vec(),
             },
         )?;
         join_driver_handler(handle)?;
@@ -2333,6 +2382,38 @@ mod tests {
         assert_eq!(value["id"], 8);
         assert_eq!(value["result"]["result"], "Tempo");
         assert_eq!(value["result"]["realm"], "ctx");
+        Ok(())
+    }
+
+    #[test]
+    fn bidi_endpoint_rejects_script_without_input_taint_evidence() -> TestResult {
+        let (client_stream, mut server_stream) = UnixStream::pair()?;
+        server_stream.set_nonblocking(true)?;
+        let mut pool = SessionPool::default();
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+
+        let response = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/bidi".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: br#"{"id":22,"method":"script.evaluate","params":{"expression":"document.title","target":{"context":"ctx"},"awaitPromise":true}}"#.to_vec(),
+            },
+        )?;
+
+        assert_eq!(response.status, 200);
+        let value: Value = serde_json::from_slice(&response.body)?;
+        assert_eq!(value["type"], "error");
+        assert_eq!(value["id"], 22);
+        assert_eq!(value["error"], "invalid argument");
+        let message = value["message"]
+            .as_str()
+            .ok_or("BiDi error response should include a message")?;
+        assert!(message.contains("inputTainted/input_tainted is required"));
+        assert_no_driver_ipc(&mut server_stream)?;
         Ok(())
     }
 
@@ -2443,7 +2524,7 @@ mod tests {
                 headers: BTreeMap::new(),
                 host: None,
                 origin: None,
-                body: br#"{"id":2,"method":"browsingContext.navigate","params":{"context":"tempo-root","url":"https://root.test"}}"#.to_vec(),
+                body: br#"{"id":2,"method":"browsingContext.navigate","params":{"context":"tempo-root","url":"https://root.test","inputTainted":false}}"#.to_vec(),
             },
         )?;
         let fork_nav = route_http_request(
@@ -2455,7 +2536,7 @@ mod tests {
                 host: None,
                 origin: None,
                 body: format!(
-                    r#"{{"id":3,"method":"browsingContext.navigate","params":{{"context":"{created_context}","url":"https://fork.test"}}}}"#
+                    r#"{{"id":3,"method":"browsingContext.navigate","params":{{"context":"{created_context}","url":"https://fork.test","inputTainted":false}}}}"#
                 )
                 .into_bytes(),
             },
