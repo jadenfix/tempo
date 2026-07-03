@@ -515,6 +515,7 @@ fn session_start_url(entries: &[JournalEntry]) -> Result<String, SpeculateError>
         .find_map(|entry| match &entry.event {
             JournalEvent::SessionStarted { url } => Some(url.clone()),
             JournalEvent::Observation { .. }
+            | JournalEvent::StructuredFastPathSelected { .. }
             | JournalEvent::ActionPlanned { .. }
             | JournalEvent::StepApplied { .. }
             | JournalEvent::StepError { .. }
@@ -540,6 +541,7 @@ fn replay_steps(entries: &[JournalEntry]) -> Vec<ReplayStep> {
                 reason: reason.clone(),
             }),
             JournalEvent::SessionStarted { .. }
+            | JournalEvent::StructuredFastPathSelected { .. }
             | JournalEvent::Observation { .. }
             | JournalEvent::ActionPlanned { .. }
             | JournalEvent::TransportError { .. }

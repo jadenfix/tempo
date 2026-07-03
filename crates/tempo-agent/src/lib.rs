@@ -95,6 +95,49 @@ impl StructuredFastPathDecision {
             StructuredSignal::WebMcp => "web_mcp",
         }
     }
+
+    pub fn supports_driver_task(&self, task: &DriverTask) -> bool {
+        if !matches!(
+            (self.lane, self.signal),
+            (StructuredLane::Mcp, StructuredSignal::McpCatalog)
+        ) {
+            return false;
+        }
+        if self.mcp_endpoint_path().is_none() {
+            return false;
+        }
+        task.steps
+            .iter()
+            .all(|step| matches!(step.action, Action::Skill { .. }))
+    }
+
+    fn mcp_endpoint_url(&self) -> Result<reqwest::Url, AgentError> {
+        let endpoint_path =
+            self.mcp_endpoint_path()
+                .ok_or_else(|| AgentError::StructuredFastPathUnsupported {
+                    reason: format!(
+                        "structured MCP source is not an executable catalog endpoint: {}",
+                        self.source
+                    ),
+                })?;
+        let mut endpoint = reqwest::Url::parse(&self.origin).map_err(|error| {
+            AgentError::InvalidStructuredEndpoint {
+                value: self.origin.clone(),
+                reason: error.to_string(),
+            }
+        })?;
+        endpoint.set_path(endpoint_path);
+        endpoint.set_query(None);
+        endpoint.set_fragment(None);
+        Ok(endpoint)
+    }
+
+    fn mcp_endpoint_path(&self) -> Option<&str> {
+        let source = self.source.trim();
+        source
+            .strip_suffix("/catalog.json")
+            .filter(|path| !path.is_empty() && path.starts_with('/'))
+    }
 }
 
 /// Pre-render structured-web probe used to avoid pixel rendering when an origin
@@ -299,6 +342,7 @@ impl ResumeCursor {
                 }
                 JournalEvent::SessionClosed => closed = true,
                 JournalEvent::SessionStarted { .. }
+                | JournalEvent::StructuredFastPathSelected { .. }
                 | JournalEvent::Observation { .. }
                 | JournalEvent::TransportError { .. }
                 | JournalEvent::CassetteRecorded { .. } => {}
@@ -450,6 +494,20 @@ impl AgentLoop {
     pub fn record_session_started(&mut self, url: impl Into<String>) -> Result<(), AgentError> {
         self.journal
             .append(JournalEvent::SessionStarted { url: url.into() })?;
+        Ok(())
+    }
+
+    pub fn record_structured_fast_path_selected(
+        &mut self,
+        decision: &StructuredFastPathDecision,
+    ) -> Result<(), AgentError> {
+        self.journal
+            .append(JournalEvent::StructuredFastPathSelected {
+                origin: decision.origin.clone(),
+                lane: decision.lane_name().to_string(),
+                signal: decision.signal_name().to_string(),
+                source: decision.source.clone(),
+            })?;
         Ok(())
     }
 
@@ -715,39 +773,10 @@ impl AgentRunner {
     where
         D: DriverTrait + ?Sized,
     {
-        let plan = task.task_plan()?;
-        let mut agent = AgentLoop::open(
-            &self.journal_path,
-            self.ids.run_id.clone(),
-            self.ids.session_id.clone(),
-            plan,
-            self.token_budget.clone(),
-        )?;
-        let initial_entries = read_journal_entries(agent.journal_path())?;
-        let mut report = AgentRunReport::new(
-            driver.engine(),
-            agent.journal_path().to_path_buf(),
-            initial_entries.len(),
-            agent.cursor().completed_steps,
-        );
+        let (mut agent, initial_entries, mut report) =
+            self.open_agent_report(AgentRunEngine::Driver(driver.engine()), task)?;
 
-        if agent.cursor().closed && agent.is_complete() {
-            report.status = AgentRunStatus::AlreadyComplete;
-            return Ok(report);
-        }
-
-        if let Some((action_index, reason)) = &agent.cursor().last_step_error {
-            report.status = if is_policy_denial_reason(reason) {
-                AgentRunStatus::PolicyDenied {
-                    action_index: *action_index,
-                    reason: reason.clone(),
-                }
-            } else {
-                AgentRunStatus::StepError {
-                    action_index: *action_index,
-                    reason: reason.clone(),
-                }
-            };
+        if self.apply_resume_terminal_status(&agent, &mut report) {
             return Ok(report);
         }
 
@@ -755,9 +784,12 @@ impl AgentRunner {
         if !has_session_started(&initial_entries) {
             if let Some(decision) = self.structured_fast_path.probe_target(&task.start_url)
                 && decision.skips_render()
+                && decision.supports_driver_task(task)
             {
-                report.status = AgentRunStatus::StructuredFastPath(decision);
-                return Ok(report);
+                report.engine = AgentRunEngine::Structured;
+                return self
+                    .run_structured_agent_task(agent, report, &initial_entries, task, decision)
+                    .await;
             }
 
             let observation = driver
@@ -908,6 +940,259 @@ impl AgentRunner {
         agent.close_session()?;
         report.status = AgentRunStatus::Completed;
         Ok(report)
+    }
+
+    pub async fn run_structured_task(
+        &self,
+        task: &DriverTask,
+        decision: StructuredFastPathDecision,
+    ) -> Result<AgentRunReport, AgentError> {
+        if !decision.skips_render() || !decision.supports_driver_task(task) {
+            return Err(AgentError::StructuredFastPathUnsupported {
+                reason: format!(
+                    "lane={} signal={} cannot execute this task without a browser",
+                    decision.lane_name(),
+                    decision.signal_name()
+                ),
+            });
+        }
+
+        let (agent, initial_entries, mut report) =
+            self.open_agent_report(AgentRunEngine::Structured, task)?;
+        if self.apply_resume_terminal_status(&agent, &mut report) {
+            return Ok(report);
+        }
+
+        self.run_structured_agent_task(agent, report, &initial_entries, task, decision)
+            .await
+    }
+
+    fn open_agent_report(
+        &self,
+        engine: AgentRunEngine,
+        task: &DriverTask,
+    ) -> Result<(AgentLoop, Vec<JournalEntry>, AgentRunReport), AgentError> {
+        let plan = task.task_plan()?;
+        let agent = AgentLoop::open(
+            &self.journal_path,
+            self.ids.run_id.clone(),
+            self.ids.session_id.clone(),
+            plan,
+            self.token_budget.clone(),
+        )?;
+        let initial_entries = read_journal_entries(agent.journal_path())?;
+        let report = AgentRunReport::new(
+            engine,
+            agent.journal_path().to_path_buf(),
+            initial_entries.len(),
+            agent.cursor().completed_steps,
+        );
+        Ok((agent, initial_entries, report))
+    }
+
+    fn apply_resume_terminal_status(&self, agent: &AgentLoop, report: &mut AgentRunReport) -> bool {
+        if agent.cursor().closed && agent.is_complete() {
+            report.status = AgentRunStatus::AlreadyComplete;
+            return true;
+        }
+
+        if let Some((action_index, reason)) = &agent.cursor().last_step_error {
+            report.status = if is_policy_denial_reason(reason) {
+                AgentRunStatus::PolicyDenied {
+                    action_index: *action_index,
+                    reason: reason.clone(),
+                }
+            } else {
+                AgentRunStatus::StepError {
+                    action_index: *action_index,
+                    reason: reason.clone(),
+                }
+            };
+            return true;
+        }
+
+        false
+    }
+
+    async fn run_structured_agent_task(
+        &self,
+        mut agent: AgentLoop,
+        mut report: AgentRunReport,
+        initial_entries: &[JournalEntry],
+        task: &DriverTask,
+        decision: StructuredFastPathDecision,
+    ) -> Result<AgentRunReport, AgentError> {
+        let current_origin = self.origin_for_url("structured fast path", &decision.origin)?;
+        if !has_session_started(initial_entries) {
+            agent.record_session_started(task.start_url.clone())?;
+            agent.record_structured_fast_path_selected(&decision)?;
+        }
+
+        while let Some(planned) = agent.next_step().cloned() {
+            let index = agent.cursor().next_step;
+            let driver_step = task
+                .steps
+                .get(index)
+                .ok_or(AgentError::JournalHasExtraStep { index })?;
+
+            if agent.next_step_already_attempted() {
+                let policy = self.step_policy(
+                    driver_step,
+                    &planned.key,
+                    current_origin.as_ref(),
+                    driver_step.action.side_effect(),
+                )?;
+                let reason = RESUME_INTERRUPTED_REASON.to_string();
+                let triple = agent.record_pending_interruption(reason.clone())?;
+                report.actions_completed += 1;
+                report.steps.push(AgentStepReport {
+                    index,
+                    policy,
+                    triple,
+                    observation_budget: None,
+                });
+                report.status = AgentRunStatus::Interrupted {
+                    action_index: index,
+                    reason,
+                };
+                return Ok(report);
+            }
+
+            let policy = self.step_policy(
+                driver_step,
+                &planned.key,
+                current_origin.as_ref(),
+                driver_step.action.side_effect(),
+            )?;
+            if !policy.confirmed {
+                let reason = policy_denied_reason(&policy);
+                let triple = agent.record_next_outcome(StepOutcome::StepError {
+                    reason: reason.clone(),
+                })?;
+                report.actions_completed += 1;
+                report.steps.push(AgentStepReport {
+                    index,
+                    policy,
+                    triple,
+                    observation_budget: None,
+                });
+                report.status = AgentRunStatus::PolicyDenied {
+                    action_index: index,
+                    reason,
+                };
+                return Ok(report);
+            }
+
+            agent.plan_next_step()?;
+            let outcome = match &planned.action {
+                Action::Skill { name, input } => {
+                    let call = self
+                        .execute_structured_mcp_tool(&decision, &planned.key, name, input)
+                        .await
+                        .map_err(|reason| {
+                            structured_transport_error(
+                                &mut agent,
+                                "structured mcp tools/call",
+                                reason,
+                            )
+                        })?;
+                    if call.is_error {
+                        StepOutcome::StepError {
+                            reason: call.error_reason(),
+                        }
+                    } else {
+                        StepOutcome::Applied {
+                            diff: empty_structured_diff(index as u64),
+                        }
+                    }
+                }
+                other => {
+                    return Err(AgentError::StructuredFastPathUnsupported {
+                        reason: format!("unsupported structured action: {other:?}"),
+                    });
+                }
+            };
+            let triple = agent.record_next_outcome(outcome)?;
+            report.actions_completed += 1;
+
+            let step_error = match &triple.outcome {
+                StepTripleOutcome::StepError { reason } => Some(reason.clone()),
+                StepTripleOutcome::Applied { .. } => None,
+            };
+            report.steps.push(AgentStepReport {
+                index,
+                policy,
+                triple,
+                observation_budget: None,
+            });
+
+            if let Some(reason) = step_error {
+                report.status = AgentRunStatus::StepError {
+                    action_index: index,
+                    reason,
+                };
+                return Ok(report);
+            }
+        }
+
+        agent.close_session()?;
+        report.status = AgentRunStatus::StructuredFastPath(decision);
+        Ok(report)
+    }
+
+    async fn execute_structured_mcp_tool(
+        &self,
+        decision: &StructuredFastPathDecision,
+        key: &IdempotencyKey,
+        name: &str,
+        input: &serde_json::Value,
+    ) -> Result<StructuredMcpToolCall, String> {
+        let endpoint = decision
+            .mcp_endpoint_url()
+            .map_err(|error| error.to_string())?;
+        self.structured_fast_path
+            .config
+            .url_policy
+            .enforce(endpoint.as_str())
+            .map_err(|error| error.to_string())?;
+        let client = reqwest::Client::builder()
+            .timeout(self.structured_fast_path.config.timeout)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|error| error.to_string())?;
+
+        let initialize = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": format!("{}:initialize", key.0),
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {"name": "tempo-agent", "version": env!("CARGO_PKG_VERSION")},
+            },
+        });
+        let initialize = post_mcp_json(&client, endpoint.as_str(), &initialize).await?;
+        if let Some(error) = initialize.get("error") {
+            return Err(format!(
+                "MCP initialize failed: {}",
+                json_rpc_error_message(error)
+            ));
+        }
+
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": key.0,
+            "method": "tools/call",
+            "params": {
+                "name": name,
+                "arguments": input,
+            },
+        });
+        let response = post_mcp_json(&client, endpoint.as_str(), &request).await?;
+        if let Some(error) = response.get("error") {
+            return Ok(StructuredMcpToolCall::error(json_rpc_error_message(error)));
+        }
+        StructuredMcpToolCall::from_json_rpc_response(response)
     }
 
     /// Read a skill from the store exactly once and return both its declared
@@ -1076,10 +1361,23 @@ fn expand_skill_batch(
     })
 }
 
-/// Durable report for one live-driver run attempt.
+/// Runtime lane used for one durable run attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentRunEngine {
+    Driver(Engine),
+    Structured,
+}
+
+impl PartialEq<Engine> for AgentRunEngine {
+    fn eq(&self, other: &Engine) -> bool {
+        matches!(self, Self::Driver(engine) if engine == other)
+    }
+}
+
+/// Durable report for one live-driver or no-render structured run attempt.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AgentRunReport {
-    pub engine: Engine,
+    pub engine: AgentRunEngine,
     pub journal_path: PathBuf,
     pub status: AgentRunStatus,
     pub initial_journal_entries: usize,
@@ -1092,7 +1390,7 @@ pub struct AgentRunReport {
 
 impl AgentRunReport {
     fn new(
-        engine: Engine,
+        engine: AgentRunEngine,
         journal_path: PathBuf,
         initial_journal_entries: usize,
         actions_completed: usize,
@@ -1113,7 +1411,9 @@ impl AgentRunReport {
     pub fn succeeded(&self) -> bool {
         matches!(
             self.status,
-            AgentRunStatus::Completed | AgentRunStatus::AlreadyComplete
+            AgentRunStatus::Completed
+                | AgentRunStatus::AlreadyComplete
+                | AgentRunStatus::StructuredFastPath(_)
         )
     }
 }
@@ -1231,6 +1531,7 @@ pub fn step_triples_from_journal(
                 step_index += 1;
             }
             JournalEvent::SessionStarted { .. }
+            | JournalEvent::StructuredFastPathSelected { .. }
             | JournalEvent::Observation { .. }
             | JournalEvent::ActionPlanned { .. }
             | JournalEvent::TransportError { .. }
@@ -1262,6 +1563,7 @@ pub fn step_triples_from_journal_entries(
                 )?);
             }
             JournalEvent::SessionStarted { .. }
+            | JournalEvent::StructuredFastPathSelected { .. }
             | JournalEvent::Observation { .. }
             | JournalEvent::ActionPlanned { .. }
             | JournalEvent::TransportError { .. }
@@ -1280,6 +1582,98 @@ pub fn step_triples_from_journal_without_plan(
 ) -> Result<Vec<StepTriple>, AgentError> {
     let entries = read_journal_entries(journal_path)?;
     step_triples_from_journal_entries(&entries)
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct StructuredMcpToolCall {
+    is_error: bool,
+    structured_content: serde_json::Value,
+}
+
+impl StructuredMcpToolCall {
+    fn error(reason: String) -> Self {
+        Self {
+            is_error: true,
+            structured_content: serde_json::json!({ "error": reason }),
+        }
+    }
+
+    fn from_json_rpc_response(response: serde_json::Value) -> Result<Self, String> {
+        let result = response
+            .get("result")
+            .ok_or_else(|| "MCP tools/call response missing result".to_string())?;
+        let is_error = result
+            .get("isError")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let structured_content = result
+            .get("structuredContent")
+            .cloned()
+            .ok_or_else(|| "MCP tools/call response missing structuredContent".to_string())?;
+        Ok(Self {
+            is_error,
+            structured_content,
+        })
+    }
+
+    fn error_reason(&self) -> String {
+        self.structured_content
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| self.structured_content.to_string())
+    }
+}
+
+async fn post_mcp_json(
+    client: &reqwest::Client,
+    endpoint: &str,
+    request: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let response = client
+        .post(endpoint)
+        .json(request)
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("MCP endpoint returned HTTP {status}"));
+    }
+    response
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|error| error.to_string())
+}
+
+fn json_rpc_error_message(error: &serde_json::Value) -> String {
+    error
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| error.to_string())
+}
+
+fn empty_structured_diff(since_seq: u64) -> ObservationDiff {
+    ObservationDiff {
+        since_seq,
+        seq: since_seq.saturating_add(1),
+        added: Vec::new(),
+        removed: Vec::new(),
+        changed: Vec::new(),
+    }
+}
+
+fn structured_transport_error(
+    agent: &mut AgentLoop,
+    context: &'static str,
+    reason: String,
+) -> AgentError {
+    let source = TransportError::Other(reason);
+    match agent.record_transport_error(context, &source) {
+        Ok(()) => AgentError::transport(context, source),
+        Err(error) => error,
+    }
 }
 
 fn journal_transport_error(
@@ -1360,6 +1754,10 @@ pub enum AgentError {
         context: String,
         source: TransportError,
     },
+    #[error("structured fast path cannot execute this task: {reason}")]
+    StructuredFastPathUnsupported { reason: String },
+    #[error("invalid structured fast path endpoint {value}: {reason}")]
+    InvalidStructuredEndpoint { value: String, reason: String },
     #[error("invalid origin during {context}: {url}: {reason}")]
     InvalidOrigin {
         context: &'static str,
@@ -1922,8 +2320,70 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runner_structured_fast_path_skips_initial_driver_navigation() -> TestResult {
+    async fn runner_structured_fast_path_executes_remote_mcp_skill_without_navigation() -> TestResult
+    {
         let root = unique_dir("runner-structured-fast-path")?;
+        remove_dir_if_exists(&root)?;
+        fs::create_dir_all(&root)?;
+        let journal_path = root.join("session.jsonl");
+        let (origin, server) = serve_structured_mcp_fixture()?;
+        let task = DriverTask::new(
+            format!("{origin}/app"),
+            vec![Action::Skill {
+                name: "search".into(),
+                input: serde_json::json!({"q": "tempo"}),
+            }],
+        );
+        let mut driver = FailingDriver::new(TransportFailurePoint::Goto);
+        let runner = AgentRunner::new(
+            &journal_path,
+            AgentRunIds::new("run-structured", "session-structured"),
+        )
+        .with_structured_fast_path(
+            StructuredFastPath::with_probe(fake_mcp_fast_path_probe).allow_private_network_access(),
+        );
+
+        let report = runner.run_driver_task(&mut driver, &task).await?;
+        server
+            .join()
+            .map_err(|_| "structured MCP fixture thread panicked")??;
+
+        assert_eq!(
+            report.status,
+            AgentRunStatus::StructuredFastPath(StructuredFastPathDecision::new(
+                origin.clone(),
+                StructuredLane::Mcp,
+                StructuredSignal::McpCatalog,
+                "/mcp/catalog.json"
+            ))
+        );
+        assert_eq!(report.engine, AgentRunEngine::Structured);
+        assert_eq!(driver.goto_calls, 0);
+        assert_eq!(report.actions_completed, 1);
+        assert_eq!(report.observations, 0);
+        let entries = read_journal_entries(&journal_path)?;
+        assert!(matches!(
+            entries.first().map(|entry| &entry.event),
+            Some(JournalEvent::SessionStarted { .. })
+        ));
+        assert!(entries
+            .iter()
+            .any(|entry| matches!(entry.event, JournalEvent::StructuredFastPathSelected { .. })));
+        assert!(entries
+            .iter()
+            .any(|entry| matches!(entry.event, JournalEvent::StepApplied { .. })));
+        assert!(matches!(
+            entries.last().map(|entry| &entry.event),
+            Some(JournalEvent::SessionClosed)
+        ));
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runner_mcp_fast_path_unsupported_actions_fall_through_to_driver() -> TestResult {
+        let root = unique_dir("runner-structured-fast-path-fallback")?;
         remove_dir_if_exists(&root)?;
         fs::create_dir_all(&root)?;
         let journal_path = root.join("session.jsonl");
@@ -1936,25 +2396,29 @@ mod tests {
         let mut driver = FailingDriver::new(TransportFailurePoint::Goto);
         let runner = AgentRunner::new(
             &journal_path,
-            AgentRunIds::new("run-structured", "session-structured"),
+            AgentRunIds::new("run-structured-fallback", "session-structured-fallback"),
         )
         .with_structured_fast_path(StructuredFastPath::with_probe(fake_mcp_fast_path_probe));
 
-        let report = runner.run_driver_task(&mut driver, &task).await?;
+        let error = runner.run_driver_task(&mut driver, &task).await.err();
 
-        assert_eq!(
-            report.status,
-            AgentRunStatus::StructuredFastPath(StructuredFastPathDecision::new(
-                "https://structured.example",
-                StructuredLane::Mcp,
-                StructuredSignal::McpCatalog,
-                "/mcp/catalog.json"
-            ))
-        );
-        assert_eq!(driver.goto_calls, 0);
-        assert_eq!(report.actions_completed, 0);
-        assert_eq!(report.observations, 0);
-        assert!(read_journal_entries(&journal_path)?.is_empty());
+        assert_eq!(driver.goto_calls, 1);
+        assert!(matches!(
+            error,
+            Some(AgentError::Transport {
+                context,
+                source: TransportError::NavTimeout,
+            }) if context == "initial goto"
+        ));
+        let entries = read_journal_entries(&journal_path)?;
+        assert!(!entries
+            .iter()
+            .any(|entry| matches!(entry.event, JournalEvent::StructuredFastPathSelected { .. })));
+        assert!(has_transport_error(
+            &entries,
+            "initial goto",
+            "navigation timed out"
+        ));
 
         remove_dir_if_exists(&root)?;
         Ok(())
@@ -2749,12 +3213,126 @@ mod tests {
         PostActionObserve,
     }
 
+    type FixtureHandle = thread::JoinHandle<std::io::Result<()>>;
+
+    fn serve_structured_mcp_fixture() -> std::io::Result<(String, FixtureHandle)> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
+        let origin = format!("http://{}", listener.local_addr()?);
+        let handle = thread::spawn(move || -> std::io::Result<()> {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut handled = 0_usize;
+            let mut saw_tool_call = false;
+            while !saw_tool_call && handled < 16 && std::time::Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _peer)) => {
+                        handled += 1;
+                        stream.set_read_timeout(Some(std::time::Duration::from_secs(1)))?;
+                        let request = read_http_request(&mut stream)?;
+                        let (status, content_type, body) = if request
+                            .starts_with("GET /mcp/catalog.json ")
+                        {
+                            http_fixture_response(
+                                "200 OK",
+                                "application/json",
+                                r#"{"tools":[{"name":"search"}]}"#,
+                            )
+                        } else if request.starts_with("POST /mcp ")
+                            && request.contains(r#""method":"initialize""#)
+                        {
+                            http_fixture_response(
+                                "200 OK",
+                                "application/json",
+                                r#"{"jsonrpc":"2.0","id":"fixture","result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"fixture","version":"1"}}}"#,
+                            )
+                        } else if request.starts_with("POST /mcp ")
+                            && request.contains(r#""method":"tools/call""#)
+                            && request.contains(r#""name":"search""#)
+                            && request.contains(r#""q":"tempo""#)
+                        {
+                            saw_tool_call = true;
+                            http_fixture_response(
+                                "200 OK",
+                                "application/json",
+                                r#"{"jsonrpc":"2.0","id":"fixture","result":{"content":[{"type":"text","text":"{\"ok\":true}"}],"structuredContent":{"ok":true,"source":"mcp"},"isError":false}}"#,
+                            )
+                        } else {
+                            http_fixture_response("404 Not Found", "text/plain", "not found")
+                        };
+                        let response = format!(
+                            "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        stream.write_all(response.as_bytes())?;
+                        stream.flush()?;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            if saw_tool_call {
+                Ok(())
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "structured MCP fixture did not receive tools/call",
+                ))
+            }
+        });
+        Ok((origin, handle))
+    }
+
+    fn http_fixture_response(
+        status: &'static str,
+        content_type: &'static str,
+        body: &'static str,
+    ) -> (&'static str, &'static str, String) {
+        (status, content_type, body.to_string())
+    }
+
+    fn read_http_request(stream: &mut std::net::TcpStream) -> std::io::Result<String> {
+        let mut bytes = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        loop {
+            let read = stream.read(&mut chunk)?;
+            if read == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&chunk[..read]);
+            let Some(header_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&bytes[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    if name.eq_ignore_ascii_case("content-length") {
+                        value.trim().parse::<usize>().ok()
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(0);
+            if bytes.len() >= header_end + 4 + content_length {
+                break;
+            }
+        }
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
     fn fake_mcp_fast_path_probe(
-        _target: &str,
+        target: &str,
         _config: HttpProbeConfig,
     ) -> Option<StructuredFastPathDecision> {
+        let origin = reqwest::Url::parse(target)
+            .ok()?
+            .origin()
+            .ascii_serialization();
         Some(StructuredFastPathDecision::new(
-            "https://structured.example",
+            origin,
             StructuredLane::Mcp,
             StructuredSignal::McpCatalog,
             "/mcp/catalog.json",
