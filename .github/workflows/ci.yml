@@ -64,6 +64,8 @@ jobs:
         run: >
           cargo run -p tempo-cli -- taint-gate
           --input fixtures/security/taint-redteam-pass.json
+      - name: install Servo system deps
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libfontconfig1-dev
       - name: servo vanilla build gate
         run: cargo check -p tempo-engine-servo --no-default-features --features servo-vanilla
 
