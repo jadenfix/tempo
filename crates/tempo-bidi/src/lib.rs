@@ -115,6 +115,8 @@ pub struct NavigateCommand {
     pub url: String,
     pub wait: ReadinessState,
     pub action: Action,
+    pub input_tainted: Option<bool>,
+    pub confirmed: bool,
 }
 
 /// Minimal endpoint state for the session domain.
@@ -204,6 +206,8 @@ impl BidiRouter {
                         url: params.url,
                         wait: params.wait,
                         action,
+                        input_tainted: params.input_tainted,
+                        confirmed: params.confirmed,
                     }),
                 })
             }
@@ -583,6 +587,10 @@ pub struct NavigateParameters {
     pub url: String,
     #[serde(default)]
     pub wait: ReadinessState,
+    #[serde(default, rename = "inputTainted", alias = "input_tainted")]
+    pub input_tainted: Option<bool>,
+    #[serde(default)]
+    pub confirmed: bool,
 }
 
 /// browsingContext.navigate result.
@@ -631,6 +639,10 @@ pub struct ScriptEvaluateParameters {
     pub await_promise: bool,
     #[serde(default)]
     pub result_ownership: ResultOwnership,
+    #[serde(default, alias = "input_tainted")]
+    pub input_tainted: Option<bool>,
+    #[serde(default)]
+    pub confirmed: bool,
 }
 
 /// Script result ownership.
@@ -1031,9 +1043,32 @@ mod tests {
                     action: Action::Goto {
                         url: "https://example.test".into(),
                     },
+                    input_tainted: None,
+                    confirmed: false,
                 }),
             }
         );
+        Ok(())
+    }
+
+    #[test]
+    fn navigate_routes_policy_metadata() -> TestResult {
+        let mut router = BidiRouter::new();
+
+        let routed = router.route_json(
+            br#"{"id":9,"method":"browsingContext.navigate","params":{"context":"ctx-1","url":"https://example.test","inputTainted":true,"confirmed":true}}"#,
+        )?;
+
+        match routed {
+            RoutedCommand::Driver {
+                command: DriverCommand::Navigate(command),
+                ..
+            } => {
+                assert_eq!(command.input_tainted, Some(true));
+                assert!(command.confirmed);
+            }
+            other => return Err(format!("expected navigate driver command, got {other:?}").into()),
+        }
         Ok(())
     }
 
@@ -1056,9 +1091,36 @@ mod tests {
                     },
                     await_promise: true,
                     result_ownership: ResultOwnership::Root,
+                    input_tainted: None,
+                    confirmed: false,
                 }),
             }
         );
+        Ok(())
+    }
+
+    #[test]
+    fn script_evaluate_routes_policy_metadata_alias() -> TestResult {
+        let mut router = BidiRouter::new();
+
+        let routed = router.route_json(
+            br#"{"id":10,"method":"script.evaluate","params":{"expression":"document.title","target":{"context":"ctx-1"},"input_tainted":true,"confirmed":true}}"#,
+        )?;
+
+        match routed {
+            RoutedCommand::Driver {
+                command: DriverCommand::EvaluateScript(command),
+                ..
+            } => {
+                assert_eq!(command.input_tainted, Some(true));
+                assert!(command.confirmed);
+            }
+            other => {
+                return Err(
+                    format!("expected script.evaluate driver command, got {other:?}").into(),
+                )
+            }
+        }
         Ok(())
     }
 
