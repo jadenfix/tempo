@@ -864,11 +864,17 @@ impl AgentRunner {
                         journal_transport_error(&mut agent, "execute action", source)
                     })?,
             };
+            // A batch StepError still fails the step. `PartiallyApplied` is a
+            // StepError whose earlier actions already grounded — it must fail
+            // the step exactly like a plain StepError (never a replayable no-op),
+            // but the side effects are already captured by the forced post-batch
+            // diff and the post-action observation below.
             let outcome = match execution.status {
                 ExecutionStatus::Applied => StepOutcome::Applied {
                     diff: execution.diff,
                 },
-                ExecutionStatus::StepError { reason } => StepOutcome::StepError { reason },
+                ExecutionStatus::PartiallyApplied { reason }
+                | ExecutionStatus::StepError { reason } => StepOutcome::StepError { reason },
             };
             let triple = agent.record_next_outcome(outcome)?;
             report.actions_completed += 1;
