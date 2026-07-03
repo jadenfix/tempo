@@ -19,6 +19,7 @@ tempo-engine-cdp = { path = "../tempo-engine-cdp" }
 tempo-driver = { path = "../tempo-driver" }
 tempo-schema = { path = "../tempo-schema" }
 tempo-session = { path = "../tempo-session" }
+tempo-taint = { path = "../tempo-taint" }
 thiserror.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread"] }
 
