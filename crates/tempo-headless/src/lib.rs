@@ -477,10 +477,7 @@ impl SessionPool {
     }
 
     fn bidi_driver_for(&self, context: &BrowsingContextId) -> Option<AttachedEngineDriver> {
-        self.bidi_contexts
-            .get(context)
-            .cloned()
-            .or_else(|| self.bidi_contexts.get(&default_context_id()).cloned())
+        self.bidi_contexts.get(context).cloned()
     }
 
     fn register_bidi_context(&mut self, driver: AttachedEngineDriver) -> BrowsingContextId {
@@ -1192,7 +1189,7 @@ fn route_bidi_driver(
             }
             let context = command.context.clone();
             let Some(mut driver) = pool.bidi_driver_for(&context) else {
-                return driver_required_result(id);
+                return unknown_browsing_context_result(id);
             };
             let url = command.url.clone();
             match futures::executor::block_on(driver.goto(&url)) {
@@ -1219,7 +1216,7 @@ fn route_bidi_driver(
         BidiDriverCommand::GetTree(command) => {
             let root = command.root.unwrap_or_else(default_context_id);
             let Some(mut driver) = pool.bidi_driver_for(&root) else {
-                return driver_required_result(id);
+                return unknown_browsing_context_result(id);
             };
             match futures::executor::block_on(driver.observe()) {
                 Ok(observation) => {
@@ -1247,7 +1244,7 @@ fn route_bidi_driver(
         BidiDriverCommand::CaptureScreenshot(_) => {
             let context = screenshot_context(&command);
             let Some(mut driver) = pool.bidi_driver_for(&context) else {
-                return driver_required_result(id);
+                return unknown_browsing_context_result(id);
             };
             match futures::executor::block_on(driver.screenshot()) {
                 Ok(bytes) => {
@@ -1281,7 +1278,7 @@ fn route_bidi_driver(
             }
             let reference = command.reference_context.unwrap_or_else(default_context_id);
             let Some(mut driver) = pool.bidi_driver_for(&reference) else {
-                return driver_required_result(id);
+                return unknown_browsing_context_result(id);
             };
             match futures::executor::block_on(driver.fork_attached()) {
                 Ok(forked) => {
@@ -1339,7 +1336,7 @@ fn route_bidi_driver(
             }
             let context = command.target.context.clone();
             let Some(mut driver) = pool.bidi_driver_for(&context) else {
-                return driver_required_result(id);
+                return unknown_browsing_context_result(id);
             };
             let expression = command.expression.clone();
             match futures::executor::block_on(
@@ -1428,13 +1425,13 @@ fn bidi_policy_denial(
     }
 }
 
-fn driver_required_result(id: tempo_bidi::CommandId) -> BidiDispatchResult {
+fn unknown_browsing_context_result(id: tempo_bidi::CommandId) -> BidiDispatchResult {
     BidiDispatchResult::new(
-        503,
+        200,
         BidiMessage::error(
             Some(id),
-            BidiErrorCode::UnknownError,
-            "driver command requires an attached engine driver",
+            BidiErrorCode::InvalidArgument,
+            "unknown browsing context",
         ),
     )
 }
@@ -2198,7 +2195,7 @@ mod tests {
                 headers: BTreeMap::new(),
                 host: None,
                 origin: None,
-                body: br#"{"id":7,"method":"browsingContext.navigate","params":{"context":"ctx","url":"https://example.test","inputTainted":false}}"#.to_vec(),
+                body: br#"{"id":7,"method":"browsingContext.navigate","params":{"context":"tempo-root","url":"https://example.test","inputTainted":false}}"#.to_vec(),
             },
         )?;
 
@@ -2206,6 +2203,37 @@ mod tests {
         let value: Value = serde_json::from_slice(&response.body)?;
         assert_eq!(value["type"], "error");
         assert_eq!(value["id"], 7);
+        Ok(())
+    }
+
+    #[test]
+    fn bidi_endpoint_rejects_unknown_context_before_driver_execution() -> TestResult {
+        let cases: &[(u64, &[u8])] = &[
+            (
+                21,
+                br#"{"id":21,"method":"browsingContext.navigate","params":{"context":"missing","url":"https://example.test","inputTainted":false}}"#,
+            ),
+            (
+                22,
+                br#"{"id":22,"method":"script.evaluate","params":{"expression":"document.title","target":{"context":"missing"},"inputTainted":false}}"#,
+            ),
+            (
+                23,
+                br#"{"id":23,"method":"browsingContext.captureScreenshot","params":{"context":"missing"}}"#,
+            ),
+            (
+                24,
+                br#"{"id":24,"method":"browsingContext.getTree","params":{"root":"missing"}}"#,
+            ),
+            (
+                25,
+                br#"{"id":25,"method":"browsingContext.create","params":{"type":"tab","referenceContext":"missing"}}"#,
+            ),
+        ];
+
+        for (id, body) in cases {
+            assert_bidi_unknown_context_rejected(*id, body)?;
+        }
         Ok(())
     }
 
@@ -2232,7 +2260,7 @@ mod tests {
                 headers: BTreeMap::new(),
                 host: None,
                 origin: None,
-                body: br#"{"id":7,"method":"browsingContext.navigate","params":{"context":"ctx","url":"https://example.test","inputTainted":false}}"#.to_vec(),
+                body: br#"{"id":7,"method":"browsingContext.navigate","params":{"context":"tempo-root","url":"https://example.test","inputTainted":false}}"#.to_vec(),
             },
         )?;
         join_driver_handler(handle)?;
@@ -2301,7 +2329,7 @@ mod tests {
                 headers: BTreeMap::new(),
                 host: None,
                 origin: None,
-                body: br#"{"id":17,"method":"browsingContext.navigate","params":{"context":"ctx","url":"https://example.test","inputTainted":true,"confirmed":true}}"#.to_vec(),
+                body: br#"{"id":17,"method":"browsingContext.navigate","params":{"context":"tempo-root","url":"https://example.test","inputTainted":true,"confirmed":true}}"#.to_vec(),
             },
         )?;
         join_driver_handler(handle)?;
@@ -2329,7 +2357,7 @@ mod tests {
                 headers: BTreeMap::new(),
                 host: None,
                 origin: None,
-                body: br#"{"id":18,"method":"browsingContext.navigate","params":{"context":"ctx","url":"https://example.test","inputTainted":true}}"#.to_vec(),
+                body: br#"{"id":18,"method":"browsingContext.navigate","params":{"context":"tempo-root","url":"https://example.test","inputTainted":true}}"#.to_vec(),
             },
         )?;
 
@@ -2371,7 +2399,7 @@ mod tests {
                 headers: BTreeMap::new(),
                 host: None,
                 origin: None,
-                body: br#"{"id":8,"method":"script.evaluate","params":{"expression":"document.title","target":{"context":"ctx"},"awaitPromise":true,"inputTainted":false}}"#.to_vec(),
+                body: br#"{"id":8,"method":"script.evaluate","params":{"expression":"document.title","target":{"context":"tempo-root"},"awaitPromise":true,"inputTainted":false}}"#.to_vec(),
             },
         )?;
         join_driver_handler(handle)?;
@@ -2381,7 +2409,7 @@ mod tests {
         assert_eq!(value["type"], "success");
         assert_eq!(value["id"], 8);
         assert_eq!(value["result"]["result"], "Tempo");
-        assert_eq!(value["result"]["realm"], "ctx");
+        assert_eq!(value["result"]["realm"], "tempo-root");
         Ok(())
     }
 
@@ -2441,7 +2469,7 @@ mod tests {
                 headers: BTreeMap::new(),
                 host: None,
                 origin: None,
-                body: br#"{"id":20,"method":"script.evaluate","params":{"expression":"document.title","target":{"context":"ctx"},"awaitPromise":true,"inputTainted":true,"confirmed":true}}"#.to_vec(),
+                body: br#"{"id":20,"method":"script.evaluate","params":{"expression":"document.title","target":{"context":"tempo-root"},"awaitPromise":true,"inputTainted":true,"confirmed":true}}"#.to_vec(),
             },
         )?;
         join_driver_handler(handle)?;
@@ -2469,7 +2497,7 @@ mod tests {
                 headers: BTreeMap::new(),
                 host: None,
                 origin: None,
-                body: br#"{"id":19,"method":"script.evaluate","params":{"expression":"document.body.textContent='owned'","target":{"context":"ctx"},"input_tainted":true}}"#.to_vec(),
+                body: br#"{"id":19,"method":"script.evaluate","params":{"expression":"document.body.textContent='owned'","target":{"context":"tempo-root"},"input_tainted":true}}"#.to_vec(),
             },
         )?;
 
@@ -3527,6 +3555,34 @@ mod tests {
             Ok(bytes) => Err(format!("invalid BiDi command dispatched {bytes} IPC bytes").into()),
             Err(error) => Err(error.into()),
         }
+    }
+
+    fn assert_bidi_unknown_context_rejected(id: u64, body: &[u8]) -> Result<(), Box<dyn Error>> {
+        let (client_stream, mut server_stream) = UnixStream::pair()?;
+        server_stream.set_nonblocking(true)?;
+        let mut pool = SessionPool::default();
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+
+        let response = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/bidi".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: body.to_vec(),
+            },
+        )?;
+
+        assert_eq!(response.status, 200);
+        let value: Value = serde_json::from_slice(&response.body)?;
+        assert_eq!(value["type"], "error");
+        assert_eq!(value["id"], id);
+        assert_eq!(value["error"], "invalid argument");
+        assert_eq!(value["message"], "unknown browsing context");
+        assert_no_driver_ipc(&mut server_stream)?;
+        Ok(())
     }
 
     fn mcp_tool_request(
