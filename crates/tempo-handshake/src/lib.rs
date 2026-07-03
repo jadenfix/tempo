@@ -28,11 +28,7 @@ pub const WEB_MCP_DETECTION_SCRIPT: &str = r#"
   return {
     available: value !== undefined && value !== null,
     type: value === undefined || value === null ? null : typeof value,
-    hasTools: !!(value && (
-      hasNamedTools ||
-      typeof value.listTools === 'function' ||
-      typeof value.callTool === 'function'
-    ))
+    hasTools: !!(value && hasNamedTools)
   };
 })()
 "#;
@@ -782,6 +778,31 @@ mod tests {
         );
         assert_eq!(detected.value_type.as_deref(), Some("object"));
         assert!(detected.has_tools);
+    }
+
+    #[test]
+    fn method_only_web_mcp_detection_does_not_select_mcp() {
+        let method_only = WebMcpDetection::from_script_result(&serde_json::json!({
+            "available": true,
+            "type": "object",
+            "hasTools": false,
+            "methods": ["listTools", "callTool"],
+        }));
+        let mut report = ProbeReport::new();
+
+        report.record_web_mcp_detection(&method_only);
+
+        assert!(method_only.available);
+        assert!(!method_only.has_tools);
+        assert!(report.hits().is_empty());
+        assert_eq!(decide_lane(&report).lane, Lane::Render);
+    }
+
+    #[test]
+    fn web_mcp_detection_script_requires_named_tools() {
+        assert!(WEB_MCP_DETECTION_SCRIPT.contains("hasTools: !!(value && hasNamedTools)"));
+        assert!(!WEB_MCP_DETECTION_SCRIPT.contains("listTools"));
+        assert!(!WEB_MCP_DETECTION_SCRIPT.contains("callTool"));
     }
 
     #[test]
