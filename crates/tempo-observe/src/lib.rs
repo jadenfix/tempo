@@ -5,6 +5,7 @@
 //! and token/byte budgeting. Live Servo/CDP adapters feed raw nodes into this
 //! pure compiler; tests exercise the same path with AccessKit-style fixtures.
 
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io::Cursor;
@@ -23,7 +24,7 @@ pub const DEFAULT_MAX_TOKENS: usize = 1_500;
 pub const DEFAULT_MAX_MARKS: usize = 16;
 
 /// Compiler controls for observation size and set-of-marks output.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompileOptions {
     pub max_bytes: usize,
     pub max_tokens: usize,
@@ -41,7 +42,7 @@ impl Default for CompileOptions {
 }
 
 /// One raw interactive candidate emitted by an engine adapter or recorded fixture.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RawElement {
     pub source_id: Option<String>,
     pub stable_hint: Option<String>,
@@ -148,7 +149,7 @@ impl RawElement {
 }
 
 /// Raw observation input for one page snapshot.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ObservationInput {
     pub url: String,
     pub elements: Vec<RawElement>,
@@ -164,7 +165,7 @@ impl ObservationInput {
 }
 
 /// Evidence summary for a recorded observation fixture corpus.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ObservationCorpusReport {
     pub snapshots: usize,
     pub bytes_p50: usize,
