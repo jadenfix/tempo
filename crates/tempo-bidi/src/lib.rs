@@ -90,6 +90,8 @@ impl BidiMessage {
 #[derive(Clone, Debug, PartialEq)]
 pub enum RoutedCommand {
     Immediate(BidiMessage),
+    SessionStarted(BidiMessage),
+    SessionEnded(BidiMessage),
     Driver {
         id: CommandId,
         command: DriverCommand,
@@ -124,6 +126,7 @@ pub struct NavigateCommand {
 pub struct BidiRouter {
     ready: bool,
     draining: bool,
+    session_active: bool,
     next_session: u64,
     next_subscription: u64,
     subscriptions: BTreeMap<SessionSubscription, BidiSubscription>,
@@ -134,6 +137,7 @@ impl BidiRouter {
         Self {
             ready: true,
             draining: false,
+            session_active: true,
             next_session: 1,
             next_subscription: 1,
             subscriptions: BTreeMap::new(),
@@ -149,6 +153,18 @@ impl BidiRouter {
     }
 
     pub fn route(&mut self, command: BidiCommand) -> Result<RoutedCommand, BidiProtocolError> {
+        if !self.session_active
+            && command.method != "session.status"
+            && command.method != "session.new"
+            && command.method != "session.end"
+        {
+            return Ok(RoutedCommand::Immediate(BidiMessage::error(
+                Some(command.id),
+                BidiErrorCode::InvalidArgument,
+                "BiDi session has ended",
+            )));
+        }
+
         match command.method.as_str() {
             "session.status" => self.session_status(command.id),
             "session.new" => self.session_new(command.id, command.params),
@@ -253,6 +269,10 @@ impl BidiRouter {
         self.ready = false;
     }
 
+    pub fn session_active(&self) -> bool {
+        self.session_active
+    }
+
     pub fn event_subscribed(
         &self,
         event: BidiEventMethod,
@@ -295,7 +315,9 @@ impl BidiRouter {
         };
         let session_id = format!("tempo-bidi-{}", self.next_session);
         self.next_session = self.next_session.saturating_add(1);
-        Ok(RoutedCommand::Immediate(BidiMessage::success(
+        self.ready = true;
+        self.session_active = true;
+        Ok(RoutedCommand::SessionStarted(BidiMessage::success(
             id,
             SessionNewResult {
                 session_id,
@@ -305,8 +327,9 @@ impl BidiRouter {
     }
 
     fn session_end(&mut self, id: CommandId) -> Result<RoutedCommand, BidiProtocolError> {
-        self.ready = false;
-        Ok(RoutedCommand::Immediate(BidiMessage::success(
+        self.session_active = false;
+        self.subscriptions.clear();
+        Ok(RoutedCommand::SessionEnded(BidiMessage::success(
             id,
             json!({}),
         )?))
@@ -936,7 +959,7 @@ mod tests {
 
         assert_eq!(
             routed,
-            RoutedCommand::Immediate(BidiMessage::Success {
+            RoutedCommand::SessionStarted(BidiMessage::Success {
                 id: 2,
                 result: json!({
                     "sessionId": "tempo-bidi-1",
@@ -983,19 +1006,30 @@ mod tests {
         let mut router = BidiRouter::new();
 
         let ended = router.route_json(br#"{"id":1,"method":"session.end","params":{}}"#)?;
-        let new_session = router.route_json(br#"{"id":2,"method":"session.new","params":{}}"#)?;
+        let rejected = router.route_json(
+            br#"{"id":2,"method":"browsingContext.navigate","params":{"context":"tempo-root","url":"https://ended.test","inputTainted":false}}"#,
+        )?;
+        let new_session = router.route_json(br#"{"id":3,"method":"session.new","params":{}}"#)?;
 
         assert_eq!(
             ended,
-            RoutedCommand::Immediate(BidiMessage::Success {
+            RoutedCommand::SessionEnded(BidiMessage::Success {
                 id: 1,
                 result: json!({}),
             })
         );
         assert_eq!(
+            rejected,
+            RoutedCommand::Immediate(BidiMessage::Error {
+                id: Some(2),
+                error: "invalid argument".into(),
+                message: "BiDi session has ended".into(),
+            })
+        );
+        assert_eq!(
             new_session,
-            RoutedCommand::Immediate(BidiMessage::Success {
-                id: 2,
+            RoutedCommand::SessionStarted(BidiMessage::Success {
+                id: 3,
                 result: json!({
                     "sessionId": "tempo-bidi-1",
                     "capabilities": {},
