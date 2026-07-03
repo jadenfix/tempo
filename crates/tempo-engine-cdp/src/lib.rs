@@ -30,6 +30,20 @@ use tempo_schema::{
 };
 use tokio::task::JoinHandle;
 
+/// Maximum number of interactive elements that receive expensive per-element
+/// accessibility-tree enrichment per snapshot.
+///
+/// `observation.elements` comes straight from `extract_interactive_elements`
+/// and is uncapped, so a hostile page with tens of thousands of interactive
+/// elements would otherwise trigger three sequential CDP round-trips each
+/// (querySelector -> describeNode -> getPartialAXTree), pinning the driver for
+/// minutes and re-firing on every observe/goto (#201). Enrichment is bounded to
+/// the highest-ranked elements — the same bound the observe pipeline uses to
+/// pick set-of-marks labels (`tempo_observe::DEFAULT_MAX_MARKS`, currently 16) —
+/// so every element that actually survives into the marked observation is still
+/// enriched, while the long tail stays present but without an AX overlay.
+const MAX_AX_ENRICHED_ELEMENTS: usize = 16;
+
 /// Launch configuration for the CDP fallback lane.
 #[derive(Clone, Debug)]
 pub struct CdpConfig {
@@ -183,16 +197,15 @@ impl CdpTempoDriver {
             .root
             .node_id;
 
-        for element in &mut observation.elements {
-            if let Some(summary) = self
-                .ax_summary_for_selector(root, &element.node_id.0)
-                .await?
-            {
-                apply_ax_summary(element, &summary);
-            }
-        }
-
-        Ok(())
+        // Bound the expensive AX round-trips to the highest-ranked elements so a
+        // hostile page cannot pin the driver with an unbounded element list
+        // (#201). The rest of `observation.elements` is left untouched.
+        enrich_elements(
+            &mut observation.elements,
+            MAX_AX_ENRICHED_ELEMENTS,
+            |selector| async move { self.ax_summary_for_selector(root, &selector).await },
+        )
+        .await
     }
 
     async fn ax_summary_for_selector(
@@ -837,6 +850,47 @@ fn apply_ax_summary(element: &mut InteractiveElement, summary: &AxSummary) {
     if let Some(value) = &summary.value {
         element.value = page_taint(value);
     }
+}
+
+/// Enrich at most `max_enriched` elements with an AX summary, chosen as the
+/// highest-ranked elements (ties broken by document order). `lookup` performs
+/// the per-element CDP round-trips; it is only invoked for the elements that are
+/// selected, so the number of round-trips is bounded by `max_enriched`
+/// regardless of how many interactive elements the page exposes (#201).
+async fn enrich_elements<F, Fut>(
+    elements: &mut [InteractiveElement],
+    max_enriched: usize,
+    mut lookup: F,
+) -> Result<(), TransportError>
+where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = Result<Option<AxSummary>, TransportError>>,
+{
+    for index in top_ranked_indices(elements, max_enriched) {
+        let Some(element) = elements.get_mut(index) else {
+            continue;
+        };
+        let selector = element.node_id.0.clone();
+        if let Some(summary) = lookup(selector).await? {
+            apply_ax_summary(element, &summary);
+        }
+    }
+    Ok(())
+}
+
+/// Indices of the up-to-`limit` highest-ranked elements, returned in document
+/// order. Rank ties keep document order, mirroring how the observe pipeline
+/// selects which elements become set-of-marks labels, so enrichment covers the
+/// same elements that survive into the compiled observation.
+fn top_ranked_indices(elements: &[InteractiveElement], limit: usize) -> Vec<usize> {
+    let mut indices: Vec<usize> = (0..elements.len()).collect();
+    // Stable sort by rank descending; equal ranks retain their original
+    // (document) order, matching the marks compositor's selection.
+    indices.sort_by(|&a, &b| elements[b].rank.total_cmp(&elements[a].rank));
+    indices.truncate(limit);
+    // Enrich in document order for deterministic, natural traversal.
+    indices.sort_unstable();
+    indices
 }
 
 fn page_taint(value: &str) -> Vec<TaintSpan> {
@@ -1630,6 +1684,121 @@ mod tests {
         });
 
         Ok(format!("http://{addr}/"))
+    }
+
+    fn sample_element(id: &str, rank: f32) -> InteractiveElement {
+        InteractiveElement {
+            node_id: NodeId(id.to_string()),
+            role: "button".into(),
+            name: vec![TaintSpan {
+                provenance: Provenance::Page,
+                text: "orig".into(),
+            }],
+            value: Vec::new(),
+            bounds: None,
+            rank,
+        }
+    }
+
+    fn enriched_summary() -> AxSummary {
+        AxSummary {
+            role: None,
+            name: Some("enriched".to_string()),
+            value: None,
+        }
+    }
+
+    #[test]
+    fn top_ranked_indices_picks_highest_ranks_in_document_order() {
+        let elements = vec![
+            sample_element("#a", 0.1),
+            sample_element("#b", 0.9),
+            sample_element("#c", 0.9),
+            sample_element("#d", 0.5),
+            sample_element("#e", 0.9),
+        ];
+        // Cap of 2: the two highest ranks are the three 0.9s; ties break by
+        // document order, so indices 1 and 2 win and are returned in order.
+        assert_eq!(top_ranked_indices(&elements, 2), vec![1, 2]);
+        // A cap at/above the length keeps every index in document order.
+        assert_eq!(top_ranked_indices(&elements, 16), vec![0, 1, 2, 3, 4]);
+    }
+
+    #[tokio::test]
+    async fn enrichment_is_bounded_to_the_top_ranked_cap() -> Result<(), TransportError> {
+        // A large interactive-element list (as a hostile page could produce):
+        // a low-rank bulk up front and a higher-rank tail at the END of the
+        // document. A first-N cap would enrich the bulk; the rank-aware cap must
+        // enrich the tail instead, and must issue at most `cap` AX lookups.
+        let total = 5000usize;
+        let high_rank_start = total - 20; // indices 4980..=4999 carry the high rank
+        let mut elements: Vec<InteractiveElement> = (0..total)
+            .map(|i| {
+                let rank = if i >= high_rank_start { 0.9 } else { 0.1 };
+                sample_element(&format!("#el{i}"), rank)
+            })
+            .collect();
+
+        let mut calls: Vec<String> = Vec::new();
+        enrich_elements(&mut elements, MAX_AX_ENRICHED_ELEMENTS, |selector| {
+            calls.push(selector);
+            async move { Ok::<_, TransportError>(Some(enriched_summary())) }
+        })
+        .await?;
+
+        // The expensive AX round-trips are bounded by the cap, not the 5000
+        // elements the page exposed.
+        assert_eq!(calls.len(), MAX_AX_ENRICHED_ELEMENTS);
+        // The enriched set is exactly the highest-ranked elements (the front of
+        // the high-rank tail), in document order — proving the cap is rank-aware
+        // rather than "first N in the list".
+        let expected: Vec<String> = (high_rank_start..high_rank_start + MAX_AX_ENRICHED_ELEMENTS)
+            .map(|i| format!("#el{i}"))
+            .collect();
+        assert_eq!(calls, expected);
+
+        // The low-rank bulk at the front is left present but un-enriched.
+        assert_eq!(elements[0].name[0].text, "orig");
+        // A high-rank element inside the cap is enriched.
+        assert_eq!(elements[high_rank_start].name[0].text, "enriched");
+        // A high-rank element just beyond the cap is still present, un-enriched.
+        assert_eq!(
+            elements[high_rank_start + MAX_AX_ENRICHED_ELEMENTS].name[0].text,
+            "orig"
+        );
+        // Nothing is dropped from the observation.
+        assert_eq!(elements.len(), total);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn enrichment_covers_all_elements_below_the_cap() -> Result<(), TransportError> {
+        let mut elements = vec![
+            sample_element("#a", 0.5),
+            sample_element("#b", 0.9),
+            sample_element("#c", 0.8),
+            sample_element("#d", 1.0),
+            sample_element("#e", 0.2),
+        ];
+        let element_count = elements.len();
+
+        let mut calls = 0usize;
+        enrich_elements(
+            &mut elements,
+            MAX_AX_ENRICHED_ELEMENTS,
+            |_selector: String| {
+                calls += 1;
+                async move { Ok::<_, TransportError>(Some(enriched_summary())) }
+            },
+        )
+        .await?;
+
+        // Under the cap, every element is enriched exactly once.
+        assert_eq!(calls, element_count);
+        assert!(elements
+            .iter()
+            .all(|element| element.name[0].text == "enriched"));
+        Ok(())
     }
 
     fn test_ax_value(r#type: AxValueType, value: serde_json::Value) -> AxValue {
