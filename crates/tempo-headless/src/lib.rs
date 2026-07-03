@@ -339,6 +339,7 @@ enum DriverClientError {
 #[derive(Clone, Default)]
 pub struct SessionPool {
     sessions: BTreeMap<TempodSessionId, TempodSession>,
+    session_drivers: BTreeMap<TempodSessionId, AttachedEngineDriver>,
     events: BTreeMap<TempodSessionId, Vec<TempodSessionEvent>>,
     otlp_exporter: Option<OtlpJsonExporter>,
     bidi: BidiRouter,
@@ -355,6 +356,7 @@ impl fmt::Debug for SessionPool {
         formatter
             .debug_struct("SessionPool")
             .field("sessions", &self.sessions)
+            .field("session_drivers", &self.session_drivers.keys())
             .field("event_sessions", &self.events.len())
             .field("otlp_exporter", &self.otlp_exporter)
             .field("bidi", &self.bidi)
@@ -397,15 +399,20 @@ impl SessionPool {
         if self.draining {
             return Err(TempodError::Draining);
         }
+        let url = url.into();
+        let session_driver = self.create_session_engine_context(&url)?;
         let id = TempodSessionId(format!("session-{}", self.next_id));
         self.next_id = self.next_id.saturating_add(1);
         let session = TempodSession {
             id: id.clone(),
-            url: url.into(),
+            url,
             state: TempodSessionState::Running,
             created_ms: current_time_ms(),
         };
         self.sessions.insert(id, session.clone());
+        if let Some(driver) = session_driver {
+            self.session_drivers.insert(session.id.clone(), driver);
+        }
         self.record_event(
             &session.id,
             TempodSessionEventKind::SessionCreated {
@@ -444,6 +451,7 @@ impl SessionPool {
             session.state = TempodSessionState::Killed;
             session.clone()
         };
+        self.close_session_driver(id);
         self.record_event(id, TempodSessionEventKind::SessionKilled);
         Ok(session.clone())
     }
@@ -459,6 +467,7 @@ impl SessionPool {
             }
         }
         for id in drained {
+            self.close_session_driver(&id);
             self.record_event(&id, TempodSessionEventKind::SessionDrained);
         }
         self.close_engine_resources(true);
@@ -494,6 +503,7 @@ impl SessionPool {
     fn close_engine_resources(&mut self, close_root: bool) {
         self.close_forked_contexts();
         self.close_mcp_forks();
+        self.close_session_drivers();
         if close_root {
             self.close_root_driver();
         } else {
@@ -501,6 +511,59 @@ impl SessionPool {
         }
         self.bidi_contexts.clear();
         self.next_bidi_context_id = 1;
+    }
+
+    /// Allocate a fresh engine context for a newly-created tempod session and
+    /// navigate it to the session URL. Without an attached engine, tempod still
+    /// supports metadata-only session records for driverless control-plane tests.
+    fn create_session_engine_context(
+        &mut self,
+        url: &str,
+    ) -> Result<Option<AttachedEngineDriver>, TempodError> {
+        let Some(root_driver) = self.driver.as_mut() else {
+            return Ok(None);
+        };
+        let options = BrowsingContextCreateOptions {
+            kind: BrowsingContextKind::Tab,
+            background: true,
+        };
+        let mut session_driver =
+            futures::executor::block_on(root_driver.create_browsing_context_attached(options))
+                .map_err(|error| {
+                    TempodError::Driver(format!(
+                        "attached engine failed to create session context: {error}"
+                    ))
+                })?;
+        if let Err(error) = futures::executor::block_on(session_driver.goto(url)) {
+            let _ = futures::executor::block_on(session_driver.close());
+            return Err(TempodError::Driver(format!(
+                "attached engine failed to navigate session context: {error}"
+            )));
+        }
+        Ok(Some(session_driver))
+    }
+
+    /// Best-effort close of one session-owned engine context. Session lifecycle
+    /// state changes must still be recorded even if engine teardown races a
+    /// crashed child, so close errors are logged and swallowed.
+    fn close_session_driver(&mut self, id: &TempodSessionId) {
+        let Some(mut driver) = self.session_drivers.remove(id) else {
+            return;
+        };
+        if let Err(error) = futures::executor::block_on(driver.close()) {
+            eprintln!(
+                "tempod: error closing engine driver for session {}: {error}",
+                id.0
+            );
+        }
+    }
+
+    /// Best-effort close of all session-owned engine contexts.
+    fn close_session_drivers(&mut self) {
+        let session_ids = self.session_drivers.keys().cloned().collect::<Vec<_>>();
+        for id in session_ids {
+            self.close_session_driver(&id);
+        }
     }
 
     /// Best-effort close of every forked BiDi context driver so engine-side
@@ -1934,6 +1997,8 @@ pub enum TempodError {
     Draining,
     #[error("session pool lock failed")]
     PoolLock,
+    #[error("driver failed: {0}")]
+    Driver(String),
     #[error("engine host failed: {0}")]
     Engine(#[from] EngineHostError),
 }
@@ -1945,7 +2010,7 @@ impl TempodError {
             Self::Forbidden(_) => 403,
             Self::SessionNotFound(_) | Self::EngineNotFound(_) => 404,
             Self::Draining => 503,
-            Self::Io(_) | Self::Json(_) | Self::PoolLock | Self::Engine(_) => 500,
+            Self::Io(_) | Self::Json(_) | Self::PoolLock | Self::Driver(_) | Self::Engine(_) => 500,
         }
     }
 }
@@ -1970,7 +2035,7 @@ mod tests {
     use tempo_agent::{IdempotencyKey, StepTripleOutcome};
     use tempo_driver::TestDriver;
     use tempo_engine_host::{
-        serve_driver_connection, DriverRequest, EngineIpcConnection, RestartPolicy,
+        serve_driver_connection, DriverRequest, DriverWireError, EngineIpcConnection, RestartPolicy,
     };
     use tempo_schema::{Action, ObservationDiff, QuiescencePolicy};
 
@@ -1989,6 +2054,153 @@ mod tests {
         assert_eq!(adopted.state, TempodSessionState::Adopted);
         assert_eq!(killed.state, TempodSessionState::Killed);
         assert!(pool.draining());
+        Ok(())
+    }
+
+    #[test]
+    fn http_create_session_allocates_attached_driver_context_and_kill_closes_it() -> TestResult {
+        let (client_stream, server_stream) = UnixStream::pair()?;
+        let server = thread::spawn(move || -> Result<(), EngineHostError> {
+            let mut connection = EngineIpcConnection::from_stream(server_stream);
+
+            let create = connection.read_driver_request()?;
+            assert_eq!(create.driver_id, None);
+            assert_eq!(
+                create.command,
+                HostDriverCommand::CreateBrowsingContext {
+                    options: BrowsingContextCreateOptions {
+                        kind: BrowsingContextKind::Tab,
+                        background: true,
+                    },
+                }
+            );
+            connection.write_driver_response(
+                create.id,
+                DriverResponse::BrowsingContextCreated {
+                    driver_id: "session-context-1".into(),
+                },
+            )?;
+
+            let goto = connection.read_driver_request()?;
+            assert_eq!(goto.driver_id.as_deref(), Some("session-context-1"));
+            assert_eq!(
+                goto.command,
+                HostDriverCommand::Goto {
+                    url: "https://session.test".into(),
+                }
+            );
+            connection.write_driver_response(
+                goto.id,
+                DriverResponse::Observation {
+                    observation: observation("https://session.test", 1),
+                },
+            )?;
+
+            let close = connection.read_driver_request()?;
+            assert_eq!(close.driver_id.as_deref(), Some("session-context-1"));
+            assert_eq!(close.command, HostDriverCommand::Close);
+            connection.write_driver_response(close.id, DriverResponse::Closed)
+        });
+
+        let mut pool = SessionPool::default();
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+
+        let create = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/sessions".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: br#"{"url":"https://session.test"}"#.to_vec(),
+            },
+        )?;
+
+        assert_eq!(create.status, 201);
+        let session: TempodSession = serde_json::from_slice(&create.body)?;
+        assert_eq!(session.id.0, "session-0");
+        assert_eq!(session.url, "https://session.test");
+        assert_eq!(session.state, TempodSessionState::Running);
+        assert!(pool.session_drivers.contains_key(&session.id));
+
+        let kill = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "DELETE".into(),
+                path: "/sessions/session-0".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: Vec::new(),
+            },
+        )?;
+
+        assert_eq!(kill.status, 200);
+        let killed: TempodSession = serde_json::from_slice(&kill.body)?;
+        assert_eq!(killed.state, TempodSessionState::Killed);
+        assert!(!pool.session_drivers.contains_key(&session.id));
+
+        drop(pool);
+        join_driver_handler(server)?;
+        Ok(())
+    }
+
+    #[test]
+    fn http_create_session_cleans_context_when_initial_navigation_fails() -> TestResult {
+        let (client_stream, server_stream) = UnixStream::pair()?;
+        let server = thread::spawn(move || -> Result<(), EngineHostError> {
+            let mut connection = EngineIpcConnection::from_stream(server_stream);
+
+            let create = connection.read_driver_request()?;
+            assert!(matches!(
+                create.command,
+                HostDriverCommand::CreateBrowsingContext { .. }
+            ));
+            connection.write_driver_response(
+                create.id,
+                DriverResponse::BrowsingContextCreated {
+                    driver_id: "session-context-failed".into(),
+                },
+            )?;
+
+            let goto = connection.read_driver_request()?;
+            assert_eq!(goto.driver_id.as_deref(), Some("session-context-failed"));
+            assert!(matches!(goto.command, HostDriverCommand::Goto { .. }));
+            connection.write_driver_response(
+                goto.id,
+                DriverResponse::Error {
+                    error: DriverWireError::transport(&TransportError::NavTimeout),
+                },
+            )?;
+
+            let close = connection.read_driver_request()?;
+            assert_eq!(close.driver_id.as_deref(), Some("session-context-failed"));
+            assert_eq!(close.command, HostDriverCommand::Close);
+            connection.write_driver_response(close.id, DriverResponse::Closed)
+        });
+
+        let mut pool = SessionPool::default();
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+
+        let create = handle_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/sessions".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: br#"{"url":"https://fail.test"}"#.to_vec(),
+            },
+        );
+
+        assert_eq!(create.status, 500);
+        assert!(pool.list().is_empty());
+        assert!(pool.session_drivers.is_empty());
+
+        drop(pool);
+        join_driver_handler(server)?;
         Ok(())
     }
 
