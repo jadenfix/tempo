@@ -453,6 +453,12 @@ impl SignatureParameters {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ParsedSignatureInput {
+    params: SignatureParameters,
+    signature_params_value: String,
+}
+
 /// Headers produced by signing an HTTP request.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SignatureHeaders {
@@ -1014,6 +1020,30 @@ pub fn verify_request_signature(
     verify_request_signature_at(request, signature_input, signature, verifier, now)
 }
 
+/// Verify Web Bot Auth headers and require Tempo's default signed components.
+pub fn verify_web_bot_auth_signature(
+    request: &NetworkRequest,
+    signature_input: &str,
+    signature: &str,
+    verifier: &WebBotAuthVerifier,
+) -> Result<(), SignatureError> {
+    let now = unix_timestamp(SystemTime::now())?;
+    verify_web_bot_auth_signature_at(request, signature_input, signature, verifier, now)
+}
+
+/// Verify Web Bot Auth headers at a caller-supplied Unix timestamp.
+pub fn verify_web_bot_auth_signature_at(
+    request: &NetworkRequest,
+    signature_input: &str,
+    signature: &str,
+    verifier: &WebBotAuthVerifier,
+    now: u64,
+) -> Result<(), SignatureError> {
+    let parsed = parse_signature_input(signature_input)?;
+    validate_web_bot_auth_components(&parsed.params)?;
+    verify_parsed_request_signature_at(request, signature, verifier, now, parsed)
+}
+
 /// Verify RFC 9421 headers against a request at a caller-supplied Unix timestamp.
 ///
 /// This is useful for replay/audit verification and deterministic tests. The
@@ -1025,19 +1055,29 @@ pub fn verify_request_signature_at(
     verifier: &WebBotAuthVerifier,
     now: u64,
 ) -> Result<(), SignatureError> {
-    let params = parse_signature_input(signature_input)?;
-    validate_web_bot_auth_components(&params)?;
-    validate_signature_freshness(&params, verifier, now)?;
-    if params.key_id != verifier.key_id {
+    let parsed = parse_signature_input(signature_input)?;
+    verify_parsed_request_signature_at(request, signature, verifier, now, parsed)
+}
+
+fn verify_parsed_request_signature_at(
+    request: &NetworkRequest,
+    signature: &str,
+    verifier: &WebBotAuthVerifier,
+    now: u64,
+    parsed: ParsedSignatureInput,
+) -> Result<(), SignatureError> {
+    validate_signature_freshness(&parsed.params, verifier, now)?;
+    if parsed.params.key_id != verifier.key_id {
         return Err(SignatureError::KeyIdMismatch {
             expected: verifier.key_id.clone(),
-            actual: params.key_id.clone(),
+            actual: parsed.params.key_id.clone(),
         });
     }
-    let signature_bytes = parse_signature_header(signature, &params.label)?;
+    let signature_bytes = parse_signature_header(signature, &parsed.params.label)?;
     let signature = Signature::from_slice(&signature_bytes)
         .map_err(|err| SignatureError::InvalidSignature(err.to_string()))?;
-    let base = signature_base(request, &params)?;
+    let base =
+        signature_base_with_params_value(request, &parsed.params, &parsed.signature_params_value)?;
     verifier
         .verifying_key
         .verify(base.as_bytes(), &signature)
@@ -1049,6 +1089,15 @@ pub fn signature_base(
     request: &NetworkRequest,
     params: &SignatureParameters,
 ) -> Result<String, SignatureError> {
+    let signature_params_value = params.signature_params_value();
+    signature_base_with_params_value(request, params, &signature_params_value)
+}
+
+fn signature_base_with_params_value(
+    request: &NetworkRequest,
+    params: &SignatureParameters,
+    signature_params_value: &str,
+) -> Result<String, SignatureError> {
     let parts = UrlParts::parse(&request.url).map_err(SignatureError::Url)?;
     let mut lines = Vec::with_capacity(params.components.len() + 1);
     for component in &params.components {
@@ -1056,10 +1105,7 @@ pub fn signature_base(
         let value = component_value(request, &parts, component)?;
         lines.push(format!("\"{identifier}\": {value}"));
     }
-    lines.push(format!(
-        "\"@signature-params\": {}",
-        params.signature_params_value()
-    ));
+    lines.push(format!("\"@signature-params\": {signature_params_value}"));
     Ok(lines.join("\n"))
 }
 
@@ -1512,11 +1558,18 @@ fn component_value(
     }
 }
 
-fn parse_signature_input(input: &str) -> Result<SignatureParameters, SignatureError> {
+fn parse_signature_input(input: &str) -> Result<ParsedSignatureInput, SignatureError> {
     let (label, rest) = input
         .split_once('=')
         .ok_or_else(|| SignatureError::InvalidSignatureInput("missing label".into()))?;
-    let rest = rest.trim();
+    let label = label.trim();
+    if label.is_empty() {
+        return Err(SignatureError::InvalidSignatureInput(
+            "missing label".into(),
+        ));
+    }
+    let signature_params_value = rest.trim().to_string();
+    let rest = signature_params_value.as_str();
     let component_start = rest
         .find('(')
         .ok_or_else(|| SignatureError::InvalidSignatureInput("missing component list".into()))?;
@@ -1554,6 +1607,7 @@ fn parse_signature_input(input: &str) -> Result<SignatureParameters, SignatureEr
         .filter(|part| !part.is_empty())
     {
         let (name, value) = param
+            .trim()
             .split_once('=')
             .ok_or_else(|| SignatureError::InvalidSignatureInput("bad parameter".into()))?;
         match name {
@@ -1568,18 +1622,22 @@ fn parse_signature_input(input: &str) -> Result<SignatureParameters, SignatureEr
         }
     }
 
-    let alg = alg.ok_or_else(|| SignatureError::InvalidSignatureInput("missing alg".into()))?;
-    if alg != "ed25519" {
+    if let Some(alg) = alg
+        && alg != "ed25519"
+    {
         return Err(SignatureError::UnsupportedAlgorithm(alg));
     }
 
-    Ok(SignatureParameters {
-        label: label.to_string(),
-        key_id: key_id
-            .ok_or_else(|| SignatureError::InvalidSignatureInput("missing keyid".into()))?,
-        created: created
-            .ok_or_else(|| SignatureError::InvalidSignatureInput("missing created".into()))?,
-        components,
+    Ok(ParsedSignatureInput {
+        params: SignatureParameters {
+            label: label.to_string(),
+            key_id: key_id
+                .ok_or_else(|| SignatureError::InvalidSignatureInput("missing keyid".into()))?,
+            created: created
+                .ok_or_else(|| SignatureError::InvalidSignatureInput("missing created".into()))?,
+            components,
+        },
+        signature_params_value,
     })
 }
 
@@ -2020,6 +2078,10 @@ fn egress_port(parts: &UrlParts) -> u16 {
 mod tests {
     use super::*;
 
+    const RFC9421_B26_PUBLIC_JWK_X: &str = "JrQLj5P_89iXES9-vFgrIy29clF9CC_oPPsw3c5D0bs";
+    const RFC9421_B26_SIGNATURE_INPUT: &str = "sig-b26=(\"date\" \"@method\" \"@path\" \"@authority\" \"content-type\" \"content-length\");created=1618884473;keyid=\"test-key-ed25519\"";
+    const RFC9421_B26_SIGNATURE: &str = "sig-b26=:wqcAqbmYJ2ji2glfAMaRy4gruYYnx2nEFN2HN6jrnDnQCK1u02Gb04v9EDgwUPiu4A0w6vuQv5lIp5WPpBKRCw==:";
+
     fn assert_allowed(policy: &UrlPolicy, url: &str) {
         assert_eq!(policy.check(url), UrlPolicyVerdict::Allow, "{url}");
     }
@@ -2041,6 +2103,27 @@ mod tests {
         } else {
             Err(format!("expected {expected}, got {actual}"))
         }
+    }
+
+    fn rfc9421_b26_request() -> NetworkRequest {
+        NetworkRequest::new(
+            "rfc9421-b26",
+            "POST",
+            "https://example.com/foo?param=Value&Pet=dog",
+            "profile-a",
+            IdentityMode::AgentDeclared,
+        )
+        .with_header("Date", "Tue, 20 Apr 2021 02:07:55 GMT")
+        .with_header("Content-Type", "application/json")
+        .with_header("Content-Length", "18")
+        .with_body_size(18)
+    }
+
+    fn rfc9421_b26_verifier() -> Result<WebBotAuthVerifier, SignatureError> {
+        let public_key = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(RFC9421_B26_PUBLIC_JWK_X)
+            .map_err(|err| SignatureError::InvalidKey(err.to_string()))?;
+        WebBotAuthVerifier::from_public_key("test-key-ed25519", &public_key)
     }
 
     #[test]
@@ -2760,6 +2843,33 @@ mod tests {
     }
 
     #[test]
+    fn rfc9421_ed25519_reference_vector_verifies() -> Result<(), SignatureError> {
+        verify_request_signature_at(
+            &rfc9421_b26_request(),
+            RFC9421_B26_SIGNATURE_INPUT,
+            RFC9421_B26_SIGNATURE,
+            &rfc9421_b26_verifier()?,
+            1_618_884_473,
+        )
+    }
+
+    #[test]
+    fn rfc9421_verifier_preserves_serialized_signature_params() -> Result<(), SignatureError> {
+        let signature_input = format!("{RFC9421_B26_SIGNATURE_INPUT};expires=1618884773");
+
+        let result = verify_request_signature_at(
+            &rfc9421_b26_request(),
+            &signature_input,
+            RFC9421_B26_SIGNATURE,
+            &rfc9421_b26_verifier()?,
+            1_618_884_473,
+        );
+
+        assert!(matches!(result, Err(SignatureError::VerificationFailed)));
+        Ok(())
+    }
+
+    #[test]
     fn web_bot_auth_signs_and_verifies_rfc_9421_headers() -> Result<(), SignatureError> {
         let key = WebBotAuthSigningKey::from_seed("tempo-agent", &[7u8; 32])?;
         let verifier = key.verifier();
@@ -2982,7 +3092,7 @@ mod tests {
         };
         let headers = sign_request(&request, &params, &key)?;
 
-        let result = verify_request_signature_at(
+        let result = verify_web_bot_auth_signature_at(
             &request,
             &headers.signature_input,
             &headers.signature,
