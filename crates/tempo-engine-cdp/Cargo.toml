@@ -13,8 +13,8 @@ serde_json = { workspace = true }
 tempo-schema = { path = "../tempo-schema" }
 tempo-driver = { path = "../tempo-driver" }
 tempo-engine-host = { path = "../tempo-engine-host" }
+tempo-net = { path = "../tempo-net" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
-url = "2"
 
 [lints]
 workspace = true

@@ -13,9 +13,9 @@ use chromiumoxide::error::CdpError;
 use chromiumoxide::page::{Page, ScreenshotParams};
 use futures::StreamExt;
 use std::collections::{BTreeMap, HashMap};
-use std::net::IpAddr;
 use std::time::{Duration, Instant};
 use tempo_driver::{DriverTrait, Engine, StepOutcome, TransportError, Unsupported};
+use tempo_net::UrlPolicy;
 use tempo_schema::{
     Action, ActionBatch, CompiledObservation, InteractiveElement, NodeId, ObservationDiff,
     Provenance, QuiescencePolicy, TaintSpan,
@@ -71,7 +71,7 @@ pub struct CdpTempoDriver {
     handler_task: JoinHandle<()>,
     seq: u64,
     history: BTreeMap<u64, CompiledObservation>,
-    allow_private_networks: bool,
+    url_policy: UrlPolicy,
 }
 
 impl CdpTempoDriver {
@@ -98,18 +98,24 @@ impl CdpTempoDriver {
             handler_task,
             seq: 0,
             history: BTreeMap::new(),
-            allow_private_networks: false,
+            url_policy: UrlPolicy::block_private(),
         })
     }
 
     /// Allow loopback/private navigation for trusted live fixtures.
     pub fn allow_private_network_access(mut self) -> Self {
-        self.allow_private_networks = true;
+        self.url_policy = UrlPolicy::allow_all();
+        self
+    }
+
+    /// Override the shared pre-navigation URL policy used by the CDP lane.
+    pub fn with_url_policy(mut self, url_policy: UrlPolicy) -> Self {
+        self.url_policy = url_policy;
         self
     }
 
     fn enforce_url_policy(&self, url: &str) -> Result<(), TransportError> {
-        enforce_url_policy(url, self.allow_private_networks)
+        enforce_url_policy(url, &self.url_policy)
     }
 
     async fn current_url(&self) -> Result<String, TransportError> {
@@ -420,82 +426,10 @@ fn is_node_not_found_msg(message: &str) -> bool {
     lowered.contains("could not find node") || lowered.contains("no node with given id")
 }
 
-fn enforce_url_policy(url: &str, allow_private_networks: bool) -> Result<(), TransportError> {
-    if allow_private_networks {
-        return Ok(());
-    }
-
-    let parsed = url::Url::parse(url)
-        .map_err(|error| TransportError::Other(format!("invalid URL: {error}")))?;
-    // Scheme allowlist (parity with tempo-net's `UrlPolicy::check`): only
-    // `http`/`https` may pass. A denylist misses opaque schemes such as
-    // `view-source:http://169.254.169.254/`, whose host parses as `None` and
-    // would otherwise be waved through.
-    if !matches!(parsed.scheme(), "http" | "https") {
-        return Err(TransportError::UrlBlocked);
-    }
-    // Use the typed `Host` enum rather than `host_str()`. For IPv6 literals
-    // `host_str()` returns the bracketed form (e.g. `"[::1]"`) which never
-    // parses as an `IpAddr`, so IPv6 loopback / ULA / link-local and
-    // IPv4-mapped metadata targets (`[::ffff:169.254.169.254]`) would slip
-    // through the guard entirely (issue #81).
-    match parsed.host() {
-        Some(url::Host::Domain(domain)) => {
-            let domain = domain.trim_end_matches('.').to_ascii_lowercase();
-            if domain == "localhost" || domain.ends_with(".localhost") {
-                return Err(TransportError::UrlBlocked);
-            }
-        }
-        Some(url::Host::Ipv4(ip)) => {
-            if is_blocked_ip(IpAddr::V4(ip)) {
-                return Err(TransportError::UrlBlocked);
-            }
-        }
-        Some(url::Host::Ipv6(ip)) => {
-            if is_blocked_ip(IpAddr::V6(ip)) {
-                return Err(TransportError::UrlBlocked);
-            }
-        }
-        // An `http`/`https` URL with no host is malformed for navigation;
-        // block rather than allow.
-        None => return Err(TransportError::UrlBlocked),
-    }
-    Ok(())
-}
-
-fn is_blocked_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(ip) => {
-            let octets = ip.octets();
-            ip.is_private()
-                || ip.is_loopback()
-                || ip.is_link_local()
-                || ip.is_broadcast()
-                || ip.is_documentation()
-                // Block the entire 0.0.0.0/8 (parity with tempo-net's
-                // `blocked_ipv4_reason`), not just the 0.0.0.0 unspecified
-                // address: `http://0.1.2.3/` must not slip through.
-                || octets[0] == 0
-                || ip.is_multicast()
-                // Carrier-grade NAT 100.64.0.0/10.
-                || (octets[0] == 100 && (64..=127).contains(&octets[1]))
-                // Reserved 240.0.0.0/4.
-                || octets[0] >= 240
-        }
-        IpAddr::V6(ip) => {
-            // Canonicalize IPv4-mapped IPv6 (`::ffff:a.b.c.d`) to its embedded
-            // IPv4 so metadata / private targets cannot be reached via the
-            // mapped form.
-            if let Some(mapped) = ip.to_ipv4_mapped() {
-                return is_blocked_ip(IpAddr::V4(mapped));
-            }
-            ip.is_loopback()
-                || ip.is_unspecified()
-                || ip.is_multicast()
-                || ip.is_unique_local()
-                || ip.is_unicast_link_local()
-        }
-    }
+fn enforce_url_policy(url: &str, policy: &UrlPolicy) -> Result<(), TransportError> {
+    policy
+        .enforce(url)
+        .map_err(|_error| TransportError::UrlBlocked)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1192,6 +1126,7 @@ mod tests {
 
     #[test]
     fn blocks_private_navigation_by_default() {
+        let policy = UrlPolicy::block_private();
         for url in [
             "http://127.0.0.1",
             "http://localhost",
@@ -1202,18 +1137,19 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    enforce_url_policy(url, false),
+                    enforce_url_policy(url, &policy),
                     Err(TransportError::UrlBlocked)
                 ),
                 "expected URL policy block for {url}"
             );
         }
-        assert!(enforce_url_policy("https://example.com", false).is_ok());
-        assert!(enforce_url_policy("http://127.0.0.1", true).is_ok());
+        assert!(enforce_url_policy("https://example.com", &policy).is_ok());
+        assert!(enforce_url_policy("http://127.0.0.1", &UrlPolicy::allow_all()).is_ok());
     }
 
     #[test]
     fn blocks_ipv6_and_ipv4_mapped_navigation() {
+        let policy = UrlPolicy::block_private();
         // Issue #81: bracketed IPv6 literals and IPv4-mapped IPv6 must be
         // guarded, including the metadata endpoint reached via `::ffff:`.
         for url in [
@@ -1227,23 +1163,24 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    enforce_url_policy(url, false),
+                    enforce_url_policy(url, &policy),
                     Err(TransportError::UrlBlocked)
                 ),
                 "expected URL policy block for {url}"
             );
         }
         // A global-unicast IPv6 literal is still permitted.
-        assert!(enforce_url_policy("http://[2606:4700:4700::1111]/", false).is_ok());
+        assert!(enforce_url_policy("http://[2606:4700:4700::1111]/", &policy).is_ok());
     }
 
     #[test]
     fn blocks_cgnat_and_reserved_ipv4_navigation() {
+        let policy = UrlPolicy::block_private();
         // Issue #82 parity in the CDP guard.
         for url in ["http://100.64.0.1/", "http://240.0.0.1/"] {
             assert!(
                 matches!(
-                    enforce_url_policy(url, false),
+                    enforce_url_policy(url, &policy),
                     Err(TransportError::UrlBlocked)
                 ),
                 "expected URL policy block for {url}"
@@ -1253,6 +1190,7 @@ mod tests {
 
     #[test]
     fn blocks_non_http_schemes_via_allowlist() {
+        let policy = UrlPolicy::block_private();
         // GAP A: opaque / non-http(s) schemes must be blocked. Previously the
         // denylist only caught `file`/`ftp`, and schemes whose host parses as
         // `None` (e.g. `view-source:...`) were waved through.
@@ -1265,31 +1203,32 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    enforce_url_policy(url, false),
+                    enforce_url_policy(url, &policy),
                     Err(TransportError::UrlBlocked)
                 ),
                 "expected URL policy block for {url}"
             );
         }
         // http/https remain allowed.
-        assert!(enforce_url_policy("http://example.com", false).is_ok());
-        assert!(enforce_url_policy("https://example.com", false).is_ok());
+        assert!(enforce_url_policy("http://example.com", &policy).is_ok());
+        assert!(enforce_url_policy("https://example.com", &policy).is_ok());
     }
 
     #[test]
     fn blocks_full_zero_ipv4_block() {
+        let policy = UrlPolicy::block_private();
         // GAP B: the whole 0.0.0.0/8 must be blocked, not just 0.0.0.0.
         for url in ["http://0.0.0.0/", "http://0.1.2.3/"] {
             assert!(
                 matches!(
-                    enforce_url_policy(url, false),
+                    enforce_url_policy(url, &policy),
                     Err(TransportError::UrlBlocked)
                 ),
                 "expected URL policy block for {url}"
             );
         }
         // A normal public IP is still permitted.
-        assert!(enforce_url_policy("http://93.184.216.34/", false).is_ok());
+        assert!(enforce_url_policy("http://93.184.216.34/", &policy).is_ok());
     }
 
     #[tokio::test]
