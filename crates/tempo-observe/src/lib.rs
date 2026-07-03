@@ -23,6 +23,15 @@ pub const DEFAULT_MAX_TOKENS: usize = 1_500;
 /// Default number of ranked elements that receive set-of-marks labels.
 pub const DEFAULT_MAX_MARKS: usize = 16;
 
+/// Minimum snapshots needed for corpus gates to prove any cross-snapshot behavior.
+pub const MIN_CORPUS_SNAPSHOTS: usize = 2;
+
+/// Minimum repeated identities needed to claim stable-ID survival evidence.
+pub const MIN_STABLE_ID_OPPORTUNITIES: usize = 1;
+
+/// Minimum adjacent snapshot diffs needed to claim diff reconstruction evidence.
+pub const MIN_DIFF_SNAPSHOTS: usize = 1;
+
 /// Compiler controls for observation size and set-of-marks output.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompileOptions {
@@ -44,15 +53,27 @@ impl Default for CompileOptions {
 /// One raw interactive candidate emitted by an engine adapter or recorded fixture.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RawElement {
+    #[serde(default)]
     pub source_id: Option<String>,
+    #[serde(default)]
     pub stable_hint: Option<String>,
     pub role: String,
+    #[serde(default)]
     pub name: Vec<TaintSpan>,
+    #[serde(default)]
     pub value: Vec<TaintSpan>,
+    #[serde(default)]
     pub bounds: Option<[f32; 4]>,
+    #[serde(default = "default_true")]
     pub visible: bool,
+    #[serde(default = "default_true")]
     pub enabled: bool,
+    #[serde(default = "default_true")]
     pub interactive: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl RawElement {
@@ -182,20 +203,37 @@ pub struct ObservationCorpusReport {
 }
 
 impl ObservationCorpusReport {
+    pub fn snapshot_evidence_passed(&self) -> bool {
+        self.snapshots >= MIN_CORPUS_SNAPSHOTS
+    }
+
     pub fn budget_p50_passed(&self) -> bool {
         self.bytes_p50 <= self.max_bytes && self.tokens_p50 <= self.max_tokens
     }
 
+    pub fn budget_p95_passed(&self) -> bool {
+        self.bytes_p95 <= self.max_bytes && self.tokens_p95 <= self.max_tokens
+    }
+
+    pub fn budget_gate_passed(&self) -> bool {
+        self.budget_p50_passed() && self.budget_p95_passed()
+    }
+
     pub fn stable_id_gate_passed(&self) -> bool {
-        self.stable_id_survival_rate >= 0.99
+        self.stable_id_opportunities >= MIN_STABLE_ID_OPPORTUNITIES
+            && self.stable_id_survival_rate >= 0.99
     }
 
     pub fn diff_gate_passed(&self) -> bool {
-        self.diff_snapshots == self.diff_reconstructable_snapshots
+        self.diff_snapshots >= MIN_DIFF_SNAPSHOTS
+            && self.diff_snapshots == self.diff_reconstructable_snapshots
     }
 
     pub fn final_md_gate_passed(&self) -> bool {
-        self.budget_p50_passed() && self.stable_id_gate_passed() && self.diff_gate_passed()
+        self.snapshot_evidence_passed()
+            && self.budget_gate_passed()
+            && self.stable_id_gate_passed()
+            && self.diff_gate_passed()
     }
 }
 
@@ -524,7 +562,8 @@ pub fn observation_corpus_report(
         if let Some(previous) = &previous_observation {
             diff_snapshots += 1;
             let diff = diff_observations(previous, &snapshot.observation);
-            if diff_reconstructs_current(previous, &snapshot.observation, &diff) {
+            if diff_reconstructs_current(previous, &snapshot.observation, &diff, options.max_marks)
+            {
                 diff_reconstructable_snapshots += 1;
             }
         }
@@ -568,31 +607,56 @@ fn diff_reconstructs_current(
     previous: &CompiledObservation,
     current: &CompiledObservation,
     diff: &ObservationDiff,
+    max_marks: usize,
 ) -> bool {
     if diff.since_seq != previous.seq || diff.seq != current.seq {
         return false;
     }
+    if previous.schema_version != current.schema_version || previous.url != current.url {
+        return false;
+    }
 
-    let mut reconstructed: HashMap<_, _> = previous
-        .elements
-        .iter()
-        .map(|element| (element.node_id.clone(), element.clone()))
-        .collect();
-    for removed in &diff.removed {
-        if reconstructed.remove(removed).is_none() {
+    let removed_ids: HashSet<_> = diff.removed.iter().cloned().collect();
+    if removed_ids.len() != diff.removed.len() {
+        return false;
+    }
+    let mut elements = previous.elements.clone();
+    let previous_len = elements.len();
+    elements.retain(|element| !removed_ids.contains(&element.node_id));
+    if previous_len.saturating_sub(elements.len()) != removed_ids.len() {
+        return false;
+    }
+
+    let mut changed_ids = HashSet::new();
+    for changed in &diff.changed {
+        if !changed_ids.insert(changed.node_id.clone()) {
             return false;
         }
-    }
-    for element in diff.added.iter().chain(&diff.changed) {
-        reconstructed.insert(element.node_id.clone(), element.clone());
+        let Some(slot) = elements
+            .iter_mut()
+            .find(|element| element.node_id == changed.node_id)
+        else {
+            return false;
+        };
+        *slot = changed.clone();
     }
 
-    let current_by_id: HashMap<_, _> = current
-        .elements
+    let mut ids: HashSet<_> = elements
         .iter()
-        .map(|element| (element.node_id.clone(), element.clone()))
+        .map(|element| element.node_id.clone())
         .collect();
-    reconstructed == current_by_id
+    if ids.len() != elements.len() {
+        return false;
+    }
+    for added in &diff.added {
+        if !ids.insert(added.node_id.clone()) {
+            return false;
+        }
+        elements.push(added.clone());
+    }
+
+    let reconstructed = make_observation(&previous.url, diff.seq, elements, max_marks);
+    serialized_observations_equal(&reconstructed, current)
 }
 
 fn corpus_identity_key(raw: &RawElement) -> String {
@@ -711,10 +775,20 @@ fn percentile_usize(mut values: Vec<usize>, percentile: f64) -> usize {
 
 fn ratio(numerator: usize, denominator: usize) -> f64 {
     if denominator == 0 {
-        1.0
+        0.0
     } else {
         numerator as f64 / denominator as f64
     }
+}
+
+fn serialized_observations_equal(left: &CompiledObservation, right: &CompiledObservation) -> bool {
+    let Ok(left) = serde_json::to_vec(left) else {
+        return false;
+    };
+    let Ok(right) = serde_json::to_vec(right) else {
+        return false;
+    };
+    left == right
 }
 
 /// Stable crate summary used by smoke tests and binaries.
@@ -1157,6 +1231,17 @@ mod tests {
         }
     }
 
+    fn test_element(node_id: &str, role: &str, rank: f32) -> InteractiveElement {
+        InteractiveElement {
+            node_id: NodeId(node_id.into()),
+            role: role.into(),
+            name: vec![page_span(node_id)],
+            value: Vec::new(),
+            bounds: Some([0.0, 0.0, 10.0, 10.0]),
+            rank,
+        }
+    }
+
     fn checkout_fixture() -> ObservationInput {
         ObservationInput::new(
             "https://shop.example/checkout",
@@ -1414,12 +1499,96 @@ mod tests {
             "{}",
             report.tokens_p50
         );
+        assert!(
+            report.bytes_p95 <= DEFAULT_MAX_BYTES,
+            "{}",
+            report.bytes_p95
+        );
+        assert!(
+            report.tokens_p95 <= DEFAULT_MAX_TOKENS,
+            "{}",
+            report.tokens_p95
+        );
         assert_eq!(report.stable_id_opportunities, 5);
         assert_eq!(report.stable_id_survivors, 5);
         assert_eq!(report.stable_id_survival_rate, 1.0);
         assert_eq!(report.diff_snapshots, 2);
         assert_eq!(report.diff_reconstructable_snapshots, 2);
         assert!(report.final_md_gate_passed());
+    }
+
+    #[test]
+    fn corpus_report_requires_cross_snapshot_evidence() {
+        let empty = observation_corpus_report(&[], CompileOptions::default());
+        assert!(!empty.snapshot_evidence_passed());
+        assert!(!empty.stable_id_gate_passed());
+        assert!(!empty.diff_gate_passed());
+        assert!(!empty.final_md_gate_passed());
+
+        let single = observation_corpus_report(&[checkout_fixture()], CompileOptions::default());
+        assert!(single.budget_gate_passed());
+        assert!(!single.snapshot_evidence_passed());
+        assert_eq!(single.stable_id_opportunities, 0);
+        assert_eq!(single.stable_id_survival_rate, 0.0);
+        assert!(!single.stable_id_gate_passed());
+        assert_eq!(single.diff_snapshots, 0);
+        assert!(!single.diff_gate_passed());
+        assert!(!single.final_md_gate_passed());
+
+        let no_repeated_identity = observation_corpus_report(
+            &[
+                ObservationInput::new(
+                    "https://stable.example",
+                    vec![RawElement::new("button", "First").stable_hint("first")],
+                ),
+                ObservationInput::new(
+                    "https://stable.example",
+                    vec![RawElement::new("button", "Second").stable_hint("second")],
+                ),
+            ],
+            CompileOptions::default(),
+        );
+        assert!(no_repeated_identity.snapshot_evidence_passed());
+        assert_eq!(no_repeated_identity.stable_id_opportunities, 0);
+        assert!(!no_repeated_identity.stable_id_gate_passed());
+        assert!(no_repeated_identity.diff_gate_passed());
+        assert!(!no_repeated_identity.final_md_gate_passed());
+    }
+
+    #[test]
+    fn diff_reconstruction_requires_full_serialized_observation() {
+        let previous = make_observation(
+            "https://order.example",
+            1,
+            vec![
+                test_element("node:a", "button", 1.0),
+                test_element("node:b", "link", 0.9),
+            ],
+            2,
+        );
+        let current = make_observation(
+            "https://order.example",
+            2,
+            vec![
+                test_element("node:b", "link", 0.9),
+                test_element("node:a", "button", 1.0),
+            ],
+            2,
+        );
+        let lossy_diff = ObservationDiff {
+            since_seq: previous.seq,
+            seq: current.seq,
+            added: Vec::new(),
+            removed: Vec::new(),
+            changed: Vec::new(),
+        };
+
+        assert!(!diff_reconstructs_current(
+            &previous,
+            &current,
+            &lossy_diff,
+            2
+        ));
     }
 
     #[test]
