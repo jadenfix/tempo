@@ -9,6 +9,7 @@
 //! preserved: a NodeId miss is a `StepError`, never a `TransportError`.
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 #[cfg(any(test, feature = "test-driver"))]
 use tempo_net::UrlPolicy;
 use tempo_schema::{Action, ActionBatch, CompiledObservation, NodeId, ObservationDiff};
@@ -53,6 +54,21 @@ pub enum Engine {
     Test,
 }
 
+/// Browser-level context kind requested by WebDriver BiDi `browsingContext.create`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowsingContextKind {
+    Tab,
+    Window,
+}
+
+/// Engine-agnostic request for a fresh browser browsing context.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowsingContextCreateOptions {
+    pub kind: BrowsingContextKind,
+    pub background: bool,
+}
+
 /// C3: the engine-agnostic driver interface. Object-safe so it can cross the UDS wire
 /// protocol and be swapped per-origin by the auto-fallback table.
 #[async_trait]
@@ -76,6 +92,18 @@ pub trait DriverTrait: Send + Sync {
     /// Fork page state for speculative k-branch exploration (final.md §2.5). Engines that
     /// cannot fork natively return `Unsupported`; `tempo-speculate` falls back to replay-fork.
     async fn fork(&mut self) -> Result<Box<dyn DriverTrait>, Unsupported>;
+
+    /// Create a fresh browser browsing context (tab/window) for WebDriver BiDi.
+    ///
+    /// This is deliberately separate from [`DriverTrait::fork`]: forks clone
+    /// page state for speculation, while browsing-context creation must start
+    /// with a clean browser context such as `about:blank`.
+    async fn create_browsing_context(
+        &mut self,
+        _options: BrowsingContextCreateOptions,
+    ) -> Result<Box<dyn DriverTrait>, Unsupported> {
+        Err(Unsupported("fresh browsing context"))
+    }
 
     /// Typed extraction of a subtree rooted at `node`.
     async fn extract(&mut self, node: &NodeId) -> Result<serde_json::Value, TransportError>;
@@ -256,6 +284,18 @@ impl DriverTrait for TestDriver {
             elements: self.elements.clone(),
         };
         Ok(Box::new(forked))
+    }
+
+    async fn create_browsing_context(
+        &mut self,
+        _options: BrowsingContextCreateOptions,
+    ) -> Result<Box<dyn DriverTrait>, Unsupported> {
+        Ok(Box::new(TestDriver {
+            seq: 0,
+            url: "about:blank".into(),
+            url_policy: self.url_policy.clone(),
+            elements: Vec::new(),
+        }))
     }
 
     async fn extract(&mut self, node: &NodeId) -> Result<serde_json::Value, TransportError> {
@@ -579,6 +619,33 @@ mod tests {
 
         assert_eq!(observation.url, "http://127.0.0.1/fixture");
         assert_eq!(observation.seq, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_driver_create_browsing_context_starts_fresh() -> Result<(), String> {
+        let mut driver = TestDriver::new().with_elements(vec![button("submit")]);
+        futures::executor::block_on(driver.goto("https://root.test")).map_err(|e| e.to_string())?;
+
+        let mut created = futures::executor::block_on(driver.create_browsing_context(
+            BrowsingContextCreateOptions {
+                kind: BrowsingContextKind::Tab,
+                background: false,
+            },
+        ))
+        .map_err(|e| e.to_string())?;
+        let created_observation =
+            futures::executor::block_on(created.observe()).map_err(|e| e.to_string())?;
+        let root_observation =
+            futures::executor::block_on(driver.observe()).map_err(|e| e.to_string())?;
+
+        assert_eq!(created_observation.url, "about:blank");
+        assert_eq!(created_observation.seq, 0);
+        assert!(created_observation.elements.is_empty());
+        assert_eq!(root_observation.url, "https://root.test");
+        assert_eq!(root_observation.seq, 1);
+        assert_eq!(root_observation.elements.len(), 1);
+        futures::executor::block_on(created.close()).map_err(|e| e.to_string())?;
         Ok(())
     }
 
