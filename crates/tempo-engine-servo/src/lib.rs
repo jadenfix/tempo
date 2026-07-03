@@ -7,6 +7,7 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::io::Read;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -501,13 +502,28 @@ impl ServoNetworkAdapter {
         request: &ServoNetworkRequest,
     ) -> Result<ServoNetworkFetch, ServoNetworkError> {
         let network_request = request.to_network_request(&self.profile_id, self.identity_mode)?;
-        let audit = AuditRecord::from_request(&network_request, &self.url_policy)?;
+        self.url_policy.enforce(&network_request.url)?;
+        let resolved_target = ResolvedTarget::from_url(&network_request.url)?;
+        self.fetch_with_resolved_target(request, network_request, resolved_target)
+    }
+
+    fn fetch_with_resolved_target(
+        &self,
+        request: &ServoNetworkRequest,
+        network_request: NetworkRequest,
+        resolved_target: ResolvedTarget,
+    ) -> Result<ServoNetworkFetch, ServoNetworkError> {
+        let audit = AuditRecord::from_request_with_resolved_socket(
+            &network_request,
+            &self.url_policy,
+            resolved_target.socket,
+        )?;
         let egress_decision = self
             .egress_policy
             .decide(&network_request)
             .map_err(ServoNetworkError::from)?;
         let signed_headers = self.signed_headers(&network_request)?;
-        let client = self.client_for(&egress_decision)?;
+        let client = self.client_for(&egress_decision, &resolved_target)?;
         let response = self.send_request(&client, request, &egress_decision, &signed_headers)?;
         let egress_record = EgressRecord::from_decision(
             request.request_id.clone(),
@@ -542,10 +558,12 @@ impl ServoNetworkAdapter {
     fn client_for(
         &self,
         decision: &EgressDecision,
+        resolved_target: &ResolvedTarget,
     ) -> Result<reqwest::blocking::Client, ServoNetworkError> {
         let mut builder = reqwest::blocking::Client::builder()
             .timeout(self.timeout)
-            .redirect(url_policy_redirect(self.url_policy.clone()));
+            .redirect(url_policy_redirect(self.url_policy.clone()))
+            .resolve_to_addrs(&resolved_target.host, &[resolved_target.socket]);
         if let EgressDecision::Proxied { proxy, .. } = decision {
             let proxy = reqwest::Proxy::all(&proxy.endpoint)
                 .map_err(|error| ServoNetworkError::Proxy(error.to_string()))?;
@@ -611,6 +629,48 @@ impl ServoNetworkAdapter {
             headers,
             body,
         })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ResolvedTarget {
+    host: String,
+    socket: SocketAddr,
+}
+
+impl ResolvedTarget {
+    fn from_url(url: &str) -> Result<Self, ServoNetworkError> {
+        let parsed =
+            reqwest::Url::parse(url).map_err(|error| ServoNetworkError::ResolveTarget {
+                url: url.into(),
+                reason: error.to_string(),
+            })?;
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| ServoNetworkError::ResolveTarget {
+                url: url.into(),
+                reason: "URL has no host".into(),
+            })?
+            .to_string();
+        let port =
+            parsed
+                .port_or_known_default()
+                .ok_or_else(|| ServoNetworkError::ResolveTarget {
+                    url: url.into(),
+                    reason: "URL has no known default port".into(),
+                })?;
+        let socket = (host.as_str(), port)
+            .to_socket_addrs()
+            .map_err(|error| ServoNetworkError::ResolveTarget {
+                url: url.into(),
+                reason: error.to_string(),
+            })?
+            .next()
+            .ok_or_else(|| ServoNetworkError::ResolveTarget {
+                url: url.into(),
+                reason: "host resolved to no socket addresses".into(),
+            })?;
+        Ok(Self { host, socket })
     }
 }
 
@@ -708,6 +768,8 @@ pub enum ServoNetworkError {
     ClientBuild(String),
     #[error("failed to configure proxy: {0}")]
     Proxy(String),
+    #[error("failed to resolve request target {url}: {reason}")]
+    ResolveTarget { url: String, reason: String },
     #[error("invalid HTTP method: {0}")]
     InvalidMethod(String),
     #[error("invalid HTTP header {name}: {reason}")]
@@ -796,7 +858,7 @@ mod tests {
     use super::*;
     use std::error::Error;
     use std::io::{self, Read, Write};
-    use std::net::{TcpListener, TcpStream};
+    use std::net::{SocketAddr, TcpListener, TcpStream};
     use std::os::unix::net::UnixStream;
     use std::sync::mpsc;
     use std::thread;
@@ -951,6 +1013,29 @@ mod tests {
             .fetch(&request)
             .err()
             .ok_or_else(|| io::Error::other("expected URL policy failure"))?;
+
+        assert!(matches!(error, ServoNetworkError::Url(_)));
+        Ok(())
+    }
+
+    #[test]
+    fn servo_network_adapter_blocks_private_resolved_socket_before_network() -> TestResult {
+        let adapter = ServoNetworkAdapter::new("profile-a", IdentityMode::AgentDeclared);
+        let request = ServoNetworkRequest::new("req-1", "GET", "https://public.example/data");
+        let network_request =
+            request.to_network_request(&adapter.profile_id, adapter.identity_mode)?;
+
+        let error = adapter
+            .fetch_with_resolved_target(
+                &request,
+                network_request,
+                ResolvedTarget {
+                    host: "public.example".into(),
+                    socket: SocketAddr::from(([169, 254, 169, 254], 443)),
+                },
+            )
+            .err()
+            .ok_or_else(|| io::Error::other("expected resolved socket policy failure"))?;
 
         assert!(matches!(error, ServoNetworkError::Url(_)));
         Ok(())
