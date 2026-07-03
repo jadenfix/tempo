@@ -172,11 +172,67 @@ pub struct ReplayBranchExecution {
     pub branch: BranchBatchExecution,
 }
 
+impl ReplayBranchExecution {
+    pub fn evidence(&self) -> ReplayBranchEvidence {
+        ReplayBranchEvidence {
+            id: self.id.clone(),
+            engine: engine_name(self.engine),
+            start_url: self.start_url.clone(),
+            prefix: self.prefix.clone(),
+            branch: self.branch.clone(),
+        }
+    }
+}
+
 /// Concrete k-branch execution report from the replay-fork orchestrator.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ReplayForkExecution {
     pub schedule: BranchSchedule,
     pub branches: Vec<ReplayBranchExecution>,
+}
+
+impl ReplayForkExecution {
+    pub fn evidence(&self) -> ReplayForkEvidence {
+        let branches = self
+            .branches
+            .iter()
+            .map(ReplayBranchExecution::evidence)
+            .collect::<Vec<_>>();
+        ReplayForkEvidence {
+            schedule: self.schedule.clone(),
+            branch_count: branches.len(),
+            replayed_prefix_steps: branches.iter().map(|branch| branch.prefix.len()).sum(),
+            branch_action_count: branches
+                .iter()
+                .map(|branch| branch.branch.action_count)
+                .sum(),
+            branches,
+        }
+    }
+}
+
+/// Serializable replay-fork evidence for one branch.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ReplayBranchEvidence {
+    pub id: BranchId,
+    pub engine: String,
+    pub start_url: String,
+    pub prefix: Vec<ReplayedPrefixStep>,
+    pub branch: BranchBatchExecution,
+}
+
+/// Serializable replay-fork evidence for one k-branch execution.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ReplayForkEvidence {
+    pub schedule: BranchSchedule,
+    pub branch_count: usize,
+    pub replayed_prefix_steps: usize,
+    pub branch_action_count: usize,
+    pub branches: Vec<ReplayBranchEvidence>,
+}
+
+fn engine_name(engine: Engine) -> String {
+    format!("{engine:?}").to_ascii_lowercase()
 }
 
 /// Replay output for one engine lane.
@@ -993,6 +1049,46 @@ mod tests {
             .branches
             .iter()
             .all(|branch| branch.engine == Engine::Test && branch.branch.action_count == 1));
+        Ok(())
+    }
+
+    #[test]
+    fn replay_fork_evidence_serializes_schedule_and_branch_outcomes() -> TestResult {
+        let execution = ReplayForkExecution {
+            schedule: BranchSchedule::Sequential {
+                branches: vec![BranchId("branch-a".into())],
+                reason: "capability unsupported by this engine: native fork".into(),
+            },
+            branches: vec![ReplayBranchExecution {
+                id: BranchId("branch-a".into()),
+                engine: Engine::Test,
+                start_url: "https://example.com".into(),
+                prefix: vec![ReplayedPrefixStep {
+                    expected_seq: 1,
+                    action: Action::Scroll { x: 0.0, y: 1.0 },
+                    outcome: ReplayStepOutcome::Applied {
+                        diff: empty_diff(1, 2),
+                    },
+                }],
+                branch: BranchBatchExecution {
+                    action_count: 2,
+                    outcome: ReplayStepOutcome::Applied {
+                        diff: empty_diff(2, 3),
+                    },
+                },
+            }],
+        };
+
+        let evidence = execution.evidence();
+        let value = serde_json::to_value(&evidence)?;
+
+        assert_eq!(evidence.branch_count, 1);
+        assert_eq!(evidence.replayed_prefix_steps, 1);
+        assert_eq!(evidence.branch_action_count, 2);
+        assert_eq!(value["schedule"]["mode"], "sequential");
+        assert_eq!(value["branches"][0]["engine"], "test");
+        assert_eq!(value["branches"][0]["prefix"][0]["expected_seq"], 1);
+        assert_eq!(value["branches"][0]["branch"]["action_count"], 2);
         Ok(())
     }
 
