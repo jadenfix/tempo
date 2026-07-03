@@ -16,7 +16,9 @@ use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use tempo_driver::{DriverTrait, StepOutcome, TransportError, Unsupported};
+use tempo_driver::{
+    BrowsingContextCreateOptions, DriverTrait, StepOutcome, TransportError, Unsupported,
+};
 use tempo_schema::{Action, ActionBatch, CompiledObservation, NodeId, ObservationDiff};
 use tempo_session::{JournalError, ResumeState, RunId, SessionId, SessionJournal};
 use thiserror::Error;
@@ -295,6 +297,9 @@ pub enum DriverCommand {
         batch: ActionBatch,
     },
     Fork,
+    CreateBrowsingContext {
+        options: BrowsingContextCreateOptions,
+    },
     Extract {
         node: NodeId,
     },
@@ -392,6 +397,9 @@ pub enum DriverResponse {
         outcome: WireStepOutcome,
     },
     Forked {
+        driver_id: String,
+    },
+    BrowsingContextCreated {
         driver_id: String,
     },
     Extracted {
@@ -724,6 +732,16 @@ where
                 error: DriverWireError::unsupported(&error),
             },
         },
+        DriverCommand::CreateBrowsingContext { options } => {
+            match driver.create_browsing_context(options).await {
+                Ok(created_driver) => {
+                    register_browsing_context_driver(forks, next_fork_id, created_driver)
+                }
+                Err(error) => DriverResponse::Error {
+                    error: DriverWireError::unsupported(&error),
+                },
+            }
+        }
         command => execute_driver_command(driver, command).await,
     }
 }
@@ -743,6 +761,23 @@ fn register_fork_driver(
     let driver_id = format!("fork-{fork_id}");
     forks.insert(driver_id.clone(), forked_driver);
     DriverResponse::Forked { driver_id }
+}
+
+fn register_browsing_context_driver(
+    forks: &mut BTreeMap<String, Box<dyn DriverTrait>>,
+    next_fork_id: &mut u64,
+    created_driver: Box<dyn DriverTrait>,
+) -> DriverResponse {
+    let context_id = *next_fork_id;
+    let Some(next_id) = next_fork_id.checked_add(1) else {
+        return DriverResponse::Error {
+            error: DriverWireError::protocol("context driver id counter exhausted"),
+        };
+    };
+    *next_fork_id = next_id;
+    let driver_id = format!("context-{context_id}");
+    forks.insert(driver_id.clone(), created_driver);
+    DriverResponse::BrowsingContextCreated { driver_id }
 }
 
 /// Execute one typed driver command and convert driver failures into wire-safe responses.
@@ -777,6 +812,11 @@ where
         },
         DriverCommand::Fork => DriverResponse::Error {
             error: DriverWireError::protocol("fork requires a persistent driver connection"),
+        },
+        DriverCommand::CreateBrowsingContext { .. } => DriverResponse::Error {
+            error: DriverWireError::protocol(
+                "browsing context creation requires a persistent driver connection",
+            ),
         },
         DriverCommand::Extract { node } => match driver.extract(&node).await {
             Ok(value) => DriverResponse::Extracted { value },
@@ -1185,12 +1225,22 @@ mod tests {
     use std::io::{self, Cursor};
     use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-    use tempo_driver::TestDriver;
+    use tempo_driver::{BrowsingContextCreateOptions, BrowsingContextKind, TestDriver};
     use tempo_session::JournalEvent;
 
     type TestResult = Result<(), Box<dyn Error>>;
     type ForkClientResponses = (
         String,
+        DriverResponse,
+        DriverResponse,
+        DriverResponse,
+        DriverResponse,
+        DriverResponse,
+        DriverResponse,
+    );
+    type ContextClientResponses = (
+        String,
+        DriverResponse,
         DriverResponse,
         DriverResponse,
         DriverResponse,
@@ -1712,6 +1762,76 @@ mod tests {
         assert_observation_response(root_observe, "https://root.test", 1)?;
         assert_observation_response(fork_observe, "https://fork.test", 2)?;
         assert_eq!(fork_close, DriverResponse::Closed);
+        assert_eq!(root_close, DriverResponse::Closed);
+        Ok(())
+    }
+
+    #[test]
+    fn serve_driver_connection_routes_created_browsing_context_handles() -> TestResult {
+        let (client_stream, server_stream) = UnixStream::pair()?;
+        let mut connection = EngineIpcConnection::from_stream(server_stream);
+        let handle = thread::spawn(move || -> Result<ContextClientResponses, EngineHostError> {
+            let mut client = EngineIpcClient::from_stream(client_stream);
+            let root_goto = client.request(DriverCommand::Goto {
+                url: "https://root.test".into(),
+            })?;
+            let created = client.request(DriverCommand::CreateBrowsingContext {
+                options: BrowsingContextCreateOptions {
+                    kind: BrowsingContextKind::Tab,
+                    background: false,
+                },
+            })?;
+            let DriverResponse::BrowsingContextCreated { driver_id } = created else {
+                return Err(EngineHostError::Io(io::Error::other(format!(
+                    "unexpected context response: {created:?}"
+                ))));
+            };
+            let context_initial = client.request_for(Some(&driver_id), DriverCommand::Observe)?;
+            let context_goto = client.request_for(
+                Some(&driver_id),
+                DriverCommand::Goto {
+                    url: "https://context.test".into(),
+                },
+            )?;
+            let root_observe = client.request(DriverCommand::Observe)?;
+            let context_observe = client.request_for(Some(&driver_id), DriverCommand::Observe)?;
+            let context_close = client.request_for(Some(&driver_id), DriverCommand::Close)?;
+            let root_close = client.request(DriverCommand::Close)?;
+            Ok((
+                driver_id,
+                root_goto,
+                context_initial,
+                context_goto,
+                root_observe,
+                context_observe,
+                context_close,
+                root_close,
+            ))
+        });
+        let mut driver = TestDriver::new();
+
+        futures::executor::block_on(serve_driver_connection(&mut connection, &mut driver))?;
+        let (
+            driver_id,
+            root_goto,
+            context_initial,
+            context_goto,
+            root_observe,
+            context_observe,
+            context_close,
+            root_close,
+        ) = match handle.join() {
+            Ok(result) => result?,
+            Err(_) => return Err("client thread panicked".into()),
+        };
+
+        assert_eq!(driver_id, "context-1");
+        assert_observation_response(root_goto, "https://root.test", 1)?;
+        assert_observation_response(context_initial, "about:blank", 0)?;
+        assert_observation_response(context_goto, "https://context.test", 1)?;
+        assert_observation_response(root_observe, "https://root.test", 1)?;
+        assert_observation_response(context_observe, "https://context.test", 1)?;
+        assert_eq!(context_close, DriverResponse::Closed);
         assert_eq!(root_close, DriverResponse::Closed);
         Ok(())
     }

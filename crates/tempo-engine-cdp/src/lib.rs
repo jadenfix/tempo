@@ -14,7 +14,9 @@ use chromiumoxide::page::{Page, ScreenshotParams};
 use futures::StreamExt;
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
-use tempo_driver::{DriverTrait, Engine, StepOutcome, TransportError, Unsupported};
+use tempo_driver::{
+    BrowsingContextCreateOptions, DriverTrait, Engine, StepOutcome, TransportError, Unsupported,
+};
 use tempo_net::UrlPolicy;
 use tempo_schema::{
     Action, ActionBatch, CompiledObservation, InteractiveElement, NodeId, ObservationDiff,
@@ -67,8 +69,9 @@ impl Default for CdpConfig {
 /// CDP-backed tempo driver. Construct it with [`CdpTempoDriver::launch`].
 pub struct CdpTempoDriver {
     browser: Browser,
-    page: Page,
+    page: Option<Page>,
     handler_task: JoinHandle<()>,
+    owns_browser: bool,
     seq: u64,
     history: BTreeMap<u64, CompiledObservation>,
     url_policy: UrlPolicy,
@@ -94,8 +97,9 @@ impl CdpTempoDriver {
 
         Ok(Self {
             browser,
-            page,
+            page: Some(page),
             handler_task,
+            owns_browser: true,
             seq: 0,
             history: BTreeMap::new(),
             url_policy: UrlPolicy::block_private(),
@@ -118,9 +122,15 @@ impl CdpTempoDriver {
         enforce_url_policy(url, &self.url_policy)
     }
 
+    fn page(&self) -> Result<&Page, TransportError> {
+        self.page
+            .as_ref()
+            .ok_or_else(|| TransportError::Other("CDP page is closed".into()))
+    }
+
     async fn current_url(&self) -> Result<String, TransportError> {
         Ok(self
-            .page
+            .page()?
             .url()
             .await
             .map_err(map_cdp_error)?
@@ -129,7 +139,7 @@ impl CdpTempoDriver {
 
     async fn snapshot(&self) -> Result<(String, String), TransportError> {
         let url = self.current_url().await?;
-        let dom_html = self.page.content().await.map_err(map_cdp_error)?;
+        let dom_html = self.page()?.content().await.map_err(map_cdp_error)?;
         Ok((url, dom_html))
     }
 
@@ -150,7 +160,7 @@ impl CdpTempoDriver {
         F: FnOnce(chromiumoxide::Element) -> Fut,
         Fut: std::future::Future<Output = Result<(), TransportError>>,
     {
-        match self.page.find_element(selector).await {
+        match self.page()?.find_element(selector).await {
             Ok(element) => match op(element).await {
                 Ok(()) => Ok(true),
                 Err(TransportError::Other(message)) if is_node_not_found_msg(&message) => Ok(false),
@@ -234,7 +244,7 @@ impl CdpTempoDriver {
                     .await
             }
             Action::Scroll { x, y } => {
-                self.page
+                self.page()?
                     .evaluate(format!("window.scrollTo({}, {});", *x as i64, *y as i64))
                     .await
                     .map_err(map_cdp_error)?;
@@ -270,13 +280,13 @@ impl CdpTempoDriver {
 
         loop {
             let ready_state = self
-                .page
+                .page()?
                 .evaluate("document.readyState")
                 .await
                 .map_err(map_cdp_error)?
                 .into_value::<String>()
                 .map_err(|error| TransportError::Other(error.to_string()))?;
-            let dom_html = self.page.content().await.map_err(map_cdp_error)?;
+            let dom_html = self.page()?.content().await.map_err(map_cdp_error)?;
             let sample = PageStabilitySample {
                 ready: ready_state != "loading",
                 dom_hash: fnv1a64(dom_html.as_bytes()),
@@ -306,11 +316,11 @@ impl DriverTrait for CdpTempoDriver {
 
     async fn goto(&mut self, url: &str) -> Result<CompiledObservation, TransportError> {
         self.enforce_url_policy(url)?;
-        self.page
+        self.page()?
             .goto(url)
             .await
             .map_err(|error| TransportError::Other(error.to_string()))?;
-        self.page
+        self.page()?
             .wait_for_navigation()
             .await
             .map_err(|error| TransportError::Other(error.to_string()))?;
@@ -374,8 +384,33 @@ impl DriverTrait for CdpTempoDriver {
         Err(Unsupported("native CDP page-state fork"))
     }
 
+    async fn create_browsing_context(
+        &mut self,
+        _options: BrowsingContextCreateOptions,
+    ) -> Result<Box<dyn DriverTrait>, Unsupported> {
+        let browser_ws = self.browser.websocket_address().clone();
+        let (browser, mut handler) = Browser::connect(browser_ws)
+            .await
+            .map_err(|_error| Unsupported("fresh CDP browsing context"))?;
+        let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
+        let page = browser
+            .new_page("about:blank")
+            .await
+            .map_err(|_error| Unsupported("fresh CDP browsing context"))?;
+
+        Ok(Box::new(Self {
+            browser,
+            page: Some(page),
+            handler_task,
+            owns_browser: false,
+            seq: 0,
+            history: BTreeMap::new(),
+            url_policy: self.url_policy.clone(),
+        }))
+    }
+
     async fn extract(&mut self, node: &NodeId) -> Result<serde_json::Value, TransportError> {
-        self.page
+        self.page()?
             .evaluate(extraction_script(&node.0)?)
             .await
             .map_err(map_cdp_error)?
@@ -394,7 +429,7 @@ impl DriverTrait for CdpTempoDriver {
             .await_promise(await_promise)
             .build()
             .map_err(TransportError::Other)?;
-        self.page
+        self.page()?
             .evaluate(params)
             .await
             .map_err(map_cdp_error)?
@@ -406,12 +441,16 @@ impl DriverTrait for CdpTempoDriver {
         let params = ScreenshotParams::builder()
             .format(CaptureScreenshotFormat::Png)
             .build();
-        self.page.screenshot(params).await.map_err(map_cdp_error)
+        self.page()?.screenshot(params).await.map_err(map_cdp_error)
     }
 
     async fn close(&mut self) -> Result<(), TransportError> {
-        self.browser.close().await.map_err(map_cdp_error)?;
-        let _ = self.browser.wait().await;
+        if self.owns_browser {
+            self.browser.close().await.map_err(map_cdp_error)?;
+            let _ = self.browser.wait().await;
+        } else if let Some(page) = self.page.take() {
+            page.close().await.map_err(map_cdp_error)?;
+        }
         self.handler_task.abort();
         Ok(())
     }
