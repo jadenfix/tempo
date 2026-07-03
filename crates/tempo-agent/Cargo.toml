@@ -9,6 +9,7 @@ license.workspace = true
 tempo-act = { path = "../tempo-act" }
 tempo-schema = { path = "../tempo-schema" }
 tempo-driver = { path = "../tempo-driver" }
+tempo-handshake = { path = "../tempo-handshake" }
 tempo-policy = { path = "../tempo-policy" }
 tempo-session = { path = "../tempo-session" }
 tempo-skills = { path = "../tempo-skills" }

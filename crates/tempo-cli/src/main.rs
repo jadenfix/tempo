@@ -14,6 +14,7 @@ use std::process::ExitCode;
 use tempo_agent::{
     step_triples_from_journal_entries, AgentRunIds, AgentRunReport, AgentRunStatus, AgentRunner,
     ConfirmationMode, DriverTask, IdempotencyKey, StepTriple, StepTripleOutcome,
+    StructuredFastPath,
 };
 use tempo_compat::{run_injection_gate, CompatScorecard, CompatThresholds, InjectionCaseResult};
 use tempo_driver::{DriverTrait, TransportError};
@@ -755,6 +756,14 @@ struct RunCdpTaskStatus {
     action_index: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lane: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    signal: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    origin: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize)]
@@ -807,6 +816,25 @@ impl From<&tempo_agent::AgentStepReport> for RunCdpTaskStep {
 }
 
 fn run_cdp_task(config: RunCdpTaskConfig) -> Result<RunCdpTaskReport, CliError> {
+    let mut structured_fast_path = StructuredFastPath::live();
+    if config.allow_private_network {
+        structured_fast_path = structured_fast_path.allow_private_network_access();
+    }
+    if let Some(decision) = structured_fast_path.probe_target(&config.start_url)
+        && decision.skips_render()
+    {
+        return Ok(RunCdpTaskReport {
+            engine: "structured".into(),
+            journal: config.journal.display().to_string(),
+            status: run_status(&AgentRunStatus::StructuredFastPath(decision)),
+            actions_completed: 0,
+            observations: 0,
+            max_observation_bytes: 0,
+            max_observation_tokens: 0,
+            steps: Vec::new(),
+        });
+    }
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
@@ -824,7 +852,8 @@ fn run_cdp_task(config: RunCdpTaskConfig) -> Result<RunCdpTaskReport, CliError> 
             &config.journal,
             AgentRunIds::new(config.run_id, config.session_id),
         )
-        .with_confirmation_mode(config.confirmation_mode);
+        .with_confirmation_mode(config.confirmation_mode)
+        .with_structured_fast_path(StructuredFastPath::disabled());
         let task = DriverTask::new(config.start_url, config.actions);
 
         let run_result = runner.run_driver_task(&mut driver, &task).await;
@@ -841,16 +870,37 @@ fn run_status(status: &AgentRunStatus) -> RunCdpTaskStatus {
             state: "running",
             action_index: None,
             reason: None,
+            lane: None,
+            signal: None,
+            source: None,
+            origin: None,
         },
         AgentRunStatus::Completed => RunCdpTaskStatus {
             state: "completed",
             action_index: None,
             reason: None,
+            lane: None,
+            signal: None,
+            source: None,
+            origin: None,
         },
         AgentRunStatus::AlreadyComplete => RunCdpTaskStatus {
             state: "already_complete",
             action_index: None,
             reason: None,
+            lane: None,
+            signal: None,
+            source: None,
+            origin: None,
+        },
+        AgentRunStatus::StructuredFastPath(decision) => RunCdpTaskStatus {
+            state: "structured_fast_path",
+            action_index: None,
+            reason: None,
+            lane: Some(decision.lane_name()),
+            signal: Some(decision.signal_name()),
+            source: Some(decision.source.clone()),
+            origin: Some(decision.origin.clone()),
         },
         AgentRunStatus::StepError {
             action_index,
@@ -859,6 +909,10 @@ fn run_status(status: &AgentRunStatus) -> RunCdpTaskStatus {
             state: "step_error",
             action_index: Some(*action_index),
             reason: Some(reason.clone()),
+            lane: None,
+            signal: None,
+            source: None,
+            origin: None,
         },
         AgentRunStatus::PolicyDenied {
             action_index,
@@ -867,6 +921,10 @@ fn run_status(status: &AgentRunStatus) -> RunCdpTaskStatus {
             state: "policy_denied",
             action_index: Some(*action_index),
             reason: Some(reason.clone()),
+            lane: None,
+            signal: None,
+            source: None,
+            origin: None,
         },
         AgentRunStatus::Interrupted {
             action_index,
@@ -875,6 +933,10 @@ fn run_status(status: &AgentRunStatus) -> RunCdpTaskStatus {
             state: "interrupted",
             action_index: Some(*action_index),
             reason: Some(reason.clone()),
+            lane: None,
+            signal: None,
+            source: None,
+            origin: None,
         },
     }
 }
@@ -972,8 +1034,11 @@ mod tests {
     use serde_json::Value;
     use std::error::Error;
     use std::fs;
-    use std::io::Write;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::io::{self, Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use tempo_agent::{StructuredFastPathDecision, StructuredLane, StructuredSignal};
     use tempo_compat::{EngineProbe, OriginScore};
     use tempo_schema::{
         Action, CompiledObservation, InteractiveElement, NodeId, ObservationDiff, Provenance,
@@ -1339,6 +1404,59 @@ mod tests {
     }
 
     #[test]
+    fn run_cdp_task_status_reports_structured_fast_path() {
+        let status = run_status(&AgentRunStatus::StructuredFastPath(
+            StructuredFastPathDecision::new(
+                "https://structured.example",
+                StructuredLane::Mcp,
+                StructuredSignal::McpCatalog,
+                "/mcp/catalog.json",
+            ),
+        ));
+
+        assert_eq!(status.state, "structured_fast_path");
+        assert_eq!(status.lane, Some("mcp"));
+        assert_eq!(status.signal, Some("mcp_catalog"));
+        assert_eq!(status.source.as_deref(), Some("/mcp/catalog.json"));
+        assert_eq!(status.origin.as_deref(), Some("https://structured.example"));
+        assert_eq!(status.action_index, None);
+        assert_eq!(status.reason, None);
+    }
+
+    #[test]
+    fn run_cdp_task_private_structured_probe_returns_before_chrome_launch() -> TestResult {
+        let dir = unique_dir("run-cdp-structured-private")?;
+        remove_dir(&dir)?;
+        fs::create_dir_all(&dir)?;
+        let (origin, server) = serve_mcp_catalog_probe_fixture()?;
+
+        let report = run_cdp_task(RunCdpTaskConfig {
+            start_url: format!("{origin}/app"),
+            actions: Vec::new(),
+            journal: dir.join("session.jsonl"),
+            run_id: "run-structured-private".into(),
+            session_id: "session-structured-private".into(),
+            chrome: Some("/definitely/not/a/chrome/binary".into()),
+            allow_private_network: true,
+            confirmation_mode: ConfirmationMode::DenyHumanRequired,
+        })?;
+        server
+            .join()
+            .map_err(|_| "structured probe fixture thread panicked")??;
+
+        assert_eq!(report.engine, "structured");
+        assert_eq!(report.status.state, "structured_fast_path");
+        assert_eq!(report.status.lane, Some("mcp"));
+        assert_eq!(report.status.signal, Some("mcp_catalog"));
+        assert_eq!(report.observations, 0);
+        assert!(report.steps.is_empty());
+        assert!(!dir.join("session.jsonl").exists());
+
+        remove_dir(&dir)?;
+        Ok(())
+    }
+
+    #[test]
     fn run_cdp_task_command_rejects_invalid_confirmation_mode() -> TestResult {
         let result = Command::parse([
             "run-cdp-task",
@@ -1371,6 +1489,50 @@ mod tests {
             other => return Err(unexpected_result(other)),
         }
         Ok(())
+    }
+
+    fn serve_mcp_catalog_probe_fixture() -> io::Result<(String, thread::JoinHandle<io::Result<()>>)>
+    {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
+        let origin = format!("http://{}", listener.local_addr()?);
+        let handle = thread::spawn(move || -> io::Result<()> {
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            let mut handled = 0_usize;
+            while handled < 5 && std::time::Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _peer)) => {
+                        handled += 1;
+                        stream.set_read_timeout(Some(Duration::from_secs(1)))?;
+                        let mut buffer = [0_u8; 1024];
+                        let read = stream.read(&mut buffer)?;
+                        let request = String::from_utf8_lossy(&buffer[..read]);
+                        let (status, content_type, body) =
+                            if request.starts_with("GET /mcp/catalog.json ") {
+                                (
+                                    "200 OK",
+                                    "application/json",
+                                    r#"{"tools":[{"name":"search"}]}"#,
+                                )
+                            } else {
+                                ("404 Not Found", "text/plain", "not found")
+                            };
+                        let response = format!(
+                            "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        stream.write_all(response.as_bytes())?;
+                        stream.flush()?;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok(())
+        });
+        Ok((origin, handle))
     }
 
     struct EvalRecordBuilder {

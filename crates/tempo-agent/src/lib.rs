@@ -9,6 +9,8 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use tempo_act::{execute_action, execute_batch, ExecutionStatus};
 use tempo_driver::{DriverTrait, Engine, StepOutcome, TransportError};
+use tempo_handshake::{probe_http_origin, LaneDecision, ProbeHit};
+pub use tempo_handshake::{HttpProbeConfig, Lane as StructuredLane, StructuredSignal};
 use tempo_policy::{
     ConfirmationGate, InputTaint, Origin, OriginError, OriginPolicy, OriginRuleMode,
 };
@@ -38,6 +40,122 @@ pub const MAX_SKILL_EXPANSION_ACTIONS: usize = 1_024;
 /// Reason recorded when resume refuses to re-run a step that was planned but not
 /// completed in a prior run, whose side effect may already have happened (#99).
 pub const RESUME_INTERRUPTED_REASON: &str = "resume: step was planned but its outcome was not journaled; not re-executed to avoid duplicating a side effect";
+
+pub type StructuredFastPathProbe = fn(&str, HttpProbeConfig) -> Option<StructuredFastPathDecision>;
+
+/// Structured surface selected before browser navigation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StructuredFastPathDecision {
+    pub origin: String,
+    pub lane: StructuredLane,
+    pub signal: StructuredSignal,
+    pub source: String,
+}
+
+impl StructuredFastPathDecision {
+    pub fn new(
+        origin: impl Into<String>,
+        lane: StructuredLane,
+        signal: StructuredSignal,
+        source: impl Into<String>,
+    ) -> Self {
+        Self {
+            origin: origin.into(),
+            lane,
+            signal,
+            source: source.into(),
+        }
+    }
+
+    pub fn from_lane_decision(origin: impl Into<String>, decision: LaneDecision) -> Option<Self> {
+        let ProbeHit { signal, source } = decision.selected?;
+        Some(Self::new(origin, decision.lane, signal, source))
+    }
+
+    pub fn skips_render(&self) -> bool {
+        self.lane.skips_render()
+    }
+
+    pub fn lane_name(&self) -> &'static str {
+        match self.lane {
+            StructuredLane::Render => "render",
+            StructuredLane::Api => "api",
+            StructuredLane::Mcp => "mcp",
+        }
+    }
+
+    pub fn signal_name(&self) -> &'static str {
+        match self.signal {
+            StructuredSignal::BeaterJson => "beater_json",
+            StructuredSignal::AgentCard => "agent_card",
+            StructuredSignal::LlmsTxt => "llms_txt",
+            StructuredSignal::OpenApi => "openapi",
+            StructuredSignal::McpCatalog => "mcp_catalog",
+            StructuredSignal::WebMcp => "web_mcp",
+        }
+    }
+}
+
+/// Pre-render structured-web probe used to avoid pixel rendering when an origin
+/// exposes an API or MCP surface.
+#[derive(Clone)]
+pub struct StructuredFastPath {
+    enabled: bool,
+    config: HttpProbeConfig,
+    probe: StructuredFastPathProbe,
+}
+
+impl StructuredFastPath {
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            config: HttpProbeConfig::default(),
+            probe: live_structured_fast_path_probe,
+        }
+    }
+
+    pub fn live() -> Self {
+        Self {
+            enabled: true,
+            config: HttpProbeConfig::default(),
+            probe: live_structured_fast_path_probe,
+        }
+    }
+
+    pub fn with_probe(probe: StructuredFastPathProbe) -> Self {
+        Self {
+            enabled: true,
+            config: HttpProbeConfig::default(),
+            probe,
+        }
+    }
+
+    pub fn with_config(mut self, config: HttpProbeConfig) -> Self {
+        self.config = config;
+        self
+    }
+
+    pub fn allow_private_network_access(mut self) -> Self {
+        self.config = self.config.allow_private_network_access();
+        self
+    }
+
+    pub fn probe_target(&self, target: &str) -> Option<StructuredFastPathDecision> {
+        if !self.enabled {
+            return None;
+        }
+        (self.probe)(target, self.config.clone())
+    }
+}
+
+fn live_structured_fast_path_probe(
+    target: &str,
+    config: HttpProbeConfig,
+) -> Option<StructuredFastPathDecision> {
+    let run = probe_http_origin(target, config).ok()?;
+    let decision = run.lane_decision();
+    StructuredFastPathDecision::from_lane_decision(run.origin, decision)
+}
 
 /// Stable key for retrying a planned step without duplicating side effects.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -539,6 +657,7 @@ pub struct AgentRunner {
     confirmation_mode: ConfirmationMode,
     skill_store_root: Option<PathBuf>,
     origin_policy: OriginPolicy,
+    structured_fast_path: StructuredFastPath,
 }
 
 impl AgentRunner {
@@ -551,6 +670,7 @@ impl AgentRunner {
             confirmation_mode: ConfirmationMode::default(),
             skill_store_root: None,
             origin_policy: OriginPolicy::default(),
+            structured_fast_path: StructuredFastPath::disabled(),
         }
     }
 
@@ -576,6 +696,11 @@ impl AgentRunner {
 
     pub fn with_origin_policy(mut self, origin_policy: OriginPolicy) -> Self {
         self.origin_policy = origin_policy;
+        self
+    }
+
+    pub fn with_structured_fast_path(mut self, structured_fast_path: StructuredFastPath) -> Self {
+        self.structured_fast_path = structured_fast_path;
         self
     }
 
@@ -625,6 +750,13 @@ impl AgentRunner {
 
         let mut current_origin;
         if !has_session_started(&initial_entries) {
+            if let Some(decision) = self.structured_fast_path.probe_target(&task.start_url)
+                && decision.skips_render()
+            {
+                report.status = AgentRunStatus::StructuredFastPath(decision);
+                return Ok(report);
+            }
+
             let observation = driver
                 .goto(&task.start_url)
                 .await
@@ -983,6 +1115,7 @@ pub enum AgentRunStatus {
     Running,
     Completed,
     AlreadyComplete,
+    StructuredFastPath(StructuredFastPathDecision),
     StepError {
         action_index: usize,
         reason: String,
@@ -1744,6 +1877,69 @@ mod tests {
             entries.last().map(|entry| &entry.event),
             Some(JournalEvent::SessionClosed)
         ));
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runner_structured_fast_path_skips_initial_driver_navigation() -> TestResult {
+        let root = unique_dir("runner-structured-fast-path")?;
+        remove_dir_if_exists(&root)?;
+        fs::create_dir_all(&root)?;
+        let journal_path = root.join("session.jsonl");
+        let task = DriverTask::new(
+            "https://structured.example/app",
+            vec![Action::Click {
+                node: NodeId("submit".into()),
+            }],
+        );
+        let mut driver = FailingDriver::new(TransportFailurePoint::Goto);
+        let runner = AgentRunner::new(
+            &journal_path,
+            AgentRunIds::new("run-structured", "session-structured"),
+        )
+        .with_structured_fast_path(StructuredFastPath::with_probe(fake_mcp_fast_path_probe));
+
+        let report = runner.run_driver_task(&mut driver, &task).await?;
+
+        assert_eq!(
+            report.status,
+            AgentRunStatus::StructuredFastPath(StructuredFastPathDecision::new(
+                "https://structured.example",
+                StructuredLane::Mcp,
+                StructuredSignal::McpCatalog,
+                "/mcp/catalog.json"
+            ))
+        );
+        assert_eq!(driver.goto_calls, 0);
+        assert_eq!(report.actions_completed, 0);
+        assert_eq!(report.observations, 0);
+        assert!(read_journal_entries(&journal_path)?.is_empty());
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runner_render_fast_path_decision_falls_through_to_driver() -> TestResult {
+        let root = unique_dir("runner-render-fast-path")?;
+        remove_dir_if_exists(&root)?;
+        fs::create_dir_all(&root)?;
+        let journal_path = root.join("session.jsonl");
+        let task = DriverTask::new("https://render.example/app", vec![]);
+        let mut driver = FailingDriver::new(TransportFailurePoint::PostActionObserve);
+        let runner = AgentRunner::new(
+            &journal_path,
+            AgentRunIds::new("run-render", "session-render"),
+        )
+        .with_structured_fast_path(StructuredFastPath::with_probe(fake_render_probe));
+
+        let report = runner.run_driver_task(&mut driver, &task).await?;
+
+        assert_eq!(report.status, AgentRunStatus::Completed);
+        assert_eq!(driver.goto_calls, 1);
+        assert_eq!(report.observations, 1);
 
         remove_dir_if_exists(&root)?;
         Ok(())
@@ -2514,9 +2710,38 @@ mod tests {
         PostActionObserve,
     }
 
+    fn fake_mcp_fast_path_probe(
+        _target: &str,
+        _config: HttpProbeConfig,
+    ) -> Option<StructuredFastPathDecision> {
+        Some(StructuredFastPathDecision::new(
+            "https://structured.example",
+            StructuredLane::Mcp,
+            StructuredSignal::McpCatalog,
+            "/mcp/catalog.json",
+        ))
+    }
+
+    fn fake_render_probe(
+        target: &str,
+        _config: HttpProbeConfig,
+    ) -> Option<StructuredFastPathDecision> {
+        if target.starts_with("structured://") {
+            Some(StructuredFastPathDecision::new(
+                "structured://fixture",
+                StructuredLane::Api,
+                StructuredSignal::OpenApi,
+                "/openapi.json",
+            ))
+        } else {
+            None
+        }
+    }
+
     struct FailingDriver {
         inner: TestDriver,
         failure: TransportFailurePoint,
+        goto_calls: usize,
         observe_calls: usize,
     }
 
@@ -2525,6 +2750,7 @@ mod tests {
             Self {
                 inner: TestDriver::new(),
                 failure,
+                goto_calls: 0,
                 observe_calls: 0,
             }
         }
@@ -2542,6 +2768,7 @@ mod tests {
         }
 
         async fn goto(&mut self, url: &str) -> Result<CompiledObservation, TransportError> {
+            self.goto_calls += 1;
             if self.failure == TransportFailurePoint::Goto {
                 return Err(TransportError::NavTimeout);
             }
