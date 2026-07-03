@@ -21,10 +21,18 @@ pub const WEB_MCP_DETECTION_SCRIPT: &str = r#"
 (() => {
   const nav = globalThis.navigator;
   const value = nav && nav.modelContext;
+  const tools = value && value.tools;
+  const hasNamedTools = Array.isArray(tools)
+    ? tools.length > 0
+    : !!(tools && typeof tools === 'object' && Object.keys(tools).length > 0);
   return {
     available: value !== undefined && value !== null,
     type: value === undefined || value === null ? null : typeof value,
-    hasTools: !!(value && (value.tools || value.listTools || value.callTool))
+    hasTools: !!(value && (
+      hasNamedTools ||
+      typeof value.listTools === 'function' ||
+      typeof value.callTool === 'function'
+    ))
   };
 })()
 "#;
@@ -354,13 +362,13 @@ impl ProbeReport {
         }
     }
 
-    pub fn record_web_mcp(&mut self, available: bool) {
-        if available {
-            self.add_hit(ProbeHit::new(
-                StructuredSignal::WebMcp,
-                "navigator.modelContext",
-            ));
-        }
+    /// Record legacy boolean WebMCP availability.
+    ///
+    /// Availability alone is not enough to select the MCP lane; callers that
+    /// can inspect `navigator.modelContext` must use
+    /// [`ProbeReport::record_web_mcp_detection`] so tool evidence is present.
+    pub fn record_web_mcp(&mut self, _available: bool) {
+        // Intentionally no-op: selecting WebMCP requires usable tool evidence.
     }
 
     pub fn record_web_mcp_detection(&mut self, detection: &WebMcpDetection) {
@@ -712,8 +720,7 @@ mod tests {
             ProbeResponse::new("/mcp/catalog.json", 200, r#"{"tools":[]}"#),
         ];
 
-        let mut report = ProbeReport::from_responses(responses);
-        report.record_web_mcp(true);
+        let report = ProbeReport::from_responses(responses);
 
         let signals: Vec<_> = report.hits().iter().map(|hit| hit.signal).collect();
         assert_eq!(
@@ -724,9 +731,18 @@ mod tests {
                 StructuredSignal::LlmsTxt,
                 StructuredSignal::OpenApi,
                 StructuredSignal::McpCatalog,
-                StructuredSignal::WebMcp,
             ]
         );
+    }
+
+    #[test]
+    fn boolean_web_mcp_availability_does_not_select_mcp_without_tools() {
+        let mut report = ProbeReport::new();
+
+        report.record_web_mcp(true);
+
+        assert!(report.hits().is_empty());
+        assert_eq!(decide_lane(&report).lane, Lane::Render);
     }
 
     #[test]
