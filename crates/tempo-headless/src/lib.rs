@@ -661,12 +661,18 @@ impl SessionPool {
         };
 
         let id = id.0.clone();
-        if let Some(Err(error)) = run_teardown_bounded(
+        match run_teardown_bounded(
             "session engine context Close",
             ENGINE_TEARDOWN_TIMEOUT,
             move || futures::executor::block_on(driver.close()),
         ) {
-            eprintln!("tempod: error closing engine driver for session {id}: {error}");
+            Some(Ok(())) => {}
+            Some(Err(error)) => {
+                eprintln!("tempod: error closing engine driver for session {id}: {error}");
+            }
+            None => {
+                self.abandon_attached_engine_after_teardown_timeout("session engine context Close");
+            }
         }
     }
 
@@ -700,12 +706,46 @@ impl SessionPool {
                 errors
             },
         ) else {
+            self.abandon_attached_engine_after_teardown_timeout(
+                "forked BiDi context Close commands",
+            );
             return;
         };
 
         for error in errors {
             eprintln!("tempod: error closing forked BiDi context at teardown: {error}");
         }
+    }
+
+    fn close_removed_bidi_context(&mut self, mut driver: AttachedEngineDriver) {
+        if driver.driver_id.is_none() {
+            return;
+        }
+        match run_teardown_bounded(
+            "removed BiDi context Close",
+            ENGINE_TEARDOWN_TIMEOUT,
+            move || futures::executor::block_on(driver.close()),
+        ) {
+            Some(Ok(())) => {}
+            Some(Err(error)) => {
+                eprintln!("tempod: error closing removed BiDi context at teardown: {error}");
+            }
+            None => {
+                self.abandon_attached_engine_after_teardown_timeout("removed BiDi context Close");
+            }
+        }
+    }
+
+    fn abandon_attached_engine_after_teardown_timeout(&mut self, label: &'static str) {
+        eprintln!(
+            "tempod: {label} was abandoned while sharing the attached engine IPC; \
+             detaching engine state to avoid future pool-lock stalls (#200)"
+        );
+        self.driver = None;
+        self.mcp = None;
+        self.session_drivers.clear();
+        self.bidi_contexts.clear();
+        self.next_bidi_context_id = 1;
     }
 
     fn bidi_driver_for(&self, context: &BrowsingContextId) -> Option<AttachedEngineDriver> {
@@ -1617,11 +1657,9 @@ fn route_bidi_driver(
                 );
             }
             match pool.bidi_contexts.remove(&context) {
-                Some(mut driver) => {
+                Some(driver) => {
                     // Release the forked engine-side driver so it is not leaked.
-                    if driver.driver_id.is_some() {
-                        let _ = futures::executor::block_on(driver.close());
-                    }
+                    pool.close_removed_bidi_context(driver);
                     BidiDispatchResult::new(200, bidi_success_or_error(id, json!({})))
                 }
                 None => BidiDispatchResult::new(
@@ -2270,6 +2308,107 @@ mod tests {
 
         drop(pool);
         join_driver_handler(server)?;
+        Ok(())
+    }
+
+    #[test]
+    fn http_kill_does_not_hang_on_wedged_session_context() -> TestResult {
+        let (client_stream, server_stream) = UnixStream::pair()?;
+        let wedged_engine = thread::spawn(move || -> Result<(), EngineHostError> {
+            let mut connection = EngineIpcConnection::from_stream(server_stream);
+
+            let create = connection.read_driver_request()?;
+            assert!(create.driver_id.is_none());
+            assert!(matches!(
+                create.command,
+                HostDriverCommand::CreateBrowsingContext { .. }
+            ));
+            connection.write_driver_response(
+                create.id,
+                DriverResponse::BrowsingContextCreated {
+                    driver_id: "session-context-1".into(),
+                },
+            )?;
+
+            let goto = connection.read_driver_request()?;
+            assert_eq!(goto.driver_id.as_deref(), Some("session-context-1"));
+            assert!(matches!(goto.command, HostDriverCommand::Goto { .. }));
+            connection.write_driver_response(
+                goto.id,
+                DriverResponse::Observation {
+                    observation: observation("https://session.test", 1),
+                },
+            )?;
+
+            let close = connection.read_driver_request()?;
+            assert_eq!(close.driver_id.as_deref(), Some("session-context-1"));
+            assert_eq!(close.command, HostDriverCommand::Close);
+            thread::park_timeout(Duration::from_secs(60));
+            Ok(())
+        });
+
+        let mut pool = SessionPool::default();
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+        let create = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/sessions".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: br#"{"url":"https://session.test"}"#.to_vec(),
+            },
+        )?;
+        assert_eq!(create.status, 201);
+        assert_eq!(pool.session_drivers.len(), 1);
+
+        let started = std::time::Instant::now();
+        let kill = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "DELETE".into(),
+                path: "/sessions/session-0".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: Vec::new(),
+            },
+        )?;
+        let elapsed = started.elapsed();
+
+        assert_eq!(kill.status, 200);
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "session kill hung on a wedged session context close: took {elapsed:?}"
+        );
+        assert!(pool.driver.is_none());
+        assert!(pool.mcp.is_none());
+        assert!(pool.session_drivers.is_empty());
+        assert!(pool.bidi_contexts.is_empty());
+
+        let started = std::time::Instant::now();
+        let rejected = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/bidi".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: br#"{"id":1,"method":"browsingContext.navigate","params":{"context":"tempo-root","url":"https://after-kill-timeout.test","inputTainted":false}}"#.to_vec(),
+            },
+        )?;
+        let elapsed = started.elapsed();
+        let rejected: Value = serde_json::from_slice(&rejected.body)?;
+        assert_eq!(rejected["type"], "error");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "post-kill driver command re-blocked on abandoned engine client: took {elapsed:?}"
+        );
+
+        wedged_engine.thread().unpark();
+        join_driver_handler(wedged_engine)?;
         Ok(())
     }
 
@@ -4611,6 +4750,96 @@ mod tests {
     }
 
     #[test]
+    fn bidi_close_does_not_hang_on_wedged_forked_context() -> TestResult {
+        let (client_stream, server_stream) = UnixStream::pair()?;
+        let wedged_engine = thread::spawn(move || {
+            let _held = server_stream;
+            thread::park_timeout(Duration::from_secs(60));
+        });
+
+        let mut pool = SessionPool::default();
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+        let started = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/bidi".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: br#"{"id":1,"method":"session.new","params":{}}"#.to_vec(),
+            },
+        )?;
+        let started: Value = serde_json::from_slice(&started.body)?;
+        assert_eq!(started["type"], "success");
+
+        let driver = pool.driver.as_ref().ok_or("attached root driver missing")?;
+        let context = BrowsingContextId("wedged-bidi-close-fork".into());
+        pool.bidi_contexts.insert(
+            context.clone(),
+            AttachedEngineDriver {
+                engine: Engine::Cdp,
+                client: Arc::clone(&driver.client),
+                driver_id: Some("fork-1".into()),
+            },
+        );
+
+        let started = std::time::Instant::now();
+        let closed = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/bidi".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: format!(
+                    r#"{{"id":2,"method":"browsingContext.close","params":{{"context":"{}"}}}}"#,
+                    context.0
+                )
+                .into_bytes(),
+            },
+        )?;
+        let elapsed = started.elapsed();
+
+        let closed: Value = serde_json::from_slice(&closed.body)?;
+        assert_eq!(closed["type"], "success");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "browsingContext.close hung on a wedged forked context: took {elapsed:?}"
+        );
+        assert!(pool.bidi_contexts.is_empty());
+        assert!(pool.driver.is_none());
+        assert!(pool.mcp.is_none());
+
+        let started = std::time::Instant::now();
+        let rejected = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/bidi".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: br#"{"id":3,"method":"browsingContext.navigate","params":{"context":"tempo-root","url":"https://after-close-timeout.test","inputTainted":false}}"#.to_vec(),
+            },
+        )?;
+        let elapsed = started.elapsed();
+        let rejected: Value = serde_json::from_slice(&rejected.body)?;
+        assert_eq!(rejected["type"], "error");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "post-close driver command re-blocked on abandoned engine client: took {elapsed:?}"
+        );
+
+        wedged_engine.thread().unpark();
+        wedged_engine
+            .join()
+            .map_err(|_| "wedged engine thread failed")?;
+        Ok(())
+    }
+
+    #[test]
     fn bidi_session_end_closes_forked_contexts_and_rejects_driver_work() -> TestResult {
         let closes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let engine_closes = Arc::clone(&closes);
@@ -4756,6 +4985,46 @@ mod tests {
             "session.end hung on a wedged forked context before bounded teardown returned: took {elapsed:?}"
         );
         assert!(pool.bidi_contexts.is_empty());
+        assert!(
+            pool.driver.is_none(),
+            "timed-out fork close must detach the shared engine client"
+        );
+        assert!(pool.mcp.is_none());
+        assert!(pool.session_drivers.is_empty());
+
+        let restarted = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/bidi".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: br#"{"id":3,"method":"session.new","params":{}}"#.to_vec(),
+            },
+        )?;
+        let restarted: Value = serde_json::from_slice(&restarted.body)?;
+        assert_eq!(restarted["type"], "success");
+
+        let started = std::time::Instant::now();
+        let rejected = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/bidi".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: br#"{"id":4,"method":"browsingContext.navigate","params":{"context":"tempo-root","url":"https://after-timeout.test","inputTainted":false}}"#.to_vec(),
+            },
+        )?;
+        let elapsed = started.elapsed();
+        let rejected: Value = serde_json::from_slice(&rejected.body)?;
+        assert_eq!(rejected["type"], "error");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "post-timeout driver command re-blocked on abandoned engine client: took {elapsed:?}"
+        );
 
         wedged_engine.thread().unpark();
         wedged_engine
