@@ -1,9 +1,10 @@
 //! tempo-session — durable session journal and cassette replay primitives.
 //!
 //! The engine/runtime layers decide what to do. This crate makes those decisions
-//! durable: every step is appended as a synced JSONL record, and every replayable
+//! durable: every step is committed to a SQLite journal, and every replayable
 //! response is stored in a deterministic cassette format that can move between hosts.
 
+use rusqlite::{params, Connection, OpenFlags};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -11,7 +12,7 @@ use std::fmt::Write as _;
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tempo_driver::{StepOutcome, TransportError};
 use tempo_schema::{Action, CompiledObservation, ObservationDiff};
 use thiserror::Error;
@@ -95,18 +96,16 @@ pub struct ResumeState {
     pub entries: Vec<JournalEntry>,
 }
 
-/// Append-only session journal. Each append is flushed and synced before returning.
+/// Append-only session journal. Each append is committed before returning.
 ///
-/// The journal holds a single file handle for its whole lifetime and takes an
-/// advisory exclusive lock on it at [`open`](SessionJournal::open). This prevents
-/// two writers from concurrently allocating the same sequence number (which would
-/// permanently brick future opens with a [`JournalError::SequenceGap`]) and avoids
-/// the reopen-per-append TOCTOU where a rotated/deleted file was silently recreated.
+/// The journal holds a sidecar lock file for its whole lifetime. This prevents
+/// two live writers from concurrently allocating sequence numbers while keeping
+/// every event durable as its own SQLite transaction.
 pub struct SessionJournal {
     path: PathBuf,
-    /// Held for the journal's lifetime. Dropping the handle releases the advisory
-    /// lock, so `file` must outlive every append.
-    file: File,
+    /// Held for the journal's lifetime. Dropping the handle releases the advisory lock.
+    _lock: File,
+    conn: Connection,
     run_id: RunId,
     session_id: SessionId,
     next_seq: u64,
@@ -115,7 +114,7 @@ pub struct SessionJournal {
 impl SessionJournal {
     /// Open or create a journal and recover the next sequence number from existing entries.
     ///
-    /// Takes an advisory exclusive lock on the journal file; if another live
+    /// Takes an advisory exclusive lock on a sidecar file; if another live
     /// [`SessionJournal`] already holds it, this fails with [`JournalError::Locked`]
     /// rather than racing to allocate duplicate sequence numbers.
     pub fn open(
@@ -124,21 +123,10 @@ impl SessionJournal {
         session_id: SessionId,
     ) -> Result<Self, JournalError> {
         let path = path.as_ref().to_path_buf();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let file = OpenOptions::new().create(true).append(true).open(&path)?;
-        match file.try_lock() {
-            Ok(()) => {}
-            Err(TryLockError::WouldBlock) => return Err(JournalError::Locked { path }),
-            Err(TryLockError::Error(source)) => return Err(JournalError::Io(source)),
-        }
+        let lock = lock_journal_writer(&path)?;
+        let conn = open_journal_connection(&path, JournalOpenMode::ReadWriteCreate)?;
 
-        // Physically drop any torn final record left by a crash so that the next
-        // append does not concatenate onto it and create genuine mid-file corruption.
-        truncate_torn_tail(&path, &file)?;
-
-        let entries = read_journal_entries(&path)?;
+        let entries = read_journal_entries_from_connection(&conn)?;
         validate_journal_entries(&entries, &run_id, &session_id)?;
         let next_seq = entries
             .iter()
@@ -149,7 +137,8 @@ impl SessionJournal {
 
         Ok(Self {
             path,
-            file,
+            _lock: lock,
+            conn,
             run_id,
             session_id,
             next_seq,
@@ -158,20 +147,17 @@ impl SessionJournal {
 
     /// Read a journal's recovered state without holding it open.
     ///
-    /// Unlike [`open`](SessionJournal::open), this takes no lock: it is a read-only
-    /// recovery snapshot and can be called while a writer holds the journal.
+    /// Unlike [`open`](SessionJournal::open), this takes no writer lock: it is a
+    /// read-only recovery snapshot and can be called while a writer holds the journal.
     pub fn resume(
         path: impl AsRef<Path>,
         run_id: RunId,
         session_id: SessionId,
     ) -> Result<ResumeState, JournalError> {
         let path = path.as_ref().to_path_buf();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        OpenOptions::new().create(true).append(true).open(&path)?;
+        let conn = open_journal_connection(&path, JournalOpenMode::ReadWriteCreate)?;
 
-        let entries = read_journal_entries(&path)?;
+        let entries = read_journal_entries_from_connection(&conn)?;
         validate_journal_entries(&entries, &run_id, &session_id)?;
         let next_seq = entries
             .iter()
@@ -189,7 +175,7 @@ impl SessionJournal {
         })
     }
 
-    /// Append one event, flush it, and sync it before returning.
+    /// Append one event in a committed SQLite transaction before returning.
     pub fn append(&mut self, event: JournalEvent) -> Result<JournalEntry, JournalError> {
         let entry = JournalEntry {
             schema_version: tempo_schema::SCHEMA_VERSION.into(),
@@ -200,10 +186,7 @@ impl SessionJournal {
             event,
         };
 
-        serde_json::to_writer(&mut self.file, &entry)?;
-        self.file.write_all(b"\n")?;
-        self.file.flush()?;
-        self.file.sync_data()?;
+        insert_journal_entry(&mut self.conn, &entry)?;
 
         self.next_seq += 1;
         Ok(entry)
@@ -367,6 +350,8 @@ pub enum JournalError {
     Io(#[from] std::io::Error),
     #[error("journal is already locked by another session: {path:?}")]
     Locked { path: PathBuf },
+    #[error("journal sqlite operation failed: {0}")]
+    Sqlite(#[from] rusqlite::Error),
     #[error("journal serialization failed: {0}")]
     Serde(#[from] serde_json::Error),
     #[error("journal line {line} is corrupt: {source}")]
@@ -390,6 +375,8 @@ pub enum JournalError {
         expected: u64,
         actual: u64,
     },
+    #[error("journal field {field} is out of range or malformed: {value}")]
+    InvalidField { field: &'static str, value: String },
     #[error("cassette key conflict for {key:?}")]
     CassetteConflict { key: CassetteKey },
     #[error("system clock is before unix epoch")]
@@ -398,15 +385,159 @@ pub enum JournalError {
 
 /// Human-readable crate summary retained for callers that expose crate capabilities.
 pub fn describe() -> &'static str {
-    "session lifecycle, synced JSONL journal, portable cassettes, and deterministic replay primitives"
+    "session lifecycle, SQLite journal, portable cassettes, and deterministic replay primitives"
 }
 
 pub fn read_journal_entries(path: impl AsRef<Path>) -> Result<Vec<JournalEntry>, JournalError> {
-    read_jsonl(path)
+    let path = path.as_ref();
+    std::fs::metadata(path)?;
+    let conn = open_journal_connection(path, JournalOpenMode::ReadWriteCreate)?;
+    read_journal_entries_from_connection(&conn)
 }
 
 pub fn read_cassettes(path: impl AsRef<Path>) -> Result<Vec<ResponseCassette>, JournalError> {
     read_jsonl(path)
+}
+
+enum JournalOpenMode {
+    ReadWriteCreate,
+}
+
+fn open_journal_connection(path: &Path, mode: JournalOpenMode) -> Result<Connection, JournalError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let flags = match mode {
+        JournalOpenMode::ReadWriteCreate => {
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE
+        }
+    };
+    let conn = Connection::open_with_flags(path, flags)?;
+    configure_journal_connection(&conn)?;
+    initialize_journal_schema(&conn)?;
+    Ok(conn)
+}
+
+fn configure_journal_connection(conn: &Connection) -> Result<(), JournalError> {
+    conn.busy_timeout(Duration::from_millis(0))?;
+    conn.execute_batch(
+        "PRAGMA journal_mode=DELETE;
+         PRAGMA synchronous=FULL;
+         PRAGMA foreign_keys=ON;
+         PRAGMA user_version=1;",
+    )?;
+    Ok(())
+}
+
+fn initialize_journal_schema(conn: &Connection) -> Result<(), JournalError> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS journal_entries(
+             run_id TEXT NOT NULL,
+             session_id TEXT NOT NULL,
+             seq INTEGER NOT NULL,
+             schema_version TEXT NOT NULL,
+             timestamp_ms TEXT NOT NULL,
+             event_json TEXT NOT NULL,
+             PRIMARY KEY(run_id, session_id, seq)
+         );
+         CREATE INDEX IF NOT EXISTS journal_entries_seq_idx
+             ON journal_entries(seq);",
+    )?;
+    Ok(())
+}
+
+fn lock_journal_writer(path: &Path) -> Result<File, JournalError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let lock_path = journal_lock_path(path);
+    let file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(TryLockError::WouldBlock) => Err(JournalError::Locked {
+            path: path.to_path_buf(),
+        }),
+        Err(TryLockError::Error(source)) => Err(JournalError::Io(source)),
+    }
+}
+
+fn journal_lock_path(path: &Path) -> PathBuf {
+    let mut raw = path.as_os_str().to_os_string();
+    raw.push(".lock");
+    PathBuf::from(raw)
+}
+
+fn insert_journal_entry(conn: &mut Connection, entry: &JournalEntry) -> Result<(), JournalError> {
+    let seq = i64::try_from(entry.seq).map_err(|_| JournalError::InvalidField {
+        field: "seq",
+        value: entry.seq.to_string(),
+    })?;
+    let event_json = serde_json::to_string(&entry.event)?;
+    let tx = conn.transaction()?;
+    tx.execute(
+        "INSERT INTO journal_entries(
+             run_id, session_id, seq, schema_version, timestamp_ms, event_json
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            entry.run_id.0.as_str(),
+            entry.session_id.0.as_str(),
+            seq,
+            entry.schema_version.as_str(),
+            entry.timestamp_ms.to_string(),
+            event_json,
+        ],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn read_journal_entries_from_connection(
+    conn: &Connection,
+) -> Result<Vec<JournalEntry>, JournalError> {
+    let mut stmt = conn.prepare(
+        "SELECT schema_version, run_id, session_id, seq, timestamp_ms, event_json
+         FROM journal_entries
+         ORDER BY seq ASC",
+    )?;
+    let rows = stmt.query_map([], journal_entry_from_row)?;
+    let mut entries = Vec::new();
+    for row in rows {
+        entries.push(row?);
+    }
+    Ok(entries)
+}
+
+fn journal_entry_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JournalEntry> {
+    let schema_version: String = row.get(0)?;
+    let run_id: String = row.get(1)?;
+    let session_id: String = row.get(2)?;
+    let seq: i64 = row.get(3)?;
+    let timestamp_ms: String = row.get(4)?;
+    let event_json: String = row.get(5)?;
+
+    let seq = u64::try_from(seq).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Integer, Box::new(err))
+    })?;
+    let timestamp_ms = timestamp_ms.parse::<u128>().map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(err))
+    })?;
+    let event = serde_json::from_str::<JournalEvent>(&event_json).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(err))
+    })?;
+
+    Ok(JournalEntry {
+        schema_version,
+        run_id: RunId(run_id),
+        session_id: SessionId(session_id),
+        seq,
+        timestamp_ms,
+        event,
+    })
 }
 
 /// Parse an append-only JSONL file into records.
@@ -677,6 +808,21 @@ mod tests {
     }
 
     #[test]
+    fn direct_read_of_missing_journal_is_not_silently_created() -> TestResult {
+        let path = unique_path("missing-read")?;
+        remove_if_exists(&path)?;
+
+        let err = read_journal_entries(&path).err();
+
+        assert!(
+            matches!(err, Some(JournalError::Io(source)) if source.kind() == std::io::ErrorKind::NotFound)
+        );
+        assert!(!path.exists());
+        assert!(!journal_lock_path(&path).exists());
+        Ok(())
+    }
+
+    #[test]
     fn step_outcome_conversion_preserves_grounding_failures() {
         let action = Action::Click {
             node: NodeId("missing".into()),
@@ -848,85 +994,66 @@ mod tests {
             },
         })?;
 
-        let serialized = fs::read_to_string(&path)?;
+        let serialized = fs::read(&path)?;
         let path_text = path.to_string_lossy();
-        assert!(!serialized.contains(path_text.as_ref()));
-        assert!(!serialized.contains("target/debug"));
+        assert!(!contains_bytes(&serialized, path_text.as_ref().as_bytes()));
+        assert!(!contains_bytes(&serialized, b"target/debug"));
 
         remove_if_exists(&path)?;
         Ok(())
     }
 
     #[test]
-    fn corrupt_journal_lines_are_reported_with_line_numbers() -> TestResult {
-        let path = unique_path("corrupt")?;
+    fn journal_file_is_real_sqlite_database_with_committed_rows() -> TestResult {
+        let path = unique_path("sqlite")?;
         remove_if_exists(&path)?;
         let mut journal = SessionJournal::open(
             &path,
-            RunId("corrupt-run".into()),
-            SessionId("corrupt-session".into()),
+            RunId("sqlite-run".into()),
+            SessionId("sqlite-session".into()),
         )?;
+        journal.append(JournalEvent::SessionStarted {
+            url: "https://sqlite.test".into(),
+        })?;
         journal.append(JournalEvent::SessionClosed)?;
-        let mut file = OpenOptions::new().append(true).open(&path)?;
-        file.write_all(b"not-json\n")?;
+        drop(journal);
 
-        let err = read_journal_entries(&path).err();
-        assert!(matches!(err, Some(JournalError::Corrupt { line: 2, .. })));
+        let conn = Connection::open(&path)?;
+        let row_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM journal_entries", [], |row| row.get(0))?;
+        let closed: String = conn.query_row(
+            "SELECT event_json FROM journal_entries WHERE seq = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(row_count, 2);
+        assert_eq!(closed, r#"{"kind":"session_closed"}"#);
 
         remove_if_exists(&path)?;
         Ok(())
     }
 
     #[test]
-    fn torn_final_line_still_loads_earlier_entries_and_resumes() -> TestResult {
-        let path = unique_path("torn-tail")?;
+    fn corrupt_sqlite_event_payload_is_reported_on_read() -> TestResult {
+        let path = unique_path("corrupt-sqlite")?;
         remove_if_exists(&path)?;
-        let run_id = RunId("run-torn".into());
-        let session_id = SessionId("session-torn".into());
+        let run_id = RunId("run-corrupt".into());
+        let session_id = SessionId("session-corrupt".into());
 
-        // Two fully-synced entries.
         {
             let mut journal = SessionJournal::open(&path, run_id.clone(), session_id.clone())?;
             journal.append(JournalEvent::SessionStarted {
                 url: "https://example.com".into(),
             })?;
-            journal.append(JournalEvent::ActionPlanned {
-                action: Action::Goto {
-                    url: "https://example.com".into(),
-                },
-            })?;
         }
 
-        // Simulate a crash mid-write of a third record: a partial JSON fragment with
-        // no trailing newline is left after the last committed entry.
-        {
-            let mut file = OpenOptions::new().append(true).open(&path)?;
-            file.write_all(br#"{"schema_version":"0.1","seq":2,"even"#)?;
-            file.flush()?;
-        }
-
-        // A read still recovers the earlier valid entries (the torn tail is dropped).
-        let entries = read_journal_entries(&path)?;
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].seq, 0);
-        assert_eq!(entries[1].seq, 1);
-
-        // Resume reports a consistent recovery snapshot.
-        let resumed = SessionJournal::resume(&path, run_id.clone(), session_id.clone())?;
-        assert_eq!(resumed.entries.len(), 2);
-        assert_eq!(resumed.next_seq, 2);
-
-        // Reopening repairs the file so appends continue from the right sequence and
-        // the journal stays parseable afterwards.
-        let mut journal = SessionJournal::open(&path, run_id.clone(), session_id.clone())?;
-        let appended = journal.append(JournalEvent::SessionClosed)?;
-        assert_eq!(appended.seq, 2);
-        drop(journal);
-
-        let final_state = SessionJournal::resume(&path, run_id, session_id)?;
-        assert_eq!(final_state.entries.len(), 3);
-        assert_eq!(final_state.next_seq, 3);
-        assert_eq!(final_state.entries[2].seq, 2);
+        let conn = Connection::open(&path)?;
+        conn.execute(
+            "UPDATE journal_entries SET event_json = '{' WHERE seq = 0",
+            [],
+        )?;
+        let err = read_journal_entries(&path).err();
+        assert!(matches!(err, Some(JournalError::Sqlite(_))));
 
         remove_if_exists(&path)?;
         Ok(())
@@ -1014,11 +1141,23 @@ mod tests {
     }
 
     fn remove_if_exists(path: &Path) -> Result<(), std::io::Error> {
+        remove_one_if_exists(path)?;
+        remove_one_if_exists(&journal_lock_path(path))
+    }
+
+    fn remove_one_if_exists(path: &Path) -> Result<(), std::io::Error> {
         match fs::remove_file(path) {
             Ok(()) => Ok(()),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(err) => Err(err),
         }
+    }
+
+    fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+        !needle.is_empty()
+            && haystack
+                .windows(needle.len())
+                .any(|window| window == needle)
     }
 
     fn crash_matrix_events() -> Vec<JournalEvent> {
@@ -1060,11 +1199,7 @@ mod tests {
     }
 
     fn write_entry(path: &Path, entry: JournalEntry) -> Result<(), JournalError> {
-        let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-        serde_json::to_writer(&mut file, &entry)?;
-        file.write_all(b"\n")?;
-        file.flush()?;
-        file.sync_data()?;
-        Ok(())
+        let mut conn = open_journal_connection(path, JournalOpenMode::ReadWriteCreate)?;
+        insert_journal_entry(&mut conn, &entry)
     }
 }
