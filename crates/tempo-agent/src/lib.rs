@@ -3325,7 +3325,14 @@ mod tests {
             r#"<!doctype html>
             <html>
               <body>
-                <button id="submit" onclick="document.body.setAttribute('data-clicked','yes'); this.textContent='Done';">Submit</button>
+                <input id="name" aria-label="Name">
+                <select id="plan" aria-label="Plan">
+                  <option value="free">Free</option>
+                  <option value="pro">Pro</option>
+                </select>
+                <button id="add" onclick="document.body.dataset.count = String(Number(document.body.dataset.count || '0') + 1);">Add</button>
+                <button id="finish" onclick="document.body.dataset.finished='yes'; document.getElementById('summary').textContent = document.getElementById('name').value + ':' + document.getElementById('plan').value + ':' + (document.body.dataset.count || '0');">Finish</button>
+                <div id="summary" tabindex="0"></div>
               </body>
             </html>"#,
         )?;
@@ -3335,9 +3342,25 @@ mod tests {
         let journal_path = root.join("session.jsonl");
         let task = DriverTask::new(
             url,
-            vec![Action::Click {
-                node: NodeId(r#"[id="submit"]"#.into()),
-            }],
+            vec![
+                Action::Type {
+                    node: NodeId(r#"[id="name"]"#.into()),
+                    text: "Ada".into(),
+                },
+                Action::Select {
+                    node: NodeId(r#"[id="plan"]"#.into()),
+                    value: "pro".into(),
+                },
+                Action::Click {
+                    node: NodeId(r#"[id="add"]"#.into()),
+                },
+                Action::Click {
+                    node: NodeId(r#"[id="finish"]"#.into()),
+                },
+                Action::Extract {
+                    node: NodeId(r#"[id="summary"]"#.into()),
+                },
+            ],
         );
         let mut driver = CdpTempoDriver::launch_with(CdpConfig::default().with_executable(chrome))
             .await?
@@ -3348,14 +3371,46 @@ mod tests {
         );
 
         let report = runner.run_driver_task(&mut driver, &task).await?;
+        let final_state = driver
+            .evaluate_script(
+                r#"(() => ({
+                    name: document.querySelector('#name').value,
+                    plan: document.querySelector('#plan').value,
+                    count: Number(document.body.dataset.count || '0'),
+                    finished: document.body.dataset.finished,
+                    summary: document.querySelector('#summary').textContent.trim()
+                }))()"#,
+                true,
+            )
+            .await?;
         driver.close().await?;
 
         assert_eq!(report.engine, Engine::Cdp);
         assert_eq!(report.status, AgentRunStatus::Completed);
-        assert_eq!(report.actions_completed, 1);
-        assert!(read_journal_entries(&journal_path)?
+        assert_eq!(report.actions_completed, 5);
+        assert_eq!(report.steps.len(), 5);
+        assert_eq!(final_state["name"], serde_json::json!("Ada"));
+        assert_eq!(final_state["plan"], serde_json::json!("pro"));
+        assert_eq!(final_state["count"], serde_json::json!(1));
+        assert_eq!(final_state["finished"], serde_json::json!("yes"));
+        assert_eq!(final_state["summary"], serde_json::json!("Ada:pro:1"));
+
+        let entries = read_journal_entries(&journal_path)?;
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| matches!(entry.event, JournalEvent::StepApplied { .. }))
+                .count(),
+            5
+        );
+        let plan = task.task_plan()?;
+        let replayed = step_triples_from_journal(&journal_path, &plan)?;
+        let reported = report
+            .steps
             .iter()
-            .any(|entry| matches!(entry.event, JournalEvent::StepApplied { .. })));
+            .map(|step| step.triple.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(replayed, reported);
 
         remove_dir_if_exists(&root)?;
         Ok(())
