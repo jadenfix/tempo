@@ -310,8 +310,32 @@ impl CassetteStore {
     pub fn record(&self, cassette: &ResponseCassette) -> Result<(), JournalError> {
         let mut file = OpenOptions::new()
             .create(true)
+            .read(true)
             .append(true)
             .open(&self.path)?;
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => {
+                return Err(JournalError::Locked {
+                    path: self.path.clone(),
+                });
+            }
+            Err(TryLockError::Error(source)) => return Err(JournalError::Io(source)),
+        }
+
+        truncate_torn_tail(&self.path, &file)?;
+
+        for existing in read_cassettes(&self.path)? {
+            if existing.key == cassette.key {
+                if existing == *cassette {
+                    return Ok(());
+                }
+                return Err(JournalError::CassetteConflict {
+                    key: cassette.key.clone(),
+                });
+            }
+        }
+
         serde_json::to_writer(&mut file, cassette)?;
         file.write_all(b"\n")?;
         file.flush()?;
@@ -366,6 +390,8 @@ pub enum JournalError {
         expected: u64,
         actual: u64,
     },
+    #[error("cassette key conflict for {key:?}")]
+    CassetteConflict { key: CassetteKey },
     #[error("system clock is before unix epoch")]
     ClockBeforeEpoch,
 }
@@ -710,6 +736,96 @@ mod tests {
 
         remove_if_exists(&path_a)?;
         remove_if_exists(&path_b)?;
+        Ok(())
+    }
+
+    #[test]
+    fn cassette_record_is_idempotent_for_identical_key_and_payload() -> TestResult {
+        let path = unique_path("cassette-idempotent")?;
+        remove_if_exists(&path)?;
+        let cassette = ResponseCassette::new(
+            "GET",
+            "https://example.com/api",
+            200,
+            vec![("content-type".into(), "application/json".into())],
+            br#"{"ok":true}"#.to_vec(),
+        );
+
+        let store = CassetteStore::open(&path)?;
+        store.record(&cassette)?;
+        store.record(&cassette)?;
+
+        let cassettes = store.all()?;
+        assert_eq!(cassettes, vec![cassette]);
+
+        remove_if_exists(&path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn cassette_record_rejects_conflicting_duplicate_keys() -> TestResult {
+        let path = unique_path("cassette-conflict")?;
+        remove_if_exists(&path)?;
+        let first = ResponseCassette::new(
+            "GET",
+            "https://example.com/api",
+            200,
+            vec![("content-type".into(), "application/json".into())],
+            br#"{"ok":true}"#.to_vec(),
+        );
+        let mut conflicting = first.clone();
+        conflicting.status = 500;
+        conflicting.body = br#"{"ok":false}"#.to_vec();
+
+        let store = CassetteStore::open(&path)?;
+        store.record(&first)?;
+        let result = store.record(&conflicting);
+
+        assert!(matches!(
+            result,
+            Err(JournalError::CassetteConflict { key }) if key == first.key
+        ));
+        assert_eq!(store.all()?, vec![first]);
+
+        remove_if_exists(&path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn cassette_record_repairs_torn_tail_before_append() -> TestResult {
+        let path = unique_path("cassette-torn-tail")?;
+        remove_if_exists(&path)?;
+        let first = ResponseCassette::new(
+            "GET",
+            "https://example.com/api",
+            200,
+            Vec::new(),
+            b"ok".to_vec(),
+        );
+        let second = ResponseCassette::new(
+            "POST",
+            "https://example.com/form",
+            201,
+            Vec::new(),
+            b"created".to_vec(),
+        );
+
+        let store = CassetteStore::open(&path)?;
+        store.record(&first)?;
+        {
+            let mut file = OpenOptions::new().append(true).open(&path)?;
+            file.write_all(br#"{"key":{"#)?;
+            file.flush()?;
+        }
+
+        assert_eq!(store.all()?, vec![first.clone()]);
+        store.record(&second)?;
+        assert_eq!(store.all()?, vec![first, second]);
+
+        let bytes = fs::read(&path)?;
+        assert_eq!(bytes.last(), Some(&b'\n'));
+
+        remove_if_exists(&path)?;
         Ok(())
     }
 
