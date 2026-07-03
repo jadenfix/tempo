@@ -516,6 +516,22 @@ impl SessionPool {
         context
     }
 
+    fn start_bidi_session(&mut self) {
+        self.close_forked_contexts();
+        self.bidi_contexts.clear();
+        self.next_bidi_context_id = 1;
+        if let Some(driver) = &self.driver {
+            self.bidi_contexts
+                .insert(default_context_id(), driver.clone());
+        }
+    }
+
+    fn end_bidi_session(&mut self) {
+        self.close_forked_contexts();
+        self.bidi_contexts.clear();
+        self.next_bidi_context_id = 1;
+    }
+
     pub fn record_step(
         &mut self,
         id: &TempodSessionId,
@@ -1184,6 +1200,14 @@ fn route_bidi_websocket(pool: &mut SessionPool, body: Vec<u8>) -> Vec<BidiMessag
 fn route_bidi_dispatch(pool: &mut SessionPool, body: Vec<u8>) -> BidiDispatchResult {
     match pool.bidi.route_json(&body) {
         Ok(RoutedCommand::Immediate(message)) => BidiDispatchResult::new(200, message),
+        Ok(RoutedCommand::SessionStarted(message)) => {
+            pool.start_bidi_session();
+            BidiDispatchResult::new(200, message)
+        }
+        Ok(RoutedCommand::SessionEnded(message)) => {
+            pool.end_bidi_session();
+            BidiDispatchResult::new(200, message)
+        }
         Ok(RoutedCommand::Driver { id, command }) => {
             if pool.draining {
                 return BidiDispatchResult::new(
@@ -3755,6 +3779,97 @@ mod tests {
         assert!(!pool
             .bidi_contexts
             .contains_key(&BrowsingContextId(created_context)));
+
+        drop(pool);
+        join_driver_handler(server)?;
+        Ok(())
+    }
+
+    #[test]
+    fn bidi_session_end_closes_forked_contexts_and_rejects_driver_work() -> TestResult {
+        let closes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let engine_closes = Arc::clone(&closes);
+        let (client_stream, server_stream) = UnixStream::pair()?;
+        let server = thread::spawn(move || -> Result<(), EngineHostError> {
+            let mut connection = EngineIpcConnection::from_stream(server_stream);
+            let mut driver = CloseCountingDriver::new(engine_closes);
+            futures::executor::block_on(serve_driver_connection(&mut connection, &mut driver))
+        });
+        let mut pool = SessionPool::default();
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+
+        let created = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/bidi".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: br#"{"id":1,"method":"browsingContext.create","params":{"type":"tab"}}"#
+                    .to_vec(),
+            },
+        )?;
+        let created: Value = serde_json::from_slice(&created.body)?;
+        assert_eq!(created["type"], "success");
+        assert_eq!(pool.bidi_contexts.len(), 2);
+
+        let ended = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/bidi".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: br#"{"id":2,"method":"session.end","params":{}}"#.to_vec(),
+            },
+        )?;
+        let ended: Value = serde_json::from_slice(&ended.body)?;
+        assert_eq!(ended["type"], "success");
+        assert!(pool.bidi_contexts.is_empty());
+        assert_eq!(
+            closes.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "session.end must close the forked engine context"
+        );
+
+        let rejected = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/bidi".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: br#"{"id":3,"method":"browsingContext.navigate","params":{"context":"tempo-root","url":"https://after-end.test","inputTainted":false}}"#.to_vec(),
+            },
+        )?;
+        let rejected: Value = serde_json::from_slice(&rejected.body)?;
+        assert_eq!(rejected["type"], "error");
+        assert_eq!(rejected["id"], 3);
+        assert_eq!(rejected["message"], "BiDi session has ended");
+        assert_eq!(
+            closes.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "rejected post-end command must not reach engine IPC"
+        );
+
+        let restarted = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/bidi".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: br#"{"id":4,"method":"session.new","params":{}}"#.to_vec(),
+            },
+        )?;
+        let restarted: Value = serde_json::from_slice(&restarted.body)?;
+        assert_eq!(restarted["type"], "success");
+        assert_eq!(pool.bidi_contexts.len(), 1);
+        assert!(pool.bidi_contexts.contains_key(&default_context_id()));
 
         drop(pool);
         join_driver_handler(server)?;
