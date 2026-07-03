@@ -320,7 +320,44 @@ pub const fn requires_idempotency(effect: SideEffect) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use tempo_schema::{NodeId, Provenance};
+
+    fn side_effect_strategy() -> impl Strategy<Value = SideEffect> {
+        prop_oneof![
+            Just(SideEffect::Read),
+            Just(SideEffect::Draft),
+            Just(SideEffect::Write),
+            Just(SideEffect::Send),
+            Just(SideEffect::Purchase),
+            Just(SideEffect::Delete),
+        ]
+    }
+
+    fn provenance_strategy() -> impl Strategy<Value = Provenance> {
+        prop_oneof![
+            Just(Provenance::System),
+            Just(Provenance::User),
+            Just(Provenance::Page),
+        ]
+    }
+
+    fn origin_rule_mode_strategy() -> impl Strategy<Value = OriginRuleMode> {
+        prop_oneof![
+            Just(OriginRuleMode::Default),
+            Just(OriginRuleMode::RequireConfirmation),
+            Just(OriginRuleMode::RequireTaintReview),
+            Just(OriginRuleMode::Block),
+        ]
+    }
+
+    fn stable_test_origin() -> Origin {
+        Origin {
+            scheme: "https".into(),
+            host: "bank.example".into(),
+            port: Some(443),
+        }
+    }
 
     #[test]
     fn confirmation_defaults_match_side_effect_table() {
@@ -643,5 +680,149 @@ mod tests {
         );
         assert_eq!(first_decision.matched_rules, 2);
         Ok(())
+    }
+
+    proptest! {
+        #[test]
+        fn taint_escalation_is_exact_for_every_side_effect(effect in side_effect_strategy()) {
+            let clean = decide_effect(effect, InputTaint::CLEAN);
+            let tainted = decide_effect(effect, InputTaint::TAINTED);
+
+            prop_assert_eq!(tainted.side_effect, clean.side_effect);
+            prop_assert_eq!(tainted.input_taint, InputTaint::TAINTED);
+            prop_assert_eq!(tainted.idempotency_required, clean.idempotency_required);
+            prop_assert_eq!(tainted.gate, clean.gate.escalate_for_taint());
+            prop_assert!(tainted.gate > clean.gate);
+        }
+
+        #[test]
+        fn dangerous_effects_are_confirm_by_default_and_taint_review_when_tainted(
+            effect in side_effect_strategy(),
+        ) {
+            let clean = decide_effect(effect, InputTaint::CLEAN);
+            let tainted = decide_effect(effect, InputTaint::TAINTED);
+            let dangerous = matches!(
+                effect,
+                SideEffect::Send | SideEffect::Purchase | SideEffect::Delete
+            );
+
+            prop_assert_eq!(requires_confirmation_by_default(effect), dangerous);
+            prop_assert_eq!(clean.requires_confirmation(), dangerous);
+            prop_assert_eq!(clean.gate, default_confirmation_gate(effect));
+
+            if dangerous {
+                prop_assert_eq!(clean.gate, ConfirmationGate::Confirm);
+                prop_assert_eq!(tainted.gate, ConfirmationGate::ConfirmWithTaintReview);
+                prop_assert!(tainted.requires_taint_review());
+            } else {
+                prop_assert_eq!(clean.gate, ConfirmationGate::None);
+                prop_assert_eq!(tainted.gate, ConfirmationGate::Confirm);
+                prop_assert!(!tainted.requires_taint_review());
+            }
+        }
+
+        #[test]
+        fn span_taint_collapses_to_any_page_provenance(
+            provenances in prop::collection::vec(provenance_strategy(), 0..64),
+        ) {
+            let spans = provenances
+                .iter()
+                .enumerate()
+                .map(|(index, provenance)| TaintSpan {
+                    provenance: *provenance,
+                    text: format!("span-{index}"),
+                })
+                .collect::<Vec<_>>();
+            let expected = provenances
+                .iter()
+                .any(|provenance| matches!(provenance, Provenance::Page));
+
+            prop_assert_eq!(InputTaint::from_spans(&spans).is_tainted(), expected);
+        }
+
+        #[test]
+        fn origin_policy_decisions_are_deterministic_for_any_rule_set(
+            effect in side_effect_strategy(),
+            tainted in any::<bool>(),
+            rules in prop::collection::vec(
+                (side_effect_strategy(), origin_rule_mode_strategy()),
+                0..32,
+            ),
+        ) {
+            let origin = stable_test_origin();
+            let rules = rules
+                .into_iter()
+                .map(|(applies_from, mode)| OriginRule::new(origin.clone(), applies_from, mode))
+                .collect::<Vec<_>>();
+            let policy = OriginPolicy::new(rules);
+            let input_taint = InputTaint::new(tainted);
+
+            let first = policy.decide_effect(Some(&origin), effect, input_taint);
+            let second = policy.decide_effect(Some(&origin), effect, input_taint);
+
+            prop_assert_eq!(first, second);
+        }
+
+        #[test]
+        fn strongest_origin_rule_is_order_independent(
+            effect in side_effect_strategy(),
+            tainted in any::<bool>(),
+            rules in prop::collection::vec(
+                (side_effect_strategy(), origin_rule_mode_strategy()),
+                0..32,
+            ),
+        ) {
+            let origin = stable_test_origin();
+            let forward_rules = rules
+                .iter()
+                .copied()
+                .map(|(applies_from, mode)| OriginRule::new(origin.clone(), applies_from, mode))
+                .collect::<Vec<_>>();
+            let reverse_rules = rules
+                .iter()
+                .rev()
+                .copied()
+                .map(|(applies_from, mode)| OriginRule::new(origin.clone(), applies_from, mode))
+                .collect::<Vec<_>>();
+            let forward = OriginPolicy::new(forward_rules);
+            let reverse = OriginPolicy::new(reverse_rules);
+            let input_taint = InputTaint::new(tainted);
+
+            let forward_decision = forward.decide_effect(Some(&origin), effect, input_taint);
+            let reverse_decision = reverse.decide_effect(Some(&origin), effect, input_taint);
+
+            prop_assert_eq!(forward_decision, reverse_decision);
+        }
+
+        #[test]
+        fn origin_rules_and_taint_escalation_compose_exactly_once(
+            effect in side_effect_strategy(),
+            rules in prop::collection::vec(
+                (side_effect_strategy(), origin_rule_mode_strategy()),
+                0..32,
+            ),
+        ) {
+            let origin = stable_test_origin();
+            let policy = OriginPolicy::new(
+                rules
+                    .into_iter()
+                    .map(|(applies_from, mode)| {
+                        OriginRule::new(origin.clone(), applies_from, mode)
+                    })
+                    .collect(),
+            );
+
+            let clean = policy.decide_effect(Some(&origin), effect, InputTaint::CLEAN);
+            let tainted = policy.decide_effect(Some(&origin), effect, InputTaint::TAINTED);
+
+            prop_assert_eq!(&tainted.origin, &clean.origin);
+            prop_assert_eq!(tainted.matched_rules, clean.matched_rules);
+            prop_assert_eq!(tainted.rule_mode, clean.rule_mode);
+            prop_assert_eq!(tainted.blocked(), clean.blocked());
+            prop_assert_eq!(
+                tainted.decision.gate,
+                clean.decision.gate.escalate_for_taint()
+            );
+        }
     }
 }
