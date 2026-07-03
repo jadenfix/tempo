@@ -123,6 +123,7 @@ pub struct NavigateCommand {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BidiRouter {
     ready: bool,
+    draining: bool,
     next_session: u64,
     next_subscription: u64,
     subscriptions: BTreeMap<SessionSubscription, BidiSubscription>,
@@ -132,6 +133,7 @@ impl BidiRouter {
     pub fn new() -> Self {
         Self {
             ready: true,
+            draining: false,
             next_session: 1,
             next_subscription: 1,
             subscriptions: BTreeMap::new(),
@@ -247,6 +249,7 @@ impl BidiRouter {
     }
 
     pub fn begin_drain(&mut self) {
+        self.draining = true;
         self.ready = false;
     }
 
@@ -279,7 +282,7 @@ impl BidiRouter {
         id: CommandId,
         params: Value,
     ) -> Result<RoutedCommand, BidiProtocolError> {
-        if !self.ready {
+        if self.draining {
             return Ok(RoutedCommand::Immediate(BidiMessage::error(
                 Some(id),
                 BidiErrorCode::SessionNotCreated,
@@ -970,6 +973,33 @@ mod tests {
                 id: Some(2),
                 error: "session not created".into(),
                 message: "tempo BiDi endpoint is draining; new sessions are not accepted".into(),
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn session_new_after_normal_session_end_is_not_reported_as_drain() -> TestResult {
+        let mut router = BidiRouter::new();
+
+        let ended = router.route_json(br#"{"id":1,"method":"session.end","params":{}}"#)?;
+        let new_session = router.route_json(br#"{"id":2,"method":"session.new","params":{}}"#)?;
+
+        assert_eq!(
+            ended,
+            RoutedCommand::Immediate(BidiMessage::Success {
+                id: 1,
+                result: json!({}),
+            })
+        );
+        assert_eq!(
+            new_session,
+            RoutedCommand::Immediate(BidiMessage::Success {
+                id: 2,
+                result: json!({
+                    "sessionId": "tempo-bidi-1",
+                    "capabilities": {},
+                }),
             })
         );
         Ok(())
