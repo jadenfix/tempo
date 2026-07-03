@@ -66,7 +66,7 @@ async fn cdp_driver_serves_commands_over_engine_host_uds() -> Result<(), Box<dyn
     match child_observed {
         DriverResponse::Observation { observation } => {
             assert_eq!(observation.url, "about:blank");
-            assert_eq!(observation.seq, 0);
+            assert_eq!(observation.seq, 1);
         }
         other => return Err(format!("unexpected child driver response: {other:?}").into()),
     }
