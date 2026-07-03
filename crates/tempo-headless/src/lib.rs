@@ -378,6 +378,9 @@ impl SessionPool {
     }
 
     pub fn adopt(&mut self, id: &TempodSessionId) -> Result<TempodSession, TempodError> {
+        if self.draining {
+            return Err(TempodError::Draining);
+        }
         let session = {
             let session = self
                 .sessions
@@ -1953,6 +1956,10 @@ mod tests {
             pool.create("https://late.test"),
             Err(TempodError::Draining)
         ));
+        assert!(matches!(
+            pool.adopt(&running.id),
+            Err(TempodError::Draining)
+        ));
         assert_eq!(pool.list()[0].id, running.id);
         assert_eq!(pool.list()[0].state, TempodSessionState::Killed);
 
@@ -1984,6 +1991,34 @@ mod tests {
         let new_session: Value = serde_json::from_slice(&new_session.body)?;
         assert_eq!(new_session["type"], "error");
         assert_eq!(new_session["error"], "session not created");
+        Ok(())
+    }
+
+    #[test]
+    fn http_adopt_session_returns_503_while_draining() -> TestResult {
+        let mut pool = SessionPool::default();
+        let session = pool.create("https://before-drain.test")?;
+        pool.drain();
+
+        let response = handle_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: format!("/sessions/{}/adopt", session.id.0),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: Vec::new(),
+            },
+        );
+
+        assert_eq!(response.status, 503);
+        let value: Value = serde_json::from_slice(&response.body)?;
+        assert_eq!(
+            value["error"],
+            "tempod is draining; new sessions are not accepted"
+        );
+        assert_eq!(pool.list()[0].state, TempodSessionState::Killed);
         Ok(())
     }
 
