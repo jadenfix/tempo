@@ -9,6 +9,7 @@ license.workspace = true
 beatbox-client = { git = "https://github.com/jadenfix/beatbox.git", rev = "b2e7b18e95563bc95aea58583e40f23a455df19f" }
 serde_json.workspace = true
 thiserror.workspace = true
+tempo-driver = { path = "../tempo-driver" }
 tempo-schema = { path = "../tempo-schema" }
 
 [dev-dependencies]
