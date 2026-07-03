@@ -673,10 +673,38 @@ impl SessionPool {
     /// Best-effort close of every forked BiDi context driver so engine-side
     /// resources are released instead of leaking when contexts/sessions end.
     fn close_forked_contexts(&mut self) {
-        for driver in self.bidi_contexts.values_mut() {
-            if driver.driver_id.is_some() {
-                let _ = futures::executor::block_on(driver.close());
-            }
+        let forked_contexts = self
+            .bidi_contexts
+            .values()
+            .filter_map(|driver| {
+                driver
+                    .driver_id
+                    .as_ref()
+                    .map(|driver_id| (driver_id.clone(), driver.clone()))
+            })
+            .collect::<Vec<_>>();
+        if forked_contexts.is_empty() {
+            return;
+        }
+
+        let Some(errors) = run_teardown_bounded(
+            "forked BiDi context Close commands",
+            ENGINE_TEARDOWN_TIMEOUT,
+            move || {
+                let mut errors = Vec::new();
+                for (driver_id, mut driver) in forked_contexts {
+                    if let Err(error) = futures::executor::block_on(driver.close()) {
+                        errors.push(format!("{driver_id}: {error}"));
+                    }
+                }
+                errors
+            },
+        ) else {
+            return;
+        };
+
+        for error in errors {
+            eprintln!("tempod: error closing forked BiDi context at teardown: {error}");
         }
     }
 
@@ -4670,6 +4698,69 @@ mod tests {
 
         drop(pool);
         join_driver_handler(server)?;
+        Ok(())
+    }
+
+    #[test]
+    fn bidi_session_end_does_not_hang_on_wedged_forked_context() -> TestResult {
+        let (client_stream, server_stream) = UnixStream::pair()?;
+        let wedged_engine = thread::spawn(move || {
+            let _held = server_stream;
+            thread::park_timeout(Duration::from_secs(60));
+        });
+
+        let mut pool = SessionPool::default();
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+        let started = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/bidi".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: br#"{"id":1,"method":"session.new","params":{}}"#.to_vec(),
+            },
+        )?;
+        let started: Value = serde_json::from_slice(&started.body)?;
+        assert_eq!(started["type"], "success");
+
+        let driver = pool.driver.as_ref().ok_or("attached root driver missing")?;
+        pool.bidi_contexts.insert(
+            BrowsingContextId("wedged-bidi-session-fork".into()),
+            AttachedEngineDriver {
+                engine: Engine::Cdp,
+                client: Arc::clone(&driver.client),
+                driver_id: Some("fork-1".into()),
+            },
+        );
+
+        let started = std::time::Instant::now();
+        let ended = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/bidi".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: br#"{"id":2,"method":"session.end","params":{}}"#.to_vec(),
+            },
+        )?;
+        let elapsed = started.elapsed();
+
+        let ended: Value = serde_json::from_slice(&ended.body)?;
+        assert_eq!(ended["type"], "success");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "session.end hung on a wedged forked context before bounded teardown returned: took {elapsed:?}"
+        );
+        assert!(pool.bidi_contexts.is_empty());
+
+        wedged_engine.thread().unpark();
+        wedged_engine
+            .join()
+            .map_err(|_| "wedged engine thread failed")?;
         Ok(())
     }
 
