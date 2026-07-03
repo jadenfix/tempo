@@ -58,16 +58,42 @@ impl ToolExecClient {
         Self { client }
     }
 
-    pub async fn execute(&self, request: &ExecuteRequest) -> Result<ToolExecution, ToolExecError> {
+    /// Execute a caller-built request whose policy has already been selected by
+    /// trusted Tempo code.
+    pub async fn execute_trusted_request(
+        &self,
+        request: &ExecuteRequest,
+    ) -> Result<ToolExecution, ToolExecError> {
         let result = self.client.execute(request).await?;
         Ok(ToolExecution::from_result(result))
     }
 
-    pub async fn create_job(
+    /// Execute page-derived input through the tainted transform builder before
+    /// dispatching to beatbox.
+    pub async fn execute_tainted_transform(
+        &self,
+        transform: TaintedTransform,
+    ) -> Result<ToolExecution, ToolExecError> {
+        let request = transform.try_into_request()?;
+        self.execute_trusted_request(&request).await
+    }
+
+    /// Create an async beatbox job from a trusted caller-built request.
+    pub async fn create_trusted_job(
         &self,
         request: &ExecuteRequest,
     ) -> Result<CreateJobResponse, ToolExecError> {
         Ok(self.client.create_job(request).await?)
+    }
+
+    /// Create an async beatbox job for page-derived input through the locked
+    /// tainted transform policy.
+    pub async fn create_tainted_transform_job(
+        &self,
+        transform: TaintedTransform,
+    ) -> Result<CreateJobResponse, ToolExecError> {
+        let request = transform.try_into_request()?;
+        self.create_trusted_job(&request).await
     }
 
     pub async fn get_job(&self, job_id: &str) -> Result<JobRecord, ToolExecError> {
@@ -547,7 +573,7 @@ mod tests {
 
         let executor = ToolExecClient::new(beatboxd.base_url());
         let execution = executor
-            .execute(&live_smoke_request("tempo-toolexec-live-execute"))
+            .execute_trusted_request(&live_smoke_request("tempo-toolexec-live-execute"))
             .await?;
         assert_eq!(execution.result.status, ExecutionStatus::Ok);
         assert_eq!(execution.step_status, ToolStepStatus::Applied);
@@ -560,7 +586,7 @@ mod tests {
 
         let executor = ToolExecClient::new(beatboxd.base_url());
         let request = live_smoke_request("tempo-toolexec-live-job");
-        let created = executor.create_job(&request).await?;
+        let created = executor.create_trusted_job(&request).await?;
 
         for _ in 0..50 {
             let record = executor.get_job(&created.job_id).await?;
@@ -620,10 +646,10 @@ mod tests {
                 epoch_ms: 789,
             },
         };
-        let request = transform.try_into_request()?;
+        let request = transform.clone().try_into_request()?;
 
         let executor = ToolExecClient::new(beatboxd.base_url());
-        let execution = executor.execute(&request).await?;
+        let execution = executor.execute_tainted_transform(transform).await?;
         assert_eq!(
             execution.step_status,
             ToolStepStatus::StepError {
@@ -642,6 +668,56 @@ mod tests {
         assert!(report.beatbox_egress_empty);
         assert_eq!(report.canary_hit_count, 0);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn tainted_transform_execution_rejects_untainted_input_before_dispatch() {
+        let executor = ToolExecClient::new("http://127.0.0.1:1");
+        let result = executor
+            .execute_tainted_transform(TaintedTransform {
+                lane: Lane::PythonWasi,
+                source: Source::Inline {
+                    code: "print(input())".into(),
+                },
+                input: ProvenancedInput::new(
+                    serde_json::json!({"user": "summarize this"}),
+                    vec![TaintSpan {
+                        provenance: Provenance::User,
+                        text: "summarize this".into(),
+                    }],
+                ),
+                session_scratch: None,
+                idempotency_key: "step-45".into(),
+                determinism: Determinism::Off,
+            })
+            .await;
+
+        assert!(matches!(result, Err(ToolExecError::UntaintedInput)));
+    }
+
+    #[tokio::test]
+    async fn tainted_transform_job_rejects_untainted_input_before_dispatch() {
+        let executor = ToolExecClient::new("http://127.0.0.1:1");
+        let result = executor
+            .create_tainted_transform_job(TaintedTransform {
+                lane: Lane::PythonWasi,
+                source: Source::Inline {
+                    code: "print(input())".into(),
+                },
+                input: ProvenancedInput::new(
+                    serde_json::json!({"user": "summarize this"}),
+                    vec![TaintSpan {
+                        provenance: Provenance::User,
+                        text: "summarize this".into(),
+                    }],
+                ),
+                session_scratch: None,
+                idempotency_key: "step-46".into(),
+                determinism: Determinism::Off,
+            })
+            .await;
+
+        assert!(matches!(result, Err(ToolExecError::UntaintedInput)));
     }
 
     #[test]
