@@ -58,6 +58,10 @@ jobs:
         run: >
           cargo run -p tempo-cli -- injection-gate
           --input fixtures/security/injection-pass.json
+      - name: taint fixture gate
+        run: >
+          cargo run -p tempo-cli -- taint-gate
+          --input fixtures/security/taint-redteam-pass.json
       # Always-green invariant (final.md §8.3): tempo-engine-servo must build against
       # pinned VANILLA servo. Enabled once the engine crate carries the servo dep.
       # - run: cargo check -p tempo-engine-servo --no-default-features --features servo-vanilla
