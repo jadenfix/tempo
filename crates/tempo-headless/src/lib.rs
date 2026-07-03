@@ -564,14 +564,12 @@ impl SessionPool {
         };
 
         let id = id.0.clone();
-        if let Some(result) = run_teardown_bounded(
+        if let Some(Err(error)) = run_teardown_bounded(
             "session engine context Close",
             ENGINE_TEARDOWN_TIMEOUT,
             move || futures::executor::block_on(driver.close()),
         ) {
-            if let Err(error) = result {
-                eprintln!("tempod: error closing engine driver for session {id}: {error}");
-            }
+            eprintln!("tempod: error closing engine driver for session {id}: {error}");
         }
     }
 
@@ -669,12 +667,12 @@ impl SessionPool {
             return;
         };
 
-        if let Some(result) = run_teardown_bounded("root engine driver Close", timeout, move || {
-            futures::executor::block_on(driver.close())
-        }) {
-            if let Err(error) = result {
-                eprintln!("tempod: error closing root engine driver at teardown: {error}");
-            }
+        if let Some(Err(error)) =
+            run_teardown_bounded("root engine driver Close", timeout, move || {
+                futures::executor::block_on(driver.close())
+            })
+        {
+            eprintln!("tempod: error closing root engine driver at teardown: {error}");
         }
     }
 
