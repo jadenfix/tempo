@@ -103,12 +103,22 @@ impl Origin {
     pub fn parse(url: &str) -> Result<Self, OriginError> {
         let parsed = url::Url::parse(url)?;
         let scheme = parsed.scheme().to_ascii_lowercase();
-        let host = parsed
+        let lowercased = parsed
             .host_str()
             .ok_or(OriginError::MissingHost)?
             .to_ascii_lowercase();
+        // Canonicalize the fully-qualified form `example.com.` to `example.com`
+        // so exact-equality matching cannot be bypassed with a trailing dot.
+        let host = lowercased.strip_suffix('.').unwrap_or(&lowercased);
+        if host.is_empty() {
+            return Err(OriginError::MissingHost);
+        }
         let port = parsed.port_or_known_default();
-        Ok(Self { scheme, host, port })
+        Ok(Self {
+            scheme,
+            host: host.to_owned(),
+            port,
+        })
     }
 
     pub fn matches_url(&self, url: &str) -> Result<bool, OriginError> {
@@ -484,6 +494,70 @@ mod tests {
             }
         );
         assert!(origin.matches_url("https://example.com:443/other")?);
+        Ok(())
+    }
+
+    #[test]
+    fn origin_parse_strips_trailing_dot_fqdn() -> Result<(), OriginError> {
+        // A trailing-dot FQDN canonicalizes to the same origin as its
+        // dotless form, including with mixed case.
+        let dotted = Origin::parse("https://a.")?;
+        let plain = Origin::parse("https://a")?;
+        assert_eq!(dotted, plain);
+        assert_eq!(dotted.host, "a");
+
+        assert_eq!(
+            Origin::parse("https://SHOP.EXAMPLE.")?,
+            Origin::parse("https://shop.example")?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn origin_parse_rejects_empty_or_dot_only_host() {
+        // A host that is empty after stripping the trailing dot must be rejected
+        // rather than canonicalizing to an empty string that could match loosely.
+        assert!(matches!(
+            Origin::parse("https://./path"),
+            Err(OriginError::MissingHost) | Err(OriginError::Url(_))
+        ));
+    }
+
+    #[test]
+    fn block_rule_matches_trailing_dot_navigation() -> Result<(), OriginError> {
+        // Regression for #169: a Block rule for `https://shop.example` must gate
+        // a navigation to the same DNS server addressed as `https://shop.example.`.
+        let rule_origin = Origin::parse("https://shop.example")?;
+        let policy = OriginPolicy::new(vec![OriginRule::new(
+            rule_origin,
+            SideEffect::Purchase,
+            OriginRuleMode::Block,
+        )]);
+
+        for url in [
+            "https://shop.example./checkout",
+            "https://SHOP.EXAMPLE./checkout",
+        ] {
+            let request_origin = Origin::parse(url)?;
+            let decision = policy.decide_effect(
+                Some(&request_origin),
+                SideEffect::Purchase,
+                InputTaint::CLEAN,
+            );
+            assert!(
+                decision.blocked(),
+                "trailing-dot origin must be blocked: {url}"
+            );
+            assert_eq!(decision.matched_rules, 1, "{url}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn matches_url_treats_trailing_dot_host_as_equal() -> Result<(), OriginError> {
+        let origin = Origin::parse("https://shop.example")?;
+        assert!(origin.matches_url("https://shop.example./checkout")?);
+        assert!(origin.matches_url("https://SHOP.EXAMPLE.")?);
         Ok(())
     }
 
