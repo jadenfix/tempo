@@ -18,7 +18,7 @@ use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tempo_agent::StepTriple;
 use tempo_bidi::{
     browsing_context_load, network_before_request_sent, network_response_completed, BidiErrorCode,
@@ -48,16 +48,18 @@ const SOCKET_TIMEOUT: Duration = Duration::from_secs(30);
 /// Timeout applied to engine-host IPC round-trips so a stalled engine cannot
 /// wedge the daemon indefinitely.
 const ENGINE_IPC_TIMEOUT: Duration = Duration::from_secs(30);
-/// Upper bound on how long teardown (`drain` / `detach_engine_driver`) waits for
-/// the root-driver `Close` IPC round-trip. `close_root_driver` runs while the
-/// caller holds the global pool `Mutex`, so a wedged engine child that never
-/// answers `Close` would otherwise hold that lock for the full
-/// `ENGINE_IPC_TIMEOUT` (or forever, if the connection carries no read timeout),
-/// hanging *every* request — including `GET /health` — and turning a graceful
-/// `POST /drain` into a full-daemon hang (#200). On timeout the close is
-/// abandoned on its own thread (the driver, and thus its connection, is dropped
-/// there), so the lock is released promptly.
-const ROOT_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Production upper bound for engine-resource teardown (`drain` /
+/// `detach_engine_driver`). Teardown runs while the caller holds the global pool
+/// `Mutex`, so a wedged engine child that never answers `Close` would otherwise
+/// hold that lock for the full `ENGINE_IPC_TIMEOUT` (or forever, if the
+/// connection carries no read timeout), hanging *every* request -- including
+/// `GET /health` -- and turning a graceful `POST /drain` into a full-daemon hang
+/// (#200). On timeout, cleanup continues on detached threads so the lock is
+/// released promptly.
+#[cfg(not(test))]
+const ENGINE_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const ENGINE_TEARDOWN_TIMEOUT: Duration = Duration::from_millis(200);
 const WS_ACCEPT_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const WS_OPCODE_TEXT: u8 = 0x1;
 const WS_OPCODE_BINARY: u8 = 0x2;
@@ -480,10 +482,11 @@ impl SessionPool {
     /// Idempotent and double-close-safe: it takes/clears the collections it
     /// closes, so a later call finds them empty.
     fn close_engine_resources(&mut self, close_root: bool) {
-        self.close_forked_contexts();
-        self.close_mcp_forks();
+        let deadline = Instant::now() + ENGINE_TEARDOWN_TIMEOUT;
+        self.close_forked_contexts_bounded(teardown_remaining(deadline));
+        self.close_mcp_forks_bounded(teardown_remaining(deadline));
         if close_root {
-            self.close_root_driver();
+            self.close_root_driver_bounded(teardown_remaining(deadline));
         } else {
             self.driver = None;
         }
@@ -501,15 +504,45 @@ impl SessionPool {
         }
     }
 
-    /// Best-effort close of the root attached engine driver. Forked handles must
-    /// be closed before this because the engine-host connection exits after the
-    /// root `Close` command.
-    fn close_root_driver(&mut self) {
-        self.close_root_driver_bounded(ROOT_CLOSE_TIMEOUT);
+    /// Best-effort close of forked BiDi contexts, bounded by the remaining
+    /// teardown budget so a wedged fork cannot block public drain/detach.
+    fn close_forked_contexts_bounded(&mut self, timeout: Duration) {
+        let forked_contexts = self
+            .bidi_contexts
+            .values()
+            .filter_map(|driver| {
+                driver
+                    .driver_id
+                    .as_ref()
+                    .map(|driver_id| (driver_id.clone(), driver.clone()))
+            })
+            .collect::<Vec<_>>();
+        if forked_contexts.is_empty() {
+            return;
+        }
+
+        let Some(errors) =
+            run_teardown_bounded("forked BiDi context Close commands", timeout, move || {
+                let mut errors = Vec::new();
+                for (driver_id, mut driver) in forked_contexts {
+                    if let Err(error) = futures::executor::block_on(driver.close()) {
+                        errors.push(format!("{driver_id}: {error}"));
+                    }
+                }
+                errors
+            })
+        else {
+            return;
+        };
+
+        for error in errors {
+            eprintln!("tempod: error closing forked BiDi context at teardown: {error}");
+        }
     }
 
     /// Close the root driver, bounding the blocking `Close` IPC round-trip to
-    /// `timeout` so a wedged/unresponsive engine cannot hang the daemon (#200).
+    /// the remaining teardown `timeout` so a wedged/unresponsive engine cannot
+    /// hang the daemon (#200).
     ///
     /// The close runs on a dedicated thread and the result is awaited with a
     /// timeout: in the normal case (responsive engine) the `Close` completes and
@@ -523,27 +556,12 @@ impl SessionPool {
         let Some(mut driver) = self.driver.take() else {
             return;
         };
-        let (tx, rx) = std::sync::mpsc::channel();
-        // Detached on purpose: on timeout we must not join (that would reintroduce
-        // the unbounded block); the thread finishes on its own and drops `driver`.
-        thread::spawn(move || {
-            let _ = tx.send(futures::executor::block_on(driver.close()));
-        });
-        match rx.recv_timeout(timeout) {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
+
+        if let Some(result) = run_teardown_bounded("root engine driver Close", timeout, move || {
+            futures::executor::block_on(driver.close())
+        }) {
+            if let Err(error) = result {
                 eprintln!("tempod: error closing root engine driver at teardown: {error}");
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                eprintln!(
-                    "tempod: root engine driver Close did not complete within {timeout:?} at \
-                     teardown; abandoning it so the pool lock is released (#200)"
-                );
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                eprintln!(
-                    "tempod: root engine driver Close thread ended without a result at teardown"
-                );
             }
         }
     }
@@ -552,21 +570,34 @@ impl SessionPool {
     /// server before it is dropped at session teardown, so remote engine
     /// contexts (up to `MAX_LIVE_FORKS`) do not leak for the process lifetime.
     ///
-    /// `close_all_forks` is async and talks to the engine over IPC, so a `Drop`
-    /// impl cannot do this. The whole MCP stack is driven synchronously via
-    /// `futures::executor::block_on` (mirroring `route_mcp`), so we do the same
-    /// here. Teardown must not fail on cleanup, so lock and close errors are
-    /// logged and swallowed. Leaves `self.mcp` as `None`.
-    fn close_mcp_forks(&mut self) {
+    /// Best-effort close of MCP forks, bounded by the remaining teardown budget
+    /// so a wedged fork cannot block public drain/detach.
+    fn close_mcp_forks_bounded(&mut self, timeout: Duration) {
         let Some(server) = self.mcp.take() else {
             return;
         };
-        let Ok(mut server) = server.lock() else {
-            eprintln!("tempod: MCP server lock poisoned during fork teardown; skipping fork close");
+
+        let Some(result) = run_teardown_bounded("MCP fork Close commands", timeout, move || {
+            let Ok(mut server) = server.lock() else {
+                return Err(
+                    "MCP server lock poisoned during fork teardown; skipping fork close"
+                        .to_string(),
+                );
+            };
+            Ok(futures::executor::block_on(server.close_all_forks()))
+        }) else {
             return;
         };
-        for error in futures::executor::block_on(server.close_all_forks()) {
-            eprintln!("tempod: error closing MCP fork at teardown: {error}");
+
+        match result {
+            Ok(errors) => {
+                for error in errors {
+                    eprintln!("tempod: error closing MCP fork at teardown: {error}");
+                }
+            }
+            Err(error) => {
+                eprintln!("tempod: {error}");
+            }
         }
     }
 
@@ -675,6 +706,39 @@ impl Drop for SessionPool {
             eprintln!(
                 "tempod: panic while closing engine resources during SessionPool drop; ignoring"
             );
+        }
+    }
+}
+
+fn teardown_remaining(deadline: Instant) -> Duration {
+    deadline.saturating_duration_since(Instant::now())
+}
+
+fn run_teardown_bounded<T, F>(label: &'static str, timeout: Duration, cleanup: F) -> Option<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::channel();
+    // Detached on purpose: on timeout we must not join (that would reintroduce
+    // the unbounded block); the thread finishes on its own and drops owned
+    // cleanup resources once the engine responds or disconnects.
+    thread::spawn(move || {
+        let _ = tx.send(cleanup());
+    });
+
+    match rx.recv_timeout(timeout) {
+        Ok(result) => Some(result),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            eprintln!(
+                "tempod: {label} did not complete within {timeout:?} at teardown; \
+                 abandoning it so the pool lock is released (#200)"
+            );
+            None
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            eprintln!("tempod: {label} thread ended without a result at teardown");
+            None
         }
     }
 }
@@ -3631,6 +3695,100 @@ mod tests {
         // Release the wedged server end so its (and the abandoned close) thread
         // observe EOF and exit instead of parking for the full timeout.
         wedged_engine.thread().unpark();
+        Ok(())
+    }
+
+    #[test]
+    fn drain_does_not_hang_on_wedged_bidi_fork() -> TestResult {
+        // Public #200 regression guard: `drain()` must not hang before reaching
+        // the bounded root close when a forked BiDi context wedges on `Close`.
+        let (client_stream, server_stream) = UnixStream::pair()?;
+        let wedged_engine = thread::spawn(move || {
+            let _held = server_stream;
+            thread::park_timeout(Duration::from_secs(60));
+        });
+
+        let mut pool = SessionPool::default();
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+        let driver = pool.driver.as_ref().ok_or("attached root driver missing")?;
+        pool.bidi_contexts.insert(
+            BrowsingContextId("wedged-bidi-fork".into()),
+            AttachedEngineDriver {
+                engine: Engine::Cdp,
+                client: Arc::clone(&driver.client),
+                driver_id: Some("fork-1".into()),
+            },
+        );
+
+        let started = std::time::Instant::now();
+        pool.drain();
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "drain hung on a wedged BiDi fork before bounded teardown returned: took {elapsed:?}"
+        );
+        assert!(pool.draining());
+        assert!(pool.driver.is_none());
+        assert!(pool.mcp.is_none());
+        assert!(pool.bidi_contexts.is_empty());
+
+        wedged_engine.thread().unpark();
+        wedged_engine
+            .join()
+            .map_err(|_| "wedged engine thread failed")?;
+        Ok(())
+    }
+
+    #[test]
+    fn drain_does_not_hang_on_wedged_mcp_fork() -> TestResult {
+        // Public #200 regression guard: `drain()` must bound MCP fork cleanup,
+        // not only the root-driver close.
+        let (client_stream, server_stream) = UnixStream::pair()?;
+        let wedged_engine = thread::spawn(move || -> Result<(), EngineHostError> {
+            let mut connection = EngineIpcConnection::from_stream(server_stream);
+            let fork_request = connection.read_driver_request()?;
+            assert!(fork_request.driver_id.is_none());
+            assert!(matches!(fork_request.command, HostDriverCommand::Fork));
+            connection.write_driver_response(
+                fork_request.id,
+                DriverResponse::Forked {
+                    driver_id: "fork-1".into(),
+                },
+            )?;
+
+            let close_request = connection.read_driver_request()?;
+            assert_eq!(close_request.driver_id.as_deref(), Some("fork-1"));
+            assert!(matches!(close_request.command, HostDriverCommand::Close));
+            thread::park_timeout(Duration::from_secs(60));
+            Ok(())
+        });
+
+        let mut pool = SessionPool::default();
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+
+        let fork_response = route_http_request(&mut pool, mcp_tool_request(1, "fork", json!({}))?)?;
+        let fork: Value = serde_json::from_slice(&fork_response.body)?;
+        assert!(
+            fork["result"]["structuredContent"]["driver_id"].is_string(),
+            "fork did not return a driver_id: {fork}"
+        );
+
+        let started = std::time::Instant::now();
+        pool.drain();
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "drain hung on a wedged MCP fork before bounded teardown returned: took {elapsed:?}"
+        );
+        assert!(pool.draining());
+        assert!(pool.driver.is_none());
+        assert!(pool.mcp.is_none());
+        assert!(pool.bidi_contexts.is_empty());
+
+        wedged_engine.thread().unpark();
+        join_driver_handler(wedged_engine)?;
         Ok(())
     }
 
