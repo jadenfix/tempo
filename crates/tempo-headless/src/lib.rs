@@ -319,6 +319,7 @@ enum DriverClientError {
 pub struct SessionPool {
     sessions: BTreeMap<TempodSessionId, TempodSession>,
     events: BTreeMap<TempodSessionId, Vec<TempodSessionEvent>>,
+    otlp_exporter: Option<OtlpJsonExporter>,
     bidi: BidiRouter,
     driver: Option<AttachedEngineDriver>,
     mcp: Option<Arc<Mutex<tempo_mcp::TempoMcpServer<AttachedEngineDriver>>>>,
@@ -334,6 +335,7 @@ impl fmt::Debug for SessionPool {
             .debug_struct("SessionPool")
             .field("sessions", &self.sessions)
             .field("event_sessions", &self.events.len())
+            .field("otlp_exporter", &self.otlp_exporter)
             .field("bidi", &self.bidi)
             .field("driver", &self.driver)
             .field("mcp_attached", &self.mcp.is_some())
@@ -344,6 +346,11 @@ impl fmt::Debug for SessionPool {
 }
 
 impl SessionPool {
+    pub fn with_otlp_exporter(mut self, exporter: OtlpJsonExporter) -> Self {
+        self.otlp_exporter = Some(exporter);
+        self
+    }
+
     pub fn create(&mut self, url: impl Into<String>) -> TempodSession {
         let id = TempodSessionId(format!("session-{}", self.next_id));
         self.next_id = self.next_id.saturating_add(1);
@@ -494,6 +501,9 @@ impl SessionPool {
     ) -> Result<TempodSessionEvent, TempodError> {
         if !self.sessions.contains_key(id) {
             return Err(TempodError::SessionNotFound(id.clone()));
+        }
+        if let Some(exporter) = &self.otlp_exporter {
+            exporter.export_step(&triple)?;
         }
         Ok(self.record_event(id, TempodSessionEventKind::StepTriple { triple }))
     }
@@ -1841,6 +1851,31 @@ mod tests {
         let after_adopt = pool.events(&session.id, Some(1))?;
         assert_eq!(after_adopt.len(), 2);
         assert_eq!(after_adopt[0].seq, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn session_pool_exports_recorded_steps_to_otlp_jsonl() -> TestResult {
+        let root = unique_dir("pool-otlp")?;
+        remove_dir_if_exists(&root)?;
+        let path = root.join("steps.jsonl");
+        let mut pool = SessionPool::default().with_otlp_exporter(OtlpJsonExporter::new(&path));
+        let session = pool.create("https://events.test");
+        let step = sample_step_triple(11);
+
+        let step_event = pool.record_step(&session.id, step.clone())?;
+
+        let bytes = std::fs::read(&path)?;
+        let value: Value = serde_json::from_slice(bytes.strip_suffix(b"\n").unwrap_or(&bytes))?;
+        assert_eq!(value["resource"]["service.name"], "tempod");
+        assert_eq!(value["name"], "tempo.step");
+        assert_eq!(value["body"]["seq"], 11);
+        assert_eq!(
+            step_event.event,
+            TempodSessionEventKind::StepTriple { triple: step }
+        );
+
+        remove_dir_if_exists(&root)?;
         Ok(())
     }
 
