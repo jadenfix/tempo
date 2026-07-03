@@ -22,6 +22,24 @@ use tempo_session::{JournalError, ResumeState, RunId, SessionId, SessionJournal}
 use thiserror::Error;
 
 pub const MAX_FRAME_BYTES: u32 = 1024 * 1024;
+/// Aggregate cap on the raw byte length of a reassembled screenshot.
+///
+/// Every individual chunk frame is already bounded by [`MAX_FRAME_BYTES`] (1 MiB),
+/// but the reassembled total is otherwise unbounded: a compromised or malicious
+/// engine child (the untrusted component this crate isolates) could stream endless
+/// `final_chunk: false` chunks to exhaust tempod's memory. 64 MiB is a small
+/// multiple of [`MAX_FRAME_BYTES`] that comfortably fits any real full-page PNG
+/// screenshot (which are typically well under a few MiB) while bounding abuse.
+pub const MAX_SCREENSHOT_BYTES: usize = 64 * 1024 * 1024;
+/// Aggregate cap on the number of chunk frames in a single screenshot stream.
+///
+/// [`MAX_SCREENSHOT_BYTES`] already bounds the memory an attacker can force us to
+/// accumulate; this secondary cap bounds the number of frames we will read for one
+/// response so a child sending endless tiny `final_chunk: false` chunks cannot spin
+/// us indefinitely. A legitimate [`MAX_SCREENSHOT_BYTES`]-sized screenshot needs at
+/// most ~86 chunks at the effective per-chunk payload of ~765 KiB (see
+/// [`max_screenshot_chunk_bytes`]); 512 leaves generous headroom.
+pub const MAX_SCREENSHOT_CHUNKS: u64 = 512;
 pub const ENGINE_HOST_SOCKET_ENV: &str = "TEMPO_ENGINE_HOST_SOCKET";
 pub const ENGINE_HOST_TOKEN_ENV: &str = "TEMPO_ENGINE_HOST_TOKEN";
 pub const DRIVER_AUTH_METHOD: &str = "driver.auth";
@@ -832,6 +850,13 @@ fn read_chunked_screenshot_response(
                 reason: format!("expected chunk {expected_index}, got {chunk_index}"),
             });
         }
+        if bytes.len().saturating_add(chunk_bytes.len()) > MAX_SCREENSHOT_BYTES {
+            return Err(EngineHostError::InvalidScreenshotChunk {
+                reason: format!(
+                    "reassembled screenshot would exceed {MAX_SCREENSHOT_BYTES} byte cap"
+                ),
+            });
+        }
         bytes.extend_from_slice(&chunk_bytes);
         if final_chunk {
             return Ok(DriverResponse::Screenshot { bytes });
@@ -840,6 +865,13 @@ fn read_chunked_screenshot_response(
         expected_index = expected_index
             .checked_add(1)
             .ok_or(EngineHostError::ScreenshotChunkIndexExhausted)?;
+        if expected_index >= MAX_SCREENSHOT_CHUNKS {
+            return Err(EngineHostError::InvalidScreenshotChunk {
+                reason: format!(
+                    "screenshot chunk stream exceeds {MAX_SCREENSHOT_CHUNKS} chunk cap"
+                ),
+            });
+        }
         let frame = read_expected_frame(reader, DRIVER_RESPONSE_METHOD)?;
         if frame.id != request_id {
             return Err(EngineHostError::ResponseIdMismatch {
@@ -1361,6 +1393,68 @@ mod tests {
     }
 
     #[test]
+    fn screenshot_chunk_reassembly_accepts_normal_multi_chunk_under_cap() -> TestResult {
+        let request_id = 3;
+        let expected = patterned_bytes(20);
+        let first_payload = screenshot_chunk_payload(0, false, expected[0..8].to_vec())?;
+
+        let mut stream = Vec::new();
+        write_frame(
+            &mut stream,
+            &WireFrame::new(
+                request_id,
+                DRIVER_RESPONSE_METHOD,
+                screenshot_chunk_payload(1, false, expected[8..16].to_vec())?,
+            ),
+        )?;
+        write_frame(
+            &mut stream,
+            &WireFrame::new(
+                request_id,
+                DRIVER_RESPONSE_METHOD,
+                screenshot_chunk_payload(2, true, expected[16..].to_vec())?,
+            ),
+        )?;
+
+        let response =
+            read_chunked_screenshot_response(&mut Cursor::new(stream), request_id, first_payload)?;
+
+        assert_eq!(response, DriverResponse::Screenshot { bytes: expected });
+        Ok(())
+    }
+
+    #[test]
+    fn screenshot_chunk_reassembly_rejects_excessive_chunk_count() -> TestResult {
+        // A compromised child streams endless tiny `final_chunk: false` chunks. The
+        // first chunk (index 0) arrives as the initial payload; the reader supplies the
+        // continuation frames. Without a cap this would accumulate frames forever; the
+        // chunk cap must reject it while the accumulator is still tiny (bounded memory).
+        let request_id = 7;
+        let first_payload = screenshot_chunk_payload(0, false, vec![0_u8; 8])?;
+
+        let mut stream = Vec::new();
+        for chunk_index in 1..=MAX_SCREENSHOT_CHUNKS {
+            write_frame(
+                &mut stream,
+                &WireFrame::new(
+                    request_id,
+                    DRIVER_RESPONSE_METHOD,
+                    screenshot_chunk_payload(chunk_index, false, vec![0_u8; 8])?,
+                ),
+            )?;
+        }
+
+        let result =
+            read_chunked_screenshot_response(&mut Cursor::new(stream), request_id, first_payload);
+
+        assert!(
+            matches!(result, Err(EngineHostError::InvalidScreenshotChunk { .. })),
+            "expected InvalidScreenshotChunk, got {result:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn child_process_starts_and_reports_pid() -> TestResult {
         let mut host = EngineHost::spawn(shell_config("sleep 2"))?;
         let pid = host.pid();
@@ -1837,6 +1931,18 @@ mod tests {
 
     fn patterned_bytes(len: usize) -> Vec<u8> {
         (0..len).map(|index| (index % 251) as u8).collect()
+    }
+
+    fn screenshot_chunk_payload(
+        chunk_index: u64,
+        final_chunk: bool,
+        bytes: Vec<u8>,
+    ) -> Result<Value, serde_json::Error> {
+        serde_json::to_value(ScreenshotChunkPayload::ScreenshotChunk {
+            chunk_index,
+            final_chunk,
+            bytes,
+        })
     }
 
     fn create_private_dir(path: &Path) -> Result<(), std::io::Error> {
