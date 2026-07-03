@@ -21,10 +21,11 @@ use std::thread;
 use std::time::Duration;
 use tempo_agent::StepTriple;
 use tempo_bidi::{
-    browsing_context_load, BidiErrorCode, BidiEventMethod, BidiMessage, BidiRouter,
-    BrowsingContextId, BrowsingContextInfo, CaptureScreenshotResult, CreateContextResult,
-    DriverCommand as BidiDriverCommand, GetTreeResult, NavigateResult, RoutedCommand,
-    ScriptEvaluateResult,
+    browsing_context_load, network_before_request_sent, network_response_completed, BidiErrorCode,
+    BidiEventMethod, BidiMessage, BidiRouter, BrowsingContextId, BrowsingContextInfo,
+    CaptureScreenshotResult, CreateContextResult, DriverCommand as BidiDriverCommand,
+    GetTreeResult, NavigateResult, NetworkRequest as BidiNetworkRequest,
+    NetworkResponse as BidiNetworkResponse, RoutedCommand, ScriptEvaluateResult,
 };
 use tempo_driver::{DriverTrait, Engine, StepOutcome, TransportError, Unsupported};
 use tempo_engine_host::{
@@ -1270,7 +1271,7 @@ fn route_bidi_driver(
                                 url: url.clone(),
                             },
                         ),
-                        browsing_context_load_events(pool, &context, &url),
+                        browsing_context_navigation_events(pool, id, &context, &url),
                     )
                 }
                 Err(error) => BidiDispatchResult::new(
@@ -1523,6 +1524,58 @@ fn browsing_context_load_events(
     browsing_context_load(context.clone(), url)
         .map(|event| vec![event])
         .unwrap_or_default()
+}
+
+fn browsing_context_navigation_events(
+    pool: &SessionPool,
+    id: tempo_bidi::CommandId,
+    context: &BrowsingContextId,
+    url: &str,
+) -> Vec<BidiMessage> {
+    let mut events = network_navigation_events(pool, id, context, url);
+    events.extend(browsing_context_load_events(pool, context, url));
+    events
+}
+
+fn network_navigation_events(
+    pool: &SessionPool,
+    id: tempo_bidi::CommandId,
+    context: &BrowsingContextId,
+    url: &str,
+) -> Vec<BidiMessage> {
+    let request_id = format!("tempo-request-{id}");
+    let mut events = Vec::new();
+    if pool
+        .bidi
+        .event_subscribed(BidiEventMethod::NetworkBeforeRequestSent, Some(context))
+    {
+        let request = tempo_net::NetworkRequest::new(
+            request_id.clone(),
+            "GET",
+            url,
+            format!("tempo-bidi-profile-{}", context.0),
+            tempo_net::IdentityMode::AgentDeclared,
+        );
+        if let Ok(event) =
+            network_before_request_sent(BidiNetworkRequest::from_tempo_request(&request))
+        {
+            events.push(event);
+        }
+    }
+    if pool
+        .bidi
+        .event_subscribed(BidiEventMethod::NetworkResponseCompleted, Some(context))
+    {
+        // DriverTrait exposes navigation completion but not the underlying HTTP
+        // response status yet, so this is the top-level successful navigation.
+        let response = tempo_net::NetworkResponseRecord::new(request_id, url, 200);
+        if let Ok(event) =
+            network_response_completed(BidiNetworkResponse::from_tempo_response(&response))
+        {
+            events.push(event);
+        }
+    }
+    events
 }
 
 #[derive(Debug, Clone)]
@@ -2415,6 +2468,64 @@ mod tests {
 
         drop(pool);
         join_server(handle)?;
+        join_driver_handler(server)?;
+        Ok(())
+    }
+
+    #[test]
+    fn bidi_network_subscription_emits_navigation_network_events() -> TestResult {
+        let (client_stream, server_stream) = UnixStream::pair()?;
+        let server = thread::spawn(move || {
+            let mut connection = EngineIpcConnection::from_stream(server_stream);
+            let mut driver = TestDriver::new();
+            futures::executor::block_on(serve_driver_connection(&mut connection, &mut driver))
+        });
+        let mut pool = SessionPool::default();
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+
+        let subscribed = route_bidi_dispatch(
+            &mut pool,
+            br#"{"id":1,"method":"session.subscribe","params":{"events":["network"],"contexts":["tempo-root"]}}"#.to_vec(),
+        );
+        let subscribed_value: Value = serde_json::from_slice(&subscribed.response.body)?;
+        assert_eq!(subscribed_value["type"], "success");
+        assert!(subscribed.events.is_empty());
+
+        let navigated = route_bidi_dispatch(
+            &mut pool,
+            br#"{"id":2,"method":"browsingContext.navigate","params":{"context":"tempo-root","url":"https://network-event.test","inputTainted":false}}"#.to_vec(),
+        );
+        let navigated_value: Value = serde_json::from_slice(&navigated.response.body)?;
+        assert_eq!(navigated_value["type"], "success");
+        assert_eq!(
+            navigated_value["result"]["url"],
+            "https://network-event.test"
+        );
+
+        assert_eq!(navigated.events.len(), 2);
+        let before_request: Value = serde_json::to_value(&navigated.events[0])?;
+        assert_eq!(before_request["type"], "event");
+        assert_eq!(before_request["method"], "network.beforeRequestSent");
+        assert_eq!(before_request["params"]["request"], "tempo-request-2");
+        assert_eq!(
+            before_request["params"]["url"],
+            "https://network-event.test"
+        );
+        assert_eq!(before_request["params"]["method"], "GET");
+        assert_eq!(before_request["params"]["bodySize"], 0);
+
+        let response_completed: Value = serde_json::to_value(&navigated.events[1])?;
+        assert_eq!(response_completed["type"], "event");
+        assert_eq!(response_completed["method"], "network.responseCompleted");
+        assert_eq!(response_completed["params"]["request"], "tempo-request-2");
+        assert_eq!(
+            response_completed["params"]["url"],
+            "https://network-event.test"
+        );
+        assert_eq!(response_completed["params"]["status"], 200);
+        assert_eq!(response_completed["params"]["bodySize"], 0);
+
+        drop(pool);
         join_driver_handler(server)?;
         Ok(())
     }
