@@ -1178,6 +1178,7 @@ impl AgentRunner {
             .url_policy
             .enforce(endpoint.as_str())
             .map_err(|error| error.to_string())?;
+        let max_body_bytes = self.structured_fast_path.config.max_body_bytes;
         let client = reqwest::Client::builder()
             .timeout(self.structured_fast_path.config.timeout)
             .redirect(reqwest::redirect::Policy::none())
@@ -1194,8 +1195,15 @@ impl AgentRunner {
                 "clientInfo": {"name": "tempo-agent", "version": env!("CARGO_PKG_VERSION")},
             },
         });
-        let initialize =
-            post_mcp_json(&client, endpoint.as_str(), &initialize, None, false).await?;
+        let initialize = post_mcp_json(
+            &client,
+            endpoint.as_str(),
+            &initialize,
+            None,
+            false,
+            max_body_bytes,
+        )
+        .await?;
         if let Some(error) = initialize.body.get("error") {
             return Err(format!(
                 "MCP initialize failed: {}",
@@ -1215,6 +1223,7 @@ impl AgentRunner {
             &initialized,
             session_id.as_deref(),
             true,
+            max_body_bytes,
         )
         .await?;
         if let Some(error) = initialized.body.get("error") {
@@ -1242,6 +1251,7 @@ impl AgentRunner {
             &request,
             session_id.as_deref(),
             true,
+            max_body_bytes,
         )
         .await?;
         if let Some(error) = response.body.get("error") {
@@ -1704,6 +1714,7 @@ async fn post_mcp_json(
     request: &serde_json::Value,
     session_id: Option<&str>,
     include_protocol_version: bool,
+    max_body_bytes: usize,
 ) -> Result<McpHttpResponse, String> {
     let mut request_builder = client
         .post(endpoint)
@@ -1734,7 +1745,7 @@ async fn post_mcp_json(
         .and_then(|value| value.to_str().ok())
         .unwrap_or("")
         .to_string();
-    let body = response.text().await.map_err(|error| error.to_string())?;
+    let body = read_mcp_body_capped(response, max_body_bytes).await?;
     if !status.is_success() {
         let detail = body.trim();
         if detail.is_empty() {
@@ -1746,6 +1757,34 @@ async fn post_mcp_json(
         body: parse_mcp_response_body(&content_type, &body, request.get("id"))?,
         session_id,
     })
+}
+
+/// Reads an MCP HTTP response body into a `String` while enforcing a hard byte
+/// cap, so an attacker-controlled endpoint cannot exhaust memory by streaming an
+/// unbounded body (see issue #212). Mirrors the probe path's `take`-style bound
+/// in `tempo-handshake`, but for the async client: rejects early when the
+/// advertised `Content-Length` already exceeds the cap, then accumulates chunks
+/// and errors as soon as the received bytes would cross the cap.
+async fn read_mcp_body_capped(
+    response: reqwest::Response,
+    max_body_bytes: usize,
+) -> Result<String, String> {
+    let cap = max_body_bytes as u64;
+    if let Some(content_length) = response.content_length()
+        && content_length > cap
+    {
+        return Err(format!("MCP response body exceeded {max_body_bytes} bytes"));
+    }
+
+    let mut response = response;
+    let mut body: Vec<u8> = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|error| error.to_string())? {
+        if body.len() as u64 + chunk.len() as u64 > cap {
+            return Err(format!("MCP response body exceeded {max_body_bytes} bytes"));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(String::from_utf8_lossy(&body).into_owned())
 }
 
 fn parse_mcp_response_body(
@@ -3936,6 +3975,111 @@ mod tests {
             }
         });
         Ok((origin, handle))
+    }
+
+    /// Serves a single `POST /mcp` request with the supplied JSON body, then
+    /// exits. Used to exercise `post_mcp_json`'s response-body size cap (#212).
+    fn serve_single_mcp_response(body: String) -> std::io::Result<(String, FixtureHandle)> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
+        let origin = format!("http://{}", listener.local_addr()?);
+        let handle = thread::spawn(move || -> std::io::Result<()> {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while std::time::Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _peer)) => {
+                        stream.set_read_timeout(Some(std::time::Duration::from_secs(1)))?;
+                        let _request = read_http_request(&mut stream)?;
+                        let response =
+                            http_fixture_response("200 OK", "application/json", body.clone());
+                        stream.write_all(response.to_http().as_bytes())?;
+                        stream.flush()?;
+                        return Ok(());
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "single MCP fixture did not receive a request",
+            ))
+        });
+        Ok((origin, handle))
+    }
+
+    #[tokio::test]
+    async fn post_mcp_json_rejects_body_over_cap() -> TestResult {
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "cap-test",
+            "method": "tools/call",
+        });
+        // Otherwise-valid JSON-RPC response whose body dwarfs the cap.
+        let oversized = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "cap-test",
+            "result": {"content": [{"type": "text", "text": "x".repeat(256 * 1024)}]},
+        })
+        .to_string();
+        assert!(oversized.len() > 64 * 1024);
+
+        let (origin, server) = serve_single_mcp_response(oversized)?;
+        let endpoint = format!("{origin}/mcp");
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|error| error.to_string())?;
+
+        let result = post_mcp_json(&client, &endpoint, &request, None, false, 64 * 1024).await;
+        server
+            .join()
+            .map_err(|_| "single MCP fixture thread panicked")??;
+
+        let Err(error) = result else {
+            return Err("oversized MCP response body must be rejected".into());
+        };
+        assert!(
+            error.contains("exceeded"),
+            "unexpected error message: {error}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn post_mcp_json_accepts_body_under_cap() -> TestResult {
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "cap-test",
+            "method": "tools/call",
+        });
+        let small = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "cap-test",
+            "result": {"content": [{"type": "text", "text": "ok"}]},
+        })
+        .to_string();
+        assert!(small.len() <= 64 * 1024);
+
+        let (origin, server) = serve_single_mcp_response(small)?;
+        let endpoint = format!("{origin}/mcp");
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|error| error.to_string())?;
+
+        let response = post_mcp_json(&client, &endpoint, &request, None, false, 64 * 1024).await?;
+        server
+            .join()
+            .map_err(|_| "single MCP fixture thread panicked")??;
+
+        assert_eq!(
+            response.body.get("id").and_then(|id| id.as_str()),
+            Some("cap-test")
+        );
+        Ok(())
     }
 
     struct HttpFixtureResponse {
