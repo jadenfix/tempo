@@ -409,6 +409,9 @@ pub struct SignatureParameters {
     pub label: String,
     pub key_id: String,
     pub created: u64,
+    pub expires: Option<u64>,
+    pub nonce: Option<String>,
+    pub tag: Option<String>,
     pub components: Vec<CoveredComponent>,
 }
 
@@ -419,6 +422,9 @@ impl SignatureParameters {
             label: "sig1".into(),
             key_id: key_id.into(),
             created,
+            expires: None,
+            nonce: None,
+            tag: None,
             components: vec![
                 CoveredComponent::Method,
                 CoveredComponent::Authority,
@@ -435,12 +441,22 @@ impl SignatureParameters {
             .map(|component| format!("\"{}\"", component.identifier()))
             .collect::<Vec<_>>()
             .join(" ");
-        format!(
+        let mut input = format!(
             "{}=({covered});created={};keyid=\"{}\";alg=\"ed25519\"",
             self.label,
             self.created,
             escape_sf_string(&self.key_id)
-        )
+        );
+        if let Some(expires) = self.expires {
+            input.push_str(&format!(";expires={expires}"));
+        }
+        if let Some(nonce) = &self.nonce {
+            input.push_str(&format!(";nonce=\"{}\"", escape_sf_string(nonce)));
+        }
+        if let Some(tag) = &self.tag {
+            input.push_str(&format!(";tag=\"{}\"", escape_sf_string(tag)));
+        }
+        input
     }
 
     fn signature_params_value(&self) -> String {
@@ -462,6 +478,7 @@ struct ParsedSignatureInput {
 /// Headers produced by signing an HTTP request.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SignatureHeaders {
+    pub signature_agent: Option<String>,
     pub signature_input: String,
     pub signature: String,
 }
@@ -472,6 +489,15 @@ impl SignatureHeaders {
             ("Signature-Input", self.signature_input.as_str()),
             ("Signature", self.signature.as_str()),
         ]
+    }
+
+    pub fn header_pairs(&self) -> Vec<(&'static str, &str)> {
+        let mut headers = Vec::with_capacity(if self.signature_agent.is_some() { 3 } else { 2 });
+        if let Some(signature_agent) = &self.signature_agent {
+            headers.push(("Signature-Agent", signature_agent.as_str()));
+        }
+        headers.extend(self.as_header_pairs());
+        headers
     }
 }
 
@@ -987,6 +1013,41 @@ impl NetworkRequest {
         let params = SignatureParameters::web_bot_auth(key.key_id(), created);
         sign_request(self, &params, key)
     }
+
+    pub fn sign_web_bot_auth_with_agent(
+        &self,
+        key: &WebBotAuthSigningKey,
+        created: u64,
+        expires: u64,
+        nonce: impl Into<String>,
+        signature_agent: impl AsRef<str>,
+    ) -> Result<SignatureHeaders, SignatureError> {
+        let signature_agent = signature_agent.as_ref();
+        if !signature_agent.starts_with("https://") {
+            return Err(SignatureError::InvalidSignatureInput(
+                "Signature-Agent must be an https URI".into(),
+            ));
+        }
+        let signature_agent_header = format!("\"{}\"", escape_sf_string(signature_agent));
+        let signed_request = self
+            .clone()
+            .with_header("Signature-Agent", signature_agent_header.clone());
+        let params = SignatureParameters {
+            label: "sig1".into(),
+            key_id: key.key_id().to_string(),
+            created,
+            expires: Some(expires),
+            nonce: Some(nonce.into()),
+            tag: Some("web-bot-auth".into()),
+            components: vec![
+                CoveredComponent::Authority,
+                CoveredComponent::Header("signature-agent".into()),
+            ],
+        };
+        let mut headers = sign_request(&signed_request, &params, key)?;
+        headers.signature_agent = Some(signature_agent_header);
+        Ok(headers)
+    }
 }
 
 /// Sign a request with Ed25519 and return RFC 9421 `Signature-Input` and `Signature` headers.
@@ -1004,6 +1065,7 @@ pub fn sign_request(
     let base = signature_base(request, params)?;
     let signature = key.signing_key.sign(base.as_bytes());
     Ok(SignatureHeaders {
+        signature_agent: None,
         signature_input: params.signature_input_value(),
         signature: format!("{}=:{}:", params.label, BASE64.encode(signature.to_bytes())),
     })
@@ -1040,7 +1102,7 @@ pub fn verify_web_bot_auth_signature_at(
     now: u64,
 ) -> Result<(), SignatureError> {
     let parsed = parse_signature_input(signature_input)?;
-    validate_web_bot_auth_components(&parsed.params)?;
+    validate_web_bot_auth_components(request, &parsed.params)?;
     verify_parsed_request_signature_at(request, signature, verifier, now, parsed)
 }
 
@@ -1602,6 +1664,9 @@ fn parse_signature_input(input: &str) -> Result<ParsedSignatureInput, SignatureE
     let mut created = None;
     let mut key_id = None;
     let mut alg = None;
+    let mut expires = None;
+    let mut nonce = None;
+    let mut tag = None;
     for param in rest[component_end + 1..]
         .split(';')
         .filter(|part| !part.is_empty())
@@ -1618,6 +1683,13 @@ fn parse_signature_input(input: &str) -> Result<ParsedSignatureInput, SignatureE
             }
             "keyid" => key_id = Some(unquote_sf_string(value)?),
             "alg" => alg = Some(unquote_sf_string(value)?),
+            "expires" => {
+                expires = Some(value.parse::<u64>().map_err(|_| {
+                    SignatureError::InvalidSignatureInput("bad expires parameter".into())
+                })?);
+            }
+            "nonce" => nonce = Some(unquote_sf_string(value)?),
+            "tag" => tag = Some(unquote_sf_string(value)?),
             _ => {}
         }
     }
@@ -1635,6 +1707,9 @@ fn parse_signature_input(input: &str) -> Result<ParsedSignatureInput, SignatureE
                 .ok_or_else(|| SignatureError::InvalidSignatureInput("missing keyid".into()))?,
             created: created
                 .ok_or_else(|| SignatureError::InvalidSignatureInput("missing created".into()))?,
+            expires,
+            nonce,
+            tag,
             components,
         },
         signature_params_value,
@@ -1652,13 +1727,57 @@ fn parse_signature_header(signature: &str, label: &str) -> Result<Vec<u8>, Signa
         .map_err(|err| SignatureError::InvalidSignature(err.to_string()))
 }
 
-fn validate_web_bot_auth_components(params: &SignatureParameters) -> Result<(), SignatureError> {
-    for required in [
-        CoveredComponent::Method,
-        CoveredComponent::Authority,
-        CoveredComponent::Scheme,
-        CoveredComponent::Path,
-    ] {
+fn validate_web_bot_auth_components(
+    request: &NetworkRequest,
+    params: &SignatureParameters,
+) -> Result<(), SignatureError> {
+    if params.tag.as_deref() != Some("web-bot-auth") {
+        return Err(SignatureError::InvalidSignatureInput(
+            "missing web-bot-auth tag".into(),
+        ));
+    }
+    if params.expires.is_none() {
+        return Err(SignatureError::InvalidSignatureInput(
+            "missing expires parameter".into(),
+        ));
+    }
+
+    let signature_agent = request.header_values("signature-agent");
+    let has_signature_agent = params
+        .components
+        .iter()
+        .any(|component| component == &CoveredComponent::Header("signature-agent".into()));
+    let required = if let Some(values) = signature_agent {
+        if values.len() != 1 {
+            return Err(SignatureError::InvalidSignatureInput(
+                "expected one Signature-Agent header".into(),
+            ));
+        }
+        let signature_agent_uri = unquote_sf_string(values[0].trim())?;
+        if !signature_agent_uri.starts_with("https://") {
+            return Err(SignatureError::InvalidSignatureInput(
+                "Signature-Agent must be an https URI".into(),
+            ));
+        }
+        if !has_signature_agent {
+            return Err(SignatureError::MissingRequiredComponent(
+                "signature-agent".into(),
+            ));
+        }
+        vec![
+            CoveredComponent::Authority,
+            CoveredComponent::Header("signature-agent".into()),
+        ]
+    } else {
+        vec![
+            CoveredComponent::Method,
+            CoveredComponent::Authority,
+            CoveredComponent::Scheme,
+            CoveredComponent::Path,
+        ]
+    };
+
+    for required in required {
         if !params
             .components
             .iter()
@@ -1679,6 +1798,16 @@ fn validate_signature_freshness(
 ) -> Result<(), SignatureError> {
     let max_age_secs = verifier.max_signature_age.as_secs();
     let allowed_skew_secs = verifier.allowed_clock_skew.as_secs();
+
+    if let Some(expires) = params.expires
+        && now > expires
+    {
+        return Err(SignatureError::SignatureExpired {
+            created: params.created,
+            now,
+            max_age_secs: expires.saturating_sub(params.created),
+        });
+    }
 
     if params.created > now {
         let skew = params.created - now;
@@ -2124,6 +2253,25 @@ mod tests {
             .decode(RFC9421_B26_PUBLIC_JWK_X)
             .map_err(|err| SignatureError::InvalidKey(err.to_string()))?;
         WebBotAuthVerifier::from_public_key("test-key-ed25519", &public_key)
+    }
+
+    fn web_bot_auth_signature_agent_params(
+        key_id: &str,
+        created: u64,
+        expires: u64,
+    ) -> SignatureParameters {
+        SignatureParameters {
+            label: "sig1".into(),
+            key_id: key_id.into(),
+            created,
+            expires: Some(expires),
+            nonce: None,
+            tag: Some("web-bot-auth".into()),
+            components: vec![
+                CoveredComponent::Authority,
+                CoveredComponent::Header("signature-agent".into()),
+            ],
+        }
     }
 
     #[test]
@@ -2911,6 +3059,153 @@ mod tests {
     }
 
     #[test]
+    fn web_bot_auth_signs_signature_agent_expires_nonce_and_tag() -> Result<(), SignatureError> {
+        let key = WebBotAuthSigningKey::from_seed("tempo-agent", &[7u8; 32])?;
+        let request = NetworkRequest::new(
+            "r1",
+            "GET",
+            "https://example.com/agent/path",
+            "profile-a",
+            IdentityMode::AgentDeclared,
+        );
+
+        let headers = request.sign_web_bot_auth_with_agent(
+            &key,
+            1_800_000_000,
+            1_800_000_300,
+            "test-nonce",
+            "https://signature-agent.test",
+        )?;
+
+        assert_eq!(
+            headers.signature_agent.as_deref(),
+            Some("\"https://signature-agent.test\"")
+        );
+        assert_eq!(
+            headers.signature_input,
+            "sig1=(\"@authority\" \"signature-agent\");created=1800000000;keyid=\"tempo-agent\";alg=\"ed25519\";expires=1800000300;nonce=\"test-nonce\";tag=\"web-bot-auth\""
+        );
+        assert_eq!(headers.header_pairs().len(), 3);
+
+        let signed_request = request.with_header(
+            "Signature-Agent",
+            headers.signature_agent.clone().unwrap_or_default(),
+        );
+        verify_web_bot_auth_signature_at(
+            &signed_request,
+            &headers.signature_input,
+            &headers.signature,
+            &key.verifier(),
+            1_800_000_000,
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn web_bot_auth_rejects_signature_agent_header_not_covered() -> Result<(), SignatureError> {
+        let key = WebBotAuthSigningKey::from_seed("tempo-agent", &[7u8; 32])?;
+        let request = NetworkRequest::new(
+            "r1",
+            "GET",
+            "https://example.com/agent/path",
+            "profile-a",
+            IdentityMode::AgentDeclared,
+        )
+        .with_header("Signature-Agent", "\"https://signature-agent.test\"");
+        let params = SignatureParameters {
+            label: "sig1".into(),
+            key_id: "tempo-agent".into(),
+            created: 1_800_000_000,
+            expires: Some(1_800_000_300),
+            nonce: None,
+            tag: Some("web-bot-auth".into()),
+            components: vec![
+                CoveredComponent::Method,
+                CoveredComponent::Authority,
+                CoveredComponent::Scheme,
+                CoveredComponent::Path,
+            ],
+        };
+        let headers = sign_request(&request, &params, &key)?;
+
+        let result = verify_web_bot_auth_signature_at(
+            &request,
+            &headers.signature_input,
+            &headers.signature,
+            &key.verifier(),
+            1_800_000_000,
+        );
+
+        assert!(matches!(
+            result,
+            Err(SignatureError::MissingRequiredComponent(component))
+                if component == "signature-agent"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn web_bot_auth_rejects_unquoted_signature_agent_header() -> Result<(), SignatureError> {
+        let key = WebBotAuthSigningKey::from_seed("tempo-agent", &[7u8; 32])?;
+        let request = NetworkRequest::new(
+            "r1",
+            "GET",
+            "https://example.com/agent/path",
+            "profile-a",
+            IdentityMode::AgentDeclared,
+        )
+        .with_header("Signature-Agent", "https://signature-agent.test");
+        let params =
+            web_bot_auth_signature_agent_params("tempo-agent", 1_800_000_000, 1_800_000_300);
+        let headers = sign_request(&request, &params, &key)?;
+
+        let result = verify_web_bot_auth_signature_at(
+            &request,
+            &headers.signature_input,
+            &headers.signature,
+            &key.verifier(),
+            1_800_000_000,
+        );
+
+        assert!(matches!(
+            result,
+            Err(SignatureError::InvalidSignatureInput(reason)) if reason == "expected quoted string"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn web_bot_auth_rejects_non_https_signature_agent_header() -> Result<(), SignatureError> {
+        let key = WebBotAuthSigningKey::from_seed("tempo-agent", &[7u8; 32])?;
+        let request = NetworkRequest::new(
+            "r1",
+            "GET",
+            "https://example.com/agent/path",
+            "profile-a",
+            IdentityMode::AgentDeclared,
+        )
+        .with_header("Signature-Agent", "\"http://signature-agent.test\"");
+        let params =
+            web_bot_auth_signature_agent_params("tempo-agent", 1_800_000_000, 1_800_000_300);
+        let headers = sign_request(&request, &params, &key)?;
+
+        let result = verify_web_bot_auth_signature_at(
+            &request,
+            &headers.signature_input,
+            &headers.signature,
+            &key.verifier(),
+            1_800_000_000,
+        );
+
+        assert!(matches!(
+            result,
+            Err(SignatureError::InvalidSignatureInput(reason))
+                if reason == "Signature-Agent must be an https URI"
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn web_bot_auth_verifies_fresh_headers_with_system_clock() -> Result<(), SignatureError> {
         let key = WebBotAuthSigningKey::from_seed("tempo-agent", &[7u8; 32])?;
         let request = NetworkRequest::new(
@@ -3084,6 +3379,9 @@ mod tests {
             label: "sig1".into(),
             key_id: "tempo-agent".into(),
             created: 1_800_000_000,
+            expires: Some(1_800_000_300),
+            nonce: None,
+            tag: Some("web-bot-auth".into()),
             components: vec![
                 CoveredComponent::Method,
                 CoveredComponent::Authority,
@@ -3121,6 +3419,9 @@ mod tests {
             label: "sig1".into(),
             key_id: "tempo-agent".into(),
             created: 1_800_000_000,
+            expires: None,
+            nonce: None,
+            tag: None,
             components: vec![CoveredComponent::Header("accept".into())],
         };
 
