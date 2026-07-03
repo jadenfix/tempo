@@ -718,7 +718,7 @@ fn grounding_json_schema() -> Value {
         "title": "Grounding",
         "type": "object",
         "additionalProperties": false,
-        "required": ["node", "selector_existed", "matched_element"],
+        "required": ["selector_existed", "matched_element"],
         "properties": {
             "node": {
                 "anyOf": [
@@ -737,7 +737,7 @@ fn action_outcome_json_schema() -> Value {
         "title": "ActionOutcome",
         "type": "object",
         "additionalProperties": false,
-        "required": ["status", "error", "grounding", "observation", "diff"],
+        "required": ["status", "grounding", "observation"],
         "properties": {
             "status": { "$ref": "#/$defs/StepStatus" },
             "error": {
@@ -763,7 +763,7 @@ fn step_triple_json_schema() -> Value {
         "title": "StepTriple",
         "type": "object",
         "additionalProperties": false,
-        "required": ["seq", "observation_before", "decision", "action", "outcome"],
+        "required": ["seq", "observation_before", "action", "outcome"],
         "properties": {
             "seq": { "type": "integer", "minimum": 0 },
             "observation_before": { "$ref": "#/$defs/CompiledObservation" },
@@ -1009,7 +1009,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_optionality_matches_serde_defaults() {
+    fn schema_optionality_matches_serde_defaults() -> Result<(), serde_json::Error> {
         // Fields carrying `#[serde(default)]` must not be schema-`required`.
         let element = interactive_element_json_schema();
         let element_required: Vec<&str> = element["required"]
@@ -1030,6 +1030,70 @@ mod tests {
             .filter_map(Value::as_str)
             .collect();
         assert!(!observation_required.contains(&"marks"));
+
+        let grounding = grounding_json_schema();
+        let grounding_required: Vec<&str> = grounding["required"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(grounding_required, ["selector_existed", "matched_element"]);
+        assert!(!grounding_required.contains(&"node"));
+
+        let outcome = action_outcome_json_schema();
+        let outcome_required: Vec<&str> = outcome["required"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(outcome_required, ["status", "grounding", "observation"]);
+        assert!(!outcome_required.contains(&"error"));
+        assert!(!outcome_required.contains(&"diff"));
+
+        let step_triple = step_triple_json_schema();
+        let step_triple_required: Vec<&str> = step_triple["required"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(
+            step_triple_required,
+            ["seq", "observation_before", "action", "outcome"]
+        );
+        assert!(!step_triple_required.contains(&"decision"));
+
+        let grounding: Grounding =
+            serde_json::from_value(json!({"selector_existed": true, "matched_element": false}))?;
+        assert!(grounding.node.is_none());
+
+        let observation = json!({
+            "schema_version": SCHEMA_VERSION,
+            "url": "https://example.test",
+            "seq": 1,
+            "elements": []
+        });
+        let outcome: ActionOutcome = serde_json::from_value(json!({
+            "status": "ok",
+            "grounding": {"selector_existed": true, "matched_element": true},
+            "observation": observation
+        }))?;
+        assert!(outcome.error.is_none());
+        assert!(outcome.diff.is_none());
+        assert!(outcome.grounding.node.is_none());
+
+        let step: StepTriple = serde_json::from_value(json!({
+            "seq": 1,
+            "observation_before": outcome.observation,
+            "action": {"kind": "wait", "millis": 1},
+            "outcome": outcome
+        }))?;
+        assert!(step.decision.is_none());
+        assert!(step.outcome.error.is_none());
+        assert!(step.outcome.diff.is_none());
+        Ok(())
     }
 
     #[test]
