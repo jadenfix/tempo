@@ -1042,7 +1042,8 @@ fn engine_name(engine: tempo_driver::Engine) -> String {
 
 fn observation_gate_violations(report: &ObservationCorpusReport) -> usize {
     [
-        report.budget_p50_passed(),
+        report.snapshot_evidence_passed(),
+        report.budget_gate_passed(),
         report.stable_id_gate_passed(),
         report.diff_gate_passed(),
     ]
@@ -1406,6 +1407,44 @@ mod tests {
     }
 
     #[test]
+    fn observe_gate_command_fails_without_cross_snapshot_evidence() -> TestResult {
+        let dir = unique_dir("observe-gate-fail")?;
+        let input = dir.join("corpus.json");
+        let output = dir.join("report.json");
+        write_json_file(
+            &input,
+            &vec![ObservationInput {
+                url: "https://empty.example".into(),
+                elements: Vec::new(),
+            }],
+        )?;
+        let mut stdout = Vec::new();
+
+        let result = run_with_writer(
+            [
+                "observe-gate".to_string(),
+                "--input".into(),
+                input_string(&input),
+                "--output".into(),
+                input_string(&output),
+            ],
+            &mut stdout,
+        );
+
+        assert!(stdout.is_empty());
+        assert!(matches!(
+            result,
+            Err(CliError::GateFailed { violations: 3 })
+        ));
+        let value: Value = serde_json::from_reader(File::open(&output)?)?;
+        assert_eq!(value["snapshots"], 1);
+        assert_eq!(value["stable_id_opportunities"], 0);
+        assert_eq!(value["diff_snapshots"], 0);
+        remove_dir(&dir)?;
+        Ok(())
+    }
+
+    #[test]
     fn observe_gate_violations_count_failed_gates() {
         let report = ObservationCorpusReport {
             snapshots: 1,
@@ -1422,7 +1461,7 @@ mod tests {
             diff_reconstructable_snapshots: 0,
         };
 
-        assert_eq!(observation_gate_violations(&report), 3);
+        assert_eq!(observation_gate_violations(&report), 4);
     }
 
     #[test]
