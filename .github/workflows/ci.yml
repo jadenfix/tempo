@@ -52,6 +52,10 @@ jobs:
           --input fixtures/evals/ci-budget-pass.jsonl
           --min-success-rate 1
           --max-fallback-rate 0
+      - name: observe fixture gate
+        run: >
+          cargo run -p tempo-cli -- observe-gate
+          --input fixtures/observe/corpus-pass.json
       - name: compat lane table gate
         run: >
           cargo run -p tempo-cli -- compat-lanes
