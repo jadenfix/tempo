@@ -27,7 +27,10 @@ use tempo_bidi::{
     GetTreeResult, NavigateResult, NetworkRequest as BidiNetworkRequest,
     NetworkResponse as BidiNetworkResponse, RoutedCommand, ScriptEvaluateResult,
 };
-use tempo_driver::{DriverTrait, Engine, StepOutcome, TransportError, Unsupported};
+use tempo_driver::{
+    BrowsingContextCreateOptions, BrowsingContextKind, DriverTrait, Engine, StepOutcome,
+    TransportError, Unsupported,
+};
 use tempo_engine_host::{
     DriverCommand as HostDriverCommand, DriverResponse, DriverWireError, EngineHost,
     EngineHostConfig, EngineHostError, EngineIpcClient,
@@ -219,6 +222,22 @@ impl AttachedEngineDriver {
             Ok(DriverResponse::Error { error }) => Err(driver_wire_unsupported(error)),
             Ok(_) => Err(Unsupported("unexpected engine IPC fork response")),
             Err(_) => Err(Unsupported("engine IPC fork failed")),
+        }
+    }
+
+    async fn create_browsing_context_attached(
+        &mut self,
+        options: BrowsingContextCreateOptions,
+    ) -> Result<Self, Unsupported> {
+        match self.request(HostDriverCommand::CreateBrowsingContext { options }) {
+            Ok(DriverResponse::BrowsingContextCreated { driver_id }) => Ok(Self {
+                engine: self.engine,
+                client: Arc::clone(&self.client),
+                driver_id: Some(driver_id),
+            }),
+            Ok(DriverResponse::Error { error }) => Err(driver_wire_unsupported(error)),
+            Ok(_) => Err(Unsupported("unexpected engine IPC create context response")),
+            Err(_) => Err(Unsupported("engine IPC create context failed")),
         }
     }
 }
@@ -1347,10 +1366,17 @@ fn route_bidi_driver(
             let Some(mut driver) = pool.bidi_driver_for(&reference) else {
                 return unknown_browsing_context_result(id);
             };
-            match futures::executor::block_on(driver.fork_attached()) {
-                Ok(forked) => {
+            let options = BrowsingContextCreateOptions {
+                kind: match command.context_type {
+                    tempo_bidi::ContextType::Tab => BrowsingContextKind::Tab,
+                    tempo_bidi::ContextType::Window => BrowsingContextKind::Window,
+                },
+                background: command.background,
+            };
+            match futures::executor::block_on(driver.create_browsing_context_attached(options)) {
+                Ok(created_driver) => {
                     pool.bidi_contexts.insert(reference, driver);
-                    let context = pool.register_bidi_context(forked);
+                    let context = pool.register_bidi_context(created_driver);
                     BidiDispatchResult::new(
                         200,
                         bidi_success_or_error(id, CreateContextResult { context }),
@@ -2872,6 +2898,17 @@ mod tests {
         let mut pool = SessionPool::default();
         pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
 
+        let root_nav = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/bidi".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: br#"{"id":1,"method":"browsingContext.navigate","params":{"context":"tempo-root","url":"https://root.test","inputTainted":false}}"#.to_vec(),
+            },
+        )?;
         let created = route_http_request(
             &mut pool,
             HttpRequest {
@@ -2880,7 +2917,7 @@ mod tests {
                 headers: BTreeMap::new(),
                 host: None,
                 origin: None,
-                body: br#"{"id":1,"method":"browsingContext.create","params":{"type":"tab"}}"#
+                body: br#"{"id":2,"method":"browsingContext.create","params":{"type":"tab"}}"#
                     .to_vec(),
             },
         )?;
@@ -2890,18 +2927,7 @@ mod tests {
             .ok_or("create result must include context")?
             .to_string();
 
-        let root_nav = route_http_request(
-            &mut pool,
-            HttpRequest {
-                method: "POST".into(),
-                path: "/bidi".into(),
-                headers: BTreeMap::new(),
-                host: None,
-                origin: None,
-                body: br#"{"id":2,"method":"browsingContext.navigate","params":{"context":"tempo-root","url":"https://root.test","inputTainted":false}}"#.to_vec(),
-            },
-        )?;
-        let fork_nav = route_http_request(
+        let initial_created_tree = route_http_request(
             &mut pool,
             HttpRequest {
                 method: "POST".into(),
@@ -2910,7 +2936,21 @@ mod tests {
                 host: None,
                 origin: None,
                 body: format!(
-                    r#"{{"id":3,"method":"browsingContext.navigate","params":{{"context":"{created_context}","url":"https://fork.test","inputTainted":false}}}}"#
+                    r#"{{"id":3,"method":"browsingContext.getTree","params":{{"root":"{created_context}"}}}}"#
+                )
+                .into_bytes(),
+            },
+        )?;
+        let context_nav = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/bidi".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: format!(
+                    r#"{{"id":4,"method":"browsingContext.navigate","params":{{"context":"{created_context}","url":"https://context.test","inputTainted":false}}}}"#
                 )
                 .into_bytes(),
             },
@@ -2924,11 +2964,11 @@ mod tests {
                 host: None,
                 origin: None,
                 body:
-                    br#"{"id":4,"method":"browsingContext.getTree","params":{"root":"tempo-root"}}"#
+                    br#"{"id":5,"method":"browsingContext.getTree","params":{"root":"tempo-root"}}"#
                         .to_vec(),
             },
         )?;
-        let fork_tree = route_http_request(
+        let context_tree = route_http_request(
             &mut pool,
             HttpRequest {
                 method: "POST".into(),
@@ -2937,7 +2977,7 @@ mod tests {
                 host: None,
                 origin: None,
                 body: format!(
-                    r#"{{"id":5,"method":"browsingContext.getTree","params":{{"root":"{created_context}"}}}}"#
+                    r#"{{"id":6,"method":"browsingContext.getTree","params":{{"root":"{created_context}"}}}}"#
                 )
                 .into_bytes(),
             },
@@ -2946,21 +2986,26 @@ mod tests {
         join_driver_handler(server)?;
 
         let root_nav: Value = serde_json::from_slice(&root_nav.body)?;
-        let fork_nav: Value = serde_json::from_slice(&fork_nav.body)?;
+        let initial_created_tree: Value = serde_json::from_slice(&initial_created_tree.body)?;
+        let context_nav: Value = serde_json::from_slice(&context_nav.body)?;
         let root_tree: Value = serde_json::from_slice(&root_tree.body)?;
-        let fork_tree: Value = serde_json::from_slice(&fork_tree.body)?;
+        let context_tree: Value = serde_json::from_slice(&context_tree.body)?;
 
+        assert_eq!(root_nav["type"], "success");
         assert_eq!(created["type"], "success");
         assert_eq!(created["result"]["context"], created_context);
-        assert_eq!(root_nav["type"], "success");
-        assert_eq!(fork_nav["type"], "success");
+        assert_eq!(
+            initial_created_tree["result"]["contexts"][0]["url"],
+            "about:blank"
+        );
+        assert_eq!(context_nav["type"], "success");
         assert_eq!(
             root_tree["result"]["contexts"][0]["url"],
             "https://root.test"
         );
         assert_eq!(
-            fork_tree["result"]["contexts"][0]["url"],
-            "https://fork.test"
+            context_tree["result"]["contexts"][0]["url"],
+            "https://context.test"
         );
         Ok(())
     }
@@ -3304,6 +3349,17 @@ mod tests {
             let forked_inner = self.inner.fork().await?;
             Ok(Box::new(CloseCountingDriver {
                 inner: forked_inner,
+                closes: Arc::clone(&self.closes),
+            }))
+        }
+
+        async fn create_browsing_context(
+            &mut self,
+            options: BrowsingContextCreateOptions,
+        ) -> Result<Box<dyn DriverTrait>, Unsupported> {
+            let created_inner = self.inner.create_browsing_context(options).await?;
+            Ok(Box::new(CloseCountingDriver {
+                inner: created_inner,
                 closes: Arc::clone(&self.closes),
             }))
         }

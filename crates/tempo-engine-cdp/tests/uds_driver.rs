@@ -1,6 +1,7 @@
 use std::io::Write;
 use std::net::TcpListener;
 use std::os::unix::net::UnixStream;
+use tempo_driver::{BrowsingContextCreateOptions, BrowsingContextKind};
 use tempo_engine_cdp::{CdpConfig, CdpTempoDriver};
 use tempo_engine_host::{
     serve_driver_connection, DriverCommand, DriverResponse, EngineIpcClient, EngineIpcConnection,
@@ -16,11 +17,32 @@ async fn cdp_driver_serves_commands_over_engine_host_uds() -> Result<(), Box<dyn
     let url = serve_fixture()?;
     let (client_stream, server_stream) = UnixStream::pair()?;
     let client = tokio::task::spawn_blocking(
-        move || -> Result<(DriverResponse, DriverResponse), tempo_engine_host::EngineHostError> {
+        move || -> Result<
+            (
+                DriverResponse,
+                DriverResponse,
+                DriverResponse,
+                DriverResponse,
+            ),
+            tempo_engine_host::EngineHostError,
+        > {
             let mut client = EngineIpcClient::from_stream(client_stream);
             let observed = client.request(DriverCommand::Goto { url })?;
+            let created = client.request(DriverCommand::CreateBrowsingContext {
+                options: BrowsingContextCreateOptions {
+                    kind: BrowsingContextKind::Tab,
+                    background: false,
+                },
+            })?;
+            let DriverResponse::BrowsingContextCreated { driver_id } = created else {
+                return Err(tempo_engine_host::EngineHostError::Io(
+                    std::io::Error::other(format!("unexpected context response: {created:?}")),
+                ));
+            };
+            let child_observed = client.request_for(Some(&driver_id), DriverCommand::Observe)?;
+            let child_closed = client.request_for(Some(&driver_id), DriverCommand::Close)?;
             let closed = client.request(DriverCommand::Close)?;
-            Ok((observed, closed))
+            Ok((observed, child_observed, child_closed, closed))
         },
     );
 
@@ -30,7 +52,7 @@ async fn cdp_driver_serves_commands_over_engine_host_uds() -> Result<(), Box<dyn
         .allow_private_network_access();
     let mut connection = EngineIpcConnection::from_stream(server_stream);
     serve_driver_connection(&mut connection, &mut driver).await?;
-    let (observed, closed) = client.await??;
+    let (observed, child_observed, child_closed, closed) = client.await??;
 
     match observed {
         DriverResponse::Observation { observation } => {
@@ -41,6 +63,14 @@ async fn cdp_driver_serves_commands_over_engine_host_uds() -> Result<(), Box<dyn
         }
         other => return Err(format!("unexpected driver response: {other:?}").into()),
     }
+    match child_observed {
+        DriverResponse::Observation { observation } => {
+            assert_eq!(observation.url, "about:blank");
+            assert_eq!(observation.seq, 0);
+        }
+        other => return Err(format!("unexpected child driver response: {other:?}").into()),
+    }
+    assert_eq!(child_closed, DriverResponse::Closed);
     assert_eq!(closed, DriverResponse::Closed);
     Ok(())
 }
