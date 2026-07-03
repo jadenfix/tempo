@@ -17,6 +17,7 @@ use tempo_handshake::{
     WEB_MCP_DETECTION_SCRIPT,
 };
 use tempo_observe::composite_set_of_marks_png;
+use tempo_policy::{decide_action, InputTaint};
 use tempo_schema::{Action, ActionBatch, NodeId};
 use thiserror::Error;
 use url::{Host, Url};
@@ -264,6 +265,11 @@ where
             }
             "act" => {
                 let args: ActArgs = parse_args(arguments)?;
+                if let Err(denial) =
+                    enforce_action_policy(&args.action, args.input_taint()?, args.confirmed)
+                {
+                    return Ok(denial);
+                }
                 let driver = self.driver_for_mut(args.driver_id.as_deref())?;
                 match driver.act(&args.action).await {
                     Ok(outcome) => Ok(ToolCall::success(step_outcome_json(outcome))),
@@ -272,6 +278,12 @@ where
             }
             "act_batch" => {
                 let args: ActBatchArgs = parse_args(arguments)?;
+                let input_taint = args.input_taint()?;
+                if let Some(denial) = args.batch.actions.iter().find_map(|action| {
+                    enforce_action_policy(action, input_taint, args.confirmed).err()
+                }) {
+                    return Ok(denial);
+                }
                 let driver = self.driver_for_mut(args.driver_id.as_deref())?;
                 match driver.act_batch(&args.batch).await {
                     Ok(outcome) => Ok(ToolCall::success(step_outcome_json(outcome))),
@@ -489,24 +501,29 @@ pub fn tools() -> Vec<ToolDescriptor> {
         },
         ToolDescriptor {
             name: "act",
-            description: "Execute one tempo semantic action.",
+            description: "Execute one tempo semantic action with explicit input_tainted evidence.",
             input_schema: object_schema(
                 vec![
                     ("action", json!({"type": "object"})),
+                    ("input_tainted", json!({"type": "boolean"})),
+                    ("confirmed", json!({"type": "boolean"})),
                     ("driver_id", json!({"type": "string"})),
                 ],
-                &["action"],
+                &["action", "input_tainted"],
             ),
         },
         ToolDescriptor {
             name: "act_batch",
-            description: "Execute a batch of tempo semantic actions with quiescence policy.",
+            description:
+                "Execute a batch of tempo semantic actions; confirmed=true authorizes the full batch.",
             input_schema: object_schema(
                 vec![
                     ("batch", json!({"type": "object"})),
+                    ("input_tainted", json!({"type": "boolean"})),
+                    ("confirmed", json!({"type": "boolean"})),
                     ("driver_id", json!({"type": "string"})),
                 ],
-                &["batch"],
+                &["batch", "input_tainted"],
             ),
         },
         ToolDescriptor {
@@ -635,6 +652,15 @@ struct ActArgs {
     #[serde(default)]
     driver_id: Option<String>,
     action: Action,
+    input_tainted: Option<bool>,
+    #[serde(default)]
+    confirmed: bool,
+}
+
+impl ActArgs {
+    fn input_taint(&self) -> Result<InputTaint, JsonRpcError> {
+        required_input_taint(self.input_tainted)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -642,6 +668,15 @@ struct ActBatchArgs {
     #[serde(default)]
     driver_id: Option<String>,
     batch: ActionBatch,
+    input_tainted: Option<bool>,
+    #[serde(default)]
+    confirmed: bool,
+}
+
+impl ActBatchArgs {
+    fn input_taint(&self) -> Result<InputTaint, JsonRpcError> {
+        required_input_taint(self.input_tainted)
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -715,6 +750,29 @@ impl From<ProbeResponseInput> for ProbeResponse {
 
 fn parse_args<T: serde::de::DeserializeOwned>(value: Value) -> Result<T, JsonRpcError> {
     serde_json::from_value(value).map_err(|error| JsonRpcError::invalid_params(error.to_string()))
+}
+
+fn required_input_taint(value: Option<bool>) -> Result<InputTaint, JsonRpcError> {
+    value
+        .map(InputTaint::new)
+        .ok_or_else(|| JsonRpcError::invalid_params("input_tainted is required for act tools"))
+}
+
+fn enforce_action_policy(
+    action: &Action,
+    input_taint: InputTaint,
+    confirmed: bool,
+) -> Result<(), ToolCall> {
+    let decision = decide_action(action, input_taint);
+    if decision.gate.requires_human() && !confirmed {
+        return Err(ToolCall::error(format!(
+            "policy denied: {:?} action with input_tainted={} requires {:?}; retry with confirmed=true after human confirmation",
+            decision.side_effect,
+            input_taint.is_tainted(),
+            decision.gate
+        )));
+    }
+    Ok(())
 }
 
 /// The origin to run a live HTTP probe against, if these handshake args request
@@ -1179,7 +1237,10 @@ mod tests {
         let act = call_tool(
             &mut server,
             "act",
-            json!({"action": {"kind": "click", "node": "button.primary"}}),
+            json!({
+                "action": {"kind": "click", "node": "button.primary"},
+                "input_tainted": false
+            }),
         )
         .await?;
         assert_eq!(act["status"], "applied");
@@ -1192,7 +1253,8 @@ mod tests {
                 "batch": {
                     "actions": [{"kind": "scroll", "x": 0.0, "y": 12.0}],
                     "quiescence": "composite"
-                }
+                },
+                "input_tainted": false
             }),
         )
         .await?;
@@ -1208,6 +1270,111 @@ mod tests {
         assert_eq!(screenshot["set_of_marks"], false);
         let bytes = decode_base64_field(&screenshot, "data")?;
         assert_eq!(bytes, TEST_SCREENSHOT_PNG);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn act_requires_explicit_input_taint_evidence() -> Result<(), String> {
+        let mut server = TempoMcpServer::new(MemoryDriver::new());
+
+        let error = call_tool(
+            &mut server,
+            "act",
+            json!({"action": {"kind": "click", "node": "button.primary"}}),
+        )
+        .await
+        .err()
+        .ok_or("act without input_tainted should fail")?;
+
+        assert!(error.contains("input_tainted is required"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn act_denies_unconfirmed_tainted_write_before_driver_execution() -> Result<(), String> {
+        let mut server = TempoMcpServer::new(MemoryDriver::new());
+
+        let denied = call_tool(
+            &mut server,
+            "act",
+            json!({
+                "action": {"kind": "click", "node": "button.primary"},
+                "input_tainted": true
+            }),
+        )
+        .await?;
+        let denial = denied["error"]
+            .as_str()
+            .ok_or("policy denial should be a tool error")?;
+        assert!(denial.contains("policy denied"));
+
+        let clean = call_tool(
+            &mut server,
+            "act",
+            json!({
+                "action": {"kind": "scroll", "x": 0.0, "y": 12.0},
+                "input_tainted": false
+            }),
+        )
+        .await?;
+        assert_eq!(clean["status"], "applied");
+        assert_eq!(clean["diff"]["seq"], 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn act_batch_denies_unconfirmed_tainted_action_before_driver_execution(
+    ) -> Result<(), String> {
+        let mut server = TempoMcpServer::new(MemoryDriver::new());
+
+        let denied = call_tool(
+            &mut server,
+            "act_batch",
+            json!({
+                "batch": {
+                    "actions": [{"kind": "click", "node": "button.primary"}],
+                    "quiescence": "composite"
+                },
+                "input_tainted": true
+            }),
+        )
+        .await?;
+        let denial = denied["error"]
+            .as_str()
+            .ok_or("policy denial should be a tool error")?;
+        assert!(denial.contains("policy denied"));
+
+        let clean = call_tool(
+            &mut server,
+            "act",
+            json!({
+                "action": {"kind": "scroll", "x": 0.0, "y": 12.0},
+                "input_tainted": false
+            }),
+        )
+        .await?;
+        assert_eq!(clean["status"], "applied");
+        assert_eq!(clean["diff"]["seq"], 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn act_allows_confirmed_tainted_write() -> Result<(), String> {
+        let mut server = TempoMcpServer::new(MemoryDriver::new());
+
+        let act = call_tool(
+            &mut server,
+            "act",
+            json!({
+                "action": {"kind": "click", "node": "button.primary"},
+                "input_tainted": true,
+                "confirmed": true
+            }),
+        )
+        .await?;
+
+        assert_eq!(act["status"], "applied");
+        assert_eq!(act["diff"]["seq"], 2);
         Ok(())
     }
 
@@ -1247,6 +1414,7 @@ mod tests {
             json!({
                 "driver_id": driver_id.clone(),
                 "action": {"kind": "click", "node": "button.primary"},
+                "input_tainted": false
             }),
         )
         .await?;

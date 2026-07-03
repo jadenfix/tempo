@@ -11,6 +11,7 @@ serde.workspace = true
 serde_json.workspace = true
 tempo-handshake = { path = "../tempo-handshake" }
 tempo-observe = { path = "../tempo-observe" }
+tempo-policy = { path = "../tempo-policy" }
 tempo-schema = { path = "../tempo-schema" }
 tempo-driver = { path = "../tempo-driver" }
 thiserror.workspace = true
