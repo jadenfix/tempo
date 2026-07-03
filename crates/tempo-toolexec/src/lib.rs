@@ -12,6 +12,8 @@ pub use beatbox_client::{
     FsPolicy, JobRecord, JobStatus, Lane, Limits, Metrics, Mount, MountMode, NetPolicy, Policy,
     Secret, Source,
 };
+use tempo_driver::StepOutcome;
+use tempo_schema::ObservationDiff;
 use tempo_schema::TaintSpan;
 use thiserror::Error;
 
@@ -139,6 +141,13 @@ impl ToolExecution {
             audit,
         }
     }
+
+    /// Convert the beatbox result into the canonical driver step model used by
+    /// session journals. Tool execution does not mutate browser state, so a
+    /// successful tool step carries an empty diff at the caller-supplied cursor.
+    pub fn to_step_outcome(&self, since_seq: u64, seq: u64) -> StepOutcome {
+        self.step_status.to_step_outcome(since_seq, seq)
+    }
 }
 
 /// Step-level status tempo records for tool execution.
@@ -170,6 +179,23 @@ impl ToolStepStatus {
             .filter(|message| !message.is_empty())
             .unwrap_or_else(|| fallback.into());
         Self::StepError { reason }
+    }
+
+    pub fn to_step_outcome(&self, since_seq: u64, seq: u64) -> StepOutcome {
+        match self {
+            Self::Applied => StepOutcome::Applied {
+                diff: ObservationDiff {
+                    since_seq,
+                    seq,
+                    added: Vec::new(),
+                    removed: Vec::new(),
+                    changed: Vec::new(),
+                },
+            },
+            Self::StepError { reason } => StepOutcome::StepError {
+                reason: reason.clone(),
+            },
+        }
     }
 }
 
@@ -625,6 +651,10 @@ mod tests {
         assert_eq!(execution.audit.metrics.wall_time_ms, 10);
         assert!(!execution.audit.has_egress());
         assert!(!execution.audit.isolation_downgraded());
+        match execution.to_step_outcome(7, 8) {
+            StepOutcome::StepError { reason } => assert_eq!(reason, "network denied"),
+            other => panic!("expected canonical step error, got {other:?}"),
+        }
     }
 
     #[test]
@@ -643,6 +673,16 @@ mod tests {
         assert_eq!(execution.step_status, ToolStepStatus::Applied);
         assert!(execution.audit.has_egress());
         assert_eq!(execution.audit.inputs_digest, "sha256:test");
+        match execution.to_step_outcome(12, 13) {
+            StepOutcome::Applied { diff } => {
+                assert_eq!(diff.since_seq, 12);
+                assert_eq!(diff.seq, 13);
+                assert!(diff.added.is_empty());
+                assert!(diff.removed.is_empty());
+                assert!(diff.changed.is_empty());
+            }
+            other => panic!("expected canonical applied outcome, got {other:?}"),
+        }
     }
 
     #[test]
