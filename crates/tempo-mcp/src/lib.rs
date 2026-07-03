@@ -1622,6 +1622,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handshake_tool_does_not_select_method_only_web_mcp() -> Result<(), String> {
+        let mut server = TempoMcpServer::new(MemoryDriver::new().with_method_only_web_mcp());
+        let result = call_tool(
+            &mut server,
+            "handshake",
+            json!({"origin": "https://example.test", "live_http": false}),
+        )
+        .await?;
+
+        assert_ne!(result["selected"]["signal"], "web_mcp");
+        assert_eq!(result["lane"], "render");
+        assert_eq!(result["skips_render"], false);
+        assert_eq!(result["web_mcp"]["checked"], true);
+        assert_eq!(result["web_mcp"]["available"], true);
+        assert_eq!(result["web_mcp"]["type"], "object");
+        assert_eq!(result["web_mcp"]["has_tools"], false);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn handshake_tool_runs_live_http_probe_for_origin() -> Result<(), String> {
         let (origin, server) = serve_handshake_fixture().map_err(|error| error.to_string())?;
         let mut server_under_test = TempoMcpServer::new(MemoryDriver::new())
@@ -1922,6 +1942,7 @@ mod tests {
         observation: CompiledObservation,
         web_mcp_available: bool,
         web_mcp_has_tools: bool,
+        web_mcp_method_only: bool,
         // Shared across forks (fork() clones this handle) so tests can assert that
         // close() actually ran on a forked driver rather than it merely being dropped.
         closed: Arc<AtomicUsize>,
@@ -1933,6 +1954,7 @@ mod tests {
                 closed: Arc::new(AtomicUsize::new(0)),
                 web_mcp_available: false,
                 web_mcp_has_tools: false,
+                web_mcp_method_only: false,
                 observation: CompiledObservation {
                     schema_version: tempo_schema::SCHEMA_VERSION.into(),
                     url: "https://example.test/".into(),
@@ -1962,6 +1984,13 @@ mod tests {
         fn with_unusable_web_mcp(mut self) -> Self {
             self.web_mcp_available = true;
             self.web_mcp_has_tools = false;
+            self
+        }
+
+        fn with_method_only_web_mcp(mut self) -> Self {
+            self.web_mcp_available = true;
+            self.web_mcp_has_tools = false;
+            self.web_mcp_method_only = true;
             self
         }
     }
@@ -2033,6 +2062,11 @@ mod tests {
                     "available": self.web_mcp_available,
                     "type": if self.web_mcp_available { Some("object") } else { None },
                     "hasTools": self.web_mcp_has_tools,
+                    "methods": if self.web_mcp_method_only {
+                        vec!["listTools", "callTool"]
+                    } else {
+                        Vec::<&str>::new()
+                    },
                 }));
             }
             Ok(json!({
