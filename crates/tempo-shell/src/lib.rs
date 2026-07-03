@@ -400,10 +400,16 @@ fn parse_http_response(bytes: &[u8]) -> Result<HttpResponse, ShellError> {
 }
 
 fn safe_path_segment(segment: &str) -> Result<&str, ShellError> {
-    if segment.is_empty() || segment.contains('/') || segment.contains('\\') {
-        Err(ShellError::Usage(format!("invalid session id: {segment}")))
-    } else {
+    let is_safe = !segment.is_empty()
+        && segment != "."
+        && segment != ".."
+        && segment
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'));
+    if is_safe {
         Ok(segment)
+    } else {
+        Err(ShellError::Usage(format!("invalid session id: {segment}")))
     }
 }
 
@@ -668,11 +674,62 @@ mod tests {
 
     #[test]
     fn rejects_unsafe_session_path_segments() {
+        for unsafe_segment in [
+            "../session",
+            "",
+            "s1\r\nX: 1",
+            "a b",
+            "a?b",
+            "a#b",
+            "..",
+            ".",
+            "a/b",
+            "a\\b",
+            "sessão",
+            "a\u{0007}b",
+        ] {
+            assert!(
+                matches!(safe_path_segment(unsafe_segment), Err(ShellError::Usage(_))),
+                "expected rejection for {unsafe_segment:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_safe_session_path_segment() {
         assert!(matches!(
-            safe_path_segment("../session"),
-            Err(ShellError::Usage(_))
+            safe_path_segment("session-123_ABC.def"),
+            Ok("session-123_ABC.def")
         ));
-        assert!(matches!(safe_path_segment(""), Err(ShellError::Usage(_))));
+    }
+
+    #[test]
+    fn adopt_events_close_work_for_valid_session_id() -> TestResult {
+        let pool = Arc::new(Mutex::new(SessionPool::default()));
+        let opened = with_tempod(&pool, |addr| {
+            ShellClient::new(addr.to_string()).open("https://valid.test")
+        })?;
+        let session_id = opened.id.0.clone();
+        assert!(matches!(
+            safe_path_segment(&session_id),
+            Ok(id) if id == session_id
+        ));
+
+        let adopted = with_tempod(&pool, |addr| {
+            ShellClient::new(addr.to_string()).adopt(&session_id)
+        })?;
+        assert_eq!(adopted.state, TempodSessionState::Adopted);
+
+        let events = with_tempod(&pool, |addr| {
+            ShellClient::new(addr.to_string()).events(&session_id, None)
+        })?;
+        assert!(!events.is_empty());
+
+        let closed = with_tempod(&pool, |addr| {
+            ShellClient::new(addr.to_string()).close(&session_id)
+        })?;
+        assert_eq!(closed.state, TempodSessionState::Killed);
+        Ok(())
     }
 
     fn with_tempod<T, F>(pool: &Arc<Mutex<SessionPool>>, call: F) -> Result<T, Box<dyn Error>>
