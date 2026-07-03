@@ -40,6 +40,21 @@ impl SkillDefinition {
         }
     }
 
+    pub fn metadata(&self) -> Result<SkillMetadata, SkillError> {
+        validate_definition(self)?;
+        let required_inputs = self.inputs.iter().filter(|input| input.required).count();
+        Ok(SkillMetadata {
+            key: self.key(),
+            description: self.description.clone(),
+            side_effect: self.side_effect,
+            inputs: self.inputs.clone(),
+            quiescence: self.quiescence,
+            step_count: self.steps.len(),
+            required_inputs,
+            optional_inputs: self.inputs.len().saturating_sub(required_inputs),
+        })
+    }
+
     pub fn compile(&self, input: &Value) -> Result<ActionBatch, SkillError> {
         validate_definition(self)?;
         let bindings = InputBindings::new(&self.inputs, input)?;
@@ -59,6 +74,19 @@ impl SkillDefinition {
 pub struct SkillKey {
     pub name: String,
     pub version: String,
+}
+
+/// Catalog metadata exposed to runtime/policy surfaces without expanding a skill.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SkillMetadata {
+    pub key: SkillKey,
+    pub description: String,
+    pub side_effect: SideEffect,
+    pub inputs: Vec<SkillInput>,
+    pub quiescence: QuiescencePolicy,
+    pub step_count: usize,
+    pub required_inputs: usize,
+    pub optional_inputs: usize,
 }
 
 /// One named input a skill requires.
@@ -256,6 +284,29 @@ impl SkillStore {
         self.get(key)?.compile(input)
     }
 
+    pub fn catalog(&self) -> Result<Vec<SkillMetadata>, SkillError> {
+        let mut entries = Vec::new();
+        for entry in std::fs::read_dir(&self.root)? {
+            let entry = entry?;
+            let path = entry.path();
+            if !is_skill_json_file(&entry, &path)? {
+                continue;
+            }
+            match Self::load_metadata(&path) {
+                Ok(metadata) => entries.push(metadata),
+                Err(err @ (SkillError::Io(_) | SkillError::OpenSkill { .. })) => return Err(err),
+                Err(err) => {
+                    eprintln!(
+                        "tempo-skills: skipping malformed skill file {}: {err}",
+                        path.display()
+                    );
+                }
+            }
+        }
+        entries.sort_by(|left, right| left.key.cmp(&right.key));
+        Ok(entries)
+    }
+
     pub fn resolve(&self, name: &str) -> Result<SkillKey, SkillError> {
         safe_segment(name)?;
         self.list()?
@@ -270,11 +321,7 @@ impl SkillStore {
         for entry in std::fs::read_dir(&self.root)? {
             let entry = entry?;
             let path = entry.path();
-            if !(entry.file_type()?.is_file()
-                && path
-                    .extension()
-                    .is_some_and(|extension| extension == "json"))
-            {
+            if !is_skill_json_file(&entry, &path)? {
                 continue;
             }
             // A single malformed or invalid skill file must not brick resolution of
@@ -305,6 +352,14 @@ impl SkillStore {
         Ok(definition.key())
     }
 
+    fn load_metadata(path: &Path) -> Result<SkillMetadata, SkillError> {
+        let mut file = File::open(path)?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        let definition: SkillDefinition = serde_json::from_slice(&bytes)?;
+        definition.metadata()
+    }
+
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -316,6 +371,13 @@ impl SkillStore {
             safe_segment(&key.version)?
         )))
     }
+}
+
+fn is_skill_json_file(entry: &std::fs::DirEntry, path: &Path) -> Result<bool, SkillError> {
+    Ok(entry.file_type()?.is_file()
+        && path
+            .extension()
+            .is_some_and(|extension| extension == "json"))
 }
 
 #[derive(Debug, Error)]
@@ -589,6 +651,58 @@ mod tests {
     }
 
     #[test]
+    fn catalog_reports_runtime_metadata_without_expanding_actions() -> TestResult {
+        let root = unique_dir("catalog")?;
+        remove_dir_if_exists(&root)?;
+        let store = SkillStore::open(&root)?;
+        let mut checkout = checkout_skill();
+        checkout.version = "2".into();
+        let mut read_only = SkillDefinition {
+            name: "extract-main".into(),
+            version: "1".into(),
+            description: "extract the main content node".into(),
+            side_effect: SideEffect::Read,
+            inputs: vec![SkillInput::required("main_node")],
+            quiescence: QuiescencePolicy::FixedMillis(0),
+            steps: vec![ActionTemplate::Extract {
+                node: TemplateString::param("main_node"),
+            }],
+        };
+        // Deliberately use an undeclared optional-looking input value at runtime
+        // nowhere: metadata loading must not expand or validate caller input.
+        read_only.inputs.push(SkillInput::optional("format"));
+
+        store.put(&checkout)?;
+        store.put(&read_only)?;
+
+        let catalog = store.catalog()?;
+
+        assert_eq!(catalog.len(), 2);
+        assert_eq!(catalog[0].key.name, "checkout");
+        assert_eq!(catalog[0].key.version, "2");
+        assert_eq!(catalog[0].side_effect, SideEffect::Write);
+        assert_eq!(catalog[0].step_count, 3);
+        assert_eq!(catalog[0].required_inputs, 3);
+        assert_eq!(catalog[0].optional_inputs, 1);
+        assert_eq!(catalog[1].key.name, "extract-main");
+        assert_eq!(catalog[1].side_effect, SideEffect::Read);
+        assert_eq!(catalog[1].quiescence, QuiescencePolicy::FixedMillis(0));
+        assert_eq!(catalog[1].step_count, 1);
+        assert_eq!(catalog[1].required_inputs, 1);
+        assert_eq!(catalog[1].optional_inputs, 1);
+
+        let value = serde_json::to_value(&catalog)?;
+        assert_eq!(value[0]["side_effect"], "write");
+        assert_eq!(
+            value[1]["quiescence"],
+            serde_json::json!({"fixed_millis": 0})
+        );
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[test]
     fn resolve_selects_highest_stored_version_for_name() -> TestResult {
         let root = unique_dir("resolve")?;
         remove_dir_if_exists(&root)?;
@@ -798,6 +912,23 @@ mod tests {
                 version: "1".into(),
             }
         );
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn catalog_skips_malformed_skill_files() -> TestResult {
+        let root = unique_dir("catalog-malformed")?;
+        remove_dir_if_exists(&root)?;
+        let store = SkillStore::open(&root)?;
+        store.put(&checkout_skill())?;
+        fs::write(root.join("broken.json"), b"{ definitely not json ")?;
+
+        let catalog = store.catalog()?;
+
+        assert_eq!(catalog.len(), 1);
+        assert_eq!(catalog[0].key.name, "checkout");
 
         remove_dir_if_exists(&root)?;
         Ok(())
