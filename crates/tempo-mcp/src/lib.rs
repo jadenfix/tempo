@@ -501,7 +501,7 @@ pub fn tools() -> Vec<ToolDescriptor> {
         },
         ToolDescriptor {
             name: "act",
-            description: "Execute one tempo semantic action.",
+            description: "Execute one tempo semantic action with explicit input_tainted evidence.",
             input_schema: object_schema(
                 vec![
                     ("action", json!({"type": "object"})),
@@ -514,7 +514,8 @@ pub fn tools() -> Vec<ToolDescriptor> {
         },
         ToolDescriptor {
             name: "act_batch",
-            description: "Execute a batch of tempo semantic actions with quiescence policy.",
+            description:
+                "Execute a batch of tempo semantic actions; confirmed=true authorizes the full batch.",
             input_schema: object_schema(
                 vec![
                     ("batch", json!({"type": "object"})),

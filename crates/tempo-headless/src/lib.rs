@@ -2453,7 +2453,8 @@ mod tests {
                     "batch": {
                         "actions": [{"kind": "scroll", "x": 0.0, "y": 12.0}],
                         "quiescence": "composite",
-                    }
+                    },
+                    "input_tainted": false
                 }),
             )?,
         )?;
@@ -2464,6 +2465,40 @@ mod tests {
         assert_eq!(value["id"], 12);
         assert_eq!(value["result"]["structuredContent"]["status"], "applied");
         assert_eq!(value["result"]["structuredContent"]["diff"]["seq"], 2);
+        Ok(())
+    }
+
+    #[test]
+    fn mcp_endpoint_rejects_act_without_input_taint_evidence() -> TestResult {
+        let (client_stream, mut server_stream) = UnixStream::pair()?;
+        server_stream.set_nonblocking(true)?;
+        let mut pool = SessionPool::default();
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+
+        let response = route_http_request(
+            &mut pool,
+            mcp_tool_request(
+                13,
+                "act",
+                json!({"action": {"kind": "scroll", "x": 0.0, "y": 8.0}}),
+            )?,
+        )?;
+
+        assert_eq!(response.status, 200);
+        let value: Value = serde_json::from_slice(&response.body)?;
+        assert_eq!(value["id"], 13);
+        assert_eq!(value["error"]["code"], -32602);
+        let message = value["error"]["message"]
+            .as_str()
+            .ok_or("error response should include a message")?;
+        assert!(message.contains("input_tainted is required"));
+
+        let mut byte = [0_u8; 1];
+        match server_stream.read(&mut byte) {
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Ok(bytes) => return Err(format!("invalid act dispatched {bytes} IPC bytes").into()),
+            Err(error) => return Err(error.into()),
+        }
         Ok(())
     }
 
@@ -2493,6 +2528,7 @@ mod tests {
                 json!({
                     "driver_id": driver_id.clone(),
                     "action": {"kind": "scroll", "x": 0.0, "y": 8.0},
+                    "input_tainted": false
                 }),
             )?,
         )?;
