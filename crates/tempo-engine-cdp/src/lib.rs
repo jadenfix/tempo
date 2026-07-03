@@ -8,7 +8,7 @@
 use async_trait::async_trait;
 use chromiumoxide::browser::{Browser, BrowserConfig, HeadlessMode};
 use chromiumoxide::cdp::browser_protocol::accessibility::{
-    AxNode, AxValue, EnableParams as AccessibilityEnableParams, GetFullAxTreeParams,
+    AxNode, AxValue, GetPartialAxTreeParams,
 };
 use chromiumoxide::cdp::browser_protocol::dom::{
     DescribeNodeParams, GetDocumentParams, NodeId as DomNodeId, QuerySelectorParams,
@@ -97,9 +97,6 @@ impl CdpTempoDriver {
             .new_page("about:blank")
             .await
             .map_err(map_cdp_error)?;
-        page.execute(AccessibilityEnableParams::default())
-            .await
-            .map_err(map_cdp_error)?;
 
         Ok(Self {
             browser,
@@ -167,18 +164,6 @@ impl CdpTempoDriver {
             return Ok(());
         }
 
-        let ax_nodes = self
-            .page
-            .execute(GetFullAxTreeParams::default())
-            .await
-            .map_err(map_cdp_error)?
-            .result
-            .nodes;
-        let summaries = ax_summaries_by_backend_id(&ax_nodes);
-        if summaries.is_empty() {
-            return Ok(());
-        }
-
         let root = self
             .page
             .execute(GetDocumentParams::default())
@@ -190,7 +175,7 @@ impl CdpTempoDriver {
 
         for element in &mut observation.elements {
             if let Some(summary) = self
-                .ax_summary_for_selector(root, &element.node_id.0, &summaries)
+                .ax_summary_for_selector(root, &element.node_id.0)
                 .await?
             {
                 apply_ax_summary(element, &summary);
@@ -204,7 +189,6 @@ impl CdpTempoDriver {
         &self,
         root: DomNodeId,
         selector: &str,
-        summaries: &BTreeMap<i64, AxSummary>,
     ) -> Result<Option<AxSummary>, TransportError> {
         let queried = match self
             .page
@@ -243,9 +227,30 @@ impl CdpTempoDriver {
             Err(error) => return Err(map_cdp_error(error)),
         };
 
-        Ok(summaries
-            .get(described.node.backend_node_id.inner())
-            .cloned())
+        let backend_node_id = described.node.backend_node_id;
+        let ax_nodes = match self
+            .page
+            .execute(
+                GetPartialAxTreeParams::builder()
+                    .backend_node_id(backend_node_id)
+                    .fetch_relatives(false)
+                    .build(),
+            )
+            .await
+        {
+            Ok(response) => response.result.nodes,
+            Err(error)
+                if matches!(error, CdpError::NotFound)
+                    || is_uninteresting_ax_node_msg(&error.to_string())
+                    || is_node_not_found_msg(&error.to_string()) =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(map_cdp_error(error)),
+        };
+        let summaries = ax_summaries_by_backend_id(&ax_nodes);
+
+        Ok(summaries.get(backend_node_id.inner()).cloned())
     }
 
     async fn with_element<F, Fut>(&self, selector: &str, op: F) -> Result<bool, TransportError>
@@ -527,6 +532,10 @@ fn map_cdp_error(error: CdpError) -> TransportError {
 fn is_node_not_found_msg(message: &str) -> bool {
     let lowered = message.to_lowercase();
     lowered.contains("could not find node") || lowered.contains("no node with given id")
+}
+
+fn is_uninteresting_ax_node_msg(message: &str) -> bool {
+    message.to_lowercase().contains("uninteresting")
 }
 
 fn enforce_url_policy(url: &str, policy: &UrlPolicy) -> Result<(), TransportError> {
