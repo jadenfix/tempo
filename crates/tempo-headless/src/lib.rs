@@ -351,7 +351,10 @@ impl SessionPool {
         self
     }
 
-    pub fn create(&mut self, url: impl Into<String>) -> TempodSession {
+    pub fn create(&mut self, url: impl Into<String>) -> Result<TempodSession, TempodError> {
+        if self.draining {
+            return Err(TempodError::Draining);
+        }
         let id = TempodSessionId(format!("session-{}", self.next_id));
         self.next_id = self.next_id.saturating_add(1);
         let session = TempodSession {
@@ -367,7 +370,7 @@ impl SessionPool {
                 url: session.url.clone(),
             },
         );
-        session
+        Ok(session)
     }
 
     pub fn list(&self) -> Vec<TempodSession> {
@@ -402,6 +405,7 @@ impl SessionPool {
 
     pub fn drain(&mut self) {
         self.draining = true;
+        self.bidi.begin_drain();
         let mut drained = Vec::new();
         for session in self.sessions.values_mut() {
             if session.state == TempodSessionState::Running {
@@ -412,6 +416,7 @@ impl SessionPool {
         for id in drained {
             self.record_event(&id, TempodSessionEventKind::SessionDrained);
         }
+        self.close_engine_resources(true);
     }
 
     pub fn draining(&self) -> bool {
@@ -419,8 +424,7 @@ impl SessionPool {
     }
 
     pub fn attach_engine_driver(&mut self, engine: Engine, client: EngineIpcClient) {
-        self.close_forked_contexts();
-        self.close_mcp_forks();
+        self.close_engine_resources(true);
         let driver = AttachedEngineDriver::new(engine, client);
         self.mcp = Some(Arc::new(Mutex::new(tempo_mcp::TempoMcpServer::new(
             driver.clone(),
@@ -433,20 +437,23 @@ impl SessionPool {
     }
 
     pub fn detach_engine_driver(&mut self) {
-        self.close_engine_resources();
+        self.close_engine_resources(true);
     }
 
     /// Best-effort close of every live engine-backed resource: forked BiDi
-    /// contexts and MCP forks. Shared by `detach_engine_driver` and `Drop` so
-    /// both use the exact same teardown. Idempotent and double-close-safe: it
-    /// takes/clears the collections it closes (`close_mcp_forks` takes
-    /// `self.mcp`; the context map is cleared), so a later call — e.g. `Drop`
-    /// after an explicit `detach_engine_driver` — finds them empty and closes
-    /// nothing again.
-    fn close_engine_resources(&mut self) {
+    /// contexts, MCP forks, and optionally the attached root driver. Explicit
+    /// drain/detach closes the root driver once; `Drop` skips root close because
+    /// it cannot safely block forever if a test or crashed engine never responds.
+    /// Idempotent and double-close-safe: it takes/clears the collections it
+    /// closes, so a later call finds them empty.
+    fn close_engine_resources(&mut self, close_root: bool) {
         self.close_forked_contexts();
-        self.driver = None;
         self.close_mcp_forks();
+        if close_root {
+            self.close_root_driver();
+        } else {
+            self.driver = None;
+        }
         self.bidi_contexts.clear();
         self.next_bidi_context_id = 1;
     }
@@ -458,6 +465,18 @@ impl SessionPool {
             if driver.driver_id.is_some() {
                 let _ = futures::executor::block_on(driver.close());
             }
+        }
+    }
+
+    /// Best-effort close of the root attached engine driver. Forked handles must
+    /// be closed before this because the engine-host connection exits after the
+    /// root `Close` command.
+    fn close_root_driver(&mut self) {
+        let Some(mut driver) = self.driver.take() else {
+            return;
+        };
+        if let Err(error) = futures::executor::block_on(driver.close()) {
+            eprintln!("tempod: error closing root engine driver at teardown: {error}");
         }
     }
 
@@ -566,7 +585,7 @@ impl Drop for SessionPool {
             return;
         }
         let closed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.close_engine_resources();
+            self.close_engine_resources(false);
         }));
         if closed.is_err() {
             eprintln!(
@@ -871,7 +890,7 @@ fn route_http_request(
             if body.url.trim().is_empty() {
                 return Err(TempodError::BadRequest("session url is required".into()));
             }
-            Ok(HttpResponse::json(201, pool.create(body.url)))
+            Ok(HttpResponse::json(201, pool.create(body.url)?))
         }
         ("POST", "/drain") => {
             pool.drain();
@@ -1163,6 +1182,16 @@ fn route_bidi_dispatch(pool: &mut SessionPool, body: Vec<u8>) -> BidiDispatchRes
     match pool.bidi.route_json(&body) {
         Ok(RoutedCommand::Immediate(message)) => BidiDispatchResult::new(200, message),
         Ok(RoutedCommand::Driver { id, command }) => {
+            if pool.draining {
+                return BidiDispatchResult::new(
+                    503,
+                    BidiMessage::error(
+                        Some(id),
+                        BidiErrorCode::UnknownError,
+                        "tempod is draining; BiDi driver commands are not accepted",
+                    ),
+                );
+            }
             if pool.driver.is_none() {
                 return BidiDispatchResult::new(
                     503,
@@ -1514,6 +1543,14 @@ fn bidi_response(status: u16, message: BidiMessage) -> HttpResponse {
 }
 
 fn route_mcp(pool: &mut SessionPool, request: &HttpRequest) -> HttpResponse {
+    if pool.draining {
+        return HttpResponse::json(
+            503,
+            json!({
+                "error": "tempod is draining; MCP tool calls are not accepted",
+            }),
+        );
+    }
     if let Some(server) = &pool.mcp {
         let Ok(mut server) = server.lock() else {
             return HttpResponse::json(
@@ -1761,6 +1798,8 @@ pub enum TempodError {
     SessionNotFound(TempodSessionId),
     #[error("engine not found: {0}")]
     EngineNotFound(String),
+    #[error("tempod is draining; new sessions are not accepted")]
+    Draining,
     #[error("session pool lock failed")]
     PoolLock,
     #[error("engine host failed: {0}")]
@@ -1773,6 +1812,7 @@ impl TempodError {
             Self::BadRequest(_) => 400,
             Self::Forbidden(_) => 403,
             Self::SessionNotFound(_) | Self::EngineNotFound(_) => 404,
+            Self::Draining => 503,
             Self::Io(_) | Self::Json(_) | Self::PoolLock | Self::Engine(_) => 500,
         }
     }
@@ -1808,7 +1848,7 @@ mod tests {
     fn session_pool_create_list_adopt_kill_and_drain() -> TestResult {
         let mut pool = SessionPool::default();
 
-        let session = pool.create("https://pool.test");
+        let session = pool.create("https://pool.test")?;
         let adopted = pool.adopt(&session.id)?;
         let killed = pool.kill(&session.id)?;
         pool.drain();
@@ -1823,7 +1863,7 @@ mod tests {
     #[test]
     fn session_pool_records_lifecycle_and_step_events() -> TestResult {
         let mut pool = SessionPool::default();
-        let session = pool.create("https://events.test");
+        let session = pool.create("https://events.test")?;
         pool.adopt(&session.id)?;
         let step = sample_step_triple(7);
         let step_event = pool.record_step(&session.id, step.clone())?;
@@ -1860,7 +1900,7 @@ mod tests {
         remove_dir_if_exists(&root)?;
         let path = root.join("steps.jsonl");
         let mut pool = SessionPool::default().with_otlp_exporter(OtlpJsonExporter::new(&path));
-        let session = pool.create("https://events.test");
+        let session = pool.create("https://events.test")?;
         let step = sample_step_triple(11);
 
         let step_event = pool.record_step(&session.id, step.clone())?;
@@ -1882,8 +1922,8 @@ mod tests {
     #[test]
     fn session_pool_records_drain_events_for_running_sessions() -> TestResult {
         let mut pool = SessionPool::default();
-        let running = pool.create("https://running.test");
-        let adopted = pool.create("https://adopted.test");
+        let running = pool.create("https://running.test")?;
+        let adopted = pool.create("https://adopted.test")?;
         pool.adopt(&adopted.id)?;
 
         pool.drain();
@@ -1898,6 +1938,52 @@ mod tests {
             adopted_events.last().map(|event| event.event.clone()),
             Some(TempodSessionEventKind::SessionAdopted)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn session_pool_drain_rejects_new_sessions_and_bidi_sessions() -> TestResult {
+        let mut pool = SessionPool::default();
+        let running = pool.create("https://running.test")?;
+
+        pool.drain();
+
+        assert!(pool.draining());
+        assert!(matches!(
+            pool.create("https://late.test"),
+            Err(TempodError::Draining)
+        ));
+        assert_eq!(pool.list()[0].id, running.id);
+        assert_eq!(pool.list()[0].state, TempodSessionState::Killed);
+
+        let status = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/bidi".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: br#"{"id":1,"method":"session.status","params":{}}"#.to_vec(),
+            },
+        )?;
+        let status: Value = serde_json::from_slice(&status.body)?;
+        assert_eq!(status["result"]["ready"], false);
+
+        let new_session = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/bidi".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: br#"{"id":2,"method":"session.new","params":{}}"#.to_vec(),
+            },
+        )?;
+        let new_session: Value = serde_json::from_slice(&new_session.body)?;
+        assert_eq!(new_session["type"], "error");
+        assert_eq!(new_session["error"], "session not created");
         Ok(())
     }
 
@@ -1934,7 +2020,7 @@ mod tests {
     #[test]
     fn http_session_events_endpoint_returns_logs_and_cursor_window() -> TestResult {
         let mut pool = SessionPool::default();
-        let session = pool.create("https://events.test");
+        let session = pool.create("https://events.test")?;
         pool.record_step(&session.id, sample_step_triple(1))?;
         pool.kill(&session.id)?;
 
@@ -2004,6 +2090,61 @@ mod tests {
 
         assert_eq!(bad_cursor.status, 400);
         assert_eq!(missing_session.status, 404);
+        Ok(())
+    }
+
+    #[test]
+    fn http_create_session_returns_503_while_draining_but_reads_still_work() -> TestResult {
+        let mut pool = SessionPool::default();
+        pool.create("https://before-drain.test")?;
+        pool.drain();
+
+        let health = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "GET".into(),
+                path: "/health".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: Vec::new(),
+            },
+        )?;
+        assert_eq!(health.status, 200);
+
+        let list = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "GET".into(),
+                path: "/sessions".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: Vec::new(),
+            },
+        )?;
+        assert_eq!(list.status, 200);
+        let sessions: Vec<TempodSession> = serde_json::from_slice(&list.body)?;
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].state, TempodSessionState::Killed);
+
+        let create = handle_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/sessions".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: br#"{"url":"https://after-drain.test"}"#.to_vec(),
+            },
+        );
+        assert_eq!(create.status, 503);
+        let value: Value = serde_json::from_slice(&create.body)?;
+        assert_eq!(
+            value["error"],
+            "tempod is draining; new sessions are not accepted"
+        );
         Ok(())
     }
 
@@ -3059,8 +3200,8 @@ mod tests {
         join_driver_handler(server)?;
         assert_eq!(
             closes.load(std::sync::atomic::Ordering::SeqCst),
-            3,
-            "every live fork must be closed at session teardown"
+            4,
+            "every live fork and the root driver must be closed at explicit detach"
         );
         Ok(())
     }
@@ -3097,6 +3238,83 @@ mod tests {
             closes.load(std::sync::atomic::Ordering::SeqCst),
             3,
             "dropping the pool must close every live fork"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn drain_closes_engine_resources_and_blocks_driver_work() -> TestResult {
+        let closes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let engine_closes = Arc::clone(&closes);
+        let (client_stream, server_stream) = UnixStream::pair()?;
+        let server = thread::spawn(move || -> Result<(), EngineHostError> {
+            let mut connection = EngineIpcConnection::from_stream(server_stream);
+            let mut driver = CloseCountingDriver::new(engine_closes);
+            futures::executor::block_on(serve_driver_connection(&mut connection, &mut driver))
+        });
+
+        let mut pool = SessionPool::default();
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+        let mcp_fork = route_http_request(&mut pool, mcp_tool_request(1, "fork", json!({}))?)?;
+        let mcp_fork: Value = serde_json::from_slice(&mcp_fork.body)?;
+        assert!(mcp_fork["result"]["structuredContent"]["driver_id"].is_string());
+
+        let bidi_create = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/bidi".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: br#"{"id":2,"method":"browsingContext.create","params":{"type":"tab"}}"#
+                    .to_vec(),
+            },
+        )?;
+        let bidi_create: Value = serde_json::from_slice(&bidi_create.body)?;
+        assert_eq!(bidi_create["type"], "success");
+        assert_eq!(pool.bidi_contexts.len(), 2);
+
+        pool.drain();
+
+        assert!(pool.draining());
+        assert!(pool.driver.is_none());
+        assert!(pool.mcp.is_none());
+        assert!(pool.bidi_contexts.is_empty());
+        join_driver_handler(server)?;
+        assert_eq!(
+            closes.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "drain must close MCP forks, BiDi forks, and the root driver"
+        );
+
+        let response = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/bidi".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: br#"{"id":3,"method":"browsingContext.navigate","params":{"context":"tempo-root","url":"https://after-drain.test","inputTainted":false}}"#.to_vec(),
+            },
+        )?;
+        assert_eq!(response.status, 503);
+        let value: Value = serde_json::from_slice(&response.body)?;
+        assert_eq!(
+            value["message"],
+            "tempod is draining; BiDi driver commands are not accepted"
+        );
+
+        let mcp_response = route_http_request(
+            &mut pool,
+            mcp_tool_request(4, "observe", json!({"driver_id": "late"}))?,
+        )?;
+        assert_eq!(mcp_response.status, 503);
+        let value: Value = serde_json::from_slice(&mcp_response.body)?;
+        assert_eq!(
+            value["error"],
+            "tempod is draining; MCP tool calls are not accepted"
         );
         Ok(())
     }
