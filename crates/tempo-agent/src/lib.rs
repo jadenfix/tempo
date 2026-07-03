@@ -42,6 +42,11 @@ pub const MAX_SKILL_EXPANSION_ACTIONS: usize = 1_024;
 /// completed in a prior run, whose side effect may already have happened (#99).
 pub const RESUME_INTERRUPTED_REASON: &str = "resume: step was planned but its outcome was not journaled; not re-executed to avoid duplicating a side effect";
 
+const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
+const MCP_ACCEPT: &str = "application/json, text/event-stream";
+const MCP_PROTOCOL_VERSION_HEADER: &str = "MCP-Protocol-Version";
+const MCP_SESSION_ID_HEADER: &str = "Mcp-Session-Id";
+
 pub type StructuredFastPathProbe = fn(&str, HttpProbeConfig) -> Option<StructuredFastPathDecision>;
 
 /// Structured surface selected before browser navigation.
@@ -780,6 +785,22 @@ impl AgentRunner {
             return Ok(report);
         }
 
+        if let Some(decision) = structured_fast_path_decision_from_entries(&initial_entries)? {
+            if !decision.skips_render() || !decision.supports_driver_task(task) {
+                return Err(AgentError::StructuredFastPathUnsupported {
+                    reason: format!(
+                        "journaled lane={} signal={} cannot execute this task without a browser",
+                        decision.lane_name(),
+                        decision.signal_name()
+                    ),
+                });
+            }
+            report.engine = AgentRunEngine::Structured;
+            return self
+                .run_structured_agent_task(agent, report, &initial_entries, task, decision)
+                .await;
+        }
+
         let mut current_origin;
         if !has_session_started(&initial_entries) {
             if let Some(decision) = self.structured_fast_path.probe_target(&task.start_url)
@@ -1025,6 +1046,8 @@ impl AgentRunner {
         let current_origin = self.origin_for_url("structured fast path", &decision.origin)?;
         if !has_session_started(initial_entries) {
             agent.record_session_started(task.start_url.clone())?;
+        }
+        if !has_structured_fast_path_selected(initial_entries) {
             agent.record_structured_fast_path_selected(&decision)?;
         }
 
@@ -1040,7 +1063,7 @@ impl AgentRunner {
                     driver_step,
                     &planned.key,
                     current_origin.as_ref(),
-                    driver_step.action.side_effect(),
+                    structured_remote_side_effect(&driver_step.action),
                 )?;
                 let reason = RESUME_INTERRUPTED_REASON.to_string();
                 let triple = agent.record_pending_interruption(reason.clone())?;
@@ -1062,7 +1085,7 @@ impl AgentRunner {
                 driver_step,
                 &planned.key,
                 current_origin.as_ref(),
-                driver_step.action.side_effect(),
+                structured_remote_side_effect(&driver_step.action),
             )?;
             if !policy.confirmed {
                 let reason = policy_denied_reason(&policy);
@@ -1166,17 +1189,42 @@ impl AgentRunner {
             "id": format!("{}:initialize", key.0),
             "method": "initialize",
             "params": {
-                "protocolVersion": "2025-11-25",
+                "protocolVersion": MCP_PROTOCOL_VERSION,
                 "capabilities": {},
                 "clientInfo": {"name": "tempo-agent", "version": env!("CARGO_PKG_VERSION")},
             },
         });
-        let initialize = post_mcp_json(&client, endpoint.as_str(), &initialize).await?;
-        if let Some(error) = initialize.get("error") {
+        let initialize =
+            post_mcp_json(&client, endpoint.as_str(), &initialize, None, false).await?;
+        if let Some(error) = initialize.body.get("error") {
             return Err(format!(
                 "MCP initialize failed: {}",
                 json_rpc_error_message(error)
             ));
+        }
+        validate_mcp_initialize_response(&initialize.body)?;
+        let mut session_id = initialize.session_id;
+
+        let initialized = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+        });
+        let initialized = post_mcp_json(
+            &client,
+            endpoint.as_str(),
+            &initialized,
+            session_id.as_deref(),
+            true,
+        )
+        .await?;
+        if let Some(error) = initialized.body.get("error") {
+            return Err(format!(
+                "MCP initialized notification failed: {}",
+                json_rpc_error_message(error)
+            ));
+        }
+        if initialized.session_id.is_some() {
+            session_id = initialized.session_id;
         }
 
         let request = serde_json::json!({
@@ -1188,11 +1236,18 @@ impl AgentRunner {
                 "arguments": input,
             },
         });
-        let response = post_mcp_json(&client, endpoint.as_str(), &request).await?;
-        if let Some(error) = response.get("error") {
+        let response = post_mcp_json(
+            &client,
+            endpoint.as_str(),
+            &request,
+            session_id.as_deref(),
+            true,
+        )
+        .await?;
+        if let Some(error) = response.body.get("error") {
             return Ok(StructuredMcpToolCall::error(json_rpc_error_message(error)));
         }
-        StructuredMcpToolCall::from_json_rpc_response(response)
+        StructuredMcpToolCall::from_json_rpc_response(response.body)
     }
 
     /// Read a skill from the store exactly once and return both its declared
@@ -1588,13 +1643,15 @@ pub fn step_triples_from_journal_without_plan(
 struct StructuredMcpToolCall {
     is_error: bool,
     structured_content: serde_json::Value,
+    content: serde_json::Value,
 }
 
 impl StructuredMcpToolCall {
     fn error(reason: String) -> Self {
         Self {
             is_error: true,
-            structured_content: serde_json::json!({ "error": reason }),
+            structured_content: serde_json::json!({ "error": reason.clone() }),
+            content: serde_json::json!([{"type": "text", "text": reason}]),
         }
     }
 
@@ -1606,13 +1663,22 @@ impl StructuredMcpToolCall {
             .get("isError")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
-        let structured_content = result
-            .get("structuredContent")
+        let content = result
+            .get("content")
             .cloned()
-            .ok_or_else(|| "MCP tools/call response missing structuredContent".to_string())?;
+            .ok_or_else(|| "MCP tools/call response missing content".to_string())?;
+        if !content.is_array() {
+            return Err("MCP tools/call response content must be an array".to_string());
+        }
+        let structured_content = result.get("structuredContent").cloned().unwrap_or_else(|| {
+            serde_json::json!({
+                "content": content.clone()
+            })
+        });
         Ok(Self {
             is_error,
             structured_content,
+            content,
         })
     }
 
@@ -1621,29 +1687,177 @@ impl StructuredMcpToolCall {
             .get("error")
             .and_then(serde_json::Value::as_str)
             .map(str::to_string)
+            .or_else(|| mcp_content_text(&self.content))
             .unwrap_or_else(|| self.structured_content.to_string())
     }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct McpHttpResponse {
+    body: serde_json::Value,
+    session_id: Option<String>,
 }
 
 async fn post_mcp_json(
     client: &reqwest::Client,
     endpoint: &str,
     request: &serde_json::Value,
-) -> Result<serde_json::Value, String> {
-    let response = client
+    session_id: Option<&str>,
+    include_protocol_version: bool,
+) -> Result<McpHttpResponse, String> {
+    let mut request_builder = client
         .post(endpoint)
+        .header(reqwest::header::ACCEPT, MCP_ACCEPT)
+        .header(reqwest::header::CONTENT_TYPE, "application/json");
+    if include_protocol_version {
+        request_builder = request_builder.header(MCP_PROTOCOL_VERSION_HEADER, MCP_PROTOCOL_VERSION);
+    }
+    if let Some(session_id) = session_id {
+        request_builder = request_builder.header(MCP_SESSION_ID_HEADER, session_id);
+    }
+
+    let response = request_builder
         .json(request)
         .send()
         .await
         .map_err(|error| error.to_string())?;
     let status = response.status();
+    let session_id = response
+        .headers()
+        .get(MCP_SESSION_ID_HEADER)
+        .or_else(|| response.headers().get("MCP-Session-Id"))
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let body = response.text().await.map_err(|error| error.to_string())?;
     if !status.is_success() {
-        return Err(format!("MCP endpoint returned HTTP {status}"));
+        let detail = body.trim();
+        if detail.is_empty() {
+            return Err(format!("MCP endpoint returned HTTP {status}"));
+        }
+        return Err(format!("MCP endpoint returned HTTP {status}: {detail}"));
     }
-    response
-        .json::<serde_json::Value>()
-        .await
-        .map_err(|error| error.to_string())
+    Ok(McpHttpResponse {
+        body: parse_mcp_response_body(&content_type, &body, request.get("id"))?,
+        session_id,
+    })
+}
+
+fn parse_mcp_response_body(
+    content_type: &str,
+    body: &str,
+    expected_id: Option<&serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        if let Some(expected_id) = expected_id {
+            return Err(format!(
+                "MCP response missing body for request id {}",
+                json_value_label(expected_id)
+            ));
+        }
+        return Ok(serde_json::Value::Null);
+    }
+
+    let media_type = content_type.split(';').next().unwrap_or_default().trim();
+    if media_type.eq_ignore_ascii_case("text/event-stream")
+        || trimmed.starts_with("event:")
+        || trimmed.starts_with("data:")
+    {
+        return parse_mcp_sse_response(trimmed, expected_id);
+    }
+
+    let response =
+        serde_json::from_str::<serde_json::Value>(trimmed).map_err(|error| error.to_string())?;
+    if let Some(expected_id) = expected_id {
+        validate_json_rpc_response_id(&response, expected_id)?;
+    }
+    Ok(response)
+}
+
+fn parse_mcp_sse_response(
+    body: &str,
+    expected_id: Option<&serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    let normalized = body.replace("\r\n", "\n");
+    let mut saw_data = false;
+    for event in normalized.split("\n\n") {
+        let data = event
+            .lines()
+            .filter_map(|line| line.strip_prefix("data:"))
+            .map(str::trim_start)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let data = data.trim();
+        if data.is_empty() {
+            continue;
+        }
+        saw_data = true;
+        let response =
+            serde_json::from_str::<serde_json::Value>(data).map_err(|error| error.to_string())?;
+        let Some(expected_id) = expected_id else {
+            return Ok(response);
+        };
+        if response.get("id") == Some(expected_id) {
+            return Ok(response);
+        }
+    }
+
+    if let Some(expected_id) = expected_id {
+        let detail = if saw_data {
+            "JSON-RPC response"
+        } else {
+            "data JSON"
+        };
+        return Err(format!(
+            "MCP SSE response missing {detail} for request id {}",
+            json_value_label(expected_id)
+        ));
+    }
+    Err("MCP SSE response missing data JSON".to_string())
+}
+
+fn validate_json_rpc_response_id(
+    response: &serde_json::Value,
+    expected_id: &serde_json::Value,
+) -> Result<(), String> {
+    match response.get("id") {
+        Some(actual_id) if actual_id == expected_id => Ok(()),
+        Some(actual_id) => Err(format!(
+            "MCP response id {} did not match request id {}",
+            json_value_label(actual_id),
+            json_value_label(expected_id)
+        )),
+        None => Err(format!(
+            "MCP response missing id for request id {}",
+            json_value_label(expected_id)
+        )),
+    }
+}
+
+fn json_value_label(value: &serde_json::Value) -> String {
+    value
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| value.to_string())
+}
+
+fn mcp_content_text(content: &serde_json::Value) -> Option<String> {
+    let text = content
+        .as_array()?
+        .iter()
+        .filter_map(|item| item.get("text")?.as_str())
+        .collect::<Vec<_>>();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text.join("\n"))
+    }
 }
 
 fn json_rpc_error_message(error: &serde_json::Value) -> String {
@@ -1652,6 +1866,34 @@ fn json_rpc_error_message(error: &serde_json::Value) -> String {
         .and_then(serde_json::Value::as_str)
         .map(str::to_string)
         .unwrap_or_else(|| error.to_string())
+}
+
+fn validate_mcp_initialize_response(response: &serde_json::Value) -> Result<(), String> {
+    let result = response
+        .get("result")
+        .ok_or_else(|| "MCP initialize response missing result".to_string())?;
+    let protocol_version = result
+        .get("protocolVersion")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "MCP initialize response missing protocolVersion".to_string())?;
+    if protocol_version != MCP_PROTOCOL_VERSION {
+        return Err(format!(
+            "MCP server negotiated unsupported protocol version {protocol_version}; expected {MCP_PROTOCOL_VERSION}"
+        ));
+    }
+
+    let capabilities = result
+        .get("capabilities")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| "MCP initialize response missing capabilities".to_string())?;
+    let Some(tools) = capabilities.get("tools") else {
+        return Err("MCP initialize response missing tools capability".to_string());
+    };
+    if !tools.is_object() {
+        return Err("MCP initialize response tools capability must be an object".to_string());
+    }
+
+    Ok(())
 }
 
 fn empty_structured_diff(since_seq: u64) -> ObservationDiff {
@@ -1691,6 +1933,77 @@ fn has_session_started(entries: &[JournalEntry]) -> bool {
     entries
         .iter()
         .any(|entry| matches!(entry.event, JournalEvent::SessionStarted { .. }))
+}
+
+fn has_structured_fast_path_selected(entries: &[JournalEntry]) -> bool {
+    entries
+        .iter()
+        .any(|entry| matches!(entry.event, JournalEvent::StructuredFastPathSelected { .. }))
+}
+
+fn structured_fast_path_decision_from_entries(
+    entries: &[JournalEntry],
+) -> Result<Option<StructuredFastPathDecision>, AgentError> {
+    let Some((origin, lane, signal, source)) = entries.iter().rev().find_map(|entry| {
+        if let JournalEvent::StructuredFastPathSelected {
+            origin,
+            lane,
+            signal,
+            source,
+        } = &entry.event
+        {
+            Some((origin, lane, signal, source))
+        } else {
+            None
+        }
+    }) else {
+        return Ok(None);
+    };
+
+    let lane = structured_lane_from_name(lane).ok_or_else(|| {
+        AgentError::StructuredFastPathUnsupported {
+            reason: format!("journaled structured lane is unknown: {lane}"),
+        }
+    })?;
+    let signal = structured_signal_from_name(signal).ok_or_else(|| {
+        AgentError::StructuredFastPathUnsupported {
+            reason: format!("journaled structured signal is unknown: {signal}"),
+        }
+    })?;
+    Ok(Some(StructuredFastPathDecision::new(
+        origin.clone(),
+        lane,
+        signal,
+        source.clone(),
+    )))
+}
+
+fn structured_lane_from_name(name: &str) -> Option<StructuredLane> {
+    match name {
+        "render" => Some(StructuredLane::Render),
+        "api" => Some(StructuredLane::Api),
+        "mcp" => Some(StructuredLane::Mcp),
+        _ => None,
+    }
+}
+
+fn structured_signal_from_name(name: &str) -> Option<StructuredSignal> {
+    match name {
+        "beater_json" => Some(StructuredSignal::BeaterJson),
+        "agent_card" => Some(StructuredSignal::AgentCard),
+        "llms_txt" => Some(StructuredSignal::LlmsTxt),
+        "openapi" => Some(StructuredSignal::OpenApi),
+        "mcp_catalog" => Some(StructuredSignal::McpCatalog),
+        "web_mcp" => Some(StructuredSignal::WebMcp),
+        _ => None,
+    }
+}
+
+fn structured_remote_side_effect(action: &Action) -> SideEffect {
+    match action {
+        Action::Skill { .. } => SideEffect::Send,
+        other => other.side_effect(),
+    }
 }
 
 fn is_policy_denial_reason(reason: &str) -> bool {
@@ -2339,6 +2652,7 @@ mod tests {
             &journal_path,
             AgentRunIds::new("run-structured", "session-structured"),
         )
+        .with_confirmation_mode(ConfirmationMode::AutoConfirmAll)
         .with_structured_fast_path(
             StructuredFastPath::with_probe(fake_mcp_fast_path_probe).allow_private_network_access(),
         );
@@ -2376,6 +2690,107 @@ mod tests {
             entries.last().map(|entry| &entry.event),
             Some(JournalEvent::SessionClosed)
         ));
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runner_mcp_fast_path_requires_confirmation_for_unknown_remote_tools() -> TestResult {
+        let root = unique_dir("runner-structured-fast-path-policy")?;
+        remove_dir_if_exists(&root)?;
+        fs::create_dir_all(&root)?;
+        let journal_path = root.join("session.jsonl");
+        let task = DriverTask::new(
+            "http://127.0.0.1:9/app",
+            vec![Action::Skill {
+                name: "send_email".into(),
+                input: serde_json::json!({"to": "user@example.com"}),
+            }],
+        );
+        let mut driver = FailingDriver::new(TransportFailurePoint::Goto);
+        let runner = AgentRunner::new(
+            &journal_path,
+            AgentRunIds::new("run-structured-policy", "session-structured-policy"),
+        )
+        .with_structured_fast_path(StructuredFastPath::with_probe(fake_mcp_fast_path_probe));
+
+        let report = runner.run_driver_task(&mut driver, &task).await?;
+
+        assert!(matches!(report.status, AgentRunStatus::PolicyDenied { .. }));
+        assert_eq!(report.engine, AgentRunEngine::Structured);
+        assert_eq!(driver.goto_calls, 0);
+        assert_eq!(report.actions_completed, 1);
+        assert_eq!(report.steps[0].policy.side_effect, SideEffect::Send);
+        assert_eq!(
+            report.steps[0].policy.confirmation_gate,
+            ConfirmationGate::Confirm
+        );
+        assert!(!report.steps[0].policy.confirmed);
+        assert!(!read_journal_entries(&journal_path)?
+            .iter()
+            .any(|entry| matches!(entry.event, JournalEvent::StepApplied { .. })));
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runner_resumes_journaled_mcp_fast_path_without_browser_observe() -> TestResult {
+        let root = unique_dir("runner-structured-fast-path-resume")?;
+        remove_dir_if_exists(&root)?;
+        fs::create_dir_all(&root)?;
+        let journal_path = root.join("session.jsonl");
+        let (origin, server) = serve_structured_mcp_fixture()?;
+        let action = Action::Skill {
+            name: "search".into(),
+            input: serde_json::json!({"q": "tempo"}),
+        };
+        let task = DriverTask::new(format!("{origin}/app"), vec![action]);
+        let mut journal = SessionJournal::open(
+            &journal_path,
+            RunId("run-structured-resume".into()),
+            SessionId("session-structured-resume".into()),
+        )?;
+        journal.append(JournalEvent::SessionStarted {
+            url: format!("{origin}/app"),
+        })?;
+        journal.append(JournalEvent::StructuredFastPathSelected {
+            origin: origin.clone(),
+            lane: "mcp".into(),
+            signal: "mcp_catalog".into(),
+            source: "/mcp/catalog.json".into(),
+        })?;
+        drop(journal);
+
+        let mut driver = FailingDriver::new(TransportFailurePoint::Goto);
+        let runner = AgentRunner::new(
+            &journal_path,
+            AgentRunIds::new("run-structured-resume", "session-structured-resume"),
+        )
+        .with_confirmation_mode(ConfirmationMode::AutoConfirmAll)
+        .with_structured_fast_path(StructuredFastPath::disabled().allow_private_network_access());
+
+        let result = runner.run_driver_task(&mut driver, &task).await;
+        let server_result = server
+            .join()
+            .map_err(|_| "structured MCP fixture thread panicked")?;
+        server_result?;
+        let report = result?;
+
+        assert_eq!(
+            report.status,
+            AgentRunStatus::StructuredFastPath(StructuredFastPathDecision::new(
+                origin,
+                StructuredLane::Mcp,
+                StructuredSignal::McpCatalog,
+                "/mcp/catalog.json"
+            ))
+        );
+        assert_eq!(report.engine, AgentRunEngine::Structured);
+        assert_eq!(driver.goto_calls, 0);
+        assert_eq!(driver.observe_calls, 0);
+        assert_eq!(report.actions_completed, 1);
 
         remove_dir_if_exists(&root)?;
         Ok(())
@@ -3066,6 +3481,136 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn mcp_tool_call_accepts_content_only_results() -> TestResult {
+        let call = StructuredMcpToolCall::from_json_rpc_response(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "fixture",
+            "result": {
+                "content": [{"type": "text", "text": "ok"}],
+                "isError": false
+            }
+        }))
+        .map_err(std::io::Error::other)?;
+
+        assert!(!call.is_error);
+        assert_eq!(
+            call.structured_content,
+            serde_json::json!({"content": [{"type": "text", "text": "ok"}]})
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn mcp_tool_call_uses_text_content_for_error_reason() -> TestResult {
+        let call = StructuredMcpToolCall::from_json_rpc_response(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "fixture",
+            "result": {
+                "content": [{"type": "text", "text": "permission denied"}],
+                "isError": true
+            }
+        }))
+        .map_err(std::io::Error::other)?;
+
+        assert!(call.is_error);
+        assert_eq!(call.error_reason(), "permission denied");
+        Ok(())
+    }
+
+    #[test]
+    fn mcp_tool_call_rejects_missing_content() -> TestResult {
+        let error = match StructuredMcpToolCall::from_json_rpc_response(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "fixture",
+            "result": {
+                "isError": false
+            }
+        })) {
+            Ok(_) => {
+                return Err(std::io::Error::other(
+                    "missing content response unexpectedly succeeded",
+                )
+                .into())
+            }
+            Err(error) => error,
+        };
+
+        assert_eq!(error, "MCP tools/call response missing content");
+        Ok(())
+    }
+
+    #[test]
+    fn mcp_initialize_response_requires_protocol_and_tools_capability() -> TestResult {
+        validate_mcp_initialize_response(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "fixture",
+            "result": {
+                "protocolVersion": MCP_PROTOCOL_VERSION,
+                "capabilities": {"tools": {}}
+            }
+        }))
+        .map_err(std::io::Error::other)?;
+
+        let error = match validate_mcp_initialize_response(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "fixture",
+            "result": {
+                "protocolVersion": MCP_PROTOCOL_VERSION,
+                "capabilities": {}
+            }
+        })) {
+            Ok(_) => {
+                return Err(std::io::Error::other(
+                    "missing tools capability unexpectedly succeeded",
+                )
+                .into())
+            }
+            Err(error) => error,
+        };
+        assert_eq!(error, "MCP initialize response missing tools capability");
+        Ok(())
+    }
+
+    #[test]
+    fn mcp_response_parser_accepts_sse_json_data() -> TestResult {
+        let parsed = parse_mcp_response_body(
+            "text/event-stream",
+            "event: message\ndata: {\"jsonrpc\":\"2.0\",\"result\":{\"content\":[]}}\n\n",
+            None,
+        )
+        .map_err(std::io::Error::other)?;
+
+        assert_eq!(
+            parsed,
+            serde_json::json!({"jsonrpc":"2.0","result":{"content":[]}})
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn mcp_response_parser_skips_sse_events_until_expected_id() -> TestResult {
+        let expected_id = serde_json::json!("wanted");
+        let parsed = parse_mcp_response_body(
+            "text/event-stream",
+            "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{}}\n\n\
+             data: {\"jsonrpc\":\"2.0\",\"id\":\"other\",\"result\":{\"content\":[]}}\n\n\
+             data: {\"jsonrpc\":\"2.0\",\"id\":\"wanted\",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"ok\"}]}}\n\n",
+            Some(&expected_id),
+        )
+        .map_err(std::io::Error::other)?;
+
+        assert_eq!(
+            parsed,
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "wanted",
+                "result": {"content": [{"type": "text", "text": "ok"}]}
+            })
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn runner_resume_does_not_reexecute_planned_but_unjournaled_step() -> TestResult {
         let root = unique_dir("runner-resume-interrupted")?;
@@ -3222,6 +3767,8 @@ mod tests {
         let handle = thread::spawn(move || -> std::io::Result<()> {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             let mut handled = 0_usize;
+            let mut saw_initialize = false;
+            let mut saw_initialized = false;
             let mut saw_tool_call = false;
             while !saw_tool_call && handled < 16 && std::time::Instant::now() < deadline {
                 match listener.accept() {
@@ -3229,9 +3776,7 @@ mod tests {
                         handled += 1;
                         stream.set_read_timeout(Some(std::time::Duration::from_secs(1)))?;
                         let request = read_http_request(&mut stream)?;
-                        let (status, content_type, body) = if request
-                            .starts_with("GET /mcp/catalog.json ")
-                        {
+                        let response = if request.starts_with("GET /mcp/catalog.json ") {
                             http_fixture_response(
                                 "200 OK",
                                 "application/json",
@@ -3240,30 +3785,84 @@ mod tests {
                         } else if request.starts_with("POST /mcp ")
                             && request.contains(r#""method":"initialize""#)
                         {
+                            assert_header_contains(&request, "accept", "application/json");
+                            assert_header_contains(&request, "accept", "text/event-stream");
+                            let request_id = json_rpc_request_id(&request)?;
+                            saw_initialize = true;
                             http_fixture_response(
                                 "200 OK",
                                 "application/json",
-                                r#"{"jsonrpc":"2.0","id":"fixture","result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"fixture","version":"1"}}}"#,
+                                serde_json::json!({
+                                    "jsonrpc": "2.0",
+                                    "id": request_id,
+                                    "result": {
+                                        "protocolVersion": MCP_PROTOCOL_VERSION,
+                                        "capabilities": {"tools": {}},
+                                        "serverInfo": {"name": "fixture", "version": "1"}
+                                    }
+                                })
+                                .to_string(),
                             )
+                            .with_header(MCP_SESSION_ID_HEADER, "fixture-session")
+                        } else if request.starts_with("POST /mcp ")
+                            && request.contains(r#""method":"notifications/initialized""#)
+                        {
+                            assert!(saw_initialize);
+                            assert_request_header(
+                                &request,
+                                MCP_SESSION_ID_HEADER,
+                                "fixture-session",
+                            );
+                            assert_request_header(
+                                &request,
+                                MCP_PROTOCOL_VERSION_HEADER,
+                                MCP_PROTOCOL_VERSION,
+                            );
+                            saw_initialized = true;
+                            http_fixture_response("202 Accepted", "text/plain", "")
                         } else if request.starts_with("POST /mcp ")
                             && request.contains(r#""method":"tools/call""#)
                             && request.contains(r#""name":"search""#)
                             && request.contains(r#""q":"tempo""#)
                         {
+                            assert!(saw_initialized);
+                            assert_request_header(
+                                &request,
+                                MCP_SESSION_ID_HEADER,
+                                "fixture-session",
+                            );
+                            assert_request_header(
+                                &request,
+                                MCP_PROTOCOL_VERSION_HEADER,
+                                MCP_PROTOCOL_VERSION,
+                            );
+                            let request_id = json_rpc_request_id(&request)?;
                             saw_tool_call = true;
+                            let response = serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "method": "notifications/progress",
+                                "params": {"progress": 1}
+                            })
+                            .to_string();
+                            let result = serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "id": request_id,
+                                "result": {
+                                    "content": [{"type": "text", "text": "{\"ok\":true}"}],
+                                    "isError": false
+                                }
+                            })
+                            .to_string();
                             http_fixture_response(
                                 "200 OK",
                                 "application/json",
-                                r#"{"jsonrpc":"2.0","id":"fixture","result":{"content":[{"type":"text","text":"{\"ok\":true}"}],"structuredContent":{"ok":true,"source":"mcp"},"isError":false}}"#,
+                                format!("data: {response}\n\ndata: {result}\n\n"),
                             )
+                            .with_content_type("text/event-stream")
                         } else {
                             http_fixture_response("404 Not Found", "text/plain", "not found")
                         };
-                        let response = format!(
-                            "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                            body.len()
-                        );
-                        stream.write_all(response.as_bytes())?;
+                        stream.write_all(response.to_http().as_bytes())?;
                         stream.flush()?;
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -3284,12 +3883,54 @@ mod tests {
         Ok((origin, handle))
     }
 
+    struct HttpFixtureResponse {
+        status: &'static str,
+        content_type: &'static str,
+        body: String,
+        headers: Vec<(&'static str, &'static str)>,
+    }
+
+    impl HttpFixtureResponse {
+        fn with_header(mut self, name: &'static str, value: &'static str) -> Self {
+            self.headers.push((name, value));
+            self
+        }
+
+        fn with_content_type(mut self, content_type: &'static str) -> Self {
+            self.content_type = content_type;
+            self
+        }
+
+        fn to_http(&self) -> String {
+            let mut response = format!(
+                "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n",
+                self.status,
+                self.content_type,
+                self.body.len()
+            );
+            for (name, value) in &self.headers {
+                response.push_str(name);
+                response.push_str(": ");
+                response.push_str(value);
+                response.push_str("\r\n");
+            }
+            response.push_str("\r\n");
+            response.push_str(&self.body);
+            response
+        }
+    }
+
     fn http_fixture_response(
         status: &'static str,
         content_type: &'static str,
-        body: &'static str,
-    ) -> (&'static str, &'static str, String) {
-        (status, content_type, body.to_string())
+        body: impl Into<String>,
+    ) -> HttpFixtureResponse {
+        HttpFixtureResponse {
+            status,
+            content_type,
+            body: body.into(),
+            headers: Vec::new(),
+        }
     }
 
     fn read_http_request(stream: &mut std::net::TcpStream) -> std::io::Result<String> {
@@ -3321,6 +3962,53 @@ mod tests {
             }
         }
         Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    fn json_rpc_request_id(request: &str) -> std::io::Result<serde_json::Value> {
+        let body = request
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "HTTP request missing body delimiter",
+                )
+            })?;
+        let request = serde_json::from_str::<serde_json::Value>(body).map_err(|error| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
+        })?;
+        request.get("id").cloned().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "JSON-RPC request missing id",
+            )
+        })
+    }
+
+    fn assert_request_header(request: &str, name: &str, expected: &str) {
+        let actual =
+            request_header(request, name).unwrap_or_else(|| panic!("missing {name} header"));
+        assert_eq!(actual, expected);
+    }
+
+    fn assert_header_contains(request: &str, name: &str, expected: &str) {
+        let actual =
+            request_header(request, name).unwrap_or_else(|| panic!("missing {name} header"));
+        assert!(
+            actual.contains(expected),
+            "expected {name} header {actual:?} to contain {expected:?}"
+        );
+    }
+
+    fn request_header<'a>(request: &'a str, name: &str) -> Option<&'a str> {
+        request.lines().find_map(|line| {
+            let (header_name, value) = line.split_once(':')?;
+            if header_name.eq_ignore_ascii_case(name) {
+                Some(value.trim())
+            } else {
+                None
+            }
+        })
     }
 
     fn fake_mcp_fast_path_probe(
