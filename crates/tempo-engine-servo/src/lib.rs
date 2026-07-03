@@ -24,6 +24,7 @@ use thiserror::Error;
 
 /// Default cap for a Servo-intercepted network response body reissued through tempo-net.
 pub const DEFAULT_MAX_SERVO_RESPONSE_BODY_BYTES: usize = 10 * 1024 * 1024;
+pub const MAX_SERVO_REDIRECTS: usize = 10;
 
 /// Which Servo build is backing this engine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -511,33 +512,64 @@ impl ServoNetworkAdapter {
         &self,
         request: &ServoNetworkRequest,
         network_request: NetworkRequest,
-        resolved_target: ResolvedTarget,
+        mut resolved_target: ResolvedTarget,
     ) -> Result<ServoNetworkFetch, ServoNetworkError> {
-        let audit = AuditRecord::from_request_with_resolved_socket(
-            &network_request,
+        let mut request = request.clone();
+        let mut network_request = network_request;
+        let mut redirects = 0_usize;
+
+        loop {
+            let audit = self.audit_checked_target(&network_request, &resolved_target)?;
+            let egress_decision = self
+                .egress_policy
+                .decide(&network_request)
+                .map_err(ServoNetworkError::from)?;
+            let signed_headers = self.signed_headers(&network_request)?;
+            let client = self.client_for(&egress_decision, &resolved_target)?;
+            let response =
+                self.send_request(&client, &request, &egress_decision, &signed_headers)?;
+
+            if let Some(next_request) = redirect_request(&request, &response)? {
+                if redirects >= MAX_SERVO_REDIRECTS {
+                    return Err(ServoNetworkError::TooManyRedirects {
+                        max: MAX_SERVO_REDIRECTS,
+                    });
+                }
+                redirects = redirects.saturating_add(1);
+                request = next_request;
+                network_request =
+                    request.to_network_request(&self.profile_id, self.identity_mode)?;
+                self.url_policy.enforce(&network_request.url)?;
+                resolved_target = ResolvedTarget::from_url(&network_request.url)?;
+                continue;
+            }
+
+            let egress_record = EgressRecord::from_decision(
+                request.request_id.clone(),
+                &egress_decision,
+                network_request.body_size(),
+                response.body.len() as u64,
+            );
+            return Ok(ServoNetworkFetch {
+                response,
+                audit,
+                egress_decision,
+                egress_record,
+                signed_headers,
+            });
+        }
+    }
+
+    fn audit_checked_target(
+        &self,
+        network_request: &NetworkRequest,
+        resolved_target: &ResolvedTarget,
+    ) -> Result<AuditRecord, ServoNetworkError> {
+        Ok(AuditRecord::from_request_with_resolved_socket(
+            network_request,
             &self.url_policy,
             resolved_target.socket,
-        )?;
-        let egress_decision = self
-            .egress_policy
-            .decide(&network_request)
-            .map_err(ServoNetworkError::from)?;
-        let signed_headers = self.signed_headers(&network_request)?;
-        let client = self.client_for(&egress_decision, &resolved_target)?;
-        let response = self.send_request(&client, request, &egress_decision, &signed_headers)?;
-        let egress_record = EgressRecord::from_decision(
-            request.request_id.clone(),
-            &egress_decision,
-            network_request.body_size(),
-            response.body.len() as u64,
-        );
-        Ok(ServoNetworkFetch {
-            response,
-            audit,
-            egress_decision,
-            egress_record,
-            signed_headers,
-        })
+        )?)
     }
 
     fn signed_headers(
@@ -562,7 +594,7 @@ impl ServoNetworkAdapter {
     ) -> Result<reqwest::blocking::Client, ServoNetworkError> {
         let mut builder = reqwest::blocking::Client::builder()
             .timeout(self.timeout)
-            .redirect(url_policy_redirect(self.url_policy.clone()))
+            .redirect(reqwest::redirect::Policy::none())
             .resolve_to_addrs(&resolved_target.host, &[resolved_target.socket]);
         if let EgressDecision::Proxied { proxy, .. } = decision {
             let proxy = reqwest::Proxy::all(&proxy.endpoint)
@@ -630,6 +662,93 @@ impl ServoNetworkAdapter {
             body,
         })
     }
+}
+
+fn redirect_request(
+    request: &ServoNetworkRequest,
+    response: &ServoNetworkResponse,
+) -> Result<Option<ServoNetworkRequest>, ServoNetworkError> {
+    if !is_redirect_status(response.status) {
+        return Ok(None);
+    }
+    let Some(location) = response_header(&response.headers, "location") else {
+        return Ok(None);
+    };
+
+    let base = reqwest::Url::parse(&request.url).map_err(|error| ServoNetworkError::Redirect {
+        url: request.url.clone(),
+        reason: error.to_string(),
+    })?;
+    let next_url = base
+        .join(location)
+        .map_err(|error| ServoNetworkError::Redirect {
+            url: request.url.clone(),
+            reason: error.to_string(),
+        })?
+        .to_string();
+
+    let mut next = request.clone();
+    next.url = next_url;
+    if !same_origin(&request.url, &next.url)? {
+        next.headers
+            .retain(|(name, _)| !is_cross_origin_redirect_sensitive_header(name));
+    }
+    if redirects_to_get(response.status, &request.method) {
+        next.method = "GET".into();
+        next.body.clear();
+        next.body_len = 0;
+        next.headers.retain(|(name, _)| {
+            !name.eq_ignore_ascii_case("content-length")
+                && !name.eq_ignore_ascii_case("content-type")
+        });
+    }
+    Ok(Some(next))
+}
+
+fn same_origin(left: &str, right: &str) -> Result<bool, ServoNetworkError> {
+    let left = reqwest::Url::parse(left).map_err(|error| ServoNetworkError::Redirect {
+        url: left.into(),
+        reason: error.to_string(),
+    })?;
+    let right = reqwest::Url::parse(right).map_err(|error| ServoNetworkError::Redirect {
+        url: right.into(),
+        reason: error.to_string(),
+    })?;
+
+    Ok(left.scheme() == right.scheme()
+        && left.host_str().map(str::to_ascii_lowercase)
+            == right.host_str().map(str::to_ascii_lowercase)
+        && left.port_or_known_default() == right.port_or_known_default())
+}
+
+fn is_redirect_status(status: u16) -> bool {
+    matches!(status, 301 | 302 | 303 | 307 | 308)
+}
+
+fn redirects_to_get(status: u16, method: &str) -> bool {
+    if method.eq_ignore_ascii_case("GET") || method.eq_ignore_ascii_case("HEAD") {
+        return false;
+    }
+    if status == 303 {
+        return true;
+    }
+    matches!(status, 301 | 302) && method.eq_ignore_ascii_case("POST")
+}
+
+fn response_header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(header_name, _)| header_name.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
+}
+
+fn is_cross_origin_redirect_sensitive_header(name: &str) -> bool {
+    name.eq_ignore_ascii_case("authorization")
+        || name.eq_ignore_ascii_case("cookie")
+        || name.eq_ignore_ascii_case("proxy-authorization")
+        || name.eq_ignore_ascii_case("signature")
+        || name.eq_ignore_ascii_case("signature-input")
+        || name.eq_ignore_ascii_case("signature-agent")
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -770,6 +889,10 @@ pub enum ServoNetworkError {
     Proxy(String),
     #[error("failed to resolve request target {url}: {reason}")]
     ResolveTarget { url: String, reason: String },
+    #[error("invalid redirect from {url}: {reason}")]
+    Redirect { url: String, reason: String },
+    #[error("too many redirects while reissuing Servo request: max {max}")]
+    TooManyRedirects { max: usize },
     #[error("invalid HTTP method: {0}")]
     InvalidMethod(String),
     #[error("invalid HTTP header {name}: {reason}")]
@@ -797,32 +920,6 @@ impl From<EgressDenied> for ServoNetworkError {
 fn servo_host_transport_error(error: ServoEngineError) -> TransportError {
     TransportError::Other(error.to_string())
 }
-
-/// Redirect policy that re-validates every hop against the URL policy so a
-/// remote origin cannot redirect the fetch into an internal/loopback target
-/// (issue #80). Blocks any hop the policy would block and caps the hop count.
-fn url_policy_redirect(url_policy: UrlPolicy) -> reqwest::redirect::Policy {
-    reqwest::redirect::Policy::custom(move |attempt| {
-        if attempt.previous().len() >= 10 {
-            return attempt.error(ServoRedirectBlocked("too many redirects".to_string()));
-        }
-        match url_policy.enforce(attempt.url().as_str()) {
-            Ok(()) => attempt.follow(),
-            Err(error) => attempt.error(ServoRedirectBlocked(error.to_string())),
-        }
-    })
-}
-
-#[derive(Debug)]
-struct ServoRedirectBlocked(String);
-
-impl std::fmt::Display for ServoRedirectBlocked {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "redirect blocked by URL policy: {}", self.0)
-    }
-}
-
-impl std::error::Error for ServoRedirectBlocked {}
 
 fn driver_wire_transport_error(error: DriverWireError) -> TransportError {
     match error {
@@ -1038,6 +1135,166 @@ mod tests {
             .ok_or_else(|| io::Error::other("expected resolved socket policy failure"))?;
 
         assert!(matches!(error, ServoNetworkError::Url(_)));
+        Ok(())
+    }
+
+    #[test]
+    fn servo_network_adapter_blocks_private_redirect_resolved_socket_before_network() -> TestResult
+    {
+        let adapter = ServoNetworkAdapter::new("profile-a", IdentityMode::AgentDeclared);
+        let original = ServoNetworkRequest::new("req-1", "GET", "https://public.example/start");
+        let redirect_response = ServoNetworkResponse {
+            request_id: "req-1".into(),
+            status: 302,
+            headers: vec![("location".into(), "https://redirect.example/latest".into())],
+            body: Vec::new(),
+        };
+        let redirected = redirect_request(&original, &redirect_response)?
+            .ok_or_else(|| io::Error::other("expected redirect request"))?;
+        let network_request =
+            redirected.to_network_request(&adapter.profile_id, adapter.identity_mode)?;
+
+        let error = adapter
+            .audit_checked_target(
+                &network_request,
+                &ResolvedTarget {
+                    host: "redirect.example".into(),
+                    socket: SocketAddr::from(([169, 254, 169, 254], 443)),
+                },
+            )
+            .err()
+            .ok_or_else(|| io::Error::other("expected resolved socket policy failure"))?;
+
+        assert!(matches!(error, ServoNetworkError::Url(_)));
+        Ok(())
+    }
+
+    #[test]
+    fn servo_network_redirect_request_rebases_relative_location_and_switches_post_to_get(
+    ) -> TestResult {
+        let request = ServoNetworkRequest::new("req-1", "POST", "https://public.example/a/form")
+            .with_header("content-type", "application/json")
+            .with_header("x-keep", "yes")
+            .with_body(br#"{"ok":true}"#.to_vec());
+        let response = ServoNetworkResponse {
+            request_id: "req-1".into(),
+            status: 303,
+            headers: vec![("Location".into(), "../done?ok=1".into())],
+            body: Vec::new(),
+        };
+
+        let redirected = redirect_request(&request, &response)?
+            .ok_or_else(|| io::Error::other("expected redirect request"))?;
+
+        assert_eq!(redirected.url, "https://public.example/done?ok=1");
+        assert_eq!(redirected.method, "GET");
+        assert_eq!(redirected.body_len, 0);
+        assert!(redirected.body.is_empty());
+        assert!(redirected
+            .headers
+            .iter()
+            .any(|(name, value)| name == "x-keep" && value == "yes"));
+        assert!(!redirected
+            .headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("content-type")));
+        Ok(())
+    }
+
+    #[test]
+    fn servo_network_redirect_request_preserves_non_post_302_method_and_body() -> TestResult {
+        let request = ServoNetworkRequest::new("req-1", "PUT", "https://public.example/a/item")
+            .with_header("content-type", "application/json")
+            .with_body(br#"{"ok":true}"#.to_vec());
+        let response = ServoNetworkResponse {
+            request_id: "req-1".into(),
+            status: 302,
+            headers: vec![("location".into(), "/moved".into())],
+            body: Vec::new(),
+        };
+
+        let redirected = redirect_request(&request, &response)?
+            .ok_or_else(|| io::Error::other("expected redirect request"))?;
+
+        assert_eq!(redirected.url, "https://public.example/moved");
+        assert_eq!(redirected.method, "PUT");
+        assert_eq!(redirected.body_len, request.body_len);
+        assert_eq!(redirected.body, request.body);
+        assert!(redirected
+            .headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("content-type")));
+        Ok(())
+    }
+
+    #[test]
+    fn servo_network_redirect_request_strips_sensitive_headers_cross_origin() -> TestResult {
+        let request = ServoNetworkRequest::new("req-1", "GET", "https://trusted.example/start")
+            .with_header("authorization", "Bearer secret")
+            .with_header("cookie", "session=secret")
+            .with_header("proxy-authorization", "Basic secret")
+            .with_header("signature", "sig1=:abc:")
+            .with_header("signature-input", "sig1=(\"@method\")")
+            .with_header("signature-agent", "agent")
+            .with_header("accept", "text/html");
+        let response = ServoNetworkResponse {
+            request_id: "req-1".into(),
+            status: 302,
+            headers: vec![("location".into(), "https://other.example/next".into())],
+            body: Vec::new(),
+        };
+
+        let redirected = redirect_request(&request, &response)?
+            .ok_or_else(|| io::Error::other("expected redirect request"))?;
+
+        assert_eq!(redirected.url, "https://other.example/next");
+        assert!(redirected
+            .headers
+            .iter()
+            .any(|(name, value)| name == "accept" && value == "text/html"));
+        for sensitive in [
+            "authorization",
+            "cookie",
+            "proxy-authorization",
+            "signature",
+            "signature-input",
+            "signature-agent",
+        ] {
+            assert!(
+                !redirected
+                    .headers
+                    .iter()
+                    .any(|(name, _)| name.eq_ignore_ascii_case(sensitive)),
+                "{sensitive} should be stripped on cross-origin redirect"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn servo_network_redirect_request_preserves_sensitive_headers_same_origin() -> TestResult {
+        let request = ServoNetworkRequest::new("req-1", "GET", "https://trusted.example/start")
+            .with_header("authorization", "Bearer secret")
+            .with_header("cookie", "session=secret");
+        let response = ServoNetworkResponse {
+            request_id: "req-1".into(),
+            status: 307,
+            headers: vec![("location".into(), "/next".into())],
+            body: Vec::new(),
+        };
+
+        let redirected = redirect_request(&request, &response)?
+            .ok_or_else(|| io::Error::other("expected redirect request"))?;
+
+        assert_eq!(redirected.url, "https://trusted.example/next");
+        assert!(redirected
+            .headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("authorization")));
+        assert!(redirected
+            .headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("cookie")));
         Ok(())
     }
 
