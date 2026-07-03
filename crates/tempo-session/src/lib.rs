@@ -32,6 +32,12 @@ pub enum JournalEvent {
     SessionStarted {
         url: String,
     },
+    StructuredFastPathSelected {
+        origin: String,
+        lane: String,
+        signal: String,
+        source: String,
+    },
     Observation {
         observation: CompiledObservation,
     },
@@ -155,9 +161,13 @@ impl SessionJournal {
         session_id: SessionId,
     ) -> Result<ResumeState, JournalError> {
         let path = path.as_ref().to_path_buf();
-        let conn = open_journal_connection(&path, JournalOpenMode::ReadWriteCreate)?;
-
-        let entries = read_journal_entries_from_connection(&conn)?;
+        // Read-only snapshot: no writer lock, no schema init, no pragma writes, and it
+        // never creates the database. A journal that does not exist yet resumes as an
+        // empty session rather than being materialized on disk.
+        let entries = match open_readonly_connection(&path)? {
+            Some(conn) => read_journal_entries_from_connection(&conn)?,
+            None => Vec::new(),
+        };
         validate_journal_entries(&entries, &run_id, &session_id)?;
         let next_seq = entries
             .iter()
@@ -381,6 +391,14 @@ pub enum JournalError {
     CassetteConflict { key: CassetteKey },
     #[error("system clock is before unix epoch")]
     ClockBeforeEpoch,
+    #[error(
+        "journal schema version {found} is newer than supported version {supported}; upgrade tempo to open this journal"
+    )]
+    IncompatibleVersion { found: i64, supported: i64 },
+    #[error(
+        "journal file {path:?} is not a tempo SQLite journal (legacy JSONL or foreign format); it cannot be opened by this version"
+    )]
+    LegacyFormat { path: PathBuf },
 }
 
 /// Human-readable crate summary retained for callers that expose crate capabilities.
@@ -390,43 +408,171 @@ pub fn describe() -> &'static str {
 
 pub fn read_journal_entries(path: impl AsRef<Path>) -> Result<Vec<JournalEntry>, JournalError> {
     let path = path.as_ref();
+    // Preserve the "missing journal is not silently created" contract: surface a
+    // NotFound IO error rather than fabricating an empty database.
     std::fs::metadata(path)?;
-    let conn = open_journal_connection(path, JournalOpenMode::ReadWriteCreate)?;
-    read_journal_entries_from_connection(&conn)
+    // Read-only: never runs schema init or pragma writes, so a concurrent writer's
+    // commit window cannot make this fail with SQLITE_BUSY.
+    match open_readonly_connection(path)? {
+        Some(conn) => read_journal_entries_from_connection(&conn),
+        None => Ok(Vec::new()),
+    }
 }
 
 pub fn read_cassettes(path: impl AsRef<Path>) -> Result<Vec<ResponseCassette>, JournalError> {
     read_jsonl(path)
 }
 
+/// Current on-disk journal schema version. Stamped into `PRAGMA user_version` on the
+/// write path and checked on every open so a newer, unknown layout is rejected instead
+/// of being silently read (and re-stamped) with the wrong assumptions.
+const SUPPORTED_JOURNAL_VERSION: i64 = 1;
+
+/// The 16-byte magic every SQLite database file begins with. Used to distinguish a
+/// legacy/foreign journal (e.g. a pre-#193 JSONL file) from a real SQLite database
+/// before handing the path to SQLite, so callers get an actionable error rather than a
+/// raw `SQLITE_NOTADB`.
+const SQLITE_HEADER_MAGIC: &[u8; 16] = b"SQLite format 3\0";
+
+/// How long a connection waits for a competing lock before returning `SQLITE_BUSY`.
+///
+/// The read/resume snapshot must be able to wait out a writer's short commit window
+/// (rollback-journal `DELETE` + `synchronous=FULL`) instead of failing immediately, so
+/// both readers and the writer use a non-zero timeout.
+const JOURNAL_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
 enum JournalOpenMode {
     ReadWriteCreate,
+    ReadOnly,
 }
 
 fn open_journal_connection(path: &Path, mode: JournalOpenMode) -> Result<Connection, JournalError> {
-    if let Some(parent) = path.parent() {
+    if let JournalOpenMode::ReadWriteCreate = mode
+        && let Some(parent) = path.parent()
+    {
         std::fs::create_dir_all(parent)?;
     }
+
+    // Reject a legacy/foreign file (e.g. a pre-#193 JSONL journal) up front so the
+    // caller gets `LegacyFormat` instead of an opaque `SQLITE_NOTADB` deep inside a
+    // pragma or query.
+    ensure_not_legacy_format(path)?;
 
     let flags = match mode {
         JournalOpenMode::ReadWriteCreate => {
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE
         }
+        JournalOpenMode::ReadOnly => OpenFlags::SQLITE_OPEN_READ_ONLY,
     };
-    let conn = Connection::open_with_flags(path, flags)?;
-    configure_journal_connection(&conn)?;
-    initialize_journal_schema(&conn)?;
+    let conn = Connection::open_with_flags(path, flags).map_err(|err| map_db_error(err, path))?;
+    configure_journal_connection(&conn, &mode)?;
+    check_journal_version(&conn, path)?;
+    if let JournalOpenMode::ReadWriteCreate = mode {
+        initialize_journal_schema(&conn)?;
+        stamp_journal_version(&conn)?;
+    }
     Ok(conn)
 }
 
-fn configure_journal_connection(conn: &Connection) -> Result<(), JournalError> {
-    conn.busy_timeout(Duration::from_millis(0))?;
-    conn.execute_batch(
-        "PRAGMA journal_mode=DELETE;
-         PRAGMA synchronous=FULL;
-         PRAGMA foreign_keys=ON;
-         PRAGMA user_version=1;",
-    )?;
+/// Open an existing journal read-only, without taking a writer lock, running schema
+/// init, or writing any pragma. Returns `Ok(None)` when the journal does not exist yet
+/// (or is a zero-byte placeholder), so a read/resume never creates the database.
+fn open_readonly_connection(path: &Path) -> Result<Option<Connection>, JournalError> {
+    match std::fs::metadata(path) {
+        Ok(metadata) if metadata.len() == 0 => return Ok(None),
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    }
+    Ok(Some(open_journal_connection(
+        path,
+        JournalOpenMode::ReadOnly,
+    )?))
+}
+
+/// Map a raw SQLite failure to an actionable [`JournalError::LegacyFormat`] when it
+/// signals the file is not a database, otherwise pass it through.
+fn map_db_error(err: rusqlite::Error, path: &Path) -> JournalError {
+    if let rusqlite::Error::SqliteFailure(inner, _) = &err
+        && inner.code == rusqlite::ErrorCode::NotADatabase
+    {
+        return JournalError::LegacyFormat {
+            path: path.to_path_buf(),
+        };
+    }
+    JournalError::Sqlite(err)
+}
+
+/// Return [`JournalError::LegacyFormat`] if an existing, non-empty file does not begin
+/// with the SQLite header magic. A missing or zero-byte file is fine: the write path
+/// will create a fresh database and the read path treats it as empty.
+fn ensure_not_legacy_format(path: &Path) -> Result<(), JournalError> {
+    use std::io::Read as _;
+
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err.into()),
+    };
+    let mut header = [0u8; SQLITE_HEADER_MAGIC.len()];
+    let mut read = 0usize;
+    while read < header.len() {
+        match file.read(&mut header[read..]) {
+            Ok(0) => break,
+            Ok(n) => read += n,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err.into()),
+        }
+    }
+    if read == 0 {
+        // Empty file: a valid target for a fresh database.
+        return Ok(());
+    }
+    if read < header.len() || &header != SQLITE_HEADER_MAGIC {
+        return Err(JournalError::LegacyFormat {
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(())
+}
+
+/// Read `PRAGMA user_version` and reject a journal written by a newer, unknown schema
+/// rather than silently reading (and re-stamping) it with stale assumptions.
+fn check_journal_version(conn: &Connection, path: &Path) -> Result<(), JournalError> {
+    let version: i64 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(|err| map_db_error(err, path))?;
+    if version > SUPPORTED_JOURNAL_VERSION {
+        return Err(JournalError::IncompatibleVersion {
+            found: version,
+            supported: SUPPORTED_JOURNAL_VERSION,
+        });
+    }
+    Ok(())
+}
+
+/// Stamp the current schema version. Only called on the write path, after the version
+/// has been checked, so an incompatible database is never overwritten.
+fn stamp_journal_version(conn: &Connection) -> Result<(), JournalError> {
+    // `PRAGMA` does not accept bound parameters; the value is a compile-time constant.
+    conn.execute_batch(&format!("PRAGMA user_version={SUPPORTED_JOURNAL_VERSION};"))?;
+    Ok(())
+}
+
+fn configure_journal_connection(
+    conn: &Connection,
+    mode: &JournalOpenMode,
+) -> Result<(), JournalError> {
+    conn.busy_timeout(JOURNAL_BUSY_TIMEOUT)?;
+    // A read-only connection cannot (and must not) write these pragmas; doing so would
+    // require a write lock and defeat the lock-free read/resume contract.
+    if let JournalOpenMode::ReadWriteCreate = mode {
+        conn.execute_batch(
+            "PRAGMA journal_mode=DELETE;
+             PRAGMA synchronous=FULL;
+             PRAGMA foreign_keys=ON;",
+        )?;
+    }
     Ok(())
 }
 
@@ -1128,6 +1274,137 @@ mod tests {
 
         let other_method = CassetteKey::from_request("POST", "https://example.com/api", b"payload");
         assert_ne!(a, other_method);
+    }
+
+    #[test]
+    fn resume_reads_committed_snapshot_while_writer_holds_journal() -> TestResult {
+        // #202: resume is a lock-free read-only snapshot. It must succeed while a
+        // SessionJournal is open for writing, returning the committed entries without a
+        // SQLITE_BUSY error.
+        let path = unique_path("resume-concurrent")?;
+        remove_if_exists(&path)?;
+        let run_id = RunId("run-live".into());
+        let session_id = SessionId("session-live".into());
+
+        let mut writer = SessionJournal::open(&path, run_id.clone(), session_id.clone())?;
+        writer.append(JournalEvent::SessionStarted {
+            url: "https://example.com".into(),
+        })?;
+        writer.append(JournalEvent::SessionClosed)?;
+
+        // Writer is still alive and holding the journal; the read must not fail.
+        let resumed = SessionJournal::resume(&path, run_id.clone(), session_id.clone())?;
+        assert_eq!(resumed.entries.len(), 2);
+        assert_eq!(resumed.next_seq, 2);
+
+        let entries = read_journal_entries(&path)?;
+        assert_eq!(entries.len(), 2);
+
+        drop(writer);
+        remove_if_exists(&path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn resume_of_missing_journal_is_empty_and_does_not_create_db() -> TestResult {
+        // #202: a read/resume of a journal that does not exist yet returns an empty
+        // snapshot and must not materialize a database on disk.
+        let path = unique_path("resume-missing")?;
+        remove_if_exists(&path)?;
+
+        let resumed = SessionJournal::resume(
+            &path,
+            RunId("run-absent".into()),
+            SessionId("session-absent".into()),
+        )?;
+        assert!(resumed.entries.is_empty());
+        assert_eq!(resumed.next_seq, 0);
+        assert!(!path.exists());
+        assert!(!journal_lock_path(&path).exists());
+
+        Ok(())
+    }
+
+    #[test]
+    fn opening_newer_schema_version_is_rejected() -> TestResult {
+        // #203: a journal stamped with a higher user_version must be rejected with a
+        // distinct error instead of being silently downgraded/re-stamped.
+        let path = unique_path("newer-version")?;
+        remove_if_exists(&path)?;
+        let run_id = RunId("run-ver".into());
+        let session_id = SessionId("session-ver".into());
+
+        {
+            let mut journal = SessionJournal::open(&path, run_id.clone(), session_id.clone())?;
+            journal.append(JournalEvent::SessionStarted {
+                url: "https://example.com".into(),
+            })?;
+        }
+
+        {
+            let conn = Connection::open(&path)?;
+            conn.execute_batch(&format!(
+                "PRAGMA user_version={};",
+                SUPPORTED_JOURNAL_VERSION + 1
+            ))?;
+        }
+
+        assert!(matches!(
+            SessionJournal::resume(&path, run_id.clone(), session_id.clone()),
+            Err(JournalError::IncompatibleVersion {
+                found,
+                supported,
+            }) if found == SUPPORTED_JOURNAL_VERSION + 1 && supported == SUPPORTED_JOURNAL_VERSION
+        ));
+        assert!(matches!(
+            read_journal_entries(&path),
+            Err(JournalError::IncompatibleVersion { .. })
+        ));
+        assert!(matches!(
+            SessionJournal::open(&path, run_id, session_id),
+            Err(JournalError::IncompatibleVersion { .. })
+        ));
+
+        remove_if_exists(&path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn opening_legacy_non_sqlite_file_reports_distinct_error() -> TestResult {
+        // #203: a pre-#193 JSONL (or any non-SQLite) file must produce an actionable
+        // LegacyFormat error rather than a raw opaque SQLITE_NOTADB.
+        let path = unique_path("legacy-jsonl")?;
+        remove_if_exists(&path)?;
+        {
+            let mut file = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&path)?;
+            file.write_all(
+                b"{\"schema_version\":\"1\",\"run_id\":\"r\",\"session_id\":\"s\",\"seq\":0}\n",
+            )?;
+            file.flush()?;
+        }
+
+        let run_id = RunId("run-legacy".into());
+        let session_id = SessionId("session-legacy".into());
+
+        assert!(matches!(
+            SessionJournal::resume(&path, run_id.clone(), session_id.clone()),
+            Err(JournalError::LegacyFormat { path: p }) if p == path
+        ));
+        assert!(matches!(
+            read_journal_entries(&path),
+            Err(JournalError::LegacyFormat { .. })
+        ));
+        assert!(matches!(
+            SessionJournal::open(&path, run_id, session_id),
+            Err(JournalError::LegacyFormat { .. })
+        ));
+
+        remove_if_exists(&path)?;
+        Ok(())
     }
 
     fn unique_path(label: &str) -> Result<PathBuf, std::time::SystemTimeError> {

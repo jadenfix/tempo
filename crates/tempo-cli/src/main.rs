@@ -12,8 +12,8 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use tempo_agent::{
-    step_triples_from_journal_entries, AgentRunIds, AgentRunReport, AgentRunStatus, AgentRunner,
-    ConfirmationMode, DriverTask, IdempotencyKey, StepTriple, StepTripleOutcome,
+    step_triples_from_journal_entries, AgentRunEngine, AgentRunIds, AgentRunReport, AgentRunStatus,
+    AgentRunner, ConfirmationMode, DriverTask, IdempotencyKey, StepTriple, StepTripleOutcome,
     StructuredFastPath,
 };
 use tempo_compat::{run_injection_gate, CompatScorecard, CompatThresholds, InjectionCaseResult};
@@ -683,6 +683,7 @@ struct ReplaySummary {
     last_seq: Option<u64>,
     session_started: bool,
     session_closed: bool,
+    structured_fast_path_selected: usize,
     observations: usize,
     planned_actions: usize,
     applied_steps: usize,
@@ -703,6 +704,7 @@ impl ReplaySummary {
             last_seq: entries.last().map(|entry| entry.seq),
             session_started: false,
             session_closed: false,
+            structured_fast_path_selected: 0,
             observations: 0,
             planned_actions: 0,
             applied_steps: 0,
@@ -716,6 +718,9 @@ impl ReplaySummary {
         for entry in entries {
             match &entry.event {
                 JournalEvent::SessionStarted { .. } => summary.session_started = true,
+                JournalEvent::StructuredFastPathSelected { .. } => {
+                    summary.structured_fast_path_selected += 1;
+                }
                 JournalEvent::Observation { .. } => summary.observations += 1,
                 JournalEvent::ActionPlanned { .. } => summary.planned_actions += 1,
                 JournalEvent::StepApplied { .. } => summary.applied_steps += 1,
@@ -794,6 +799,7 @@ fn replay_steps_from_entries(entries: &[JournalEntry]) -> Result<Vec<ReplayStep>
                 completed_steps += 1;
             }
             JournalEvent::SessionStarted { .. }
+            | JournalEvent::StructuredFastPathSelected { .. }
             | JournalEvent::Observation { .. }
             | JournalEvent::TransportError { .. }
             | JournalEvent::CassetteRecorded { .. }
@@ -902,24 +908,25 @@ fn run_cdp_task(config: RunCdpTaskConfig) -> Result<RunCdpTaskReport, CliError> 
     if config.allow_private_network {
         structured_fast_path = structured_fast_path.allow_private_network_access();
     }
-    if let Some(decision) = structured_fast_path.probe_target(&config.start_url)
-        && decision.skips_render()
-    {
-        return Ok(RunCdpTaskReport {
-            engine: "structured".into(),
-            journal: config.journal.display().to_string(),
-            status: run_status(&AgentRunStatus::StructuredFastPath(decision)),
-            actions_completed: 0,
-            observations: 0,
-            max_observation_bytes: 0,
-            max_observation_tokens: 0,
-            steps: Vec::new(),
-        });
-    }
+    let task = DriverTask::new(config.start_url.clone(), config.actions.clone());
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
+    if let Some(decision) = structured_fast_path.probe_target(&config.start_url)
+        && decision.skips_render()
+        && decision.supports_driver_task(&task)
+    {
+        let runner = AgentRunner::new(
+            &config.journal,
+            AgentRunIds::new(config.run_id, config.session_id),
+        )
+        .with_confirmation_mode(config.confirmation_mode)
+        .with_structured_fast_path(structured_fast_path);
+        let report = runtime.block_on(runner.run_structured_task(&task, decision))?;
+        return Ok(RunCdpTaskReport::from_agent_report(report));
+    }
+
     runtime.block_on(async move {
         let mut cdp_config = CdpConfig::default();
         if let Some(chrome) = config.chrome {
@@ -936,7 +943,6 @@ fn run_cdp_task(config: RunCdpTaskConfig) -> Result<RunCdpTaskReport, CliError> 
         )
         .with_confirmation_mode(config.confirmation_mode)
         .with_structured_fast_path(StructuredFastPath::disabled());
-        let task = DriverTask::new(config.start_url, config.actions);
 
         let run_result = runner.run_driver_task(&mut driver, &task).await;
         let close_result = driver.close().await;
@@ -1036,8 +1042,11 @@ fn step_outcome(outcome: &StepTripleOutcome) -> RunCdpTaskStepOutcome {
     }
 }
 
-fn engine_name(engine: tempo_driver::Engine) -> String {
-    format!("{engine:?}").to_ascii_lowercase()
+fn engine_name(engine: AgentRunEngine) -> String {
+    match engine {
+        AgentRunEngine::Structured => "structured".into(),
+        AgentRunEngine::Driver(engine) => format!("{engine:?}").to_ascii_lowercase(),
+    }
 }
 
 fn observation_gate_violations(report: &ObservationCorpusReport) -> usize {
@@ -1679,7 +1688,14 @@ mod tests {
         assert_eq!(report.status.signal, Some("mcp_catalog"));
         assert_eq!(report.observations, 0);
         assert!(report.steps.is_empty());
-        assert!(!dir.join("session.jsonl").exists());
+        let entries = tempo_session::read_journal_entries(dir.join("session.jsonl"))?;
+        assert!(entries
+            .iter()
+            .any(|entry| matches!(entry.event, JournalEvent::StructuredFastPathSelected { .. })));
+        assert!(matches!(
+            entries.last().map(|entry| &entry.event),
+            Some(JournalEvent::SessionClosed)
+        ));
 
         remove_dir(&dir)?;
         Ok(())

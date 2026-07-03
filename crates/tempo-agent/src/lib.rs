@@ -42,6 +42,11 @@ pub const MAX_SKILL_EXPANSION_ACTIONS: usize = 1_024;
 /// completed in a prior run, whose side effect may already have happened (#99).
 pub const RESUME_INTERRUPTED_REASON: &str = "resume: step was planned but its outcome was not journaled; not re-executed to avoid duplicating a side effect";
 
+const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
+const MCP_ACCEPT: &str = "application/json, text/event-stream";
+const MCP_PROTOCOL_VERSION_HEADER: &str = "MCP-Protocol-Version";
+const MCP_SESSION_ID_HEADER: &str = "Mcp-Session-Id";
+
 pub type StructuredFastPathProbe = fn(&str, HttpProbeConfig) -> Option<StructuredFastPathDecision>;
 
 /// Structured surface selected before browser navigation.
@@ -94,6 +99,49 @@ impl StructuredFastPathDecision {
             StructuredSignal::McpCatalog => "mcp_catalog",
             StructuredSignal::WebMcp => "web_mcp",
         }
+    }
+
+    pub fn supports_driver_task(&self, task: &DriverTask) -> bool {
+        if !matches!(
+            (self.lane, self.signal),
+            (StructuredLane::Mcp, StructuredSignal::McpCatalog)
+        ) {
+            return false;
+        }
+        if self.mcp_endpoint_path().is_none() {
+            return false;
+        }
+        task.steps
+            .iter()
+            .all(|step| matches!(step.action, Action::Skill { .. }))
+    }
+
+    fn mcp_endpoint_url(&self) -> Result<reqwest::Url, AgentError> {
+        let endpoint_path =
+            self.mcp_endpoint_path()
+                .ok_or_else(|| AgentError::StructuredFastPathUnsupported {
+                    reason: format!(
+                        "structured MCP source is not an executable catalog endpoint: {}",
+                        self.source
+                    ),
+                })?;
+        let mut endpoint = reqwest::Url::parse(&self.origin).map_err(|error| {
+            AgentError::InvalidStructuredEndpoint {
+                value: self.origin.clone(),
+                reason: error.to_string(),
+            }
+        })?;
+        endpoint.set_path(endpoint_path);
+        endpoint.set_query(None);
+        endpoint.set_fragment(None);
+        Ok(endpoint)
+    }
+
+    fn mcp_endpoint_path(&self) -> Option<&str> {
+        let source = self.source.trim();
+        source
+            .strip_suffix("/catalog.json")
+            .filter(|path| !path.is_empty() && path.starts_with('/'))
     }
 }
 
@@ -299,6 +347,7 @@ impl ResumeCursor {
                 }
                 JournalEvent::SessionClosed => closed = true,
                 JournalEvent::SessionStarted { .. }
+                | JournalEvent::StructuredFastPathSelected { .. }
                 | JournalEvent::Observation { .. }
                 | JournalEvent::TransportError { .. }
                 | JournalEvent::CassetteRecorded { .. } => {}
@@ -450,6 +499,20 @@ impl AgentLoop {
     pub fn record_session_started(&mut self, url: impl Into<String>) -> Result<(), AgentError> {
         self.journal
             .append(JournalEvent::SessionStarted { url: url.into() })?;
+        Ok(())
+    }
+
+    pub fn record_structured_fast_path_selected(
+        &mut self,
+        decision: &StructuredFastPathDecision,
+    ) -> Result<(), AgentError> {
+        self.journal
+            .append(JournalEvent::StructuredFastPathSelected {
+                origin: decision.origin.clone(),
+                lane: decision.lane_name().to_string(),
+                signal: decision.signal_name().to_string(),
+                source: decision.source.clone(),
+            })?;
         Ok(())
     }
 
@@ -715,49 +778,39 @@ impl AgentRunner {
     where
         D: DriverTrait + ?Sized,
     {
-        let plan = task.task_plan()?;
-        let mut agent = AgentLoop::open(
-            &self.journal_path,
-            self.ids.run_id.clone(),
-            self.ids.session_id.clone(),
-            plan,
-            self.token_budget.clone(),
-        )?;
-        let initial_entries = read_journal_entries(agent.journal_path())?;
-        let mut report = AgentRunReport::new(
-            driver.engine(),
-            agent.journal_path().to_path_buf(),
-            initial_entries.len(),
-            agent.cursor().completed_steps,
-        );
+        let (mut agent, initial_entries, mut report) =
+            self.open_agent_report(AgentRunEngine::Driver(driver.engine()), task)?;
 
-        if agent.cursor().closed && agent.is_complete() {
-            report.status = AgentRunStatus::AlreadyComplete;
+        if self.apply_resume_terminal_status(&agent, &mut report) {
             return Ok(report);
         }
 
-        if let Some((action_index, reason)) = &agent.cursor().last_step_error {
-            report.status = if is_policy_denial_reason(reason) {
-                AgentRunStatus::PolicyDenied {
-                    action_index: *action_index,
-                    reason: reason.clone(),
-                }
-            } else {
-                AgentRunStatus::StepError {
-                    action_index: *action_index,
-                    reason: reason.clone(),
-                }
-            };
-            return Ok(report);
+        if let Some(decision) = structured_fast_path_decision_from_entries(&initial_entries)? {
+            if !decision.skips_render() || !decision.supports_driver_task(task) {
+                return Err(AgentError::StructuredFastPathUnsupported {
+                    reason: format!(
+                        "journaled lane={} signal={} cannot execute this task without a browser",
+                        decision.lane_name(),
+                        decision.signal_name()
+                    ),
+                });
+            }
+            report.engine = AgentRunEngine::Structured;
+            return self
+                .run_structured_agent_task(agent, report, &initial_entries, task, decision)
+                .await;
         }
 
         let mut current_origin;
         if !has_session_started(&initial_entries) {
             if let Some(decision) = self.structured_fast_path.probe_target(&task.start_url)
                 && decision.skips_render()
+                && decision.supports_driver_task(task)
             {
-                report.status = AgentRunStatus::StructuredFastPath(decision);
-                return Ok(report);
+                report.engine = AgentRunEngine::Structured;
+                return self
+                    .run_structured_agent_task(agent, report, &initial_entries, task, decision)
+                    .await;
             }
 
             let observation = driver
@@ -908,6 +961,293 @@ impl AgentRunner {
         agent.close_session()?;
         report.status = AgentRunStatus::Completed;
         Ok(report)
+    }
+
+    pub async fn run_structured_task(
+        &self,
+        task: &DriverTask,
+        decision: StructuredFastPathDecision,
+    ) -> Result<AgentRunReport, AgentError> {
+        if !decision.skips_render() || !decision.supports_driver_task(task) {
+            return Err(AgentError::StructuredFastPathUnsupported {
+                reason: format!(
+                    "lane={} signal={} cannot execute this task without a browser",
+                    decision.lane_name(),
+                    decision.signal_name()
+                ),
+            });
+        }
+
+        let (agent, initial_entries, mut report) =
+            self.open_agent_report(AgentRunEngine::Structured, task)?;
+        if self.apply_resume_terminal_status(&agent, &mut report) {
+            return Ok(report);
+        }
+
+        self.run_structured_agent_task(agent, report, &initial_entries, task, decision)
+            .await
+    }
+
+    fn open_agent_report(
+        &self,
+        engine: AgentRunEngine,
+        task: &DriverTask,
+    ) -> Result<(AgentLoop, Vec<JournalEntry>, AgentRunReport), AgentError> {
+        let plan = task.task_plan()?;
+        let agent = AgentLoop::open(
+            &self.journal_path,
+            self.ids.run_id.clone(),
+            self.ids.session_id.clone(),
+            plan,
+            self.token_budget.clone(),
+        )?;
+        let initial_entries = read_journal_entries(agent.journal_path())?;
+        let report = AgentRunReport::new(
+            engine,
+            agent.journal_path().to_path_buf(),
+            initial_entries.len(),
+            agent.cursor().completed_steps,
+        );
+        Ok((agent, initial_entries, report))
+    }
+
+    fn apply_resume_terminal_status(&self, agent: &AgentLoop, report: &mut AgentRunReport) -> bool {
+        if agent.cursor().closed && agent.is_complete() {
+            report.status = AgentRunStatus::AlreadyComplete;
+            return true;
+        }
+
+        if let Some((action_index, reason)) = &agent.cursor().last_step_error {
+            report.status = if is_policy_denial_reason(reason) {
+                AgentRunStatus::PolicyDenied {
+                    action_index: *action_index,
+                    reason: reason.clone(),
+                }
+            } else {
+                AgentRunStatus::StepError {
+                    action_index: *action_index,
+                    reason: reason.clone(),
+                }
+            };
+            return true;
+        }
+
+        false
+    }
+
+    async fn run_structured_agent_task(
+        &self,
+        mut agent: AgentLoop,
+        mut report: AgentRunReport,
+        initial_entries: &[JournalEntry],
+        task: &DriverTask,
+        decision: StructuredFastPathDecision,
+    ) -> Result<AgentRunReport, AgentError> {
+        let current_origin = self.origin_for_url("structured fast path", &decision.origin)?;
+        if !has_session_started(initial_entries) {
+            agent.record_session_started(task.start_url.clone())?;
+        }
+        if !has_structured_fast_path_selected(initial_entries) {
+            agent.record_structured_fast_path_selected(&decision)?;
+        }
+
+        while let Some(planned) = agent.next_step().cloned() {
+            let index = agent.cursor().next_step;
+            let driver_step = task
+                .steps
+                .get(index)
+                .ok_or(AgentError::JournalHasExtraStep { index })?;
+
+            if agent.next_step_already_attempted() {
+                let policy = self.step_policy(
+                    driver_step,
+                    &planned.key,
+                    current_origin.as_ref(),
+                    structured_remote_side_effect(&driver_step.action),
+                )?;
+                let reason = RESUME_INTERRUPTED_REASON.to_string();
+                let triple = agent.record_pending_interruption(reason.clone())?;
+                report.actions_completed += 1;
+                report.steps.push(AgentStepReport {
+                    index,
+                    policy,
+                    triple,
+                    observation_budget: None,
+                });
+                report.status = AgentRunStatus::Interrupted {
+                    action_index: index,
+                    reason,
+                };
+                return Ok(report);
+            }
+
+            let policy = self.step_policy(
+                driver_step,
+                &planned.key,
+                current_origin.as_ref(),
+                structured_remote_side_effect(&driver_step.action),
+            )?;
+            if !policy.confirmed {
+                let reason = policy_denied_reason(&policy);
+                let triple = agent.record_next_outcome(StepOutcome::StepError {
+                    reason: reason.clone(),
+                })?;
+                report.actions_completed += 1;
+                report.steps.push(AgentStepReport {
+                    index,
+                    policy,
+                    triple,
+                    observation_budget: None,
+                });
+                report.status = AgentRunStatus::PolicyDenied {
+                    action_index: index,
+                    reason,
+                };
+                return Ok(report);
+            }
+
+            agent.plan_next_step()?;
+            let outcome = match &planned.action {
+                Action::Skill { name, input } => {
+                    let call = self
+                        .execute_structured_mcp_tool(&decision, &planned.key, name, input)
+                        .await
+                        .map_err(|reason| {
+                            structured_transport_error(
+                                &mut agent,
+                                "structured mcp tools/call",
+                                reason,
+                            )
+                        })?;
+                    if call.is_error {
+                        StepOutcome::StepError {
+                            reason: call.error_reason(),
+                        }
+                    } else {
+                        StepOutcome::Applied {
+                            diff: empty_structured_diff(index as u64),
+                        }
+                    }
+                }
+                other => {
+                    return Err(AgentError::StructuredFastPathUnsupported {
+                        reason: format!("unsupported structured action: {other:?}"),
+                    });
+                }
+            };
+            let triple = agent.record_next_outcome(outcome)?;
+            report.actions_completed += 1;
+
+            let step_error = match &triple.outcome {
+                StepTripleOutcome::StepError { reason } => Some(reason.clone()),
+                StepTripleOutcome::Applied { .. } => None,
+            };
+            report.steps.push(AgentStepReport {
+                index,
+                policy,
+                triple,
+                observation_budget: None,
+            });
+
+            if let Some(reason) = step_error {
+                report.status = AgentRunStatus::StepError {
+                    action_index: index,
+                    reason,
+                };
+                return Ok(report);
+            }
+        }
+
+        agent.close_session()?;
+        report.status = AgentRunStatus::StructuredFastPath(decision);
+        Ok(report)
+    }
+
+    async fn execute_structured_mcp_tool(
+        &self,
+        decision: &StructuredFastPathDecision,
+        key: &IdempotencyKey,
+        name: &str,
+        input: &serde_json::Value,
+    ) -> Result<StructuredMcpToolCall, String> {
+        let endpoint = decision
+            .mcp_endpoint_url()
+            .map_err(|error| error.to_string())?;
+        self.structured_fast_path
+            .config
+            .url_policy
+            .enforce(endpoint.as_str())
+            .map_err(|error| error.to_string())?;
+        let client = reqwest::Client::builder()
+            .timeout(self.structured_fast_path.config.timeout)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|error| error.to_string())?;
+
+        let initialize = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": format!("{}:initialize", key.0),
+            "method": "initialize",
+            "params": {
+                "protocolVersion": MCP_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {"name": "tempo-agent", "version": env!("CARGO_PKG_VERSION")},
+            },
+        });
+        let initialize =
+            post_mcp_json(&client, endpoint.as_str(), &initialize, None, false).await?;
+        if let Some(error) = initialize.body.get("error") {
+            return Err(format!(
+                "MCP initialize failed: {}",
+                json_rpc_error_message(error)
+            ));
+        }
+        validate_mcp_initialize_response(&initialize.body)?;
+        let mut session_id = initialize.session_id;
+
+        let initialized = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+        });
+        let initialized = post_mcp_json(
+            &client,
+            endpoint.as_str(),
+            &initialized,
+            session_id.as_deref(),
+            true,
+        )
+        .await?;
+        if let Some(error) = initialized.body.get("error") {
+            return Err(format!(
+                "MCP initialized notification failed: {}",
+                json_rpc_error_message(error)
+            ));
+        }
+        if initialized.session_id.is_some() {
+            session_id = initialized.session_id;
+        }
+
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": key.0,
+            "method": "tools/call",
+            "params": {
+                "name": name,
+                "arguments": input,
+            },
+        });
+        let response = post_mcp_json(
+            &client,
+            endpoint.as_str(),
+            &request,
+            session_id.as_deref(),
+            true,
+        )
+        .await?;
+        if let Some(error) = response.body.get("error") {
+            return Ok(StructuredMcpToolCall::error(json_rpc_error_message(error)));
+        }
+        StructuredMcpToolCall::from_json_rpc_response(response.body)
     }
 
     /// Read a skill from the store exactly once and return both its declared
@@ -1076,10 +1416,23 @@ fn expand_skill_batch(
     })
 }
 
-/// Durable report for one live-driver run attempt.
+/// Runtime lane used for one durable run attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentRunEngine {
+    Driver(Engine),
+    Structured,
+}
+
+impl PartialEq<Engine> for AgentRunEngine {
+    fn eq(&self, other: &Engine) -> bool {
+        matches!(self, Self::Driver(engine) if engine == other)
+    }
+}
+
+/// Durable report for one live-driver or no-render structured run attempt.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AgentRunReport {
-    pub engine: Engine,
+    pub engine: AgentRunEngine,
     pub journal_path: PathBuf,
     pub status: AgentRunStatus,
     pub initial_journal_entries: usize,
@@ -1092,7 +1445,7 @@ pub struct AgentRunReport {
 
 impl AgentRunReport {
     fn new(
-        engine: Engine,
+        engine: AgentRunEngine,
         journal_path: PathBuf,
         initial_journal_entries: usize,
         actions_completed: usize,
@@ -1113,7 +1466,9 @@ impl AgentRunReport {
     pub fn succeeded(&self) -> bool {
         matches!(
             self.status,
-            AgentRunStatus::Completed | AgentRunStatus::AlreadyComplete
+            AgentRunStatus::Completed
+                | AgentRunStatus::AlreadyComplete
+                | AgentRunStatus::StructuredFastPath(_)
         )
     }
 }
@@ -1231,6 +1586,7 @@ pub fn step_triples_from_journal(
                 step_index += 1;
             }
             JournalEvent::SessionStarted { .. }
+            | JournalEvent::StructuredFastPathSelected { .. }
             | JournalEvent::Observation { .. }
             | JournalEvent::ActionPlanned { .. }
             | JournalEvent::TransportError { .. }
@@ -1262,6 +1618,7 @@ pub fn step_triples_from_journal_entries(
                 )?);
             }
             JournalEvent::SessionStarted { .. }
+            | JournalEvent::StructuredFastPathSelected { .. }
             | JournalEvent::Observation { .. }
             | JournalEvent::ActionPlanned { .. }
             | JournalEvent::TransportError { .. }
@@ -1282,6 +1639,285 @@ pub fn step_triples_from_journal_without_plan(
     step_triples_from_journal_entries(&entries)
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct StructuredMcpToolCall {
+    is_error: bool,
+    structured_content: serde_json::Value,
+    content: serde_json::Value,
+}
+
+impl StructuredMcpToolCall {
+    fn error(reason: String) -> Self {
+        Self {
+            is_error: true,
+            structured_content: serde_json::json!({ "error": reason.clone() }),
+            content: serde_json::json!([{"type": "text", "text": reason}]),
+        }
+    }
+
+    fn from_json_rpc_response(response: serde_json::Value) -> Result<Self, String> {
+        let result = response
+            .get("result")
+            .ok_or_else(|| "MCP tools/call response missing result".to_string())?;
+        let is_error = result
+            .get("isError")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let content = result
+            .get("content")
+            .cloned()
+            .ok_or_else(|| "MCP tools/call response missing content".to_string())?;
+        if !content.is_array() {
+            return Err("MCP tools/call response content must be an array".to_string());
+        }
+        let structured_content = result.get("structuredContent").cloned().unwrap_or_else(|| {
+            serde_json::json!({
+                "content": content.clone()
+            })
+        });
+        Ok(Self {
+            is_error,
+            structured_content,
+            content,
+        })
+    }
+
+    fn error_reason(&self) -> String {
+        self.structured_content
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .or_else(|| mcp_content_text(&self.content))
+            .unwrap_or_else(|| self.structured_content.to_string())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct McpHttpResponse {
+    body: serde_json::Value,
+    session_id: Option<String>,
+}
+
+async fn post_mcp_json(
+    client: &reqwest::Client,
+    endpoint: &str,
+    request: &serde_json::Value,
+    session_id: Option<&str>,
+    include_protocol_version: bool,
+) -> Result<McpHttpResponse, String> {
+    let mut request_builder = client
+        .post(endpoint)
+        .header(reqwest::header::ACCEPT, MCP_ACCEPT)
+        .header(reqwest::header::CONTENT_TYPE, "application/json");
+    if include_protocol_version {
+        request_builder = request_builder.header(MCP_PROTOCOL_VERSION_HEADER, MCP_PROTOCOL_VERSION);
+    }
+    if let Some(session_id) = session_id {
+        request_builder = request_builder.header(MCP_SESSION_ID_HEADER, session_id);
+    }
+
+    let response = request_builder
+        .json(request)
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    let status = response.status();
+    let session_id = response
+        .headers()
+        .get(MCP_SESSION_ID_HEADER)
+        .or_else(|| response.headers().get("MCP-Session-Id"))
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let body = response.text().await.map_err(|error| error.to_string())?;
+    if !status.is_success() {
+        let detail = body.trim();
+        if detail.is_empty() {
+            return Err(format!("MCP endpoint returned HTTP {status}"));
+        }
+        return Err(format!("MCP endpoint returned HTTP {status}: {detail}"));
+    }
+    Ok(McpHttpResponse {
+        body: parse_mcp_response_body(&content_type, &body, request.get("id"))?,
+        session_id,
+    })
+}
+
+fn parse_mcp_response_body(
+    content_type: &str,
+    body: &str,
+    expected_id: Option<&serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        if let Some(expected_id) = expected_id {
+            return Err(format!(
+                "MCP response missing body for request id {}",
+                json_value_label(expected_id)
+            ));
+        }
+        return Ok(serde_json::Value::Null);
+    }
+
+    let media_type = content_type.split(';').next().unwrap_or_default().trim();
+    if media_type.eq_ignore_ascii_case("text/event-stream")
+        || trimmed.starts_with("event:")
+        || trimmed.starts_with("data:")
+    {
+        return parse_mcp_sse_response(trimmed, expected_id);
+    }
+
+    let response =
+        serde_json::from_str::<serde_json::Value>(trimmed).map_err(|error| error.to_string())?;
+    if let Some(expected_id) = expected_id {
+        validate_json_rpc_response_id(&response, expected_id)?;
+    }
+    Ok(response)
+}
+
+fn parse_mcp_sse_response(
+    body: &str,
+    expected_id: Option<&serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    let normalized = body.replace("\r\n", "\n");
+    let mut saw_data = false;
+    for event in normalized.split("\n\n") {
+        let data = event
+            .lines()
+            .filter_map(|line| line.strip_prefix("data:"))
+            .map(str::trim_start)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let data = data.trim();
+        if data.is_empty() {
+            continue;
+        }
+        saw_data = true;
+        let response =
+            serde_json::from_str::<serde_json::Value>(data).map_err(|error| error.to_string())?;
+        let Some(expected_id) = expected_id else {
+            return Ok(response);
+        };
+        if response.get("id") == Some(expected_id) {
+            return Ok(response);
+        }
+    }
+
+    if let Some(expected_id) = expected_id {
+        let detail = if saw_data {
+            "JSON-RPC response"
+        } else {
+            "data JSON"
+        };
+        return Err(format!(
+            "MCP SSE response missing {detail} for request id {}",
+            json_value_label(expected_id)
+        ));
+    }
+    Err("MCP SSE response missing data JSON".to_string())
+}
+
+fn validate_json_rpc_response_id(
+    response: &serde_json::Value,
+    expected_id: &serde_json::Value,
+) -> Result<(), String> {
+    match response.get("id") {
+        Some(actual_id) if actual_id == expected_id => Ok(()),
+        Some(actual_id) => Err(format!(
+            "MCP response id {} did not match request id {}",
+            json_value_label(actual_id),
+            json_value_label(expected_id)
+        )),
+        None => Err(format!(
+            "MCP response missing id for request id {}",
+            json_value_label(expected_id)
+        )),
+    }
+}
+
+fn json_value_label(value: &serde_json::Value) -> String {
+    value
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| value.to_string())
+}
+
+fn mcp_content_text(content: &serde_json::Value) -> Option<String> {
+    let text = content
+        .as_array()?
+        .iter()
+        .filter_map(|item| item.get("text")?.as_str())
+        .collect::<Vec<_>>();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text.join("\n"))
+    }
+}
+
+fn json_rpc_error_message(error: &serde_json::Value) -> String {
+    error
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| error.to_string())
+}
+
+fn validate_mcp_initialize_response(response: &serde_json::Value) -> Result<(), String> {
+    let result = response
+        .get("result")
+        .ok_or_else(|| "MCP initialize response missing result".to_string())?;
+    let protocol_version = result
+        .get("protocolVersion")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "MCP initialize response missing protocolVersion".to_string())?;
+    if protocol_version != MCP_PROTOCOL_VERSION {
+        return Err(format!(
+            "MCP server negotiated unsupported protocol version {protocol_version}; expected {MCP_PROTOCOL_VERSION}"
+        ));
+    }
+
+    let capabilities = result
+        .get("capabilities")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| "MCP initialize response missing capabilities".to_string())?;
+    let Some(tools) = capabilities.get("tools") else {
+        return Err("MCP initialize response missing tools capability".to_string());
+    };
+    if !tools.is_object() {
+        return Err("MCP initialize response tools capability must be an object".to_string());
+    }
+
+    Ok(())
+}
+
+fn empty_structured_diff(since_seq: u64) -> ObservationDiff {
+    ObservationDiff {
+        since_seq,
+        seq: since_seq.saturating_add(1),
+        added: Vec::new(),
+        removed: Vec::new(),
+        changed: Vec::new(),
+    }
+}
+
+fn structured_transport_error(
+    agent: &mut AgentLoop,
+    context: &'static str,
+    reason: String,
+) -> AgentError {
+    let source = TransportError::Other(reason);
+    match agent.record_transport_error(context, &source) {
+        Ok(()) => AgentError::transport(context, source),
+        Err(error) => error,
+    }
+}
+
 fn journal_transport_error(
     agent: &mut AgentLoop,
     context: &'static str,
@@ -1297,6 +1933,77 @@ fn has_session_started(entries: &[JournalEntry]) -> bool {
     entries
         .iter()
         .any(|entry| matches!(entry.event, JournalEvent::SessionStarted { .. }))
+}
+
+fn has_structured_fast_path_selected(entries: &[JournalEntry]) -> bool {
+    entries
+        .iter()
+        .any(|entry| matches!(entry.event, JournalEvent::StructuredFastPathSelected { .. }))
+}
+
+fn structured_fast_path_decision_from_entries(
+    entries: &[JournalEntry],
+) -> Result<Option<StructuredFastPathDecision>, AgentError> {
+    let Some((origin, lane, signal, source)) = entries.iter().rev().find_map(|entry| {
+        if let JournalEvent::StructuredFastPathSelected {
+            origin,
+            lane,
+            signal,
+            source,
+        } = &entry.event
+        {
+            Some((origin, lane, signal, source))
+        } else {
+            None
+        }
+    }) else {
+        return Ok(None);
+    };
+
+    let lane = structured_lane_from_name(lane).ok_or_else(|| {
+        AgentError::StructuredFastPathUnsupported {
+            reason: format!("journaled structured lane is unknown: {lane}"),
+        }
+    })?;
+    let signal = structured_signal_from_name(signal).ok_or_else(|| {
+        AgentError::StructuredFastPathUnsupported {
+            reason: format!("journaled structured signal is unknown: {signal}"),
+        }
+    })?;
+    Ok(Some(StructuredFastPathDecision::new(
+        origin.clone(),
+        lane,
+        signal,
+        source.clone(),
+    )))
+}
+
+fn structured_lane_from_name(name: &str) -> Option<StructuredLane> {
+    match name {
+        "render" => Some(StructuredLane::Render),
+        "api" => Some(StructuredLane::Api),
+        "mcp" => Some(StructuredLane::Mcp),
+        _ => None,
+    }
+}
+
+fn structured_signal_from_name(name: &str) -> Option<StructuredSignal> {
+    match name {
+        "beater_json" => Some(StructuredSignal::BeaterJson),
+        "agent_card" => Some(StructuredSignal::AgentCard),
+        "llms_txt" => Some(StructuredSignal::LlmsTxt),
+        "openapi" => Some(StructuredSignal::OpenApi),
+        "mcp_catalog" => Some(StructuredSignal::McpCatalog),
+        "web_mcp" => Some(StructuredSignal::WebMcp),
+        _ => None,
+    }
+}
+
+fn structured_remote_side_effect(action: &Action) -> SideEffect {
+    match action {
+        Action::Skill { .. } => SideEffect::Send,
+        other => other.side_effect(),
+    }
 }
 
 fn is_policy_denial_reason(reason: &str) -> bool {
@@ -1360,6 +2067,10 @@ pub enum AgentError {
         context: String,
         source: TransportError,
     },
+    #[error("structured fast path cannot execute this task: {reason}")]
+    StructuredFastPathUnsupported { reason: String },
+    #[error("invalid structured fast path endpoint {value}: {reason}")]
+    InvalidStructuredEndpoint { value: String, reason: String },
     #[error("invalid origin during {context}: {url}: {reason}")]
     InvalidOrigin {
         context: &'static str,
@@ -1922,8 +2633,172 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runner_structured_fast_path_skips_initial_driver_navigation() -> TestResult {
+    async fn runner_structured_fast_path_executes_remote_mcp_skill_without_navigation() -> TestResult
+    {
         let root = unique_dir("runner-structured-fast-path")?;
+        remove_dir_if_exists(&root)?;
+        fs::create_dir_all(&root)?;
+        let journal_path = root.join("session.jsonl");
+        let (origin, server) = serve_structured_mcp_fixture()?;
+        let task = DriverTask::new(
+            format!("{origin}/app"),
+            vec![Action::Skill {
+                name: "search".into(),
+                input: serde_json::json!({"q": "tempo"}),
+            }],
+        );
+        let mut driver = FailingDriver::new(TransportFailurePoint::Goto);
+        let runner = AgentRunner::new(
+            &journal_path,
+            AgentRunIds::new("run-structured", "session-structured"),
+        )
+        .with_confirmation_mode(ConfirmationMode::AutoConfirmAll)
+        .with_structured_fast_path(
+            StructuredFastPath::with_probe(fake_mcp_fast_path_probe).allow_private_network_access(),
+        );
+
+        let report = runner.run_driver_task(&mut driver, &task).await?;
+        server
+            .join()
+            .map_err(|_| "structured MCP fixture thread panicked")??;
+
+        assert_eq!(
+            report.status,
+            AgentRunStatus::StructuredFastPath(StructuredFastPathDecision::new(
+                origin.clone(),
+                StructuredLane::Mcp,
+                StructuredSignal::McpCatalog,
+                "/mcp/catalog.json"
+            ))
+        );
+        assert_eq!(report.engine, AgentRunEngine::Structured);
+        assert_eq!(driver.goto_calls, 0);
+        assert_eq!(report.actions_completed, 1);
+        assert_eq!(report.observations, 0);
+        let entries = read_journal_entries(&journal_path)?;
+        assert!(matches!(
+            entries.first().map(|entry| &entry.event),
+            Some(JournalEvent::SessionStarted { .. })
+        ));
+        assert!(entries
+            .iter()
+            .any(|entry| matches!(entry.event, JournalEvent::StructuredFastPathSelected { .. })));
+        assert!(entries
+            .iter()
+            .any(|entry| matches!(entry.event, JournalEvent::StepApplied { .. })));
+        assert!(matches!(
+            entries.last().map(|entry| &entry.event),
+            Some(JournalEvent::SessionClosed)
+        ));
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runner_mcp_fast_path_requires_confirmation_for_unknown_remote_tools() -> TestResult {
+        let root = unique_dir("runner-structured-fast-path-policy")?;
+        remove_dir_if_exists(&root)?;
+        fs::create_dir_all(&root)?;
+        let journal_path = root.join("session.jsonl");
+        let task = DriverTask::new(
+            "http://127.0.0.1:9/app",
+            vec![Action::Skill {
+                name: "send_email".into(),
+                input: serde_json::json!({"to": "user@example.com"}),
+            }],
+        );
+        let mut driver = FailingDriver::new(TransportFailurePoint::Goto);
+        let runner = AgentRunner::new(
+            &journal_path,
+            AgentRunIds::new("run-structured-policy", "session-structured-policy"),
+        )
+        .with_structured_fast_path(StructuredFastPath::with_probe(fake_mcp_fast_path_probe));
+
+        let report = runner.run_driver_task(&mut driver, &task).await?;
+
+        assert!(matches!(report.status, AgentRunStatus::PolicyDenied { .. }));
+        assert_eq!(report.engine, AgentRunEngine::Structured);
+        assert_eq!(driver.goto_calls, 0);
+        assert_eq!(report.actions_completed, 1);
+        assert_eq!(report.steps[0].policy.side_effect, SideEffect::Send);
+        assert_eq!(
+            report.steps[0].policy.confirmation_gate,
+            ConfirmationGate::Confirm
+        );
+        assert!(!report.steps[0].policy.confirmed);
+        assert!(!read_journal_entries(&journal_path)?
+            .iter()
+            .any(|entry| matches!(entry.event, JournalEvent::StepApplied { .. })));
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runner_resumes_journaled_mcp_fast_path_without_browser_observe() -> TestResult {
+        let root = unique_dir("runner-structured-fast-path-resume")?;
+        remove_dir_if_exists(&root)?;
+        fs::create_dir_all(&root)?;
+        let journal_path = root.join("session.jsonl");
+        let (origin, server) = serve_structured_mcp_fixture()?;
+        let action = Action::Skill {
+            name: "search".into(),
+            input: serde_json::json!({"q": "tempo"}),
+        };
+        let task = DriverTask::new(format!("{origin}/app"), vec![action]);
+        let mut journal = SessionJournal::open(
+            &journal_path,
+            RunId("run-structured-resume".into()),
+            SessionId("session-structured-resume".into()),
+        )?;
+        journal.append(JournalEvent::SessionStarted {
+            url: format!("{origin}/app"),
+        })?;
+        journal.append(JournalEvent::StructuredFastPathSelected {
+            origin: origin.clone(),
+            lane: "mcp".into(),
+            signal: "mcp_catalog".into(),
+            source: "/mcp/catalog.json".into(),
+        })?;
+        drop(journal);
+
+        let mut driver = FailingDriver::new(TransportFailurePoint::Goto);
+        let runner = AgentRunner::new(
+            &journal_path,
+            AgentRunIds::new("run-structured-resume", "session-structured-resume"),
+        )
+        .with_confirmation_mode(ConfirmationMode::AutoConfirmAll)
+        .with_structured_fast_path(StructuredFastPath::disabled().allow_private_network_access());
+
+        let result = runner.run_driver_task(&mut driver, &task).await;
+        let server_result = server
+            .join()
+            .map_err(|_| "structured MCP fixture thread panicked")?;
+        server_result?;
+        let report = result?;
+
+        assert_eq!(
+            report.status,
+            AgentRunStatus::StructuredFastPath(StructuredFastPathDecision::new(
+                origin,
+                StructuredLane::Mcp,
+                StructuredSignal::McpCatalog,
+                "/mcp/catalog.json"
+            ))
+        );
+        assert_eq!(report.engine, AgentRunEngine::Structured);
+        assert_eq!(driver.goto_calls, 0);
+        assert_eq!(driver.observe_calls, 0);
+        assert_eq!(report.actions_completed, 1);
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runner_mcp_fast_path_unsupported_actions_fall_through_to_driver() -> TestResult {
+        let root = unique_dir("runner-structured-fast-path-fallback")?;
         remove_dir_if_exists(&root)?;
         fs::create_dir_all(&root)?;
         let journal_path = root.join("session.jsonl");
@@ -1936,25 +2811,29 @@ mod tests {
         let mut driver = FailingDriver::new(TransportFailurePoint::Goto);
         let runner = AgentRunner::new(
             &journal_path,
-            AgentRunIds::new("run-structured", "session-structured"),
+            AgentRunIds::new("run-structured-fallback", "session-structured-fallback"),
         )
         .with_structured_fast_path(StructuredFastPath::with_probe(fake_mcp_fast_path_probe));
 
-        let report = runner.run_driver_task(&mut driver, &task).await?;
+        let error = runner.run_driver_task(&mut driver, &task).await.err();
 
-        assert_eq!(
-            report.status,
-            AgentRunStatus::StructuredFastPath(StructuredFastPathDecision::new(
-                "https://structured.example",
-                StructuredLane::Mcp,
-                StructuredSignal::McpCatalog,
-                "/mcp/catalog.json"
-            ))
-        );
-        assert_eq!(driver.goto_calls, 0);
-        assert_eq!(report.actions_completed, 0);
-        assert_eq!(report.observations, 0);
-        assert!(read_journal_entries(&journal_path)?.is_empty());
+        assert_eq!(driver.goto_calls, 1);
+        assert!(matches!(
+            error,
+            Some(AgentError::Transport {
+                context,
+                source: TransportError::NavTimeout,
+            }) if context == "initial goto"
+        ));
+        let entries = read_journal_entries(&journal_path)?;
+        assert!(!entries
+            .iter()
+            .any(|entry| matches!(entry.event, JournalEvent::StructuredFastPathSelected { .. })));
+        assert!(has_transport_error(
+            &entries,
+            "initial goto",
+            "navigation timed out"
+        ));
 
         remove_dir_if_exists(&root)?;
         Ok(())
@@ -2446,7 +3325,14 @@ mod tests {
             r#"<!doctype html>
             <html>
               <body>
-                <button id="submit" onclick="document.body.setAttribute('data-clicked','yes'); this.textContent='Done';">Submit</button>
+                <input id="name" aria-label="Name">
+                <select id="plan" aria-label="Plan">
+                  <option value="free">Free</option>
+                  <option value="pro">Pro</option>
+                </select>
+                <button id="add" onclick="document.body.dataset.count = String(Number(document.body.dataset.count || '0') + 1);">Add</button>
+                <button id="finish" onclick="document.body.dataset.finished='yes'; document.getElementById('summary').textContent = document.getElementById('name').value + ':' + document.getElementById('plan').value + ':' + (document.body.dataset.count || '0');">Finish</button>
+                <div id="summary" tabindex="0"></div>
               </body>
             </html>"#,
         )?;
@@ -2456,9 +3342,25 @@ mod tests {
         let journal_path = root.join("session.jsonl");
         let task = DriverTask::new(
             url,
-            vec![Action::Click {
-                node: NodeId(r#"[id="submit"]"#.into()),
-            }],
+            vec![
+                Action::Type {
+                    node: NodeId(r#"[id="name"]"#.into()),
+                    text: "Ada".into(),
+                },
+                Action::Select {
+                    node: NodeId(r#"[id="plan"]"#.into()),
+                    value: "pro".into(),
+                },
+                Action::Click {
+                    node: NodeId(r#"[id="add"]"#.into()),
+                },
+                Action::Click {
+                    node: NodeId(r#"[id="finish"]"#.into()),
+                },
+                Action::Extract {
+                    node: NodeId(r#"[id="summary"]"#.into()),
+                },
+            ],
         );
         let mut driver = CdpTempoDriver::launch_with(CdpConfig::default().with_executable(chrome))
             .await?
@@ -2469,14 +3371,46 @@ mod tests {
         );
 
         let report = runner.run_driver_task(&mut driver, &task).await?;
+        let final_state = driver
+            .evaluate_script(
+                r#"(() => ({
+                    name: document.querySelector('#name').value,
+                    plan: document.querySelector('#plan').value,
+                    count: Number(document.body.dataset.count || '0'),
+                    finished: document.body.dataset.finished,
+                    summary: document.querySelector('#summary').textContent.trim()
+                }))()"#,
+                true,
+            )
+            .await?;
         driver.close().await?;
 
         assert_eq!(report.engine, Engine::Cdp);
         assert_eq!(report.status, AgentRunStatus::Completed);
-        assert_eq!(report.actions_completed, 1);
-        assert!(read_journal_entries(&journal_path)?
+        assert_eq!(report.actions_completed, 5);
+        assert_eq!(report.steps.len(), 5);
+        assert_eq!(final_state["name"], serde_json::json!("Ada"));
+        assert_eq!(final_state["plan"], serde_json::json!("pro"));
+        assert_eq!(final_state["count"], serde_json::json!(1));
+        assert_eq!(final_state["finished"], serde_json::json!("yes"));
+        assert_eq!(final_state["summary"], serde_json::json!("Ada:pro:1"));
+
+        let entries = read_journal_entries(&journal_path)?;
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| matches!(entry.event, JournalEvent::StepApplied { .. }))
+                .count(),
+            5
+        );
+        let plan = task.task_plan()?;
+        let replayed = step_triples_from_journal(&journal_path, &plan)?;
+        let reported = report
+            .steps
             .iter()
-            .any(|entry| matches!(entry.event, JournalEvent::StepApplied { .. })));
+            .map(|step| step.triple.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(replayed, reported);
 
         remove_dir_if_exists(&root)?;
         Ok(())
@@ -2599,6 +3533,136 @@ mod tests {
         assert_eq!(after.batch.actions.len(), 2);
 
         remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn mcp_tool_call_accepts_content_only_results() -> TestResult {
+        let call = StructuredMcpToolCall::from_json_rpc_response(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "fixture",
+            "result": {
+                "content": [{"type": "text", "text": "ok"}],
+                "isError": false
+            }
+        }))
+        .map_err(std::io::Error::other)?;
+
+        assert!(!call.is_error);
+        assert_eq!(
+            call.structured_content,
+            serde_json::json!({"content": [{"type": "text", "text": "ok"}]})
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn mcp_tool_call_uses_text_content_for_error_reason() -> TestResult {
+        let call = StructuredMcpToolCall::from_json_rpc_response(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "fixture",
+            "result": {
+                "content": [{"type": "text", "text": "permission denied"}],
+                "isError": true
+            }
+        }))
+        .map_err(std::io::Error::other)?;
+
+        assert!(call.is_error);
+        assert_eq!(call.error_reason(), "permission denied");
+        Ok(())
+    }
+
+    #[test]
+    fn mcp_tool_call_rejects_missing_content() -> TestResult {
+        let error = match StructuredMcpToolCall::from_json_rpc_response(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "fixture",
+            "result": {
+                "isError": false
+            }
+        })) {
+            Ok(_) => {
+                return Err(std::io::Error::other(
+                    "missing content response unexpectedly succeeded",
+                )
+                .into())
+            }
+            Err(error) => error,
+        };
+
+        assert_eq!(error, "MCP tools/call response missing content");
+        Ok(())
+    }
+
+    #[test]
+    fn mcp_initialize_response_requires_protocol_and_tools_capability() -> TestResult {
+        validate_mcp_initialize_response(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "fixture",
+            "result": {
+                "protocolVersion": MCP_PROTOCOL_VERSION,
+                "capabilities": {"tools": {}}
+            }
+        }))
+        .map_err(std::io::Error::other)?;
+
+        let error = match validate_mcp_initialize_response(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "fixture",
+            "result": {
+                "protocolVersion": MCP_PROTOCOL_VERSION,
+                "capabilities": {}
+            }
+        })) {
+            Ok(_) => {
+                return Err(std::io::Error::other(
+                    "missing tools capability unexpectedly succeeded",
+                )
+                .into())
+            }
+            Err(error) => error,
+        };
+        assert_eq!(error, "MCP initialize response missing tools capability");
+        Ok(())
+    }
+
+    #[test]
+    fn mcp_response_parser_accepts_sse_json_data() -> TestResult {
+        let parsed = parse_mcp_response_body(
+            "text/event-stream",
+            "event: message\ndata: {\"jsonrpc\":\"2.0\",\"result\":{\"content\":[]}}\n\n",
+            None,
+        )
+        .map_err(std::io::Error::other)?;
+
+        assert_eq!(
+            parsed,
+            serde_json::json!({"jsonrpc":"2.0","result":{"content":[]}})
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn mcp_response_parser_skips_sse_events_until_expected_id() -> TestResult {
+        let expected_id = serde_json::json!("wanted");
+        let parsed = parse_mcp_response_body(
+            "text/event-stream",
+            "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{}}\n\n\
+             data: {\"jsonrpc\":\"2.0\",\"id\":\"other\",\"result\":{\"content\":[]}}\n\n\
+             data: {\"jsonrpc\":\"2.0\",\"id\":\"wanted\",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"ok\"}]}}\n\n",
+            Some(&expected_id),
+        )
+        .map_err(std::io::Error::other)?;
+
+        assert_eq!(
+            parsed,
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "wanted",
+                "result": {"content": [{"type": "text", "text": "ok"}]}
+            })
+        );
         Ok(())
     }
 
@@ -2749,12 +3813,269 @@ mod tests {
         PostActionObserve,
     }
 
+    type FixtureHandle = thread::JoinHandle<std::io::Result<()>>;
+
+    fn serve_structured_mcp_fixture() -> std::io::Result<(String, FixtureHandle)> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
+        let origin = format!("http://{}", listener.local_addr()?);
+        let handle = thread::spawn(move || -> std::io::Result<()> {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut handled = 0_usize;
+            let mut saw_initialize = false;
+            let mut saw_initialized = false;
+            let mut saw_tool_call = false;
+            while !saw_tool_call && handled < 16 && std::time::Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _peer)) => {
+                        handled += 1;
+                        stream.set_read_timeout(Some(std::time::Duration::from_secs(1)))?;
+                        let request = read_http_request(&mut stream)?;
+                        let response = if request.starts_with("GET /mcp/catalog.json ") {
+                            http_fixture_response(
+                                "200 OK",
+                                "application/json",
+                                r#"{"tools":[{"name":"search"}]}"#,
+                            )
+                        } else if request.starts_with("POST /mcp ")
+                            && request.contains(r#""method":"initialize""#)
+                        {
+                            assert_header_contains(&request, "accept", "application/json");
+                            assert_header_contains(&request, "accept", "text/event-stream");
+                            let request_id = json_rpc_request_id(&request)?;
+                            saw_initialize = true;
+                            http_fixture_response(
+                                "200 OK",
+                                "application/json",
+                                serde_json::json!({
+                                    "jsonrpc": "2.0",
+                                    "id": request_id,
+                                    "result": {
+                                        "protocolVersion": MCP_PROTOCOL_VERSION,
+                                        "capabilities": {"tools": {}},
+                                        "serverInfo": {"name": "fixture", "version": "1"}
+                                    }
+                                })
+                                .to_string(),
+                            )
+                            .with_header(MCP_SESSION_ID_HEADER, "fixture-session")
+                        } else if request.starts_with("POST /mcp ")
+                            && request.contains(r#""method":"notifications/initialized""#)
+                        {
+                            assert!(saw_initialize);
+                            assert_request_header(
+                                &request,
+                                MCP_SESSION_ID_HEADER,
+                                "fixture-session",
+                            );
+                            assert_request_header(
+                                &request,
+                                MCP_PROTOCOL_VERSION_HEADER,
+                                MCP_PROTOCOL_VERSION,
+                            );
+                            saw_initialized = true;
+                            http_fixture_response("202 Accepted", "text/plain", "")
+                        } else if request.starts_with("POST /mcp ")
+                            && request.contains(r#""method":"tools/call""#)
+                            && request.contains(r#""name":"search""#)
+                            && request.contains(r#""q":"tempo""#)
+                        {
+                            assert!(saw_initialized);
+                            assert_request_header(
+                                &request,
+                                MCP_SESSION_ID_HEADER,
+                                "fixture-session",
+                            );
+                            assert_request_header(
+                                &request,
+                                MCP_PROTOCOL_VERSION_HEADER,
+                                MCP_PROTOCOL_VERSION,
+                            );
+                            let request_id = json_rpc_request_id(&request)?;
+                            saw_tool_call = true;
+                            let response = serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "method": "notifications/progress",
+                                "params": {"progress": 1}
+                            })
+                            .to_string();
+                            let result = serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "id": request_id,
+                                "result": {
+                                    "content": [{"type": "text", "text": "{\"ok\":true}"}],
+                                    "isError": false
+                                }
+                            })
+                            .to_string();
+                            http_fixture_response(
+                                "200 OK",
+                                "application/json",
+                                format!("data: {response}\n\ndata: {result}\n\n"),
+                            )
+                            .with_content_type("text/event-stream")
+                        } else {
+                            http_fixture_response("404 Not Found", "text/plain", "not found")
+                        };
+                        stream.write_all(response.to_http().as_bytes())?;
+                        stream.flush()?;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            if saw_tool_call {
+                Ok(())
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "structured MCP fixture did not receive tools/call",
+                ))
+            }
+        });
+        Ok((origin, handle))
+    }
+
+    struct HttpFixtureResponse {
+        status: &'static str,
+        content_type: &'static str,
+        body: String,
+        headers: Vec<(&'static str, &'static str)>,
+    }
+
+    impl HttpFixtureResponse {
+        fn with_header(mut self, name: &'static str, value: &'static str) -> Self {
+            self.headers.push((name, value));
+            self
+        }
+
+        fn with_content_type(mut self, content_type: &'static str) -> Self {
+            self.content_type = content_type;
+            self
+        }
+
+        fn to_http(&self) -> String {
+            let mut response = format!(
+                "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n",
+                self.status,
+                self.content_type,
+                self.body.len()
+            );
+            for (name, value) in &self.headers {
+                response.push_str(name);
+                response.push_str(": ");
+                response.push_str(value);
+                response.push_str("\r\n");
+            }
+            response.push_str("\r\n");
+            response.push_str(&self.body);
+            response
+        }
+    }
+
+    fn http_fixture_response(
+        status: &'static str,
+        content_type: &'static str,
+        body: impl Into<String>,
+    ) -> HttpFixtureResponse {
+        HttpFixtureResponse {
+            status,
+            content_type,
+            body: body.into(),
+            headers: Vec::new(),
+        }
+    }
+
+    fn read_http_request(stream: &mut std::net::TcpStream) -> std::io::Result<String> {
+        let mut bytes = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        loop {
+            let read = stream.read(&mut chunk)?;
+            if read == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&chunk[..read]);
+            let Some(header_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&bytes[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    if name.eq_ignore_ascii_case("content-length") {
+                        value.trim().parse::<usize>().ok()
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(0);
+            if bytes.len() >= header_end + 4 + content_length {
+                break;
+            }
+        }
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    fn json_rpc_request_id(request: &str) -> std::io::Result<serde_json::Value> {
+        let body = request
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "HTTP request missing body delimiter",
+                )
+            })?;
+        let request = serde_json::from_str::<serde_json::Value>(body).map_err(|error| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
+        })?;
+        request.get("id").cloned().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "JSON-RPC request missing id",
+            )
+        })
+    }
+
+    fn assert_request_header(request: &str, name: &str, expected: &str) {
+        let actual =
+            request_header(request, name).unwrap_or_else(|| panic!("missing {name} header"));
+        assert_eq!(actual, expected);
+    }
+
+    fn assert_header_contains(request: &str, name: &str, expected: &str) {
+        let actual =
+            request_header(request, name).unwrap_or_else(|| panic!("missing {name} header"));
+        assert!(
+            actual.contains(expected),
+            "expected {name} header {actual:?} to contain {expected:?}"
+        );
+    }
+
+    fn request_header<'a>(request: &'a str, name: &str) -> Option<&'a str> {
+        request.lines().find_map(|line| {
+            let (header_name, value) = line.split_once(':')?;
+            if header_name.eq_ignore_ascii_case(name) {
+                Some(value.trim())
+            } else {
+                None
+            }
+        })
+    }
+
     fn fake_mcp_fast_path_probe(
-        _target: &str,
+        target: &str,
         _config: HttpProbeConfig,
     ) -> Option<StructuredFastPathDecision> {
+        let origin = reqwest::Url::parse(target)
+            .ok()?
+            .origin()
+            .ascii_serialization();
         Some(StructuredFastPathDecision::new(
-            "https://structured.example",
+            origin,
             StructuredLane::Mcp,
             StructuredSignal::McpCatalog,
             "/mcp/catalog.json",

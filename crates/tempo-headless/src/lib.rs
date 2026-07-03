@@ -66,6 +66,7 @@ const WS_OPCODE_BINARY: u8 = 0x2;
 const WS_OPCODE_CLOSE: u8 = 0x8;
 const WS_OPCODE_PING: u8 = 0x9;
 const WS_OPCODE_PONG: u8 = 0xA;
+pub const TEMPO_OTLP_JSONL_ENV: &str = "TEMPO_OTLP_JSONL";
 
 /// Stable tempod session id.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -350,6 +351,7 @@ enum DriverClientError {
 #[derive(Clone, Default)]
 pub struct SessionPool {
     sessions: BTreeMap<TempodSessionId, TempodSession>,
+    session_drivers: BTreeMap<TempodSessionId, AttachedEngineDriver>,
     events: BTreeMap<TempodSessionId, Vec<TempodSessionEvent>>,
     otlp_exporter: Option<OtlpJsonExporter>,
     bidi: BidiRouter,
@@ -366,6 +368,7 @@ impl fmt::Debug for SessionPool {
         formatter
             .debug_struct("SessionPool")
             .field("sessions", &self.sessions)
+            .field("session_drivers", &self.session_drivers.keys())
             .field("event_sessions", &self.events.len())
             .field("otlp_exporter", &self.otlp_exporter)
             .field("bidi", &self.bidi)
@@ -378,24 +381,50 @@ impl fmt::Debug for SessionPool {
 }
 
 impl SessionPool {
+    pub fn from_env() -> Self {
+        Self::from_otlp_env_value(std::env::var_os(TEMPO_OTLP_JSONL_ENV))
+    }
+
+    fn from_otlp_env_value(value: Option<std::ffi::OsString>) -> Self {
+        match value {
+            Some(path) if !path.is_empty() => {
+                Self::default().with_otlp_exporter(OtlpJsonExporter::new(path))
+            }
+            _ => Self::default(),
+        }
+    }
+
     pub fn with_otlp_exporter(mut self, exporter: OtlpJsonExporter) -> Self {
         self.otlp_exporter = Some(exporter);
         self
+    }
+
+    pub fn set_otlp_exporter(&mut self, exporter: Option<OtlpJsonExporter>) {
+        self.otlp_exporter = exporter;
+    }
+
+    pub fn otlp_exporter(&self) -> Option<&OtlpJsonExporter> {
+        self.otlp_exporter.as_ref()
     }
 
     pub fn create(&mut self, url: impl Into<String>) -> Result<TempodSession, TempodError> {
         if self.draining {
             return Err(TempodError::Draining);
         }
+        let url = url.into();
+        let session_driver = self.create_session_engine_context(&url)?;
         let id = TempodSessionId(format!("session-{}", self.next_id));
         self.next_id = self.next_id.saturating_add(1);
         let session = TempodSession {
             id: id.clone(),
-            url: url.into(),
+            url,
             state: TempodSessionState::Running,
             created_ms: current_time_ms(),
         };
         self.sessions.insert(id, session.clone());
+        if let Some(driver) = session_driver {
+            self.session_drivers.insert(session.id.clone(), driver);
+        }
         self.record_event(
             &session.id,
             TempodSessionEventKind::SessionCreated {
@@ -434,6 +463,7 @@ impl SessionPool {
             session.state = TempodSessionState::Killed;
             session.clone()
         };
+        self.close_session_driver(id);
         self.record_event(id, TempodSessionEventKind::SessionKilled);
         Ok(session.clone())
     }
@@ -485,6 +515,7 @@ impl SessionPool {
         let deadline = Instant::now() + ENGINE_TEARDOWN_TIMEOUT;
         self.close_forked_contexts_bounded(teardown_remaining(deadline));
         self.close_mcp_forks_bounded(teardown_remaining(deadline));
+        self.close_session_drivers_bounded(teardown_remaining(deadline));
         if close_root {
             self.close_root_driver_bounded(teardown_remaining(deadline));
         } else {
@@ -492,6 +523,87 @@ impl SessionPool {
         }
         self.bidi_contexts.clear();
         self.next_bidi_context_id = 1;
+    }
+
+    /// Allocate a fresh engine context for a newly-created tempod session and
+    /// navigate it to the session URL. Without an attached engine, tempod still
+    /// supports metadata-only session records for driverless control-plane tests.
+    fn create_session_engine_context(
+        &mut self,
+        url: &str,
+    ) -> Result<Option<AttachedEngineDriver>, TempodError> {
+        let Some(root_driver) = self.driver.as_mut() else {
+            return Ok(None);
+        };
+        let options = BrowsingContextCreateOptions {
+            kind: BrowsingContextKind::Tab,
+            background: true,
+        };
+        let mut session_driver =
+            futures::executor::block_on(root_driver.create_browsing_context_attached(options))
+                .map_err(|error| {
+                    TempodError::Driver(format!(
+                        "attached engine failed to create session context: {error}"
+                    ))
+                })?;
+        if let Err(error) = futures::executor::block_on(session_driver.goto(url)) {
+            let _ = futures::executor::block_on(session_driver.close());
+            return Err(TempodError::Driver(format!(
+                "attached engine failed to navigate session context: {error}"
+            )));
+        }
+        Ok(Some(session_driver))
+    }
+
+    /// Best-effort close of one session-owned engine context. Session lifecycle
+    /// state changes must still be recorded even if engine teardown races a
+    /// crashed child, so close errors are logged and swallowed.
+    fn close_session_driver(&mut self, id: &TempodSessionId) {
+        let Some(mut driver) = self.session_drivers.remove(id) else {
+            return;
+        };
+
+        let id = id.0.clone();
+        if let Some(result) = run_teardown_bounded(
+            "session engine context Close",
+            ENGINE_TEARDOWN_TIMEOUT,
+            move || futures::executor::block_on(driver.close()),
+        ) {
+            if let Err(error) = result {
+                eprintln!("tempod: error closing engine driver for session {id}: {error}");
+            }
+        }
+    }
+
+    /// Best-effort close of all session-owned engine contexts.
+    fn close_session_drivers_bounded(&mut self, timeout: Duration) {
+        let session_drivers = std::mem::take(&mut self.session_drivers)
+            .into_iter()
+            .map(|(id, driver)| (id.0, driver))
+            .collect::<Vec<_>>();
+        if session_drivers.is_empty() {
+            return;
+        }
+
+        let Some(errors) = run_teardown_bounded(
+            "session engine context Close commands",
+            timeout,
+            move || {
+                let mut errors = Vec::new();
+                for (id, mut driver) in session_drivers {
+                    if let Err(error) = futures::executor::block_on(driver.close()) {
+                        errors.push(format!("{id}: {error}"));
+                    }
+                }
+                errors
+            },
+        ) else {
+            return;
+        };
+
+        for error in errors {
+            eprintln!("tempod: error closing session engine context at teardown: {error}");
+        }
     }
 
     /// Best-effort close of every forked BiDi context driver so engine-side
@@ -838,7 +950,11 @@ impl OtlpJsonExporter {
     }
 
     pub fn export_step(&self, triple: &StepTriple) -> Result<(), TempodError> {
-        if let Some(parent) = self.path.parent() {
+        if let Some(parent) = self
+            .path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
             std::fs::create_dir_all(parent)?;
         }
         let mut file = OpenOptions::new()
@@ -868,7 +984,7 @@ impl OtlpJsonExporter {
 /// Run tempod forever on an address such as `127.0.0.1:8787`.
 pub fn run_tempod(addr: &str) -> Result<(), TempodError> {
     let listener = TcpListener::bind(addr)?;
-    let pool = Arc::new(Mutex::new(SessionPool::default()));
+    let pool = Arc::new(Mutex::new(SessionPool::from_env()));
     serve_forever(listener, pool)
 }
 
@@ -879,7 +995,7 @@ pub fn run_tempod_with_attached_driver(
     socket_path: impl AsRef<Path>,
 ) -> Result<(), TempodError> {
     let listener = TcpListener::bind(addr)?;
-    let mut pool = SessionPool::default();
+    let mut pool = SessionPool::from_env();
     pool.attach_engine_driver(engine, connect_engine_ipc(socket_path)?);
     serve_forever(listener, Arc::new(Mutex::new(pool)))
 }
@@ -2017,6 +2133,8 @@ pub enum TempodError {
     Draining,
     #[error("session pool lock failed")]
     PoolLock,
+    #[error("driver failed: {0}")]
+    Driver(String),
     #[error("engine host failed: {0}")]
     Engine(#[from] EngineHostError),
 }
@@ -2028,7 +2146,7 @@ impl TempodError {
             Self::Forbidden(_) => 403,
             Self::SessionNotFound(_) | Self::EngineNotFound(_) => 404,
             Self::Draining => 503,
-            Self::Io(_) | Self::Json(_) | Self::PoolLock | Self::Engine(_) => 500,
+            Self::Io(_) | Self::Json(_) | Self::PoolLock | Self::Driver(_) | Self::Engine(_) => 500,
         }
     }
 }
@@ -2053,7 +2171,7 @@ mod tests {
     use tempo_agent::{IdempotencyKey, StepTripleOutcome};
     use tempo_driver::TestDriver;
     use tempo_engine_host::{
-        serve_driver_connection, DriverRequest, EngineIpcConnection, RestartPolicy,
+        serve_driver_connection, DriverRequest, DriverWireError, EngineIpcConnection, RestartPolicy,
     };
     use tempo_schema::{Action, ObservationDiff, QuiescencePolicy};
 
@@ -2072,6 +2190,153 @@ mod tests {
         assert_eq!(adopted.state, TempodSessionState::Adopted);
         assert_eq!(killed.state, TempodSessionState::Killed);
         assert!(pool.draining());
+        Ok(())
+    }
+
+    #[test]
+    fn http_create_session_allocates_attached_driver_context_and_kill_closes_it() -> TestResult {
+        let (client_stream, server_stream) = UnixStream::pair()?;
+        let server = thread::spawn(move || -> Result<(), EngineHostError> {
+            let mut connection = EngineIpcConnection::from_stream(server_stream);
+
+            let create = connection.read_driver_request()?;
+            assert_eq!(create.driver_id, None);
+            assert_eq!(
+                create.command,
+                HostDriverCommand::CreateBrowsingContext {
+                    options: BrowsingContextCreateOptions {
+                        kind: BrowsingContextKind::Tab,
+                        background: true,
+                    },
+                }
+            );
+            connection.write_driver_response(
+                create.id,
+                DriverResponse::BrowsingContextCreated {
+                    driver_id: "session-context-1".into(),
+                },
+            )?;
+
+            let goto = connection.read_driver_request()?;
+            assert_eq!(goto.driver_id.as_deref(), Some("session-context-1"));
+            assert_eq!(
+                goto.command,
+                HostDriverCommand::Goto {
+                    url: "https://session.test".into(),
+                }
+            );
+            connection.write_driver_response(
+                goto.id,
+                DriverResponse::Observation {
+                    observation: observation("https://session.test", 1),
+                },
+            )?;
+
+            let close = connection.read_driver_request()?;
+            assert_eq!(close.driver_id.as_deref(), Some("session-context-1"));
+            assert_eq!(close.command, HostDriverCommand::Close);
+            connection.write_driver_response(close.id, DriverResponse::Closed)
+        });
+
+        let mut pool = SessionPool::default();
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+
+        let create = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/sessions".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: br#"{"url":"https://session.test"}"#.to_vec(),
+            },
+        )?;
+
+        assert_eq!(create.status, 201);
+        let session: TempodSession = serde_json::from_slice(&create.body)?;
+        assert_eq!(session.id.0, "session-0");
+        assert_eq!(session.url, "https://session.test");
+        assert_eq!(session.state, TempodSessionState::Running);
+        assert!(pool.session_drivers.contains_key(&session.id));
+
+        let kill = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "DELETE".into(),
+                path: "/sessions/session-0".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: Vec::new(),
+            },
+        )?;
+
+        assert_eq!(kill.status, 200);
+        let killed: TempodSession = serde_json::from_slice(&kill.body)?;
+        assert_eq!(killed.state, TempodSessionState::Killed);
+        assert!(!pool.session_drivers.contains_key(&session.id));
+
+        drop(pool);
+        join_driver_handler(server)?;
+        Ok(())
+    }
+
+    #[test]
+    fn http_create_session_cleans_context_when_initial_navigation_fails() -> TestResult {
+        let (client_stream, server_stream) = UnixStream::pair()?;
+        let server = thread::spawn(move || -> Result<(), EngineHostError> {
+            let mut connection = EngineIpcConnection::from_stream(server_stream);
+
+            let create = connection.read_driver_request()?;
+            assert!(matches!(
+                create.command,
+                HostDriverCommand::CreateBrowsingContext { .. }
+            ));
+            connection.write_driver_response(
+                create.id,
+                DriverResponse::BrowsingContextCreated {
+                    driver_id: "session-context-failed".into(),
+                },
+            )?;
+
+            let goto = connection.read_driver_request()?;
+            assert_eq!(goto.driver_id.as_deref(), Some("session-context-failed"));
+            assert!(matches!(goto.command, HostDriverCommand::Goto { .. }));
+            connection.write_driver_response(
+                goto.id,
+                DriverResponse::Error {
+                    error: DriverWireError::transport(&TransportError::NavTimeout),
+                },
+            )?;
+
+            let close = connection.read_driver_request()?;
+            assert_eq!(close.driver_id.as_deref(), Some("session-context-failed"));
+            assert_eq!(close.command, HostDriverCommand::Close);
+            connection.write_driver_response(close.id, DriverResponse::Closed)
+        });
+
+        let mut pool = SessionPool::default();
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+
+        let create = handle_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/sessions".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: br#"{"url":"https://fail.test"}"#.to_vec(),
+            },
+        );
+
+        assert_eq!(create.status, 500);
+        assert!(pool.list().is_empty());
+        assert!(pool.session_drivers.is_empty());
+
+        drop(pool);
+        join_driver_handler(server)?;
         Ok(())
     }
 
@@ -2131,6 +2396,51 @@ mod tests {
         );
 
         remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn session_pool_from_env_value_configures_otlp_jsonl_exporter() -> TestResult {
+        let path = unique_dir("env-otlp")?.join("steps.jsonl");
+
+        let mut pool = SessionPool::from_otlp_env_value(Some(path.as_os_str().to_os_string()));
+        assert_eq!(
+            pool.otlp_exporter()
+                .ok_or("expected env path to configure exporter")?
+                .path(),
+            path.as_path()
+        );
+
+        pool.set_otlp_exporter(None);
+        assert!(pool.otlp_exporter().is_none());
+        assert!(SessionPool::from_otlp_env_value(None)
+            .otlp_exporter()
+            .is_none());
+        assert!(
+            SessionPool::from_otlp_env_value(Some(std::ffi::OsString::new()))
+                .otlp_exporter()
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn otlp_json_exporter_writes_bare_file_path() -> TestResult {
+        let unique = unique_dir("bare-otlp")?;
+        let bare_path = PathBuf::from(
+            unique
+                .file_name()
+                .ok_or("unique test path must have a file name")?,
+        )
+        .with_extension("jsonl");
+        let _ = std::fs::remove_file(&bare_path);
+
+        OtlpJsonExporter::new(&bare_path).export_step(&sample_step_triple(12))?;
+
+        let bytes = std::fs::read(&bare_path)?;
+        let value: Value = serde_json::from_slice(bytes.strip_suffix(b"\n").unwrap_or(&bytes))?;
+        assert_eq!(value["body"]["seq"], 12);
+        std::fs::remove_file(&bare_path)?;
         Ok(())
     }
 
@@ -3786,6 +4096,80 @@ mod tests {
         assert!(pool.driver.is_none());
         assert!(pool.mcp.is_none());
         assert!(pool.bidi_contexts.is_empty());
+
+        wedged_engine.thread().unpark();
+        join_driver_handler(wedged_engine)?;
+        Ok(())
+    }
+
+    #[test]
+    fn drain_does_not_hang_on_wedged_session_context() -> TestResult {
+        // Public #200 regression guard for session-owned engine contexts added
+        // to tempod session creation. `drain()` must bound these closes too.
+        let (client_stream, server_stream) = UnixStream::pair()?;
+        let wedged_engine = thread::spawn(move || -> Result<(), EngineHostError> {
+            let mut connection = EngineIpcConnection::from_stream(server_stream);
+
+            let create = connection.read_driver_request()?;
+            assert!(create.driver_id.is_none());
+            assert!(matches!(
+                create.command,
+                HostDriverCommand::CreateBrowsingContext { .. }
+            ));
+            connection.write_driver_response(
+                create.id,
+                DriverResponse::BrowsingContextCreated {
+                    driver_id: "session-context-1".into(),
+                },
+            )?;
+
+            let goto = connection.read_driver_request()?;
+            assert_eq!(goto.driver_id.as_deref(), Some("session-context-1"));
+            assert!(matches!(goto.command, HostDriverCommand::Goto { .. }));
+            connection.write_driver_response(
+                goto.id,
+                DriverResponse::Observation {
+                    observation: observation("https://session.test", 1),
+                },
+            )?;
+
+            let close = connection.read_driver_request()?;
+            assert_eq!(close.driver_id.as_deref(), Some("session-context-1"));
+            assert_eq!(close.command, HostDriverCommand::Close);
+            thread::park_timeout(Duration::from_secs(60));
+            Ok(())
+        });
+
+        let mut pool = SessionPool::default();
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+        let create = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/sessions".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: br#"{"url":"https://session.test"}"#.to_vec(),
+            },
+        )?;
+
+        assert_eq!(create.status, 201);
+        assert_eq!(pool.session_drivers.len(), 1);
+
+        let started = std::time::Instant::now();
+        pool.drain();
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "drain hung on a wedged session context before bounded teardown returned: took {elapsed:?}"
+        );
+        assert!(pool.draining());
+        assert!(pool.driver.is_none());
+        assert!(pool.mcp.is_none());
+        assert!(pool.bidi_contexts.is_empty());
+        assert!(pool.session_drivers.is_empty());
 
         wedged_engine.thread().unpark();
         join_driver_handler(wedged_engine)?;

@@ -339,6 +339,7 @@ pub fn eval_record_from_session_journal(
                 last_observe_start_ms = Some(entry.timestamp_ms);
             }
             JournalEvent::TransportError { .. }
+            | JournalEvent::StructuredFastPathSelected { .. }
             | JournalEvent::CassetteRecorded { .. }
             | JournalEvent::SessionClosed => {}
         }
