@@ -174,8 +174,8 @@ impl CdpTempoDriver {
             return Ok(());
         }
 
-        let root = self
-            .page
+        let page = self.page()?;
+        let root = page
             .execute(GetDocumentParams::default())
             .await
             .map_err(map_cdp_error)?
@@ -200,11 +200,8 @@ impl CdpTempoDriver {
         root: DomNodeId,
         selector: &str,
     ) -> Result<Option<AxSummary>, TransportError> {
-        let queried = match self
-            .page
-            .execute(QuerySelectorParams::new(root, selector))
-            .await
-        {
+        let page = self.page()?;
+        let queried = match page.execute(QuerySelectorParams::new(root, selector)).await {
             Ok(response) => response.result,
             Err(error)
                 if matches!(error, CdpError::NotFound)
@@ -218,8 +215,7 @@ impl CdpTempoDriver {
             return Ok(None);
         }
 
-        let described = match self
-            .page
+        let described = match page
             .execute(
                 DescribeNodeParams::builder()
                     .node_id(queried.node_id)
@@ -238,8 +234,7 @@ impl CdpTempoDriver {
         };
 
         let backend_node_id = described.node.backend_node_id;
-        let ax_nodes = match self
-            .page
+        let ax_nodes = match page
             .execute(
                 GetPartialAxTreeParams::builder()
                     .backend_node_id(backend_node_id)
