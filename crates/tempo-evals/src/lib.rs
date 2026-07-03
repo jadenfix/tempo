@@ -110,8 +110,30 @@ pub struct Scorecard {
     pub max_unconfirmed_high_risk_actions: u64,
     #[serde(default)]
     pub speculation_reduction_p50: Option<f64>,
+    pub suites: Vec<SuiteScore>,
+    pub lanes: Vec<LaneScore>,
     pub origins: Vec<OriginLaneScore>,
     pub violations: Vec<GateViolation>,
+}
+
+/// Per-suite scorecard row for WebVoyager/WebArena/Mind2Web-style gates.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SuiteScore {
+    pub suite: String,
+    pub total_cases: usize,
+    pub success_rate: f64,
+    pub fallback_rate: f64,
+    pub speculation_reduction_p50: Option<f64>,
+    pub max_unconfirmed_high_risk_actions: u64,
+}
+
+/// Per-runtime-lane scorecard row used to compare Servo/CDP/API behavior.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LaneScore {
+    pub lane: Lane,
+    pub total_cases: usize,
+    pub success_rate: f64,
+    pub fallback_rate: f64,
 }
 
 /// Per-origin lane table entry consumed by runtime fallback selection.
@@ -195,6 +217,8 @@ impl Scorecard {
             .max()
             .unwrap_or(0);
         let speculation_reduction_p50 = speculation_reduction_p50(records);
+        let suites = suite_table(records);
+        let lanes = lane_table(records);
         let origins = origin_lane_table(records);
 
         let mut scorecard = Self {
@@ -209,6 +233,8 @@ impl Scorecard {
             action_latency_ms_p50,
             max_unconfirmed_high_risk_actions,
             speculation_reduction_p50,
+            suites,
+            lanes,
             origins,
             violations: Vec::new(),
         };
@@ -350,6 +376,30 @@ pub fn describe() -> &'static str {
     "scorecard regression gates over persisted eval records and tempo session journals"
 }
 
+fn suite_table(records: &[EvalRecord]) -> Vec<SuiteScore> {
+    let mut by_suite: BTreeMap<&str, SuiteAccumulator> = BTreeMap::new();
+    for record in records {
+        by_suite.entry(&record.suite).or_default().push(record);
+    }
+
+    by_suite
+        .into_iter()
+        .map(|(suite, acc)| acc.score(suite))
+        .collect()
+}
+
+fn lane_table(records: &[EvalRecord]) -> Vec<LaneScore> {
+    let mut by_lane: BTreeMap<Lane, LaneAccumulator> = BTreeMap::new();
+    for record in records {
+        by_lane.entry(record.lane).or_default().push(record);
+    }
+
+    by_lane
+        .into_iter()
+        .map(|(lane, acc)| acc.lane_score(lane))
+        .collect()
+}
+
 fn origin_lane_table(records: &[EvalRecord]) -> Vec<OriginLaneScore> {
     let mut by_origin_lane: BTreeMap<(&str, Lane), LaneAccumulator> = BTreeMap::new();
     for record in records {
@@ -364,7 +414,7 @@ fn origin_lane_table(records: &[EvalRecord]) -> Vec<OriginLaneScore> {
         by_origin
             .entry(origin)
             .or_default()
-            .push(acc.score(origin, lane));
+            .push(acc.origin_score(origin, lane));
     }
 
     let mut table = Vec::new();
@@ -387,6 +437,44 @@ fn compare_lane_scores(left: &OriginLaneScore, right: &OriginLaneScore) -> Order
 }
 
 #[derive(Default)]
+struct SuiteAccumulator {
+    total: usize,
+    successes: usize,
+    fallbacks: usize,
+    max_unconfirmed_high_risk_actions: u64,
+    speculation_reductions: Vec<f64>,
+}
+
+impl SuiteAccumulator {
+    fn push(&mut self, record: &EvalRecord) {
+        self.total += 1;
+        if record.success {
+            self.successes += 1;
+        }
+        if record.fallback_used {
+            self.fallbacks += 1;
+        }
+        self.max_unconfirmed_high_risk_actions = self
+            .max_unconfirmed_high_risk_actions
+            .max(record.unconfirmed_high_risk_actions);
+        if let Some(reduction) = record_speculation_reduction(record) {
+            self.speculation_reductions.push(reduction);
+        }
+    }
+
+    fn score(self, suite: &str) -> SuiteScore {
+        SuiteScore {
+            suite: suite.into(),
+            total_cases: self.total,
+            success_rate: rate(self.successes, self.total),
+            fallback_rate: rate(self.fallbacks, self.total),
+            speculation_reduction_p50: percentile_f64(self.speculation_reductions, 0.50),
+            max_unconfirmed_high_risk_actions: self.max_unconfirmed_high_risk_actions,
+        }
+    }
+}
+
+#[derive(Default)]
 struct LaneAccumulator {
     total: usize,
     successes: usize,
@@ -404,7 +492,16 @@ impl LaneAccumulator {
         }
     }
 
-    fn score(&self, origin: &str, lane: Lane) -> OriginLaneScore {
+    fn lane_score(&self, lane: Lane) -> LaneScore {
+        LaneScore {
+            lane,
+            total_cases: self.total,
+            success_rate: rate(self.successes, self.total),
+            fallback_rate: rate(self.fallbacks, self.total),
+        }
+    }
+
+    fn origin_score(&self, origin: &str, lane: Lane) -> OriginLaneScore {
         OriginLaneScore {
             origin: origin.into(),
             selected_lane: lane,
@@ -499,17 +596,21 @@ fn percentile_u64(values: impl IntoIterator<Item = u64>, percentile: f64) -> u64
 fn speculation_reduction_p50(records: &[EvalRecord]) -> Option<f64> {
     let reductions: Vec<_> = records
         .iter()
-        // A zero wall clock (e.g. a journal missing `SessionStarted`) would
-        // compute a fake 100% reduction; exclude such records entirely (#115).
-        .filter(|record| record.wall_clock_ms > 0)
-        .filter_map(|record| {
-            record
-                .baseline_wall_clock_ms
-                .filter(|baseline| *baseline > 0)
-                .map(|baseline| 1.0 - record.wall_clock_ms as f64 / baseline as f64)
-        })
+        .filter_map(record_speculation_reduction)
         .collect();
     percentile_f64(reductions, 0.50)
+}
+
+fn record_speculation_reduction(record: &EvalRecord) -> Option<f64> {
+    // A zero wall clock (e.g. a journal missing `SessionStarted`) would compute
+    // a fake 100% reduction; exclude such records entirely (#115).
+    if record.wall_clock_ms == 0 {
+        return None;
+    }
+    record
+        .baseline_wall_clock_ms
+        .filter(|baseline| *baseline > 0)
+        .map(|baseline| 1.0 - record.wall_clock_ms as f64 / baseline as f64)
 }
 
 fn percentile_f64(mut values: Vec<f64>, percentile: f64) -> Option<f64> {
@@ -595,26 +696,38 @@ mod tests {
     #[test]
     fn scorecard_computes_budget_metrics_and_origin_lane_table() -> TestResult {
         let records = vec![
-            record(
-                "a",
-                "https://one.test",
-                Lane::Servo,
-                true,
-                false,
-                1_000,
-                100,
+            with_suite(
+                record(
+                    "a",
+                    "https://one.test",
+                    Lane::Servo,
+                    true,
+                    false,
+                    1_000,
+                    100,
+                ),
+                "webvoyager",
             ),
-            record("b", "https://one.test", Lane::Cdp, true, true, 6_000, 220),
-            record(
-                "c",
-                "https://two.test",
-                Lane::Servo,
-                false,
-                true,
-                2_000,
-                300,
+            with_suite(
+                record("b", "https://one.test", Lane::Cdp, true, true, 6_000, 220),
+                "webarena",
             ),
-            record("d", "https://two.test", Lane::Cdp, true, false, 3_000, 120),
+            with_suite(
+                record(
+                    "c",
+                    "https://two.test",
+                    Lane::Servo,
+                    false,
+                    true,
+                    2_000,
+                    300,
+                ),
+                "webvoyager",
+            ),
+            with_suite(
+                record("d", "https://two.test", Lane::Cdp, true, false, 3_000, 120),
+                "webarena",
+            ),
         ];
         let budget = EvalBudget {
             min_speculation_reduction: None,
@@ -629,6 +742,44 @@ mod tests {
         assert_eq!(scorecard.observation_tokens_p50, 500);
         assert_eq!(scorecard.observe_latency_ms_p50, 120);
         assert_eq!(scorecard.observe_latency_ms_p95, 300);
+        assert_eq!(
+            scorecard.suites,
+            vec![
+                SuiteScore {
+                    suite: "webarena".into(),
+                    total_cases: 2,
+                    success_rate: 1.0,
+                    fallback_rate: 0.5,
+                    speculation_reduction_p50: None,
+                    max_unconfirmed_high_risk_actions: 0,
+                },
+                SuiteScore {
+                    suite: "webvoyager".into(),
+                    total_cases: 2,
+                    success_rate: 0.5,
+                    fallback_rate: 0.5,
+                    speculation_reduction_p50: None,
+                    max_unconfirmed_high_risk_actions: 0,
+                }
+            ]
+        );
+        assert_eq!(
+            scorecard.lanes,
+            vec![
+                LaneScore {
+                    lane: Lane::Servo,
+                    total_cases: 2,
+                    success_rate: 0.5,
+                    fallback_rate: 0.5,
+                },
+                LaneScore {
+                    lane: Lane::Cdp,
+                    total_cases: 2,
+                    success_rate: 1.0,
+                    fallback_rate: 0.5,
+                }
+            ]
+        );
         assert_eq!(
             scorecard.origins,
             vec![
@@ -780,9 +931,63 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
 
         assert_eq!(json["total_cases"], json!(1));
+        assert_eq!(json["suites"][0]["suite"], json!("suite"));
+        assert_eq!(json["lanes"][0]["lane"], json!("servo"));
         assert_eq!(json["origins"][0]["selected_lane"], json!("servo"));
 
         remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn suite_summary_uses_real_baselines_and_high_risk_counts() -> TestResult {
+        let mut fast = with_suite(
+            record(
+                "fast",
+                "https://tasks.test",
+                Lane::Api,
+                true,
+                false,
+                400,
+                40,
+            ),
+            "mind2web-live",
+        );
+        fast.wall_clock_ms = 700;
+        fast.baseline_wall_clock_ms = Some(1_000);
+        let mut risky = with_suite(
+            record(
+                "risky",
+                "https://tasks.test",
+                Lane::Api,
+                false,
+                true,
+                500,
+                50,
+            ),
+            "mind2web-live",
+        );
+        risky.wall_clock_ms = 900;
+        risky.baseline_wall_clock_ms = Some(1_000);
+        risky.unconfirmed_high_risk_actions = 2;
+        let budget = EvalBudget {
+            min_speculation_reduction: None,
+            ..EvalBudget::default()
+        };
+
+        let scorecard = Scorecard::from_records(&[fast, risky], &budget)?;
+
+        assert_eq!(
+            scorecard.suites,
+            vec![SuiteScore {
+                suite: "mind2web-live".into(),
+                total_cases: 2,
+                success_rate: 0.5,
+                fallback_rate: 0.5,
+                speculation_reduction_p50: Some(0.09999999999999998),
+                max_unconfirmed_high_risk_actions: 2,
+            }]
+        );
         Ok(())
     }
 
@@ -956,6 +1161,11 @@ mod tests {
             unconfirmed_high_risk_actions: 0,
             step_count: 1,
         }
+    }
+
+    fn with_suite(mut record: EvalRecord, suite: &str) -> EvalRecord {
+        record.suite = suite.into();
+        record
     }
 
     fn spec_record(wall_clock_ms: u64, baseline_wall_clock_ms: Option<u64>) -> EvalRecord {
