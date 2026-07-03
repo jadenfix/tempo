@@ -494,7 +494,31 @@ impl ServoNetworkAdapter {
     }
 
     pub fn with_web_bot_auth_key(mut self, key: WebBotAuthSigningKey, created: u64) -> Self {
-        self.signing = Some(ServoSigningConfig { key, created });
+        self.signing = Some(ServoSigningConfig {
+            key,
+            created,
+            expires: None,
+            nonce: None,
+            signature_agent: None,
+        });
+        self
+    }
+
+    pub fn with_web_bot_auth_signature_agent(
+        mut self,
+        key: WebBotAuthSigningKey,
+        created: u64,
+        expires: u64,
+        nonce: impl Into<String>,
+        signature_agent: impl Into<String>,
+    ) -> Self {
+        self.signing = Some(ServoSigningConfig {
+            key,
+            created,
+            expires: Some(expires),
+            nonce: Some(nonce.into()),
+            signature_agent: Some(signature_agent.into()),
+        });
         self
     }
 
@@ -579,9 +603,23 @@ impl ServoNetworkAdapter {
         let Some(signing) = &self.signing else {
             return Ok(Vec::new());
         };
-        let headers = request.sign_web_bot_auth(&signing.key, signing.created)?;
+        let headers = if let (Some(expires), Some(nonce), Some(signature_agent)) = (
+            signing.expires,
+            signing.nonce.as_deref(),
+            signing.signature_agent.as_deref(),
+        ) {
+            request.sign_web_bot_auth_with_agent(
+                &signing.key,
+                signing.created,
+                expires,
+                nonce,
+                signature_agent,
+            )?
+        } else {
+            request.sign_web_bot_auth(&signing.key, signing.created)?
+        };
         Ok(headers
-            .as_header_pairs()
+            .header_pairs()
             .into_iter()
             .map(|(name, value)| (name.to_string(), value.to_string()))
             .collect())
@@ -796,6 +834,9 @@ impl ResolvedTarget {
 struct ServoSigningConfig {
     key: WebBotAuthSigningKey,
     created: u64,
+    expires: Option<u64>,
+    nonce: Option<String>,
+    signature_agent: Option<String>,
 }
 
 /// Engine readiness gates that must be satisfied before a page is agent-drivable.
@@ -1339,7 +1380,13 @@ mod tests {
         let signing_key = WebBotAuthSigningKey::from_seed("tempo-key", &[7_u8; 32])?;
         let adapter = ServoNetworkAdapter::new("profile-a", IdentityMode::AgentDeclared)
             .with_url_policy(UrlPolicy::allow_all())
-            .with_web_bot_auth_key(signing_key, 123);
+            .with_web_bot_auth_signature_agent(
+                signing_key,
+                123,
+                423,
+                "test-nonce",
+                "https://signature-agent.test",
+            );
         let request = ServoNetworkRequest::new("req-1", "GET", format!("{origin}/signed"));
 
         let fetch = adapter.fetch(&request)?;
@@ -1348,8 +1395,11 @@ mod tests {
             .recv_timeout(StdDuration::from_secs(1))?
             .to_ascii_lowercase();
 
-        assert_eq!(fetch.signed_headers.len(), 2);
+        assert_eq!(fetch.signed_headers.len(), 3);
+        assert!(captured.contains("\r\nsignature-agent: \"https://signature-agent.test\""));
         assert!(captured.contains("\r\nsignature-input:"));
+        assert!(captured.contains("expires=423"));
+        assert!(captured.contains("tag=\"web-bot-auth\""));
         assert!(captured.contains("\r\nsignature:"));
         Ok(())
     }
