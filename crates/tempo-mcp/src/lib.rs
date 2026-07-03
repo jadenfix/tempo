@@ -263,6 +263,14 @@ where
                     Err(error) => Ok(ToolCall::error(error.to_string())),
                 }
             }
+            "observe_diff" => {
+                let args: ObserveDiffArgs = parse_args(arguments)?;
+                let driver = self.driver_for_mut(args.driver_id.as_deref())?;
+                match driver.observe_diff(args.since_seq).await {
+                    Ok(diff) => Ok(ToolCall::success(json!(diff))),
+                    Err(error) => Ok(ToolCall::error(error.to_string())),
+                }
+            }
             "act" => {
                 let args: ActArgs = parse_args(arguments)?;
                 if let Err(denial) =
@@ -500,6 +508,17 @@ pub fn tools() -> Vec<ToolDescriptor> {
             input_schema: object_schema(vec![("driver_id", json!({"type": "string"}))], &[]),
         },
         ToolDescriptor {
+            name: "observe_diff",
+            description: "Return the observation diff since a known sequence number.",
+            input_schema: object_schema(
+                vec![
+                    ("since_seq", json!({"type": "integer", "minimum": 0})),
+                    ("driver_id", json!({"type": "string"})),
+                ],
+                &["since_seq"],
+            ),
+        },
+        ToolDescriptor {
             name: "act",
             description: "Execute one tempo semantic action with explicit input_tainted evidence.",
             input_schema: object_schema(
@@ -579,7 +598,7 @@ pub fn tools() -> Vec<ToolDescriptor> {
 }
 
 pub fn describe() -> &'static str {
-    "tempo MCP server core: initialize/ping/tools/list/tools/call for observe, act, act_batch, fork, close_fork, extract, screenshot, and handshake"
+    "tempo MCP server core: initialize/ping/tools/list/tools/call for observe, observe_diff, act, act_batch, fork, close_fork, extract, screenshot, and handshake"
 }
 
 #[derive(Debug, Error)]
@@ -645,6 +664,13 @@ impl ToolCall {
 struct DriverTargetArgs {
     #[serde(default)]
     driver_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ObserveDiffArgs {
+    #[serde(default)]
+    driver_id: Option<String>,
+    since_seq: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1193,6 +1219,7 @@ mod tests {
             names,
             vec![
                 "observe",
+                "observe_diff",
                 "act",
                 "act_batch",
                 "fork",
@@ -1223,6 +1250,7 @@ mod tests {
             "http://127.0.0.1:8787/mcp"
         );
         assert!(skills.iter().any(|skill| skill["id"] == "observe"));
+        assert!(skills.iter().any(|skill| skill["id"] == "observe_diff"));
         assert!(skills.iter().any(|skill| skill["id"] == "handshake"));
         Ok(())
     }
@@ -1233,6 +1261,11 @@ mod tests {
 
         let observe = call_tool(&mut server, "observe", json!({})).await?;
         assert_eq!(observe["url"], "https://example.test/");
+
+        let diff = call_tool(&mut server, "observe_diff", json!({"since_seq": 0})).await?;
+        assert_eq!(diff["since_seq"], 0);
+        assert_eq!(diff["seq"], 1);
+        assert_eq!(diff["changed"][0]["node_id"], "button.primary");
 
         let act = call_tool(
             &mut server,
@@ -1419,13 +1452,25 @@ mod tests {
         )
         .await?;
         let root_observe = call_tool(&mut server, "observe", json!({})).await?;
-        let fork_observe =
-            call_tool(&mut server, "observe", json!({"driver_id": driver_id})).await?;
+        let fork_observe = call_tool(
+            &mut server,
+            "observe",
+            json!({"driver_id": driver_id.clone()}),
+        )
+        .await?;
+        let fork_diff = call_tool(
+            &mut server,
+            "observe_diff",
+            json!({"driver_id": driver_id, "since_seq": 1}),
+        )
+        .await?;
 
         assert_eq!(fork_act["status"], "applied");
         assert_eq!(fork_act["diff"]["seq"], 2);
         assert_eq!(root_observe["seq"], 1);
         assert_eq!(fork_observe["seq"], 2);
+        assert_eq!(fork_diff["since_seq"], 1);
+        assert_eq!(fork_diff["seq"], 2);
         Ok(())
     }
 
