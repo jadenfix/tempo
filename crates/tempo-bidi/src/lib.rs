@@ -246,6 +246,10 @@ impl BidiRouter {
         BidiMessage::success(id, result)
     }
 
+    pub fn begin_drain(&mut self) {
+        self.ready = false;
+    }
+
     pub fn event_subscribed(
         &self,
         event: BidiEventMethod,
@@ -275,6 +279,13 @@ impl BidiRouter {
         id: CommandId,
         params: Value,
     ) -> Result<RoutedCommand, BidiProtocolError> {
+        if !self.ready {
+            return Ok(RoutedCommand::Immediate(BidiMessage::error(
+                Some(id),
+                BidiErrorCode::SessionNotCreated,
+                "tempo BiDi endpoint is draining; new sessions are not accepted",
+            )));
+        }
         let params: SessionNewParameters = match parse_command_params(id, params) {
             Ok(params) => params,
             Err(routed) => return Ok(routed),
@@ -799,6 +810,7 @@ fn headers_from_iter<'a>(headers: impl Iterator<Item = (&'a str, &'a str)>) -> V
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BidiErrorCode {
     InvalidArgument,
+    SessionNotCreated,
     UnknownCommand,
     UnknownError,
 }
@@ -807,6 +819,7 @@ impl BidiErrorCode {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::InvalidArgument => "invalid argument",
+            Self::SessionNotCreated => "session not created",
             Self::UnknownCommand => "unknown command",
             Self::UnknownError => "unknown error",
         }
@@ -928,6 +941,35 @@ mod tests {
                         "acceptInsecureCerts": false,
                     },
                 }),
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn session_new_is_rejected_after_drain_begins() -> TestResult {
+        let mut router = BidiRouter::new();
+
+        router.begin_drain();
+        let status = router.route_json(br#"{"id":1,"method":"session.status","params":{}}"#)?;
+        let new_session = router.route_json(br#"{"id":2,"method":"session.new","params":{}}"#)?;
+
+        assert_eq!(
+            status,
+            RoutedCommand::Immediate(BidiMessage::Success {
+                id: 1,
+                result: json!({
+                    "ready": false,
+                    "message": "tempo BiDi endpoint is draining",
+                }),
+            })
+        );
+        assert_eq!(
+            new_session,
+            RoutedCommand::Immediate(BidiMessage::Error {
+                id: Some(2),
+                error: "session not created".into(),
+                message: "tempo BiDi endpoint is draining; new sessions are not accepted".into(),
             })
         );
         Ok(())
