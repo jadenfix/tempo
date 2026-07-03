@@ -9,6 +9,8 @@
 //! preserved: a NodeId miss is a `StepError`, never a `TransportError`.
 
 use async_trait::async_trait;
+#[cfg(any(test, feature = "test-driver"))]
+use tempo_net::UrlPolicy;
 use tempo_schema::{Action, ActionBatch, CompiledObservation, NodeId, ObservationDiff};
 use thiserror::Error;
 
@@ -95,6 +97,7 @@ pub trait DriverTrait: Send + Sync {
 pub struct TestDriver {
     seq: u64,
     url: String,
+    url_policy: UrlPolicy,
     elements: Vec<tempo_schema::InteractiveElement>,
 }
 
@@ -113,8 +116,19 @@ impl TestDriver {
         Self {
             seq: 0,
             url: "about:blank".into(),
+            url_policy: UrlPolicy::block_private(),
             elements: Vec::new(),
         }
+    }
+
+    pub fn with_url_policy(mut self, url_policy: UrlPolicy) -> Self {
+        self.url_policy = url_policy;
+        self
+    }
+
+    pub fn allow_private_network_access(mut self) -> Self {
+        self.url_policy = UrlPolicy::allow_all();
+        self
     }
 
     /// Seed the page with elements so tests can plan actions against known NodeIds.
@@ -153,6 +167,9 @@ impl DriverTrait for TestDriver {
     }
 
     async fn goto(&mut self, url: &str) -> Result<CompiledObservation, TransportError> {
+        self.url_policy
+            .enforce(url)
+            .map_err(|_error| TransportError::UrlBlocked)?;
         self.url = url.to_string();
         self.seq += 1;
         Ok(self.snapshot())
@@ -173,6 +190,20 @@ impl DriverTrait for TestDriver {
     }
 
     async fn act(&mut self, action: &Action) -> Result<StepOutcome, TransportError> {
+        if let Action::Goto { url } = action {
+            let since_seq = self.seq;
+            let observation = self.goto(url).await?;
+            return Ok(StepOutcome::Applied {
+                diff: ObservationDiff {
+                    since_seq,
+                    seq: observation.seq,
+                    added: vec![],
+                    removed: vec![],
+                    changed: vec![],
+                },
+            });
+        }
+
         // Grounding contract: an action against a missing node is a StepError, not a fault.
         let missing = match action {
             Action::Click { node }
@@ -221,6 +252,7 @@ impl DriverTrait for TestDriver {
         let forked = TestDriver {
             seq: self.seq,
             url: self.url.clone(),
+            url_policy: self.url_policy.clone(),
             elements: self.elements.clone(),
         };
         Ok(Box::new(forked))
@@ -470,6 +502,83 @@ mod tests {
 
         assert!(bytes.starts_with(PNG_SIGNATURE));
         assert!(bytes.len() > PNG_SIGNATURE.len());
+        Ok(())
+    }
+
+    #[test]
+    fn test_driver_blocks_private_navigation_by_default() -> Result<(), String> {
+        for url in [
+            "http://127.0.0.1/admin",
+            "http://169.254.169.254/latest/meta-data",
+            "http://10.0.0.1/internal",
+        ] {
+            let mut driver = TestDriver::new();
+            let result = futures::executor::block_on(driver.goto(url));
+
+            assert!(
+                matches!(result, Err(TransportError::UrlBlocked)),
+                "{url} was not blocked: {result:?}"
+            );
+            let observation =
+                futures::executor::block_on(driver.observe()).map_err(|e| e.to_string())?;
+            assert_eq!(observation.url, "about:blank", "{url} mutated url");
+            assert_eq!(observation.seq, 0, "{url} mutated sequence");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_driver_blocks_private_goto_action_by_default() -> Result<(), String> {
+        let mut driver = TestDriver::new();
+        let action = Action::Goto {
+            url: "http://169.254.169.254/latest/meta-data".into(),
+        };
+
+        let result = futures::executor::block_on(driver.act(&action));
+
+        assert!(
+            matches!(result, Err(TransportError::UrlBlocked)),
+            "private goto action was not blocked: {result:?}"
+        );
+        let observation =
+            futures::executor::block_on(driver.observe()).map_err(|e| e.to_string())?;
+        assert_eq!(observation.url, "about:blank");
+        assert_eq!(observation.seq, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_driver_blocks_private_goto_action_in_batch_by_default() -> Result<(), String> {
+        let mut driver = TestDriver::new();
+        let batch = ActionBatch {
+            actions: vec![Action::Goto {
+                url: "http://169.254.169.254/latest/meta-data".into(),
+            }],
+            quiescence: tempo_schema::QuiescencePolicy::FixedMillis(0),
+        };
+
+        let result = futures::executor::block_on(driver.act_batch(&batch));
+
+        assert!(
+            matches!(result, Err(TransportError::UrlBlocked)),
+            "private batched goto action was not blocked: {result:?}"
+        );
+        let observation =
+            futures::executor::block_on(driver.observe()).map_err(|e| e.to_string())?;
+        assert_eq!(observation.url, "about:blank");
+        assert_eq!(observation.seq, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_driver_can_explicitly_allow_private_navigation() -> Result<(), String> {
+        let mut driver = TestDriver::new().allow_private_network_access();
+
+        let observation = futures::executor::block_on(driver.goto("http://127.0.0.1/fixture"))
+            .map_err(|e| e.to_string())?;
+
+        assert_eq!(observation.url, "http://127.0.0.1/fixture");
+        assert_eq!(observation.seq, 1);
         Ok(())
     }
 
