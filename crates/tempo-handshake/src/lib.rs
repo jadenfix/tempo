@@ -157,6 +157,11 @@ impl HttpProbeConfig {
         self.url_policy = url_policy;
         self
     }
+
+    pub fn allow_private_network_access(mut self) -> Self {
+        self.url_policy = UrlPolicy::allow_all();
+        self
+    }
 }
 
 impl Default for HttpProbeConfig {
