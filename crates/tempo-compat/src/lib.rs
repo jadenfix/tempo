@@ -188,8 +188,22 @@ impl CompatScorecard {
             .iter()
             .map(|entry| decide_lane(entry, thresholds))
             .collect::<Vec<_>>();
-        LaneTable::new(rows)
+        LaneTable::new_with_thresholds(rows, thresholds)
     }
+}
+
+/// Stable count for a primary runtime lane.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeLaneCount {
+    pub lane: RuntimeLane,
+    pub count: usize,
+}
+
+/// Stable count for CDP fallback causes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaneReasonCount {
+    pub reason: LaneReason,
+    pub count: usize,
 }
 
 /// Per-origin lane table plus aggregate KPIs.
@@ -199,10 +213,22 @@ pub struct LaneTable {
     pub fallback_rate: f32,
     pub structured_rate: f32,
     pub servo_rate: f32,
+    pub missing_primary_count: usize,
+    pub primary_lane_counts: Vec<RuntimeLaneCount>,
+    pub fallback_reason_counts: Vec<LaneReasonCount>,
+    pub challenge_rate_threshold: f32,
+    pub average_challenge_rate: f32,
+    pub max_challenge_rate: f32,
+    pub challenge_rate_exceeded_count: usize,
+    pub challenge_rate_exceeded_rate: f32,
 }
 
 impl LaneTable {
-    pub fn new(mut rows: Vec<LaneTableRow>) -> Self {
+    pub fn new(rows: Vec<LaneTableRow>) -> Self {
+        Self::new_with_thresholds(rows, CompatThresholds::default())
+    }
+
+    pub fn new_with_thresholds(mut rows: Vec<LaneTableRow>, thresholds: CompatThresholds) -> Self {
         rows.sort_by(|left, right| left.origin.cmp(&right.origin));
         let total = rows.len() as f32;
         let fallback_count = rows
@@ -217,18 +243,89 @@ impl LaneTable {
             .iter()
             .filter(|row| row.primary == Some(RuntimeLane::Servo))
             .count() as f32;
+        let missing_primary_count = rows.iter().filter(|row| row.primary.is_none()).count();
+        let challenge_rate_sum = rows
+            .iter()
+            .map(|row| row.challenge_rate)
+            .fold(0.0, |sum, rate| sum + rate);
+        let max_challenge_rate = rows
+            .iter()
+            .map(|row| row.challenge_rate)
+            .fold(0.0, f32::max);
+        let challenge_rate_exceeded_count = rows
+            .iter()
+            .filter(|row| row.challenge_rate > thresholds.max_challenge_rate)
+            .count();
+        let primary_lane_counts = primary_lane_counts(&rows);
+        let fallback_reason_counts = fallback_reason_counts(&rows);
 
         Self {
             rows,
             fallback_rate: ratio(fallback_count, total),
             structured_rate: ratio(structured_count, total),
             servo_rate: ratio(servo_count, total),
+            missing_primary_count,
+            primary_lane_counts,
+            fallback_reason_counts,
+            challenge_rate_threshold: thresholds.max_challenge_rate,
+            average_challenge_rate: ratio(challenge_rate_sum, total),
+            max_challenge_rate,
+            challenge_rate_exceeded_count,
+            challenge_rate_exceeded_rate: ratio(challenge_rate_exceeded_count as f32, total),
         }
     }
 
     pub fn row_for(&self, origin: &str) -> Option<&LaneTableRow> {
         self.rows.iter().find(|row| row.origin == origin)
     }
+
+    pub fn primary_lane_count(&self, lane: RuntimeLane) -> usize {
+        self.primary_lane_counts
+            .iter()
+            .find(|entry| entry.lane == lane)
+            .map_or(0, |entry| entry.count)
+    }
+
+    pub fn fallback_reason_count(&self, reason: LaneReason) -> usize {
+        self.fallback_reason_counts
+            .iter()
+            .find(|entry| entry.reason == reason)
+            .map_or(0, |entry| entry.count)
+    }
+}
+
+fn primary_lane_counts(rows: &[LaneTableRow]) -> Vec<RuntimeLaneCount> {
+    [
+        RuntimeLane::Servo,
+        RuntimeLane::Cdp,
+        RuntimeLane::Api,
+        RuntimeLane::Mcp,
+    ]
+    .into_iter()
+    .filter_map(|lane| {
+        let count = rows.iter().filter(|row| row.primary == Some(lane)).count();
+        (count > 0).then_some(RuntimeLaneCount { lane, count })
+    })
+    .collect()
+}
+
+fn fallback_reason_counts(rows: &[LaneTableRow]) -> Vec<LaneReasonCount> {
+    [
+        LaneReason::ServoLoadFailed,
+        LaneReason::ServoObservationLow,
+        LaneReason::ServoActionFailed,
+        LaneReason::ChallengeRateHigh,
+        LaneReason::NoHealthyRenderLane,
+    ]
+    .into_iter()
+    .filter_map(|reason| {
+        let count = rows
+            .iter()
+            .filter(|row| row.primary == Some(RuntimeLane::Cdp) && row.reason == reason)
+            .count();
+        (count > 0).then_some(LaneReasonCount { reason, count })
+    })
+    .collect()
 }
 
 /// Decide the runtime lane for one origin.
@@ -503,21 +600,63 @@ mod tests {
             ),
             healthy_origin("https://servo.example"),
             healthy_origin("https://mcp.example").structured_surface(StructuredSurface::Mcp),
+            OriginScore::new(
+                "https://challenge.example",
+                EngineProbe::servo(true, 0.98, true, 90),
+                cdp_oracle(),
+            )
+            .challenge_rate(0.42),
         ]);
 
         let table = scorecard.lane_table(CompatThresholds::default());
-        assert_eq!(table.rows.len(), 3);
-        assert_eq!(table.rows[0].origin, "https://fallback.example");
-        assert_eq!(table.rows[1].origin, "https://mcp.example");
-        assert_eq!(table.rows[2].origin, "https://servo.example");
-        assert_close(table.fallback_rate, 1.0 / 3.0)?;
-        assert_close(table.structured_rate, 1.0 / 3.0)?;
-        assert_close(table.servo_rate, 1.0 / 3.0)?;
+        assert_eq!(table.rows.len(), 4);
+        assert_eq!(table.rows[0].origin, "https://challenge.example");
+        assert_eq!(table.rows[1].origin, "https://fallback.example");
+        assert_eq!(table.rows[2].origin, "https://mcp.example");
+        assert_eq!(table.rows[3].origin, "https://servo.example");
+        assert_close(table.fallback_rate, 2.0 / 4.0)?;
+        assert_close(table.structured_rate, 1.0 / 4.0)?;
+        assert_close(table.servo_rate, 1.0 / 4.0)?;
+        assert_eq!(table.missing_primary_count, 0);
+        assert_eq!(table.primary_lane_count(RuntimeLane::Servo), 1);
+        assert_eq!(table.primary_lane_count(RuntimeLane::Cdp), 2);
+        assert_eq!(table.primary_lane_count(RuntimeLane::Mcp), 1);
+        assert_eq!(table.fallback_reason_count(LaneReason::ServoLoadFailed), 1);
+        assert_eq!(
+            table.fallback_reason_count(LaneReason::ChallengeRateHigh),
+            1
+        );
+        assert_close(table.challenge_rate_threshold, 0.10)?;
+        assert_close(table.max_challenge_rate, 0.42)?;
+        assert_eq!(table.challenge_rate_exceeded_count, 1);
+        assert_close(table.challenge_rate_exceeded_rate, 1.0 / 4.0)?;
         assert_eq!(
             table.row_for("https://mcp.example").map(|row| row.primary),
             Some(Some(RuntimeLane::Mcp))
         );
         Ok(())
+    }
+
+    #[test]
+    fn lane_table_reports_missing_lanes_as_ci_evidence() {
+        let table = LaneTable::new(vec![LaneTableRow {
+            origin: "https://down.example".to_string(),
+            primary: None,
+            fallback: None,
+            reason: LaneReason::NoHealthyRenderLane,
+            servo_passed: false,
+            cdp_passed: false,
+            servo_quality: 0.0,
+            cdp_quality: 0.0,
+            challenge_rate: 0.0,
+        }]);
+
+        assert_eq!(table.missing_primary_count, 1);
+        assert_eq!(table.primary_lane_count(RuntimeLane::Servo), 0);
+        assert_eq!(
+            table.fallback_reason_count(LaneReason::NoHealthyRenderLane),
+            0
+        );
     }
 
     #[test]
