@@ -44,6 +44,8 @@ jobs:
         run: bash scripts/check-servo-public-api.sh
       - name: cargo test (contracts + conformance)
         run: cargo test --workspace
+      - name: cargo test (toolexec live beatbox)
+        run: cargo test --manifest-path tests/toolexec-live/Cargo.toml
       - name: eval budget fixture gate
         run: >
           cargo run -p tempo-cli -- scorecard
@@ -62,9 +64,8 @@ jobs:
         run: >
           cargo run -p tempo-cli -- taint-gate
           --input fixtures/security/taint-redteam-pass.json
-      # Always-green invariant (final.md §8.3): tempo-engine-servo must build against
-      # pinned VANILLA servo. Enabled once the engine crate carries the servo dep.
-      # - run: cargo check -p tempo-engine-servo --no-default-features --features servo-vanilla
+      - name: servo vanilla build gate
+        run: cargo check -p tempo-engine-servo --no-default-features --features servo-vanilla
 
   live-cdp:
     runs-on: ubuntu-latest

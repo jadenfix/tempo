@@ -22,9 +22,13 @@ use tempo_net::{
 use tempo_schema::{Action, ActionBatch, CompiledObservation, NodeId, ObservationDiff};
 use thiserror::Error;
 
+#[cfg(feature = "servo-vanilla")]
+mod servo_embedder;
+
 /// Default cap for a Servo-intercepted network response body reissued through tempo-net.
 pub const DEFAULT_MAX_SERVO_RESPONSE_BODY_BYTES: usize = 10 * 1024 * 1024;
 pub const MAX_SERVO_REDIRECTS: usize = 10;
+pub const PINNED_VANILLA_SERVO_VERSION: &str = "0.3.0";
 
 /// Which Servo build is backing this engine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,6 +88,37 @@ impl ServoEngineConfig {
             ServoBuildFlavor::Vanilla => Err(Unsupported("native servo fork requires tempo fork")),
         }
     }
+}
+
+/// Tempo-visible evidence that the vanilla Servo embedder feature is wired.
+///
+/// This deliberately exposes only tempo-owned types and scalar metadata. The
+/// private `servo-vanilla` module imports the real Servo embedding types and
+/// maps this config into that private surface.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServoVanillaBuildPlan {
+    pub servo_crate_version: String,
+    pub build_flavor: ServoBuildFlavor,
+    pub viewport: Viewport,
+    pub user_agent: String,
+    pub access_tree: bool,
+    pub intercept_network: bool,
+}
+
+#[cfg(feature = "servo-vanilla")]
+pub fn vanilla_servo_build_plan(
+    config: &ServoEngineConfig,
+) -> Result<ServoVanillaBuildPlan, Unsupported> {
+    servo_embedder::VanillaServoEmbedderPlan::from_config(config).map(Into::into)
+}
+
+#[cfg(not(feature = "servo-vanilla"))]
+pub fn vanilla_servo_build_plan(
+    _config: &ServoEngineConfig,
+) -> Result<ServoVanillaBuildPlan, Unsupported> {
+    Err(Unsupported(
+        "vanilla Servo embedder requires the servo-vanilla feature",
+    ))
 }
 
 /// Servo-backed driver handle connected to an out-of-process Servo engine.
@@ -1029,6 +1064,38 @@ mod tests {
 
         assert!(vanilla.native_fork().is_err());
         assert!(fork.native_fork().is_ok());
+    }
+
+    #[test]
+    fn vanilla_servo_build_plan_requires_feature_or_returns_private_mapping() -> TestResult {
+        let config = ServoEngineConfig::vanilla();
+
+        let result = vanilla_servo_build_plan(&config);
+
+        #[cfg(feature = "servo-vanilla")]
+        {
+            let plan = result?;
+            assert_eq!(plan.servo_crate_version, PINNED_VANILLA_SERVO_VERSION);
+            assert_eq!(plan.build_flavor, ServoBuildFlavor::Vanilla);
+            assert_eq!(plan.viewport, config.viewport);
+            assert_eq!(plan.user_agent, config.user_agent);
+            assert!(plan.access_tree);
+            assert!(plan.intercept_network);
+        }
+
+        #[cfg(not(feature = "servo-vanilla"))]
+        {
+            assert!(matches!(result, Err(Unsupported(_))));
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "servo-vanilla")]
+    #[test]
+    fn vanilla_servo_build_plan_rejects_tempo_fork_config() {
+        let result = vanilla_servo_build_plan(&ServoEngineConfig::tempo_fork());
+
+        assert!(matches!(result, Err(Unsupported(_))));
     }
 
     #[test]
