@@ -32,6 +32,12 @@ pub enum JournalEvent {
     SessionStarted {
         url: String,
     },
+    StructuredFastPathSelected {
+        origin: String,
+        lane: String,
+        signal: String,
+        source: String,
+    },
     Observation {
         observation: CompiledObservation,
     },

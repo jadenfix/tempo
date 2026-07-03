@@ -15,6 +15,7 @@ tempo-session = { path = "../tempo-session" }
 tempo-skills = { path = "../tempo-skills" }
 serde.workspace = true
 serde_json.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 sha2.workspace = true
 thiserror.workspace = true
 
