@@ -2762,6 +2762,41 @@ mod tests {
     }
 
     #[test]
+    fn mcp_endpoint_routes_observe_diff_to_attached_engine_driver() -> TestResult {
+        let mut pool = SessionPool::default();
+        let handle = attach_driver_handler(&mut pool, |request| {
+            assert_eq!(request.driver_id, None);
+            assert_eq!(
+                request.command,
+                HostDriverCommand::ObserveDiff { since_seq: 7 }
+            );
+            DriverResponse::Diff {
+                diff: ObservationDiff {
+                    since_seq: 7,
+                    seq: 9,
+                    added: Vec::new(),
+                    removed: Vec::new(),
+                    changed: Vec::new(),
+                },
+            }
+        })?;
+
+        let response = route_http_request(
+            &mut pool,
+            mcp_tool_request(14, "observe_diff", json!({"since_seq": 7}))?,
+        )?;
+        join_driver_handler(handle)?;
+
+        assert_eq!(response.status, 200);
+        let value: Value = serde_json::from_slice(&response.body)?;
+        assert_eq!(value["jsonrpc"], "2.0");
+        assert_eq!(value["id"], 14);
+        assert_eq!(value["result"]["structuredContent"]["since_seq"], 7);
+        assert_eq!(value["result"]["structuredContent"]["seq"], 9);
+        Ok(())
+    }
+
+    #[test]
     fn mcp_endpoint_routes_act_batch_to_attached_engine_driver() -> TestResult {
         let mut pool = SessionPool::default();
         let handle = attach_driver_handler(&mut pool, |request| {
@@ -2880,7 +2915,15 @@ mod tests {
             route_http_request(&mut pool, mcp_tool_request(3, "observe", json!({}))?)?;
         let fork_response = route_http_request(
             &mut pool,
-            mcp_tool_request(4, "observe", json!({"driver_id": driver_id}))?,
+            mcp_tool_request(4, "observe", json!({"driver_id": driver_id.clone()}))?,
+        )?;
+        let fork_diff_response = route_http_request(
+            &mut pool,
+            mcp_tool_request(
+                5,
+                "observe_diff",
+                json!({"driver_id": driver_id, "since_seq": 0}),
+            )?,
         )?;
 
         drop(pool);
@@ -2892,8 +2935,11 @@ mod tests {
 
         let root: Value = serde_json::from_slice(&root_response.body)?;
         let fork: Value = serde_json::from_slice(&fork_response.body)?;
+        let fork_diff: Value = serde_json::from_slice(&fork_diff_response.body)?;
         assert_eq!(root["result"]["structuredContent"]["seq"], 0);
         assert_eq!(fork["result"]["structuredContent"]["seq"], 1);
+        assert_eq!(fork_diff["result"]["structuredContent"]["since_seq"], 0);
+        assert_eq!(fork_diff["result"]["structuredContent"]["seq"], 1);
         Ok(())
     }
 
