@@ -163,6 +163,41 @@ impl ObservationInput {
     }
 }
 
+/// Evidence summary for a recorded observation fixture corpus.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ObservationCorpusReport {
+    pub snapshots: usize,
+    pub bytes_p50: usize,
+    pub bytes_p95: usize,
+    pub tokens_p50: usize,
+    pub tokens_p95: usize,
+    pub max_bytes: usize,
+    pub max_tokens: usize,
+    pub stable_id_opportunities: usize,
+    pub stable_id_survivors: usize,
+    pub stable_id_survival_rate: f64,
+    pub diff_snapshots: usize,
+    pub diff_reconstructable_snapshots: usize,
+}
+
+impl ObservationCorpusReport {
+    pub fn budget_p50_passed(&self) -> bool {
+        self.bytes_p50 <= self.max_bytes && self.tokens_p50 <= self.max_tokens
+    }
+
+    pub fn stable_id_gate_passed(&self) -> bool {
+        self.stable_id_survival_rate >= 0.99
+    }
+
+    pub fn diff_gate_passed(&self) -> bool {
+        self.diff_snapshots == self.diff_reconstructable_snapshots
+    }
+
+    pub fn final_md_gate_passed(&self) -> bool {
+        self.budget_p50_passed() && self.stable_id_gate_passed() && self.diff_gate_passed()
+    }
+}
+
 /// Stateful compiler. The mapper remembers identities across snapshots so NodeIds
 /// survive relayout, reorder, and re-render when either engine IDs or stable DOM
 /// hints/fingerprints line up.
@@ -188,26 +223,33 @@ impl ObservationCompiler {
 
     /// Compile one raw snapshot into the frozen schema observation.
     pub fn compile(&mut self, input: ObservationInput) -> CompiledObservation {
+        self.compile_with_identities(input).observation
+    }
+
+    fn compile_with_identities(&mut self, input: ObservationInput) -> CompiledSnapshot {
         self.seq += 1;
         self.mapper.begin_snapshot(self.seq);
 
-        let mut elements: Vec<_> = input
+        let mut identities = Vec::new();
+        let mut elements = Vec::new();
+        for raw in input
             .elements
             .into_iter()
             .filter(|raw| raw.visible && raw.interactive)
-            .map(|raw| {
-                let node_id = self.mapper.node_id_for(&raw);
-                let rank = rank_raw_element(&raw);
-                InteractiveElement {
-                    node_id,
-                    role: raw.role,
-                    name: raw.name,
-                    value: raw.value,
-                    bounds: raw.bounds,
-                    rank,
-                }
-            })
-            .collect();
+        {
+            let report_key = corpus_identity_key(&raw);
+            let node_id = self.mapper.node_id_for(&raw);
+            identities.push((report_key, node_id.clone()));
+            let rank = rank_raw_element(&raw);
+            elements.push(InteractiveElement {
+                node_id,
+                role: raw.role,
+                name: raw.name,
+                value: raw.value,
+                bounds: raw.bounds,
+                rank,
+            });
+        }
 
         self.mapper.evict_stale();
 
@@ -218,12 +260,28 @@ impl ObservationCompiler {
                 .then_with(|| left.node_id.0.cmp(&right.node_id.0))
         });
 
-        apply_budget(input.url, self.seq, elements, self.options)
+        let observation = apply_budget(input.url, self.seq, elements, self.options);
+        let emitted_ids: HashSet<_> = observation
+            .elements
+            .iter()
+            .map(|element| element.node_id.clone())
+            .collect();
+        identities.retain(|(_, node_id)| emitted_ids.contains(node_id));
+
+        CompiledSnapshot {
+            observation,
+            identities,
+        }
     }
 
     pub fn seq(&self) -> u64 {
         self.seq
     }
+}
+
+struct CompiledSnapshot {
+    observation: CompiledObservation,
+    identities: Vec<(String, NodeId)>,
 }
 
 /// Number of snapshots an unseen mapping is retained before eviction. Keeps the
@@ -432,6 +490,117 @@ pub fn diff_observations(
     }
 }
 
+/// Compile a recorded fixture corpus and emit budget, stable-ID, and diff evidence.
+pub fn observation_corpus_report(
+    inputs: &[ObservationInput],
+    options: CompileOptions,
+) -> ObservationCorpusReport {
+    let mut compiler = ObservationCompiler::with_options(options);
+    let mut bytes = Vec::with_capacity(inputs.len());
+    let mut tokens = Vec::with_capacity(inputs.len());
+    let mut previous_observation = None;
+    let mut previous_identities = HashMap::new();
+    let mut stable_id_opportunities = 0usize;
+    let mut stable_id_survivors = 0usize;
+    let mut diff_snapshots = 0usize;
+    let mut diff_reconstructable_snapshots = 0usize;
+
+    for input in inputs.iter().cloned() {
+        let snapshot = compiler.compile_with_identities(input);
+        bytes.push(serialized_len(&snapshot.observation));
+        tokens.push(estimated_tokens(&snapshot.observation));
+        let current_identities = unique_identity_map(snapshot.identities);
+
+        for (key, node_id) in &current_identities {
+            if let Some(previous_node_id) = previous_identities.get(key) {
+                stable_id_opportunities += 1;
+                if previous_node_id == node_id {
+                    stable_id_survivors += 1;
+                }
+            }
+        }
+
+        if let Some(previous) = &previous_observation {
+            diff_snapshots += 1;
+            let diff = diff_observations(previous, &snapshot.observation);
+            if diff_reconstructs_current(previous, &snapshot.observation, &diff) {
+                diff_reconstructable_snapshots += 1;
+            }
+        }
+
+        previous_identities = current_identities;
+        previous_observation = Some(snapshot.observation);
+    }
+
+    ObservationCorpusReport {
+        snapshots: inputs.len(),
+        bytes_p50: percentile_usize(bytes.clone(), 0.50),
+        bytes_p95: percentile_usize(bytes, 0.95),
+        tokens_p50: percentile_usize(tokens.clone(), 0.50),
+        tokens_p95: percentile_usize(tokens, 0.95),
+        max_bytes: options.max_bytes,
+        max_tokens: options.max_tokens,
+        stable_id_opportunities,
+        stable_id_survivors,
+        stable_id_survival_rate: ratio(stable_id_survivors, stable_id_opportunities),
+        diff_snapshots,
+        diff_reconstructable_snapshots,
+    }
+}
+
+fn unique_identity_map(identities: Vec<(String, NodeId)>) -> HashMap<String, NodeId> {
+    let mut counts = HashMap::new();
+    for (key, _) in &identities {
+        *counts.entry(key.clone()).or_insert(0usize) += 1;
+    }
+
+    let mut unique = HashMap::new();
+    for (key, node_id) in identities {
+        if counts.get(&key).copied() == Some(1) {
+            unique.insert(key, node_id);
+        }
+    }
+    unique
+}
+
+fn diff_reconstructs_current(
+    previous: &CompiledObservation,
+    current: &CompiledObservation,
+    diff: &ObservationDiff,
+) -> bool {
+    if diff.since_seq != previous.seq || diff.seq != current.seq {
+        return false;
+    }
+
+    let mut reconstructed: HashMap<_, _> = previous
+        .elements
+        .iter()
+        .map(|element| (element.node_id.clone(), element.clone()))
+        .collect();
+    for removed in &diff.removed {
+        if reconstructed.remove(removed).is_none() {
+            return false;
+        }
+    }
+    for element in diff.added.iter().chain(&diff.changed) {
+        reconstructed.insert(element.node_id.clone(), element.clone());
+    }
+
+    let current_by_id: HashMap<_, _> = current
+        .elements
+        .iter()
+        .map(|element| (element.node_id.clone(), element.clone()))
+        .collect();
+    reconstructed == current_by_id
+}
+
+fn corpus_identity_key(raw: &RawElement) -> String {
+    if let Some(stable_hint) = &raw.stable_hint {
+        return format!("hint:{}", normalize(stable_hint));
+    }
+    raw.source_key().unwrap_or_else(|| raw.fingerprint_key())
+}
+
 /// Errors returned by the set-of-marks bitmap compositor.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MarkCompositorError {
@@ -527,6 +696,24 @@ pub fn serialized_len(observation: &CompiledObservation) -> usize {
 /// Coarse token estimate used for the budget gate.
 pub fn estimated_tokens(observation: &CompiledObservation) -> usize {
     serialized_len(observation).div_ceil(4)
+}
+
+fn percentile_usize(mut values: Vec<usize>, percentile: f64) -> usize {
+    if values.is_empty() {
+        return 0;
+    }
+    values.sort_unstable();
+    let rank = (percentile * values.len() as f64).ceil() as usize;
+    let index = rank.saturating_sub(1).min(values.len() - 1);
+    values[index]
+}
+
+fn ratio(numerator: usize, denominator: usize) -> f64 {
+    if denominator == 0 {
+        1.0
+    } else {
+        numerator as f64 / denominator as f64
+    }
 }
 
 /// Stable crate summary used by smoke tests and binaries.
@@ -990,6 +1177,48 @@ mod tests {
         )
     }
 
+    fn checkout_relayout_fixture() -> ObservationInput {
+        ObservationInput::new(
+            "https://shop.example/checkout",
+            vec![
+                RawElement::new("link", "Terms")
+                    .source_id("new-terms-source")
+                    .stable_hint("a[href=/terms]")
+                    .bounds([88.0, 780.0, 80.0, 22.0]),
+                RawElement::new("button", "Pay now")
+                    .source_id("new-pay-source")
+                    .stable_hint("button#pay")
+                    .bounds([340.0, 720.0, 180.0, 42.0]),
+                RawElement::new("textbox", "Email")
+                    .source_id("new-email-source")
+                    .stable_hint("input[name=email]")
+                    .value("me@example.com")
+                    .bounds([122.0, 185.0, 360.0, 38.0]),
+            ],
+        )
+    }
+
+    fn checkout_mutation_fixture() -> ObservationInput {
+        ObservationInput::new(
+            "https://shop.example/checkout",
+            vec![
+                RawElement::new("button", "Pay now")
+                    .source_id("ax:pay")
+                    .stable_hint("button#pay")
+                    .bounds([320.0, 700.0, 180.0, 42.0]),
+                RawElement::new("textbox", "Email address")
+                    .source_id("ax:email")
+                    .stable_hint("input[name=email]")
+                    .value("me@example.com")
+                    .bounds([120.0, 180.0, 360.0, 38.0]),
+                RawElement::new("button", "Apply coupon")
+                    .source_id("ax:coupon")
+                    .stable_hint("button#coupon")
+                    .bounds([120.0, 240.0, 140.0, 38.0]),
+            ],
+        )
+    }
+
     #[test]
     fn compiles_schema_observation_with_page_taint() {
         let mut compiler = ObservationCompiler::new();
@@ -1161,6 +1390,35 @@ mod tests {
             assert!(serialized_len(&observation) <= DEFAULT_MAX_BYTES);
             assert!(estimated_tokens(&observation) <= DEFAULT_MAX_TOKENS);
         }
+    }
+
+    #[test]
+    fn corpus_report_measures_budget_stable_ids_and_diffs() {
+        let fixtures = vec![
+            checkout_fixture(),
+            checkout_relayout_fixture(),
+            checkout_mutation_fixture(),
+        ];
+
+        let report = observation_corpus_report(&fixtures, CompileOptions::default());
+
+        assert_eq!(report.snapshots, 3);
+        assert!(
+            report.bytes_p50 <= DEFAULT_MAX_BYTES,
+            "{}",
+            report.bytes_p50
+        );
+        assert!(
+            report.tokens_p50 <= DEFAULT_MAX_TOKENS,
+            "{}",
+            report.tokens_p50
+        );
+        assert_eq!(report.stable_id_opportunities, 5);
+        assert_eq!(report.stable_id_survivors, 5);
+        assert_eq!(report.stable_id_survival_rate, 1.0);
+        assert_eq!(report.diff_snapshots, 2);
+        assert_eq!(report.diff_reconstructable_snapshots, 2);
+        assert!(report.final_md_gate_passed());
     }
 
     #[test]
