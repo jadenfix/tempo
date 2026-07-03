@@ -12,14 +12,14 @@ use serde_json::json;
 use sha1::{Digest, Sha1};
 use std::collections::BTreeMap;
 use std::fmt;
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
-use tempo_agent::StepTriple;
+use tempo_agent::{StepTriple, StepTripleOutcome};
 use tempo_bidi::{
     browsing_context_load, network_before_request_sent, network_response_completed, BidiErrorCode,
     BidiEventMethod, BidiMessage, BidiRouter, BrowsingContextId, BrowsingContextInfo,
@@ -784,7 +784,12 @@ impl SessionPool {
             return Err(TempodError::SessionNotFound(id.clone()));
         }
         if let Some(exporter) = &self.otlp_exporter {
-            exporter.export_step(&triple)?;
+            // Telemetry export is best-effort: a failing export (issue #214) must
+            // never break the core step-recording path. Log and continue rather
+            // than propagating the IO error out of `record_step`.
+            if let Err(error) = exporter.export_step(&triple) {
+                eprintln!("tempod: OTLP step export failed (telemetry only): {error}");
+            }
         }
         Ok(self.record_event(id, TempodSessionEventKind::StepTriple { triple }))
     }
@@ -970,17 +975,49 @@ impl Default for EngineSupervisor {
 }
 
 /// JSONL exporter for StepTriple telemetry.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// Hardened per issue #214:
+/// * The append file handle is opened once (lazily) and reused for every step,
+///   so we no longer `create_dir_all` + open + close per step while the caller
+///   holds the pool lock — only the minimal write + flush stays on the hot path.
+/// * On unix the file is created with `0600` permissions so telemetry captured
+///   from a browsing session is not world-readable.
+/// * Sensitive fields (typed action text, select values, skill inputs, and URL
+///   query strings) are redacted/hashed before serialization instead of being
+///   written verbatim. See [`redact_action`] / [`redact_step_outcome`].
+#[derive(Clone)]
 pub struct OtlpJsonExporter {
     path: PathBuf,
+    /// Lazily-opened, reused append handle (issue #214, weakness 2). Shared so
+    /// clones of the owning `SessionPool` write to the same open file.
+    handle: Arc<Mutex<Option<File>>>,
+}
+
+impl fmt::Debug for OtlpJsonExporter {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Do not expose the raw OS file handle in Debug output.
+        formatter
+            .debug_struct("OtlpJsonExporter")
+            .field("path", &self.path)
+            .field(
+                "open",
+                &self.handle.lock().map(|guard| guard.is_some()).ok(),
+            )
+            .finish()
+    }
 }
 
 impl OtlpJsonExporter {
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
+        Self {
+            path: path.into(),
+            handle: Arc::new(Mutex::new(None)),
+        }
     }
 
-    pub fn export_step(&self, triple: &StepTriple) -> Result<(), TempodError> {
+    /// Open (creating parents as needed) the append target with restrictive
+    /// permissions. Called at most once per exporter; the handle is then reused.
+    fn open_append_file(&self) -> Result<File, TempodError> {
         if let Some(parent) = self
             .path
             .parent()
@@ -988,28 +1025,142 @@ impl OtlpJsonExporter {
         {
             std::fs::create_dir_all(parent)?;
         }
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
-        serde_json::to_writer(
-            &mut file,
-            &json!({
-                "resource": {
-                    "service.name": "tempod",
-                },
-                "name": "tempo.step",
-                "body": triple,
-            }),
-        )?;
-        file.write_all(b"\n")?;
-        file.flush()?;
-        Ok(())
+        let mut options = OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // 0600: owner read/write only (issue #214, weakness 3).
+            options.mode(0o600);
+        }
+        let file = options.open(&self.path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // Enforce 0600 even if the file pre-existed with looser permissions;
+            // `mode()` above only applies to files this call actually creates.
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        Ok(file)
+    }
+
+    pub fn export_step(&self, triple: &StepTriple) -> Result<(), TempodError> {
+        // Serialize (including redaction) before touching the handle lock so the
+        // lock-held region is just the write + flush.
+        let mut bytes = serde_json::to_vec(&redacted_export_record(triple))?;
+        bytes.push(b'\n');
+
+        let mut guard = self.handle.lock().map_err(|_| TempodError::PoolLock)?;
+        if guard.is_none() {
+            *guard = Some(self.open_append_file()?);
+        }
+        match guard.as_mut() {
+            Some(file) => {
+                file.write_all(&bytes)?;
+                file.flush()?;
+                Ok(())
+            }
+            // Unreachable: the handle was just populated above.
+            None => Ok(()),
+        }
     }
 
     pub fn path(&self) -> &Path {
         &self.path
     }
+}
+
+/// Build the redacted OTLP record written for a step (issue #214, weakness 3).
+///
+/// We keep telemetry-useful, non-sensitive fields (idempotency key, seq, action
+/// kind, node ids, coordinates, observation-diff counts) and redact anything
+/// that can carry raw secrets: typed text, select values, skill inputs, and URL
+/// query strings.
+fn redacted_export_record(triple: &StepTriple) -> serde_json::Value {
+    json!({
+        "resource": {
+            "service.name": "tempod",
+        },
+        "name": "tempo.step",
+        "body": {
+            "key": triple.key,
+            "seq": triple.seq,
+            "action": redact_action(&triple.action),
+            "outcome": redact_step_outcome(&triple.outcome),
+        },
+    })
+}
+
+/// Redact an [`Action`] for telemetry: preserve structural fields, hash or strip
+/// anything that can embed user/page secrets.
+fn redact_action(action: &Action) -> serde_json::Value {
+    match action {
+        Action::Goto { url } => json!({ "kind": "goto", "url": strip_url_secrets(url) }),
+        Action::Click { node } => json!({ "kind": "click", "node": node }),
+        // Typed text frequently carries credentials — hash instead of logging.
+        Action::Type { node, text } => {
+            json!({ "kind": "type", "node": node, "text": hash_secret(text) })
+        }
+        // Select values can be sensitive (e.g. account numbers) — hash them.
+        Action::Select { node, value } => {
+            json!({ "kind": "select", "node": node, "value": hash_secret(value) })
+        }
+        Action::Scroll { x, y } => json!({ "kind": "scroll", "x": x, "y": y }),
+        Action::Wait { millis } => json!({ "kind": "wait", "millis": millis }),
+        Action::Extract { node } => json!({ "kind": "extract", "node": node }),
+        // Skill input is arbitrary JSON that may contain secrets — keep the name,
+        // hash the serialized input.
+        Action::Skill { name, input } => json!({
+            "kind": "skill",
+            "name": name,
+            "input": hash_secret(&input.to_string()),
+        }),
+    }
+}
+
+/// Summarize a step outcome without emitting raw page content. The observation
+/// diff (which contains taint-labeled page text) is reduced to element counts.
+fn redact_step_outcome(outcome: &StepTripleOutcome) -> serde_json::Value {
+    match outcome {
+        StepTripleOutcome::Applied { diff } => json!({
+            "kind": "applied",
+            "since_seq": diff.since_seq,
+            "seq": diff.seq,
+            "added": diff.added.len(),
+            "removed": diff.removed.len(),
+            "changed": diff.changed.len(),
+        }),
+        // `reason` is an engine-produced error string (diagnostics), not raw page
+        // content, so it is retained for telemetry usefulness.
+        StepTripleOutcome::StepError { reason } => json!({
+            "kind": "step_error",
+            "reason": reason,
+        }),
+    }
+}
+
+/// Strip the query string and fragment from a URL so secrets carried in query
+/// parameters are not written verbatim, while keeping the scheme/host/path for
+/// telemetry.
+fn strip_url_secrets(url: &str) -> &str {
+    match url.find(['?', '#']) {
+        Some(index) => &url[..index],
+        None => url,
+    }
+}
+
+/// Hash a sensitive value to `sha256:<hex>` so raw secrets are never persisted
+/// while still allowing equality/correlation across steps.
+fn hash_secret(value: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(value.as_bytes());
+    let mut hex = String::with_capacity(digest.len() * 2 + 7);
+    hex.push_str("sha256:");
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
 }
 
 /// Run tempod forever on an address such as `127.0.0.1:8787`.
@@ -2197,7 +2348,7 @@ mod tests {
     use std::os::unix::net::UnixStream;
     use std::thread;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
-    use tempo_agent::{IdempotencyKey, StepTripleOutcome};
+    use tempo_agent::IdempotencyKey;
     use tempo_driver::TestDriver;
     use tempo_engine_host::{
         serve_driver_connection, DriverRequest, DriverWireError, EngineIpcConnection, RestartPolicy,
@@ -4403,6 +4554,112 @@ mod tests {
         assert_eq!(value["resource"]["service.name"], "tempod");
         assert_eq!(value["name"], "tempo.step");
         assert_eq!(value["body"]["seq"], 1);
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn otlp_export_failure_does_not_break_record_step() -> TestResult {
+        // Issue #214 (weakness 1): point the exporter at an existing directory so
+        // the append-open fails; record_step must still succeed (best-effort).
+        let dir = unique_dir("otlp-export-fail")?;
+        remove_dir_if_exists(&dir)?;
+        std::fs::create_dir_all(&dir)?;
+        let mut pool = SessionPool::default().with_otlp_exporter(OtlpJsonExporter::new(&dir));
+        let session = pool.create("https://fail.test")?;
+
+        let result = pool.record_step(&session.id, sample_step_triple(1));
+        assert!(
+            result.is_ok(),
+            "record_step must survive a telemetry export error"
+        );
+
+        // The step event is still recorded despite the export failure.
+        let events = pool.events(&session.id, None)?;
+        assert!(events
+            .iter()
+            .any(|event| matches!(event.event, TempodSessionEventKind::StepTriple { .. })));
+
+        remove_dir_if_exists(&dir)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn otlp_export_file_has_owner_only_permissions() -> TestResult {
+        use std::os::unix::fs::PermissionsExt;
+        // Issue #214 (weakness 3): the telemetry file must not be world-readable.
+        let root = unique_dir("otlp-perms")?;
+        remove_dir_if_exists(&root)?;
+        let path = root.join("steps.jsonl");
+        OtlpJsonExporter::new(&path).export_step(&sample_step_triple(3))?;
+
+        let mode = std::fs::metadata(&path)?.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "export file must be created with 0600 perms");
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn otlp_export_redacts_secrets_from_action() -> TestResult {
+        // Issue #214 (weakness 3): typed text and URL query strings must never be
+        // written verbatim, while non-sensitive fields remain for telemetry.
+        let root = unique_dir("otlp-redact")?;
+        remove_dir_if_exists(&root)?;
+
+        let typed_path = root.join("typed.jsonl");
+        let secret = "hunter2-super-secret-password";
+        let typed = StepTriple {
+            key: IdempotencyKey("step-type".into()),
+            seq: 5,
+            action: Action::Type {
+                node: NodeId("login-password".into()),
+                text: secret.into(),
+            },
+            outcome: StepTripleOutcome::Applied {
+                diff: ObservationDiff {
+                    since_seq: 4,
+                    seq: 5,
+                    added: vec![],
+                    removed: vec![],
+                    changed: vec![],
+                },
+            },
+        };
+        OtlpJsonExporter::new(&typed_path).export_step(&typed)?;
+        let typed_text = String::from_utf8(std::fs::read(&typed_path)?)?;
+        assert!(
+            !typed_text.contains(secret),
+            "raw typed secret must not be written verbatim"
+        );
+        assert!(typed_text.contains("sha256:"), "typed text must be hashed");
+        let typed_value: Value = serde_json::from_str(typed_text.trim_end())?;
+        assert_eq!(typed_value["body"]["action"]["kind"], "type");
+        assert_eq!(typed_value["body"]["action"]["node"], "login-password");
+        assert_eq!(typed_value["body"]["seq"], 5);
+
+        let goto_path = root.join("goto.jsonl");
+        let goto = StepTriple {
+            key: IdempotencyKey("step-goto".into()),
+            seq: 6,
+            action: Action::Goto {
+                url: "https://ex.test/login?token=SECRETQUERY123".into(),
+            },
+            outcome: StepTripleOutcome::StepError {
+                reason: "boom".into(),
+            },
+        };
+        OtlpJsonExporter::new(&goto_path).export_step(&goto)?;
+        let goto_text = String::from_utf8(std::fs::read(&goto_path)?)?;
+        assert!(
+            !goto_text.contains("SECRETQUERY123"),
+            "URL query secret must be stripped"
+        );
+        let goto_value: Value = serde_json::from_str(goto_text.trim_end())?;
+        assert_eq!(goto_value["body"]["action"]["url"], "https://ex.test/login");
+        assert_eq!(goto_value["body"]["action"]["kind"], "goto");
 
         remove_dir_if_exists(&root)?;
         Ok(())
