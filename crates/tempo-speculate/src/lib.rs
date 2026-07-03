@@ -600,11 +600,16 @@ fn replay_outcomes_match(actual: &ReplayStepOutcome, expected: &ReplayStepOutcom
 }
 
 fn replay_outcome_from_execution(execution: ActionExecution) -> ReplayStepOutcome {
+    // A `PartiallyApplied` batch step-errored after earlier actions grounded; for
+    // replay-divergence purposes it did not fully ground, so it maps to the same
+    // StepError outcome as a clean no-op step error.
     match execution.status {
         ExecutionStatus::Applied => ReplayStepOutcome::Applied {
             diff: execution.diff,
         },
-        ExecutionStatus::StepError { reason } => ReplayStepOutcome::StepError { reason },
+        ExecutionStatus::PartiallyApplied { reason } | ExecutionStatus::StepError { reason } => {
+            ReplayStepOutcome::StepError { reason }
+        }
     }
 }
 

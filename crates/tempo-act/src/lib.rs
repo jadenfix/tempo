@@ -9,11 +9,22 @@ use tempo_driver::{DriverTrait, Engine, StepOutcome, TransportError};
 use tempo_schema::{Action, ActionBatch, ObservationDiff, SideEffect};
 
 /// Result category for one executed action or batch.
+///
+/// Note the two distinct error shapes: a batch driver applies each action in
+/// order and breaks on the first step error, so a `StepError` can coexist with
+/// side effects that already grounded. `PartiallyApplied` names that case
+/// explicitly so a consumer never mistakes a partially-applied batch for a
+/// clean no-op.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ExecutionStatus {
     /// The driver grounded and applied the requested operation.
     Applied,
-    /// The operation did not ground, but the driver stayed healthy.
+    /// A batch step-errored *after* one or more earlier actions had already been
+    /// applied and grounded (the post-batch diff is non-empty). Real side effects
+    /// have occurred — this MUST NOT be treated as a replayable no-op.
+    PartiallyApplied { reason: String },
+    /// The operation did not ground and produced no observable change, so no side
+    /// effects occurred; the driver stayed healthy.
     StepError { reason: String },
 }
 
@@ -30,12 +41,42 @@ pub struct ActionExecution {
 }
 
 impl ActionExecution {
+    /// True only when the whole operation grounded cleanly (`Applied`). A batch
+    /// that step-errored partway is deliberately NOT `applied()`, but it may
+    /// still have produced side effects — see [`applied_side_effects`].
+    ///
+    /// [`applied_side_effects`]: ActionExecution::applied_side_effects
     pub fn applied(&self) -> bool {
         matches!(self.status, ExecutionStatus::Applied)
     }
 
+    /// True when the driver reported a step error, whether or not earlier actions
+    /// in the batch already grounded (covers both `StepError` and
+    /// `PartiallyApplied`).
     pub fn step_error(&self) -> bool {
-        matches!(self.status, ExecutionStatus::StepError { .. })
+        matches!(
+            self.status,
+            ExecutionStatus::StepError { .. } | ExecutionStatus::PartiallyApplied { .. }
+        )
+    }
+
+    /// True when the batch step-errored *after* applying and grounding at least
+    /// one earlier action (`PartiallyApplied`). Distinguishes a partial-apply
+    /// step error from a clean no-op step error.
+    pub fn partially_applied(&self) -> bool {
+        matches!(self.status, ExecutionStatus::PartiallyApplied { .. })
+    }
+
+    /// True when side effects may have occurred and the execution therefore must
+    /// NOT be treated as a replayable no-op. This is the honest replay-safety
+    /// signal: it holds for a clean `Applied`, and also for a `PartiallyApplied`
+    /// batch StepError whose post-batch diff proved earlier actions grounded.
+    /// Only a plain `StepError` (empty post-batch diff) is safe to replay.
+    pub fn applied_side_effects(&self) -> bool {
+        matches!(
+            self.status,
+            ExecutionStatus::Applied | ExecutionStatus::PartiallyApplied { .. }
+        )
     }
 }
 
@@ -82,6 +123,12 @@ where
     .await
 }
 
+/// Whether a post-batch diff proves at least one action grounded (any added,
+/// removed, or changed element).
+fn diff_grounded(diff: &ObservationDiff) -> bool {
+    !diff.added.is_empty() || !diff.removed.is_empty() || !diff.changed.is_empty()
+}
+
 /// Conservative maximum side-effect level for a batch.
 pub fn max_side_effect(actions: &[Action]) -> SideEffect {
     actions
@@ -102,11 +149,18 @@ async fn finish_execution<D>(
 where
     D: DriverTrait + ?Sized,
 {
+    // Ground the outcome against a forced post-batch diff. The batch driver
+    // applies actions in order and breaks on the first step error, so a
+    // StepError with a non-empty diff means earlier actions already grounded:
+    // that is a partial apply, not a no-op.
+    let diff = driver.observe_diff(since_seq).await?;
     let status = match outcome {
         StepOutcome::Applied { .. } => ExecutionStatus::Applied,
+        StepOutcome::StepError { reason } if diff_grounded(&diff) => {
+            ExecutionStatus::PartiallyApplied { reason }
+        }
         StepOutcome::StepError { reason } => ExecutionStatus::StepError { reason },
     };
-    let diff = driver.observe_diff(since_seq).await?;
     Ok(ActionExecution {
         engine,
         status,
@@ -552,8 +606,80 @@ mod tests {
         let execution =
             block_on(execute_batch(&mut driver, &batch)).map_err(|error| error.to_string())?;
         assert!(execution.applied());
+        assert!(execution.applied_side_effects());
+        assert!(!execution.partially_applied());
         assert_eq!(execution.action_count, 2);
         assert_eq!(execution.max_side_effect, SideEffect::Write);
+        Ok(())
+    }
+
+    #[test]
+    fn batch_step_error_after_grounding_reports_partially_applied() -> Result<(), String> {
+        let mut driver = ContractDriver::new();
+        // First action grounds (advances seq), second step-errors — the batch
+        // driver breaks after applying the first, so real side effects precede
+        // the error.
+        let batch = ActionBatch {
+            actions: vec![
+                Action::Goto {
+                    url: "https://example.com".into(),
+                },
+                Action::Click {
+                    node: NodeId("missing".into()),
+                },
+            ],
+            quiescence: QuiescencePolicy::Composite,
+        };
+        let execution =
+            block_on(execute_batch(&mut driver, &batch)).map_err(|error| error.to_string())?;
+
+        assert!(!execution.applied());
+        assert!(execution.step_error());
+        assert!(execution.partially_applied());
+        assert!(execution.applied_side_effects());
+        assert_eq!(
+            execution.status,
+            ExecutionStatus::PartiallyApplied {
+                reason: "node not found".into()
+            }
+        );
+        // The forced post-batch diff proves the earlier action grounded.
+        assert!(!execution.diff.changed.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn batch_step_error_on_first_action_reports_plain_step_error() -> Result<(), String> {
+        let mut driver = ContractDriver::new();
+        // The very first action step-errors, so nothing grounds: a clean no-op
+        // that is safe to replay.
+        let batch = ActionBatch {
+            actions: vec![
+                Action::Click {
+                    node: NodeId("missing".into()),
+                },
+                Action::Goto {
+                    url: "https://example.com".into(),
+                },
+            ],
+            quiescence: QuiescencePolicy::Composite,
+        };
+        let execution =
+            block_on(execute_batch(&mut driver, &batch)).map_err(|error| error.to_string())?;
+
+        assert!(!execution.applied());
+        assert!(execution.step_error());
+        assert!(!execution.partially_applied());
+        assert!(!execution.applied_side_effects());
+        assert_eq!(
+            execution.status,
+            ExecutionStatus::StepError {
+                reason: "node not found".into()
+            }
+        );
+        assert!(execution.diff.added.is_empty());
+        assert!(execution.diff.changed.is_empty());
+        assert!(execution.diff.removed.is_empty());
         Ok(())
     }
 
@@ -638,17 +764,27 @@ mod tests {
             })
         }
 
-        async fn act_batch(&mut self, _batch: &ActionBatch) -> Result<StepOutcome, TransportError> {
-            self.seq += 1;
-            Ok(StepOutcome::Applied {
+        async fn act_batch(&mut self, batch: &ActionBatch) -> Result<StepOutcome, TransportError> {
+            // Mirror the real batch contract: apply each action in order, then
+            // break on the first StepError. `act` advances `seq` for grounded
+            // actions and leaves it untouched for a StepError, so an earlier
+            // grounded action stays observable in the forced post-batch diff.
+            let mut last = StepOutcome::Applied {
                 diff: ObservationDiff {
-                    since_seq: self.seq - 1,
+                    since_seq: self.seq,
                     seq: self.seq,
                     added: Vec::new(),
                     removed: Vec::new(),
-                    changed: vec![button_element(self.seq)],
+                    changed: Vec::new(),
                 },
-            })
+            };
+            for action in &batch.actions {
+                last = self.act(action).await?;
+                if matches!(last, StepOutcome::StepError { .. }) {
+                    break;
+                }
+            }
+            Ok(last)
         }
 
         async fn fork(&mut self) -> Result<Box<dyn DriverTrait>, Unsupported> {
