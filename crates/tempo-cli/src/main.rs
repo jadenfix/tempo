@@ -2,7 +2,7 @@
 //!
 //! The binary intentionally exposes only operations backed by implemented crates:
 //! schema emission, eval scorecards, session journal adaptation, compat lane
-//! tables, injection gates, and replay summaries.
+//! tables, observation/injection gates, and replay summaries.
 
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -23,6 +23,9 @@ use tempo_evals::{
     eval_record_from_session_journal, read_eval_records, write_scorecard, EvalBudget, EvalError,
     Lane, Scorecard, SessionEvalDescriptor,
 };
+use tempo_observe::{
+    observation_corpus_report, CompileOptions, ObservationCorpusReport, ObservationInput,
+};
 use tempo_schema::Action;
 use tempo_session::{read_journal_entries, JournalEntry, JournalError, JournalEvent};
 use tempo_taint::{run_taint_gate, TaintRedTeamCase};
@@ -41,6 +44,7 @@ Commands:
             [--output PATH]
   compat-lanes --input PATH [--output PATH]
             [--min-observation-quality N] [--max-challenge-rate N]
+  observe-gate --input PATH [--output PATH]
   injection-gate --input PATH [--output PATH]
   taint-gate --input PATH [--output PATH]
   replay --journal PATH [--output PATH]
@@ -92,6 +96,10 @@ enum Command {
         output: Output,
         thresholds: CompatThresholds,
     },
+    ObserveGate {
+        input: PathBuf,
+        output: Output,
+    },
     InjectionGate {
         input: PathBuf,
         output: Output,
@@ -134,6 +142,7 @@ impl Command {
             "scorecard" => parse_scorecard(options),
             "session-eval" => parse_session_eval(options),
             "compat-lanes" => parse_compat_lanes(options),
+            "observe-gate" => parse_observe_gate(options),
             "injection-gate" => parse_injection_gate(options),
             "taint-gate" => parse_taint_gate(options),
             "replay" => parse_replay(options),
@@ -199,6 +208,18 @@ impl Command {
                 } else {
                     Err(CliError::GateFailed {
                         violations: missing_primary_lanes,
+                    })
+                }
+            }
+            Self::ObserveGate { input, output } => {
+                let inputs: Vec<ObservationInput> = read_json(&input)?;
+                let report = observation_corpus_report(&inputs, CompileOptions::default());
+                write_json(&output, &report, stdout)?;
+                if report.final_md_gate_passed() {
+                    Ok(())
+                } else {
+                    Err(CliError::GateFailed {
+                        violations: observation_gate_violations(&report),
                     })
                 }
             }
@@ -405,6 +426,27 @@ fn parse_compat_lanes(options: &[String]) -> Result<Command, CliError> {
         input: required_path("--input", input)?,
         output,
         thresholds,
+    })
+}
+
+fn parse_observe_gate(options: &[String]) -> Result<Command, CliError> {
+    let mut input = None;
+    let mut output = Output::Stdout;
+    let mut index = 0;
+
+    while index < options.len() {
+        match options[index].as_str() {
+            "--input" => input = Some(PathBuf::from(take_value(options, &mut index)?)),
+            "--output" => output = Output::Path(PathBuf::from(take_value(options, &mut index)?)),
+            "-h" | "--help" => return Ok(Command::Help),
+            flag => return Err(unknown_flag(flag)),
+        }
+        index += 1;
+    }
+
+    Ok(Command::ObserveGate {
+        input: required_path("--input", input)?,
+        output,
     })
 }
 
@@ -998,6 +1040,17 @@ fn engine_name(engine: tempo_driver::Engine) -> String {
     format!("{engine:?}").to_ascii_lowercase()
 }
 
+fn observation_gate_violations(report: &ObservationCorpusReport) -> usize {
+    [
+        report.budget_p50_passed(),
+        report.stable_id_gate_passed(),
+        report.diff_gate_passed(),
+    ]
+    .into_iter()
+    .filter(|passed| !passed)
+    .count()
+}
+
 #[derive(Debug, Error)]
 enum CliError {
     #[error("{0}")]
@@ -1080,6 +1133,7 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tempo_agent::{StructuredFastPathDecision, StructuredLane, StructuredSignal};
     use tempo_compat::{EngineProbe, OriginScore};
+    use tempo_observe::RawElement;
     use tempo_schema::{
         Action, CompiledObservation, InteractiveElement, NodeId, ObservationDiff, Provenance,
         SideEffect, TaintSpan, SCHEMA_VERSION,
@@ -1318,6 +1372,57 @@ mod tests {
         assert_eq!(value["violations"][0]["id"], "trusted-mislabel");
         remove_dir(&dir)?;
         Ok(())
+    }
+
+    #[test]
+    fn observe_gate_command_writes_corpus_report() -> TestResult {
+        let dir = unique_dir("observe-gate")?;
+        let input = dir.join("corpus.json");
+        let output = dir.join("report.json");
+        write_json_file(&input, &observe_corpus_fixture())?;
+        let mut stdout = Vec::new();
+
+        run_with_writer(
+            [
+                "observe-gate".to_string(),
+                "--input".into(),
+                input_string(&input),
+                "--output".into(),
+                input_string(&output),
+            ],
+            &mut stdout,
+        )?;
+
+        assert!(stdout.is_empty());
+        let value: Value = serde_json::from_reader(File::open(&output)?)?;
+        assert_eq!(value["snapshots"], 3);
+        assert_eq!(value["stable_id_opportunities"], 5);
+        assert_eq!(value["stable_id_survivors"], 5);
+        assert_eq!(value["stable_id_survival_rate"].as_f64(), Some(1.0));
+        assert_eq!(value["diff_snapshots"], 2);
+        assert_eq!(value["diff_reconstructable_snapshots"], 2);
+        remove_dir(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn observe_gate_violations_count_failed_gates() {
+        let report = ObservationCorpusReport {
+            snapshots: 1,
+            bytes_p50: 2,
+            bytes_p95: 2,
+            tokens_p50: 2,
+            tokens_p95: 2,
+            max_bytes: 1,
+            max_tokens: 1,
+            stable_id_opportunities: 1,
+            stable_id_survivors: 0,
+            stable_id_survival_rate: 0.0,
+            diff_snapshots: 1,
+            diff_reconstructable_snapshots: 0,
+        };
+
+        assert_eq!(observation_gate_violations(&report), 3);
     }
 
     #[test]
@@ -1746,6 +1851,65 @@ mod tests {
             }],
             marks: Vec::new(),
         }
+    }
+
+    fn observe_corpus_fixture() -> Vec<ObservationInput> {
+        vec![
+            ObservationInput {
+                url: "https://shop.example/checkout".into(),
+                elements: vec![
+                    RawElement::new("button", "Pay now")
+                        .source_id("ax:pay")
+                        .stable_hint("button#pay")
+                        .bounds([320.0, 700.0, 180.0, 42.0]),
+                    RawElement::new("textbox", "Email")
+                        .source_id("ax:email")
+                        .stable_hint("input[name=email]")
+                        .value("me@example.com")
+                        .bounds([120.0, 180.0, 360.0, 38.0]),
+                    RawElement::new("link", "Terms")
+                        .source_id("ax:terms")
+                        .stable_hint("a[href=/terms]")
+                        .bounds([80.0, 760.0, 80.0, 22.0]),
+                ],
+            },
+            ObservationInput {
+                url: "https://shop.example/checkout".into(),
+                elements: vec![
+                    RawElement::new("link", "Terms")
+                        .source_id("new-terms-source")
+                        .stable_hint("a[href=/terms]")
+                        .bounds([88.0, 780.0, 80.0, 22.0]),
+                    RawElement::new("button", "Pay now")
+                        .source_id("new-pay-source")
+                        .stable_hint("button#pay")
+                        .bounds([340.0, 720.0, 180.0, 42.0]),
+                    RawElement::new("textbox", "Email")
+                        .source_id("new-email-source")
+                        .stable_hint("input[name=email]")
+                        .value("me@example.com")
+                        .bounds([122.0, 185.0, 360.0, 38.0]),
+                ],
+            },
+            ObservationInput {
+                url: "https://shop.example/checkout".into(),
+                elements: vec![
+                    RawElement::new("button", "Pay now")
+                        .source_id("ax:pay")
+                        .stable_hint("button#pay")
+                        .bounds([320.0, 700.0, 180.0, 42.0]),
+                    RawElement::new("textbox", "Email address")
+                        .source_id("ax:email")
+                        .stable_hint("input[name=email]")
+                        .value("me@example.com")
+                        .bounds([120.0, 180.0, 360.0, 38.0]),
+                    RawElement::new("button", "Apply coupon")
+                        .source_id("ax:coupon")
+                        .stable_hint("button#coupon")
+                        .bounds([120.0, 240.0, 140.0, 38.0]),
+                ],
+            },
+        ]
     }
 
     fn unique_dir(prefix: &str) -> Result<PathBuf, io::Error> {

@@ -1,0 +1,221 @@
+[
+  {
+    "url": "https://shop.example/checkout",
+    "elements": [
+      {
+        "source_id": "ax:pay",
+        "stable_hint": "button#pay",
+        "role": "button",
+        "name": [
+          {
+            "provenance": "page",
+            "text": "Pay now"
+          }
+        ],
+        "value": [],
+        "bounds": [
+          320.0,
+          700.0,
+          180.0,
+          42.0
+        ],
+        "visible": true,
+        "enabled": true,
+        "interactive": true
+      },
+      {
+        "source_id": "ax:email",
+        "stable_hint": "input[name=email]",
+        "role": "textbox",
+        "name": [
+          {
+            "provenance": "page",
+            "text": "Email"
+          }
+        ],
+        "value": [
+          {
+            "provenance": "page",
+            "text": "me@example.com"
+          }
+        ],
+        "bounds": [
+          120.0,
+          180.0,
+          360.0,
+          38.0
+        ],
+        "visible": true,
+        "enabled": true,
+        "interactive": true
+      },
+      {
+        "source_id": "ax:terms",
+        "stable_hint": "a[href=/terms]",
+        "role": "link",
+        "name": [
+          {
+            "provenance": "page",
+            "text": "Terms"
+          }
+        ],
+        "value": [],
+        "bounds": [
+          80.0,
+          760.0,
+          80.0,
+          22.0
+        ],
+        "visible": true,
+        "enabled": true,
+        "interactive": true
+      }
+    ]
+  },
+  {
+    "url": "https://shop.example/checkout",
+    "elements": [
+      {
+        "source_id": "new-terms-source",
+        "stable_hint": "a[href=/terms]",
+        "role": "link",
+        "name": [
+          {
+            "provenance": "page",
+            "text": "Terms"
+          }
+        ],
+        "value": [],
+        "bounds": [
+          88.0,
+          780.0,
+          80.0,
+          22.0
+        ],
+        "visible": true,
+        "enabled": true,
+        "interactive": true
+      },
+      {
+        "source_id": "new-pay-source",
+        "stable_hint": "button#pay",
+        "role": "button",
+        "name": [
+          {
+            "provenance": "page",
+            "text": "Pay now"
+          }
+        ],
+        "value": [],
+        "bounds": [
+          340.0,
+          720.0,
+          180.0,
+          42.0
+        ],
+        "visible": true,
+        "enabled": true,
+        "interactive": true
+      },
+      {
+        "source_id": "new-email-source",
+        "stable_hint": "input[name=email]",
+        "role": "textbox",
+        "name": [
+          {
+            "provenance": "page",
+            "text": "Email"
+          }
+        ],
+        "value": [
+          {
+            "provenance": "page",
+            "text": "me@example.com"
+          }
+        ],
+        "bounds": [
+          122.0,
+          185.0,
+          360.0,
+          38.0
+        ],
+        "visible": true,
+        "enabled": true,
+        "interactive": true
+      }
+    ]
+  },
+  {
+    "url": "https://shop.example/checkout",
+    "elements": [
+      {
+        "source_id": "ax:pay",
+        "stable_hint": "button#pay",
+        "role": "button",
+        "name": [
+          {
+            "provenance": "page",
+            "text": "Pay now"
+          }
+        ],
+        "value": [],
+        "bounds": [
+          320.0,
+          700.0,
+          180.0,
+          42.0
+        ],
+        "visible": true,
+        "enabled": true,
+        "interactive": true
+      },
+      {
+        "source_id": "ax:email",
+        "stable_hint": "input[name=email]",
+        "role": "textbox",
+        "name": [
+          {
+            "provenance": "page",
+            "text": "Email address"
+          }
+        ],
+        "value": [
+          {
+            "provenance": "page",
+            "text": "me@example.com"
+          }
+        ],
+        "bounds": [
+          120.0,
+          180.0,
+          360.0,
+          38.0
+        ],
+        "visible": true,
+        "enabled": true,
+        "interactive": true
+      },
+      {
+        "source_id": "ax:coupon",
+        "stable_hint": "button#coupon",
+        "role": "button",
+        "name": [
+          {
+            "provenance": "page",
+            "text": "Apply coupon"
+          }
+        ],
+        "value": [],
+        "bounds": [
+          120.0,
+          240.0,
+          140.0,
+          38.0
+        ],
+        "visible": true,
+        "enabled": true,
+        "interactive": true
+      }
+    ]
+  }
+]
