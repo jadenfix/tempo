@@ -7,6 +7,12 @@
 
 use async_trait::async_trait;
 use chromiumoxide::browser::{Browser, BrowserConfig, HeadlessMode};
+use chromiumoxide::cdp::browser_protocol::accessibility::{
+    AxNode, AxValue, GetPartialAxTreeParams,
+};
+use chromiumoxide::cdp::browser_protocol::dom::{
+    DescribeNodeParams, GetDocumentParams, NodeId as DomNodeId, QuerySelectorParams,
+};
 use chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotFormat;
 use chromiumoxide::cdp::js_protocol::runtime::EvaluateParams;
 use chromiumoxide::error::CdpError;
@@ -143,16 +149,113 @@ impl CdpTempoDriver {
         Ok((url, dom_html))
     }
 
-    fn record_snapshot(&mut self, url: String, dom_html: String) -> CompiledObservation {
+    async fn record_snapshot(
+        &mut self,
+        url: String,
+        dom_html: String,
+    ) -> Result<CompiledObservation, TransportError> {
         self.seq += 1;
-        let compiled = compile_observation(url, dom_html, self.seq);
+        let mut compiled = compile_observation(url, dom_html, self.seq);
+        self.enrich_observation_from_ax_tree(&mut compiled).await?;
         self.history.insert(compiled.seq, compiled.clone());
-        compiled
+        Ok(compiled)
     }
 
     async fn record_current_observation(&mut self) -> Result<CompiledObservation, TransportError> {
         let (url, dom_html) = self.snapshot().await?;
-        Ok(self.record_snapshot(url, dom_html))
+        self.record_snapshot(url, dom_html).await
+    }
+
+    async fn enrich_observation_from_ax_tree(
+        &self,
+        observation: &mut CompiledObservation,
+    ) -> Result<(), TransportError> {
+        if observation.elements.is_empty() {
+            return Ok(());
+        }
+
+        let page = self.page()?;
+        let root = page
+            .execute(GetDocumentParams::default())
+            .await
+            .map_err(map_cdp_error)?
+            .result
+            .root
+            .node_id;
+
+        for element in &mut observation.elements {
+            if let Some(summary) = self
+                .ax_summary_for_selector(root, &element.node_id.0)
+                .await?
+            {
+                apply_ax_summary(element, &summary);
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn ax_summary_for_selector(
+        &self,
+        root: DomNodeId,
+        selector: &str,
+    ) -> Result<Option<AxSummary>, TransportError> {
+        let page = self.page()?;
+        let queried = match page.execute(QuerySelectorParams::new(root, selector)).await {
+            Ok(response) => response.result,
+            Err(error)
+                if matches!(error, CdpError::NotFound)
+                    || is_node_not_found_msg(&error.to_string()) =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(map_cdp_error(error)),
+        };
+        if *queried.node_id.inner() == 0 {
+            return Ok(None);
+        }
+
+        let described = match page
+            .execute(
+                DescribeNodeParams::builder()
+                    .node_id(queried.node_id)
+                    .build(),
+            )
+            .await
+        {
+            Ok(response) => response.result,
+            Err(error)
+                if matches!(error, CdpError::NotFound)
+                    || is_node_not_found_msg(&error.to_string()) =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(map_cdp_error(error)),
+        };
+
+        let backend_node_id = described.node.backend_node_id;
+        let ax_nodes = match page
+            .execute(
+                GetPartialAxTreeParams::builder()
+                    .backend_node_id(backend_node_id)
+                    .fetch_relatives(false)
+                    .build(),
+            )
+            .await
+        {
+            Ok(response) => response.result.nodes,
+            Err(error)
+                if matches!(error, CdpError::NotFound)
+                    || is_uninteresting_ax_node_msg(&error.to_string())
+                    || is_node_not_found_msg(&error.to_string()) =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(map_cdp_error(error)),
+        };
+        let summaries = ax_summaries_by_backend_id(&ax_nodes);
+
+        Ok(summaries.get(backend_node_id.inner()).cloned())
     }
 
     async fn with_element<F, Fut>(&self, selector: &str, op: F) -> Result<bool, TransportError>
@@ -325,7 +428,7 @@ impl DriverTrait for CdpTempoDriver {
             .await
             .map_err(|error| TransportError::Other(error.to_string()))?;
         let (_, dom_html) = self.snapshot().await?;
-        Ok(self.record_snapshot(url.to_string(), dom_html))
+        self.record_snapshot(url.to_string(), dom_html).await
     }
 
     async fn observe(&mut self) -> Result<CompiledObservation, TransportError> {
@@ -463,6 +566,10 @@ fn map_cdp_error(error: CdpError) -> TransportError {
 fn is_node_not_found_msg(message: &str) -> bool {
     let lowered = message.to_lowercase();
     lowered.contains("could not find node") || lowered.contains("no node with given id")
+}
+
+fn is_uninteresting_ax_node_msg(message: &str) -> bool {
+    message.to_lowercase().contains("uninteresting")
 }
 
 fn enforce_url_policy(url: &str, policy: &UrlPolicy) -> Result<(), TransportError> {
@@ -650,6 +757,101 @@ fn compile_observation(url: String, dom_html: String, seq: u64) -> CompiledObser
         seq,
         elements: extract_interactive_elements(&dom_html),
         marks: Vec::new(),
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AxSummary {
+    role: Option<String>,
+    name: Option<String>,
+    value: Option<String>,
+}
+
+fn ax_summaries_by_backend_id(nodes: &[AxNode]) -> BTreeMap<i64, AxSummary> {
+    let mut summaries = BTreeMap::new();
+    for node in nodes {
+        if node.ignored {
+            continue;
+        }
+        let Some(backend_dom_node_id) = node.backend_dom_node_id else {
+            continue;
+        };
+
+        let summary = AxSummary {
+            role: node
+                .role
+                .as_ref()
+                .and_then(ax_value_string)
+                .map(normalize_ax_role),
+            name: node
+                .name
+                .as_ref()
+                .and_then(ax_value_string)
+                .filter(|value| !value.trim().is_empty()),
+            value: node
+                .value
+                .as_ref()
+                .and_then(ax_value_string)
+                .filter(|value| !value.trim().is_empty()),
+        };
+
+        if summary.role.is_some() || summary.name.is_some() || summary.value.is_some() {
+            summaries
+                .entry(*backend_dom_node_id.inner())
+                .or_insert(summary);
+        }
+    }
+    summaries
+}
+
+fn ax_value_string(value: &AxValue) -> Option<String> {
+    let string = match value.value.as_ref()? {
+        serde_json::Value::String(value) => value.trim().to_string(),
+        serde_json::Value::Number(value) => value.to_string(),
+        serde_json::Value::Bool(value) => value.to_string(),
+        _ => return None,
+    };
+    if string.is_empty() {
+        None
+    } else {
+        Some(string)
+    }
+}
+
+fn normalize_ax_role(role: String) -> String {
+    match role.trim() {
+        "textField" | "text field" => "textbox".to_string(),
+        "comboBox" => "combobox".to_string(),
+        other => other.to_ascii_lowercase(),
+    }
+}
+
+fn apply_ax_summary(element: &mut InteractiveElement, summary: &AxSummary) {
+    if let Some(role) = &summary.role {
+        element.role = role.clone();
+        element.rank = element.rank.max(rank_for_ax_role(role));
+    }
+    if let Some(name) = &summary.name {
+        element.name = page_taint(name);
+    }
+    if let Some(value) = &summary.value {
+        element.value = page_taint(value);
+    }
+}
+
+fn page_taint(value: &str) -> Vec<TaintSpan> {
+    vec![TaintSpan {
+        provenance: Provenance::Page,
+        text: value.to_string(),
+    }]
+}
+
+fn rank_for_ax_role(role: &str) -> f32 {
+    match role {
+        "button" => 1.0,
+        "textbox" | "checkbox" | "radio" | "combobox" => 0.9,
+        "link" => 0.8,
+        _ => 0.5,
     }
 }
 
@@ -1027,6 +1229,8 @@ pub fn describe() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chromiumoxide::cdp::browser_protocol::accessibility::{AxNodeId, AxValueType};
+    use chromiumoxide::cdp::browser_protocol::dom::BackendNodeId;
     use std::io::Write;
     use std::net::TcpListener;
 
@@ -1164,6 +1368,47 @@ mod tests {
     }
 
     #[test]
+    fn ax_summary_overlays_dom_fallback_name_role_and_value(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let html = r#"
+            <label for="email">Email Address</label>
+            <input id="email" value="me@example.com">
+        "#;
+        let mut element = extract_interactive_elements(html)
+            .into_iter()
+            .next()
+            .ok_or_else(|| std::io::Error::other("missing input element"))?;
+        assert_eq!(element.role, "textbox");
+        assert_eq!(element.name[0].text, "me@example.com");
+
+        let mut ax_node = AxNode::new(AxNodeId::new("email"), false);
+        ax_node.backend_dom_node_id = Some(BackendNodeId::new(42));
+        ax_node.role = Some(test_ax_value(
+            AxValueType::Role,
+            serde_json::json!("textField"),
+        ));
+        ax_node.name = Some(test_ax_value(
+            AxValueType::ComputedString,
+            serde_json::json!("Email Address"),
+        ));
+        ax_node.value = Some(test_ax_value(
+            AxValueType::String,
+            serde_json::json!("me@example.com"),
+        ));
+
+        let summaries = ax_summaries_by_backend_id(&[ax_node]);
+        let summary = summaries
+            .get(&42)
+            .ok_or_else(|| std::io::Error::other("missing AX summary"))?;
+        apply_ax_summary(&mut element, summary);
+
+        assert_eq!(element.role, "textbox");
+        assert_eq!(element.name[0].text, "Email Address");
+        assert_eq!(element.value[0].text, "me@example.com");
+        Ok(())
+    }
+
+    #[test]
     fn blocks_private_navigation_by_default() {
         let policy = UrlPolicy::block_private();
         for url in [
@@ -1289,6 +1534,22 @@ mod tests {
             .elements
             .iter()
             .any(|element| element.node_id == NodeId("[id=\"save\"]".into())));
+        let email = observation
+            .elements
+            .iter()
+            .find(|element| element.node_id == NodeId("[id=\"email\"]".into()))
+            .ok_or_else(|| std::io::Error::other("missing email input"))?;
+        let email_name = email
+            .name
+            .first()
+            .ok_or_else(|| std::io::Error::other("missing email accessible name"))?;
+        let email_value = email
+            .value
+            .first()
+            .ok_or_else(|| std::io::Error::other("missing email value"))?;
+        assert_eq!(email.role, "textbox");
+        assert_eq!(email_name.text, "Email Address");
+        assert_eq!(email_value.text, "me@example.com");
 
         let extracted = driver.extract(&NodeId("[id=\"save\"]".into())).await?;
         assert_eq!(extracted["selector"], "[id=\"save\"]");
@@ -1350,6 +1611,8 @@ mod tests {
                     <button id="save" onclick="document.body.dataset.clicked='yes'">
                       <span>Save</span>
                     </button>
+                    <label for="email">Email Address</label>
+                    <input id="email" value="me@example.com">
                   </body>
                 </html>"#;
             for stream in listener.incoming().take(16) {
@@ -1367,5 +1630,14 @@ mod tests {
         });
 
         Ok(format!("http://{addr}/"))
+    }
+
+    fn test_ax_value(r#type: AxValueType, value: serde_json::Value) -> AxValue {
+        AxValue {
+            r#type,
+            value: Some(value),
+            related_nodes: None,
+            sources: None,
+        }
     }
 }
