@@ -16,6 +16,7 @@ tempo-bidi = { path = "../tempo-bidi" }
 tempo-driver = { path = "../tempo-driver" }
 tempo-engine-host = { path = "../tempo-engine-host" }
 tempo-mcp = { path = "../tempo-mcp" }
+tempo-net = { path = "../tempo-net" }
 tempo-policy = { path = "../tempo-policy" }
 async-trait.workspace = true
 base64 = "0.22"
