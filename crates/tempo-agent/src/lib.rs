@@ -5,6 +5,7 @@
 //! resume, and StepTriple extraction from durable session records.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use tempo_act::{execute_action, execute_batch, ExecutionStatus};
@@ -163,11 +164,13 @@ pub struct IdempotencyKey(pub String);
 
 impl IdempotencyKey {
     pub fn for_action(index: usize, action: &Action) -> Result<Self, AgentError> {
-        let mut hash = Fnv1a64::new();
-        hash.update(&(index as u64).to_be_bytes());
-        hash.update(&[0]);
-        hash.update(&serde_json::to_vec(action)?);
-        Ok(Self(format!("{:016x}", hash.finish())))
+        let action = serde_json::to_vec(action)?;
+        let mut hash = Sha256::new();
+        hash.update(b"tempo-agent:idempotency-key:v1\0");
+        hash.update(index.to_string().as_bytes());
+        hash.update(b"\0");
+        hash.update(action);
+        Ok(Self(lower_hex(&hash.finalize())))
     }
 }
 
@@ -1387,26 +1390,14 @@ impl AgentError {
     }
 }
 
-struct Fnv1a64(u64);
-
-impl Fnv1a64 {
-    const OFFSET: u64 = 0xcbf29ce484222325;
-    const PRIME: u64 = 0x00000100000001b3;
-
-    fn new() -> Self {
-        Self(Self::OFFSET)
+fn lower_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(char::from(HEX[(byte >> 4) as usize]));
+        output.push(char::from(HEX[(byte & 0x0f) as usize]));
     }
-
-    fn update(&mut self, bytes: &[u8]) {
-        for byte in bytes {
-            self.0 ^= u64::from(*byte);
-            self.0 = self.0.wrapping_mul(Self::PRIME);
-        }
-    }
-
-    fn finish(&self) -> u64 {
-        self.0
-    }
+    output
 }
 
 #[cfg(test)]
@@ -1429,6 +1420,12 @@ mod tests {
 
     type TestResult = Result<(), Box<dyn Error>>;
 
+    fn is_lower_hex(value: &str) -> bool {
+        value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }
+
     #[test]
     fn token_budget_rejects_overrun() {
         let mut budget = TokenBudget::new(10);
@@ -1442,6 +1439,41 @@ mod tests {
                 max: 10
             })
         ));
+    }
+
+    #[test]
+    fn idempotency_key_is_deterministic_sha256_hex() -> TestResult {
+        let action = Action::Click {
+            node: NodeId("submit".into()),
+        };
+
+        let key = IdempotencyKey::for_action(0, &action)?;
+        let repeated = IdempotencyKey::for_action(0, &action)?;
+
+        assert_eq!(key, repeated);
+        assert_eq!(key.0.len(), 64);
+        assert!(is_lower_hex(&key.0));
+        Ok(())
+    }
+
+    #[test]
+    fn idempotency_key_separates_action_index_and_payload() -> TestResult {
+        let click = Action::Click {
+            node: NodeId("submit".into()),
+        };
+        let other_click = Action::Click {
+            node: NodeId("cancel".into()),
+        };
+
+        assert_ne!(
+            IdempotencyKey::for_action(0, &click)?,
+            IdempotencyKey::for_action(1, &click)?
+        );
+        assert_ne!(
+            IdempotencyKey::for_action(0, &click)?,
+            IdempotencyKey::for_action(0, &other_click)?
+        );
+        Ok(())
     }
 
     #[test]
@@ -1863,7 +1895,8 @@ mod tests {
         assert_eq!(report.status, AgentRunStatus::Completed);
         assert_eq!(report.actions_completed, 1);
         assert!(report.max_observation_bytes > 0);
-        assert!(report.steps[0].policy.idempotency_key.0.len() >= 16);
+        assert_eq!(report.steps[0].policy.idempotency_key.0.len(), 64);
+        assert!(is_lower_hex(&report.steps[0].policy.idempotency_key.0));
 
         let entries = read_journal_entries(&journal_path)?;
         assert!(matches!(
