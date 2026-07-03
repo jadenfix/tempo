@@ -154,6 +154,24 @@ impl PageSignals {
             pending_js_tasks: 0,
         }
     }
+
+    /// Build page signals from the real network-idle counters owned by
+    /// `tempo-net`, plus the engine-local layout/frame/JS signals.
+    pub fn from_network_counters(
+        now_ms: u64,
+        network: &tempo_net::QuiescenceCounters,
+        layout_generation: u64,
+        frame_generation: u64,
+        pending_js_tasks: u32,
+    ) -> Self {
+        Self {
+            now_ms,
+            inflight_requests: network.inflight().min(u32::MAX as usize) as u32,
+            layout_generation,
+            frame_generation,
+            pending_js_tasks,
+        }
+    }
 }
 
 /// Quiescence decision after one signal sample.
@@ -188,6 +206,42 @@ impl QuiescenceTracker {
         signals: PageSignals,
         config: QuiescenceConfig,
     ) -> QuiescenceDecision {
+        self.observe_inner(signals, None, config)
+    }
+
+    /// Observe engine-local signals plus real `tempo-net` network counters.
+    ///
+    /// Unlike sampling only `inflight_requests`, this preserves the network
+    /// layer's last activity tick, so a request that starts and finishes between
+    /// two action-layer samples still restarts the composed quiet window.
+    pub fn observe_with_network_counters(
+        &mut self,
+        now_ms: u64,
+        network: &tempo_net::QuiescenceCounters,
+        layout_generation: u64,
+        frame_generation: u64,
+        pending_js_tasks: u32,
+        config: QuiescenceConfig,
+    ) -> QuiescenceDecision {
+        self.observe_inner(
+            PageSignals::from_network_counters(
+                now_ms,
+                network,
+                layout_generation,
+                frame_generation,
+                pending_js_tasks,
+            ),
+            Some(network.last_activity_tick()),
+            config,
+        )
+    }
+
+    fn observe_inner(
+        &mut self,
+        signals: PageSignals,
+        network_last_activity_ms: Option<u64>,
+        config: QuiescenceConfig,
+    ) -> QuiescenceDecision {
         let started_at = *self.started_at_ms.get_or_insert(signals.now_ms);
         let timed_out = signals.now_ms.saturating_sub(started_at) >= config.timeout_ms;
 
@@ -213,8 +267,11 @@ impl QuiescenceTracker {
             };
         }
 
-        let idle_since = *self.idle_since_ms.get_or_insert(signals.now_ms);
-        if signals.now_ms.saturating_sub(idle_since) >= config.idle_window_ms {
+        let idle_since = self.idle_since_ms.get_or_insert(signals.now_ms);
+        if let Some(network_last_activity_ms) = network_last_activity_ms {
+            *idle_since = (*idle_since).max(network_last_activity_ms);
+        }
+        if signals.now_ms.saturating_sub(*idle_since) >= config.idle_window_ms {
             QuiescenceDecision::Settled
         } else if timed_out {
             QuiescenceDecision::TimedOut
@@ -359,6 +416,81 @@ mod tests {
                 config,
             ),
             QuiescenceDecision::TimedOut
+        );
+    }
+
+    #[test]
+    fn page_signals_reflect_real_network_counters() {
+        let mut network = tempo_net::QuiescenceCounters::new();
+        network.begin("request-1", 10);
+        network.begin("request-2", 11);
+
+        let signals = PageSignals::from_network_counters(20, &network, 3, 5, 7);
+
+        assert_eq!(
+            signals,
+            PageSignals {
+                now_ms: 20,
+                inflight_requests: 2,
+                layout_generation: 3,
+                frame_generation: 5,
+                pending_js_tasks: 7,
+            }
+        );
+    }
+
+    #[test]
+    fn quiescence_network_counter_activity_resets_idle_window_between_samples() {
+        let config = QuiescenceConfig {
+            idle_window_ms: 100,
+            timeout_ms: 1_000,
+        };
+        let mut tracker = QuiescenceTracker::new();
+        let mut network = tempo_net::QuiescenceCounters::new();
+
+        assert_eq!(
+            tracker.observe_with_network_counters(0, &network, 0, 0, 0, config),
+            QuiescenceDecision::Waiting
+        );
+
+        network.begin("request-1", 25);
+        assert!(network.finish(
+            &tempo_net::RequestId("request-1".into()),
+            tempo_net::RequestOutcome::Completed,
+            60
+        ));
+
+        assert_eq!(
+            tracker.observe_with_network_counters(120, &network, 0, 0, 0, config),
+            QuiescenceDecision::Waiting
+        );
+        assert_eq!(
+            tracker.observe_with_network_counters(159, &network, 0, 0, 0, config),
+            QuiescenceDecision::Waiting
+        );
+        assert_eq!(
+            tracker.observe_with_network_counters(160, &network, 0, 0, 0, config),
+            QuiescenceDecision::Settled
+        );
+    }
+
+    #[test]
+    fn quiescence_network_counter_inflight_requests_are_busy() {
+        let config = QuiescenceConfig {
+            idle_window_ms: 100,
+            timeout_ms: 1_000,
+        };
+        let mut tracker = QuiescenceTracker::new();
+        let mut network = tempo_net::QuiescenceCounters::new();
+        network.begin("request-1", 25);
+
+        assert_eq!(
+            tracker.observe_with_network_counters(125, &network, 0, 0, 0, config),
+            QuiescenceDecision::Waiting
+        );
+        assert_eq!(
+            tracker.observe_with_network_counters(225, &network, 0, 0, 0, config),
+            QuiescenceDecision::Waiting
         );
     }
 
