@@ -63,6 +63,30 @@ const ENGINE_IPC_TIMEOUT: Duration = Duration::from_secs(30);
 const ENGINE_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(test)]
 const ENGINE_TEARDOWN_TIMEOUT: Duration = Duration::from_millis(200);
+/// Upper bound on how long `create()` waits for the attached engine to create a
+/// session browsing context AND navigate it to the session URL before giving up.
+/// Both are blocking engine-IPC round-trips run on the create path while the
+/// caller holds the global pool `Mutex` (`handle_stream`), so a slow/unresponsive
+/// navigation target would otherwise stall every request -- including
+/// `GET /health` and `POST /drain` -- for up to 2x`ENGINE_IPC_TIMEOUT`, or
+/// *forever* if the engine connection carries no read timeout (#213). The
+/// create+goto (and the failure-path `Close`) run on a detached worker thread and
+/// we await it with one `recv_timeout`; on timeout the worker owns and abandons
+/// the wedged work while `create()` returns a `TempodError`, so the pool lock is
+/// released and the daemon stays available. The bound is set to 2x
+/// `ENGINE_IPC_TIMEOUT` plus a small margin so a genuinely slow-but-valid
+/// navigation the engine still answers within its own per-round-trip IPC budget
+/// is never cut off; only the pathological never-answers case is capped.
+///
+/// RESIDUAL (#213): the pool lock is still held for up to this window -- a strict
+/// improvement over an indefinite/forever stall, but not zero. Fully releasing
+/// the lock across the create+goto IPC (take the root driver handle out, drop the
+/// `MutexGuard`, do the IPC off-lock, re-acquire to insert) is a larger,
+/// higher-risk refactor of the routing/locking path left as a follow-up.
+#[cfg(not(test))]
+const SESSION_CREATE_TIMEOUT: Duration = Duration::from_secs(65);
+#[cfg(test)]
+const SESSION_CREATE_TIMEOUT: Duration = Duration::from_millis(200);
 const WS_ACCEPT_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const WS_OPCODE_TEXT: u8 = 0x1;
 const WS_OPCODE_BINARY: u8 = 0x2;
@@ -629,27 +653,50 @@ impl SessionPool {
         &mut self,
         url: &str,
     ) -> Result<Option<AttachedEngineDriver>, TempodError> {
-        let Some(root_driver) = self.driver.as_mut() else {
+        let Some(root_driver) = self.driver.as_ref() else {
             return Ok(None);
         };
-        let options = BrowsingContextCreateOptions {
-            kind: BrowsingContextKind::Tab,
-            background: true,
-        };
-        let mut session_driver =
-            futures::executor::block_on(root_driver.create_browsing_context_attached(options))
+        // The create-context + goto round-trips block on engine IPC while the
+        // caller holds the global pool `Mutex`. A slow/unresponsive navigation
+        // target must not wedge the daemon (and every `GET /health` / `POST
+        // /drain` blocked on that lock), so we run them on a detached worker
+        // bounded by `SESSION_CREATE_TIMEOUT`, mirroring the #200/#205
+        // bounded-teardown pattern (#213). The root driver's engine handle is an
+        // `Arc<Mutex<EngineIpcClient>>`, so cloning it shares the same engine
+        // connection with the worker. The failure-path `Close` runs on the same
+        // worker so it is bounded by the same window and never re-blocks us.
+        let mut worker_driver = root_driver.clone();
+        let url = url.to_string();
+        let outcome = run_create_bounded(
+            SESSION_CREATE_TIMEOUT,
+            move || -> Result<AttachedEngineDriver, TempodError> {
+                let options = BrowsingContextCreateOptions {
+                    kind: BrowsingContextKind::Tab,
+                    background: true,
+                };
+                let mut session_driver = futures::executor::block_on(
+                    worker_driver.create_browsing_context_attached(options),
+                )
                 .map_err(|error| {
                     TempodError::Driver(format!(
                         "attached engine failed to create session context: {error}"
                     ))
                 })?;
-        if let Err(error) = futures::executor::block_on(session_driver.goto(url)) {
-            let _ = futures::executor::block_on(session_driver.close());
-            return Err(TempodError::Driver(format!(
-                "attached engine failed to navigate session context: {error}"
-            )));
+                if let Err(error) = futures::executor::block_on(session_driver.goto(&url)) {
+                    let _ = futures::executor::block_on(session_driver.close());
+                    return Err(TempodError::Driver(format!(
+                        "attached engine failed to navigate session context: {error}"
+                    )));
+                }
+                Ok(session_driver)
+            },
+        );
+        match outcome {
+            Some(result) => result.map(Some),
+            None => Err(TempodError::Driver(
+                "attached engine timed out creating/navigating session context".into(),
+            )),
         }
-        Ok(Some(session_driver))
     }
 
     /// Best-effort close of one session-owned engine context. Session lifecycle
@@ -881,6 +928,41 @@ where
         }
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
             eprintln!("tempod: {label} thread ended without a result at teardown");
+            None
+        }
+    }
+}
+
+/// Run the blocking session create+goto engine IPC on a detached worker thread,
+/// bounded by `timeout`, so a slow/unresponsive navigation target cannot stall
+/// the daemon (and the pool lock it holds) indefinitely (#213). Returns `None` on
+/// timeout; the detached worker then owns and abandons/finishes the wedged work
+/// once the engine answers or disconnects, so the caller is released promptly.
+/// Mirrors `run_teardown_bounded` (#200) but for the create path.
+fn run_create_bounded<T, F>(timeout: Duration, op: F) -> Option<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::channel();
+    // Detached on purpose: on timeout we must not join (that would reintroduce
+    // the unbounded block); the worker finishes on its own and drops the owned
+    // session driver / engine handle once the engine responds or disconnects.
+    thread::spawn(move || {
+        let _ = tx.send(op());
+    });
+
+    match rx.recv_timeout(timeout) {
+        Ok(result) => Some(result),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            eprintln!(
+                "tempod: session-create engine navigation did not complete within {timeout:?}; \
+                 abandoning it so the pool lock is released (#213)"
+            );
+            None
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            eprintln!("tempod: session-create engine worker ended without a result");
             None
         }
     }
@@ -2467,6 +2549,165 @@ mod tests {
 
         drop(pool);
         join_driver_handler(server)?;
+        Ok(())
+    }
+
+    #[test]
+    fn http_create_session_bounds_wedged_navigation() -> TestResult {
+        // Fake engine that creates the session context but NEVER answers the
+        // goto, on a raw pair with no read timeout -- a slow/unresponsive
+        // navigation target that would otherwise hang create+goto forever while
+        // the caller holds the global pool lock (#213).
+        let (client_stream, server_stream) = UnixStream::pair()?;
+        let wedged_engine = thread::spawn(move || -> Result<(), EngineHostError> {
+            let mut connection = EngineIpcConnection::from_stream(server_stream);
+
+            let create = connection.read_driver_request()?;
+            assert!(matches!(
+                create.command,
+                HostDriverCommand::CreateBrowsingContext { .. }
+            ));
+            connection.write_driver_response(
+                create.id,
+                DriverResponse::BrowsingContextCreated {
+                    driver_id: "session-context-wedged".into(),
+                },
+            )?;
+
+            let goto = connection.read_driver_request()?;
+            assert_eq!(goto.driver_id.as_deref(), Some("session-context-wedged"));
+            assert!(matches!(goto.command, HostDriverCommand::Goto { .. }));
+            // Never respond to the goto: hold the connection open so the create
+            // path blocks on the engine round-trip.
+            thread::park_timeout(Duration::from_secs(60));
+            Ok(())
+        });
+
+        let mut pool = SessionPool::default();
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+
+        let started = std::time::Instant::now();
+        let response = handle_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/sessions".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: br#"{"url":"https://wedged-nav.test"}"#.to_vec(),
+            },
+        );
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "session create hung on a wedged navigation target: took {elapsed:?}"
+        );
+        assert_eq!(
+            response.status, 500,
+            "wedged navigation should fail session creation, not hang"
+        );
+        // A timed-out create must not leave a half-created session or a leaked
+        // driver behind.
+        assert!(pool.list().is_empty());
+        assert!(pool.session_drivers.is_empty());
+
+        wedged_engine.thread().unpark();
+        join_driver_handler(wedged_engine)?;
+        Ok(())
+    }
+
+    #[test]
+    fn wedged_create_does_not_block_concurrent_health_beyond_bound() -> TestResult {
+        // Same wedged navigation target as above, but here we prove that while a
+        // create is stuck on it a concurrent `GET /health` is delayed only by the
+        // bounded create window (approach-A residual) and never indefinitely.
+        let (client_stream, server_stream) = UnixStream::pair()?;
+        let wedged_engine = thread::spawn(move || -> Result<(), EngineHostError> {
+            let mut connection = EngineIpcConnection::from_stream(server_stream);
+
+            let create = connection.read_driver_request()?;
+            assert!(matches!(
+                create.command,
+                HostDriverCommand::CreateBrowsingContext { .. }
+            ));
+            connection.write_driver_response(
+                create.id,
+                DriverResponse::BrowsingContextCreated {
+                    driver_id: "session-context-wedged".into(),
+                },
+            )?;
+
+            let goto = connection.read_driver_request()?;
+            assert!(matches!(goto.command, HostDriverCommand::Goto { .. }));
+            thread::park_timeout(Duration::from_secs(60));
+            Ok(())
+        });
+
+        let mut pool = SessionPool::default();
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+        let pool = Arc::new(Mutex::new(pool));
+
+        // Thread A holds the pool lock across the wedged create. It signals once it
+        // owns the lock so the health probe below is guaranteed to contend for it.
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let create_pool = Arc::clone(&pool);
+        let create = thread::spawn(move || -> Result<u16, String> {
+            let mut guard = create_pool
+                .lock()
+                .map_err(|_| "pool lock poisoned".to_string())?;
+            locked_tx
+                .send(())
+                .map_err(|_| "lock signal failed".to_string())?;
+            let response = handle_http_request(
+                &mut guard,
+                HttpRequest {
+                    method: "POST".into(),
+                    path: "/sessions".into(),
+                    headers: BTreeMap::new(),
+                    host: None,
+                    origin: None,
+                    body: br#"{"url":"https://wedged-nav.test"}"#.to_vec(),
+                },
+            );
+            Ok(response.status)
+        });
+
+        locked_rx
+            .recv()
+            .map_err(|_| "create thread never acquired the pool lock")?;
+        let started = std::time::Instant::now();
+        let health = {
+            let mut guard = pool.lock().map_err(|_| "pool lock poisoned")?;
+            route_http_request(
+                &mut guard,
+                HttpRequest {
+                    method: "GET".into(),
+                    path: "/health".into(),
+                    headers: BTreeMap::new(),
+                    host: None,
+                    origin: None,
+                    body: Vec::new(),
+                },
+            )?
+        };
+        let waited = started.elapsed();
+
+        assert_eq!(health.status, 200);
+        assert!(
+            waited < Duration::from_secs(5),
+            "GET /health blocked on the pool lock beyond the create bound: waited {waited:?}"
+        );
+
+        let create_status = match create.join() {
+            Ok(result) => result.map_err(|error| -> Box<dyn Error> { error.into() })?,
+            Err(_) => return Err("create thread panicked".into()),
+        };
+        assert_eq!(create_status, 500);
+
+        wedged_engine.thread().unpark();
+        join_driver_handler(wedged_engine)?;
         Ok(())
     }
 
