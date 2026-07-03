@@ -54,6 +54,7 @@ const WS_OPCODE_BINARY: u8 = 0x2;
 const WS_OPCODE_CLOSE: u8 = 0x8;
 const WS_OPCODE_PING: u8 = 0x9;
 const WS_OPCODE_PONG: u8 = 0xA;
+pub const TEMPO_OTLP_JSONL_ENV: &str = "TEMPO_OTLP_JSONL";
 
 /// Stable tempod session id.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -366,9 +367,30 @@ impl fmt::Debug for SessionPool {
 }
 
 impl SessionPool {
+    pub fn from_env() -> Self {
+        Self::from_otlp_env_value(std::env::var_os(TEMPO_OTLP_JSONL_ENV))
+    }
+
+    fn from_otlp_env_value(value: Option<std::ffi::OsString>) -> Self {
+        match value {
+            Some(path) if !path.is_empty() => {
+                Self::default().with_otlp_exporter(OtlpJsonExporter::new(path))
+            }
+            _ => Self::default(),
+        }
+    }
+
     pub fn with_otlp_exporter(mut self, exporter: OtlpJsonExporter) -> Self {
         self.otlp_exporter = Some(exporter);
         self
+    }
+
+    pub fn set_otlp_exporter(&mut self, exporter: Option<OtlpJsonExporter>) {
+        self.otlp_exporter = exporter;
+    }
+
+    pub fn otlp_exporter(&self) -> Option<&OtlpJsonExporter> {
+        self.otlp_exporter.as_ref()
     }
 
     pub fn create(&mut self, url: impl Into<String>) -> Result<TempodSession, TempodError> {
@@ -729,7 +751,11 @@ impl OtlpJsonExporter {
     }
 
     pub fn export_step(&self, triple: &StepTriple) -> Result<(), TempodError> {
-        if let Some(parent) = self.path.parent() {
+        if let Some(parent) = self
+            .path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
             std::fs::create_dir_all(parent)?;
         }
         let mut file = OpenOptions::new()
@@ -759,7 +785,7 @@ impl OtlpJsonExporter {
 /// Run tempod forever on an address such as `127.0.0.1:8787`.
 pub fn run_tempod(addr: &str) -> Result<(), TempodError> {
     let listener = TcpListener::bind(addr)?;
-    let pool = Arc::new(Mutex::new(SessionPool::default()));
+    let pool = Arc::new(Mutex::new(SessionPool::from_env()));
     serve_forever(listener, pool)
 }
 
@@ -770,7 +796,7 @@ pub fn run_tempod_with_attached_driver(
     socket_path: impl AsRef<Path>,
 ) -> Result<(), TempodError> {
     let listener = TcpListener::bind(addr)?;
-    let mut pool = SessionPool::default();
+    let mut pool = SessionPool::from_env();
     pool.attach_engine_driver(engine, connect_engine_ipc(socket_path)?);
     serve_forever(listener, Arc::new(Mutex::new(pool)))
 }
@@ -2022,6 +2048,51 @@ mod tests {
         );
 
         remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn session_pool_from_env_value_configures_otlp_jsonl_exporter() -> TestResult {
+        let path = unique_dir("env-otlp")?.join("steps.jsonl");
+
+        let mut pool = SessionPool::from_otlp_env_value(Some(path.as_os_str().to_os_string()));
+        assert_eq!(
+            pool.otlp_exporter()
+                .ok_or("expected env path to configure exporter")?
+                .path(),
+            path.as_path()
+        );
+
+        pool.set_otlp_exporter(None);
+        assert!(pool.otlp_exporter().is_none());
+        assert!(SessionPool::from_otlp_env_value(None)
+            .otlp_exporter()
+            .is_none());
+        assert!(
+            SessionPool::from_otlp_env_value(Some(std::ffi::OsString::new()))
+                .otlp_exporter()
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn otlp_json_exporter_writes_bare_file_path() -> TestResult {
+        let unique = unique_dir("bare-otlp")?;
+        let bare_path = PathBuf::from(
+            unique
+                .file_name()
+                .ok_or("unique test path must have a file name")?,
+        )
+        .with_extension("jsonl");
+        let _ = std::fs::remove_file(&bare_path);
+
+        OtlpJsonExporter::new(&bare_path).export_step(&sample_step_triple(12))?;
+
+        let bytes = std::fs::read(&bare_path)?;
+        let value: Value = serde_json::from_slice(bytes.strip_suffix(b"\n").unwrap_or(&bytes))?;
+        assert_eq!(value["body"]["seq"], 12);
+        std::fs::remove_file(&bare_path)?;
         Ok(())
     }
 
