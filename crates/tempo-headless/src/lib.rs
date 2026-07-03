@@ -48,6 +48,16 @@ const SOCKET_TIMEOUT: Duration = Duration::from_secs(30);
 /// Timeout applied to engine-host IPC round-trips so a stalled engine cannot
 /// wedge the daemon indefinitely.
 const ENGINE_IPC_TIMEOUT: Duration = Duration::from_secs(30);
+/// Upper bound on how long teardown (`drain` / `detach_engine_driver`) waits for
+/// the root-driver `Close` IPC round-trip. `close_root_driver` runs while the
+/// caller holds the global pool `Mutex`, so a wedged engine child that never
+/// answers `Close` would otherwise hold that lock for the full
+/// `ENGINE_IPC_TIMEOUT` (or forever, if the connection carries no read timeout),
+/// hanging *every* request — including `GET /health` — and turning a graceful
+/// `POST /drain` into a full-daemon hang (#200). On timeout the close is
+/// abandoned on its own thread (the driver, and thus its connection, is dropped
+/// there), so the lock is released promptly.
+const ROOT_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 const WS_ACCEPT_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const WS_OPCODE_TEXT: u8 = 0x1;
 const WS_OPCODE_BINARY: u8 = 0x2;
@@ -495,11 +505,46 @@ impl SessionPool {
     /// be closed before this because the engine-host connection exits after the
     /// root `Close` command.
     fn close_root_driver(&mut self) {
+        self.close_root_driver_bounded(ROOT_CLOSE_TIMEOUT);
+    }
+
+    /// Close the root driver, bounding the blocking `Close` IPC round-trip to
+    /// `timeout` so a wedged/unresponsive engine cannot hang the daemon (#200).
+    ///
+    /// The close runs on a dedicated thread and the result is awaited with a
+    /// timeout: in the normal case (responsive engine) the `Close` completes and
+    /// is joined immediately, preserving root-close semantics; in the pathological
+    /// case the wait returns after `timeout`, the driver is left owned by the
+    /// detached thread (which drops it — and its connection — once `close`
+    /// eventually returns or the engine child dies), and the caller regains the
+    /// pool lock promptly. `AttachedEngineDriver` is `Send + 'static`
+    /// (`Arc<Mutex<..>>` + `Copy` `Engine`), so it can move to the worker thread.
+    fn close_root_driver_bounded(&mut self, timeout: Duration) {
         let Some(mut driver) = self.driver.take() else {
             return;
         };
-        if let Err(error) = futures::executor::block_on(driver.close()) {
-            eprintln!("tempod: error closing root engine driver at teardown: {error}");
+        let (tx, rx) = std::sync::mpsc::channel();
+        // Detached on purpose: on timeout we must not join (that would reintroduce
+        // the unbounded block); the thread finishes on its own and drops `driver`.
+        thread::spawn(move || {
+            let _ = tx.send(futures::executor::block_on(driver.close()));
+        });
+        match rx.recv_timeout(timeout) {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                eprintln!("tempod: error closing root engine driver at teardown: {error}");
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                eprintln!(
+                    "tempod: root engine driver Close did not complete within {timeout:?} at \
+                     teardown; abandoning it so the pool lock is released (#200)"
+                );
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                eprintln!(
+                    "tempod: root engine driver Close thread ended without a result at teardown"
+                );
+            }
         }
     }
 
@@ -3542,6 +3587,50 @@ mod tests {
             value["error"],
             "tempod is draining; MCP tool calls are not accepted"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn close_root_driver_does_not_hang_on_wedged_engine() -> TestResult {
+        // #200 regression guard. Teardown closes the root driver via a blocking
+        // engine-IPC `Close` round-trip while the caller holds the global pool
+        // `Mutex`. A wedged engine child that never answers `Close` must NOT hang
+        // the daemon (which would block every request, including `GET /health`).
+        //
+        // The server end of the IPC connection here is held open but never
+        // replies, and the test-side client stream carries no read timeout, so
+        // the `Close` read blocks indefinitely. Against the pre-fix
+        // `close_root_driver` (a bare `block_on(driver.close())`) this call would
+        // block forever and the test itself would hang. The bounded close must
+        // return within its timeout and leave the root driver detached.
+        let (client_stream, server_stream) = UnixStream::pair()?;
+        let wedged_engine = thread::spawn(move || {
+            // Keep the server end open (so the client read blocks rather than
+            // seeing EOF) but never respond, then wait to be released.
+            let _held = server_stream;
+            thread::park_timeout(Duration::from_secs(60));
+        });
+
+        let mut pool = SessionPool::default();
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+        assert!(pool.driver.is_some());
+
+        let started = std::time::Instant::now();
+        pool.close_root_driver_bounded(Duration::from_millis(200));
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "bounded root-driver close hung on a wedged engine: took {elapsed:?}"
+        );
+        assert!(
+            pool.driver.is_none(),
+            "root driver must be detached even when its Close is abandoned"
+        );
+
+        // Release the wedged server end so its (and the abandoned close) thread
+        // observe EOF and exit instead of parking for the full timeout.
+        wedged_engine.thread().unpark();
         Ok(())
     }
 
