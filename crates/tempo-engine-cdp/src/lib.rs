@@ -63,6 +63,14 @@ use tokio::task::JoinHandle;
 /// so every element that actually survives into the marked observation is still
 /// enriched, while the long tail stays present but without an AX overlay.
 const MAX_AX_ENRICHED_ELEMENTS: usize = 16;
+/// How many recent compiled observations to retain for diff bases. Diffs are only
+/// ever requested against recent seqs (`previous_seq`, `batch_base_seq`, a
+/// client-supplied `since_seq`), and `diff_from_base(None, ...)` already degrades a
+/// missing base to a full snapshot, so evicting older entries is safe. Without this
+/// bound `history` grew by one full observation clone on every observe and was never
+/// pruned — a steady RSS leak on long-lived sessions (and each live fork keeps its
+/// own driver + history). Mirrors `StableIdMapper`'s retention window (#107).
+const HISTORY_RETENTION_SNAPSHOTS: u64 = 16;
 const MAX_BLOCKED_REQUESTS: usize = 64;
 const REQUEST_POLICY_EVENT_GRACE: Duration = Duration::from_millis(25);
 const BLOCKED_REQUEST_SETTLE_TIMEOUT: Duration = Duration::from_millis(750);
@@ -449,6 +457,7 @@ impl CdpTempoDriver {
         self.selectors_by_node = selectors_by_node;
         self.enrich_observation_from_ax_tree(&mut compiled).await?;
         self.history.insert(compiled.seq, compiled.clone());
+        prune_observation_history(&mut self.history, compiled.seq);
         Ok(compiled)
     }
 
@@ -2744,6 +2753,17 @@ fn find_close_tag(haystack: &[u8], tag: &[u8]) -> Option<usize> {
     None
 }
 
+/// Evict compiled observations older than the retention window, keeping the most
+/// recent `HISTORY_RETENTION_SNAPSHOTS` seqs (those up to and including `newest_seq`).
+/// Pure and O(retained) — the map never exceeds the window after the first prune.
+fn prune_observation_history(history: &mut BTreeMap<u64, CompiledObservation>, newest_seq: u64) {
+    let cutoff = newest_seq.saturating_sub(HISTORY_RETENTION_SNAPSHOTS - 1);
+    if cutoff == 0 {
+        return; // still within the first window; nothing to evict
+    }
+    history.retain(|&seq, _| seq >= cutoff);
+}
+
 fn strip_tags(input: &str) -> String {
     let mut out = String::new();
     let mut in_tag = false;
@@ -2893,6 +2913,36 @@ mod tests {
         );
         // input/select never carry inner text.
         assert_eq!(element_text("<input>", 7, "input"), None);
+    }
+
+    #[test]
+    fn observation_history_stays_bounded_to_the_retention_window() {
+        fn obs(seq: u64) -> CompiledObservation {
+            CompiledObservation {
+                schema_version: tempo_schema::SCHEMA_VERSION.to_string(),
+                url: "https://example.test/".to_string(),
+                seq,
+                elements: Vec::new(),
+                marks: Vec::new(),
+                omitted: 0,
+            }
+        }
+        let mut history: BTreeMap<u64, CompiledObservation> = BTreeMap::new();
+        for seq in 1..=100 {
+            history.insert(seq, obs(seq));
+            prune_observation_history(&mut history, seq);
+        }
+        // Never exceeds the window, and keeps exactly the most-recent K seqs.
+        assert_eq!(history.len() as u64, HISTORY_RETENTION_SNAPSHOTS);
+        assert_eq!(*history.keys().next().unwrap(), 100 - HISTORY_RETENTION_SNAPSHOTS + 1);
+        assert_eq!(*history.keys().next_back().unwrap(), 100);
+        // Early seqs (before the window fills) are all retained.
+        let mut early: BTreeMap<u64, CompiledObservation> = BTreeMap::new();
+        for seq in 1..=3 {
+            early.insert(seq, obs(seq));
+            prune_observation_history(&mut early, seq);
+        }
+        assert_eq!(early.len(), 3);
     }
 
     #[test]
