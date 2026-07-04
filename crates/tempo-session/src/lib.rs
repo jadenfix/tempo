@@ -436,9 +436,9 @@ const SQLITE_HEADER_MAGIC: &[u8; 16] = b"SQLite format 3\0";
 
 /// How long a connection waits for a competing lock before returning `SQLITE_BUSY`.
 ///
-/// The read/resume snapshot must be able to wait out a writer's short commit window
-/// (rollback-journal `DELETE` + `synchronous=FULL`) instead of failing immediately, so
-/// both readers and the writer use a non-zero timeout.
+/// In WAL mode a read/resume snapshot never blocks on the writer, so this timeout is
+/// only a backstop for the brief exclusive window a WAL checkpoint takes; it is kept
+/// non-zero so a checkpoint racing an open cannot surface a spurious `SQLITE_BUSY`.
 const JOURNAL_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 enum JournalOpenMode {
@@ -565,11 +565,21 @@ fn configure_journal_connection(
 ) -> Result<(), JournalError> {
     conn.busy_timeout(JOURNAL_BUSY_TIMEOUT)?;
     // A read-only connection cannot (and must not) write these pragmas; doing so would
-    // require a write lock and defeat the lock-free read/resume contract.
+    // require a write lock and defeat the lock-free read/resume contract. The read path
+    // inherits the on-disk journal mode from the database header, so it reads a WAL
+    // journal without setting anything.
     if let JournalOpenMode::ReadWriteCreate = mode {
+        // WAL + synchronous=NORMAL (issue #232): one fsync per commit instead of the
+        // multiple fsyncs + directory sync that rollback-journal `DELETE` +
+        // `synchronous=FULL` pays per step, and readers no longer contend with the
+        // writer (the #202 lock-free resume contract becomes free rather than relying
+        // on the busy-timeout). NORMAL is crash-safe in WAL mode: a power loss can only
+        // lose commits still in the WAL that were not yet checkpointed, and the resume
+        // protocol already treats an un-acked trailing step as interrupted. `journal_mode`
+        // is persisted in the database header, so every subsequent open honours WAL.
         conn.execute_batch(
-            "PRAGMA journal_mode=DELETE;
-             PRAGMA synchronous=FULL;
+            "PRAGMA journal_mode=WAL;
+             PRAGMA synchronous=NORMAL;
              PRAGMA foreign_keys=ON;",
         )?;
     }
@@ -1175,6 +1185,33 @@ mod tests {
         assert_eq!(row_count, 2);
         assert_eq!(closed, r#"{"kind":"session_closed"}"#);
 
+        remove_if_exists(&path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn writer_uses_wal_journal_mode() -> TestResult {
+        // #232: the write path must persist WAL mode into the database header so every
+        // step commits with a single fsync (synchronous=NORMAL) and readers never block
+        // on the writer. Guards against a silent revert to DELETE/FULL.
+        let path = unique_path("wal-mode")?;
+        remove_if_exists(&path)?;
+        let mut journal = SessionJournal::open(
+            &path,
+            RunId("wal-run".into()),
+            SessionId("wal-session".into()),
+        )?;
+        journal.append(JournalEvent::SessionStarted {
+            url: "https://wal.test".into(),
+        })?;
+
+        // Query on the live writer connection's own database via a fresh handle; the
+        // journal mode is a persistent property of the file header.
+        let conn = Connection::open(&path)?;
+        let mode: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+        assert_eq!(mode.to_ascii_lowercase(), "wal");
+
+        drop(journal);
         remove_if_exists(&path)?;
         Ok(())
     }

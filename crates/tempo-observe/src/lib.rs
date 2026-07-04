@@ -803,18 +803,111 @@ fn apply_budget(
     options: CompileOptions,
 ) -> CompiledObservation {
     // Elements are pre-sorted by rank descending, so the kept set is always a
-    // prefix and serialized size grows monotonically with prefix length. Rather
-    // than re-serializing after popping one element at a time (O(n^2), issue
-    // #106), binary-search for the longest prefix that fits the budget: O(log n)
-    // serializations, each computed once and reused for both the byte and token
-    // gate.
+    // prefix and serialized size grows monotonically with prefix length.
+    //
+    // Rather than re-serializing the whole observation once per binary-search probe
+    // (#106 fixed O(n^2) → O(n log n), but still re-encodes the full payload
+    // O(log n) times), serialize each element *once*, build a prefix sum of the
+    // elements-array body length, and evaluate a candidate prefix in O(1) from the
+    // sum (#234). Total serialization work becomes O(total bytes) instead of
+    // O(total bytes · log n).
     let full = make_observation(&url, seq, elements.clone(), options.max_marks);
     if elements.is_empty() || within_budget(&full, &options) {
         return full;
     }
 
-    // Invariant: prefix of length `hi` is known not to fit; `lo` tracks the
-    // longest prefix confirmed to fit (0 as a fallback when nothing fits).
+    let n = elements.len();
+    // Per-element serialized length, computed once. `elem_len[i]` is the byte length
+    // of element i on its own; the JSON array body for a k-element prefix is the sum
+    // of the first k plus the (k-1) separating commas.
+    let mut elem_len = Vec::with_capacity(n);
+    for element in &elements {
+        match serde_json::to_vec(element) {
+            Ok(bytes) => elem_len.push(bytes.len()),
+            // An element that will not serialize can't be sized analytically; fall
+            // back to the exact per-probe search below rather than guess.
+            Err(_) => return apply_budget_by_probe(url, seq, elements, options),
+        }
+    }
+    // `cum[k]` = sum of the first k element lengths (cum[0] = 0).
+    let mut cum = Vec::with_capacity(n + 1);
+    cum.push(0usize);
+    for len in &elem_len {
+        cum.push(cum.last().copied().unwrap_or(0).saturating_add(*len));
+    }
+    let elements_body = |k: usize| -> usize {
+        if k == 0 {
+            0
+        } else {
+            cum[k].saturating_add(k - 1) // (k-1) commas between k elements
+        }
+    };
+
+    // The set-of-marks section holds `min(k, max_marks)` marks. When the page has
+    // more than `max_marks` elements — exactly the case where truncation happens —
+    // every candidate prefix in `[max_marks, n]` carries the *same* number of marks
+    // (`min(n, max_marks)`), so the non-element bytes are constant. Derive that
+    // constant exactly from the already-serialized full observation:
+    //   full_len = fixed + elements_body(n)   ⇒   fixed = full_len - elements_body(n)
+    // and for any k in [marks_floor, n], total_len(k) = fixed + elements_body(k).
+    let marks_floor = options.max_marks.min(n);
+    let full_len = serialized_len(&full);
+    let elements_body_n = elements_body(n);
+    if marks_floor >= n || full_len < elements_body_n {
+        // Too few elements for the marks count to be constant across the search
+        // range (n <= max_marks), or an unexpected sizing inconsistency: use the
+        // exact per-probe search. `n` is tiny in the marks_floor >= n case.
+        return apply_budget_by_probe(url, seq, elements, options);
+    }
+    let fixed = full_len - elements_body_n;
+
+    let fits = |k: usize| -> bool {
+        let total = fixed.saturating_add(elements_body(k));
+        let within_bytes = options.max_bytes == 0 || total <= options.max_bytes;
+        let within_tokens = options.max_tokens == 0 || total.div_ceil(4) <= options.max_tokens;
+        within_bytes && within_tokens
+    };
+
+    // Binary search the longest prefix that fits, over [marks_floor, n]. The formula
+    // is only exact for k >= marks_floor; smaller prefixes (if even `marks_floor`
+    // elements do not fit) are handled by an exact probe.
+    if !fits(marks_floor) {
+        return apply_budget_by_probe(url, seq, elements, options);
+    }
+    let mut lo = marks_floor; // known to fit
+    let mut hi = n; // known not to fit (full didn't fit)
+    while lo + 1 < hi {
+        let mid = lo + (hi - lo) / 2;
+        if fits(mid) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+
+    let candidate = make_observation(&url, seq, elements[..lo].to_vec(), options.max_marks);
+    // Safety net: the analytic size is exact by construction, but verify against a
+    // real serialization so a hard budget gate can never be violated by a sizing
+    // bug. On the rare miss, drop back to the exact probe search.
+    debug_assert!(within_budget(&candidate, &options));
+    if within_budget(&candidate, &options) {
+        candidate
+    } else {
+        apply_budget_by_probe(url, seq, elements, options)
+    }
+}
+
+/// Exact fallback: binary-search the longest fitting prefix by serializing each
+/// candidate observation in full. Correct for any input but does O(log n) full
+/// serializations; used only when the analytic prefix-sum path cannot apply.
+fn apply_budget_by_probe(
+    url: String,
+    seq: u64,
+    elements: Vec<InteractiveElement>,
+    options: CompileOptions,
+) -> CompiledObservation {
+    // Invariant: prefix of length `hi` is known not to fit; `lo` tracks the longest
+    // prefix confirmed to fit (0 as a fallback when nothing fits).
     let mut lo = 0usize;
     let mut hi = elements.len();
     while lo + 1 < hi {
@@ -826,7 +919,6 @@ fn apply_budget(
             hi = mid;
         }
     }
-
     make_observation(&url, seq, elements[..lo].to_vec(), options.max_marks)
 }
 
@@ -1676,6 +1768,66 @@ mod tests {
             assert!(pair[0].rank >= pair[1].rank);
         }
         assert_eq!(observation.marks.len(), 8.min(observation.elements.len()));
+    }
+
+    #[test]
+    fn prefix_sum_budget_matches_exact_probe_search() -> Result<(), serde_json::Error> {
+        // #234: the analytic prefix-sum budgeter must select byte-for-byte the same
+        // truncated observation as the exact per-probe binary search, across a range
+        // of budgets and element counts — and never exceed the byte/token budget.
+        let mut elements = Vec::new();
+        for index in 0..400usize {
+            // Vary name length so element sizes differ and prefix boundaries land in
+            // non-trivial places (not a uniform grid).
+            let filler = "x".repeat(index % 37);
+            elements.push(InteractiveElement {
+                node_id: NodeId(format!("n{index}")),
+                role: if index % 2 == 0 { "link" } else { "button" }.into(),
+                name: vec![TaintSpan {
+                    provenance: Provenance::Page,
+                    text: format!("Element {index} {filler}"),
+                }],
+                value: vec![],
+                bounds: Some([0.0, index as f32, 80.0, 18.0]),
+                rank: 1.0 - (index as f32) / 400.0,
+            });
+        }
+
+        for &max_bytes in &[300usize, 800, 1_500, 4_096, 20_000] {
+            for &max_marks in &[0usize, 4, 8] {
+                let options = CompileOptions {
+                    max_bytes,
+                    max_tokens: 0,
+                    max_marks,
+                };
+                let fast =
+                    apply_budget("https://equiv.example".into(), 3, elements.clone(), options);
+                let exact = apply_budget_by_probe(
+                    "https://equiv.example".into(),
+                    3,
+                    elements.clone(),
+                    options,
+                );
+                assert_eq!(
+                    fast.elements.len(),
+                    exact.elements.len(),
+                    "element count differs at max_bytes={max_bytes} max_marks={max_marks}"
+                );
+                assert_eq!(
+                    serde_json::to_vec(&fast)?,
+                    serde_json::to_vec(&exact)?,
+                    "serialized output differs at max_bytes={max_bytes} max_marks={max_marks}"
+                );
+                if max_bytes != 0 {
+                    assert!(
+                        serialized_len(&fast) <= max_bytes,
+                        "budget exceeded: {} > {max_bytes}",
+                        serialized_len(&fast)
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     #[test]

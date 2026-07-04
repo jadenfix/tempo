@@ -79,6 +79,54 @@ pub struct CompiledObservation {
     pub marks: Vec<(NodeId, u32)>,
 }
 
+impl CompiledObservation {
+    /// A prompt-cache-aligned view of this observation for serialization into an LLM
+    /// context (final.md §2.1; issues #218/#235).
+    ///
+    /// LLM providers (Anthropic/OpenAI) only reuse the KV cache for an **unchanged
+    /// prefix**. The canonical wire order places the per-step `seq` counter *before*
+    /// the bulk `elements` array, so the moment `seq` increments the cacheable prefix
+    /// breaks and the entire `elements` payload — the bulk of the tokens — is re-priced
+    /// every step, even when the page did not change.
+    ///
+    /// This view re-orders serialization so the stable fields (`schema_version`, `url`,
+    /// `elements`, `marks`) come first and the only per-step-volatile scalar (`seq`)
+    /// comes **last**. `marks` are a deterministic function of `elements`, so they stay
+    /// in the stable prefix. The canonical wire type is untouched — journal, diff, and
+    /// engine transport keep their frozen layout; this is purely the model-facing
+    /// rendering. Round-trips back to a `CompiledObservation` since field order is
+    /// irrelevant to deserialization.
+    pub fn to_llm_cache_view(&self) -> LlmObservationView<'_> {
+        LlmObservationView(self)
+    }
+}
+
+/// Serialization adapter that renders a [`CompiledObservation`] in prompt-cache-stable
+/// field order (stable prefix first, volatile `seq` last). See
+/// [`CompiledObservation::to_llm_cache_view`].
+#[derive(Clone, Debug)]
+pub struct LlmObservationView<'a>(&'a CompiledObservation);
+
+impl Serialize for LlmObservationView<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let obs = self.0;
+        // Field emission order is the whole point: everything stable, then `seq`.
+        let mut state = serializer.serialize_struct("CompiledObservation", 5)?;
+        state.serialize_field("schema_version", &obs.schema_version)?;
+        state.serialize_field("url", &obs.url)?;
+        state.serialize_field("elements", &obs.elements)?;
+        state.serialize_field("marks", &obs.marks)?;
+        // Volatile tail — the one field that changes every observation on an
+        // otherwise-unchanged page. Kept last so the prefix above stays cache-stable.
+        state.serialize_field("seq", &obs.seq)?;
+        state.end()
+    }
+}
+
 /// Diff-based re-observation: only what changed since `since_seq` (final.md §2.3).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ObservationDiff {
@@ -957,6 +1005,83 @@ mod tests {
         let s = serde_json::to_string(&obs)?;
         let back: CompiledObservation = serde_json::from_str(&s)?;
         assert_eq!(obs, back);
+        Ok(())
+    }
+
+    fn sample_observation(seq: u64) -> CompiledObservation {
+        CompiledObservation {
+            schema_version: SCHEMA_VERSION.into(),
+            url: "https://example.com/cart".into(),
+            seq,
+            elements: vec![
+                InteractiveElement {
+                    node_id: NodeId("n1".into()),
+                    role: "button".into(),
+                    name: vec![TaintSpan {
+                        provenance: Provenance::Page,
+                        text: "Checkout".into(),
+                    }],
+                    value: vec![],
+                    bounds: Some([0.0, 0.0, 10.0, 10.0]),
+                    rank: 0.9,
+                },
+                InteractiveElement {
+                    node_id: NodeId("n2".into()),
+                    role: "textbox".into(),
+                    name: vec![TaintSpan {
+                        provenance: Provenance::Page,
+                        text: "Coupon".into(),
+                    }],
+                    value: vec![],
+                    bounds: Some([0.0, 20.0, 30.0, 10.0]),
+                    rank: 0.4,
+                },
+            ],
+            marks: vec![(NodeId("n1".into()), 1)],
+        }
+    }
+
+    #[test]
+    fn llm_cache_view_round_trips_to_canonical() -> Result<(), serde_json::Error> {
+        let obs = sample_observation(7);
+        let s = serde_json::to_string(&obs.to_llm_cache_view())?;
+        let back: CompiledObservation = serde_json::from_str(&s)?;
+        assert_eq!(obs, back);
+        Ok(())
+    }
+
+    #[test]
+    fn llm_cache_view_keeps_prefix_stable_across_seq_bump() -> Result<(), serde_json::Error> {
+        // Two observations of an unchanged page differing only in `seq`. The
+        // cache-ordered view must share a byte-identical prefix up to the volatile
+        // `seq` tail, so the whole `elements` payload stays prompt-cache-reusable.
+        let a = serde_json::to_string(&sample_observation(7).to_llm_cache_view())?;
+        let b = serde_json::to_string(&sample_observation(8).to_llm_cache_view())?;
+
+        let tail = "\"seq\":";
+        let (Some(a_seq), Some(b_seq)) = (a.find(tail), b.find(tail)) else {
+            panic!("seq field must be present in the cache view");
+        };
+        let a_prefix = &a[..a_seq];
+        let b_prefix = &b[..b_seq];
+        assert_eq!(a_prefix, b_prefix, "prefix must be stable across seq bump");
+
+        // The bulk of the payload (the elements array) must live in that stable prefix.
+        assert!(a_prefix.contains("\"elements\""));
+        assert!(a_prefix.contains("Checkout"));
+
+        // Sanity: the canonical wire order does NOT have this property (seq precedes
+        // elements), which is exactly why the view exists.
+        let canon_a = serde_json::to_string(&sample_observation(7))?;
+        let (Some(canon_seq), Some(canon_elems)) =
+            (canon_a.find("\"seq\""), canon_a.find("\"elements\""))
+        else {
+            panic!("canonical observation must contain seq and elements");
+        };
+        assert!(
+            canon_seq < canon_elems,
+            "canonical order keeps seq before elements"
+        );
         Ok(())
     }
 
