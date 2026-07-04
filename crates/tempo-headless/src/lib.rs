@@ -3798,8 +3798,14 @@ pub fn tempod_openapi(base_url: &str) -> JsonValue {
                 "get": {
                     "operationId": "ready",
                     "responses": {
-                        "200": {"description": "tempod is ready for new sessions"},
-                        "503": {"description": "tempod is alive but not ready"}
+                        "200": {
+                            "description": "tempod is ready for new sessions",
+                            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ReadinessResponse"}}}
+                        },
+                        "503": {
+                            "description": "tempod is reachable but not ready for new sessions",
+                            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ReadinessResponse"}}}
+                        }
                     }
                 }
             },
@@ -3820,7 +3826,10 @@ pub fn tempod_openapi(base_url: &str) -> JsonValue {
                         "required": true,
                         "content": {"application/json": {"schema": {"$ref": "#/components/schemas/CreateSessionRequest"}}}
                     },
-                    "responses": {"201": {"description": "Created session"}}
+                    "responses": {
+                        "201": {"description": "Created session"},
+                        "429": {"description": "Session admission limit reached"}
+                    }
                 }
             },
             "/sessions/{session_id}/observe": {
@@ -3865,6 +3874,34 @@ pub fn tempod_openapi(base_url: &str) -> JsonValue {
                     "additionalProperties": false,
                     "required": ["url"],
                     "properties": {"url": {"type": "string", "format": "uri"}}
+                },
+                "ReadinessResponse": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                        "ok",
+                        "ready",
+                        "draining",
+                        "engine_attached",
+                        "sessions",
+                        "max_sessions",
+                        "reasons"
+                    ],
+                    "properties": {
+                        "ok": {"type": "boolean"},
+                        "ready": {"type": "boolean"},
+                        "draining": {"type": "boolean"},
+                        "engine_attached": {"type": "boolean"},
+                        "sessions": {"type": "integer", "minimum": 0},
+                        "max_sessions": {"type": "integer", "minimum": 0},
+                        "reasons": {
+                            "type": "array",
+                            "items": {
+                                "type": "string",
+                                "enum": ["draining", "engine_detached", "session_limit_reached"]
+                            }
+                        }
+                    }
                 },
                 "SessionActBatchRequest": {
                     "type": "object",
@@ -7262,6 +7299,27 @@ mod tests {
         assert_eq!(openapi["servers"][0]["url"], "http://localhost");
         assert_eq!(openapi["paths"]["/ready"]["get"]["operationId"], "ready");
         Ok(())
+    }
+
+    #[test]
+    fn openapi_advertises_readiness_and_session_admission_limit() {
+        let openapi = tempod_openapi("http://localhost");
+
+        assert_eq!(openapi["paths"]["/ready"]["get"]["operationId"], "ready");
+        assert_eq!(
+            openapi["paths"]["/ready"]["get"]["responses"]["503"]["content"]["application/json"]
+                ["schema"]["$ref"],
+            "#/components/schemas/ReadinessResponse"
+        );
+        assert_eq!(
+            openapi["paths"]["/sessions"]["post"]["responses"]["429"]["description"],
+            "Session admission limit reached"
+        );
+        assert_eq!(
+            openapi["components"]["schemas"]["ReadinessResponse"]["properties"]["reasons"]["items"]
+                ["enum"],
+            json!(["draining", "engine_detached", "session_limit_reached"])
+        );
     }
 
     #[test]
