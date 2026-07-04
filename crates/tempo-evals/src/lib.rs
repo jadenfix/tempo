@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use tempo_schema::{CompiledObservation, StepStatus, StepTriple};
 use tempo_session::{
     read_journal_entries_with_retention_policy, DurableRetentionPolicy, JournalEntry, JournalError,
     JournalEvent,
@@ -787,6 +788,129 @@ pub enum EvalError {
     Journal(#[from] JournalError),
 }
 
+/// Minimal task description consumed by a [`Judge`]: the natural-language goal
+/// plus deterministic terminal-state markers a rule-based judge can check for
+/// (WebJudge-style, arXiv 2504.01382, per #240/#357).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskSpec {
+    /// Human-readable task goal, e.g. "book a flight from SFO to JFK".
+    pub goal: String,
+    /// Case-insensitive substrings that, if present in an element name of any
+    /// post-action observation, indicate the task's goal state was reached
+    /// (e.g. "order confirmed", "thank you for your purchase").
+    #[serde(default)]
+    pub success_markers: Vec<String>,
+}
+
+/// A judge's verdict on one trajectory against one [`TaskSpec`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Verdict {
+    pub success: bool,
+    /// Judge's confidence in `success`, in `[0.0, 1.0]`.
+    pub confidence: f64,
+    /// Human-readable justification for the verdict.
+    pub rationale: String,
+}
+
+/// Oracle that scores an agent trajectory against a task. Modeled on the
+/// WebJudge pattern from Online-Mind2Web (arXiv 2504.01382, referenced by
+/// #240). [`MockJudge`] below is a deterministic, rule-based stand-in used as
+/// a test oracle; a real LLM-backed implementation is an explicit gated
+/// follow-up (#363) that plugs into this same trait without any redesign.
+pub trait Judge {
+    fn verdict(&self, task: &TaskSpec, trajectory: &[StepTriple]) -> Verdict;
+}
+
+/// Deterministic, rule-based test oracle — NOT a real judge. Evaluates canned
+/// fixture trajectories with four ordered, documented rules; no network calls,
+/// no model calls, same input always yields the same [`Verdict`].
+///
+/// Rules, checked in this order:
+/// 1. Empty trajectory -> failure, confidence `1.0` (no work was done).
+/// 2. The last step's outcome is [`StepStatus::Error`] -> failure, confidence
+///    `0.9` (the agent did not end in a working state).
+/// 3. Any step's post-action observation has an element whose name contains
+///    (case-insensitively) one of `task.success_markers` -> success,
+///    confidence `0.95` (an explicit terminal-state signal was observed).
+/// 4. Otherwise (ran to completion without error, but no configured success
+///    marker was ever observed) -> failure, confidence `0.6` (weak signal:
+///    absence of evidence, not evidence of failure).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MockJudge;
+
+impl Judge for MockJudge {
+    fn verdict(&self, task: &TaskSpec, trajectory: &[StepTriple]) -> Verdict {
+        if trajectory.is_empty() {
+            return Verdict {
+                success: false,
+                confidence: 1.0,
+                rationale: "empty trajectory: no steps were taken".into(),
+            };
+        }
+
+        match trajectory.last() {
+            Some(last) if last.outcome.status == StepStatus::Error => {
+                let reason = last
+                    .outcome
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "unknown error".into());
+                return Verdict {
+                    success: false,
+                    confidence: 0.9,
+                    rationale: format!("final step (seq {}) errored: {reason}", last.seq),
+                };
+            }
+            Some(_) | None => {}
+        }
+
+        if let Some((seq, marker)) = find_success_marker(task, trajectory) {
+            return Verdict {
+                success: true,
+                confidence: 0.95,
+                rationale: format!("observed success marker {marker:?} at step seq {seq}"),
+            };
+        }
+
+        Verdict {
+            success: false,
+            confidence: 0.6,
+            rationale: "trajectory completed without error but no configured success marker \
+                was ever observed"
+                .into(),
+        }
+    }
+}
+
+/// Rule 3 helper: scan every step's post-action observation for a configured
+/// success marker, returning the first (step seq, marker) match.
+fn find_success_marker<'a>(
+    task: &'a TaskSpec,
+    trajectory: &[StepTriple],
+) -> Option<(u64, &'a str)> {
+    if task.success_markers.is_empty() {
+        return None;
+    }
+    for step in trajectory {
+        for marker in &task.success_markers {
+            if observation_contains_marker(&step.outcome.observation, marker) {
+                return Some((step.seq, marker.as_str()));
+            }
+        }
+    }
+    None
+}
+
+fn observation_contains_marker(observation: &CompiledObservation, marker: &str) -> bool {
+    let marker = marker.to_lowercase();
+    observation.elements.iter().any(|element| {
+        element
+            .name
+            .iter()
+            .any(|span| span.text.to_lowercase().contains(&marker))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -796,8 +920,8 @@ mod tests {
     use std::io::Write;
     use std::time::{SystemTime, UNIX_EPOCH};
     use tempo_schema::{
-        Action, CompiledObservation, InteractiveElement, NodeId, ObservationDiff, Provenance,
-        TaintSpan,
+        Action, ActionOutcome, CompiledObservation, Grounding, InteractiveElement, NodeId,
+        ObservationDiff, Provenance, StepStatus, StepTriple, TaintSpan,
     };
     use tempo_session::{
         DurableEncryptionKey, DurableRetentionPolicy, RunId, SessionId, SessionJournal,
@@ -1487,5 +1611,174 @@ mod tests {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(err) => Err(err),
         }
+    }
+
+    // -- Judge / MockJudge (#357) --
+
+    fn task_with_marker(marker: &str) -> TaskSpec {
+        TaskSpec {
+            goal: "book a flight from SFO to JFK".into(),
+            success_markers: vec![marker.into()],
+        }
+    }
+
+    fn observation_with_element_name(name: &str) -> CompiledObservation {
+        CompiledObservation {
+            schema_version: tempo_schema::SCHEMA_VERSION.into(),
+            url: "https://booking.test".into(),
+            seq: 1,
+            elements: vec![InteractiveElement {
+                node_id: NodeId("status".into()),
+                role: "status".into(),
+                name: vec![TaintSpan {
+                    provenance: Provenance::Page,
+                    text: name.into(),
+                }],
+                value: vec![],
+                bounds: None,
+                rank: 1.0,
+            }],
+            marks: vec![],
+        }
+    }
+
+    fn step(
+        seq: u64,
+        status: StepStatus,
+        error: Option<&str>,
+        observation_name: &str,
+    ) -> StepTriple {
+        StepTriple {
+            seq,
+            observation_before: observation_with_element_name("before"),
+            decision: None,
+            action: Action::Click {
+                node: NodeId("submit".into()),
+            },
+            outcome: ActionOutcome {
+                status,
+                error: error.map(Into::into),
+                grounding: Grounding {
+                    node: Some(NodeId("submit".into())),
+                    selector_existed: true,
+                    matched_element: true,
+                },
+                observation: observation_with_element_name(observation_name),
+                diff: None,
+            },
+        }
+    }
+
+    #[test]
+    fn mock_judge_succeeds_when_a_success_marker_is_observed() {
+        let task = task_with_marker("order confirmed");
+        let trajectory = vec![
+            step(1, StepStatus::Ok, None, "search results"),
+            step(2, StepStatus::Ok, None, "Order Confirmed! Thank you."),
+        ];
+
+        let verdict = MockJudge.verdict(&task, &trajectory);
+
+        assert!(verdict.success);
+        assert_eq!(verdict.confidence, 0.95);
+        assert!(verdict.rationale.contains("order confirmed"));
+    }
+
+    #[test]
+    fn mock_judge_fails_when_the_final_step_errored() {
+        let task = task_with_marker("order confirmed");
+        let trajectory = vec![
+            step(1, StepStatus::Ok, None, "search results"),
+            step(
+                2,
+                StepStatus::Error,
+                Some("selector not found"),
+                "search results",
+            ),
+        ];
+
+        let verdict = MockJudge.verdict(&task, &trajectory);
+
+        assert!(!verdict.success);
+        assert_eq!(verdict.confidence, 0.9);
+        assert!(verdict.rationale.contains("selector not found"));
+    }
+
+    #[test]
+    fn mock_judge_fails_when_no_marker_is_ever_observed() {
+        let task = task_with_marker("order confirmed");
+        let trajectory = vec![
+            step(1, StepStatus::Ok, None, "search results"),
+            step(2, StepStatus::Ok, None, "cart page"),
+        ];
+
+        let verdict = MockJudge.verdict(&task, &trajectory);
+
+        assert!(!verdict.success);
+        assert_eq!(verdict.confidence, 0.6);
+    }
+
+    #[test]
+    fn mock_judge_fails_on_an_empty_trajectory() {
+        let task = task_with_marker("order confirmed");
+
+        let verdict = MockJudge.verdict(&task, &[]);
+
+        assert!(!verdict.success);
+        assert_eq!(verdict.confidence, 1.0);
+    }
+
+    #[test]
+    fn mock_judge_marker_match_is_case_insensitive() {
+        let task = task_with_marker("ORDER CONFIRMED");
+        let trajectory = vec![step(1, StepStatus::Ok, None, "order confirmed, thanks!")];
+
+        let verdict = MockJudge.verdict(&task, &trajectory);
+
+        assert!(verdict.success);
+    }
+
+    #[test]
+    fn mock_judge_confidence_is_always_in_unit_interval() {
+        let with_marker = task_with_marker("order confirmed");
+        let without_marker = TaskSpec {
+            goal: "book a flight".into(),
+            success_markers: vec![],
+        };
+        let cases = vec![
+            (with_marker.clone(), vec![]),
+            (
+                with_marker.clone(),
+                vec![step(1, StepStatus::Error, Some("boom"), "x")],
+            ),
+            (
+                with_marker.clone(),
+                vec![step(1, StepStatus::Ok, None, "order confirmed")],
+            ),
+            (without_marker, vec![step(1, StepStatus::Ok, None, "x")]),
+        ];
+
+        for (task, trajectory) in cases {
+            let verdict = MockJudge.verdict(&task, &trajectory);
+            assert!(
+                (0.0..=1.0).contains(&verdict.confidence),
+                "confidence {} out of range",
+                verdict.confidence
+            );
+        }
+    }
+
+    #[test]
+    fn mock_judge_is_deterministic_for_the_same_input() {
+        let task = task_with_marker("order confirmed");
+        let trajectory = vec![
+            step(1, StepStatus::Ok, None, "search results"),
+            step(2, StepStatus::Ok, None, "Order Confirmed! Thank you."),
+        ];
+
+        let first = MockJudge.verdict(&task, &trajectory);
+        let second = MockJudge.verdict(&task, &trajectory);
+
+        assert_eq!(first, second);
     }
 }
