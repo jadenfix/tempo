@@ -23,6 +23,8 @@ use tempo_session::{
 use tempo_skills::{SkillError, SkillStore};
 use thiserror::Error;
 
+pub mod decider;
+
 /// Default p95 observation budget from `final.md` §10.
 pub const DEFAULT_MAX_OBSERVATION_BYTES: usize = 8 * 1024;
 
@@ -349,6 +351,7 @@ impl ResumeCursor {
                 JournalEvent::SessionStarted { .. }
                 | JournalEvent::StructuredFastPathSelected { .. }
                 | JournalEvent::Observation { .. }
+                | JournalEvent::ModelDecision { .. }
                 | JournalEvent::TransportError { .. }
                 | JournalEvent::CassetteRecorded { .. } => {}
             }
@@ -1598,6 +1601,7 @@ pub fn step_triples_from_journal(
             JournalEvent::SessionStarted { .. }
             | JournalEvent::StructuredFastPathSelected { .. }
             | JournalEvent::Observation { .. }
+            | JournalEvent::ModelDecision { .. }
             | JournalEvent::ActionPlanned { .. }
             | JournalEvent::TransportError { .. }
             | JournalEvent::CassetteRecorded { .. }
@@ -1630,6 +1634,7 @@ pub fn step_triples_from_journal_entries(
             JournalEvent::SessionStarted { .. }
             | JournalEvent::StructuredFastPathSelected { .. }
             | JournalEvent::Observation { .. }
+            | JournalEvent::ModelDecision { .. }
             | JournalEvent::ActionPlanned { .. }
             | JournalEvent::TransportError { .. }
             | JournalEvent::CassetteRecorded { .. }
@@ -2118,6 +2123,8 @@ pub enum AgentError {
     },
     #[error("token budget exceeded: attempted {attempted}, max {max}")]
     TokenBudgetExceeded { attempted: u64, max: u64 },
+    #[error("model decider failed: {0}")]
+    Decider(#[from] decider::DeciderError),
     #[error(
         "observation budget exceeded: {bytes} bytes/{estimated_tokens} tokens, max {max_bytes} bytes/{max_tokens} tokens"
     )]
@@ -4167,7 +4174,7 @@ mod tests {
         Ok(())
     }
 
-    struct HttpFixtureResponse {
+    pub(crate) struct HttpFixtureResponse {
         status: &'static str,
         content_type: &'static str,
         body: String,
@@ -4185,7 +4192,7 @@ mod tests {
             self
         }
 
-        fn to_http(&self) -> String {
+        pub(crate) fn to_http(&self) -> String {
             let mut response = format!(
                 "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n",
                 self.status,
@@ -4204,7 +4211,7 @@ mod tests {
         }
     }
 
-    fn http_fixture_response(
+    pub(crate) fn http_fixture_response(
         status: &'static str,
         content_type: &'static str,
         body: impl Into<String>,
@@ -4217,7 +4224,7 @@ mod tests {
         }
     }
 
-    fn read_http_request(stream: &mut std::net::TcpStream) -> std::io::Result<String> {
+    pub(crate) fn read_http_request(stream: &mut std::net::TcpStream) -> std::io::Result<String> {
         let mut bytes = Vec::new();
         let mut chunk = [0_u8; 1024];
         loop {
@@ -4440,7 +4447,7 @@ mod tests {
         }
     }
 
-    fn button(id: &str) -> InteractiveElement {
+    pub(crate) fn button(id: &str) -> InteractiveElement {
         InteractiveElement {
             node_id: NodeId(id.into()),
             role: "button".into(),
@@ -4483,7 +4490,7 @@ mod tests {
         }
     }
 
-    fn unique_dir(label: &str) -> Result<PathBuf, std::time::SystemTimeError> {
+    pub(crate) fn unique_dir(label: &str) -> Result<PathBuf, std::time::SystemTimeError> {
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         let mut path = std::env::temp_dir();
         path.push(format!(
@@ -4493,7 +4500,7 @@ mod tests {
         Ok(path)
     }
 
-    fn remove_dir_if_exists(path: &Path) -> Result<(), std::io::Error> {
+    pub(crate) fn remove_dir_if_exists(path: &Path) -> Result<(), std::io::Error> {
         match fs::remove_dir_all(path) {
             Ok(()) => Ok(()),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),

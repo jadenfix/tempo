@@ -712,6 +712,7 @@ struct ReplaySummary {
     session_closed: bool,
     structured_fast_path_selected: usize,
     observations: usize,
+    model_decisions: usize,
     planned_actions: usize,
     applied_steps: usize,
     step_errors: usize,
@@ -733,6 +734,7 @@ impl ReplaySummary {
             session_closed: false,
             structured_fast_path_selected: 0,
             observations: 0,
+            model_decisions: 0,
             planned_actions: 0,
             applied_steps: 0,
             step_errors: 0,
@@ -749,6 +751,7 @@ impl ReplaySummary {
                     summary.structured_fast_path_selected += 1;
                 }
                 JournalEvent::Observation { .. } => summary.observations += 1,
+                JournalEvent::ModelDecision { .. } => summary.model_decisions += 1,
                 JournalEvent::ActionPlanned { .. } => summary.planned_actions += 1,
                 JournalEvent::StepApplied { .. } => summary.applied_steps += 1,
                 JournalEvent::StepError { .. } => summary.step_errors += 1,
@@ -828,6 +831,7 @@ fn replay_steps_from_entries(entries: &[JournalEntry]) -> Result<Vec<ReplayStep>
             JournalEvent::SessionStarted { .. }
             | JournalEvent::StructuredFastPathSelected { .. }
             | JournalEvent::Observation { .. }
+            | JournalEvent::ModelDecision { .. }
             | JournalEvent::TransportError { .. }
             | JournalEvent::CassetteRecorded { .. }
             | JournalEvent::SessionClosed => {}
