@@ -1107,10 +1107,14 @@ async fn handle_connect_proxy_request(
         return;
     };
     let mut upstream = match connect_policy_target(&policy_url, &host, port, policy).await {
-        Some(upstream) => upstream,
-        None => {
+        Ok(upstream) => upstream,
+        Err(PolicyProxyConnectError::PolicyBlocked) => {
             mark_proxy_blocked_request(&blocked_request_url, &policy_url);
             let _ = write_proxy_response(&mut client, 403, "Forbidden").await;
+            return;
+        }
+        Err(PolicyProxyConnectError::UpstreamUnavailable) => {
+            let _ = write_proxy_response(&mut client, 502, "Bad Gateway").await;
             return;
         }
     };
@@ -1146,10 +1150,14 @@ async fn handle_http_proxy_request(
         return;
     };
     let mut upstream = match connect_policy_target(parsed.as_str(), &host, port, policy).await {
-        Some(upstream) => upstream,
-        None => {
+        Ok(upstream) => upstream,
+        Err(PolicyProxyConnectError::PolicyBlocked) => {
             mark_proxy_blocked_request(&blocked_request_url, parsed.as_str());
             let _ = write_proxy_response(&mut client, 403, "Forbidden").await;
+            return;
+        }
+        Err(PolicyProxyConnectError::UpstreamUnavailable) => {
+            let _ = write_proxy_response(&mut client, 502, "Bad Gateway").await;
             return;
         }
     };
@@ -1218,31 +1226,38 @@ fn origin_form(parsed: &url::Url) -> String {
     path
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PolicyProxyConnectError {
+    PolicyBlocked,
+    UpstreamUnavailable,
+}
+
 async fn connect_policy_target(
     url: &str,
     host: &str,
     port: u16,
     policy: &UrlPolicy,
-) -> Option<TcpStream> {
-    enforce_url_policy(url, policy).ok()?;
+) -> Result<TcpStream, PolicyProxyConnectError> {
+    enforce_url_policy(url, policy).map_err(|_error| PolicyProxyConnectError::PolicyBlocked)?;
     let mut addrs = tokio::net::lookup_host((host, port))
         .await
-        .ok()?
+        .map_err(|_error| PolicyProxyConnectError::UpstreamUnavailable)?
         .collect::<Vec<_>>();
     if addrs.is_empty() {
-        return None;
+        return Err(PolicyProxyConnectError::UpstreamUnavailable);
     }
     addrs.sort_unstable();
     addrs.dedup();
     for resolved_socket in &addrs {
-        enforce_url_policy_with_resolved_socket(url, policy, *resolved_socket).ok()?;
+        enforce_url_policy_with_resolved_socket(url, policy, *resolved_socket)
+            .map_err(|_error| PolicyProxyConnectError::PolicyBlocked)?;
     }
     for resolved_socket in addrs {
         if let Ok(stream) = TcpStream::connect(resolved_socket).await {
-            return Some(stream);
+            return Ok(stream);
         }
     }
-    None
+    Err(PolicyProxyConnectError::UpstreamUnavailable)
 }
 
 async fn write_proxy_response(
@@ -2552,6 +2567,40 @@ mod tests {
                 .map_err(|_error| std::io::Error::other("blocked URL lock poisoned"))?
                 .as_deref(),
             Some(expected_blocked_url.as_str())
+        );
+        drop(proxy);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn policy_proxy_keeps_upstream_failures_out_of_block_mapping(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let reserved = TokioTcpListener::bind(("127.0.0.1", 0)).await?;
+        let origin_addr = reserved.local_addr()?;
+        drop(reserved);
+
+        let blocked_request_url = Arc::new(Mutex::new(None));
+        let proxy = PolicyProxy::start(
+            Arc::new(Mutex::new(UrlPolicy::allow_all())),
+            blocked_request_url.clone(),
+        )
+        .await?;
+        let mut client = TcpStream::connect(proxy.addr).await?;
+        let request = format!(
+            "GET http://{origin_addr}/missing HTTP/1.1\r\nHost: {origin_addr}\r\nConnection: close\r\n\r\n"
+        );
+        client.write_all(request.as_bytes()).await?;
+        let mut response = [0_u8; 128];
+        let read = client.read(&mut response).await?;
+        let response = std::str::from_utf8(&response[..read])?;
+
+        assert!(response.starts_with("HTTP/1.1 502 Bad Gateway"));
+        assert_eq!(
+            blocked_request_url
+                .lock()
+                .map_err(|_error| std::io::Error::other("blocked URL lock poisoned"))?
+                .as_deref(),
+            None
         );
         drop(proxy);
         Ok(())
