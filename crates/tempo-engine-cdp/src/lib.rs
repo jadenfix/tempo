@@ -920,11 +920,11 @@ async fn enforce_request_url_policy(url: &str, policy: &UrlPolicy) -> Result<(),
     let port = parsed
         .port_or_known_default()
         .ok_or(TransportError::UrlBlocked)?;
-    let mut addrs = tokio::net::lookup_host((host, port))
+    let addrs = tokio::net::lookup_host((host, port))
         .await
         .map_err(|_error| TransportError::UrlBlocked)?;
     let mut saw_addr = false;
-    while let Some(resolved_socket) = addrs.next() {
+    for resolved_socket in addrs {
         saw_addr = true;
         enforce_url_policy_with_resolved_socket(url, policy, resolved_socket)?;
     }
@@ -2089,8 +2089,8 @@ mod tests {
     #[test]
     fn blocks_public_hostname_when_resolved_socket_is_private() {
         let policy = UrlPolicy::block_private();
-        let loopback: SocketAddr = "127.0.0.1:443".parse().unwrap();
-        let public: SocketAddr = "93.184.216.34:443".parse().unwrap();
+        let loopback = SocketAddr::from(([127, 0, 0, 1], 443));
+        let public = SocketAddr::from(([93, 184, 216, 34], 443));
 
         assert!(matches!(
             enforce_url_policy_with_resolved_socket("https://public.example/", &policy, loopback),
