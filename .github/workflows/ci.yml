@@ -90,6 +90,7 @@ jobs:
         shell: bash
         env:
           TEMPO_CDP_CHROME: ${{ steps.setup-chrome.outputs.chrome-path }}
+          TEMPO_CDP_NO_SANDBOX: "1"
         run: |
           set -euo pipefail
           test -n "$TEMPO_CDP_CHROME"

@@ -3540,7 +3540,7 @@ mod tests {
             return Ok(());
         };
 
-        let url = serve_once(
+        let url = serve_times(
             r#"<!doctype html>
             <html>
               <body>
@@ -3551,39 +3551,53 @@ mod tests {
                 </select>
                 <button id="add" onclick="document.body.dataset.count = String(Number(document.body.dataset.count || '0') + 1);">Add</button>
                 <button id="finish" onclick="document.body.dataset.finished='yes'; document.getElementById('summary').textContent = document.getElementById('name').value + ':' + document.getElementById('plan').value + ':' + (document.body.dataset.count || '0');">Finish</button>
-                <div id="summary" tabindex="0"></div>
+                <div id="summary" tabindex="0" aria-label="Summary"></div>
               </body>
             </html>"#,
+            4,
         )?;
         let root = unique_dir("runner-live-cdp")?;
         remove_dir_if_exists(&root)?;
         fs::create_dir_all(&root)?;
         let journal_path = root.join("session.jsonl");
+        let mut driver = CdpTempoDriver::launch_with(
+            CdpConfig::default()
+                .with_executable(chrome)
+                .with_no_sandbox_env_opt_in(),
+        )
+        .await?
+        .allow_private_network_access();
+        let observation = driver.goto(&url).await?;
+        let node_named = |name: &str| -> Result<NodeId, std::io::Error> {
+            observation
+                .elements
+                .iter()
+                .find(|element| element.name.first().map(|span| span.text.as_str()) == Some(name))
+                .map(|element| element.node_id.clone())
+                .ok_or_else(|| std::io::Error::other(format!("missing observed node: {name}")))
+        };
         let task = DriverTask::new(
             url,
             vec![
                 Action::Type {
-                    node: NodeId(r#"[id="name"]"#.into()),
+                    node: node_named("Name")?,
                     text: "Ada".into(),
                 },
                 Action::Select {
-                    node: NodeId(r#"[id="plan"]"#.into()),
+                    node: node_named("Plan")?,
                     value: "pro".into(),
                 },
                 Action::Click {
-                    node: NodeId(r#"[id="add"]"#.into()),
+                    node: node_named("Add")?,
                 },
                 Action::Click {
-                    node: NodeId(r#"[id="finish"]"#.into()),
+                    node: node_named("Finish")?,
                 },
                 Action::Extract {
-                    node: NodeId(r#"[id="summary"]"#.into()),
+                    node: node_named("Summary")?,
                 },
             ],
         );
-        let mut driver = CdpTempoDriver::launch_with(CdpConfig::default().with_executable(chrome))
-            .await?
-            .allow_private_network_access();
         let runner = AgentRunner::new_plaintext_unsafe(
             &journal_path,
             AgentRunIds::new("run-live-cdp", "session-live-cdp"),
@@ -4703,11 +4717,14 @@ mod tests {
         }
     }
 
-    fn serve_once(body: &'static str) -> Result<String, std::io::Error> {
+    fn serve_times(body: &'static str, max_requests: usize) -> Result<String, std::io::Error> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let addr = listener.local_addr()?;
         thread::spawn(move || {
-            if let Ok((mut stream, _)) = listener.accept() {
+            for _ in 0..max_requests {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
                 let mut buffer = [0u8; 1024];
                 let _ = stream.read(&mut buffer);
                 let response = format!(

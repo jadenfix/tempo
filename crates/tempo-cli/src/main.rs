@@ -1004,7 +1004,7 @@ fn run_cdp_task(config: RunCdpTaskConfig) -> Result<RunCdpTaskReport, CliError> 
     }
 
     runtime.block_on(async move {
-        let mut cdp_config = CdpConfig::default();
+        let mut cdp_config = CdpConfig::default().with_no_sandbox_env_opt_in();
         if let Some(chrome) = config.chrome {
             cdp_config = cdp_config.with_executable(chrome);
         }
