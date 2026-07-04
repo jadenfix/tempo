@@ -244,6 +244,7 @@ pub enum BlockCode {
     MalformedIpv6,
     Localhost,
     BlockedIp,
+    CrawlLimit,
 }
 
 /// Human-readable block reason paired with a stable code.
@@ -1791,6 +1792,12 @@ pub const DEFAULT_CRAWL_MAX_CONCURRENT_PER_ORIGIN: usize = 4;
 /// Default global request concurrency for one crawler frontier.
 pub const DEFAULT_CRAWL_MAX_GLOBAL_INFLIGHT: usize = 128;
 
+/// Default global pending queue cap for one crawler frontier.
+pub const DEFAULT_CRAWL_MAX_GLOBAL_PENDING: usize = 4096;
+
+/// Default pending queue cap for one origin within a crawler frontier.
+pub const DEFAULT_CRAWL_MAX_PENDING_PER_ORIGIN: usize = 256;
+
 /// Default minimum spacing between starts for one origin, expressed in caller
 /// supplied deterministic ticks.
 pub const DEFAULT_CRAWL_MIN_DELAY_TICKS: u64 = 1;
@@ -2539,6 +2546,9 @@ pub struct CrawlFrontierSnapshot {
 pub struct CrawlFrontier {
     scheduler: CrawlScheduler,
     pending: BTreeMap<CrawlRequestKey, NetworkRequest>,
+    pending_origins: BTreeMap<String, usize>,
+    max_global_pending: usize,
+    max_pending_per_origin: usize,
 }
 
 impl fmt::Debug for CrawlFrontier {
@@ -2546,6 +2556,9 @@ impl fmt::Debug for CrawlFrontier {
         f.debug_struct("CrawlFrontier")
             .field("scheduler", &self.scheduler)
             .field("pending", &self.pending.len())
+            .field("pending_origins", &self.pending_origins.len())
+            .field("max_global_pending", &self.max_global_pending)
+            .field("max_pending_per_origin", &self.max_pending_per_origin)
             .finish()
     }
 }
@@ -2555,7 +2568,22 @@ impl CrawlFrontier {
         Self {
             scheduler: CrawlScheduler::new(policy),
             pending: BTreeMap::new(),
+            pending_origins: BTreeMap::new(),
+            max_global_pending: DEFAULT_CRAWL_MAX_GLOBAL_PENDING,
+            max_pending_per_origin: DEFAULT_CRAWL_MAX_PENDING_PER_ORIGIN,
         }
+    }
+
+    /// Bound the total pending queue for this frontier before dispatch.
+    pub fn with_max_global_pending(mut self, max_pending: usize) -> Self {
+        self.max_global_pending = max_pending.max(1);
+        self
+    }
+
+    /// Bound pending queue entries for any one origin before dispatch.
+    pub fn with_max_pending_per_origin(mut self, max_pending: usize) -> Self {
+        self.max_pending_per_origin = max_pending.max(1);
+        self
     }
 
     pub fn scheduler(&self) -> &CrawlScheduler {
@@ -2569,11 +2597,31 @@ impl CrawlFrontier {
     /// Add a request by canonical crawl request identity. Returns `false` when
     /// the same identity is already pending or active.
     pub fn enqueue(&mut self, request: NetworkRequest) -> Result<bool, CrawlError> {
-        let key = crawl_request_key(&request)?;
+        let target = CrawlTarget::parse_request(&request)?;
+        let key = target.request_key.clone();
         if self.pending.contains_key(&key) || self.scheduler.active_request_keys.contains(&key) {
             return Ok(false);
         }
+        if self.pending.len() >= self.max_global_pending {
+            return Err(crawl_limit_error(format!(
+                "global pending crawl cap reached: {} >= {}",
+                self.pending.len(),
+                self.max_global_pending
+            )));
+        }
+        let origin_pending = self
+            .pending_origins
+            .get(&target.origin)
+            .copied()
+            .unwrap_or_default();
+        if origin_pending >= self.max_pending_per_origin {
+            return Err(crawl_limit_error(format!(
+                "per-origin pending crawl cap reached for {}: {} >= {}",
+                target.origin, origin_pending, self.max_pending_per_origin
+            )));
+        }
         self.pending.insert(key, request);
+        *self.pending_origins.entry(target.origin).or_default() += 1;
         Ok(true)
     }
 
@@ -2601,13 +2649,13 @@ impl CrawlFrontier {
             };
             match self.scheduler.begin(&request, tick)? {
                 CrawlDecision::Allow { origin } => {
-                    self.pending.remove(&key);
+                    self.remove_pending(&key);
                     batch.dispatches.push(CrawlDispatch { request, origin });
                     dispatched += 1;
                 }
                 decision @ CrawlDecision::Wait { .. } => batch.waiting.push(decision),
                 decision @ CrawlDecision::Block { .. } => {
-                    self.pending.remove(&key);
+                    self.remove_pending(&key);
                     batch.blocked.push(decision);
                 }
             }
@@ -2649,7 +2697,7 @@ impl CrawlFrontier {
             };
             if self.scheduler.active_requests.contains_key(&request.id) {
                 let target = CrawlTarget::parse_request(&request)?;
-                self.pending.remove(&key);
+                self.remove_pending(&key);
                 batch.blocked.push(CrawlDecision::Block {
                     origin: target.origin,
                     reason: "request id is already active".into(),
@@ -2663,7 +2711,7 @@ impl CrawlFrontier {
                     let egress_decision = match guard.precheck(&dispatch) {
                         Ok(egress_decision) => egress_decision,
                         Err(error) => {
-                            self.pending.remove(&key);
+                            self.remove_pending(&key);
                             batch
                                 .rejected
                                 .push(RejectedCrawlDispatch { dispatch, error });
@@ -2684,17 +2732,17 @@ impl CrawlFrontier {
                             .begin(&checked.dispatch.request, tick)?
                         {
                             CrawlDecision::Allow { .. } => {
-                                self.pending.remove(&key);
+                                self.remove_pending(&key);
                                 batch.dispatches.push(checked);
                             }
                             decision @ CrawlDecision::Wait { .. } => batch.waiting.push(decision),
                             decision @ CrawlDecision::Block { .. } => {
-                                self.pending.remove(&key);
+                                self.remove_pending(&key);
                                 batch.blocked.push(decision);
                             }
                         },
                         Err(error) => {
-                            self.pending.remove(&key);
+                            self.remove_pending(&key);
                             batch
                                 .rejected
                                 .push(RejectedCrawlDispatch { dispatch, error });
@@ -2703,7 +2751,7 @@ impl CrawlFrontier {
                 }
                 decision @ CrawlDecision::Wait { .. } => batch.waiting.push(decision),
                 decision @ CrawlDecision::Block { .. } => {
-                    self.pending.remove(&key);
+                    self.remove_pending(&key);
                     batch.blocked.push(decision);
                 }
             }
@@ -2722,11 +2770,31 @@ impl CrawlFrontier {
             origins: self.scheduler.snapshots(),
         }
     }
+
+    fn remove_pending(&mut self, key: &CrawlRequestKey) -> Option<NetworkRequest> {
+        let request = self.pending.remove(key)?;
+        if let Ok(target) = CrawlTarget::parse_request(&request) {
+            match self.pending_origins.get_mut(&target.origin) {
+                Some(count) if *count > 1 => *count -= 1,
+                Some(_) => {
+                    self.pending_origins.remove(&target.origin);
+                }
+                None => {}
+            }
+        }
+        Some(request)
+    }
 }
 
 impl Default for CrawlFrontier {
     fn default() -> Self {
         Self::new(CrawlPolicy::default())
+    }
+}
+
+fn crawl_limit_error(detail: impl Into<String>) -> CrawlError {
+    CrawlError {
+        reason: BlockReason::new(BlockCode::CrawlLimit, detail),
     }
 }
 
@@ -5754,6 +5822,44 @@ Disallow: /private
         assert!(frontier.enqueue(crawl_request("a", "https://example.com/a/../page"))?);
         assert!(!frontier.enqueue(crawl_request("b", "https://example.com/page"))?);
         assert_eq!(frontier.snapshot().pending, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn crawl_frontier_caps_global_pending_without_counting_duplicates() -> Result<(), CrawlError> {
+        let mut frontier = CrawlFrontier::new(CrawlPolicy::default().without_robots_txt())
+            .with_max_global_pending(2)
+            .with_max_pending_per_origin(8);
+
+        assert!(frontier.enqueue(crawl_request("a", "https://a.example/one"))?);
+        assert!(frontier.enqueue(crawl_request("b", "https://b.example/one"))?);
+        assert!(!frontier.enqueue(crawl_request("a-dup", "https://a.example/one"))?);
+
+        let Err(error) = frontier.enqueue(crawl_request("c", "https://c.example/one")) else {
+            panic!("global pending cap should reject new identities");
+        };
+        assert_eq!(error.reason.code, BlockCode::CrawlLimit);
+        assert!(error.reason.detail.contains("global pending crawl cap"));
+        assert_eq!(frontier.snapshot().pending, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn crawl_frontier_caps_pending_per_origin() -> Result<(), CrawlError> {
+        let mut frontier = CrawlFrontier::new(CrawlPolicy::default().without_robots_txt())
+            .with_max_global_pending(8)
+            .with_max_pending_per_origin(2);
+
+        assert!(frontier.enqueue(crawl_request("a1", "https://a.example/one"))?);
+        assert!(frontier.enqueue(crawl_request("a2", "https://a.example/two"))?);
+        let Err(error) = frontier.enqueue(crawl_request("a3", "https://a.example/three")) else {
+            panic!("per-origin pending cap should reject new identities");
+        };
+        assert_eq!(error.reason.code, BlockCode::CrawlLimit);
+        assert!(error.reason.detail.contains("per-origin pending crawl cap"));
+
+        assert!(frontier.enqueue(crawl_request("b1", "https://b.example/one"))?);
+        assert_eq!(frontier.snapshot().pending, 3);
         Ok(())
     }
 
