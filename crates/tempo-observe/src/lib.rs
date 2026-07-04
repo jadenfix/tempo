@@ -8,8 +8,10 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::fmt::Write as _;
 use std::io::Cursor;
 
+use sha2::{Digest, Sha256};
 use tempo_schema::{
     CompiledObservation, InteractiveElement, NodeId, ObservationDiff, Provenance, TaintSpan,
 };
@@ -51,7 +53,7 @@ impl Default for CompileOptions {
 }
 
 /// One raw interactive candidate emitted by an engine adapter or recorded fixture.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct RawElement {
     #[serde(default)]
     pub source_id: Option<String>,
@@ -70,6 +72,22 @@ pub struct RawElement {
     pub enabled: bool,
     #[serde(default = "default_true")]
     pub interactive: bool,
+}
+
+impl fmt::Debug for RawElement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RawElement")
+            .field("source_id_present", &self.source_id.is_some())
+            .field("stable_hint_present", &self.stable_hint.is_some())
+            .field("role", &self.role)
+            .field("name_spans", &self.name.len())
+            .field("value_spans", &self.value.len())
+            .field("bounds", &self.bounds)
+            .field("visible", &self.visible)
+            .field("enabled", &self.enabled)
+            .field("interactive", &self.interactive)
+            .finish()
+    }
 }
 
 fn default_true() -> bool {
@@ -144,36 +162,50 @@ impl RawElement {
     }
 
     fn source_key(&self) -> Option<String> {
-        self.source_id.as_ref().map(|id| format!("source:{id}"))
+        self.source_id
+            .as_ref()
+            .map(|id| opaque_identity_key("source", &[id.as_str()]))
     }
 
     fn fingerprint_key(&self) -> String {
         if let Some(stable_hint) = &self.stable_hint {
-            return format!("hint:{}", normalize(stable_hint));
+            let mut hint = String::with_capacity(stable_hint.len());
+            normalize_into(&mut hint, stable_hint);
+            return opaque_identity_key("hint", &[hint.as_str()]);
         }
 
-        format!(
-            "fp:role={};name={};value={}",
-            normalize(&self.role),
-            normalize(&span_text(&self.name)),
-            normalize(&span_text(&self.value))
-        )
+        let mut role = String::with_capacity(self.role.len());
+        let mut name = String::with_capacity(spans_text_len(&self.name));
+        let mut value = String::with_capacity(spans_text_len(&self.value));
+        normalize_into(&mut role, &self.role);
+        normalize_spans_into(&mut name, &self.name);
+        normalize_spans_into(&mut value, &self.value);
+        opaque_identity_key("fp", &[role.as_str(), name.as_str(), value.as_str()])
     }
 
     fn allocation_key(&self) -> String {
-        self.stable_hint
-            .as_ref()
-            .map(|hint| format!("hint:{}", normalize(hint)))
-            .or_else(|| self.source_key())
-            .unwrap_or_else(|| self.fingerprint_key())
+        if self.stable_hint.is_some() {
+            return self.fingerprint_key();
+        }
+        self.source_key().unwrap_or_else(|| self.fingerprint_key())
     }
 }
 
 /// Raw observation input for one page snapshot.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct ObservationInput {
     pub url: String,
     pub elements: Vec<RawElement>,
+}
+
+impl fmt::Debug for ObservationInput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let url = redacted_url_for_debug(&self.url);
+        f.debug_struct("ObservationInput")
+            .field("url", &url)
+            .field("elements", &self.elements)
+            .finish()
+    }
 }
 
 impl ObservationInput {
@@ -240,11 +272,21 @@ impl ObservationCorpusReport {
 /// Stateful compiler. The mapper remembers identities across snapshots so NodeIds
 /// survive relayout, reorder, and re-render when either engine IDs or stable DOM
 /// hints/fingerprints line up.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct ObservationCompiler {
     seq: u64,
     mapper: StableIdMapper,
     options: CompileOptions,
+}
+
+impl fmt::Debug for ObservationCompiler {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ObservationCompiler")
+            .field("seq", &self.seq)
+            .field("mapper", &self.mapper)
+            .field("options", &self.options)
+            .finish()
+    }
 }
 
 impl ObservationCompiler {
@@ -262,23 +304,34 @@ impl ObservationCompiler {
 
     /// Compile one raw snapshot into the frozen schema observation.
     pub fn compile(&mut self, input: ObservationInput) -> CompiledObservation {
-        self.compile_with_identities(input).observation
+        // The live observe path never reads identity evidence; skipping it
+        // saves one key String and one NodeId clone per element.
+        self.compile_snapshot(input, false).observation
     }
 
     fn compile_with_identities(&mut self, input: ObservationInput) -> CompiledSnapshot {
+        self.compile_snapshot(input, true)
+    }
+
+    fn compile_snapshot(
+        &mut self,
+        input: ObservationInput,
+        track_identities: bool,
+    ) -> CompiledSnapshot {
         self.seq += 1;
         self.mapper.begin_snapshot(self.seq);
 
         let mut identities = Vec::new();
-        let mut elements = Vec::new();
+        let mut elements = Vec::with_capacity(input.elements.len());
         for raw in input
             .elements
             .into_iter()
             .filter(|raw| raw.visible && raw.interactive)
         {
-            let report_key = corpus_identity_key(&raw);
             let node_id = self.mapper.node_id_for(&raw);
-            identities.push((report_key, node_id.clone()));
+            if track_identities {
+                identities.push((corpus_identity_key(&raw), node_id.clone()));
+            }
             let rank = rank_raw_element(&raw);
             elements.push(InteractiveElement {
                 node_id,
@@ -300,12 +353,14 @@ impl ObservationCompiler {
         });
 
         let observation = apply_budget(input.url, self.seq, elements, self.options);
-        let emitted_ids: HashSet<_> = observation
-            .elements
-            .iter()
-            .map(|element| element.node_id.clone())
-            .collect();
-        identities.retain(|(_, node_id)| emitted_ids.contains(node_id));
+        if track_identities {
+            let emitted_ids: HashSet<&str> = observation
+                .elements
+                .iter()
+                .map(|element| element.node_id.0.as_str())
+                .collect();
+            identities.retain(|(_, node_id)| emitted_ids.contains(node_id.0.as_str()));
+        }
 
         CompiledSnapshot {
             observation,
@@ -343,7 +398,7 @@ struct MappedId {
 /// across a long-lived session (issue #107). Within a single snapshot, identical
 /// fingerprints are disambiguated by occurrence index so distinct elements never
 /// collapse onto one NodeId (issue #105).
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct StableIdMapper {
     by_source: HashMap<String, MappedId>,
     by_fingerprint: HashMap<String, MappedId>,
@@ -352,9 +407,37 @@ pub struct StableIdMapper {
     occurrences: HashMap<String, usize>,
 }
 
+impl fmt::Debug for StableIdMapper {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StableIdMapper")
+            .field("by_source", &self.by_source.len())
+            .field("by_fingerprint", &self.by_fingerprint.len())
+            .field("allocated", &self.allocated.len())
+            .field("seq", &self.seq)
+            .field("occurrences", &self.occurrences.len())
+            .finish()
+    }
+}
+
 impl StableIdMapper {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Map one full snapshot of raw elements to stable IDs.
+    ///
+    /// This is the adapter-level API for engines that already own their ranking,
+    /// budgeting, or grounding metadata. It preserves the caller's element order,
+    /// resets duplicate-fingerprint occurrence counters for the snapshot, and
+    /// performs the same bounded stale-entry eviction as `ObservationCompiler`.
+    pub fn map_snapshot(&mut self, seq: u64, raw: &[RawElement]) -> Vec<NodeId> {
+        self.begin_snapshot(seq);
+        let node_ids = raw
+            .iter()
+            .map(|element| self.node_id_for(element))
+            .collect();
+        self.evict_stale();
+        node_ids
     }
 
     /// Begin a new snapshot generation. Resets the per-snapshot occurrence
@@ -371,16 +454,26 @@ impl StableIdMapper {
         // Nth occurrence gets its own lookup key so two genuinely distinct
         // elements never resolve to the same NodeId (issue #105).
         let base_fingerprint = raw.fingerprint_key();
-        let occurrence = {
-            let counter = self
-                .occurrences
-                .entry(base_fingerprint.clone())
-                .or_insert(0);
-            let current = *counter;
-            *counter += 1;
-            current
+        // get_mut-then-insert instead of entry(clone): the common case (first
+        // occurrence within a snapshot) pays one clone, repeats pay none.
+        let occurrence = match self.occurrences.get_mut(&base_fingerprint) {
+            Some(counter) => {
+                let current = *counter;
+                *counter += 1;
+                current
+            }
+            None => {
+                self.occurrences.insert(base_fingerprint.clone(), 1);
+                0
+            }
         };
-        let fingerprint = format!("{base_fingerprint}#{occurrence}");
+        // Extend the owned base key in place rather than format!-ing a fresh
+        // String per element.
+        let mut fingerprint = base_fingerprint;
+        {
+            use std::fmt::Write as _;
+            let _ = write!(fingerprint, "#{occurrence}");
+        }
 
         if let Some(source_key) = raw.source_key()
             && let Some(entry) = self.by_source.get_mut(&source_key)
@@ -433,9 +526,17 @@ impl StableIdMapper {
     /// bound (issue #107).
     fn evict_stale(&mut self) {
         let seq = self.seq;
+        let before = self.by_source.len() + self.by_fingerprint.len();
         let retained = |entry: &MappedId| seq.saturating_sub(entry.last_seen) < RETENTION_SNAPSHOTS;
         self.by_source.retain(|_, entry| retained(entry));
         self.by_fingerprint.retain(|_, entry| retained(entry));
+
+        // `allocated` equals the union of live node ids whenever no entry was
+        // evicted (allocate() inserts into both), so the steady-state snapshot
+        // skips rebuilding it — that rebuild cloned every id String per frame.
+        if self.by_source.len() + self.by_fingerprint.len() == before {
+            return;
+        }
 
         self.allocated.clear();
         for entry in self.by_source.values() {
@@ -464,18 +565,33 @@ impl StableIdMapper {
 }
 
 /// Deterministic ranker for interactive candidates.
+///
+/// Allocation-free: runs once per raw element per snapshot, so the previous
+/// lowercased-role String and joined-name String were two heap allocations
+/// per element for what is a handful of byte comparisons.
 pub fn rank_raw_element(raw: &RawElement) -> f32 {
-    let role = raw.role.to_ascii_lowercase();
-    let role_score = match role.as_str() {
-        "textbox" | "searchbox" | "combobox" => 1.0,
-        "button" | "menuitem" | "option" => 0.92,
-        "link" => 0.78,
-        "checkbox" | "radio" | "switch" | "slider" => 0.72,
-        "tab" | "listbox" => 0.64,
-        _ => 0.35,
-    };
+    const ROLE_SCORES: &[(&str, f32)] = &[
+        ("textbox", 1.0),
+        ("searchbox", 1.0),
+        ("combobox", 1.0),
+        ("button", 0.92),
+        ("menuitem", 0.92),
+        ("option", 0.92),
+        ("link", 0.78),
+        ("checkbox", 0.72),
+        ("radio", 0.72),
+        ("switch", 0.72),
+        ("slider", 0.72),
+        ("tab", 0.64),
+        ("listbox", 0.64),
+    ];
+    let role_score = ROLE_SCORES
+        .iter()
+        .find(|(name, _)| raw.role.eq_ignore_ascii_case(name))
+        .map(|(_, score)| *score)
+        .unwrap_or(0.35);
 
-    let label_score = if span_text(&raw.name).trim().is_empty() {
+    let label_score = if raw.name.iter().all(|span| span.text.trim().is_empty()) {
         0.0
     } else {
         0.12
@@ -492,21 +608,23 @@ pub fn diff_observations(
     previous: &CompiledObservation,
     current: &CompiledObservation,
 ) -> ObservationDiff {
-    let previous_by_id: HashMap<_, _> = previous
+    // Index by borrowed &str keys: the maps live only for this call, so
+    // cloning every NodeId String into them was pure allocator churn.
+    let previous_by_id: HashMap<&str, &InteractiveElement> = previous
         .elements
         .iter()
-        .map(|element| (element.node_id.clone(), element))
+        .map(|element| (element.node_id.0.as_str(), element))
         .collect();
-    let current_ids: HashSet<_> = current
+    let current_ids: HashSet<&str> = current
         .elements
         .iter()
-        .map(|element| element.node_id.clone())
+        .map(|element| element.node_id.0.as_str())
         .collect();
 
     let mut added = Vec::new();
     let mut changed = Vec::new();
     for element in &current.elements {
-        match previous_by_id.get(&element.node_id) {
+        match previous_by_id.get(element.node_id.0.as_str()) {
             None => added.push(element.clone()),
             Some(previous_element) if *previous_element != element => changed.push(element.clone()),
             Some(_) => {}
@@ -516,7 +634,7 @@ pub fn diff_observations(
     let removed = previous
         .elements
         .iter()
-        .filter(|element| !current_ids.contains(&element.node_id))
+        .filter(|element| !current_ids.contains(element.node_id.0.as_str()))
         .map(|element| element.node_id.clone())
         .collect();
 
@@ -572,12 +690,14 @@ pub fn observation_corpus_report(
         previous_observation = Some(snapshot.observation);
     }
 
+    bytes.sort_unstable();
+    tokens.sort_unstable();
     ObservationCorpusReport {
         snapshots: inputs.len(),
-        bytes_p50: percentile_usize(bytes.clone(), 0.50),
-        bytes_p95: percentile_usize(bytes, 0.95),
-        tokens_p50: percentile_usize(tokens.clone(), 0.50),
-        tokens_p95: percentile_usize(tokens, 0.95),
+        bytes_p50: sorted_percentile(&bytes, 0.50),
+        bytes_p95: sorted_percentile(&bytes, 0.95),
+        tokens_p50: sorted_percentile(&tokens, 0.50),
+        tokens_p95: sorted_percentile(&tokens, 0.95),
         max_bytes: options.max_bytes,
         max_tokens: options.max_tokens,
         stable_id_opportunities,
@@ -589,18 +709,23 @@ pub fn observation_corpus_report(
 }
 
 fn unique_identity_map(identities: Vec<(String, NodeId)>) -> HashMap<String, NodeId> {
-    let mut counts = HashMap::new();
-    for (key, _) in &identities {
-        *counts.entry(key.clone()).or_insert(0usize) += 1;
-    }
-
-    let mut unique = HashMap::new();
+    // Single pass, keys moved rather than cloned: duplicates collapse to a
+    // tombstone and are filtered at the end.
+    let mut unique: HashMap<String, Option<NodeId>> = HashMap::with_capacity(identities.len());
     for (key, node_id) in identities {
-        if counts.get(&key).copied() == Some(1) {
-            unique.insert(key, node_id);
+        match unique.entry(key) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                entry.insert(None);
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(Some(node_id));
+            }
         }
     }
     unique
+        .into_iter()
+        .filter_map(|(key, node_id)| node_id.map(|node_id| (key, node_id)))
+        .collect()
 }
 
 fn diff_reconstructs_current(
@@ -616,40 +741,52 @@ fn diff_reconstructs_current(
         return false;
     }
 
-    let removed_ids: HashSet<_> = diff.removed.iter().cloned().collect();
+    let removed_ids: HashSet<&str> = diff.removed.iter().map(|id| id.0.as_str()).collect();
     if removed_ids.len() != diff.removed.len() {
         return false;
     }
-    let mut elements = previous.elements.clone();
-    let previous_len = elements.len();
-    elements.retain(|element| !removed_ids.contains(&element.node_id));
-    if previous_len.saturating_sub(elements.len()) != removed_ids.len() {
-        return false;
-    }
 
-    let mut changed_ids = HashSet::new();
+    // Index the changed set once instead of scanning `elements` per change
+    // (the old find() made reconstruction O(changes × elements)), and clone
+    // only survivors instead of cloning the full previous list and retaining.
+    let mut changed_by_id: HashMap<&str, &InteractiveElement> =
+        HashMap::with_capacity(diff.changed.len());
     for changed in &diff.changed {
-        if !changed_ids.insert(changed.node_id.clone()) {
+        if changed_by_id
+            .insert(changed.node_id.0.as_str(), changed)
+            .is_some()
+        {
             return false;
         }
-        let Some(slot) = elements
-            .iter_mut()
-            .find(|element| element.node_id == changed.node_id)
-        else {
-            return false;
-        };
-        *slot = changed.clone();
     }
 
-    let mut ids: HashSet<_> = elements
-        .iter()
-        .map(|element| element.node_id.clone())
-        .collect();
-    if ids.len() != elements.len() {
+    let mut ids: HashSet<&str> = HashSet::with_capacity(previous.elements.len() + diff.added.len());
+    let mut elements: Vec<InteractiveElement> =
+        Vec::with_capacity(previous.elements.len() + diff.added.len());
+    let mut removed_seen = 0usize;
+    let mut replaced = 0usize;
+    for element in &previous.elements {
+        let id = element.node_id.0.as_str();
+        if removed_ids.contains(id) {
+            removed_seen += 1;
+            continue;
+        }
+        if !ids.insert(id) {
+            return false;
+        }
+        if let Some(replacement) = changed_by_id.get(id) {
+            replaced += 1;
+            elements.push((*replacement).clone());
+        } else {
+            elements.push(element.clone());
+        }
+    }
+    if removed_seen != removed_ids.len() || replaced != diff.changed.len() {
         return false;
     }
+
     for added in &diff.added {
-        if !ids.insert(added.node_id.clone()) {
+        if !ids.insert(added.node_id.0.as_str()) {
             return false;
         }
         elements.push(added.clone());
@@ -661,7 +798,8 @@ fn diff_reconstructs_current(
 
 fn corpus_identity_key(raw: &RawElement) -> String {
     if let Some(stable_hint) = &raw.stable_hint {
-        return format!("hint:{}", normalize(stable_hint));
+        let stable_hint = normalize(stable_hint);
+        return opaque_identity_key("hint", &[stable_hint.as_str()]);
     }
     raw.source_key().unwrap_or_else(|| raw.fingerprint_key())
 }
@@ -734,12 +872,15 @@ pub fn composite_set_of_marks_rgba(
         width,
         height,
     };
+    // One index build instead of a linear scan per mark (marks × elements
+    // comparisons on every screenshot).
+    let elements_by_id: HashMap<&str, &InteractiveElement> = observation
+        .elements
+        .iter()
+        .map(|element| (element.node_id.0.as_str(), element))
+        .collect();
     for (node_id, label) in &observation.marks {
-        let Some(element) = observation
-            .elements
-            .iter()
-            .find(|candidate| candidate.node_id == *node_id)
-        else {
+        let Some(element) = elements_by_id.get(node_id.0.as_str()) else {
             continue;
         };
         let Some(bounds) = element.bounds else {
@@ -763,11 +904,11 @@ pub fn estimated_tokens(observation: &CompiledObservation) -> usize {
     serialized_len(observation).div_ceil(4)
 }
 
-fn percentile_usize(mut values: Vec<usize>, percentile: f64) -> usize {
+/// Percentile over pre-sorted values: callers sort once and probe many times.
+fn sorted_percentile(values: &[usize], percentile: f64) -> usize {
     if values.is_empty() {
         return 0;
     }
-    values.sort_unstable();
     let rank = (percentile * values.len() as f64).ceil() as usize;
     let index = rank.saturating_sub(1).min(values.len() - 1);
     values[index]
@@ -799,7 +940,7 @@ pub fn describe() -> &'static str {
 fn apply_budget(
     url: String,
     seq: u64,
-    elements: Vec<InteractiveElement>,
+    mut elements: Vec<InteractiveElement>,
     options: CompileOptions,
 ) -> CompiledObservation {
     // Elements are pre-sorted by rank descending, so the kept set is always a
@@ -807,10 +948,11 @@ fn apply_budget(
     // than re-serializing after popping one element at a time (O(n^2), issue
     // #106), binary-search for the longest prefix that fits the budget: O(log n)
     // serializations, each computed once and reused for both the byte and token
-    // gate.
-    let full = make_observation(&url, seq, elements.clone(), options.max_marks);
-    if elements.is_empty() || within_budget(&full, &options) {
-        return full;
+    // gate. Every probe serializes a *borrowed* prefix through a counting sink,
+    // so the search allocates nothing and copies no elements.
+    let full_marks = mark_labels(&elements, options.max_marks);
+    if elements.is_empty() || prefix_within_budget(&url, seq, &elements, &full_marks, &options) {
+        return assemble_observation(url, seq, elements, full_marks);
     }
 
     // Invariant: prefix of length `hi` is known not to fit; `lo` tracks the
@@ -819,24 +961,95 @@ fn apply_budget(
     let mut hi = elements.len();
     while lo + 1 < hi {
         let mid = lo + (hi - lo) / 2;
-        let candidate = make_observation(&url, seq, elements[..mid].to_vec(), options.max_marks);
-        if within_budget(&candidate, &options) {
+        let marks = &full_marks[..mid.min(full_marks.len())];
+        if prefix_within_budget(&url, seq, &elements[..mid], marks, &options) {
             lo = mid;
         } else {
             hi = mid;
         }
     }
 
-    make_observation(&url, seq, elements[..lo].to_vec(), options.max_marks)
+    elements.truncate(lo);
+    let mut marks = full_marks;
+    marks.truncate(lo);
+    assemble_observation(url, seq, elements, marks)
 }
 
-/// Whether a compiled observation fits both the byte and token budgets, computing
-/// the serialized length exactly once (previously serialized twice per gate).
-fn within_budget(observation: &CompiledObservation, options: &CompileOptions) -> bool {
-    let serialized = serialized_len(observation);
+/// Serialization proxy that borrows an element prefix while producing byte
+/// output identical to [`CompiledObservation`]: same field names, same order.
+#[derive(Serialize)]
+struct ObservationPrefixProbe<'a> {
+    schema_version: &'a str,
+    url: &'a str,
+    seq: u64,
+    elements: &'a [InteractiveElement],
+    marks: &'a [(NodeId, u32)],
+}
+
+/// `io::Write` sink that only counts bytes: budget probing needs the
+/// serialized length, never the serialized bytes.
+struct CountingSink(usize);
+
+impl std::io::Write for CountingSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 += buf.len();
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Whether a borrowed element prefix fits both the byte and token budgets,
+/// computing the serialized length exactly once without materializing the
+/// candidate observation.
+fn prefix_within_budget(
+    url: &str,
+    seq: u64,
+    elements: &[InteractiveElement],
+    marks: &[(NodeId, u32)],
+    options: &CompileOptions,
+) -> bool {
+    let probe = ObservationPrefixProbe {
+        schema_version: tempo_schema::SCHEMA_VERSION,
+        url,
+        seq,
+        elements,
+        marks,
+    };
+    let mut sink = CountingSink(0);
+    let serialized = match serde_json::to_writer(&mut sink, &probe) {
+        Ok(()) => sink.0,
+        Err(_) => usize::MAX,
+    };
     let within_bytes = options.max_bytes == 0 || serialized <= options.max_bytes;
     let within_tokens = options.max_tokens == 0 || serialized.div_ceil(4) <= options.max_tokens;
     within_bytes && within_tokens
+}
+
+fn mark_labels(elements: &[InteractiveElement], max_marks: usize) -> Vec<(NodeId, u32)> {
+    elements
+        .iter()
+        .take(max_marks)
+        .enumerate()
+        .map(|(index, element)| (element.node_id.clone(), (index + 1) as u32))
+        .collect()
+}
+
+fn assemble_observation(
+    url: String,
+    seq: u64,
+    elements: Vec<InteractiveElement>,
+    marks: Vec<(NodeId, u32)>,
+) -> CompiledObservation {
+    CompiledObservation {
+        schema_version: tempo_schema::SCHEMA_VERSION.into(),
+        url,
+        seq,
+        elements,
+        marks,
+    }
 }
 
 fn make_observation(
@@ -845,20 +1058,8 @@ fn make_observation(
     elements: Vec<InteractiveElement>,
     max_marks: usize,
 ) -> CompiledObservation {
-    let marks = elements
-        .iter()
-        .take(max_marks)
-        .enumerate()
-        .map(|(index, element)| (element.node_id.clone(), (index + 1) as u32))
-        .collect();
-
-    CompiledObservation {
-        schema_version: tempo_schema::SCHEMA_VERSION.into(),
-        url: url.into(),
-        seq,
-        elements,
-        marks,
-    }
+    let marks = mark_labels(&elements, max_marks);
+    assemble_observation(url.into(), seq, elements, marks)
 }
 
 fn area_bonus(bounds: [f32; 4]) -> f32 {
@@ -1185,23 +1386,83 @@ fn digit_bitmap(ch: char) -> Option<[u8; 15]> {
     }
 }
 
-fn span_text(spans: &[TaintSpan]) -> String {
-    let mut out = String::new();
-    for span in spans {
-        if !out.is_empty() {
-            out.push(' ');
-        }
-        out.push_str(&span.text);
-    }
-    out
+fn spans_text_len(spans: &[TaintSpan]) -> usize {
+    spans.iter().map(|span| span.text.len() + 1).sum()
 }
 
 fn normalize(value: &str) -> String {
-    value
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_ascii_lowercase()
+    let mut out = String::with_capacity(value.len());
+    normalize_into(&mut out, value);
+    out
+}
+
+/// Whitespace-collapse + ASCII-lowercase `value` into `out` in a single pass,
+/// replacing the split → collect → join → to_ascii_lowercase chain that
+/// allocated three temporaries per call.
+fn normalize_into(out: &mut String, value: &str) {
+    let mut first = true;
+    for word in value.split_whitespace() {
+        if !first {
+            out.push(' ');
+        }
+        first = false;
+        out.extend(word.chars().map(|ch| ch.to_ascii_lowercase()));
+    }
+}
+
+/// Equivalent to `normalize_into(out, &span_text(spans))` without building the
+/// intermediate joined String: span boundaries collapse to single spaces just
+/// like any other whitespace.
+fn normalize_spans_into(out: &mut String, spans: &[TaintSpan]) {
+    let mut first = true;
+    for span in spans {
+        for word in span.text.split_whitespace() {
+            if !first {
+                out.push(' ');
+            }
+            first = false;
+            out.extend(word.chars().map(|ch| ch.to_ascii_lowercase()));
+        }
+    }
+}
+
+fn opaque_identity_key(kind: &str, parts: &[&str]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(kind.as_bytes());
+    hasher.update([0]);
+    for part in parts {
+        let bytes = part.as_bytes();
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(bytes);
+    }
+    let digest = hasher.finalize();
+
+    let mut suffix = String::with_capacity(32);
+    for byte in digest.iter().take(16) {
+        let _ = write!(suffix, "{byte:02x}");
+    }
+    format!("{kind}:sha256:{suffix}")
+}
+
+fn redacted_url_for_debug(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return "[invalid-url]".into();
+    };
+    let authority = rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default()
+        .rsplit_once('@')
+        .map(|(_, host)| host)
+        .unwrap_or_else(|| rest.split(['/', '?', '#']).next().unwrap_or_default());
+    if authority.is_empty() {
+        return "[invalid-url]".into();
+    }
+    format!(
+        "{}://{}",
+        scheme.to_ascii_lowercase(),
+        authority.to_ascii_lowercase()
+    )
 }
 
 fn fnv1a64(bytes: &[u8]) -> u64 {
@@ -1357,6 +1618,87 @@ mod tests {
                 "{first_element:?}"
             );
         }
+    }
+
+    #[test]
+    fn stable_mapper_maps_full_snapshots_for_engine_adapters() {
+        let mut mapper = StableIdMapper::new();
+        let first = mapper.map_snapshot(
+            1,
+            &[
+                RawElement::new("button", "Continue").source_id("css:#continue"),
+                RawElement::new("link", "Help").source_id("css:#help"),
+            ],
+        );
+        let second = mapper.map_snapshot(
+            2,
+            &[
+                RawElement::new("button", "Continue").source_id("css:#renamed"),
+                RawElement::new("link", "Help").source_id("css:#help"),
+            ],
+        );
+
+        assert_eq!(first.len(), 2);
+        assert!(first.iter().all(|node_id| node_id.0.starts_with("node:")));
+        assert_eq!(second[0], first[0]);
+        assert_eq!(second[1], first[1]);
+    }
+
+    #[test]
+    fn stable_mapper_retains_opaque_identity_keys() {
+        let mut mapper = StableIdMapper::new();
+        let element = RawElement::new("textbox", "Account secret")
+            .source_id("css:input[value='4111-secret']")
+            .stable_hint("account-secret")
+            .value("4111-secret-value");
+
+        mapper.map_snapshot(1, std::slice::from_ref(&element));
+        let retained = format!(
+            "{:?}\n{:?}\n{}",
+            mapper.by_source.keys().collect::<Vec<_>>(),
+            mapper.by_fingerprint.keys().collect::<Vec<_>>(),
+            corpus_identity_key(&element)
+        );
+
+        assert!(retained.contains("sha256"));
+        for secret in [
+            "Account secret",
+            "account-secret",
+            "4111-secret",
+            "4111-secret-value",
+            "css:input",
+        ] {
+            assert!(!retained.contains(secret), "leaked {secret}: {retained}");
+        }
+    }
+
+    #[test]
+    fn debug_output_redacts_raw_observation_material() {
+        let element = RawElement::new("textbox", "Account secret")
+            .source_id("css:input[value='4111-secret']")
+            .stable_hint("account-secret")
+            .value("4111-secret-value");
+        let input = ObservationInput::new(
+            "https://user:secret@example.com/path?token=secret#fragment",
+            vec![element.clone()],
+        );
+        let mut compiler = ObservationCompiler::new();
+        compiler.compile(input.clone());
+
+        let debug = format!("{element:?}\n{input:?}\n{compiler:?}");
+        for secret in [
+            "user:secret",
+            "token=secret",
+            "Account secret",
+            "account-secret",
+            "4111-secret",
+            "4111-secret-value",
+            "css:input",
+        ] {
+            assert!(!debug.contains(secret), "leaked {secret}: {debug}");
+        }
+        assert!(debug.contains("https://example.com"));
+        assert!(debug.contains("name_spans"));
     }
 
     #[test]

@@ -5,15 +5,23 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[lib]
+bench = false
+
 [dependencies]
 tempo-schema = { path = "../tempo-schema" }
 tempo-driver = { path = "../tempo-driver" }
 tempo-net = { path = "../tempo-net" }
 
 [dev-dependencies]
+criterion.workspace = true
 async-trait.workspace = true
 futures = "0.3"
 serde_json.workspace = true
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "quiescence"
+harness = false

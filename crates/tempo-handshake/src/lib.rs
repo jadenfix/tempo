@@ -7,7 +7,7 @@
 use std::io::Read;
 use std::time::Duration;
 
-use tempo_net::UrlPolicy;
+use tempo_net::{resolve_url_target, UrlPolicy};
 use thiserror::Error;
 
 /// Default response body cap for each pre-render HTTP probe.
@@ -213,21 +213,16 @@ pub fn probe_http_origin(
     target: &str,
     config: HttpProbeConfig,
 ) -> Result<HttpProbeRun, HttpProbeError> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(config.timeout)
-        .redirect(url_policy_redirect(config.url_policy.clone()))
-        .build()
-        .map_err(|error| HttpProbeError::ClientBuild(error.to_string()))?;
     let origin = canonical_probe_origin(target)?;
 
     let mut handles = Vec::with_capacity(DEFAULT_HTTP_PROBES.len());
     for (index, probe) in DEFAULT_HTTP_PROBES.iter().copied().enumerate() {
-        let client = client.clone();
         let url_policy = config.url_policy.clone();
         let url = format!("{origin}{}", probe.path);
         let max_body_bytes = config.max_body_bytes;
+        let timeout = config.timeout;
         handles.push(std::thread::spawn(move || {
-            fetch_probe(index, probe, url, max_body_bytes, url_policy, client)
+            fetch_probe(index, probe, url, max_body_bytes, url_policy, timeout)
         }));
     }
 
@@ -504,6 +499,7 @@ struct IndexedProbeFetch {
 /// client would follow it into an internal/loopback target, capturing the
 /// internal response body (issue #80). This stops any redirect whose target the
 /// URL policy would block, and caps the hop count.
+#[cfg(test)]
 fn url_policy_redirect(url_policy: UrlPolicy) -> reqwest::redirect::Policy {
     reqwest::redirect::Policy::custom(move |attempt| {
         if attempt.previous().len() >= 10 {
@@ -516,15 +512,18 @@ fn url_policy_redirect(url_policy: UrlPolicy) -> reqwest::redirect::Policy {
     })
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 struct HttpRedirectBlocked(String);
 
+#[cfg(test)]
 impl std::fmt::Display for HttpRedirectBlocked {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "redirect blocked by URL policy: {}", self.0)
     }
 }
 
+#[cfg(test)]
 impl std::error::Error for HttpRedirectBlocked {}
 
 fn fetch_probe(
@@ -533,19 +532,25 @@ fn fetch_probe(
     url: String,
     max_body_bytes: usize,
     url_policy: UrlPolicy,
-    client: reqwest::blocking::Client,
+    timeout: Duration,
 ) -> IndexedProbeFetch {
-    if let Err(error) = url_policy.enforce(&url) {
-        return IndexedProbeFetch {
-            index,
-            response: None,
-            failure: Some(HttpProbeFailure {
-                path: probe.path.to_string(),
-                url,
-                reason: error.to_string(),
-            }),
-        };
-    }
+    let endpoint = match reqwest::Url::parse(&url) {
+        Ok(endpoint) => endpoint,
+        Err(error) => return probe_failure(index, probe, url, error.to_string()),
+    };
+    let target = match resolve_url_target(&endpoint, &url_policy) {
+        Ok(target) => target,
+        Err(error) => return probe_failure(index, probe, url, error.to_string()),
+    };
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .resolve_to_addrs(target.host(), target.sockets())
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => return probe_failure(index, probe, url, error.to_string()),
+    };
 
     match fetch_probe_response(&client, probe.path, &url, max_body_bytes) {
         Ok(response) => IndexedProbeFetch {
@@ -562,6 +567,18 @@ fn fetch_probe(
                 reason,
             }),
         },
+    }
+}
+
+fn probe_failure(index: usize, probe: HttpProbe, url: String, reason: String) -> IndexedProbeFetch {
+    IndexedProbeFetch {
+        index,
+        response: None,
+        failure: Some(HttpProbeFailure {
+            path: probe.path.to_string(),
+            url,
+            reason,
+        }),
     }
 }
 

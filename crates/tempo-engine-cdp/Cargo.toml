@@ -10,11 +10,14 @@ async-trait = { workspace = true }
 chromiumoxide = { version = "0.7", default-features = false, features = ["tokio-runtime"] }
 futures = "0.3"
 serde_json = { workspace = true }
+tempfile = "3"
 tempo-schema = { path = "../tempo-schema" }
 tempo-driver = { path = "../tempo-driver" }
 tempo-engine-host = { path = "../tempo-engine-host" }
 tempo-net = { path = "../tempo-net" }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+tempo-observe = { path = "../tempo-observe" }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "time"] }
+url = "2"
 
 [lints]
 workspace = true

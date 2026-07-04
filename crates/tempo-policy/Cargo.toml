@@ -5,14 +5,22 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[lib]
+bench = false
+
 [dependencies]
 tempo-schema = { path = "../tempo-schema" }
 thiserror.workspace = true
 url = "2"
 
 [dev-dependencies]
+criterion.workspace = true
 proptest = "1"
 serde_json.workspace = true
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "policy"
+harness = false

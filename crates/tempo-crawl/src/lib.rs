@@ -5,25 +5,24 @@
 //! facade gives SDKs a crawl-focused import surface without duplicating that
 //! enforcement logic.
 //!
-//! SDKs should pass [`NetworkRequest`] values into [`CrawlFrontier`]. Tempo-net
-//! evaluates the canonical crawl request identity there, so callers do not need
-//! to recreate its dedupe key. Checked dispatch is likewise delegated through
-//! [`CrawlDispatchGuard`] and [`CrawlFrontier::dispatch_checked_ready`]: only
-//! [`CheckedCrawlDispatch`] values have passed URL, resolved-socket, egress,
-//! audit, and optional Web Bot Auth checks. Raw scheduler dispatches are kept
-//! as deprecated compatibility aliases in this facade because they have not
+//! SDKs should pass [`NetworkRequest`] values into [`CrawlFrontier`]. The
+//! facade delegates canonical crawl request identity, scheduler state, and
+//! checked dispatch to tempo-net, but does not expose raw `dispatch_ready()` as a
+//! normal method. Only [`CheckedCrawlDispatch`] values returned by
+//! [`CrawlFrontier::dispatch_checked_ready`] have passed URL, resolved-socket,
+//! egress, audit, and optional Web Bot Auth checks. Raw scheduler dispatch
+//! types are kept as deprecated compatibility aliases because they have not
 //! passed SSRF/egress checks and are not safe as a direct network execution
 //! surface.
 
 pub use tempo_net::{
     AuditRecord, BlockCode, BlockReason, CheckedCrawlDispatch, CrawlCheckedBatch, CrawlDecision,
-    CrawlDispatchError, CrawlDispatchGuard, CrawlDispatchSigner, CrawlError, CrawlFrontier,
-    CrawlFrontierSnapshot, CrawlPolicy, CrawlScheduler, DomainRule, EgressDenied, EgressPolicy,
-    EgressRecord, IdentityMode, NetworkRequest, NetworkResponseRecord, OriginCrawlSnapshot,
-    ProfileId, ProxyRoute, RejectedCrawlDispatch, RequestId, RobotsRules, SignatureError,
-    SignatureHeaders, UrlBlocked, UrlPolicy, WebBotAuthSigningKey,
-    DEFAULT_CRAWL_MAX_CONCURRENT_PER_ORIGIN, DEFAULT_CRAWL_MAX_GLOBAL_INFLIGHT,
-    DEFAULT_CRAWL_MIN_DELAY_TICKS,
+    CrawlDispatchError, CrawlDispatchGuard, CrawlDispatchSigner, CrawlError, CrawlFrontierSnapshot,
+    CrawlPolicy, CrawlScheduler, DomainRule, EgressDenied, EgressPolicy, EgressRecord,
+    IdentityMode, NetworkRequest, NetworkResponseRecord, OriginCrawlSnapshot, ProfileId,
+    ProxyRoute, RejectedCrawlDispatch, RequestId, RobotsRules, SignatureError, SignatureHeaders,
+    UrlBlocked, UrlPolicy, WebBotAuthSigningKey, DEFAULT_CRAWL_MAX_CONCURRENT_PER_ORIGIN,
+    DEFAULT_CRAWL_MAX_GLOBAL_INFLIGHT, DEFAULT_CRAWL_MIN_DELAY_TICKS,
 };
 
 #[deprecated(
@@ -39,6 +38,67 @@ pub type CrawlDispatch = tempo_net::CrawlDispatch;
 /// Human-readable crate summary for smoke tests and package metadata.
 pub fn describe() -> &'static str {
     "crawler facade over tempo-net: scheduler primitives plus checked dispatch for network execution"
+}
+
+/// SDK-facing crawl frontier.
+///
+/// This wrapper intentionally omits tempo-net's raw `dispatch_ready()` method so
+/// callers use checked dispatch before network execution.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CrawlFrontier {
+    inner: tempo_net::CrawlFrontier,
+}
+
+impl CrawlFrontier {
+    pub fn new(policy: CrawlPolicy) -> Self {
+        Self {
+            inner: tempo_net::CrawlFrontier::new(policy),
+        }
+    }
+
+    pub fn scheduler(&self) -> &CrawlScheduler {
+        self.inner.scheduler()
+    }
+
+    pub fn scheduler_mut(&mut self) -> &mut CrawlScheduler {
+        self.inner.scheduler_mut()
+    }
+
+    /// Add a request by canonical crawl request identity. Returns `false` when
+    /// the same identity is already pending or active.
+    pub fn enqueue(&mut self, request: NetworkRequest) -> Result<bool, CrawlError> {
+        self.inner.enqueue(request)
+    }
+
+    /// Dispatch ready requests only after URL, socket, egress, audit, and
+    /// optional signing checks pass.
+    pub fn dispatch_checked_ready<F>(
+        &mut self,
+        tick: u64,
+        max_requests: usize,
+        guard: CrawlDispatchGuard<'_>,
+        resolve_socket: F,
+    ) -> Result<CrawlCheckedBatch, CrawlError>
+    where
+        F: FnMut(&tempo_net::CrawlDispatch) -> Result<std::net::SocketAddr, CrawlDispatchError>,
+    {
+        self.inner
+            .dispatch_checked_ready(tick, max_requests, guard, resolve_socket)
+    }
+
+    pub fn finish(&mut self, response: &NetworkResponseRecord, tick: u64) -> bool {
+        self.inner.finish(response, tick)
+    }
+
+    pub fn snapshot(&self) -> CrawlFrontierSnapshot {
+        self.inner.snapshot()
+    }
+}
+
+impl Default for CrawlFrontier {
+    fn default() -> Self {
+        Self::new(CrawlPolicy::default())
+    }
 }
 
 /// Build a crawler frontier with the shared tempo-net policy engine.
@@ -105,12 +165,15 @@ mod tests {
         assert!(!frontier.enqueue(crawl_request("a1-dup", "https://a.example/a"))?);
         assert!(frontier.enqueue(crawl_request("a2", "https://a.example/c"))?);
 
-        let batch = frontier.dispatch_ready(1, 8)?;
+        let guard = public_checked_guard();
+        let batch = frontier.dispatch_checked_ready(1, 8, guard, |_| {
+            Ok(std::net::SocketAddr::from(([93, 184, 216, 34], 443)))
+        })?;
         assert_eq!(
             batch
                 .dispatches
                 .iter()
-                .map(|dispatch| dispatch.request.id.0.as_str())
+                .map(|checked| checked.dispatch.request.id.0.as_str())
                 .collect::<Vec<_>>(),
             vec!["a1", "b"]
         );
@@ -163,9 +226,12 @@ mod tests {
             IdentityMode::UserDriven,
         ))?);
 
-        let batch = frontier.dispatch_ready(1, 4)?;
+        let guard = public_checked_guard();
+        let batch = frontier.dispatch_checked_ready(1, 4, guard, |_| {
+            Ok(std::net::SocketAddr::from(([93, 184, 216, 34], 443)))
+        })?;
         assert_eq!(batch.dispatches.len(), 4);
-        let _request_id: RequestId = batch.dispatches[0].request.id.clone();
+        let _request_id: RequestId = batch.dispatches[0].dispatch.request.id.clone();
         assert!(frontier
             .scheduler()
             .is_url_active("https://example.com/page")?);
@@ -248,5 +314,13 @@ mod tests {
 
     fn crawl_request(id: &str, url: &str) -> NetworkRequest {
         NetworkRequest::new(id, "GET", url, "profile-a", IdentityMode::AgentDeclared)
+    }
+
+    fn public_checked_guard<'a>() -> CrawlDispatchGuard<'a> {
+        static URL_POLICY: std::sync::LazyLock<UrlPolicy> =
+            std::sync::LazyLock::new(UrlPolicy::block_private);
+        static EGRESS_POLICY: std::sync::LazyLock<EgressPolicy> =
+            std::sync::LazyLock::new(EgressPolicy::allow_all);
+        checked_dispatch_guard(&URL_POLICY, &EGRESS_POLICY)
     }
 }

@@ -12,16 +12,20 @@ use tempo_act::{execute_action, execute_batch, ExecutionStatus};
 use tempo_driver::{DriverTrait, Engine, StepOutcome, TransportError};
 use tempo_handshake::{probe_http_origin, LaneDecision, ProbeHit};
 pub use tempo_handshake::{HttpProbeConfig, Lane as StructuredLane, StructuredSignal};
+use tempo_net::resolve_url_target;
 use tempo_policy::{
     ConfirmationGate, InputTaint, Origin, OriginError, OriginPolicy, OriginRuleMode,
 };
 use tempo_schema::{Action, ActionBatch, CompiledObservation, ObservationDiff, SideEffect};
 use tempo_session::{
-    read_journal_entries, JournalEntry, JournalError, JournalEvent, RunId, SessionId,
+    durable_retention_policy_from_env, read_journal_entries_with_retention_policy,
+    DurableRetentionPolicy, JournalEntry, JournalError, JournalEvent, RunId, SessionId,
     SessionJournal,
 };
 use tempo_skills::{SkillError, SkillStore};
 use thiserror::Error;
+
+pub mod decider;
 
 /// Default p95 observation budget from `final.md` §10.
 pub const DEFAULT_MAX_OBSERVATION_BYTES: usize = 8 * 1024;
@@ -288,6 +292,17 @@ impl TokenBudget {
     pub fn remaining(&self) -> u64 {
         self.max_tokens.saturating_sub(self.used_tokens)
     }
+
+    pub fn ensure_available(&self, tokens: u64) -> Result<(), AgentError> {
+        let attempted = self.used_tokens.saturating_add(tokens);
+        if attempted > self.max_tokens {
+            return Err(AgentError::TokenBudgetExceeded {
+                attempted,
+                max: self.max_tokens,
+            });
+        }
+        Ok(())
+    }
 }
 
 /// Resume cursor derived from existing journal entries.
@@ -349,6 +364,7 @@ impl ResumeCursor {
                 JournalEvent::SessionStarted { .. }
                 | JournalEvent::StructuredFastPathSelected { .. }
                 | JournalEvent::Observation { .. }
+                | JournalEvent::ModelDecision { .. }
                 | JournalEvent::TransportError { .. }
                 | JournalEvent::CassetteRecorded { .. } => {}
             }
@@ -385,9 +401,50 @@ impl AgentLoop {
         plan: TaskPlan,
         budget: TokenBudget,
     ) -> Result<Self, AgentError> {
+        let retention_policy = durable_retention_policy_from_env()?;
+        Self::open_with_retention_policy(
+            journal_path,
+            run_id,
+            session_id,
+            plan,
+            budget,
+            retention_policy,
+        )
+    }
+
+    pub fn open_plaintext_unsafe(
+        journal_path: impl AsRef<Path>,
+        run_id: RunId,
+        session_id: SessionId,
+        plan: TaskPlan,
+        budget: TokenBudget,
+    ) -> Result<Self, AgentError> {
+        Self::open_with_retention_policy(
+            journal_path,
+            run_id,
+            session_id,
+            plan,
+            budget,
+            DurableRetentionPolicy::PlaintextUnsafe,
+        )
+    }
+
+    pub fn open_with_retention_policy(
+        journal_path: impl AsRef<Path>,
+        run_id: RunId,
+        session_id: SessionId,
+        plan: TaskPlan,
+        budget: TokenBudget,
+        retention_policy: DurableRetentionPolicy,
+    ) -> Result<Self, AgentError> {
         let journal_path = journal_path.as_ref().to_path_buf();
-        let journal = SessionJournal::open(&journal_path, run_id, session_id)?;
-        let entries = read_journal_entries(&journal_path)?;
+        let journal = SessionJournal::open_with_retention_policy(
+            &journal_path,
+            run_id,
+            session_id,
+            retention_policy.clone(),
+        )?;
+        let entries = read_journal_entries_with_retention_policy(&journal_path, &retention_policy)?;
         let cursor = ResumeCursor::from_entries(&plan, &entries)?;
         let mut budget = TokenBudget::new(budget.max_tokens);
         restore_completed_token_budget(&plan, cursor.completed_steps, &mut budget)?;
@@ -443,6 +500,11 @@ impl AgentLoop {
             Some(step) => self.cursor.pending_planned.as_ref() == Some(&step.key),
             None => false,
         }
+    }
+
+    pub fn ensure_next_step_budget(&self) -> Result<(), AgentError> {
+        let step = self.next_step().ok_or(AgentError::PlanComplete)?;
+        self.budget.ensure_available(step.estimated_tokens)
     }
 
     pub fn record_next_outcome(&mut self, outcome: StepOutcome) -> Result<StepTriple, AgentError> {
@@ -724,6 +786,7 @@ pub struct AgentRunner {
     skill_store_root: Option<PathBuf>,
     origin_policy: OriginPolicy,
     structured_fast_path: StructuredFastPath,
+    retention_policy: Option<DurableRetentionPolicy>,
 }
 
 impl AgentRunner {
@@ -737,7 +800,12 @@ impl AgentRunner {
             skill_store_root: None,
             origin_policy: OriginPolicy::default(),
             structured_fast_path: StructuredFastPath::disabled(),
+            retention_policy: None,
         }
+    }
+
+    pub fn new_plaintext_unsafe(journal_path: impl AsRef<Path>, ids: AgentRunIds) -> Self {
+        Self::new(journal_path, ids).with_retention_policy(DurableRetentionPolicy::PlaintextUnsafe)
     }
 
     pub fn with_token_budget(mut self, token_budget: TokenBudget) -> Self {
@@ -767,6 +835,11 @@ impl AgentRunner {
 
     pub fn with_structured_fast_path(mut self, structured_fast_path: StructuredFastPath) -> Self {
         self.structured_fast_path = structured_fast_path;
+        self
+    }
+
+    pub fn with_retention_policy(mut self, retention_policy: DurableRetentionPolicy) -> Self {
+        self.retention_policy = Some(retention_policy);
         self
     }
 
@@ -901,6 +974,8 @@ impl AgentRunner {
                 return Ok(report);
             }
 
+            agent.ensure_next_step_budget()?;
+
             // Journal intent before the side effect runs (#99) so an interrupted
             // execution is detected — rather than silently repeated — on resume.
             agent.plan_next_step()?;
@@ -994,14 +1069,17 @@ impl AgentRunner {
         task: &DriverTask,
     ) -> Result<(AgentLoop, Vec<JournalEntry>, AgentRunReport), AgentError> {
         let plan = task.task_plan()?;
-        let agent = AgentLoop::open(
+        let retention_policy = self.resolved_retention_policy()?;
+        let agent = AgentLoop::open_with_retention_policy(
             &self.journal_path,
             self.ids.run_id.clone(),
             self.ids.session_id.clone(),
             plan,
             self.token_budget.clone(),
+            retention_policy.clone(),
         )?;
-        let initial_entries = read_journal_entries(agent.journal_path())?;
+        let initial_entries =
+            read_journal_entries_with_retention_policy(agent.journal_path(), &retention_policy)?;
         let report = AgentRunReport::new(
             engine,
             agent.journal_path().to_path_buf(),
@@ -1009,6 +1087,13 @@ impl AgentRunner {
             agent.cursor().completed_steps,
         );
         Ok((agent, initial_entries, report))
+    }
+
+    fn resolved_retention_policy(&self) -> Result<DurableRetentionPolicy, AgentError> {
+        match &self.retention_policy {
+            Some(retention_policy) => Ok(retention_policy.clone()),
+            None => Ok(durable_retention_policy_from_env()?),
+        }
     }
 
     fn apply_resume_terminal_status(&self, agent: &AgentLoop, report: &mut AgentRunReport) -> bool {
@@ -1106,6 +1191,8 @@ impl AgentRunner {
                 return Ok(report);
             }
 
+            agent.ensure_next_step_budget()?;
+
             agent.plan_next_step()?;
             let outcome = match &planned.action {
                 Action::Skill { name, input } => {
@@ -1173,14 +1260,14 @@ impl AgentRunner {
         let endpoint = decision
             .mcp_endpoint_url()
             .map_err(|error| error.to_string())?;
-        self.structured_fast_path
-            .config
-            .url_policy
-            .enforce(endpoint.as_str())
-            .map_err(|error| error.to_string())?;
+        let resolved_endpoint =
+            resolve_url_target(&endpoint, &self.structured_fast_path.config.url_policy)
+                .map_err(|error| error.to_string())?;
+        let max_body_bytes = self.structured_fast_path.config.max_body_bytes;
         let client = reqwest::Client::builder()
             .timeout(self.structured_fast_path.config.timeout)
             .redirect(reqwest::redirect::Policy::none())
+            .resolve_to_addrs(resolved_endpoint.host(), resolved_endpoint.sockets())
             .build()
             .map_err(|error| error.to_string())?;
 
@@ -1194,8 +1281,15 @@ impl AgentRunner {
                 "clientInfo": {"name": "tempo-agent", "version": env!("CARGO_PKG_VERSION")},
             },
         });
-        let initialize =
-            post_mcp_json(&client, endpoint.as_str(), &initialize, None, false).await?;
+        let initialize = post_mcp_json(
+            &client,
+            endpoint.as_str(),
+            &initialize,
+            None,
+            false,
+            max_body_bytes,
+        )
+        .await?;
         if let Some(error) = initialize.body.get("error") {
             return Err(format!(
                 "MCP initialize failed: {}",
@@ -1215,6 +1309,7 @@ impl AgentRunner {
             &initialized,
             session_id.as_deref(),
             true,
+            max_body_bytes,
         )
         .await?;
         if let Some(error) = initialized.body.get("error") {
@@ -1242,6 +1337,7 @@ impl AgentRunner {
             &request,
             session_id.as_deref(),
             true,
+            max_body_bytes,
         )
         .await?;
         if let Some(error) = response.body.get("error") {
@@ -1562,7 +1658,27 @@ pub fn step_triples_from_journal(
     journal_path: impl AsRef<Path>,
     plan: &TaskPlan,
 ) -> Result<Vec<StepTriple>, AgentError> {
-    let entries = read_journal_entries(journal_path)?;
+    let retention_policy = durable_retention_policy_from_env()?;
+    step_triples_from_journal_with_retention_policy(journal_path, plan, &retention_policy)
+}
+
+pub fn step_triples_from_journal_plaintext_unsafe(
+    journal_path: impl AsRef<Path>,
+    plan: &TaskPlan,
+) -> Result<Vec<StepTriple>, AgentError> {
+    step_triples_from_journal_with_retention_policy(
+        journal_path,
+        plan,
+        &DurableRetentionPolicy::PlaintextUnsafe,
+    )
+}
+
+pub fn step_triples_from_journal_with_retention_policy(
+    journal_path: impl AsRef<Path>,
+    plan: &TaskPlan,
+    retention_policy: &DurableRetentionPolicy,
+) -> Result<Vec<StepTriple>, AgentError> {
+    let entries = read_journal_entries_with_retention_policy(journal_path, retention_policy)?;
     let mut triples = Vec::new();
     let mut step_index = 0_usize;
 
@@ -1588,6 +1704,7 @@ pub fn step_triples_from_journal(
             JournalEvent::SessionStarted { .. }
             | JournalEvent::StructuredFastPathSelected { .. }
             | JournalEvent::Observation { .. }
+            | JournalEvent::ModelDecision { .. }
             | JournalEvent::ActionPlanned { .. }
             | JournalEvent::TransportError { .. }
             | JournalEvent::CassetteRecorded { .. }
@@ -1620,6 +1737,7 @@ pub fn step_triples_from_journal_entries(
             JournalEvent::SessionStarted { .. }
             | JournalEvent::StructuredFastPathSelected { .. }
             | JournalEvent::Observation { .. }
+            | JournalEvent::ModelDecision { .. }
             | JournalEvent::ActionPlanned { .. }
             | JournalEvent::TransportError { .. }
             | JournalEvent::CassetteRecorded { .. }
@@ -1635,7 +1753,24 @@ pub fn step_triples_from_journal_entries(
 pub fn step_triples_from_journal_without_plan(
     journal_path: impl AsRef<Path>,
 ) -> Result<Vec<StepTriple>, AgentError> {
-    let entries = read_journal_entries(journal_path)?;
+    let retention_policy = durable_retention_policy_from_env()?;
+    step_triples_from_journal_without_plan_with_retention_policy(journal_path, &retention_policy)
+}
+
+pub fn step_triples_from_journal_without_plan_plaintext_unsafe(
+    journal_path: impl AsRef<Path>,
+) -> Result<Vec<StepTriple>, AgentError> {
+    step_triples_from_journal_without_plan_with_retention_policy(
+        journal_path,
+        &DurableRetentionPolicy::PlaintextUnsafe,
+    )
+}
+
+pub fn step_triples_from_journal_without_plan_with_retention_policy(
+    journal_path: impl AsRef<Path>,
+    retention_policy: &DurableRetentionPolicy,
+) -> Result<Vec<StepTriple>, AgentError> {
+    let entries = read_journal_entries_with_retention_policy(journal_path, retention_policy)?;
     step_triples_from_journal_entries(&entries)
 }
 
@@ -1704,6 +1839,7 @@ async fn post_mcp_json(
     request: &serde_json::Value,
     session_id: Option<&str>,
     include_protocol_version: bool,
+    max_body_bytes: usize,
 ) -> Result<McpHttpResponse, String> {
     let mut request_builder = client
         .post(endpoint)
@@ -1734,7 +1870,7 @@ async fn post_mcp_json(
         .and_then(|value| value.to_str().ok())
         .unwrap_or("")
         .to_string();
-    let body = response.text().await.map_err(|error| error.to_string())?;
+    let body = read_mcp_body_capped(response, max_body_bytes).await?;
     if !status.is_success() {
         let detail = body.trim();
         if detail.is_empty() {
@@ -1746,6 +1882,67 @@ async fn post_mcp_json(
         body: parse_mcp_response_body(&content_type, &body, request.get("id"))?,
         session_id,
     })
+}
+
+/// MCP-flavored wrapper over [`read_body_capped`]: collapses the typed cap
+/// errors onto this client's string-error plumbing.
+async fn read_mcp_body_capped(
+    response: reqwest::Response,
+    max_body_bytes: usize,
+) -> Result<String, String> {
+    read_body_capped(response, max_body_bytes)
+        .await
+        .map_err(|error| match error {
+            CappedBodyError::TooLarge { max_bytes } => {
+                format!("MCP response body exceeded {max_bytes} bytes")
+            }
+            CappedBodyError::Transport(reason) => reason,
+        })
+}
+
+/// Typed failure from [`read_body_capped`], so callers can distinguish a
+/// retryable transport fault from a fatal size-cap breach.
+pub(crate) enum CappedBodyError {
+    TooLarge { max_bytes: usize },
+    Transport(String),
+}
+
+/// Reads an HTTP response body into a `String` while enforcing a hard byte
+/// cap, so an attacker-controlled endpoint cannot exhaust memory by streaming
+/// an unbounded body (see issue #212). Mirrors the probe path's `take`-style
+/// bound in `tempo-handshake`, but for the async client: rejects early when
+/// the advertised `Content-Length` already exceeds the cap, then accumulates
+/// chunks and errors as soon as the received bytes would cross the cap.
+/// Shared by the MCP client above and the Anthropic decider (#248); each
+/// caller maps [`CappedBodyError`] onto its own error type.
+pub(crate) async fn read_body_capped(
+    response: reqwest::Response,
+    max_body_bytes: usize,
+) -> Result<String, CappedBodyError> {
+    let cap = max_body_bytes as u64;
+    if let Some(content_length) = response.content_length()
+        && content_length > cap
+    {
+        return Err(CappedBodyError::TooLarge {
+            max_bytes: max_body_bytes,
+        });
+    }
+
+    let mut response = response;
+    let mut body: Vec<u8> = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| CappedBodyError::Transport(error.to_string()))?
+    {
+        if body.len() as u64 + chunk.len() as u64 > cap {
+            return Err(CappedBodyError::TooLarge {
+                max_bytes: max_body_bytes,
+            });
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(String::from_utf8_lossy(&body).into_owned())
 }
 
 fn parse_mcp_response_body(
@@ -2079,6 +2276,8 @@ pub enum AgentError {
     },
     #[error("token budget exceeded: attempted {attempted}, max {max}")]
     TokenBudgetExceeded { attempted: u64, max: u64 },
+    #[error("model decider failed: {0}")]
+    Decider(#[from] decider::DeciderError),
     #[error(
         "observation budget exceeded: {bytes} bytes/{estimated_tokens} tokens, max {max_bytes} bytes/{max_tokens} tokens"
     )]
@@ -2133,6 +2332,7 @@ mod tests {
     use tempo_schema::{
         InteractiveElement, NodeId, ObservationDiff, Provenance, QuiescencePolicy, TaintSpan,
     };
+    use tempo_session::{read_journal_entries, DurableEncryptionKey};
     use tempo_skills::{ActionTemplate, SkillDefinition, SkillInput, SkillStore, TemplateString};
 
     type TestResult = Result<(), Box<dyn Error>>;
@@ -2200,7 +2400,7 @@ mod tests {
         fs::create_dir_all(&root)?;
         let journal_path = root.join("session.jsonl");
         let plan = TaskPlan::from_actions(vec![Action::Scroll { x: 0.0, y: 32.0 }], 12)?;
-        let mut agent = AgentLoop::open(
+        let mut agent = AgentLoop::open_plaintext_unsafe(
             &journal_path,
             RunId("run".into()),
             SessionId("session".into()),
@@ -2210,7 +2410,7 @@ mod tests {
 
         let triple = agent.record_next_outcome(StepOutcome::Applied { diff: diff(0, 1) })?;
         let entries = read_journal_entries(&journal_path)?;
-        let triples = step_triples_from_journal(&journal_path, &plan)?;
+        let triples = step_triples_from_journal_plaintext_unsafe(&journal_path, &plan)?;
 
         assert_eq!(entries.len(), 2);
         assert!(matches!(
@@ -2261,7 +2461,7 @@ mod tests {
 
         let entries = read_journal_entries(&journal_path)?;
         let triples = step_triples_from_journal_entries(&entries)?;
-        let path_triples = step_triples_from_journal_without_plan(&journal_path)?;
+        let path_triples = step_triples_from_journal_without_plan_plaintext_unsafe(&journal_path)?;
 
         assert_eq!(triples, path_triples);
         assert_eq!(triples.len(), 2);
@@ -2307,7 +2507,7 @@ mod tests {
         journal.append(JournalEvent::ActionPlanned { action: pending })?;
         drop(journal);
 
-        let triples = step_triples_from_journal_without_plan(&journal_path)?;
+        let triples = step_triples_from_journal_without_plan_plaintext_unsafe(&journal_path)?;
 
         assert_eq!(triples.len(), 1);
         assert_eq!(triples[0].key, IdempotencyKey::for_action(0, &completed)?);
@@ -2343,7 +2543,7 @@ mod tests {
         })?;
         drop(journal);
 
-        let mut agent = AgentLoop::open(
+        let mut agent = AgentLoop::open_plaintext_unsafe(
             &journal_path,
             RunId("run".into()),
             SessionId("session".into()),
@@ -2393,7 +2593,7 @@ mod tests {
         drop(journal);
 
         assert!(matches!(
-            AgentLoop::open(
+            AgentLoop::open_plaintext_unsafe(
                 &journal_path,
                 RunId("run".into()),
                 SessionId("session".into()),
@@ -2432,7 +2632,7 @@ mod tests {
         })?;
         drop(journal);
 
-        let agent = AgentLoop::open(
+        let agent = AgentLoop::open_plaintext_unsafe(
             &journal_path,
             RunId("run".into()),
             SessionId("session".into()),
@@ -2469,7 +2669,7 @@ mod tests {
         })?;
         drop(journal);
 
-        let agent = AgentLoop::open(
+        let agent = AgentLoop::open_plaintext_unsafe(
             &journal_path,
             RunId("run".into()),
             SessionId("session".into()),
@@ -2511,7 +2711,7 @@ mod tests {
         journal.append(JournalEvent::ActionPlanned { action: second })?;
         drop(journal);
 
-        let mut agent = AgentLoop::open(
+        let mut agent = AgentLoop::open_plaintext_unsafe(
             &journal_path,
             RunId("run".into()),
             SessionId("session".into()),
@@ -2549,7 +2749,7 @@ mod tests {
         drop(journal);
 
         assert!(matches!(
-            AgentLoop::open(
+            AgentLoop::open_plaintext_unsafe(
                 &journal_path,
                 RunId("run".into()),
                 SessionId("session".into()),
@@ -2572,7 +2772,7 @@ mod tests {
         let action = Action::Scroll { x: 0.0, y: 4.0 };
         let plan = TaskPlan::from_actions(vec![action], 1)?;
         let expected = plan.steps[0].key.clone();
-        let mut agent = AgentLoop::open(
+        let mut agent = AgentLoop::open_plaintext_unsafe(
             &journal_path,
             RunId("run".into()),
             SessionId("session".into()),
@@ -2601,7 +2801,7 @@ mod tests {
             }],
         );
         let mut driver = TestDriver::new().with_elements(vec![button("submit")]);
-        let runner = AgentRunner::new(
+        let runner = AgentRunner::new_plaintext_unsafe(
             &journal_path,
             AgentRunIds::new("run-test-driver", "session-test-driver"),
         );
@@ -2633,6 +2833,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runner_writes_encrypted_journal_when_retention_policy_is_secure() -> TestResult {
+        let root = unique_dir("runner-encrypted")?;
+        remove_dir_if_exists(&root)?;
+        fs::create_dir_all(&root)?;
+        let journal_path = root.join("session.jsonl");
+        let retention_policy =
+            DurableRetentionPolicy::encrypted(DurableEncryptionKey::from_bytes([42; 32]));
+        let task = DriverTask::new(
+            "https://example.com/private?token=secret",
+            vec![Action::Click {
+                node: NodeId("submit".into()),
+            }],
+        );
+        let mut driver = TestDriver::new().with_elements(vec![button("submit")]);
+        let runner = AgentRunner::new(
+            &journal_path,
+            AgentRunIds::new("run-encrypted", "session-encrypted"),
+        )
+        .with_retention_policy(retention_policy.clone());
+
+        let report = runner.run_driver_task(&mut driver, &task).await?;
+
+        assert_eq!(report.status, AgentRunStatus::Completed);
+        assert!(matches!(
+            read_journal_entries(&journal_path),
+            Err(JournalError::EncryptedRecordRequiresKey)
+        ));
+        let entries = read_journal_entries_with_retention_policy(&journal_path, &retention_policy)?;
+        assert!(entries
+            .iter()
+            .any(|entry| matches!(entry.event, JournalEvent::StepApplied { .. })));
+        let bytes = fs::read(&journal_path)?;
+        assert!(!contains_bytes(&bytes, b"token=secret"));
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn runner_structured_fast_path_executes_remote_mcp_skill_without_navigation() -> TestResult
     {
         let root = unique_dir("runner-structured-fast-path")?;
@@ -2648,7 +2887,7 @@ mod tests {
             }],
         );
         let mut driver = FailingDriver::new(TransportFailurePoint::Goto);
-        let runner = AgentRunner::new(
+        let runner = AgentRunner::new_plaintext_unsafe(
             &journal_path,
             AgentRunIds::new("run-structured", "session-structured"),
         )
@@ -2709,7 +2948,7 @@ mod tests {
             }],
         );
         let mut driver = FailingDriver::new(TransportFailurePoint::Goto);
-        let runner = AgentRunner::new(
+        let runner = AgentRunner::new_plaintext_unsafe(
             &journal_path,
             AgentRunIds::new("run-structured-policy", "session-structured-policy"),
         )
@@ -2764,7 +3003,7 @@ mod tests {
         drop(journal);
 
         let mut driver = FailingDriver::new(TransportFailurePoint::Goto);
-        let runner = AgentRunner::new(
+        let runner = AgentRunner::new_plaintext_unsafe(
             &journal_path,
             AgentRunIds::new("run-structured-resume", "session-structured-resume"),
         )
@@ -2809,7 +3048,7 @@ mod tests {
             }],
         );
         let mut driver = FailingDriver::new(TransportFailurePoint::Goto);
-        let runner = AgentRunner::new(
+        let runner = AgentRunner::new_plaintext_unsafe(
             &journal_path,
             AgentRunIds::new("run-structured-fallback", "session-structured-fallback"),
         )
@@ -2847,7 +3086,7 @@ mod tests {
         let journal_path = root.join("session.jsonl");
         let task = DriverTask::new("https://render.example/app", vec![]);
         let mut driver = FailingDriver::new(TransportFailurePoint::PostActionObserve);
-        let runner = AgentRunner::new(
+        let runner = AgentRunner::new_plaintext_unsafe(
             &journal_path,
             AgentRunIds::new("run-render", "session-render"),
         )
@@ -2871,7 +3110,7 @@ mod tests {
         let journal_path = root.join("session.jsonl");
         let task = DriverTask::new("https://example.com", vec![]);
         let mut driver = FailingDriver::new(TransportFailurePoint::Goto);
-        let runner = AgentRunner::new(
+        let runner = AgentRunner::new_plaintext_unsafe(
             &journal_path,
             AgentRunIds::new("run-transport-goto", "session-transport-goto"),
         );
@@ -2911,7 +3150,7 @@ mod tests {
         );
         let mut driver =
             FailingDriver::new(TransportFailurePoint::Act).with_elements(vec![button("submit")]);
-        let runner = AgentRunner::new(
+        let runner = AgentRunner::new_plaintext_unsafe(
             &journal_path,
             AgentRunIds::new("run-transport-action", "session-transport-action"),
         );
@@ -2959,7 +3198,7 @@ mod tests {
         );
         let mut driver = FailingDriver::new(TransportFailurePoint::PostActionObserve)
             .with_elements(vec![button("submit")]);
-        let runner = AgentRunner::new(
+        let runner = AgentRunner::new_plaintext_unsafe(
             &journal_path,
             AgentRunIds::new(
                 "run-transport-post-observe",
@@ -3013,7 +3252,7 @@ mod tests {
         };
         let task = DriverTask::new("https://example.com", vec![skill_action.clone()]);
         let mut driver = TestDriver::new().with_elements(vec![button("submit")]);
-        let runner = AgentRunner::new(
+        let runner = AgentRunner::new_plaintext_unsafe(
             &journal_path,
             AgentRunIds::new("run-skill", "session-skill"),
         )
@@ -3059,7 +3298,7 @@ mod tests {
         };
         let task = DriverTask::new("https://example.com", vec![skill_action]);
         let mut driver = TestDriver::new().with_elements(vec![button("submit")]);
-        let runner = AgentRunner::new(
+        let runner = AgentRunner::new_plaintext_unsafe(
             &journal_path,
             AgentRunIds::new("run-purchase-skill-policy", "session-purchase-skill-policy"),
         )
@@ -3101,7 +3340,7 @@ mod tests {
             }],
         );
         let mut driver = TestDriver::new().with_elements(vec![button("submit")]);
-        let runner = AgentRunner::new(
+        let runner = AgentRunner::new_plaintext_unsafe(
             &journal_path,
             AgentRunIds::new("run-missing-skill-store", "session-missing-skill-store"),
         );
@@ -3132,7 +3371,7 @@ mod tests {
         let ids = AgentRunIds::new("run-resume", "session-resume");
 
         let mut first_driver = TestDriver::new().with_elements(vec![button("submit")]);
-        let first_runner = AgentRunner::new(&journal_path, ids.clone());
+        let first_runner = AgentRunner::new_plaintext_unsafe(&journal_path, ids.clone());
         let first = first_runner
             .run_driver_task(&mut first_driver, &task)
             .await?;
@@ -3140,7 +3379,7 @@ mod tests {
         let entry_count = read_journal_entries(&journal_path)?.len();
 
         let mut second_driver = TestDriver::new().with_elements(vec![button("submit")]);
-        let second_runner = AgentRunner::new(&journal_path, ids);
+        let second_runner = AgentRunner::new_plaintext_unsafe(&journal_path, ids);
         let second = second_runner
             .run_driver_task(&mut second_driver, &task)
             .await?;
@@ -3165,7 +3404,7 @@ mod tests {
             })],
         );
         let mut driver = TestDriver::new().with_elements(vec![button("submit")]);
-        let runner = AgentRunner::new(
+        let runner = AgentRunner::new_plaintext_unsafe(
             &journal_path,
             AgentRunIds::new("run-policy", "session-policy"),
         );
@@ -3200,7 +3439,7 @@ mod tests {
             }],
         );
         let mut driver = TestDriver::new().with_elements(vec![button("submit")]);
-        let runner = AgentRunner::new(
+        let runner = AgentRunner::new_plaintext_unsafe(
             &journal_path,
             AgentRunIds::new("run-origin-deny", "session-origin-deny"),
         )
@@ -3254,7 +3493,7 @@ mod tests {
             }],
         );
         let mut driver = TestDriver::new().with_elements(vec![button("submit")]);
-        let runner = AgentRunner::new(
+        let runner = AgentRunner::new_plaintext_unsafe(
             &journal_path,
             AgentRunIds::new("run-origin-gate", "session-origin-gate"),
         )
@@ -3295,7 +3534,7 @@ mod tests {
         let journal_path = root.join("session.jsonl");
         let task = DriverTask::new("https://example.com", vec![]);
         let mut driver = TestDriver::new().with_elements(vec![button("submit")]);
-        let runner = AgentRunner::new(
+        let runner = AgentRunner::new_plaintext_unsafe(
             &journal_path,
             AgentRunIds::new("run-budget", "session-budget"),
         )
@@ -3314,6 +3553,95 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn runner_budget_exhaustion_preempts_driver_action_execution() -> TestResult {
+        let root = unique_dir("runner-action-budget-preexecute")?;
+        remove_dir_if_exists(&root)?;
+        fs::create_dir_all(&root)?;
+        let journal_path = root.join("session.jsonl");
+        let task = DriverTask::new(
+            "https://example.com",
+            vec![Action::Click {
+                node: NodeId("submit".into()),
+            }],
+        );
+        let mut driver = FailingDriver::new(TransportFailurePoint::PostActionObserve)
+            .with_elements(vec![button("submit")]);
+        let runner = AgentRunner::new_plaintext_unsafe(
+            &journal_path,
+            AgentRunIds::new(
+                "run-action-budget-preexecute",
+                "session-action-budget-preexecute",
+            ),
+        )
+        .with_confirmation_mode(ConfirmationMode::AutoConfirmAll)
+        .with_token_budget(TokenBudget::new(0));
+
+        let error = runner.run_driver_task(&mut driver, &task).await.err();
+
+        assert!(matches!(
+            error,
+            Some(AgentError::TokenBudgetExceeded { max: 0, .. })
+        ));
+        assert_eq!(driver.goto_calls, 1);
+        assert_eq!(driver.act_calls, 0);
+        let entries = read_journal_entries(&journal_path)?;
+        assert!(!entries
+            .iter()
+            .any(|entry| matches!(entry.event, JournalEvent::ActionPlanned { .. })));
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn structured_budget_exhaustion_preempts_mcp_tool_call() -> TestResult {
+        let root = unique_dir("structured-budget-preempts-mcp")?;
+        remove_dir_if_exists(&root)?;
+        fs::create_dir_all(&root)?;
+        let journal_path = root.join("session.jsonl");
+        let origin = "http://127.0.0.1:9";
+        let task = DriverTask::new(
+            format!("{origin}/app"),
+            vec![Action::Skill {
+                name: "search".into(),
+                input: serde_json::json!({"q": "tempo"}),
+            }],
+        );
+        let decision = StructuredFastPathDecision::new(
+            origin,
+            StructuredLane::Mcp,
+            StructuredSignal::McpCatalog,
+            "/mcp/catalog.json",
+        );
+        let runner = AgentRunner::new_plaintext_unsafe(
+            &journal_path,
+            AgentRunIds::new(
+                "run-structured-budget-preexecute",
+                "session-structured-budget-preexecute",
+            ),
+        )
+        .with_confirmation_mode(ConfirmationMode::AutoConfirmAll)
+        .with_token_budget(TokenBudget::new(0));
+
+        let error = runner.run_structured_task(&task, decision).await.err();
+
+        assert!(matches!(
+            error,
+            Some(AgentError::TokenBudgetExceeded { max: 0, .. })
+        ));
+        let entries = read_journal_entries(&journal_path)?;
+        assert!(entries
+            .iter()
+            .any(|entry| matches!(entry.event, JournalEvent::StructuredFastPathSelected { .. })));
+        assert!(!entries
+            .iter()
+            .any(|entry| matches!(entry.event, JournalEvent::ActionPlanned { .. })));
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn live_cdp_runner_completes_scripted_task_and_journals_it() -> TestResult {
         let Some(chrome) = std::env::var("TEMPO_CDP_CHROME").ok() else {
@@ -3321,7 +3649,7 @@ mod tests {
             return Ok(());
         };
 
-        let url = serve_once(
+        let url = serve_times(
             r#"<!doctype html>
             <html>
               <body>
@@ -3332,40 +3660,54 @@ mod tests {
                 </select>
                 <button id="add" onclick="document.body.dataset.count = String(Number(document.body.dataset.count || '0') + 1);">Add</button>
                 <button id="finish" onclick="document.body.dataset.finished='yes'; document.getElementById('summary').textContent = document.getElementById('name').value + ':' + document.getElementById('plan').value + ':' + (document.body.dataset.count || '0');">Finish</button>
-                <div id="summary" tabindex="0"></div>
+                <div id="summary" tabindex="0" aria-label="Summary"></div>
               </body>
             </html>"#,
+            4,
         )?;
         let root = unique_dir("runner-live-cdp")?;
         remove_dir_if_exists(&root)?;
         fs::create_dir_all(&root)?;
         let journal_path = root.join("session.jsonl");
+        let mut driver = CdpTempoDriver::launch_with(
+            CdpConfig::default()
+                .with_executable(chrome)
+                .with_no_sandbox_env_opt_in(),
+        )
+        .await?
+        .allow_private_network_access();
+        let observation = driver.goto(&url).await?;
+        let node_named = |name: &str| -> Result<NodeId, std::io::Error> {
+            observation
+                .elements
+                .iter()
+                .find(|element| element.name.first().map(|span| span.text.as_str()) == Some(name))
+                .map(|element| element.node_id.clone())
+                .ok_or_else(|| std::io::Error::other(format!("missing observed node: {name}")))
+        };
         let task = DriverTask::new(
             url,
             vec![
                 Action::Type {
-                    node: NodeId(r#"[id="name"]"#.into()),
+                    node: node_named("Name")?,
                     text: "Ada".into(),
                 },
                 Action::Select {
-                    node: NodeId(r#"[id="plan"]"#.into()),
+                    node: node_named("Plan")?,
                     value: "pro".into(),
                 },
                 Action::Click {
-                    node: NodeId(r#"[id="add"]"#.into()),
+                    node: node_named("Add")?,
                 },
                 Action::Click {
-                    node: NodeId(r#"[id="finish"]"#.into()),
+                    node: node_named("Finish")?,
                 },
                 Action::Extract {
-                    node: NodeId(r#"[id="summary"]"#.into()),
+                    node: node_named("Summary")?,
                 },
             ],
         );
-        let mut driver = CdpTempoDriver::launch_with(CdpConfig::default().with_executable(chrome))
-            .await?
-            .allow_private_network_access();
-        let runner = AgentRunner::new(
+        let runner = AgentRunner::new_plaintext_unsafe(
             &journal_path,
             AgentRunIds::new("run-live-cdp", "session-live-cdp"),
         );
@@ -3404,7 +3746,7 @@ mod tests {
             5
         );
         let plan = task.task_plan()?;
-        let replayed = step_triples_from_journal(&journal_path, &plan)?;
+        let replayed = step_triples_from_journal_plaintext_unsafe(&journal_path, &plan)?;
         let reported = report
             .steps
             .iter()
@@ -3465,7 +3807,7 @@ mod tests {
             }],
         );
         let mut driver = TestDriver::new().with_elements(vec![button("submit")]);
-        let runner = AgentRunner::new(
+        let runner = AgentRunner::new_plaintext_unsafe(
             &journal_path,
             AgentRunIds::new("run-billion-laughs", "session-billion-laughs"),
         )
@@ -3497,8 +3839,11 @@ mod tests {
         let store = SkillStore::open(&skills_root)?;
         store.put(&click_skill("gated", "1"))?;
         let journal_path = root.join("session.jsonl");
-        let runner = AgentRunner::new(&journal_path, AgentRunIds::new("run-snap", "session-snap"))
-            .with_skill_store(&skills_root);
+        let runner = AgentRunner::new_plaintext_unsafe(
+            &journal_path,
+            AgentRunIds::new("run-snap", "session-snap"),
+        )
+        .with_skill_store(&skills_root);
         let input = serde_json::json!({"target": "submit"});
 
         // A single read yields both the gate side-effect and the compiled batch.
@@ -3694,7 +4039,7 @@ mod tests {
         drop(journal);
 
         let mut driver = TestDriver::new().with_elements(vec![button("submit")]);
-        let runner = AgentRunner::new(
+        let runner = AgentRunner::new_plaintext_unsafe(
             &journal_path,
             AgentRunIds::new("run-resume-interrupted", "session-resume-interrupted"),
         );
@@ -3745,7 +4090,7 @@ mod tests {
         drop(journal);
 
         let mut driver = TestDriver::new().with_elements(vec![button("submit")]);
-        let runner = AgentRunner::new(
+        let runner = AgentRunner::new_plaintext_unsafe(
             &journal_path,
             AgentRunIds::new(
                 "run-resume-interrupted-budget",
@@ -3790,7 +4135,7 @@ mod tests {
         drop(journal);
 
         let mut driver = TestDriver::new();
-        let runner = AgentRunner::new(
+        let runner = AgentRunner::new_plaintext_unsafe(
             &journal_path,
             AgentRunIds::new(
                 "run-resume-interrupted-skill",
@@ -3829,6 +4174,10 @@ mod tests {
                 match listener.accept() {
                     Ok((mut stream, _peer)) => {
                         handled += 1;
+                        // Accepted sockets can inherit the listener's
+                        // nonblocking flag (macOS), flaking reads with
+                        // WouldBlock; force blocking mode explicitly.
+                        stream.set_nonblocking(false)?;
                         stream.set_read_timeout(Some(std::time::Duration::from_secs(1)))?;
                         let request = read_http_request(&mut stream)?;
                         let response = if request.starts_with("GET /mcp/catalog.json ") {
@@ -3938,7 +4287,205 @@ mod tests {
         Ok((origin, handle))
     }
 
-    struct HttpFixtureResponse {
+    /// Serves a single `POST /mcp` request with the supplied JSON body, then
+    /// exits. Used to exercise `post_mcp_json`'s response-body size cap (#212).
+    fn serve_single_mcp_response(body: String) -> std::io::Result<(String, FixtureHandle)> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
+        let origin = format!("http://{}", listener.local_addr()?);
+        let handle = thread::spawn(move || -> std::io::Result<()> {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while std::time::Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _peer)) => {
+                        // Accepted sockets can inherit the listener's
+                        // nonblocking flag (macOS), flaking reads with
+                        // WouldBlock; force blocking mode explicitly.
+                        stream.set_nonblocking(false)?;
+                        stream.set_read_timeout(Some(std::time::Duration::from_secs(1)))?;
+                        let _request = read_http_request(&mut stream)?;
+                        let response =
+                            http_fixture_response("200 OK", "application/json", body.clone());
+                        stream.write_all(response.to_http().as_bytes())?;
+                        stream.flush()?;
+                        return Ok(());
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "single MCP fixture did not receive a request",
+            ))
+        });
+        Ok((origin, handle))
+    }
+
+    /// Serves a single `POST /mcp` request with the supplied JSON body but
+    /// deliberately OMITS `Content-Length`, streaming an HTTP/1.0-style
+    /// close-delimited body (the connection is closed to signal end-of-body).
+    /// This exercises the chunk-accumulation branch of `read_mcp_body_capped`
+    /// rather than the early `Content-Length > cap` rejection (#212 review).
+    fn serve_single_mcp_response_no_content_length(
+        body: String,
+    ) -> std::io::Result<(String, FixtureHandle)> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
+        let origin = format!("http://{}", listener.local_addr()?);
+        let handle = thread::spawn(move || -> std::io::Result<()> {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while std::time::Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _peer)) => {
+                        // Accepted sockets can inherit the listener's
+                        // nonblocking flag (macOS), flaking reads with
+                        // WouldBlock; force blocking mode explicitly.
+                        stream.set_nonblocking(false)?;
+                        stream.set_read_timeout(Some(std::time::Duration::from_secs(1)))?;
+                        let _request = read_http_request(&mut stream)?;
+                        // Status + headers WITHOUT Content-Length; `Connection: close`
+                        // means the client reads the body until EOF.
+                        let head = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n";
+                        stream.write_all(head.as_bytes())?;
+                        stream.write_all(body.as_bytes())?;
+                        stream.flush()?;
+                        // Dropping the stream closes the connection, delimiting the body.
+                        return Ok(());
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "single MCP fixture did not receive a request",
+            ))
+        });
+        Ok((origin, handle))
+    }
+
+    #[tokio::test]
+    async fn post_mcp_json_rejects_body_over_cap() -> TestResult {
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "cap-test",
+            "method": "tools/call",
+        });
+        // Otherwise-valid JSON-RPC response whose body dwarfs the cap.
+        let oversized = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "cap-test",
+            "result": {"content": [{"type": "text", "text": "x".repeat(256 * 1024)}]},
+        })
+        .to_string();
+        assert!(oversized.len() > 64 * 1024);
+
+        let (origin, server) = serve_single_mcp_response(oversized)?;
+        let endpoint = format!("{origin}/mcp");
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|error| error.to_string())?;
+
+        let result = post_mcp_json(&client, &endpoint, &request, None, false, 64 * 1024).await;
+        server
+            .join()
+            .map_err(|_| "single MCP fixture thread panicked")??;
+
+        let Err(error) = result else {
+            return Err("oversized MCP response body must be rejected".into());
+        };
+        assert!(
+            error.contains("exceeded"),
+            "unexpected error message: {error}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn post_mcp_json_accepts_body_under_cap() -> TestResult {
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "cap-test",
+            "method": "tools/call",
+        });
+        let small = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "cap-test",
+            "result": {"content": [{"type": "text", "text": "ok"}]},
+        })
+        .to_string();
+        assert!(small.len() <= 64 * 1024);
+
+        let (origin, server) = serve_single_mcp_response(small)?;
+        let endpoint = format!("{origin}/mcp");
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|error| error.to_string())?;
+
+        let response = post_mcp_json(&client, &endpoint, &request, None, false, 64 * 1024).await?;
+        server
+            .join()
+            .map_err(|_| "single MCP fixture thread panicked")??;
+
+        assert_eq!(
+            response.body.get("id").and_then(|id| id.as_str()),
+            Some("cap-test")
+        );
+        Ok(())
+    }
+
+    /// Regression for #212 review: a response that OMITS `Content-Length` and
+    /// streams an oversized close-delimited body must still be rejected by the
+    /// chunk-accumulation guard in `read_mcp_body_capped`. Because there is no
+    /// advertised length, the early `content_length() > cap` check is skipped,
+    /// so this only passes when the accumulation loop enforces the cap. A naive
+    /// unbounded `.text()` reader would slurp the whole body and fail this test.
+    #[tokio::test]
+    async fn post_mcp_json_rejects_streamed_body_over_cap_without_content_length() -> TestResult {
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "cap-test",
+            "method": "tools/call",
+        });
+        // Otherwise-valid JSON-RPC response whose body dwarfs the cap.
+        let oversized = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "cap-test",
+            "result": {"content": [{"type": "text", "text": "x".repeat(256 * 1024)}]},
+        })
+        .to_string();
+        assert!(oversized.len() > 64 * 1024);
+
+        let (origin, server) = serve_single_mcp_response_no_content_length(oversized)?;
+        let endpoint = format!("{origin}/mcp");
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|error| error.to_string())?;
+
+        let result = post_mcp_json(&client, &endpoint, &request, None, false, 64 * 1024).await;
+        server
+            .join()
+            .map_err(|_| "single MCP fixture thread panicked")??;
+
+        let Err(error) = result else {
+            return Err("oversized streamed MCP response body must be rejected".into());
+        };
+        assert!(
+            error.contains("exceeded"),
+            "unexpected error message: {error}"
+        );
+        Ok(())
+    }
+
+    pub(crate) struct HttpFixtureResponse {
         status: &'static str,
         content_type: &'static str,
         body: String,
@@ -3956,7 +4503,7 @@ mod tests {
             self
         }
 
-        fn to_http(&self) -> String {
+        pub(crate) fn to_http(&self) -> String {
             let mut response = format!(
                 "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n",
                 self.status,
@@ -3975,7 +4522,7 @@ mod tests {
         }
     }
 
-    fn http_fixture_response(
+    pub(crate) fn http_fixture_response(
         status: &'static str,
         content_type: &'static str,
         body: impl Into<String>,
@@ -3988,7 +4535,7 @@ mod tests {
         }
     }
 
-    fn read_http_request(stream: &mut std::net::TcpStream) -> std::io::Result<String> {
+    pub(crate) fn read_http_request(stream: &mut std::net::TcpStream) -> std::io::Result<String> {
         let mut bytes = Vec::new();
         let mut chunk = [0_u8; 1024];
         loop {
@@ -4066,6 +4613,13 @@ mod tests {
         })
     }
 
+    fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+        !needle.is_empty()
+            && haystack
+                .windows(needle.len())
+                .any(|window| window == needle)
+    }
+
     fn fake_mcp_fast_path_probe(
         target: &str,
         _config: HttpProbeConfig,
@@ -4103,6 +4657,7 @@ mod tests {
         failure: TransportFailurePoint,
         goto_calls: usize,
         observe_calls: usize,
+        act_calls: usize,
     }
 
     impl FailingDriver {
@@ -4112,6 +4667,7 @@ mod tests {
                 failure,
                 goto_calls: 0,
                 observe_calls: 0,
+                act_calls: 0,
             }
         }
 
@@ -4151,6 +4707,7 @@ mod tests {
         }
 
         async fn act(&mut self, action: &Action) -> Result<StepOutcome, TransportError> {
+            self.act_calls += 1;
             if self.failure == TransportFailurePoint::Act {
                 return Err(TransportError::Other("act failed".into()));
             }
@@ -4158,6 +4715,7 @@ mod tests {
         }
 
         async fn act_batch(&mut self, batch: &ActionBatch) -> Result<StepOutcome, TransportError> {
+            self.act_calls += batch.actions.len();
             if self.failure == TransportFailurePoint::Act {
                 return Err(TransportError::Other("act failed".into()));
             }
@@ -4211,7 +4769,7 @@ mod tests {
         }
     }
 
-    fn button(id: &str) -> InteractiveElement {
+    pub(crate) fn button(id: &str) -> InteractiveElement {
         InteractiveElement {
             node_id: NodeId(id.into()),
             role: "button".into(),
@@ -4254,7 +4812,7 @@ mod tests {
         }
     }
 
-    fn unique_dir(label: &str) -> Result<PathBuf, std::time::SystemTimeError> {
+    pub(crate) fn unique_dir(label: &str) -> Result<PathBuf, std::time::SystemTimeError> {
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         let mut path = std::env::temp_dir();
         path.push(format!(
@@ -4264,7 +4822,7 @@ mod tests {
         Ok(path)
     }
 
-    fn remove_dir_if_exists(path: &Path) -> Result<(), std::io::Error> {
+    pub(crate) fn remove_dir_if_exists(path: &Path) -> Result<(), std::io::Error> {
         match fs::remove_dir_all(path) {
             Ok(()) => Ok(()),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -4272,11 +4830,14 @@ mod tests {
         }
     }
 
-    fn serve_once(body: &'static str) -> Result<String, std::io::Error> {
+    fn serve_times(body: &'static str, max_requests: usize) -> Result<String, std::io::Error> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let addr = listener.local_addr()?;
         thread::spawn(move || {
-            if let Ok((mut stream, _)) = listener.accept() {
+            for _ in 0..max_requests {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
                 let mut buffer = [0u8; 1024];
                 let _ = stream.read(&mut buffer);
                 let response = format!(

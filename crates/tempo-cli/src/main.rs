@@ -23,14 +23,17 @@ use tempo_compat::{
 use tempo_driver::{DriverTrait, TransportError};
 use tempo_engine_cdp::{CdpConfig, CdpTempoDriver};
 use tempo_evals::{
-    eval_record_from_session_journal, read_eval_records, write_scorecard, EvalBudget, EvalError,
-    Lane, Scorecard, SessionEvalDescriptor,
+    eval_record_from_session_journal_with_retention_policy, read_eval_records, write_scorecard,
+    EvalBudget, EvalError, Lane, Scorecard, SessionEvalDescriptor,
 };
 use tempo_observe::{
     observation_corpus_report, CompileOptions, ObservationCorpusReport, ObservationInput,
 };
 use tempo_schema::Action;
-use tempo_session::{read_journal_entries, JournalEntry, JournalError, JournalEvent};
+use tempo_session::{
+    durable_retention_policy_from_env, read_journal_entries_with_retention_policy,
+    DurableRetentionPolicy, JournalEntry, JournalError, JournalEvent,
+};
 use tempo_taint::{run_taint_gate, TaintRedTeamCase};
 use thiserror::Error;
 
@@ -77,6 +80,19 @@ where
     S: Into<String>,
 {
     Command::parse(args)?.execute(stdout)
+}
+
+#[cfg(test)]
+fn run_with_writer_with_retention_policy<I, S>(
+    args: I,
+    stdout: &mut dyn Write,
+    retention_policy: DurableRetentionPolicy,
+) -> Result<(), CliError>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    Command::parse(args)?.execute_with_retention_policy(stdout, Some(retention_policy))
 }
 
 #[derive(Debug, PartialEq)]
@@ -160,6 +176,14 @@ impl Command {
     }
 
     fn execute(self, stdout: &mut dyn Write) -> Result<(), CliError> {
+        self.execute_with_retention_policy(stdout, None)
+    }
+
+    fn execute_with_retention_policy(
+        self,
+        stdout: &mut dyn Write,
+        retention_policy: Option<DurableRetentionPolicy>,
+    ) -> Result<(), CliError> {
         match self {
             Self::Help => {
                 stdout.write_all(USAGE.as_bytes())?;
@@ -193,7 +217,12 @@ impl Command {
                 descriptor,
                 output,
             } => {
-                let record = eval_record_from_session_journal(journal, descriptor)?;
+                let retention_policy = retention_policy_from_cli_or_env(retention_policy)?;
+                let record = eval_record_from_session_journal_with_retention_policy(
+                    journal,
+                    descriptor,
+                    &retention_policy,
+                )?;
                 write_json(&output, &record, stdout)
             }
             Self::CompatLanes {
@@ -258,7 +287,9 @@ impl Command {
                 }
             }
             Self::Replay { journal, output } => {
-                let entries = read_journal_entries(&journal)?;
+                let retention_policy = retention_policy_from_cli_or_env(retention_policy)?;
+                let entries =
+                    read_journal_entries_with_retention_policy(&journal, &retention_policy)?;
                 let summary = ReplaySummary::from_entries(&journal, &entries)?;
                 write_json(&output, &summary, stdout)
             }
@@ -283,10 +314,21 @@ impl Command {
                     chrome,
                     allow_private_network,
                     confirmation_mode,
+                    structured_fast_path: StructuredFastPath::live(),
+                    retention_policy,
                 })?;
                 write_json(&output, &report, stdout)
             }
         }
+    }
+}
+
+fn retention_policy_from_cli_or_env(
+    retention_policy: Option<DurableRetentionPolicy>,
+) -> Result<DurableRetentionPolicy, JournalError> {
+    match retention_policy {
+        Some(retention_policy) => Ok(retention_policy),
+        None => durable_retention_policy_from_env(),
     }
 }
 
@@ -712,6 +754,7 @@ struct ReplaySummary {
     session_closed: bool,
     structured_fast_path_selected: usize,
     observations: usize,
+    model_decisions: usize,
     planned_actions: usize,
     applied_steps: usize,
     step_errors: usize,
@@ -733,6 +776,7 @@ impl ReplaySummary {
             session_closed: false,
             structured_fast_path_selected: 0,
             observations: 0,
+            model_decisions: 0,
             planned_actions: 0,
             applied_steps: 0,
             step_errors: 0,
@@ -749,6 +793,7 @@ impl ReplaySummary {
                     summary.structured_fast_path_selected += 1;
                 }
                 JournalEvent::Observation { .. } => summary.observations += 1,
+                JournalEvent::ModelDecision { .. } => summary.model_decisions += 1,
                 JournalEvent::ActionPlanned { .. } => summary.planned_actions += 1,
                 JournalEvent::StepApplied { .. } => summary.applied_steps += 1,
                 JournalEvent::StepError { .. } => summary.step_errors += 1,
@@ -828,6 +873,7 @@ fn replay_steps_from_entries(entries: &[JournalEntry]) -> Result<Vec<ReplayStep>
             JournalEvent::SessionStarted { .. }
             | JournalEvent::StructuredFastPathSelected { .. }
             | JournalEvent::Observation { .. }
+            | JournalEvent::ModelDecision { .. }
             | JournalEvent::TransportError { .. }
             | JournalEvent::CassetteRecorded { .. }
             | JournalEvent::SessionClosed => {}
@@ -850,6 +896,8 @@ struct RunCdpTaskConfig {
     chrome: Option<String>,
     allow_private_network: bool,
     confirmation_mode: ConfirmationMode,
+    structured_fast_path: StructuredFastPath,
+    retention_policy: Option<DurableRetentionPolicy>,
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize)]
@@ -931,7 +979,7 @@ impl From<&tempo_agent::AgentStepReport> for RunCdpTaskStep {
 }
 
 fn run_cdp_task(config: RunCdpTaskConfig) -> Result<RunCdpTaskReport, CliError> {
-    let mut structured_fast_path = StructuredFastPath::live();
+    let mut structured_fast_path = config.structured_fast_path;
     if config.allow_private_network {
         structured_fast_path = structured_fast_path.allow_private_network_access();
     }
@@ -950,15 +998,17 @@ fn run_cdp_task(config: RunCdpTaskConfig) -> Result<RunCdpTaskReport, CliError> 
         )
         .with_confirmation_mode(config.confirmation_mode)
         .with_structured_fast_path(structured_fast_path);
+        let runner = with_retention_policy(runner, config.retention_policy.clone());
         let report = runtime.block_on(runner.run_structured_task(&task, decision))?;
         return Ok(RunCdpTaskReport::from_agent_report(report));
     }
 
     runtime.block_on(async move {
-        let mut cdp_config = CdpConfig::default();
+        let mut cdp_config = CdpConfig::default().with_no_sandbox_env_opt_in();
         if let Some(chrome) = config.chrome {
             cdp_config = cdp_config.with_executable(chrome);
         }
+        cdp_config = cdp_config.with_no_sandbox_env_opt_in();
         let mut driver = CdpTempoDriver::launch_with(cdp_config).await?;
         if config.allow_private_network {
             driver = driver.allow_private_network_access();
@@ -970,6 +1020,7 @@ fn run_cdp_task(config: RunCdpTaskConfig) -> Result<RunCdpTaskReport, CliError> 
         )
         .with_confirmation_mode(config.confirmation_mode)
         .with_structured_fast_path(StructuredFastPath::disabled());
+        let runner = with_retention_policy(runner, config.retention_policy);
 
         let run_result = runner.run_driver_task(&mut driver, &task).await;
         let close_result = driver.close().await;
@@ -977,6 +1028,16 @@ fn run_cdp_task(config: RunCdpTaskConfig) -> Result<RunCdpTaskReport, CliError> 
         close_result?;
         Ok(RunCdpTaskReport::from_agent_report(report))
     })
+}
+
+fn with_retention_policy(
+    runner: AgentRunner,
+    retention_policy: Option<DurableRetentionPolicy>,
+) -> AgentRunner {
+    match retention_policy {
+        Some(retention_policy) => runner.with_retention_policy(retention_policy),
+        None => runner,
+    }
 }
 
 fn run_status(status: &AgentRunStatus) -> RunCdpTaskStatus {
@@ -1167,10 +1228,8 @@ mod tests {
     use serde_json::Value;
     use std::error::Error;
     use std::fs;
-    use std::io::{self, Read, Write};
-    use std::net::TcpListener;
-    use std::thread;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::io;
+    use std::time::{SystemTime, UNIX_EPOCH};
     use tempo_agent::{StructuredFastPathDecision, StructuredLane, StructuredSignal};
     use tempo_compat::{CompatScorecard, EngineProbe, OriginScore};
     use tempo_observe::RawElement;
@@ -1178,7 +1237,7 @@ mod tests {
         Action, CompiledObservation, InteractiveElement, NodeId, ObservationDiff, Provenance,
         SideEffect, TaintSpan, SCHEMA_VERSION,
     };
-    use tempo_session::{RunId, SessionId, SessionJournal};
+    use tempo_session::{DurableEncryptionKey, RunId, SessionId, SessionJournal};
 
     type TestResult = Result<(), Box<dyn Error>>;
 
@@ -1559,7 +1618,7 @@ mod tests {
         write_journal(&journal)?;
         let mut stdout = Vec::new();
 
-        run_with_writer(
+        run_with_writer_with_retention_policy(
             [
                 "session-eval".to_string(),
                 "--journal".into(),
@@ -1580,6 +1639,7 @@ mod tests {
                 input_string(&output),
             ],
             &mut stdout,
+            DurableRetentionPolicy::PlaintextUnsafe,
         )?;
 
         let record: tempo_evals::EvalRecord = serde_json::from_reader(File::open(&output)?)?;
@@ -1591,19 +1651,60 @@ mod tests {
     }
 
     #[test]
+    fn session_eval_command_reads_encrypted_journal() -> TestResult {
+        let dir = unique_dir("session-eval-encrypted")?;
+        let journal = dir.join("session.jsonl");
+        let output = dir.join("record.json");
+        let policy = encrypted_test_policy(32);
+        write_journal_with_retention_policy(&journal, policy.clone())?;
+        let mut stdout = Vec::new();
+
+        run_with_writer_with_retention_policy(
+            [
+                "session-eval".to_string(),
+                "--journal".into(),
+                input_string(&journal),
+                "--suite".into(),
+                "journal".into(),
+                "--case-id".into(),
+                "case-a".into(),
+                "--origin".into(),
+                "https://session.test".into(),
+                "--lane".into(),
+                "servo".into(),
+                "--success".into(),
+                "true".into(),
+                "--fallback-used".into(),
+                "false".into(),
+                "--output".into(),
+                input_string(&output),
+            ],
+            &mut stdout,
+            policy,
+        )?;
+
+        let record: tempo_evals::EvalRecord = serde_json::from_reader(File::open(&output)?)?;
+        assert_eq!(record.suite, "journal");
+        assert_eq!(record.step_count, 1);
+        remove_dir(&dir)?;
+        Ok(())
+    }
+
+    #[test]
     fn replay_command_summarizes_journal_events() -> TestResult {
         let dir = unique_dir("replay")?;
         let journal = dir.join("session.jsonl");
         write_journal(&journal)?;
         let mut stdout = Vec::new();
 
-        run_with_writer(
+        run_with_writer_with_retention_policy(
             [
                 "replay".to_string(),
                 "--journal".into(),
                 input_string(&journal),
             ],
             &mut stdout,
+            DurableRetentionPolicy::PlaintextUnsafe,
         )?;
 
         let value: Value = serde_json::from_slice(&stdout)?;
@@ -1627,6 +1728,32 @@ mod tests {
     }
 
     #[test]
+    fn replay_command_reads_encrypted_journal() -> TestResult {
+        let dir = unique_dir("replay-encrypted")?;
+        let journal = dir.join("session.jsonl");
+        let policy = encrypted_test_policy(33);
+        write_journal_with_retention_policy(&journal, policy.clone())?;
+        let mut stdout = Vec::new();
+
+        run_with_writer_with_retention_policy(
+            [
+                "replay".to_string(),
+                "--journal".into(),
+                input_string(&journal),
+            ],
+            &mut stdout,
+            policy,
+        )?;
+
+        let value: Value = serde_json::from_slice(&stdout)?;
+        assert_eq!(value["entries"], 5);
+        assert_eq!(value["session_started"], true);
+        assert_eq!(value["applied_steps"], 1);
+        remove_dir(&dir)?;
+        Ok(())
+    }
+
+    #[test]
     fn replay_command_reports_pending_planned_step() -> TestResult {
         let dir = unique_dir("replay-pending")?;
         let journal = dir.join("session.jsonl");
@@ -1641,13 +1768,14 @@ mod tests {
         drop(session);
         let mut stdout = Vec::new();
 
-        run_with_writer(
+        run_with_writer_with_retention_policy(
             [
                 "replay".to_string(),
                 "--journal".into(),
                 input_string(&journal),
             ],
             &mut stdout,
+            DurableRetentionPolicy::PlaintextUnsafe,
         )?;
 
         let value: Value = serde_json::from_slice(&stdout)?;
@@ -1744,7 +1872,10 @@ mod tests {
         let dir = unique_dir("run-cdp-structured-private")?;
         remove_dir(&dir)?;
         fs::create_dir_all(&dir)?;
-        let (origin, server) = serve_mcp_catalog_probe_fixture()?;
+        let origin = "http://127.0.0.1:7421";
+        let retention_policy = DurableRetentionPolicy::encrypted(
+            tempo_session::DurableEncryptionKey::from_bytes([23; 32]),
+        );
 
         let report = run_cdp_task(RunCdpTaskConfig {
             start_url: format!("{origin}/app"),
@@ -1755,10 +1886,9 @@ mod tests {
             chrome: Some("/definitely/not/a/chrome/binary".into()),
             allow_private_network: true,
             confirmation_mode: ConfirmationMode::DenyHumanRequired,
+            structured_fast_path: StructuredFastPath::with_probe(fake_mcp_fast_path_probe),
+            retention_policy: Some(retention_policy.clone()),
         })?;
-        server
-            .join()
-            .map_err(|_| "structured probe fixture thread panicked")??;
 
         assert_eq!(report.engine, "structured");
         assert_eq!(report.status.state, "structured_fast_path");
@@ -1766,7 +1896,10 @@ mod tests {
         assert_eq!(report.status.signal, Some("mcp_catalog"));
         assert_eq!(report.observations, 0);
         assert!(report.steps.is_empty());
-        let entries = tempo_session::read_journal_entries(dir.join("session.jsonl"))?;
+        let entries = tempo_session::read_journal_entries_with_retention_policy(
+            dir.join("session.jsonl"),
+            &retention_policy,
+        )?;
         assert!(entries
             .iter()
             .any(|entry| matches!(entry.event, JournalEvent::StructuredFastPathSelected { .. })));
@@ -1777,6 +1910,19 @@ mod tests {
 
         remove_dir(&dir)?;
         Ok(())
+    }
+
+    fn fake_mcp_fast_path_probe(
+        target: &str,
+        _config: tempo_agent::HttpProbeConfig,
+    ) -> Option<StructuredFastPathDecision> {
+        let origin = target.strip_suffix("/app").unwrap_or(target);
+        Some(StructuredFastPathDecision::new(
+            origin,
+            StructuredLane::Mcp,
+            StructuredSignal::McpCatalog,
+            "/mcp/catalog.json",
+        ))
     }
 
     #[test]
@@ -1812,50 +1958,6 @@ mod tests {
             other => return Err(unexpected_result(other)),
         }
         Ok(())
-    }
-
-    fn serve_mcp_catalog_probe_fixture() -> io::Result<(String, thread::JoinHandle<io::Result<()>>)>
-    {
-        let listener = TcpListener::bind("127.0.0.1:0")?;
-        listener.set_nonblocking(true)?;
-        let origin = format!("http://{}", listener.local_addr()?);
-        let handle = thread::spawn(move || -> io::Result<()> {
-            let deadline = std::time::Instant::now() + Duration::from_secs(3);
-            let mut handled = 0_usize;
-            while handled < 5 && std::time::Instant::now() < deadline {
-                match listener.accept() {
-                    Ok((mut stream, _peer)) => {
-                        handled += 1;
-                        stream.set_read_timeout(Some(Duration::from_secs(1)))?;
-                        let mut buffer = [0_u8; 1024];
-                        let read = stream.read(&mut buffer)?;
-                        let request = String::from_utf8_lossy(&buffer[..read]);
-                        let (status, content_type, body) =
-                            if request.starts_with("GET /mcp/catalog.json ") {
-                                (
-                                    "200 OK",
-                                    "application/json",
-                                    r#"{"tools":[{"name":"search"}]}"#,
-                                )
-                            } else {
-                                ("404 Not Found", "text/plain", "not found")
-                            };
-                        let response = format!(
-                            "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                            body.len()
-                        );
-                        stream.write_all(response.as_bytes())?;
-                        stream.flush()?;
-                    }
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(10));
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
-            Ok(())
-        });
-        Ok((origin, handle))
     }
 
     struct EvalRecordBuilder {
@@ -1920,8 +2022,19 @@ mod tests {
     }
 
     fn write_journal(path: &Path) -> TestResult {
-        let mut journal =
-            SessionJournal::open(path, RunId("run-a".into()), SessionId("session-a".into()))?;
+        write_journal_with_retention_policy(path, DurableRetentionPolicy::PlaintextUnsafe)
+    }
+
+    fn write_journal_with_retention_policy(
+        path: &Path,
+        retention_policy: DurableRetentionPolicy,
+    ) -> TestResult {
+        let mut journal = SessionJournal::open_with_retention_policy(
+            path,
+            RunId("run-a".into()),
+            SessionId("session-a".into()),
+            retention_policy,
+        )?;
         let action = Action::Scroll { x: 0.0, y: 10.0 };
         journal.append(JournalEvent::SessionStarted {
             url: "https://session.test".into(),
@@ -1944,6 +2057,10 @@ mod tests {
         })?;
         journal.append(JournalEvent::SessionClosed)?;
         Ok(())
+    }
+
+    fn encrypted_test_policy(seed: u8) -> DurableRetentionPolicy {
+        DurableRetentionPolicy::encrypted(DurableEncryptionKey::from_bytes([seed; 32]))
     }
 
     fn observation(seq: u64) -> CompiledObservation {

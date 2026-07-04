@@ -72,6 +72,20 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libfontconfig1-dev llvm
       - name: servo vanilla build gate
         run: cargo check -p tempo-engine-servo --no-default-features --features servo-vanilla
+      - name: servo tempo fork build gate
+        run: bash scripts/cargo-servo-tempo.sh
+
+  bench-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.96.1
+      - name: criterion benches compile and run once (test mode)
+        run: >
+          cargo bench
+          -p tempo-observe -p tempo-engine-host -p tempo-act
+          -p tempo-policy -p tempo-session
+          -- --test
 
   live-cdp:
     runs-on: ubuntu-latest
@@ -88,6 +102,7 @@ jobs:
         shell: bash
         env:
           TEMPO_CDP_CHROME: ${{ steps.setup-chrome.outputs.chrome-path }}
+          TEMPO_CDP_NO_SANDBOX: "1"
         run: |
           set -euo pipefail
           test -n "$TEMPO_CDP_CHROME"
