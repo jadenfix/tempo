@@ -771,7 +771,7 @@ impl CdpTempoDriver {
     }
 
     /// One O(1) stability sample: a single `Runtime.evaluate` in a CDP
-    /// isolated world that installs a page-wide MutationObserver once and
+    /// isolated world that installs or reuses a page-wide MutationObserver and
     /// returns `readyState|mutationGen`.
     ///
     /// The previous sampler pulled the full serialized DOM over CDP and hashed
@@ -932,15 +932,20 @@ fn parse_stability_probe(probe: &str) -> Option<PageStabilitySample> {
 const QUIESCENCE_POLL_INTERVALS_MS: [u64; 2] = [25, 50];
 const QUIESCENCE_POLL_INTERVAL_CAP_MS: u64 = 50;
 
-/// In-page probe: installs a document-wide MutationObserver once per window
-/// and reports `readyState|generation` (`generation = -1` when the observer
-/// cannot run, signalling the caller to use the DOM-hash fallback).
+/// In-page probe: installs a document-wide MutationObserver, rebinds it if the
+/// document root is replaced, and reports `readyState|generation`
+/// (`generation = -1` when the observer cannot run, signalling the caller to
+/// use the DOM-hash fallback).
 const STABILITY_PROBE_SCRIPT: &str = r#"(() => {
   const w = window;
-  if (w.__tempoMutObs === undefined) {
-    w.__tempoMutGen = 0;
+  const target = document.documentElement || document;
+  if (w.__tempoMutObs === undefined || w.__tempoMutTarget !== target) {
+    if (w.__tempoMutObs && typeof w.__tempoMutObs.disconnect === 'function') {
+      try { w.__tempoMutObs.disconnect(); } catch (e) {}
+    }
+    w.__tempoMutTarget = target;
+    w.__tempoMutGen = typeof w.__tempoMutGen === 'number' ? w.__tempoMutGen + 1 : 0;
     try {
-      const target = document.documentElement || document;
       const obs = new MutationObserver(() => { w.__tempoMutGen += 1; });
       obs.observe(target, { subtree: true, childList: true, attributes: true, characterData: true });
       w.__tempoMutObs = obs;
@@ -2744,6 +2749,14 @@ mod tests {
         assert_eq!(parse_stability_probe("complete|abc"), None);
         assert_eq!(parse_stability_probe(""), None);
         assert_eq!(parse_stability_probe("|"), None);
+    }
+
+    #[test]
+    fn stability_probe_rebinds_when_document_root_changes() {
+        assert!(STABILITY_PROBE_SCRIPT.contains("__tempoMutTarget !== target"));
+        assert!(STABILITY_PROBE_SCRIPT.contains("__tempoMutObs.disconnect()"));
+        assert!(STABILITY_PROBE_SCRIPT
+            .contains("typeof w.__tempoMutGen === 'number' ? w.__tempoMutGen + 1 : 0"));
     }
 
     #[test]
