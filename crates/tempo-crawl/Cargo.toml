@@ -1,17 +1,12 @@
 [package]
-name = "tempo-net"
+name = "tempo-crawl"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-base64 = "0.22"
-ed25519-dalek = "2"
-httpdate = "1"
-sha2.workspace = true
-tempo-schema = { path = "../tempo-schema" }
-url = "2"
+tempo-net = { path = "../tempo-net" }
 
 [lints]
 workspace = true

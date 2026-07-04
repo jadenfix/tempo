@@ -12,6 +12,7 @@ bench = false
 png = "0.17"
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tempo-schema = { path = "../tempo-schema" }
 
 [dev-dependencies]

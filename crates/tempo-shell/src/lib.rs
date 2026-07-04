@@ -359,7 +359,11 @@ impl ShellClient {
         request.push_str("connection: close\r\n\r\n");
         stream.write_all(request.as_bytes())?;
         stream.write_all(body)?;
-        stream.shutdown(std::net::Shutdown::Write)?;
+        match stream.shutdown(std::net::Shutdown::Write) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotConnected => {}
+            Err(err) => return Err(err.into()),
+        }
 
         read_http_response(&mut stream, max_response_bytes)
     }
@@ -1065,10 +1069,10 @@ mod tests {
             Err(err) => err,
         };
 
-        assert!(matches!(
-            err,
-            ShellError::ResponseTooLarge { max_bytes: 64 }
-        ));
+        assert!(
+            matches!(err, ShellError::ResponseTooLarge { max_bytes: 64 }),
+            "{err:?}"
+        );
         match handle.join() {
             Ok(result) => result?,
             Err(_) => return Err("server thread failed".into()),
