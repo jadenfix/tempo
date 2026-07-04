@@ -10,11 +10,16 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use tempo_schema::{CompiledObservation, InteractiveElement, StepStatus, StepTriple};
+use tempo_observe::{ObservationInput, StableIdMapper};
+use tempo_schema::{
+    Action, CompiledObservation, InteractiveElement, NodeId, QuiescencePolicy, SideEffect,
+    StepStatus, StepTriple,
+};
 use tempo_session::{
     read_journal_entries_with_retention_policy, DurableRetentionPolicy, JournalEntry, JournalError,
     JournalEvent,
 };
+use tempo_skills::{ActionTemplate, SkillDefinition, SkillInput, TemplateString};
 use thiserror::Error;
 
 /// Runtime lane used for an eval case.
@@ -798,6 +803,21 @@ pub enum EvalError {
         #[source]
         source: serde_json::Error,
     },
+    #[error(
+        "skill drift case {case:?} names target_index {index} but the pre-drift page only has \
+         {len} element(s)"
+    )]
+    DriftTargetIndexOutOfBounds {
+        case: String,
+        index: usize,
+        len: usize,
+    },
+    #[error("skill drift case {case:?} failed to compile its recorded skill: {source}")]
+    DriftSkillCompile {
+        case: String,
+        #[source]
+        source: tempo_skills::SkillError,
+    },
 }
 
 /// Minimal task description consumed by a [`Judge`]: the natural-language goal
@@ -1334,6 +1354,191 @@ pub fn read_oracle_fixture(path: impl AsRef<Path>) -> Result<Vec<ElementId>, Eva
         .into_iter()
         .map(|element| ElementId::new(element.role, element.name))
         .collect())
+}
+
+// ---------------------------------------------------------------------------
+// Synthetic skill-replay-after-drift metric (#362).
+//
+// HONESTY (see `fixtures/evals/skill_drift/README.md` for the long version):
+// this is an explicit SYNTHETIC PROXY for the real claim — that a recorded
+// skill/cassette still resolves after a *genuine*, live, time-separated
+// re-crawl of a real site. The `pre`/`post` fixture pages below are
+// hand-authored to simulate one kind of DOM/selector drift each; they are NOT
+// two captures of the same real site taken at different times. That real
+// measurement needs live web access and is deferred to #363. Nothing computed
+// here should be read as evidence about real-world drift resilience.
+//
+// What is real: the replay primitive. `tempo_skills::SkillDefinition::compile`
+// is tempo's actual (only) skill-expansion path today, and it is pure
+// template substitution — a stored step's target is a literal (or
+// once-bound-parameter) `NodeId` string baked in at authoring time; `compile`
+// does not itself look anything up against a live page. The thing that can
+// survive or fail to survive drift is that baked-in `NodeId`, which
+// `tempo_observe::StableIdMapper` derives from a *fingerprint* of the
+// element's stable DOM hint (if the engine supplied one) or else its
+// role+name+value — deliberately independent of DOM position/order. So:
+//
+// - A pure position/order/bounds move (the "moved" case) does not change the
+//   fingerprint -> the skill's recorded `NodeId` re-binds -> it survives.
+// - A renamed element (its accessible name/text changes) DOES change the
+//   fingerprint -> a "new" NodeId is allocated -> the recorded target is not
+//   found -> replay fails. Caveat: this is indistinguishable, under this
+//   scheme, from the element having been removed and a same-shaped one added
+//   in its place; tempo's replay cannot tell "renamed" apart from
+//   "replaced". A live, continuously-tracked session could still resolve a
+//   rename via its engine-native `source_id` (`StableIdMapper::by_source`),
+//   but that requires session continuity that a genuine time-separated
+//   re-crawl (#363's real subject) would not have either, so this metric
+//   intentionally uses a *fresh* `StableIdMapper` per fixture page rather than
+//   carrying one across `pre`/`post`.
+// - A genuinely removed element (the "removed" case) is simply absent from
+//   the post-drift fingerprint set -> replay fails.
+// ---------------------------------------------------------------------------
+
+/// One synthetic replay-after-drift case: a recorded skill's click target,
+/// resolved once against a hand-authored "pre-drift" fixture page, replayed
+/// against a hand-authored "post-drift" fixture page that simulates one kind
+/// of DOM/selector change. See the module-level note above — this is a
+/// synthetic proxy (#362), not a live re-crawl (deferred to #363).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SkillDriftCase {
+    /// Case label, e.g. `"moved-position"`.
+    pub name: String,
+    /// Free-text note on which kind of drift this simulates, for humans
+    /// reading a report; not consumed by the metric computation itself (the
+    /// actual survive/fail outcome is derived from fingerprint recomputation,
+    /// not asserted by this label).
+    pub drift_kind: String,
+    pub pre: ObservationInput,
+    pub post: ObservationInput,
+    /// Index into `pre.elements` naming the element the recorded skill's one
+    /// `Click` step targets.
+    pub target_index: usize,
+}
+
+/// Outcome of replaying one [`SkillDriftCase`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SkillDriftResult {
+    pub name: String,
+    pub drift_kind: String,
+    /// The `NodeId` a skill recorded against `pre` would have baked in for
+    /// its target, per `tempo_skills::SkillDefinition::compile`.
+    pub recorded_node_id: NodeId,
+    /// Whether that same `NodeId` is present among the stable ids
+    /// `tempo_observe::StableIdMapper` assigns to `post`, computed with a
+    /// fresh mapper (see the module-level honesty note on session
+    /// continuity).
+    pub replay_success_after_drift: bool,
+}
+
+/// Aggregate report over a corpus of [`SkillDriftCase`]s.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SkillDriftCorpusReport {
+    pub cases: Vec<SkillDriftResult>,
+    /// Fraction of `cases` with `replay_success_after_drift == true`.
+    /// Vacuously `1.0` for an empty corpus (nothing failed to replay because
+    /// nothing was replayed); this does not arise for the committed fixture
+    /// corpus, which is never empty.
+    pub replay_success_rate_after_drift: f64,
+}
+
+/// Compile a minimal one-step "click the recorded target" skill the way a
+/// real recorded skill would carry a target baked in at authoring time, and
+/// return the concrete `NodeId` its single compiled `Click` action carries.
+/// This is `tempo_skills::SkillDefinition::compile` — the actual expansion
+/// primitive tempo ships today — not a new replay engine.
+fn compile_recorded_click_target(node_id: &NodeId) -> Result<NodeId, tempo_skills::SkillError> {
+    let skill = SkillDefinition {
+        name: "skill-drift-probe".into(),
+        version: "1".into(),
+        description: "click the one recorded target node".into(),
+        side_effect: SideEffect::Write,
+        inputs: vec![SkillInput::required("target")],
+        quiescence: QuiescencePolicy::FixedMillis(0),
+        steps: vec![ActionTemplate::Click {
+            node: TemplateString::param("target"),
+        }],
+    };
+    let batch = skill.compile(&serde_json::json!({ "target": node_id.0 }))?;
+    match batch.actions.into_iter().next() {
+        Some(Action::Click { node }) => Ok(node),
+        // `compile` is pure template substitution over a fixed one-step
+        // definition constructed just above: it always yields exactly the
+        // one `Click` action templated in, never anything else.
+        other => unreachable!(
+            "single-step click skill compiled to an unexpected action batch: {other:?}"
+        ),
+    }
+}
+
+/// Replay one [`SkillDriftCase`]: recompute the target's `NodeId` against
+/// `pre` (fresh `StableIdMapper`), run it through the real skill-compile
+/// primitive, then recompute stable ids for `post` (another fresh mapper) and
+/// check whether the recorded `NodeId` is still present.
+pub fn replay_skill_after_drift(case: &SkillDriftCase) -> Result<SkillDriftResult, EvalError> {
+    let pre_ids = StableIdMapper::new().map_snapshot(1, &case.pre.elements);
+    let target_raw_id =
+        pre_ids
+            .get(case.target_index)
+            .ok_or_else(|| EvalError::DriftTargetIndexOutOfBounds {
+                case: case.name.clone(),
+                index: case.target_index,
+                len: pre_ids.len(),
+            })?;
+
+    let recorded_node_id = compile_recorded_click_target(target_raw_id).map_err(|source| {
+        EvalError::DriftSkillCompile {
+            case: case.name.clone(),
+            source,
+        }
+    })?;
+
+    // Fresh mapper: honestly models an independent, later observation (a real
+    // time-separated re-crawl, #363's actual subject, would not share
+    // in-memory mapper state with the original session either).
+    let post_ids: BTreeSet<NodeId> = StableIdMapper::new()
+        .map_snapshot(1, &case.post.elements)
+        .into_iter()
+        .collect();
+
+    Ok(SkillDriftResult {
+        name: case.name.clone(),
+        drift_kind: case.drift_kind.clone(),
+        replay_success_after_drift: post_ids.contains(&recorded_node_id),
+        recorded_node_id,
+    })
+}
+
+/// Replay a whole corpus of [`SkillDriftCase`]s and aggregate the
+/// replay-success-after-drift rate.
+pub fn skill_drift_corpus_report(
+    cases: &[SkillDriftCase],
+) -> Result<SkillDriftCorpusReport, EvalError> {
+    let results = cases
+        .iter()
+        .map(replay_skill_after_drift)
+        .collect::<Result<Vec<_>, _>>()?;
+    let survivors = results
+        .iter()
+        .filter(|result| result.replay_success_after_drift)
+        .count();
+    let rate = if results.is_empty() {
+        1.0
+    } else {
+        survivors as f64 / results.len() as f64
+    };
+    Ok(SkillDriftCorpusReport {
+        cases: results,
+        replay_success_rate_after_drift: rate,
+    })
+}
+
+/// Load a hand-authored skill-drift fixture page (see
+/// `fixtures/evals/skill_drift/README.md`): a `tempo_observe::ObservationInput`
+/// JSON file, structurally identical to the raw-element fixtures already used
+/// by `tempo-observe`'s own corpus tests.
+pub fn read_drift_page_fixture(path: impl AsRef<Path>) -> Result<ObservationInput, EvalError> {
+    read_json_fixture(path)
 }
 
 #[cfg(test)]
@@ -2463,5 +2668,148 @@ Some non-interactive caption
                 ElementId::new("button", "Pay now"),
             ]
         );
+    }
+
+    // -- Synthetic skill-replay-after-drift metric (#362) --
+    //
+    // SYNTHETIC PROXY: these fixtures are hand-authored to simulate drift, not
+    // captured from a real time-separated re-crawl. See the module-level note
+    // above `SkillDriftCase` and `fixtures/evals/skill_drift/README.md`. Real
+    // live drift is deferred to #363.
+
+    fn skill_drift_fixture(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/evals/skill_drift")
+            .join(name)
+    }
+
+    fn drift_case(
+        stem: &str,
+        drift_kind: &str,
+        target_index: usize,
+    ) -> Result<SkillDriftCase, EvalError> {
+        let pre = read_drift_page_fixture(skill_drift_fixture(&format!("{stem}-pre.json")))?;
+        let post = read_drift_page_fixture(skill_drift_fixture(&format!("{stem}-post.json")))?;
+        Ok(SkillDriftCase {
+            name: stem.to_string(),
+            drift_kind: drift_kind.to_string(),
+            pre,
+            post,
+            target_index,
+        })
+    }
+
+    #[test]
+    fn moved_position_case_survives_drift() -> TestResult {
+        let case = drift_case("case1-moved-position", "moved", 0)?;
+        let result = replay_skill_after_drift(&case)?;
+        assert!(
+            result.replay_success_after_drift,
+            "fingerprint (role+name+value) does not depend on element order/bounds, \
+             so a pure position move must still resolve"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn renamed_target_case_fails_drift() -> TestResult {
+        let case = drift_case("case2-renamed-target", "renamed", 0)?;
+        let result = replay_skill_after_drift(&case)?;
+        assert!(
+            !result.replay_success_after_drift,
+            "an accessible-name change alters the fingerprint, so the recorded \
+             NodeId must not resolve against the renamed page"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn removed_target_case_fails_drift() -> TestResult {
+        let case = drift_case("case3-removed-target", "removed", 0)?;
+        let result = replay_skill_after_drift(&case)?;
+        assert!(
+            !result.replay_success_after_drift,
+            "the recorded target is genuinely absent from the post-drift page"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn corpus_report_aggregates_a_mixed_survive_and_fail_rate() -> TestResult {
+        let cases = vec![
+            drift_case("case1-moved-position", "moved", 0)?,
+            drift_case("case2-renamed-target", "renamed", 0)?,
+            drift_case("case3-removed-target", "removed", 0)?,
+        ];
+
+        let report = skill_drift_corpus_report(&cases)?;
+
+        assert_eq!(report.cases.len(), 3);
+        assert!(report.cases[0].replay_success_after_drift);
+        assert!(!report.cases[1].replay_success_after_drift);
+        assert!(!report.cases[2].replay_success_after_drift);
+        // Exactly 1 of 3 survives: a genuinely mixed, non-trivial rate, not
+        // an all-survive or all-fail degenerate result.
+        assert!((report.replay_success_rate_after_drift - (1.0 / 3.0)).abs() < 1e-9);
+        Ok(())
+    }
+
+    #[test]
+    fn empty_corpus_reports_a_vacuous_full_rate() -> TestResult {
+        let report = skill_drift_corpus_report(&[])?;
+        assert_eq!(report.cases.len(), 0);
+        assert_eq!(report.replay_success_rate_after_drift, 1.0);
+        Ok(())
+    }
+
+    #[test]
+    fn out_of_bounds_target_index_is_a_typed_error() -> TestResult {
+        let mut case = drift_case("case1-moved-position", "moved", 0)?;
+        case.target_index = 99;
+
+        let err = replay_skill_after_drift(&case);
+        assert!(matches!(
+            err,
+            Err(EvalError::DriftTargetIndexOutOfBounds {
+                index: 99,
+                len: 2,
+                ..
+            })
+        ));
+        Ok(())
+    }
+
+    /// Revert-sensitive: replaying a case's recorded target against its OWN
+    /// pre-drift page (no drift at all) must always succeed. Contrasting that
+    /// with the real post-drift result below is exactly the property a
+    /// regression that scored replay-after-drift identically to
+    /// replay-before-drift (e.g. always comparing against `pre`, or always
+    /// returning `true`) would fail to reproduce.
+    #[test]
+    fn replay_against_the_undrifted_page_itself_always_survives() -> TestResult {
+        for (stem, target_index) in [
+            ("case1-moved-position", 0),
+            ("case2-renamed-target", 0),
+            ("case3-removed-target", 0),
+        ] {
+            let mut case = drift_case(stem, "no-drift-self-check", target_index)?;
+            case.post = case.pre.clone();
+
+            let result = replay_skill_after_drift(&case)?;
+            assert!(
+                result.replay_success_after_drift,
+                "case {stem}: replaying against the unmodified page must always survive"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn recorded_node_id_is_deterministic_given_the_same_pre_drift_page() -> TestResult {
+        let case = drift_case("case1-moved-position", "moved", 0)?;
+        let first = replay_skill_after_drift(&case)?;
+        let second = replay_skill_after_drift(&case)?;
+        assert_eq!(first.recorded_node_id, second.recorded_node_id);
+        Ok(())
     }
 }

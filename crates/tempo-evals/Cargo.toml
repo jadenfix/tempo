@@ -8,6 +8,8 @@ license.workspace = true
 [dependencies]
 tempo-schema = { path = "../tempo-schema" }
 tempo-session = { path = "../tempo-session" }
+tempo-observe = { path = "../tempo-observe" }
+tempo-skills = { path = "../tempo-skills" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
