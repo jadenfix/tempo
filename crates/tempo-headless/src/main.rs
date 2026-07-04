@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use tempo_config::TempodConfig;
 use tempo_driver::Engine;
+use tempo_net::UrlPolicy;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -44,22 +45,31 @@ fn main() {
         tempo_telemetry::logger().set_min_level(level);
     }
     tempo_headless::set_metrics_enabled(layered.telemetry.metrics_enabled);
+    let navigation_url_policy = options.navigation_url_policy();
     tempo_telemetry::logger()
         .event(tempo_telemetry::Level::Info, "tempod", "starting")
         .field("addr", options.addr.clone())
         .field("engine", format!("{:?}", options.engine))
         .field("attached_engine", options.engine_socket.is_some())
         .field("metrics_enabled", layered.telemetry.metrics_enabled)
+        .field("allow_private_network", options.allow_private_network)
         .emit();
 
     let result = match options.engine_socket {
-        Some(socket_path) => tempo_headless::run_tempod_with_attached_driver_config(
+        Some(socket_path) => {
+            tempo_headless::run_tempod_with_attached_driver_config_and_navigation_url_policy(
+                &options.addr,
+                config,
+                options.engine,
+                socket_path,
+                navigation_url_policy,
+            )
+        }
+        None => tempo_headless::run_tempod_with_config_and_navigation_url_policy(
             &options.addr,
             config,
-            options.engine,
-            socket_path,
+            navigation_url_policy,
         ),
-        None => tempo_headless::run_tempod_with_config(&options.addr, config),
     };
 
     if let Err(err) = result {
@@ -73,6 +83,7 @@ struct TempodOptions {
     engine: Engine,
     engine_socket: Option<PathBuf>,
     allow_remote: bool,
+    allow_private_network: bool,
     auth_token: Option<String>,
 }
 
@@ -99,7 +110,7 @@ impl TempodOptions {
                         .ok_or_else(|| "--engine-socket requires a path".to_string())?;
                     overrides.engine_socket = Some(value.clone());
                 }
-                "--allow-remote" => {}
+                "--allow-remote" | "--allow-private-network" => {}
                 "--auth-token" => {
                     args.next()
                         .ok_or_else(|| "--auth-token requires a bearer token".to_string())?;
@@ -140,6 +151,7 @@ impl TempodOptions {
         let mut engine_was_set = false;
         let mut engine_socket = defaults.engine_socket.clone().map(PathBuf::from);
         let mut allow_remote = false;
+        let mut allow_private_network = false;
         let mut auth_token = env_auth_token.filter(|token| !token.is_empty());
         let mut args = args.into_iter();
 
@@ -160,6 +172,9 @@ impl TempodOptions {
                 }
                 "--allow-remote" => {
                     allow_remote = true;
+                }
+                "--allow-private-network" => {
+                    allow_private_network = true;
                 }
                 "--auth-token" => {
                     let value = args
@@ -199,8 +214,17 @@ impl TempodOptions {
             engine,
             engine_socket,
             allow_remote,
+            allow_private_network,
             auth_token,
         })
+    }
+
+    fn navigation_url_policy(&self) -> UrlPolicy {
+        if self.allow_private_network {
+            UrlPolicy::allow_all()
+        } else {
+            UrlPolicy::block_private()
+        }
     }
 
     fn server_config(&self) -> Result<tempo_headless::TempodServerConfig, String> {
@@ -236,6 +260,7 @@ fn parse_engine(value: &str) -> Result<Engine, String> {
 fn usage() -> String {
     format!(
         "usage: tempod [ADDR] [--engine cdp|servo] [--engine-socket PATH] [--allow-remote] [--auth-token TOKEN]\n\
+         [--allow-private-network]\n\
          \n\
          layered config: defaults < JSON file named by {config_env} < TEMPO_* env < flags\n\
          non-loopback binds require --allow-remote plus --auth-token TOKEN or {env}",
@@ -326,6 +351,7 @@ mod tests {
             "servo".to_string(),
             "--engine-socket".to_string(),
             "/tmp/flag-engine.sock".to_string(),
+            "--allow-private-network".to_string(),
             "--auth-token".to_string(),
             "secret-token".to_string(),
         ])?;

@@ -5,16 +5,18 @@
 //! it uses the standard library so the control surface works before a larger web
 //! framework is selected for production packaging.
 
+#![recursion_limit = "256"]
+
 use async_trait::async_trait;
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value as JsonValue};
 use sha1::{Digest, Sha1};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
@@ -35,14 +37,18 @@ use tempo_engine_host::{
     DriverCommand as HostDriverCommand, DriverResponse, DriverWireError, EngineHost,
     EngineHostConfig, EngineHostError, EngineIpcClient, SharedEngineIpcClient,
 };
+use tempo_net::UrlPolicy;
 use tempo_policy::trust::{
     action_caller_texts, gate_boundary_effect, requires_observation_evidence, CallerPolicyClaims,
 };
+use tempo_policy::{decide_action, ConfirmationGate, InputTaint};
 use tempo_schema::{Action, ActionBatch, CompiledObservation, NodeId, ObservationDiff, SideEffect};
 use thiserror::Error;
 use url::Url;
 
 const MAX_HTTP_BYTES: usize = 64 * 1024;
+const MAX_IDEMPOTENCY_KEY_BYTES: usize = 256;
+const MAX_SESSION_IDEMPOTENCY_RECORDS: usize = 1024;
 const MAX_WS_PAYLOAD_BYTES: u64 = MAX_HTTP_BYTES as u64;
 /// Maximum accepted TCP control-plane connections handled concurrently.
 const MAX_HTTP_CONNECTIONS: usize = 128;
@@ -100,6 +106,10 @@ pub const TEMPO_OTLP_JSONL_ENV: &str = "TEMPO_OTLP_JSONL";
 pub const TEMPO_TEMPOD_AUTH_TOKEN_ENV: &str = "TEMPO_TEMPOD_AUTH_TOKEN";
 /// Prometheus text exposition endpoint (`GET /metrics`).
 pub const TEMPOD_METRICS_PATH: &str = "/metrics";
+pub const TEMPO_STEALTH_MODE_ENV: &str = "TEMPO_STEALTH_MODE";
+/// Machine-readable REST contract used as the source of truth for generated SDKs.
+pub const TEMPOD_OPENAPI_PATH: &str = "/openapi.json";
+const TEMPOD_OPENAPI_CONTENT_TYPE: &str = "application/vnd.oai.openapi+json;version=3.1";
 /// Constant marker written in place of any secret-bearing field in OTLP
 /// telemetry (issue #214 review). A constant — never a hash, length, or prefix
 /// of the secret — so low-entropy secrets (PINs, OTPs, common passwords/tokens)
@@ -235,6 +245,42 @@ pub enum TempodSessionEventKind {
     StepTriple { triple: StepTriple },
 }
 
+/// Controls intentional local history retention for the headless control plane.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PrivacyMode {
+    /// Keep in-memory per-session events and allow opt-in OTLP export.
+    #[default]
+    Audit,
+    /// Do not retain per-session events, ignore OTLP export, and purge terminal
+    /// sessions from the in-memory pool.
+    Stealth,
+}
+
+impl PrivacyMode {
+    fn from_env_value(value: Option<std::ffi::OsString>) -> Self {
+        let Some(value) = value else {
+            return Self::Audit;
+        };
+        let value = value.to_string_lossy();
+        if matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on" | "stealth"
+        ) {
+            Self::Stealth
+        } else {
+            Self::Audit
+        }
+    }
+
+    const fn retains_history(self) -> bool {
+        matches!(self, Self::Audit)
+    }
+
+    const fn retains_idempotency_cache(self) -> bool {
+        matches!(self, Self::Audit)
+    }
+}
+
 /// Per-driver (per browsing context / fork / root) operation gate.
 ///
 /// Serializes engine round-trips issued through clones of the SAME driver
@@ -303,6 +349,7 @@ pub struct AttachedEngineDriver {
     engine: Engine,
     client: SharedEngineIpcClient,
     driver_id: Option<String>,
+    url_policy: UrlPolicy,
     gate: Arc<OpGate>,
 }
 
@@ -314,8 +361,17 @@ impl AttachedEngineDriver {
             engine,
             client,
             driver_id: None,
+            #[cfg(not(test))]
+            url_policy: UrlPolicy::block_private(),
+            #[cfg(test)]
+            url_policy: UrlPolicy::allow_all(),
             gate: Arc::new(OpGate::default()),
         })
+    }
+
+    pub fn with_navigation_url_policy(mut self, url_policy: UrlPolicy) -> Self {
+        self.url_policy = url_policy;
+        self
     }
 
     fn request(&self, command: HostDriverCommand) -> Result<DriverResponse, DriverClientError> {
@@ -429,6 +485,7 @@ impl AttachedEngineDriver {
             engine: self.engine,
             client: self.client.clone(),
             driver_id: Some(driver_id),
+            url_policy: self.url_policy.clone(),
             gate: Arc::new(OpGate::default()),
         }
     }
@@ -461,6 +518,7 @@ impl fmt::Debug for AttachedEngineDriver {
             .debug_struct("AttachedEngineDriver")
             .field("engine", &self.engine)
             .field("driver_id", &self.driver_id)
+            .field("url_policy", &self.url_policy)
             .finish_non_exhaustive()
     }
 }
@@ -472,6 +530,7 @@ impl DriverTrait for AttachedEngineDriver {
     }
 
     async fn goto(&mut self, url: &str) -> Result<CompiledObservation, TransportError> {
+        enforce_tempod_navigation_url_transport(&self.url_policy, url)?;
         self.request_observation(HostDriverCommand::Goto { url: url.into() }, "goto")
     }
 
@@ -484,6 +543,7 @@ impl DriverTrait for AttachedEngineDriver {
     }
 
     async fn act(&mut self, action: &Action) -> Result<StepOutcome, TransportError> {
+        enforce_action_navigation_url_policy(&self.url_policy, action)?;
         self.request_step(
             HostDriverCommand::Act {
                 action: action.clone(),
@@ -493,6 +553,7 @@ impl DriverTrait for AttachedEngineDriver {
     }
 
     async fn act_batch(&mut self, batch: &ActionBatch) -> Result<StepOutcome, TransportError> {
+        enforce_batch_navigation_url_policy_transport(&self.url_policy, batch)?;
         self.request_step(
             HostDriverCommand::ActBatch {
                 batch: batch.clone(),
@@ -550,12 +611,15 @@ enum DriverClientError {
 }
 
 /// In-memory session pool for a tempod process.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct SessionPool {
     sessions: BTreeMap<TempodSessionId, TempodSession>,
     session_drivers: BTreeMap<TempodSessionId, AttachedEngineDriver>,
+    session_act_batch_idempotency:
+        BTreeMap<(TempodSessionId, String), SessionActBatchIdempotencyEntry>,
     events: BTreeMap<TempodSessionId, Vec<TempodSessionEvent>>,
     otlp_exporter: Option<OtlpJsonExporter>,
+    privacy_mode: PrivacyMode,
     bidi: BidiRouter,
     driver: Option<AttachedEngineDriver>,
     /// One MCP server for the attached engine. No outer `Mutex`: the server
@@ -564,9 +628,34 @@ pub struct SessionPool {
     /// sessions no longer queue behind a process-wide MCP lock.
     mcp: Option<Arc<tempo_mcp::TempoMcpServer<AttachedEngineDriver>>>,
     bidi_contexts: BTreeMap<BrowsingContextId, AttachedEngineDriver>,
+    url_policy: UrlPolicy,
     next_bidi_context_id: u64,
     next_id: u64,
     draining: bool,
+}
+
+impl Default for SessionPool {
+    fn default() -> Self {
+        Self {
+            sessions: BTreeMap::new(),
+            session_drivers: BTreeMap::new(),
+            session_act_batch_idempotency: BTreeMap::new(),
+            events: BTreeMap::new(),
+            otlp_exporter: None,
+            privacy_mode: PrivacyMode::default(),
+            bidi: BidiRouter::default(),
+            driver: None,
+            mcp: None,
+            bidi_contexts: BTreeMap::new(),
+            #[cfg(not(test))]
+            url_policy: UrlPolicy::block_private(),
+            #[cfg(test)]
+            url_policy: UrlPolicy::allow_all(),
+            next_bidi_context_id: 0,
+            next_id: 0,
+            draining: false,
+        }
+    }
 }
 
 impl fmt::Debug for SessionPool {
@@ -575,38 +664,95 @@ impl fmt::Debug for SessionPool {
             .debug_struct("SessionPool")
             .field("sessions", &self.sessions)
             .field("session_drivers", &self.session_drivers.keys())
+            .field(
+                "session_act_batch_idempotency",
+                &self.session_act_batch_idempotency.len(),
+            )
             .field("event_sessions", &self.events.len())
             .field("otlp_exporter", &self.otlp_exporter)
+            .field("privacy_mode", &self.privacy_mode)
             .field("bidi", &self.bidi)
             .field("driver", &self.driver)
             .field("mcp_attached", &self.mcp.is_some())
+            .field("url_policy", &self.url_policy)
             .field("next_id", &self.next_id)
             .field("draining", &self.draining)
             .finish()
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct SessionActBatchIdempotencyEntry {
+    request_fingerprint: JsonValue,
+    response: CachedSessionActBatchResponse,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct CachedSessionActBatchResponse {
+    status: u16,
+    body: JsonValue,
+}
+
 impl SessionPool {
     pub fn from_env() -> Self {
-        Self::from_otlp_env_value(std::env::var_os(TEMPO_OTLP_JSONL_ENV))
+        Self::from_env_values(
+            std::env::var_os(TEMPO_OTLP_JSONL_ENV),
+            std::env::var_os(TEMPO_STEALTH_MODE_ENV),
+        )
     }
 
+    #[cfg(test)]
     fn from_otlp_env_value(value: Option<std::ffi::OsString>) -> Self {
-        match value {
-            Some(path) if !path.is_empty() => {
-                Self::default().with_otlp_exporter(OtlpJsonExporter::new(path))
-            }
-            _ => Self::default(),
+        Self::from_env_values(value, None)
+    }
+
+    fn from_env_values(
+        otlp_value: Option<std::ffi::OsString>,
+        stealth_value: Option<std::ffi::OsString>,
+    ) -> Self {
+        let privacy_mode = PrivacyMode::from_env_value(stealth_value);
+        let mut pool = Self::default().with_privacy_mode(privacy_mode);
+        if privacy_mode.retains_history()
+            && let Some(path) = otlp_value
+            && !path.is_empty()
+        {
+            pool = pool.with_otlp_exporter(OtlpJsonExporter::new(path));
         }
+        pool
+    }
+
+    pub fn with_privacy_mode(mut self, privacy_mode: PrivacyMode) -> Self {
+        self.privacy_mode = privacy_mode;
+        if !privacy_mode.retains_history() {
+            self.otlp_exporter = None;
+            self.events.clear();
+            self.session_act_batch_idempotency.clear();
+        }
+        self
+    }
+
+    pub fn with_navigation_url_policy(mut self, url_policy: UrlPolicy) -> Self {
+        self.url_policy = url_policy;
+        self
+    }
+
+    pub fn privacy_mode(&self) -> PrivacyMode {
+        self.privacy_mode
     }
 
     pub fn with_otlp_exporter(mut self, exporter: OtlpJsonExporter) -> Self {
-        self.otlp_exporter = Some(exporter);
+        if self.privacy_mode.retains_history() {
+            self.otlp_exporter = Some(exporter);
+        }
         self
     }
 
     pub fn set_otlp_exporter(&mut self, exporter: Option<OtlpJsonExporter>) {
-        self.otlp_exporter = exporter;
+        self.otlp_exporter = if self.privacy_mode.retains_history() {
+            exporter
+        } else {
+            None
+        };
     }
 
     pub fn otlp_exporter(&self) -> Option<&OtlpJsonExporter> {
@@ -623,6 +769,7 @@ impl SessionPool {
             return Err(TempodError::Draining);
         }
         let url = url.into();
+        enforce_tempod_navigation_url(&self.url_policy, &url)?;
         let session_driver = self.create_session_engine_context(&url)?;
         Ok(self.finish_create(url, session_driver))
     }
@@ -689,7 +836,9 @@ impl SessionPool {
             session.clone()
         };
         self.close_session_driver(id);
+        self.clear_session_idempotency(id);
         self.record_event(id, TempodSessionEventKind::SessionKilled);
+        self.purge_terminal_session_if_stealth(id);
         Ok(session.clone())
     }
 
@@ -706,7 +855,9 @@ impl SessionPool {
         for id in drained {
             self.record_event(&id, TempodSessionEventKind::SessionDrained);
         }
+        self.session_act_batch_idempotency.clear();
         self.close_engine_resources(true);
+        self.purge_terminal_sessions_if_stealth();
     }
 
     pub fn draining(&self) -> bool {
@@ -719,7 +870,8 @@ impl SessionPool {
         client: EngineIpcClient,
     ) -> Result<(), TempodError> {
         self.close_engine_resources(true);
-        let driver = AttachedEngineDriver::new(engine, client)?;
+        let driver = AttachedEngineDriver::new(engine, client)?
+            .with_navigation_url_policy(self.url_policy.clone());
         self.mcp = Some(Arc::new(tempo_mcp::TempoMcpServer::new(driver.clone())));
         self.bidi_contexts.clear();
         self.next_bidi_context_id = 1;
@@ -851,6 +1003,11 @@ impl SessionPool {
         let Some(root_driver) = self.driver.as_ref() else {
             return Ok(None);
         };
+        if let Some(message) =
+            tempod_resolved_navigation_url_policy_denial(&root_driver.url_policy, url)
+        {
+            return Err(TempodError::Forbidden(message));
+        }
         match run_session_context_create(root_driver.clone(), url) {
             Some(result) => result.map(Some),
             None => {
@@ -1029,6 +1186,123 @@ impl SessionPool {
         Ok(self.record_event(id, TempodSessionEventKind::StepTriple { triple }))
     }
 
+    fn cached_session_act_batch_response(
+        &self,
+        id: &TempodSessionId,
+        key: &str,
+        request_fingerprint: &JsonValue,
+    ) -> Result<Option<CachedSessionActBatchResponse>, TempodError> {
+        if !self.sessions.contains_key(id) {
+            return Err(TempodError::SessionNotFound(id.clone()));
+        }
+        if !self.privacy_mode.retains_idempotency_cache() {
+            return Ok(None);
+        }
+        let Some(entry) = self
+            .session_act_batch_idempotency
+            .get(&(id.clone(), key.to_owned()))
+        else {
+            return Ok(None);
+        };
+        if &entry.request_fingerprint != request_fingerprint {
+            return Err(TempodError::Conflict(
+                "idempotency_key was already used for a different act_batch request".into(),
+            ));
+        }
+        Ok(Some(entry.response.clone()))
+    }
+
+    fn ensure_session_idempotency_capacity(
+        &self,
+        id: &TempodSessionId,
+        key: &str,
+    ) -> Result<(), TempodError> {
+        if !self.sessions.contains_key(id) {
+            return Err(TempodError::SessionNotFound(id.clone()));
+        }
+        if !self.privacy_mode.retains_idempotency_cache() {
+            return Ok(());
+        }
+        if self
+            .session_act_batch_idempotency
+            .contains_key(&(id.clone(), key.to_owned()))
+            || self.session_idempotency_record_count(id) < MAX_SESSION_IDEMPOTENCY_RECORDS
+        {
+            return Ok(());
+        }
+        Err(TempodError::Conflict(format!(
+            "session idempotency cache is full; max {MAX_SESSION_IDEMPOTENCY_RECORDS} records"
+        )))
+    }
+
+    fn remember_session_act_batch_response(
+        &mut self,
+        id: &TempodSessionId,
+        key: &str,
+        request_fingerprint: JsonValue,
+        status: u16,
+        body: JsonValue,
+    ) -> Result<(), TempodError> {
+        if !self.sessions.contains_key(id) {
+            return Err(TempodError::SessionNotFound(id.clone()));
+        }
+        if !self.privacy_mode.retains_idempotency_cache() {
+            return Ok(());
+        }
+        self.ensure_session_idempotency_capacity(id, key)?;
+        self.session_act_batch_idempotency.insert(
+            (id.clone(), key.to_owned()),
+            SessionActBatchIdempotencyEntry {
+                request_fingerprint,
+                response: CachedSessionActBatchResponse { status, body },
+            },
+        );
+        Ok(())
+    }
+
+    fn session_idempotency_record_count(&self, id: &TempodSessionId) -> usize {
+        self.session_act_batch_idempotency
+            .keys()
+            .filter(|(session_id, _)| session_id == id)
+            .count()
+    }
+
+    fn clear_session_idempotency(&mut self, id: &TempodSessionId) {
+        self.session_act_batch_idempotency
+            .retain(|(session_id, _), _| session_id != id);
+    }
+
+    fn session_driver(&self, id: &TempodSessionId) -> Result<AttachedEngineDriver, TempodError> {
+        if !self.sessions.contains_key(id) {
+            return Err(TempodError::SessionNotFound(id.clone()));
+        }
+        self.session_drivers.get(id).cloned().ok_or_else(|| {
+            TempodError::DriverUnavailable(format!(
+                "session {} has no attached engine driver",
+                id.0
+            ))
+        })
+    }
+
+    fn purge_terminal_session_if_stealth(&mut self, id: &TempodSessionId) {
+        if self.privacy_mode.retains_history() {
+            return;
+        }
+        self.events.remove(id);
+        self.clear_session_idempotency(id);
+        self.sessions.remove(id);
+    }
+
+    fn purge_terminal_sessions_if_stealth(&mut self) {
+        if self.privacy_mode.retains_history() {
+            return;
+        }
+        self.events.clear();
+        self.session_act_batch_idempotency.clear();
+        self.sessions
+            .retain(|_, session| session.state == TempodSessionState::Running);
+    }
+
     pub fn events(
         &self,
         id: &TempodSessionId,
@@ -1050,6 +1324,14 @@ impl SessionPool {
         id: &TempodSessionId,
         event: TempodSessionEventKind,
     ) -> TempodSessionEvent {
+        if !self.privacy_mode.retains_history() {
+            return TempodSessionEvent {
+                session_id: id.clone(),
+                seq: 0,
+                timestamp_ms: current_time_ms(),
+                event,
+            };
+        }
         let events = self.events.entry(id.clone()).or_default();
         let record = TempodSessionEvent {
             session_id: id.clone(),
@@ -1536,9 +1818,31 @@ pub fn run_tempod(addr: &str) -> Result<(), TempodError> {
 }
 
 pub fn run_tempod_with_config(addr: &str, config: TempodServerConfig) -> Result<(), TempodError> {
+    run_tempod_with_config_and_navigation_url_policy(addr, config, UrlPolicy::block_private())
+}
+
+/// Run tempod with an explicit navigation URL policy.
+pub fn run_tempod_with_navigation_url_policy(
+    addr: &str,
+    url_policy: UrlPolicy,
+) -> Result<(), TempodError> {
+    run_tempod_with_config_and_navigation_url_policy(
+        addr,
+        TempodServerConfig::default(),
+        url_policy,
+    )
+}
+
+pub fn run_tempod_with_config_and_navigation_url_policy(
+    addr: &str,
+    config: TempodServerConfig,
+    url_policy: UrlPolicy,
+) -> Result<(), TempodError> {
     config.validate_bind_addr(addr)?;
     let listener = TcpListener::bind(addr)?;
-    let pool = Arc::new(Mutex::new(SessionPool::from_env()));
+    let pool = Arc::new(Mutex::new(
+        SessionPool::from_env().with_navigation_url_policy(url_policy),
+    ));
     serve_forever_with_config(listener, pool, config)
 }
 
@@ -1557,9 +1861,41 @@ pub fn run_tempod_with_attached_driver_config(
     engine: Engine,
     socket_path: impl AsRef<Path>,
 ) -> Result<(), TempodError> {
+    run_tempod_with_attached_driver_config_and_navigation_url_policy(
+        addr,
+        config,
+        engine,
+        socket_path,
+        UrlPolicy::block_private(),
+    )
+}
+
+/// Run tempod with an attached engine and explicit navigation URL policy.
+pub fn run_tempod_with_attached_driver_and_navigation_url_policy(
+    addr: &str,
+    engine: Engine,
+    socket_path: impl AsRef<Path>,
+    url_policy: UrlPolicy,
+) -> Result<(), TempodError> {
+    run_tempod_with_attached_driver_config_and_navigation_url_policy(
+        addr,
+        TempodServerConfig::default(),
+        engine,
+        socket_path,
+        url_policy,
+    )
+}
+
+pub fn run_tempod_with_attached_driver_config_and_navigation_url_policy(
+    addr: &str,
+    config: TempodServerConfig,
+    engine: Engine,
+    socket_path: impl AsRef<Path>,
+    url_policy: UrlPolicy,
+) -> Result<(), TempodError> {
     config.validate_bind_addr(addr)?;
     let listener = TcpListener::bind(addr)?;
-    let mut pool = SessionPool::from_env();
+    let mut pool = SessionPool::from_env().with_navigation_url_policy(url_policy);
     pool.attach_engine_driver(engine, connect_engine_ipc(socket_path)?)?;
     serve_forever_with_config(listener, Arc::new(Mutex::new(pool)), config)
 }
@@ -1867,12 +2203,7 @@ fn handle_stream(
 }
 
 fn tempod_error_response(err: &TempodError) -> HttpResponse {
-    HttpResponse::json(
-        err.status(),
-        json!({
-            "error": err.to_string(),
-        }),
-    )
+    HttpResponse::json(err.status(), err.body())
 }
 
 /// Lock the pool for a SHORT, engine-IPC-free critical section. Routes must
@@ -2057,6 +2388,11 @@ fn route_http_request_with_auth(
             let pool = lock_pool(pool)?;
             Ok(metrics_response(&pool))
         }
+        ("GET", TEMPOD_OPENAPI_PATH) => Ok(HttpResponse::new(
+            200,
+            TEMPOD_OPENAPI_CONTENT_TYPE,
+            tempod_openapi(&request.base_url()).to_string().into_bytes(),
+        )),
         ("GET", tempo_mcp::A2A_AGENT_CARD_PATH) | ("GET", tempo_mcp::A2A_AGENT_JSON_PATH) => Ok(
             HttpResponse::from_mcp(tempo_mcp::agent_card_response(&request.base_url())),
         ),
@@ -2108,6 +2444,15 @@ fn route_http_request_with_auth(
                 let id = session_id_from_action_path(&request.path, "adopt")?;
                 return Ok(HttpResponse::json(200, lock_pool(pool)?.adopt(&id)?));
             }
+            if request.method == "GET" && request.path.ends_with("/observe") {
+                let id = session_id_from_action_path(&request.path, "observe")?;
+                return Ok(HttpResponse::json(200, route_session_observe(pool, &id)?));
+            }
+            if request.method == "POST" && request.path.ends_with("/act_batch") {
+                let id = session_id_from_action_path(&request.path, "act_batch")?;
+                let body = parse_session_act_batch_request(&request.body)?;
+                return route_session_act_batch(pool, id, body);
+            }
             if request.method == "DELETE" {
                 let id = session_id_from_path(&request.path)?;
                 return Ok(HttpResponse::json(200, lock_pool(pool)?.kill(&id)?));
@@ -2138,6 +2483,7 @@ fn create_session_shared(
         if pool.draining {
             return Err(TempodError::Draining);
         }
+        enforce_tempod_navigation_url(&pool.url_policy, &url)?;
         pool.driver.clone()
     };
 
@@ -2178,6 +2524,509 @@ fn create_session_shared(
         return Err(TempodError::Draining);
     }
     Ok(pool.finish_create(url, session_driver))
+}
+
+fn route_session_observe(
+    pool: &Arc<Mutex<SessionPool>>,
+    id: &TempodSessionId,
+) -> Result<CompiledObservation, TempodError> {
+    let mut driver = lock_pool(pool)?.session_driver(id)?;
+    futures::executor::block_on(driver.observe())
+        .map_err(|error| TempodError::Driver(error.to_string()))
+}
+
+fn route_session_act_batch(
+    pool: &Arc<Mutex<SessionPool>>,
+    id: TempodSessionId,
+    body: SessionActBatchRequest,
+) -> Result<HttpResponse, TempodError> {
+    let (mut driver, request_fingerprint, idempotency_key, policy) = {
+        let mut pool = lock_pool(pool)?;
+        let policy = enforce_session_batch_policy(&pool.url_policy, &body)?;
+        let request_fingerprint = session_act_batch_idempotency_fingerprint(&body);
+        if let Some(key) = body.idempotency_key.as_deref()
+            && let Some(response) =
+                pool.cached_session_act_batch_response(&id, key, &request_fingerprint)?
+        {
+            return Ok(HttpResponse::json(response.status, response.body));
+        }
+        let driver = pool.session_driver(&id)?;
+        let idempotency_key = body.idempotency_key.clone();
+        if let Some(key) = idempotency_key.as_deref() {
+            pool.remember_session_act_batch_response(
+                &id,
+                key,
+                request_fingerprint.clone(),
+                409,
+                session_act_batch_unknown_outcome_response(&policy),
+            )?;
+        }
+        (driver, request_fingerprint, idempotency_key, policy)
+    };
+
+    let response = match futures::executor::block_on(driver.act_batch(&body.batch)) {
+        Ok(outcome) => CachedSessionActBatchResponse {
+            status: 200,
+            body: step_outcome_response(outcome, policy),
+        },
+        Err(error) => CachedSessionActBatchResponse {
+            status: 500,
+            body: json!({ "error": error.to_string() }),
+        },
+    };
+
+    if let Some(key) = idempotency_key {
+        let mut pool = lock_pool(pool)?;
+        pool.remember_session_act_batch_response(
+            &id,
+            &key,
+            request_fingerprint,
+            response.status,
+            response.body.clone(),
+        )?;
+    }
+    Ok(HttpResponse::json(response.status, response.body))
+}
+
+fn parse_session_act_batch_request(body: &[u8]) -> Result<SessionActBatchRequest, TempodError> {
+    let value: JsonValue = serde_json::from_slice(body).map_err(|error| {
+        TempodError::BadRequest(format!("invalid act_batch request JSON: {error}"))
+    })?;
+    reject_explicit_null_field(&value, "input_tainted")?;
+    reject_explicit_null_field(&value, "idempotency_key")?;
+    serde_json::from_value(value).map_err(|error| {
+        TempodError::BadRequest(format!("invalid act_batch request JSON: {error}"))
+    })
+}
+
+fn reject_explicit_null_field(value: &JsonValue, field: &'static str) -> Result<(), TempodError> {
+    if value.get(field).is_some_and(JsonValue::is_null) {
+        return Err(TempodError::BadRequest(format!(
+            "{field} must not be null; omit the field to use its default"
+        )));
+    }
+    Ok(())
+}
+
+fn enforce_session_batch_policy(
+    policy: &UrlPolicy,
+    body: &SessionActBatchRequest,
+) -> Result<SessionBatchPolicyReport, TempodError> {
+    if let Some(key) = body.idempotency_key.as_deref() {
+        if key.is_empty() {
+            return Err(TempodError::BadRequest(
+                "idempotency_key must not be empty".into(),
+            ));
+        }
+        if key.len() > MAX_IDEMPOTENCY_KEY_BYTES {
+            return Err(TempodError::BadRequest(format!(
+                "idempotency_key exceeds {MAX_IDEMPOTENCY_KEY_BYTES} bytes"
+            )));
+        }
+    }
+    enforce_batch_navigation_url_policy(policy, &body.batch)?;
+    let forced_tainted_actions = body
+        .batch
+        .actions
+        .iter()
+        .filter(|action| action_requires_external_taint_floor(action))
+        .count();
+    let input_tainted_effective = body.input_tainted.unwrap_or(true) || forced_tainted_actions > 0;
+    let declared_input_tainted = body.input_tainted.unwrap_or(true);
+    let mut report = SessionBatchPolicyReport {
+        input_tainted_declared: body.input_tainted,
+        input_tainted_effective,
+        forced_tainted_actions,
+        max_side_effect: SideEffect::Read,
+        strongest_gate: ConfirmationGate::None,
+        confirmation_required: false,
+        confirmed: body.confirmed,
+        idempotency_required: false,
+        idempotency_key_provided: body.idempotency_key.is_some(),
+    };
+    let mut first_confirmation_index = None;
+    let mut first_idempotency_index = None;
+    for (index, action) in body.batch.actions.iter().enumerate() {
+        let input_taint =
+            InputTaint::new(declared_input_tainted || action_requires_external_taint_floor(action));
+        let decision = decide_action(action, input_taint);
+        report.max_side_effect = report.max_side_effect.max(decision.side_effect);
+        report.strongest_gate = report.strongest_gate.max(decision.gate);
+        if decision.requires_confirmation() {
+            report.confirmation_required = true;
+            first_confirmation_index.get_or_insert(index);
+        }
+        if decision.idempotency_required {
+            report.idempotency_required = true;
+            first_idempotency_index.get_or_insert(index);
+        }
+    }
+    let missing_confirmation = report.confirmation_required && !body.confirmed;
+    let missing_idempotency = report.idempotency_required && body.idempotency_key.is_none();
+    if missing_confirmation || missing_idempotency {
+        let denied_action_index = match (missing_confirmation, missing_idempotency) {
+            (true, true) => match (first_confirmation_index, first_idempotency_index) {
+                (Some(confirmation_index), Some(idempotency_index)) => {
+                    confirmation_index.min(idempotency_index)
+                }
+                (Some(confirmation_index), None) => confirmation_index,
+                (None, Some(idempotency_index)) => idempotency_index,
+                (None, None) => 0,
+            },
+            (true, false) => first_confirmation_index.unwrap_or_default(),
+            (false, true) => first_idempotency_index.unwrap_or_default(),
+            (false, false) => unreachable!("policy denial requires at least one reason"),
+        };
+        let denied_action_kind = body
+            .batch
+            .actions
+            .get(denied_action_index)
+            .map(action_kind)
+            .unwrap_or("batch");
+        let reason = match (missing_confirmation, missing_idempotency) {
+            (true, true) => {
+                "requires human confirmation and idempotency_key before execution".to_string()
+            }
+            (true, false) => "requires human confirmation before execution".to_string(),
+            (false, true) => "requires idempotency_key before execution".to_string(),
+            (false, false) => unreachable!("policy denial requires at least one reason"),
+        };
+        return Err(TempodError::PolicyDenied(Box::new(PolicyDeniedError {
+            reason,
+            denied_action_index,
+            denied_action_kind,
+            policy: report,
+        })));
+    }
+    Ok(report)
+}
+
+fn action_requires_external_taint_floor(action: &Action) -> bool {
+    match action {
+        Action::Goto { .. }
+        | Action::Scroll { .. }
+        | Action::Wait { .. }
+        | Action::Extract { .. } => false,
+        Action::Click { .. }
+        | Action::Type { .. }
+        | Action::Select { .. }
+        | Action::Skill { .. } => true,
+    }
+}
+
+fn action_kind(action: &Action) -> &'static str {
+    match action {
+        Action::Goto { .. } => "goto",
+        Action::Click { .. } => "click",
+        Action::Type { .. } => "type",
+        Action::Select { .. } => "select",
+        Action::Scroll { .. } => "scroll",
+        Action::Wait { .. } => "wait",
+        Action::Extract { .. } => "extract",
+        Action::Skill { .. } => "skill",
+    }
+}
+
+fn tempod_navigation_url_policy_denial(policy: &UrlPolicy, url: &str) -> Option<String> {
+    policy
+        .enforce(url)
+        .err()
+        .map(|error| format!("navigation URL denied by tempod URL policy: {error}"))
+}
+
+fn tempod_resolved_navigation_url_policy_denial(policy: &UrlPolicy, url: &str) -> Option<String> {
+    if let Some(message) = tempod_navigation_url_policy_denial(policy, url) {
+        return Some(message);
+    }
+    if policy == &UrlPolicy::allow_all() {
+        return None;
+    }
+    let sockets = match resolve_navigation_url_sockets(url) {
+        Ok(sockets) => sockets,
+        Err(reason) => {
+            return Some(format!(
+                "navigation URL denied by tempod URL policy: {reason}"
+            ));
+        }
+    };
+    for socket in sockets {
+        if let Err(error) = policy.enforce_resolved_socket(url, socket) {
+            return Some(format!(
+                "navigation URL denied by tempod URL policy: {error}"
+            ));
+        }
+    }
+    None
+}
+
+fn resolve_navigation_url_sockets(url: &str) -> Result<Vec<SocketAddr>, String> {
+    let parsed = url::Url::parse(url).map_err(|error| format!("invalid URL: {error}"))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "URL has no host".to_string())?;
+    let port = parsed
+        .port_or_known_default()
+        .ok_or_else(|| "URL has no port for its scheme".to_string())?;
+    let sockets = (host, port)
+        .to_socket_addrs()
+        .map_err(|error| format!("failed to resolve {host}:{port}: {error}"))?
+        .collect::<Vec<_>>();
+    if sockets.is_empty() {
+        return Err(format!("failed to resolve {host}:{port}: no addresses"));
+    }
+    Ok(sockets)
+}
+
+fn enforce_tempod_navigation_url(policy: &UrlPolicy, url: &str) -> Result<(), TempodError> {
+    if let Some(message) = tempod_navigation_url_policy_denial(policy, url) {
+        return Err(TempodError::Forbidden(message));
+    }
+    Ok(())
+}
+
+fn enforce_batch_navigation_url_policy(
+    policy: &UrlPolicy,
+    batch: &ActionBatch,
+) -> Result<(), TempodError> {
+    for (index, action) in batch.actions.iter().enumerate() {
+        if let Action::Goto { url } = action
+            && let Some(message) = tempod_navigation_url_policy_denial(policy, url)
+        {
+            return Err(TempodError::Forbidden(format!(
+                "action {index} goto {message}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn enforce_tempod_navigation_url_transport(
+    policy: &UrlPolicy,
+    url: &str,
+) -> Result<(), TransportError> {
+    if tempod_resolved_navigation_url_policy_denial(policy, url).is_some() {
+        return Err(TransportError::UrlBlocked);
+    }
+    Ok(())
+}
+
+fn enforce_action_navigation_url_policy(
+    policy: &UrlPolicy,
+    action: &Action,
+) -> Result<(), TransportError> {
+    if let Action::Goto { url } = action {
+        enforce_tempod_navigation_url_transport(policy, url)?;
+    }
+    Ok(())
+}
+
+fn enforce_batch_navigation_url_policy_transport(
+    policy: &UrlPolicy,
+    batch: &ActionBatch,
+) -> Result<(), TransportError> {
+    for action in &batch.actions {
+        enforce_action_navigation_url_policy(policy, action)?;
+    }
+    Ok(())
+}
+
+fn session_act_batch_idempotency_fingerprint(body: &SessionActBatchRequest) -> JsonValue {
+    json!({
+        "batch": &body.batch,
+        "input_tainted": body.input_tainted,
+        "confirmed": body.confirmed,
+    })
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SessionBatchPolicyReport {
+    input_tainted_declared: Option<bool>,
+    input_tainted_effective: bool,
+    forced_tainted_actions: usize,
+    max_side_effect: SideEffect,
+    strongest_gate: ConfirmationGate,
+    confirmation_required: bool,
+    confirmed: bool,
+    idempotency_required: bool,
+    idempotency_key_provided: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PolicyDeniedError {
+    reason: String,
+    denied_action_index: usize,
+    denied_action_kind: &'static str,
+    policy: SessionBatchPolicyReport,
+}
+
+impl fmt::Display for PolicyDeniedError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "policy denied: {} at action {} ({}); input_tainted={}",
+            self.reason,
+            self.denied_action_index,
+            self.denied_action_kind,
+            self.policy.input_tainted_effective
+        )
+    }
+}
+
+impl std::error::Error for PolicyDeniedError {}
+
+fn step_outcome_response(outcome: StepOutcome, policy: SessionBatchPolicyReport) -> JsonValue {
+    let policy = session_batch_policy_json(&policy);
+    match outcome {
+        StepOutcome::Applied { diff } => json!({
+            "status": "applied",
+            "diff": diff,
+            "policy": policy,
+        }),
+        StepOutcome::StepError { reason } => json!({
+            "status": "step_error",
+            "reason": reason,
+            "policy": policy,
+        }),
+    }
+}
+
+fn session_act_batch_unknown_outcome_response(policy: &SessionBatchPolicyReport) -> JsonValue {
+    json!({
+        "status": "unknown_outcome",
+        "reason": "act_batch execution is already in progress for this idempotency_key; retry with the same request to replay the terminal result",
+        "policy": session_batch_policy_json(policy),
+    })
+}
+
+fn policy_denied_error_json(error: &PolicyDeniedError) -> JsonValue {
+    json!({
+        "error": error.to_string(),
+        "reason": &error.reason,
+        "denied_action_index": error.denied_action_index,
+        "denied_action_kind": error.denied_action_kind,
+        "policy": session_batch_policy_json(&error.policy),
+    })
+}
+
+fn session_batch_policy_json(policy: &SessionBatchPolicyReport) -> JsonValue {
+    json!({
+        "input_tainted_declared": policy.input_tainted_declared,
+        "input_tainted_effective": policy.input_tainted_effective,
+        "forced_tainted_actions": policy.forced_tainted_actions,
+        "max_side_effect": policy.max_side_effect,
+        "strongest_gate": confirmation_gate_name(policy.strongest_gate),
+        "confirmation_required": policy.confirmation_required,
+        "confirmed": policy.confirmed,
+        "idempotency_required": policy.idempotency_required,
+        "idempotency_key_provided": policy.idempotency_key_provided,
+    })
+}
+
+fn confirmation_gate_name(gate: ConfirmationGate) -> &'static str {
+    match gate {
+        ConfirmationGate::None => "none",
+        ConfirmationGate::Confirm => "confirm",
+        ConfirmationGate::ConfirmWithTaintReview => "confirm_with_taint_review",
+    }
+}
+
+pub fn tempod_openapi(base_url: &str) -> JsonValue {
+    let base_url = base_url.trim_end_matches('/');
+    json!({
+        "openapi": "3.1.0",
+        "info": {
+            "title": "tempo tempod control plane",
+            "version": env!("CARGO_PKG_VERSION")
+        },
+        "servers": [{"url": base_url}],
+        "paths": {
+            "/health": {
+                "get": {
+                    "operationId": "health",
+                    "responses": {"200": {"description": "tempod is reachable"}}
+                }
+            },
+            TEMPOD_OPENAPI_PATH: {
+                "get": {
+                    "operationId": "openapi",
+                    "responses": {"200": {"description": "OpenAPI 3.1 document"}}
+                }
+            },
+            "/sessions": {
+                "get": {
+                    "operationId": "listSessions",
+                    "responses": {"200": {"description": "List sessions"}}
+                },
+                "post": {
+                    "operationId": "createSession",
+                    "requestBody": {
+                        "required": true,
+                        "content": {"application/json": {"schema": {"$ref": "#/components/schemas/CreateSessionRequest"}}}
+                    },
+                    "responses": {"201": {"description": "Created session"}}
+                }
+            },
+            "/sessions/{session_id}/observe": {
+                "get": {
+                    "operationId": "observeSession",
+                    "parameters": [{"$ref": "#/components/parameters/SessionId"}],
+                    "responses": {"200": {"description": "Compiled observation"}}
+                }
+            },
+            "/sessions/{session_id}/act_batch": {
+                "post": {
+                    "operationId": "actBatchSession",
+                    "parameters": [{"$ref": "#/components/parameters/SessionId"}],
+                    "requestBody": {
+                        "required": true,
+                        "content": {"application/json": {"schema": {"$ref": "#/components/schemas/SessionActBatchRequest"}}}
+                    },
+                    "responses": {
+                        "200": {"description": "Action batch outcome"},
+                        "403": {"description": "Policy denied"},
+                        "409": {"description": "Idempotency conflict"}
+                    }
+                }
+            },
+            "/mcp": {
+                "get": {"operationId": "mcpGet", "responses": {"200": {"description": "MCP metadata"}}},
+                "post": {"operationId": "mcpPost", "responses": {"200": {"description": "MCP JSON-RPC response"}}}
+            }
+        },
+        "components": {
+            "parameters": {
+                "SessionId": {
+                    "name": "session_id",
+                    "in": "path",
+                    "required": true,
+                    "schema": {"type": "string"}
+                }
+            },
+            "schemas": {
+                "CreateSessionRequest": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["url"],
+                    "properties": {"url": {"type": "string", "format": "uri"}}
+                },
+                "SessionActBatchRequest": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["batch"],
+                    "properties": {
+                        "batch": {"type": "object"},
+                        "input_tainted": {"type": "boolean"},
+                        "confirmed": {"type": "boolean", "default": false},
+                        "idempotency_key": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": MAX_IDEMPOTENCY_KEY_BYTES
+                        }
+                    }
+                }
+            }
+        }
+    })
 }
 
 fn session_events_from_path(
@@ -2294,6 +3143,7 @@ fn control_route_requires_origin_check(method: &str, path: &str) -> bool {
         ("GET", "/health")
             | ("GET", tempo_mcp::A2A_AGENT_CARD_PATH)
             | ("GET", tempo_mcp::A2A_AGENT_JSON_PATH)
+            | ("GET", TEMPOD_OPENAPI_PATH)
             | ("GET", "/mcp")
             | ("POST", "/mcp")
             | ("GET", "/bidi")
@@ -3267,8 +4117,20 @@ fn content_length(headers: &BTreeMap<String, String>) -> Result<usize, TempodErr
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CreateSessionRequest {
     url: String,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SessionActBatchRequest {
+    batch: ActionBatch,
+    input_tainted: Option<bool>,
+    #[serde(default)]
+    confirmed: bool,
+    #[serde(default)]
+    idempotency_key: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3334,8 +4196,12 @@ pub enum TempodError {
     BadRequest(String),
     #[error("unauthorized: {0}")]
     Unauthorized(String),
+    #[error("conflict: {0}")]
+    Conflict(String),
     #[error("forbidden: {0}")]
     Forbidden(String),
+    #[error("{0}")]
+    PolicyDenied(Box<PolicyDeniedError>),
     #[error("connection limit reached: {0}")]
     ConnectionLimit(String),
     #[error("session not found: {0:?}")]
@@ -3348,6 +4214,8 @@ pub enum TempodError {
     PoolLock,
     #[error("driver failed: {0}")]
     Driver(String),
+    #[error("driver unavailable: {0}")]
+    DriverUnavailable(String),
     #[error("engine host failed: {0}")]
     Engine(#[from] EngineHostError),
 }
@@ -3357,10 +4225,21 @@ impl TempodError {
         match self {
             Self::BadRequest(_) => 400,
             Self::Unauthorized(_) => 401,
+            Self::Conflict(_) => 409,
             Self::Forbidden(_) => 403,
+            Self::PolicyDenied(_) => 403,
             Self::SessionNotFound(_) | Self::EngineNotFound(_) => 404,
-            Self::Draining | Self::ConnectionLimit(_) => 503,
+            Self::Draining | Self::ConnectionLimit(_) | Self::DriverUnavailable(_) => 503,
             Self::Io(_) | Self::Json(_) | Self::PoolLock | Self::Driver(_) | Self::Engine(_) => 500,
+        }
+    }
+
+    fn body(&self) -> JsonValue {
+        match self {
+            Self::PolicyDenied(error) => policy_denied_error_json(error),
+            _ => json!({
+                "error": self.to_string(),
+            }),
         }
     }
 }
@@ -4838,6 +5717,27 @@ mod tests {
         let after_adopt = pool.events(&session.id, Some(1))?;
         assert_eq!(after_adopt.len(), 2);
         assert_eq!(after_adopt[0].seq, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn stealth_mode_does_not_retain_lifecycle_or_step_events() -> TestResult {
+        let mut pool = SessionPool::default().with_privacy_mode(PrivacyMode::Stealth);
+        let session = pool.create("https://stealth.test")?;
+        pool.adopt(&session.id)?;
+        let step_event = pool.record_step(&session.id, sample_step_triple(13))?;
+
+        assert!(matches!(
+            step_event.event,
+            TempodSessionEventKind::StepTriple { .. }
+        ));
+        assert_eq!(pool.events(&session.id, None)?, Vec::new());
+
+        pool.kill(&session.id)?;
+        assert!(matches!(
+            pool.events(&session.id, None),
+            Err(TempodError::SessionNotFound(_))
+        ));
         Ok(())
     }
 
