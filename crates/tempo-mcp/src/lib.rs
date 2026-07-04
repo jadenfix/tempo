@@ -3256,6 +3256,7 @@ mod tests {
             Ok(ObservationDiff {
                 since_seq,
                 seq: self.observation.seq,
+                omitted: 0,
                 added: Vec::new(),
                 removed: Vec::new(),
                 changed: self.observation.elements.clone(),

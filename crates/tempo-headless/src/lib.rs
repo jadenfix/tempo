@@ -10746,6 +10746,7 @@ mod tests {
                 diff: ObservationDiff {
                     since_seq: seq.saturating_sub(1),
                     seq,
+                    omitted: 0,
                     added: vec![],
                     removed: vec![],
                     changed: vec![],
