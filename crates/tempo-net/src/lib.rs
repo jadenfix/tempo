@@ -2229,14 +2229,70 @@ impl CrawlDispatch {
     }
 }
 
+/// Checked capability for opening a crawl network connection.
+///
+/// Executors must connect to [`Self::resolved_socket`] and use
+/// [`Self::request`] only for HTTP request metadata. Re-resolving the request
+/// URL after this capability is issued bypasses the checked socket decision.
+/// For direct egress the socket is the target URL socket; for proxied egress it
+/// is the selected proxy endpoint socket.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CheckedCrawlConnection {
+    dispatch: CrawlDispatch,
+    resolved_socket: SocketAddr,
+}
+
+impl CheckedCrawlConnection {
+    pub fn request(&self) -> &NetworkRequest {
+        &self.dispatch.request
+    }
+
+    pub fn origin(&self) -> &str {
+        &self.dispatch.origin
+    }
+
+    pub fn resolved_socket(&self) -> SocketAddr {
+        self.resolved_socket
+    }
+
+    pub fn into_parts(self) -> (NetworkRequest, String, SocketAddr) {
+        (
+            self.dispatch.request,
+            self.dispatch.origin,
+            self.resolved_socket,
+        )
+    }
+}
+
 /// Crawl dispatch after all mandatory network policy checks have passed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CheckedCrawlDispatch {
-    pub dispatch: CrawlDispatch,
-    pub resolved_socket: SocketAddr,
+    connection: CheckedCrawlConnection,
     pub audit: AuditRecord,
     pub egress: EgressRecord,
     pub web_bot_auth_headers: Option<SignatureHeaders>,
+}
+
+impl CheckedCrawlDispatch {
+    pub fn connection(&self) -> &CheckedCrawlConnection {
+        &self.connection
+    }
+
+    pub fn request(&self) -> &NetworkRequest {
+        self.connection.request()
+    }
+
+    pub fn origin(&self) -> &str {
+        self.connection.origin()
+    }
+
+    pub fn resolved_socket(&self) -> SocketAddr {
+        self.connection.resolved_socket()
+    }
+
+    pub fn into_connection(self) -> CheckedCrawlConnection {
+        self.connection
+    }
 }
 
 /// Policy bundle used by checked frontier dispatch.
@@ -2449,6 +2505,9 @@ impl CrawlFrontier {
     /// Dispatch at most `max_requests` pending requests in deterministic request
     /// identity order, subject to global, per-origin, delay, robots, and backoff
     /// gates.
+    #[deprecated(
+        note = "raw crawl dispatch is scheduler-only and does not perform URL/socket/egress checks; use dispatch_checked_ready for network execution"
+    )]
     pub fn dispatch_ready(
         &mut self,
         tick: u64,
@@ -2548,10 +2607,7 @@ impl CrawlFrontier {
                         Err(error) => Err(error),
                     };
                     match checked {
-                        Ok(checked) => match self
-                            .scheduler
-                            .begin(&checked.dispatch.request, tick)?
-                        {
+                        Ok(checked) => match self.scheduler.begin(checked.request(), tick)? {
                             CrawlDecision::Allow { .. } => {
                                 self.pending.remove(&key);
                                 batch.dispatches.push(checked);
@@ -2734,8 +2790,10 @@ fn checked_crawl_dispatch_from_records(
         .transpose()?;
 
     Ok(CheckedCrawlDispatch {
-        dispatch: dispatch.clone(),
-        resolved_socket,
+        connection: CheckedCrawlConnection {
+            dispatch: dispatch.clone(),
+            resolved_socket,
+        },
         audit,
         egress,
         web_bot_auth_headers,
@@ -3801,6 +3859,7 @@ fn parse_retry_after_delta_ticks(value: &str, response: &NetworkResponseRecord) 
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
 
@@ -6038,12 +6097,42 @@ Disallow: /private
             .as_ref()
             .ok_or("expected Web Bot Auth headers")?;
         verify_web_bot_auth_signature_at(
-            &checked.dispatch.request,
+            checked.request(),
             &headers.signature_input,
             &headers.signature,
             &key.verifier(),
             1_800_000_000,
         )?;
+        Ok(())
+    }
+
+    #[test]
+    fn checked_crawl_dispatch_returns_connection_pinned_capability() -> Result<(), CrawlError> {
+        let dispatch = CrawlDispatch {
+            request: crawl_request("r1", "https://example.com/page"),
+            origin: "https://example.com".into(),
+        };
+        let resolved_socket = SocketAddr::from(([93, 184, 216, 34], 443));
+
+        let checked = dispatch
+            .check(
+                &UrlPolicy::block_private(),
+                &EgressPolicy::allow_all(),
+                resolved_socket,
+            )
+            .map_err(|error| CrawlError {
+                reason: BlockReason::new(BlockCode::InvalidUrl, error.to_string()),
+            })?;
+
+        let connection = checked.connection();
+        assert_eq!(connection.request().id.0.as_str(), "r1");
+        assert_eq!(connection.origin(), "https://example.com");
+        assert_eq!(connection.resolved_socket(), resolved_socket);
+
+        let (request, origin, socket) = checked.into_connection().into_parts();
+        assert_eq!(request.url, "https://example.com/page");
+        assert_eq!(origin, "https://example.com");
+        assert_eq!(socket, resolved_socket);
         Ok(())
     }
 
@@ -6191,7 +6280,12 @@ Disallow: /private
         assert!(batch.rejected.is_empty());
         assert_eq!(batch.dispatches.len(), 1);
         let checked = &batch.dispatches[0];
-        assert_eq!(checked.resolved_socket.port(), 1080);
+        let connection: &CheckedCrawlConnection = checked.connection();
+        assert_eq!(
+            connection.resolved_socket(),
+            SocketAddr::from(([93, 184, 216, 34], 1080))
+        );
+        assert_eq!(connection.request().url, "https://proxied.example/page");
         assert_eq!(checked.egress.domain, "proxied.example");
         assert_eq!(checked.egress.port, 443);
         assert_eq!(checked.egress.proxy_id.as_deref(), Some("proxy-a"));
@@ -6364,7 +6458,7 @@ Disallow: /private
             .as_ref()
             .ok_or("expected Web Bot Auth headers")?;
         verify_web_bot_auth_signature_at(
-            &checked.dispatch.request,
+            checked.request(),
             &headers.signature_input,
             &headers.signature,
             &key.verifier(),

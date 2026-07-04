@@ -8,31 +8,38 @@
 //! SDKs should pass [`NetworkRequest`] values into [`CrawlFrontier`]. The
 //! facade delegates canonical crawl request identity, scheduler state, and
 //! checked dispatch to tempo-net, but does not expose raw `dispatch_ready()` as a
-//! normal method. Only [`CheckedCrawlDispatch`] values returned by
-//! [`CrawlFrontier::dispatch_checked_ready`] have passed URL, resolved-socket,
-//! egress, audit, and optional Web Bot Auth checks. Raw scheduler dispatch
-//! types are kept as deprecated compatibility aliases because they have not
-//! passed SSRF/egress checks and are not safe as a direct network execution
-//! surface.
+//! normal method. Only [`CheckedCrawlConnection`] values reached through
+//! [`CheckedCrawlDispatch::connection`] have a resolved socket pinned by URL,
+//! egress, audit, and optional Web Bot Auth checks. Raw scheduler dispatch types
+//! are kept as deprecated compatibility aliases because they have not passed
+//! SSRF/egress checks and are not safe as a direct network execution surface.
+//!
+//! ```compile_fail
+//! let mut frontier = tempo_crawl::CrawlFrontier::default();
+//! let _ = frontier.dispatch_ready(1, 1);
+//! ```
 
 pub use tempo_net::{
-    AuditRecord, BlockCode, BlockReason, CheckedCrawlDispatch, CrawlCheckedBatch, CrawlDecision,
-    CrawlDispatchError, CrawlDispatchGuard, CrawlDispatchSigner, CrawlError, CrawlFrontierSnapshot,
-    CrawlPolicy, CrawlScheduler, DomainRule, EgressDenied, EgressPolicy, EgressRecord,
-    IdentityMode, NetworkRequest, NetworkResponseRecord, OriginCrawlSnapshot, ProfileId,
-    ProxyRoute, RejectedCrawlDispatch, RequestId, RobotsRules, SignatureError, SignatureHeaders,
-    UrlBlocked, UrlPolicy, WebBotAuthSigningKey, DEFAULT_CRAWL_MAX_CONCURRENT_PER_ORIGIN,
-    DEFAULT_CRAWL_MAX_GLOBAL_INFLIGHT, DEFAULT_CRAWL_MIN_DELAY_TICKS,
+    AuditRecord, BlockCode, BlockReason, CheckedCrawlConnection, CheckedCrawlDispatch,
+    CrawlCheckedBatch, CrawlDecision, CrawlDispatchError, CrawlDispatchGuard, CrawlDispatchSigner,
+    CrawlError, CrawlFrontierSnapshot, CrawlPolicy, CrawlScheduler, DomainRule, EgressDenied,
+    EgressPolicy, EgressRecord, IdentityMode, NetworkRequest, NetworkResponseRecord,
+    OriginCrawlSnapshot, ProfileId, ProxyRoute, RejectedCrawlDispatch, RequestId, RobotsRules,
+    SignatureError, SignatureHeaders, UrlBlocked, UrlPolicy, WebBotAuthSigningKey,
+    DEFAULT_CRAWL_MAX_CONCURRENT_PER_ORIGIN, DEFAULT_CRAWL_MAX_GLOBAL_INFLIGHT,
+    DEFAULT_CRAWL_MIN_DELAY_TICKS,
 };
 
 #[deprecated(
     note = "raw CrawlBatch is scheduler-only; use CrawlCheckedBatch from dispatch_checked_ready before network execution"
 )]
+#[doc(hidden)]
 pub type CrawlBatch = tempo_net::CrawlBatch;
 
 #[deprecated(
     note = "raw CrawlDispatch has not passed URL/socket/egress checks; use CheckedCrawlDispatch before network execution"
 )]
+#[doc(hidden)]
 pub type CrawlDispatch = tempo_net::CrawlDispatch;
 
 /// Human-readable crate summary for smoke tests and package metadata.
@@ -173,7 +180,7 @@ mod tests {
             batch
                 .dispatches
                 .iter()
-                .map(|checked| checked.dispatch.request.id.0.as_str())
+                .map(|checked| checked.request().id.0.as_str())
                 .collect::<Vec<_>>(),
             vec!["a1", "b"]
         );
@@ -231,7 +238,7 @@ mod tests {
             Ok(std::net::SocketAddr::from(([93, 184, 216, 34], 443)))
         })?;
         assert_eq!(batch.dispatches.len(), 4);
-        let _request_id: RequestId = batch.dispatches[0].dispatch.request.id.clone();
+        let _request_id: RequestId = batch.dispatches[0].request().id.clone();
         assert!(frontier
             .scheduler()
             .is_url_active("https://example.com/page")?);
@@ -260,6 +267,12 @@ mod tests {
         assert_eq!(batch.dispatches.len(), 1);
         assert!(batch.rejected.is_empty());
         assert_eq!(batch.dispatches[0].audit.request_id, RequestId("r1".into()));
+        let connection: &CheckedCrawlConnection = batch.dispatches[0].connection();
+        assert_eq!(connection.request().id, RequestId("r1".into()));
+        assert_eq!(
+            connection.resolved_socket(),
+            std::net::SocketAddr::from(([93, 184, 216, 34], 443))
+        );
         assert_eq!(frontier.snapshot().inflight, 1);
         Ok(())
     }
