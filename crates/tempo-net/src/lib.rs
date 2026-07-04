@@ -1590,6 +1590,13 @@ impl ProxyRoute {
     }
 }
 
+/// Host and port selected from a proxy endpoint after policy preflight.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProxyEndpointTarget {
+    pub host: String,
+    pub port: u16,
+}
+
 /// Default egress behavior when no domain rule matches.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EgressDefault {
@@ -1691,6 +1698,35 @@ impl EgressPolicy {
             domain,
             port,
             reason: "domain is not allowed by egress policy".into(),
+        })
+    }
+
+    /// Validate the socket selected for a proxied egress decision before the
+    /// proxy client is configured.
+    pub fn enforce_proxy_resolved_socket(
+        &self,
+        proxy: &ProxyRoute,
+        resolved_socket: SocketAddr,
+    ) -> Result<(), UrlBlocked> {
+        enforce_proxy_endpoint_resolved_socket(
+            &proxy.endpoint,
+            resolved_socket,
+            self.allow_insecure_local_proxy_endpoints,
+        )
+    }
+
+    /// Return the proxy endpoint host/port after applying the same proxy
+    /// endpoint policy used by `decide`.
+    pub fn proxy_endpoint_target(
+        &self,
+        proxy: &ProxyRoute,
+    ) -> Result<ProxyEndpointTarget, UrlBlocked> {
+        let parts = UrlParts::parse(&proxy.endpoint).map_err(|reason| UrlBlocked { reason })?;
+        enforce_proxy_endpoint_parts_policy(&parts, self.allow_insecure_local_proxy_endpoints)?;
+        let port = proxy_endpoint_port(&parts)?;
+        Ok(ProxyEndpointTarget {
+            host: parts.host,
+            port,
         })
     }
 

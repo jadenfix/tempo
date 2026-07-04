@@ -17,7 +17,8 @@ use tempo_engine_host::{
 };
 use tempo_net::{
     AuditRecord, EgressDecision, EgressDenied, EgressPolicy, EgressRecord, IdentityMode,
-    NetworkRequest, ProfileId, SignatureError, UrlBlocked, UrlPolicy, WebBotAuthSigningKey,
+    NetworkRequest, ProfileId, ProxyEndpointTarget, ProxyRoute, SignatureError, UrlBlocked,
+    UrlPolicy, WebBotAuthSigningKey,
 };
 use tempo_schema::{Action, ActionBatch, CompiledObservation, NodeId, ObservationDiff};
 use thiserror::Error;
@@ -766,11 +767,28 @@ impl ServoNetworkAdapter {
         decision: &EgressDecision,
         resolved_target: &ResolvedTarget,
     ) -> Result<reqwest::blocking::Client, ServoNetworkError> {
+        self.client_for_with_proxy_resolver(decision, resolved_target, Self::resolve_proxy_endpoint)
+    }
+
+    fn client_for_with_proxy_resolver<F>(
+        &self,
+        decision: &EgressDecision,
+        resolved_target: &ResolvedTarget,
+        mut resolve_proxy: F,
+    ) -> Result<reqwest::blocking::Client, ServoNetworkError>
+    where
+        F: FnMut(&ProxyRoute, &ProxyEndpointTarget) -> Result<SocketAddr, ServoNetworkError>,
+    {
         let mut builder = reqwest::blocking::Client::builder()
             .timeout(self.timeout)
             .redirect(reqwest::redirect::Policy::none())
             .resolve_to_addrs(&resolved_target.host, &[resolved_target.socket]);
         if let EgressDecision::Proxied { proxy, .. } = decision {
+            let proxy_target = self.egress_policy.proxy_endpoint_target(proxy)?;
+            let proxy_socket = resolve_proxy(proxy, &proxy_target)?;
+            self.egress_policy
+                .enforce_proxy_resolved_socket(proxy, proxy_socket)?;
+            builder = builder.resolve_to_addrs(&proxy_target.host, &[proxy_socket]);
             let proxy = reqwest::Proxy::all(&proxy.endpoint)
                 .map_err(|error| ServoNetworkError::Proxy(error.to_string()))?;
             builder = builder.proxy(proxy);
@@ -778,6 +796,23 @@ impl ServoNetworkAdapter {
         builder
             .build()
             .map_err(|error| ServoNetworkError::ClientBuild(error.to_string()))
+    }
+
+    fn resolve_proxy_endpoint(
+        proxy: &ProxyRoute,
+        target: &ProxyEndpointTarget,
+    ) -> Result<SocketAddr, ServoNetworkError> {
+        (target.host.as_str(), target.port)
+            .to_socket_addrs()
+            .map_err(|error| ServoNetworkError::ResolveProxy {
+                proxy_id: proxy.id.clone(),
+                reason: error.to_string(),
+            })?
+            .next()
+            .ok_or_else(|| ServoNetworkError::ResolveProxy {
+                proxy_id: proxy.id.clone(),
+                reason: "host resolved to no socket addresses".into(),
+            })
     }
 
     fn send_request(
@@ -1064,6 +1099,8 @@ pub enum ServoNetworkError {
     ClientBuild(String),
     #[error("failed to configure proxy: {0}")]
     Proxy(String),
+    #[error("failed to resolve proxy {proxy_id}: {reason}")]
+    ResolveProxy { proxy_id: String, reason: String },
     #[error("failed to resolve request target {url}: {reason}")]
     ResolveTarget { url: String, reason: String },
     #[error("invalid redirect from {url}: {reason}")]
@@ -1139,6 +1176,7 @@ mod tests {
     use std::time::Duration as StdDuration;
     use tempo_driver::{DriverTrait, Engine, TestDriver};
     use tempo_engine_host::{serve_driver_connection, EngineIpcConnection};
+    use tempo_net::{BlockCode, DomainRule};
     use tempo_schema::{InteractiveElement, Provenance, TaintSpan};
 
     type TestResult = Result<(), Box<dyn Error>>;
@@ -1622,6 +1660,48 @@ mod tests {
             .ok_or_else(|| io::Error::other("expected egress policy failure"))?;
 
         assert!(matches!(error, ServoNetworkError::EgressDenied { .. }));
+        Ok(())
+    }
+
+    #[test]
+    fn servo_network_adapter_rejects_local_proxy_resolving_off_loopback() -> TestResult {
+        let adapter = ServoNetworkAdapter::new("profile-a", IdentityMode::AgentDeclared)
+            .with_url_policy(UrlPolicy::allow_all())
+            .with_egress_policy(
+                EgressPolicy::block_by_default()
+                    .allow_insecure_local_proxy_endpoints()
+                    .proxy_domain(
+                        DomainRule::exact("public.example"),
+                        ProxyRoute::new("local-proxy", "http://localhost:8080"),
+                    ),
+            );
+        let request = ServoNetworkRequest::new("req-1", "GET", "https://public.example/data");
+        let network_request =
+            request.to_network_request(&adapter.profile_id, adapter.identity_mode)?;
+        let decision = adapter
+            .egress_policy
+            .decide(&network_request)
+            .map_err(ServoNetworkError::from)?;
+
+        let error = adapter
+            .client_for_with_proxy_resolver(
+                &decision,
+                &ResolvedTarget {
+                    host: "public.example".into(),
+                    socket: SocketAddr::from(([93, 184, 216, 34], 443)),
+                },
+                |_, _| Ok(SocketAddr::from(([93, 184, 216, 34], 8080))),
+            )
+            .err()
+            .ok_or_else(|| io::Error::other("expected proxy resolved-socket policy failure"))?;
+
+        assert!(matches!(
+            error,
+            ServoNetworkError::Url(UrlBlocked {
+                reason
+            }) if reason.code == BlockCode::Localhost
+                && reason.detail.contains("proxy endpoint")
+        ));
         Ok(())
     }
 
