@@ -1,0 +1,63 @@
+{
+  "schema_version": "2.0.0",
+  "url": "https://shop.example/search?q=electronics",
+  "seq": 1,
+  "elements": [
+    {
+      "node_id": "search-input",
+      "role": "searchbox",
+      "name": [{ "provenance": "page", "text": "Search products" }],
+      "value": [{ "provenance": "page", "text": "electronics" }],
+      "bounds": [40.0, 20.0, 320.0, 36.0],
+      "rank": 0.9
+    },
+    {
+      "node_id": "sort-select",
+      "role": "combobox",
+      "name": [{ "provenance": "page", "text": "Sort by" }],
+      "value": [{ "provenance": "page", "text": "Relevance" }],
+      "bounds": [380.0, 20.0, 160.0, 36.0],
+      "rank": 0.55
+    },
+    {
+      "node_id": "in-stock-checkbox",
+      "role": "checkbox",
+      "name": [{ "provenance": "page", "text": "In stock only" }],
+      "value": [],
+      "bounds": [40.0, 80.0, 160.0, 24.0],
+      "rank": 0.5
+    },
+    {
+      "node_id": "add-to-cart-mouse",
+      "role": "button",
+      "name": [{ "provenance": "page", "text": "Add Wireless Mouse to cart" }],
+      "value": [],
+      "bounds": [40.0, 160.0, 220.0, 36.0],
+      "rank": 0.8
+    },
+    {
+      "node_id": "add-to-cart-keyboard",
+      "role": "button",
+      "name": [{ "provenance": "page", "text": "Add Mechanical Keyboard to cart" }],
+      "value": [],
+      "bounds": [40.0, 240.0, 220.0, 36.0],
+      "rank": 0.8
+    },
+    {
+      "node_id": "next-page-link",
+      "role": "link",
+      "name": [{ "provenance": "page", "text": "Next page" }],
+      "value": [],
+      "bounds": [40.0, 900.0, 100.0, 24.0],
+      "rank": 0.3
+    }
+  ],
+  "marks": [
+    ["search-input", 1],
+    ["sort-select", 2],
+    ["in-stock-checkbox", 3],
+    ["add-to-cart-mouse", 4],
+    ["add-to-cart-keyboard", 5],
+    ["next-page-link", 6]
+  ]
+}

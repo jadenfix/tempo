@@ -1,0 +1,26 @@
+[Start of page]
+[0]<a href=/>Example Shop home</a>
+[1]<a href=/shop>Shop</a>
+[2]<a href=/deals>Deals</a>
+[3]<a href=/account>My account</a>
+[4]<a href=/cart>Cart (2 items)</a>
+12 results for "electronics"
+[5]<input type=search value=electronics>Search products</input>
+[6]<select name=sort>Sort by</select>
+[7]<input type=checkbox>In stock only</input>
+Wireless Mouse
+4.5 out of 5 stars, 1,204 ratings
+$24.99
+Ergonomic wireless mouse with USB-C rechargeable battery.
+[8]<button data-sku=MOUSE-01>Add Wireless Mouse to cart</button>
+Mechanical Keyboard
+5 out of 5 stars, 812 ratings
+$89.99
+Hot-swappable mechanical keyboard with per-key RGB lighting.
+[9]<button data-sku=KEY-02>Add Mechanical Keyboard to cart</button>
+[10]<span role=link tabindex=0>Next page</span>
+[11]<a href=/about>About us</a>
+[12]<a href=/contact>Contact support</a>
+[13]<a href=/privacy>Privacy policy</a>
+[14]<a href=/faq>Shipping FAQ</a>
+[End of page]
