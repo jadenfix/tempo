@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
-use std::sync::{Condvar, Mutex};
+use std::sync::{Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -166,7 +166,11 @@ impl<D> DriverSlot<D> {
 
     fn take(&self, timeout: Duration) -> Result<D, LeaseError> {
         let deadline = Instant::now().checked_add(timeout);
-        let mut slot = self.slot.lock().map_err(|_| LeaseError::Poisoned)?;
+        // Recover poison (`into_inner`) rather than treat it as fatal: the
+        // guarded state is `Option<D>` with no invariant a panicking holder can
+        // break, and surfacing poison would wedge every later tool call behind a
+        // one-off panic. Same justification as [`OpGate`] in tempo-headless.
+        let mut slot = self.slot.lock().unwrap_or_else(PoisonError::into_inner);
         loop {
             if let Some(driver) = slot.take() {
                 return Ok(driver);
@@ -176,18 +180,18 @@ impl<D> DriverSlot<D> {
             else {
                 return Err(LeaseError::Busy);
             };
-            let (guard, _) = self
-                .returned
-                .wait_timeout(slot, remaining)
-                .map_err(|_| LeaseError::Poisoned)?;
-            slot = guard;
+            slot = match self.returned.wait_timeout(slot, remaining) {
+                Ok((guard, _)) => guard,
+                Err(poisoned) => poisoned.into_inner().0,
+            };
         }
     }
 
     fn put(&self, driver: D) {
-        if let Ok(mut slot) = self.slot.lock() {
-            *slot = Some(driver);
-        }
+        // Poison recovery (see `take`): dropping the driver on a poisoned lock
+        // would strand the slot empty and brick every later lease for the full
+        // lease timeout.
+        *self.slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(driver);
         self.returned.notify_one();
     }
 }
@@ -239,12 +243,10 @@ struct ForkRegisterRejection {
 
 impl ForkSlots {
     fn register(&self, forked: Box<dyn DriverTrait>) -> Result<String, ForkRegisterRejection> {
-        let Ok(mut map) = self.inner.lock() else {
-            return Err(ForkRegisterRejection {
-                forked,
-                reason: "MCP fork registry lock poisoned".into(),
-            });
-        };
+        // Recover poison (`into_inner`, as in `DriverSlot::take`): the guarded
+        // `ForkMap` has no invariant a panicking holder can break, so rejecting
+        // the fork here would leak its engine-side context needlessly.
+        let mut map = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         // Retirement, cap check, and registration are all atomic under the
         // registry lock: a fork either registers before the teardown snapshot
         // (and is closed by it) or is refused here (and closed by its caller).
@@ -282,7 +284,8 @@ impl ForkSlots {
         timeout: Duration,
     ) -> Result<Box<dyn DriverTrait>, LeaseError> {
         let deadline = Instant::now().checked_add(timeout);
-        let mut map = self.inner.lock().map_err(|_| LeaseError::Poisoned)?;
+        // Poison recovery, see `register`.
+        let mut map = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         loop {
             match map.entries.get_mut(driver_id) {
                 None => return Err(LeaseError::Unknown),
@@ -300,23 +303,24 @@ impl ForkSlots {
             else {
                 return Err(LeaseError::Busy);
             };
-            let (guard, _) = self
-                .returned
-                .wait_timeout(map, remaining)
-                .map_err(|_| LeaseError::Poisoned)?;
-            map = guard;
+            map = match self.returned.wait_timeout(map, remaining) {
+                Ok((guard, _)) => guard,
+                Err(poisoned) => poisoned.into_inner().0,
+            };
         }
     }
 
     fn restore(&self, driver_id: &str, driver: Box<dyn DriverTrait>) {
-        if let Ok(mut map) = self.inner.lock()
-            && let Some(entry) = map.entries.get_mut(driver_id)
-        {
+        // Poison recovery (see `register`): dropping the driver on a poisoned
+        // lock would leave the entry stuck `Leased`, so every later lease of
+        // this fork blocks the full lease timeout and then fails Busy.
+        let mut map = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(entry) = map.entries.get_mut(driver_id) {
             // `remove` waits for idle entries, so a leased entry is still
-            // present until it is restored here; a missing entry means the
-            // registry was poisoned, in which case the driver is dropped.
+            // present until it is restored here.
             *entry = ForkEntry::Idle(driver);
         }
+        drop(map);
         self.returned.notify_all();
     }
 
@@ -327,7 +331,8 @@ impl ForkSlots {
         timeout: Duration,
     ) -> Result<Box<dyn DriverTrait>, LeaseError> {
         let deadline = Instant::now().checked_add(timeout);
-        let mut map = self.inner.lock().map_err(|_| LeaseError::Poisoned)?;
+        // Poison recovery, see `register`.
+        let mut map = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         loop {
             match map.entries.get(driver_id) {
                 None => return Err(LeaseError::Unknown),
@@ -344,11 +349,10 @@ impl ForkSlots {
             else {
                 return Err(LeaseError::Busy);
             };
-            let (guard, _) = self
-                .returned
-                .wait_timeout(map, remaining)
-                .map_err(|_| LeaseError::Poisoned)?;
-            map = guard;
+            map = match self.returned.wait_timeout(map, remaining) {
+                Ok((guard, _)) => guard,
+                Err(poisoned) => poisoned.into_inner().0,
+            };
         }
     }
 
@@ -359,13 +363,11 @@ impl ForkSlots {
     /// [`TempoMcpServer::close_all_forks`]) or refused at registration
     /// (closed by the `fork` tool call itself).
     fn retire(&self) -> Vec<String> {
-        match self.inner.lock() {
-            Ok(mut map) => {
-                map.retired = true;
-                map.entries.keys().cloned().collect()
-            }
-            Err(_) => Vec::new(),
-        }
+        // Poison recovery (see `register`): returning an empty snapshot on
+        // poison would leak every live fork's engine-side context past teardown.
+        let mut map = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        map.retired = true;
+        map.entries.keys().cloned().collect()
     }
 }
 
@@ -1848,6 +1850,75 @@ mod tests {
         0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, b'I',
         b'E', b'N', b'D', 0xae, 0x42, 0x60, 0x82,
     ];
+
+    /// Poison a mutex by locking it on a thread that then panics; the guard's
+    /// drop during unwind marks the mutex poisoned. Panic output is suppressed
+    /// so the deliberate panic does not clutter the test log.
+    fn poison_via_panicking_holder<T: Send>(mutex: &Mutex<T>) {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        // The panic unwinds while the guard is held, so its drop marks the
+        // mutex poisoned; the scoped thread is joined here so the scope does
+        // not resume the panic.
+        let joined = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let _guard = mutex.lock().unwrap();
+                    panic!("poison the lease mutex");
+                })
+                .join()
+        });
+        std::panic::set_hook(prev);
+        assert!(joined.is_err(), "holder should have panicked");
+        assert!(mutex.is_poisoned(), "mutex should now be poisoned");
+    }
+
+    #[test]
+    fn poisoned_root_lease_slot_still_serves_the_driver() {
+        // #443: a panic that poisons the lease mutex must not brick the slot.
+        // The guarded `Option<D>` invariant survives the panic, so put/take
+        // recover via `into_inner` instead of dropping the driver (which would
+        // strand the slot empty and fail every later tool call with Busy).
+        let slot = DriverSlot::new(7u32);
+        poison_via_panicking_holder(&slot.slot);
+
+        let driver = slot
+            .take(Duration::from_millis(50))
+            .unwrap_or_else(|_| panic!("take must recover from poison, not surface it as error"));
+        assert_eq!(driver, 7);
+
+        // put must return the driver rather than drop it on the poisoned lock...
+        slot.put(driver);
+        let again = slot
+            .take(Duration::from_millis(50))
+            .unwrap_or_else(|_| panic!("driver must still be leasable after put on poisoned slot"));
+        assert_eq!(again, 7);
+    }
+
+    #[test]
+    fn poisoned_fork_registry_still_leases_and_restores() {
+        // #443 (same defect in `ForkSlots::restore`): a poisoned registry must
+        // still lease and restore forks instead of dropping the driver and
+        // stranding the entry `Leased` forever.
+        let slots = ForkSlots::default();
+        let driver_id = slots
+            .register(Box::new(MemoryDriver::new()))
+            .unwrap_or_else(|rejection| panic!("register failed: {}", rejection.reason));
+
+        poison_via_panicking_holder(&slots.inner);
+
+        let driver = slots
+            .lease(&driver_id, Duration::from_millis(50))
+            .unwrap_or_else(|_| panic!("lease must recover from poison"));
+        slots.restore(&driver_id, driver);
+
+        let again = slots
+            .lease(&driver_id, Duration::from_millis(50))
+            .unwrap_or_else(|_| {
+                panic!("fork must still be leasable after restore on poisoned map")
+            });
+        slots.restore(&driver_id, again);
+    }
 
     #[tokio::test]
     async fn initialize_and_tool_list_follow_mcp_shape() -> Result<(), String> {
