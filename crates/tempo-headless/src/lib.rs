@@ -3049,7 +3049,7 @@ fn route_session_act_batch(
 ) -> Result<HttpResponse, TempodError> {
     let (mut driver, request_fingerprint, idempotency_key, policy) = {
         let mut pool = lock_pool(pool)?;
-        let policy = enforce_session_batch_policy(&pool.url_policy, &body)?;
+        let policy = enforce_session_batch_policy(&pool.url_policy, pool.privacy_mode, &body)?;
         let request_fingerprint = session_act_batch_idempotency_fingerprint(&body);
         if let Some(key) = body.idempotency_key.as_deref()
             && let Some(response) =
@@ -3117,6 +3117,7 @@ fn reject_explicit_null_field(value: &JsonValue, field: &'static str) -> Result<
 
 fn enforce_session_batch_policy(
     policy: &UrlPolicy,
+    privacy_mode: PrivacyMode,
     body: &SessionActBatchRequest,
 ) -> Result<SessionBatchPolicyReport, TempodError> {
     if let Some(key) = body.idempotency_key.as_deref() {
@@ -3148,8 +3149,11 @@ fn enforce_session_batch_policy(
         strongest_gate: ConfirmationGate::None,
         confirmation_required: false,
         confirmed: body.confirmed,
+        confirmed_effective: body.confirmed,
+        confirmed_claim_ignored: false,
         idempotency_required: false,
         idempotency_key_provided: body.idempotency_key.is_some(),
+        idempotency_cache_retained: privacy_mode.retains_idempotency_cache(),
     };
     let mut first_confirmation_index = None;
     let mut first_idempotency_index = None;
@@ -3168,10 +3172,14 @@ fn enforce_session_batch_policy(
             first_idempotency_index.get_or_insert(index);
         }
     }
-    let missing_confirmation = report.confirmation_required && !body.confirmed;
-    let missing_idempotency = report.idempotency_required && body.idempotency_key.is_none();
-    if missing_confirmation || missing_idempotency {
-        let denied_action_index = match (missing_confirmation, missing_idempotency) {
+    report.confirmed_claim_ignored = report.confirmation_required && body.confirmed;
+    report.confirmed_effective = body.confirmed && !report.confirmed_claim_ignored;
+    let missing_confirmation = report.confirmation_required && !report.confirmed_effective;
+    let missing_idempotency_key = report.idempotency_required && body.idempotency_key.is_none();
+    let idempotency_unavailable = report.idempotency_required && !report.idempotency_cache_retained;
+    let ineffective_idempotency = missing_idempotency_key || idempotency_unavailable;
+    if missing_confirmation || ineffective_idempotency {
+        let denied_action_index = match (missing_confirmation, ineffective_idempotency) {
             (true, true) => match (first_confirmation_index, first_idempotency_index) {
                 (Some(confirmation_index), Some(idempotency_index)) => {
                     confirmation_index.min(idempotency_index)
@@ -3190,12 +3198,20 @@ fn enforce_session_batch_policy(
             .get(denied_action_index)
             .map(action_kind)
             .unwrap_or("batch");
-        let reason = match (missing_confirmation, missing_idempotency) {
-            (true, true) => {
-                "requires human confirmation and idempotency_key before execution".to_string()
-            }
-            (true, false) => "requires human confirmation before execution".to_string(),
-            (false, true) => "requires idempotency_key before execution".to_string(),
+        let confirmation_reason = if report.confirmed_claim_ignored {
+            "requires server-attributable confirmation before execution; confirmed=true was ignored"
+        } else {
+            "requires human confirmation before execution"
+        };
+        let idempotency_reason = if idempotency_unavailable {
+            "requires retained idempotency replay state before execution; stealth mode disables the idempotency cache"
+        } else {
+            "requires idempotency_key before execution"
+        };
+        let reason = match (missing_confirmation, ineffective_idempotency) {
+            (true, true) => format!("{confirmation_reason}; also {idempotency_reason}"),
+            (true, false) => confirmation_reason.to_string(),
+            (false, true) => idempotency_reason.to_string(),
             (false, false) => unreachable!("policy denial requires at least one reason"),
         };
         return Err(TempodError::PolicyDenied(Box::new(PolicyDeniedError {
@@ -3354,8 +3370,11 @@ struct SessionBatchPolicyReport {
     strongest_gate: ConfirmationGate,
     confirmation_required: bool,
     confirmed: bool,
+    confirmed_effective: bool,
+    confirmed_claim_ignored: bool,
     idempotency_required: bool,
     idempotency_key_provided: bool,
+    idempotency_cache_retained: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3424,8 +3443,11 @@ fn session_batch_policy_json(policy: &SessionBatchPolicyReport) -> JsonValue {
         "strongest_gate": confirmation_gate_name(policy.strongest_gate),
         "confirmation_required": policy.confirmation_required,
         "confirmed": policy.confirmed,
+        "confirmed_effective": policy.confirmed_effective,
+        "confirmed_claim_ignored": policy.confirmed_claim_ignored,
         "idempotency_required": policy.idempotency_required,
         "idempotency_key_provided": policy.idempotency_key_provided,
+        "idempotency_cache_retained": policy.idempotency_cache_retained,
     })
 }
 
@@ -4536,6 +4558,13 @@ mod tests {
         with_shared_pool(pool, |shared| super::route_bidi_driver(shared, id, command))
     }
 
+    fn discard_unserved_attached_engine(pool: &mut SessionPool) {
+        pool.session_drivers.clear();
+        pool.bidi_contexts.clear();
+        pool.mcp = None;
+        pool.driver = None;
+    }
+
     #[test]
     fn session_pool_create_list_adopt_kill_and_drain() -> TestResult {
         let mut pool = SessionPool::default();
@@ -4549,6 +4578,99 @@ mod tests {
         assert_eq!(adopted.state, TempodSessionState::Adopted);
         assert_eq!(killed.state, TempodSessionState::Killed);
         assert!(pool.draining());
+        Ok(())
+    }
+
+    #[test]
+    fn session_act_batch_ignores_caller_confirmed_for_external_writes() -> TestResult {
+        let (client_stream, mut server_stream) = UnixStream::pair()?;
+        server_stream.set_nonblocking(true)?;
+        let mut pool = SessionPool::default();
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream))?;
+        let session_driver = pool
+            .driver
+            .clone()
+            .ok_or("attached engine driver should be present")?;
+        let session = pool.finish_create("https://rest-policy.test".into(), Some(session_driver));
+        let body = br#"{
+            "batch": {
+                "actions": [{"kind": "click", "node": "button-primary"}],
+                "quiescence": "composite"
+            },
+            "input_tainted": false,
+            "confirmed": true,
+            "idempotency_key": "click-once"
+        }"#;
+
+        let response = handle_http_request(
+            &mut pool,
+            control_request(
+                "POST",
+                &format!("/sessions/{}/act_batch", session.id.0),
+                None,
+                body,
+            ),
+        );
+
+        assert_eq!(response.status, 403);
+        let value: Value = serde_json::from_slice(&response.body)?;
+        assert_eq!(value["denied_action_kind"], "click");
+        assert_eq!(value["policy"]["confirmed"], true);
+        assert_eq!(value["policy"]["confirmed_effective"], false);
+        assert_eq!(value["policy"]["confirmed_claim_ignored"], true);
+        assert!(value["reason"]
+            .as_str()
+            .ok_or("policy denial should include a reason")?
+            .contains("confirmed=true was ignored"));
+        assert_no_driver_ipc(&mut server_stream)?;
+        discard_unserved_attached_engine(&mut pool);
+        Ok(())
+    }
+
+    #[test]
+    fn stealth_session_act_batch_rejects_uncacheable_idempotency_required_actions() -> TestResult {
+        let (client_stream, mut server_stream) = UnixStream::pair()?;
+        server_stream.set_nonblocking(true)?;
+        let mut pool = SessionPool::default().with_privacy_mode(PrivacyMode::Stealth);
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream))?;
+        let session_driver = pool
+            .driver
+            .clone()
+            .ok_or("attached engine driver should be present")?;
+        let session =
+            pool.finish_create("https://stealth-policy.test".into(), Some(session_driver));
+        let body = br#"{
+            "batch": {
+                "actions": [{"kind": "click", "node": "stealth-button"}],
+                "quiescence": "composite"
+            },
+            "input_tainted": false,
+            "confirmed": true,
+            "idempotency_key": "stealth-click-once"
+        }"#;
+
+        let response = handle_http_request(
+            &mut pool,
+            control_request(
+                "POST",
+                &format!("/sessions/{}/act_batch", session.id.0),
+                None,
+                body,
+            ),
+        );
+
+        assert_eq!(response.status, 403);
+        let value: Value = serde_json::from_slice(&response.body)?;
+        assert_eq!(value["denied_action_kind"], "click");
+        assert_eq!(value["policy"]["idempotency_required"], true);
+        assert_eq!(value["policy"]["idempotency_key_provided"], true);
+        assert_eq!(value["policy"]["idempotency_cache_retained"], false);
+        assert!(value["reason"]
+            .as_str()
+            .ok_or("policy denial should include a reason")?
+            .contains("stealth mode disables the idempotency cache"));
+        assert_no_driver_ipc(&mut server_stream)?;
+        discard_unserved_attached_engine(&mut pool);
         Ok(())
     }
 
