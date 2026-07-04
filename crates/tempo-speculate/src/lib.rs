@@ -12,8 +12,9 @@ use tempo_act::{execute_action, execute_batch, ActionExecution, ExecutionStatus}
 use tempo_driver::{DriverTrait, Engine, TransportError, Unsupported};
 use tempo_schema::{Action, ActionBatch, ObservationDiff};
 use tempo_session::{
-    read_cassettes, read_journal_entries, CassetteKey, JournalEntry, JournalError, JournalEvent,
-    ResponseCassette,
+    durable_retention_policy_from_env, read_cassettes_with_retention_policy,
+    read_journal_entries_with_retention_policy, CassetteKey, DurableRetentionPolicy, JournalEntry,
+    JournalError, JournalEvent, ResponseCassette,
 };
 use thiserror::Error;
 
@@ -52,10 +53,38 @@ impl ReplayForkPlan {
         cassette_path: impl AsRef<Path>,
         branches: Vec<BranchRequest>,
     ) -> Result<Self, SpeculateError> {
+        let retention_policy = durable_retention_policy_from_env()?;
+        Self::from_paths_with_retention_policy(
+            journal_path,
+            cassette_path,
+            branches,
+            &retention_policy,
+        )
+    }
+
+    pub fn from_paths_plaintext_unsafe(
+        journal_path: impl AsRef<Path>,
+        cassette_path: impl AsRef<Path>,
+        branches: Vec<BranchRequest>,
+    ) -> Result<Self, SpeculateError> {
+        Self::from_paths_with_retention_policy(
+            journal_path,
+            cassette_path,
+            branches,
+            &DurableRetentionPolicy::PlaintextUnsafe,
+        )
+    }
+
+    pub fn from_paths_with_retention_policy(
+        journal_path: impl AsRef<Path>,
+        cassette_path: impl AsRef<Path>,
+        branches: Vec<BranchRequest>,
+        retention_policy: &DurableRetentionPolicy,
+    ) -> Result<Self, SpeculateError> {
         let journal_path = journal_path.as_ref().to_path_buf();
         let cassette_path = cassette_path.as_ref().to_path_buf();
-        let entries = read_journal_entries(&journal_path)?;
-        let cassettes = read_cassettes(&cassette_path)?;
+        let entries = read_journal_entries_with_retention_policy(&journal_path, retention_policy)?;
+        let cassettes = read_cassettes_with_retention_policy(&cassette_path, retention_policy)?;
         Self::from_records(journal_path, cassette_path, entries, cassettes, branches)
     }
 
@@ -693,7 +722,10 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
     use tempo_driver::TestDriver;
     use tempo_schema::QuiescencePolicy;
-    use tempo_session::{CassetteStore, RunId, SessionId, SessionJournal};
+    use tempo_session::{
+        CassetteStore, DurableEncryptionKey, DurableRetentionPolicy, RunId, SessionId,
+        SessionJournal,
+    };
 
     type TestResult = Result<(), Box<dyn Error>>;
 
@@ -740,7 +772,11 @@ mod tests {
                 node: tempo_schema::NodeId("buy".into()),
             },
         );
-        let plan = ReplayForkPlan::from_paths(&journal_path, &cassette_path, vec![branch])?;
+        let plan = ReplayForkPlan::from_paths_plaintext_unsafe(
+            &journal_path,
+            &cassette_path,
+            vec![branch],
+        )?;
 
         assert_eq!(plan.branches.len(), 1);
         assert_eq!(plan.start_url, "https://example.com");
@@ -753,6 +789,55 @@ mod tests {
                 diff,
             }]
         );
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn replay_plan_loads_encrypted_journal_and_cassettes_from_disk() -> TestResult {
+        let root = unique_dir("encrypted-plan")?;
+        remove_dir_if_exists(&root)?;
+        fs::create_dir_all(&root)?;
+        let journal_path = root.join("session.jsonl");
+        let cassette_path = root.join("cassettes.jsonl");
+        let retention_policy =
+            DurableRetentionPolicy::encrypted(DurableEncryptionKey::from_bytes([21; 32]));
+
+        let cassette = ResponseCassette::new(
+            "GET",
+            "https://example.com/private?token=secret",
+            200,
+            vec![("set-cookie".into(), "session=secret".into())],
+            b"secret-body".to_vec(),
+        );
+        let cassette_store =
+            CassetteStore::open_with_retention_policy(&cassette_path, retention_policy.clone())?;
+        cassette_store.record(&cassette)?;
+
+        let mut journal = SessionJournal::open_with_retention_policy(
+            &journal_path,
+            RunId("run".into()),
+            SessionId("session".into()),
+            retention_policy.clone(),
+        )?;
+        journal.append(JournalEvent::SessionStarted {
+            url: "https://example.com".into(),
+        })?;
+        journal.append(JournalEvent::CassetteRecorded {
+            key: cassette.key.clone(),
+        })?;
+        drop(journal);
+
+        let plan = ReplayForkPlan::from_paths_with_retention_policy(
+            &journal_path,
+            &cassette_path,
+            vec![branch("branch-a", Action::Scroll { x: 0.0, y: 1.0 })],
+            &retention_policy,
+        )?;
+
+        assert_eq!(plan.start_url, "https://example.com");
+        assert_eq!(plan.branches[0].cassettes, vec![cassette]);
 
         remove_dir_if_exists(&root)?;
         Ok(())
@@ -778,7 +863,7 @@ mod tests {
         })?;
         journal.append(JournalEvent::CassetteRecorded { key: key.clone() })?;
 
-        let err = ReplayForkPlan::from_paths(
+        let err = ReplayForkPlan::from_paths_plaintext_unsafe(
             &journal_path,
             &cassette_path,
             vec![branch("branch-a", Action::Scroll { x: 0.0, y: 1.0 })],
@@ -805,7 +890,7 @@ mod tests {
         )?;
         journal.append(JournalEvent::SessionClosed)?;
 
-        let err = ReplayForkPlan::from_paths(
+        let err = ReplayForkPlan::from_paths_plaintext_unsafe(
             &journal_path,
             &cassette_path,
             vec![branch("branch-a", Action::Scroll { x: 0.0, y: 1.0 })],

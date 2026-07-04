@@ -17,7 +17,8 @@ use tempo_policy::{
 };
 use tempo_schema::{Action, ActionBatch, CompiledObservation, ObservationDiff, SideEffect};
 use tempo_session::{
-    read_journal_entries, JournalEntry, JournalError, JournalEvent, RunId, SessionId,
+    durable_retention_policy_from_env, read_journal_entries_with_retention_policy,
+    DurableRetentionPolicy, JournalEntry, JournalError, JournalEvent, RunId, SessionId,
     SessionJournal,
 };
 use tempo_skills::{SkillError, SkillStore};
@@ -385,9 +386,50 @@ impl AgentLoop {
         plan: TaskPlan,
         budget: TokenBudget,
     ) -> Result<Self, AgentError> {
+        let retention_policy = durable_retention_policy_from_env()?;
+        Self::open_with_retention_policy(
+            journal_path,
+            run_id,
+            session_id,
+            plan,
+            budget,
+            retention_policy,
+        )
+    }
+
+    pub fn open_plaintext_unsafe(
+        journal_path: impl AsRef<Path>,
+        run_id: RunId,
+        session_id: SessionId,
+        plan: TaskPlan,
+        budget: TokenBudget,
+    ) -> Result<Self, AgentError> {
+        Self::open_with_retention_policy(
+            journal_path,
+            run_id,
+            session_id,
+            plan,
+            budget,
+            DurableRetentionPolicy::PlaintextUnsafe,
+        )
+    }
+
+    pub fn open_with_retention_policy(
+        journal_path: impl AsRef<Path>,
+        run_id: RunId,
+        session_id: SessionId,
+        plan: TaskPlan,
+        budget: TokenBudget,
+        retention_policy: DurableRetentionPolicy,
+    ) -> Result<Self, AgentError> {
         let journal_path = journal_path.as_ref().to_path_buf();
-        let journal = SessionJournal::open(&journal_path, run_id, session_id)?;
-        let entries = read_journal_entries(&journal_path)?;
+        let journal = SessionJournal::open_with_retention_policy(
+            &journal_path,
+            run_id,
+            session_id,
+            retention_policy.clone(),
+        )?;
+        let entries = read_journal_entries_with_retention_policy(&journal_path, &retention_policy)?;
         let cursor = ResumeCursor::from_entries(&plan, &entries)?;
         let mut budget = TokenBudget::new(budget.max_tokens);
         restore_completed_token_budget(&plan, cursor.completed_steps, &mut budget)?;
@@ -724,6 +766,7 @@ pub struct AgentRunner {
     skill_store_root: Option<PathBuf>,
     origin_policy: OriginPolicy,
     structured_fast_path: StructuredFastPath,
+    retention_policy: Option<DurableRetentionPolicy>,
 }
 
 impl AgentRunner {
@@ -737,7 +780,12 @@ impl AgentRunner {
             skill_store_root: None,
             origin_policy: OriginPolicy::default(),
             structured_fast_path: StructuredFastPath::disabled(),
+            retention_policy: None,
         }
+    }
+
+    pub fn new_plaintext_unsafe(journal_path: impl AsRef<Path>, ids: AgentRunIds) -> Self {
+        Self::new(journal_path, ids).with_retention_policy(DurableRetentionPolicy::PlaintextUnsafe)
     }
 
     pub fn with_token_budget(mut self, token_budget: TokenBudget) -> Self {
@@ -767,6 +815,11 @@ impl AgentRunner {
 
     pub fn with_structured_fast_path(mut self, structured_fast_path: StructuredFastPath) -> Self {
         self.structured_fast_path = structured_fast_path;
+        self
+    }
+
+    pub fn with_retention_policy(mut self, retention_policy: DurableRetentionPolicy) -> Self {
+        self.retention_policy = Some(retention_policy);
         self
     }
 
@@ -994,14 +1047,17 @@ impl AgentRunner {
         task: &DriverTask,
     ) -> Result<(AgentLoop, Vec<JournalEntry>, AgentRunReport), AgentError> {
         let plan = task.task_plan()?;
-        let agent = AgentLoop::open(
+        let retention_policy = self.resolved_retention_policy()?;
+        let agent = AgentLoop::open_with_retention_policy(
             &self.journal_path,
             self.ids.run_id.clone(),
             self.ids.session_id.clone(),
             plan,
             self.token_budget.clone(),
+            retention_policy.clone(),
         )?;
-        let initial_entries = read_journal_entries(agent.journal_path())?;
+        let initial_entries =
+            read_journal_entries_with_retention_policy(agent.journal_path(), &retention_policy)?;
         let report = AgentRunReport::new(
             engine,
             agent.journal_path().to_path_buf(),
@@ -1009,6 +1065,13 @@ impl AgentRunner {
             agent.cursor().completed_steps,
         );
         Ok((agent, initial_entries, report))
+    }
+
+    fn resolved_retention_policy(&self) -> Result<DurableRetentionPolicy, AgentError> {
+        match &self.retention_policy {
+            Some(retention_policy) => Ok(retention_policy.clone()),
+            None => Ok(durable_retention_policy_from_env()?),
+        }
     }
 
     fn apply_resume_terminal_status(&self, agent: &AgentLoop, report: &mut AgentRunReport) -> bool {
@@ -1562,7 +1625,27 @@ pub fn step_triples_from_journal(
     journal_path: impl AsRef<Path>,
     plan: &TaskPlan,
 ) -> Result<Vec<StepTriple>, AgentError> {
-    let entries = read_journal_entries(journal_path)?;
+    let retention_policy = durable_retention_policy_from_env()?;
+    step_triples_from_journal_with_retention_policy(journal_path, plan, &retention_policy)
+}
+
+pub fn step_triples_from_journal_plaintext_unsafe(
+    journal_path: impl AsRef<Path>,
+    plan: &TaskPlan,
+) -> Result<Vec<StepTriple>, AgentError> {
+    step_triples_from_journal_with_retention_policy(
+        journal_path,
+        plan,
+        &DurableRetentionPolicy::PlaintextUnsafe,
+    )
+}
+
+pub fn step_triples_from_journal_with_retention_policy(
+    journal_path: impl AsRef<Path>,
+    plan: &TaskPlan,
+    retention_policy: &DurableRetentionPolicy,
+) -> Result<Vec<StepTriple>, AgentError> {
+    let entries = read_journal_entries_with_retention_policy(journal_path, retention_policy)?;
     let mut triples = Vec::new();
     let mut step_index = 0_usize;
 
@@ -1635,7 +1718,24 @@ pub fn step_triples_from_journal_entries(
 pub fn step_triples_from_journal_without_plan(
     journal_path: impl AsRef<Path>,
 ) -> Result<Vec<StepTriple>, AgentError> {
-    let entries = read_journal_entries(journal_path)?;
+    let retention_policy = durable_retention_policy_from_env()?;
+    step_triples_from_journal_without_plan_with_retention_policy(journal_path, &retention_policy)
+}
+
+pub fn step_triples_from_journal_without_plan_plaintext_unsafe(
+    journal_path: impl AsRef<Path>,
+) -> Result<Vec<StepTriple>, AgentError> {
+    step_triples_from_journal_without_plan_with_retention_policy(
+        journal_path,
+        &DurableRetentionPolicy::PlaintextUnsafe,
+    )
+}
+
+pub fn step_triples_from_journal_without_plan_with_retention_policy(
+    journal_path: impl AsRef<Path>,
+    retention_policy: &DurableRetentionPolicy,
+) -> Result<Vec<StepTriple>, AgentError> {
+    let entries = read_journal_entries_with_retention_policy(journal_path, retention_policy)?;
     step_triples_from_journal_entries(&entries)
 }
 
@@ -2133,6 +2233,7 @@ mod tests {
     use tempo_schema::{
         InteractiveElement, NodeId, ObservationDiff, Provenance, QuiescencePolicy, TaintSpan,
     };
+    use tempo_session::{read_journal_entries, DurableEncryptionKey};
     use tempo_skills::{ActionTemplate, SkillDefinition, SkillInput, SkillStore, TemplateString};
 
     type TestResult = Result<(), Box<dyn Error>>;
@@ -2200,7 +2301,7 @@ mod tests {
         fs::create_dir_all(&root)?;
         let journal_path = root.join("session.jsonl");
         let plan = TaskPlan::from_actions(vec![Action::Scroll { x: 0.0, y: 32.0 }], 12)?;
-        let mut agent = AgentLoop::open(
+        let mut agent = AgentLoop::open_plaintext_unsafe(
             &journal_path,
             RunId("run".into()),
             SessionId("session".into()),
@@ -2210,7 +2311,7 @@ mod tests {
 
         let triple = agent.record_next_outcome(StepOutcome::Applied { diff: diff(0, 1) })?;
         let entries = read_journal_entries(&journal_path)?;
-        let triples = step_triples_from_journal(&journal_path, &plan)?;
+        let triples = step_triples_from_journal_plaintext_unsafe(&journal_path, &plan)?;
 
         assert_eq!(entries.len(), 2);
         assert!(matches!(
@@ -2261,7 +2362,7 @@ mod tests {
 
         let entries = read_journal_entries(&journal_path)?;
         let triples = step_triples_from_journal_entries(&entries)?;
-        let path_triples = step_triples_from_journal_without_plan(&journal_path)?;
+        let path_triples = step_triples_from_journal_without_plan_plaintext_unsafe(&journal_path)?;
 
         assert_eq!(triples, path_triples);
         assert_eq!(triples.len(), 2);
@@ -2307,7 +2408,7 @@ mod tests {
         journal.append(JournalEvent::ActionPlanned { action: pending })?;
         drop(journal);
 
-        let triples = step_triples_from_journal_without_plan(&journal_path)?;
+        let triples = step_triples_from_journal_without_plan_plaintext_unsafe(&journal_path)?;
 
         assert_eq!(triples.len(), 1);
         assert_eq!(triples[0].key, IdempotencyKey::for_action(0, &completed)?);
@@ -2343,7 +2444,7 @@ mod tests {
         })?;
         drop(journal);
 
-        let mut agent = AgentLoop::open(
+        let mut agent = AgentLoop::open_plaintext_unsafe(
             &journal_path,
             RunId("run".into()),
             SessionId("session".into()),
@@ -2393,7 +2494,7 @@ mod tests {
         drop(journal);
 
         assert!(matches!(
-            AgentLoop::open(
+            AgentLoop::open_plaintext_unsafe(
                 &journal_path,
                 RunId("run".into()),
                 SessionId("session".into()),
@@ -2432,7 +2533,7 @@ mod tests {
         })?;
         drop(journal);
 
-        let agent = AgentLoop::open(
+        let agent = AgentLoop::open_plaintext_unsafe(
             &journal_path,
             RunId("run".into()),
             SessionId("session".into()),
@@ -2469,7 +2570,7 @@ mod tests {
         })?;
         drop(journal);
 
-        let agent = AgentLoop::open(
+        let agent = AgentLoop::open_plaintext_unsafe(
             &journal_path,
             RunId("run".into()),
             SessionId("session".into()),
@@ -2511,7 +2612,7 @@ mod tests {
         journal.append(JournalEvent::ActionPlanned { action: second })?;
         drop(journal);
 
-        let mut agent = AgentLoop::open(
+        let mut agent = AgentLoop::open_plaintext_unsafe(
             &journal_path,
             RunId("run".into()),
             SessionId("session".into()),
@@ -2549,7 +2650,7 @@ mod tests {
         drop(journal);
 
         assert!(matches!(
-            AgentLoop::open(
+            AgentLoop::open_plaintext_unsafe(
                 &journal_path,
                 RunId("run".into()),
                 SessionId("session".into()),
@@ -2572,7 +2673,7 @@ mod tests {
         let action = Action::Scroll { x: 0.0, y: 4.0 };
         let plan = TaskPlan::from_actions(vec![action], 1)?;
         let expected = plan.steps[0].key.clone();
-        let mut agent = AgentLoop::open(
+        let mut agent = AgentLoop::open_plaintext_unsafe(
             &journal_path,
             RunId("run".into()),
             SessionId("session".into()),
@@ -2601,7 +2702,7 @@ mod tests {
             }],
         );
         let mut driver = TestDriver::new().with_elements(vec![button("submit")]);
-        let runner = AgentRunner::new(
+        let runner = AgentRunner::new_plaintext_unsafe(
             &journal_path,
             AgentRunIds::new("run-test-driver", "session-test-driver"),
         );
@@ -2633,6 +2734,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runner_writes_encrypted_journal_when_retention_policy_is_secure() -> TestResult {
+        let root = unique_dir("runner-encrypted")?;
+        remove_dir_if_exists(&root)?;
+        fs::create_dir_all(&root)?;
+        let journal_path = root.join("session.jsonl");
+        let retention_policy =
+            DurableRetentionPolicy::encrypted(DurableEncryptionKey::from_bytes([42; 32]));
+        let task = DriverTask::new(
+            "https://example.com/private?token=secret",
+            vec![Action::Click {
+                node: NodeId("submit".into()),
+            }],
+        );
+        let mut driver = TestDriver::new().with_elements(vec![button("submit")]);
+        let runner = AgentRunner::new(
+            &journal_path,
+            AgentRunIds::new("run-encrypted", "session-encrypted"),
+        )
+        .with_retention_policy(retention_policy.clone());
+
+        let report = runner.run_driver_task(&mut driver, &task).await?;
+
+        assert_eq!(report.status, AgentRunStatus::Completed);
+        assert!(matches!(
+            read_journal_entries(&journal_path),
+            Err(JournalError::EncryptedRecordRequiresKey)
+        ));
+        let entries = read_journal_entries_with_retention_policy(&journal_path, &retention_policy)?;
+        assert!(entries
+            .iter()
+            .any(|entry| matches!(entry.event, JournalEvent::StepApplied { .. })));
+        let bytes = fs::read(&journal_path)?;
+        assert!(!contains_bytes(&bytes, b"token=secret"));
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn runner_structured_fast_path_executes_remote_mcp_skill_without_navigation() -> TestResult
     {
         let root = unique_dir("runner-structured-fast-path")?;
@@ -2648,7 +2788,7 @@ mod tests {
             }],
         );
         let mut driver = FailingDriver::new(TransportFailurePoint::Goto);
-        let runner = AgentRunner::new(
+        let runner = AgentRunner::new_plaintext_unsafe(
             &journal_path,
             AgentRunIds::new("run-structured", "session-structured"),
         )
@@ -2709,7 +2849,7 @@ mod tests {
             }],
         );
         let mut driver = FailingDriver::new(TransportFailurePoint::Goto);
-        let runner = AgentRunner::new(
+        let runner = AgentRunner::new_plaintext_unsafe(
             &journal_path,
             AgentRunIds::new("run-structured-policy", "session-structured-policy"),
         )
@@ -2764,7 +2904,7 @@ mod tests {
         drop(journal);
 
         let mut driver = FailingDriver::new(TransportFailurePoint::Goto);
-        let runner = AgentRunner::new(
+        let runner = AgentRunner::new_plaintext_unsafe(
             &journal_path,
             AgentRunIds::new("run-structured-resume", "session-structured-resume"),
         )
@@ -2809,7 +2949,7 @@ mod tests {
             }],
         );
         let mut driver = FailingDriver::new(TransportFailurePoint::Goto);
-        let runner = AgentRunner::new(
+        let runner = AgentRunner::new_plaintext_unsafe(
             &journal_path,
             AgentRunIds::new("run-structured-fallback", "session-structured-fallback"),
         )
@@ -2847,7 +2987,7 @@ mod tests {
         let journal_path = root.join("session.jsonl");
         let task = DriverTask::new("https://render.example/app", vec![]);
         let mut driver = FailingDriver::new(TransportFailurePoint::PostActionObserve);
-        let runner = AgentRunner::new(
+        let runner = AgentRunner::new_plaintext_unsafe(
             &journal_path,
             AgentRunIds::new("run-render", "session-render"),
         )
@@ -2871,7 +3011,7 @@ mod tests {
         let journal_path = root.join("session.jsonl");
         let task = DriverTask::new("https://example.com", vec![]);
         let mut driver = FailingDriver::new(TransportFailurePoint::Goto);
-        let runner = AgentRunner::new(
+        let runner = AgentRunner::new_plaintext_unsafe(
             &journal_path,
             AgentRunIds::new("run-transport-goto", "session-transport-goto"),
         );
@@ -2911,7 +3051,7 @@ mod tests {
         );
         let mut driver =
             FailingDriver::new(TransportFailurePoint::Act).with_elements(vec![button("submit")]);
-        let runner = AgentRunner::new(
+        let runner = AgentRunner::new_plaintext_unsafe(
             &journal_path,
             AgentRunIds::new("run-transport-action", "session-transport-action"),
         );
@@ -2959,7 +3099,7 @@ mod tests {
         );
         let mut driver = FailingDriver::new(TransportFailurePoint::PostActionObserve)
             .with_elements(vec![button("submit")]);
-        let runner = AgentRunner::new(
+        let runner = AgentRunner::new_plaintext_unsafe(
             &journal_path,
             AgentRunIds::new(
                 "run-transport-post-observe",
@@ -3013,7 +3153,7 @@ mod tests {
         };
         let task = DriverTask::new("https://example.com", vec![skill_action.clone()]);
         let mut driver = TestDriver::new().with_elements(vec![button("submit")]);
-        let runner = AgentRunner::new(
+        let runner = AgentRunner::new_plaintext_unsafe(
             &journal_path,
             AgentRunIds::new("run-skill", "session-skill"),
         )
@@ -3059,7 +3199,7 @@ mod tests {
         };
         let task = DriverTask::new("https://example.com", vec![skill_action]);
         let mut driver = TestDriver::new().with_elements(vec![button("submit")]);
-        let runner = AgentRunner::new(
+        let runner = AgentRunner::new_plaintext_unsafe(
             &journal_path,
             AgentRunIds::new("run-purchase-skill-policy", "session-purchase-skill-policy"),
         )
@@ -3101,7 +3241,7 @@ mod tests {
             }],
         );
         let mut driver = TestDriver::new().with_elements(vec![button("submit")]);
-        let runner = AgentRunner::new(
+        let runner = AgentRunner::new_plaintext_unsafe(
             &journal_path,
             AgentRunIds::new("run-missing-skill-store", "session-missing-skill-store"),
         );
@@ -3132,7 +3272,7 @@ mod tests {
         let ids = AgentRunIds::new("run-resume", "session-resume");
 
         let mut first_driver = TestDriver::new().with_elements(vec![button("submit")]);
-        let first_runner = AgentRunner::new(&journal_path, ids.clone());
+        let first_runner = AgentRunner::new_plaintext_unsafe(&journal_path, ids.clone());
         let first = first_runner
             .run_driver_task(&mut first_driver, &task)
             .await?;
@@ -3140,7 +3280,7 @@ mod tests {
         let entry_count = read_journal_entries(&journal_path)?.len();
 
         let mut second_driver = TestDriver::new().with_elements(vec![button("submit")]);
-        let second_runner = AgentRunner::new(&journal_path, ids);
+        let second_runner = AgentRunner::new_plaintext_unsafe(&journal_path, ids);
         let second = second_runner
             .run_driver_task(&mut second_driver, &task)
             .await?;
@@ -3165,7 +3305,7 @@ mod tests {
             })],
         );
         let mut driver = TestDriver::new().with_elements(vec![button("submit")]);
-        let runner = AgentRunner::new(
+        let runner = AgentRunner::new_plaintext_unsafe(
             &journal_path,
             AgentRunIds::new("run-policy", "session-policy"),
         );
@@ -3200,7 +3340,7 @@ mod tests {
             }],
         );
         let mut driver = TestDriver::new().with_elements(vec![button("submit")]);
-        let runner = AgentRunner::new(
+        let runner = AgentRunner::new_plaintext_unsafe(
             &journal_path,
             AgentRunIds::new("run-origin-deny", "session-origin-deny"),
         )
@@ -3254,7 +3394,7 @@ mod tests {
             }],
         );
         let mut driver = TestDriver::new().with_elements(vec![button("submit")]);
-        let runner = AgentRunner::new(
+        let runner = AgentRunner::new_plaintext_unsafe(
             &journal_path,
             AgentRunIds::new("run-origin-gate", "session-origin-gate"),
         )
@@ -3295,7 +3435,7 @@ mod tests {
         let journal_path = root.join("session.jsonl");
         let task = DriverTask::new("https://example.com", vec![]);
         let mut driver = TestDriver::new().with_elements(vec![button("submit")]);
-        let runner = AgentRunner::new(
+        let runner = AgentRunner::new_plaintext_unsafe(
             &journal_path,
             AgentRunIds::new("run-budget", "session-budget"),
         )
@@ -3365,7 +3505,7 @@ mod tests {
         let mut driver = CdpTempoDriver::launch_with(CdpConfig::default().with_executable(chrome))
             .await?
             .allow_private_network_access();
-        let runner = AgentRunner::new(
+        let runner = AgentRunner::new_plaintext_unsafe(
             &journal_path,
             AgentRunIds::new("run-live-cdp", "session-live-cdp"),
         );
@@ -3404,7 +3544,7 @@ mod tests {
             5
         );
         let plan = task.task_plan()?;
-        let replayed = step_triples_from_journal(&journal_path, &plan)?;
+        let replayed = step_triples_from_journal_plaintext_unsafe(&journal_path, &plan)?;
         let reported = report
             .steps
             .iter()
@@ -3465,7 +3605,7 @@ mod tests {
             }],
         );
         let mut driver = TestDriver::new().with_elements(vec![button("submit")]);
-        let runner = AgentRunner::new(
+        let runner = AgentRunner::new_plaintext_unsafe(
             &journal_path,
             AgentRunIds::new("run-billion-laughs", "session-billion-laughs"),
         )
@@ -3497,8 +3637,11 @@ mod tests {
         let store = SkillStore::open(&skills_root)?;
         store.put(&click_skill("gated", "1"))?;
         let journal_path = root.join("session.jsonl");
-        let runner = AgentRunner::new(&journal_path, AgentRunIds::new("run-snap", "session-snap"))
-            .with_skill_store(&skills_root);
+        let runner = AgentRunner::new_plaintext_unsafe(
+            &journal_path,
+            AgentRunIds::new("run-snap", "session-snap"),
+        )
+        .with_skill_store(&skills_root);
         let input = serde_json::json!({"target": "submit"});
 
         // A single read yields both the gate side-effect and the compiled batch.
@@ -3694,7 +3837,7 @@ mod tests {
         drop(journal);
 
         let mut driver = TestDriver::new().with_elements(vec![button("submit")]);
-        let runner = AgentRunner::new(
+        let runner = AgentRunner::new_plaintext_unsafe(
             &journal_path,
             AgentRunIds::new("run-resume-interrupted", "session-resume-interrupted"),
         );
@@ -3745,7 +3888,7 @@ mod tests {
         drop(journal);
 
         let mut driver = TestDriver::new().with_elements(vec![button("submit")]);
-        let runner = AgentRunner::new(
+        let runner = AgentRunner::new_plaintext_unsafe(
             &journal_path,
             AgentRunIds::new(
                 "run-resume-interrupted-budget",
@@ -3790,7 +3933,7 @@ mod tests {
         drop(journal);
 
         let mut driver = TestDriver::new();
-        let runner = AgentRunner::new(
+        let runner = AgentRunner::new_plaintext_unsafe(
             &journal_path,
             AgentRunIds::new(
                 "run-resume-interrupted-skill",
@@ -4064,6 +4207,13 @@ mod tests {
                 None
             }
         })
+    }
+
+    fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+        !needle.is_empty()
+            && haystack
+                .windows(needle.len())
+                .any(|window| window == needle)
     }
 
     fn fake_mcp_fast_path_probe(
