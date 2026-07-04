@@ -1,0 +1,11 @@
+{
+  "page": "https://shop.example/search?q=electronics",
+  "note": "Ground-truth interactive elements per a CDP AX tree capture (Chrome DevTools Protocol Accessibility.getFullAXTree). Hand-authored representative oracle — see README.md in this directory.",
+  "elements": [
+    { "role": "searchbox", "name": "Search products" },
+    { "role": "checkbox", "name": "In stock only" },
+    { "role": "button", "name": "Add Wireless Mouse to cart" },
+    { "role": "button", "name": "Add Mechanical Keyboard to cart" },
+    { "role": "link", "name": "Next page" }
+  ]
+}

@@ -1,0 +1,155 @@
+[
+  {
+    "index": 0,
+    "tag": "a",
+    "role": "link",
+    "name": "Example Shop home",
+    "xpath": "/html/body/header/a[@class='logo']",
+    "attributes": { "href": "/", "class": "logo" },
+    "interactive": true
+  },
+  {
+    "index": 1,
+    "tag": "a",
+    "role": "link",
+    "name": "Shop",
+    "xpath": "/html/body/header/nav/a[1]",
+    "attributes": { "href": "/shop" },
+    "interactive": true
+  },
+  {
+    "index": 2,
+    "tag": "a",
+    "role": "link",
+    "name": "Deals",
+    "xpath": "/html/body/header/nav/a[2]",
+    "attributes": { "href": "/deals" },
+    "interactive": true
+  },
+  {
+    "index": 3,
+    "tag": "a",
+    "role": "link",
+    "name": "My account",
+    "xpath": "/html/body/header/nav/a[3]",
+    "attributes": { "href": "/account" },
+    "interactive": true
+  },
+  {
+    "index": 4,
+    "tag": "a",
+    "role": "link",
+    "name": "Cart (2 items)",
+    "xpath": "/html/body/header/nav/a[4]",
+    "attributes": { "href": "/cart", "class": "cart-link" },
+    "interactive": true
+  },
+  {
+    "index": 5,
+    "tag": "select",
+    "role": "combobox",
+    "name": "Sort by",
+    "xpath": "/html/body/main/div[@class='toolbar']/select",
+    "attributes": { "name": "sort", "class": "sort-select" },
+    "interactive": true
+  },
+  {
+    "index": 6,
+    "tag": "input",
+    "role": "searchbox",
+    "name": "Search products",
+    "xpath": "/html/body/header/form/input[@type='search']",
+    "attributes": {
+      "type": "search",
+      "name": "q",
+      "value": "electronics",
+      "placeholder": "Search products"
+    },
+    "interactive": true
+  },
+  {
+    "index": 7,
+    "tag": "input",
+    "role": "checkbox",
+    "name": "In stock only",
+    "xpath": "/html/body/main/aside/input[@type='checkbox']",
+    "attributes": {
+      "type": "checkbox",
+      "name": "in_stock"
+    },
+    "interactive": true
+  },
+  {
+    "index": 8,
+    "tag": "button",
+    "role": "button",
+    "name": "Add Wireless Mouse to cart",
+    "xpath": "/html/body/main/ul/li[1]/button",
+    "attributes": {
+      "class": "btn btn-add-to-cart",
+      "data-sku": "MOUSE-01"
+    },
+    "interactive": true
+  },
+  {
+    "index": 9,
+    "tag": "button",
+    "role": "button",
+    "name": "Add Mechanical Keyboard to cart",
+    "xpath": "/html/body/main/ul/li[2]/button",
+    "attributes": {
+      "class": "btn btn-add-to-cart",
+      "data-sku": "KEY-02"
+    },
+    "interactive": true
+  },
+  {
+    "index": 10,
+    "tag": "span",
+    "role": "link",
+    "name": "Next page",
+    "xpath": "/html/body/main/nav/span[@role='link']",
+    "attributes": {
+      "role": "link",
+      "tabindex": "0",
+      "class": "pager-next"
+    },
+    "interactive": false
+  },
+  {
+    "index": 11,
+    "tag": "a",
+    "role": "link",
+    "name": "About us",
+    "xpath": "/html/body/footer/nav/a[1]",
+    "attributes": { "href": "/about" },
+    "interactive": true
+  },
+  {
+    "index": 12,
+    "tag": "a",
+    "role": "link",
+    "name": "Contact support",
+    "xpath": "/html/body/footer/nav/a[2]",
+    "attributes": { "href": "/contact" },
+    "interactive": true
+  },
+  {
+    "index": 13,
+    "tag": "a",
+    "role": "link",
+    "name": "Privacy policy",
+    "xpath": "/html/body/footer/nav/a[3]",
+    "attributes": { "href": "/privacy" },
+    "interactive": true
+  },
+  {
+    "index": 14,
+    "tag": "a",
+    "role": "link",
+    "name": "Shipping FAQ",
+    "xpath": "/html/body/footer/nav/a[4]",
+    "attributes": { "href": "/faq" },
+    "interactive": true
+  }
+]

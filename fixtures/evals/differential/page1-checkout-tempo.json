@@ -1,0 +1,45 @@
+{
+  "schema_version": "2.0.0",
+  "url": "https://shop.example/checkout",
+  "seq": 1,
+  "elements": [
+    {
+      "node_id": "pay-button",
+      "role": "button",
+      "name": [{ "provenance": "page", "text": "Pay now" }],
+      "value": [],
+      "bounds": [320.0, 700.0, 180.0, 42.0],
+      "rank": 0.95
+    },
+    {
+      "node_id": "email-input",
+      "role": "textbox",
+      "name": [{ "provenance": "page", "text": "Email" }],
+      "value": [{ "provenance": "page", "text": "me@example.com" }],
+      "bounds": [120.0, 180.0, 360.0, 38.0],
+      "rank": 0.72
+    },
+    {
+      "node_id": "terms-link",
+      "role": "link",
+      "name": [{ "provenance": "page", "text": "Terms" }],
+      "value": [],
+      "bounds": [80.0, 760.0, 80.0, 22.0],
+      "rank": 0.18
+    },
+    {
+      "node_id": "remember-me-checkbox",
+      "role": "checkbox",
+      "name": [{ "provenance": "page", "text": "Remember me" }],
+      "value": [],
+      "bounds": [120.0, 224.0, 140.0, 24.0],
+      "rank": 0.41
+    }
+  ],
+  "marks": [
+    ["pay-button", 1],
+    ["email-input", 2],
+    ["terms-link", 3],
+    ["remember-me-checkbox", 4]
+  ]
+}

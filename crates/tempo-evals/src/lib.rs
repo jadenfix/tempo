@@ -6,11 +6,11 @@
 
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use tempo_schema::{CompiledObservation, StepStatus, StepTriple};
+use tempo_schema::{CompiledObservation, InteractiveElement, StepStatus, StepTriple};
 use tempo_session::{
     read_journal_entries_with_retention_policy, DurableRetentionPolicy, JournalEntry, JournalError,
     JournalEvent,
@@ -730,7 +730,13 @@ fn percentile_f64(mut values: Vec<f64>, percentile: f64) -> Option<f64> {
     Some(values[index])
 }
 
-fn estimated_tokens(bytes: u64) -> u64 {
+/// Approximate token count from a byte length: the crate's existing
+/// `~4 bytes/token` heuristic, used both for `EvalRecord::max_observation_tokens`
+/// budgets and for the differential report below (#361) so "tokens" means the
+/// same thing in both places. This is a documented approximation, not a real
+/// tokenizer — good enough for relative/differential comparisons, and adding
+/// no new dependency.
+pub fn estimated_tokens(bytes: u64) -> u64 {
     bytes.saturating_add(3) / 4
 }
 
@@ -786,6 +792,17 @@ pub enum EvalError {
     },
     #[error("session journal failed: {0}")]
     Journal(#[from] JournalError),
+    #[error("differential fixture JSON parse failed at {path:?}: {source}")]
+    JsonRead {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("differential fixture re-serialization failed: {source}")]
+    FixtureSerialize {
+        #[source]
+        source: serde_json::Error,
+    },
 }
 
 /// Minimal task description consumed by a [`Judge`]: the natural-language goal
@@ -909,6 +926,332 @@ fn observation_contains_marker(observation: &CompiledObservation, marker: &str) 
             .iter()
             .any(|span| span.text.to_lowercase().contains(&marker))
     })
+}
+
+// ---------------------------------------------------------------------------
+// Differential observation-size/recall metric (#361, hermetic core of #241).
+//
+// This is the hermetic slice only: `tempo_obs` plus each baseline are RECORDED
+// static, versioned fixtures committed under `fixtures/evals/differential/`,
+// not produced by invoking a live Playwright-MCP or browser-use process at
+// test time. Live third-party-tool invocation is explicit deferred scope,
+// tracked separately by #363. See `fixtures/evals/differential/README.md` for
+// the fixture set and the out-of-cargo regeneration seam.
+// ---------------------------------------------------------------------------
+
+/// Ground-truth (or observed) interactive-element identity used for recall
+/// comparisons: role + case-insensitive accessible name. This is deliberately
+/// coarser than a full AX-node diff so it is comparable across three very
+/// different serialization formats — tempo's own schema, a Playwright-MCP-
+/// style nested a11y tree, and a browser-use-style flat DOM list — all scored
+/// against the same CDP AX tree oracle.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ElementId {
+    pub role: String,
+    pub name: String,
+}
+
+impl ElementId {
+    /// Normalizes role/name to trimmed lowercase so recall matching is not
+    /// sensitive to whitespace or casing differences between the oracle and a
+    /// given observation/baseline (mirrors the case-insensitive matching
+    /// `MockJudge` already uses for success markers).
+    pub fn new(role: impl Into<String>, name: impl Into<String>) -> Self {
+        Self {
+            role: role.into().trim().to_lowercase(),
+            name: name.into().trim().to_lowercase(),
+        }
+    }
+}
+
+/// Which recorded baseline a [`BaselineSnapshot`] represents. Both are static,
+/// versioned, hand-authored representative fixtures (see
+/// `fixtures/evals/differential/README.md`) captured offline — not live
+/// third-party-tool invocations (those are gated separately, #363).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BaselineKind {
+    /// A Playwright MCP `browser_snapshot`-style accessibility-tree dump.
+    PlaywrightMcpA11ySnapshot,
+    /// A browser-use `dom/serializer`-style flat indexed element list.
+    BrowserUseDomSerializer,
+}
+
+impl BaselineKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::PlaywrightMcpA11ySnapshot => "playwright-mcp-a11y-snapshot",
+            Self::BrowserUseDomSerializer => "browser-use-dom-serializer",
+        }
+    }
+}
+
+/// One recorded baseline serialization for a fixture page: its kind, the
+/// interactive elements it exposes (extracted from its raw JSON once, at load
+/// time), and the compact byte length of that JSON.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BaselineSnapshot {
+    pub kind: BaselineKind,
+    /// Byte length of the baseline's *compact* (whitespace-free) JSON
+    /// serialization — the same convention `EvalRecord::max_observation_bytes`
+    /// uses for tempo observations (`serde_json::to_vec(..).len()`), so bytes
+    /// mean the same thing on both sides of the comparison and neither format
+    /// is penalized or flattered by how the fixture file happens to be
+    /// pretty-printed on disk.
+    pub compact_bytes: u64,
+    pub elements: Vec<ElementId>,
+}
+
+/// Byte/token counts for one format on one fixture page.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FormatTokens {
+    pub bytes: u64,
+    pub tokens: u64,
+}
+
+impl FormatTokens {
+    fn from_bytes(bytes: u64) -> Self {
+        Self {
+            bytes,
+            tokens: estimated_tokens(bytes),
+        }
+    }
+}
+
+/// One baseline's token counts and element recall against the oracle, for a
+/// single fixture page.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BaselineComparison {
+    pub kind: BaselineKind,
+    pub tokens: FormatTokens,
+    /// Fraction of the oracle's ground-truth interactive elements this
+    /// baseline surfaces, in `[0.0, 1.0]`.
+    pub recall: f64,
+}
+
+/// Differential report for one fixture page: tempo's compiled observation vs
+/// each recorded baseline, on both size (`tokens_per_observation`, split as
+/// `tempo`/`baselines[].tokens`) and interactive-element recall against the
+/// CDP AX tree oracle (`element_recall`, split as `tempo_recall`/
+/// `baselines[].recall`) — the two DoD metrics from #361/#241.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DifferentialReport {
+    pub page: String,
+    pub oracle_element_count: usize,
+    pub tempo: FormatTokens,
+    pub tempo_recall: f64,
+    pub baselines: Vec<BaselineComparison>,
+}
+
+impl DifferentialReport {
+    /// True if tempo's compiled observation is strictly smaller, by the
+    /// crate's approx-token heuristic, than every recorded baseline on this
+    /// page.
+    pub fn tempo_tokens_lower_than_all_baselines(&self) -> bool {
+        self.baselines
+            .iter()
+            .all(|baseline| self.tempo.tokens < baseline.tokens.tokens)
+    }
+
+    /// True if tempo's recall against the oracle is at least as good as every
+    /// recorded baseline's recall on this page.
+    pub fn tempo_recall_at_least_baselines(&self) -> bool {
+        self.baselines
+            .iter()
+            .all(|baseline| self.tempo_recall >= baseline.recall)
+    }
+}
+
+/// Compute a [`DifferentialReport`] for one fixture page: `tempo_obs` vs
+/// `baselines`, both scored for interactive-element recall against `oracle`
+/// (the CDP AX tree ground-truth set). This is the `differential_report`
+/// entry point from #361's DoD; `page` and `oracle` are required in addition
+/// to `tempo_obs`/`baselines` because recall is undefined without a
+/// ground-truth set to score against.
+pub fn differential_report(
+    page: impl Into<String>,
+    tempo_obs: &CompiledObservation,
+    baselines: &[BaselineSnapshot],
+    oracle: &[ElementId],
+) -> Result<DifferentialReport, EvalError> {
+    let tempo_bytes = serde_json::to_vec(tempo_obs)
+        .map_err(|source| EvalError::ObservationSerialize { source })?
+        .len() as u64;
+    let tempo_elements: BTreeSet<ElementId> =
+        tempo_obs.elements.iter().map(tempo_element_id).collect();
+    let oracle_set: BTreeSet<ElementId> = oracle.iter().cloned().collect();
+    let tempo_recall = recall(&oracle_set, &tempo_elements);
+
+    let baseline_comparisons = baselines
+        .iter()
+        .map(|baseline| {
+            let observed: BTreeSet<ElementId> = baseline.elements.iter().cloned().collect();
+            BaselineComparison {
+                kind: baseline.kind,
+                tokens: FormatTokens::from_bytes(baseline.compact_bytes),
+                recall: recall(&oracle_set, &observed),
+            }
+        })
+        .collect();
+
+    Ok(DifferentialReport {
+        page: page.into(),
+        oracle_element_count: oracle_set.len(),
+        tempo: FormatTokens::from_bytes(tempo_bytes),
+        tempo_recall,
+        baselines: baseline_comparisons,
+    })
+}
+
+fn tempo_element_id(element: &InteractiveElement) -> ElementId {
+    let name = element
+        .name
+        .iter()
+        .map(|span| span.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    ElementId::new(element.role.clone(), name)
+}
+
+/// Fraction of `oracle` elements present in `observed`. Vacuously `1.0` when
+/// the oracle set is empty (nothing to miss) — this does not arise for real
+/// fixture pages, which always define at least one ground-truth interactive
+/// element, but is documented rather than left to divide-by-zero.
+fn recall(oracle: &BTreeSet<ElementId>, observed: &BTreeSet<ElementId>) -> f64 {
+    if oracle.is_empty() {
+        return 1.0;
+    }
+    let hits = oracle.intersection(observed).count();
+    hits as f64 / oracle.len() as f64
+}
+
+/// AX/ARIA roles the fixture extractors below treat as "interactive" —
+/// mirrors the interactive-widget subset of the ARIA role taxonomy, excluding
+/// structural/decorative roles (`"generic"`, `"WebArea"`, `"heading"`,
+/// `"img"`, `"paragraph"`, `"list"`, `"listitem"`, `"navigation"`, ...) that
+/// both recorded baseline formats also emit but that are not agent-actionable.
+const INTERACTIVE_ROLES: &[&str] = &[
+    "button",
+    "link",
+    "textbox",
+    "searchbox",
+    "checkbox",
+    "radio",
+    "combobox",
+    "switch",
+    "slider",
+    "menuitem",
+    "tab",
+];
+
+fn read_json_fixture<T: for<'de> Deserialize<'de>>(path: impl AsRef<Path>) -> Result<T, EvalError> {
+    let path = path.as_ref().to_path_buf();
+    let file = File::open(&path).map_err(|source| EvalError::Io {
+        path: path.clone(),
+        source,
+    })?;
+    serde_json::from_reader(BufReader::new(file))
+        .map_err(|source| EvalError::JsonRead { path, source })
+}
+
+fn compact_bytes_of(value: &serde_json::Value) -> Result<u64, EvalError> {
+    serde_json::to_vec(value)
+        .map(|bytes| bytes.len() as u64)
+        .map_err(|source| EvalError::FixtureSerialize { source })
+}
+
+/// Load a tempo `CompiledObservation` fixture (a recorded serialization of
+/// tempo's own structured observation for one fixture page).
+pub fn read_tempo_observation_fixture(
+    path: impl AsRef<Path>,
+) -> Result<CompiledObservation, EvalError> {
+    read_json_fixture(path)
+}
+
+/// Load a checked-in Playwright-MCP-style nested a11y-snapshot JSON fixture
+/// and extract its [`BaselineSnapshot`]: every tree node whose `role` is in
+/// [`INTERACTIVE_ROLES`] and has a non-empty `name` contributes one
+/// [`ElementId`]; the compact byte length is computed the same way as the
+/// tempo observation (parse, then re-serialize without whitespace).
+pub fn read_playwright_a11y_fixture(path: impl AsRef<Path>) -> Result<BaselineSnapshot, EvalError> {
+    let value: serde_json::Value = read_json_fixture(path)?;
+    let compact_bytes = compact_bytes_of(&value)?;
+    let mut elements = Vec::new();
+    collect_playwright_elements(&value, &mut elements);
+    Ok(BaselineSnapshot {
+        kind: BaselineKind::PlaywrightMcpA11ySnapshot,
+        compact_bytes,
+        elements,
+    })
+}
+
+fn collect_playwright_elements(node: &serde_json::Value, out: &mut Vec<ElementId>) {
+    if let Some(role) = node.get("role").and_then(serde_json::Value::as_str)
+        && let Some(name) = node.get("name").and_then(serde_json::Value::as_str)
+        && !name.is_empty()
+        && INTERACTIVE_ROLES.contains(&role)
+    {
+        out.push(ElementId::new(role, name));
+    }
+    if let Some(children) = node.get("children").and_then(serde_json::Value::as_array) {
+        for child in children {
+            collect_playwright_elements(child, out);
+        }
+    }
+}
+
+/// Load a checked-in browser-use-style flat DOM-serializer JSON fixture and
+/// extract its [`BaselineSnapshot`]: every array entry with `"interactive":
+/// true` and a non-empty `name` contributes one [`ElementId`] (using the
+/// fixture's tag-derived `role` field); the compact byte length is computed
+/// the same way as the tempo observation.
+pub fn read_browser_use_dom_fixture(path: impl AsRef<Path>) -> Result<BaselineSnapshot, EvalError> {
+    let value: serde_json::Value = read_json_fixture(path)?;
+    let compact_bytes = compact_bytes_of(&value)?;
+    let mut elements = Vec::new();
+    if let Some(items) = value.as_array() {
+        for item in items {
+            let interactive = item
+                .get("interactive")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            if !interactive {
+                continue;
+            }
+            if let Some(role) = item.get("role").and_then(serde_json::Value::as_str)
+                && let Some(name) = item.get("name").and_then(serde_json::Value::as_str)
+                && !name.is_empty()
+            {
+                elements.push(ElementId::new(role, name));
+            }
+        }
+    }
+    Ok(BaselineSnapshot {
+        kind: BaselineKind::BrowserUseDomSerializer,
+        compact_bytes,
+        elements,
+    })
+}
+
+/// Load the CDP AX tree oracle fixture: the ground-truth set of interactive
+/// elements for one fixture page, against which tempo and both recorded
+/// baselines are scored for recall.
+pub fn read_oracle_fixture(path: impl AsRef<Path>) -> Result<Vec<ElementId>, EvalError> {
+    #[derive(Deserialize)]
+    struct OracleFixture {
+        elements: Vec<OracleElement>,
+    }
+    #[derive(Deserialize)]
+    struct OracleElement {
+        role: String,
+        name: String,
+    }
+    let fixture: OracleFixture = read_json_fixture(path)?;
+    Ok(fixture
+        .elements
+        .into_iter()
+        .map(|element| ElementId::new(element.role, element.name))
+        .collect())
 }
 
 #[cfg(test)]
@@ -1780,5 +2123,214 @@ mod tests {
         let second = MockJudge.verdict(&task, &trajectory);
 
         assert_eq!(first, second);
+    }
+
+    // -- Differential observation-size/recall metric (#361) --
+
+    fn differential_fixture(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/evals/differential")
+            .join(name)
+    }
+
+    fn load_page_report(stem: &str) -> Result<DifferentialReport, EvalError> {
+        let tempo_obs =
+            read_tempo_observation_fixture(differential_fixture(&format!("{stem}-tempo.json")))?;
+        let playwright = read_playwright_a11y_fixture(differential_fixture(&format!(
+            "{stem}-playwright-a11y.json"
+        )))?;
+        let browser_use = read_browser_use_dom_fixture(differential_fixture(&format!(
+            "{stem}-browser-use-dom.json"
+        )))?;
+        let oracle = read_oracle_fixture(differential_fixture(&format!("{stem}-oracle.json")))?;
+
+        differential_report(stem, &tempo_obs, &[playwright, browser_use], &oracle)
+    }
+
+    #[test]
+    fn differential_report_tempo_beats_both_baselines_on_tokens_across_fixture_pages() -> TestResult
+    {
+        for stem in ["page1-checkout", "page2-search"] {
+            let report = load_page_report(stem)?;
+            assert!(
+                report.tempo_tokens_lower_than_all_baselines(),
+                "{stem}: expected tempo tokens ({}) below every baseline, got {:?}",
+                report.tempo.tokens,
+                report
+                    .baselines
+                    .iter()
+                    .map(|baseline| (baseline.kind, baseline.tokens.tokens))
+                    .collect::<Vec<_>>()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn differential_report_tempo_recall_is_at_least_every_baseline_across_fixture_pages(
+    ) -> TestResult {
+        for stem in ["page1-checkout", "page2-search"] {
+            let report = load_page_report(stem)?;
+            assert_eq!(
+                report.tempo_recall, 1.0,
+                "{stem}: tempo should surface every oracle element"
+            );
+            assert!(
+                report.tempo_recall_at_least_baselines(),
+                "{stem}: tempo recall ({}) not >= every baseline {:?}",
+                report.tempo_recall,
+                report
+                    .baselines
+                    .iter()
+                    .map(|baseline| (baseline.kind, baseline.recall))
+                    .collect::<Vec<_>>()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn differential_report_playwright_baseline_ties_tempo_recall_honestly() -> TestResult {
+        // Both the Playwright-style baseline and tempo are backed by a real
+        // accessibility tree, so recall parity here is the honest result, not
+        // a fudge: there is no fixture-supported basis to claim tempo "wins"
+        // recall against an equally AX-tree-backed baseline (see this
+        // directory's README "Honesty note").
+        for stem in ["page1-checkout", "page2-search"] {
+            let report = load_page_report(stem)?;
+            let playwright = report
+                .baselines
+                .iter()
+                .find(|baseline| baseline.kind == BaselineKind::PlaywrightMcpA11ySnapshot)
+                .ok_or("expected a playwright baseline entry")?;
+            assert_eq!(
+                playwright.recall, 1.0,
+                "{stem}: expected the AX-tree-backed playwright baseline to tie tempo's recall"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn differential_report_browser_use_baseline_misses_a_known_element() -> TestResult {
+        // The browser-use-style baseline uses heuristic DOM/JS interactivity
+        // detection rather than a real accessibility tree, so it genuinely
+        // misses a semantically-interactive-but-non-standard element on each
+        // page (a custom div-based checkbox on page 1, a span-based pager
+        // link on page 2).
+        let page1 = load_page_report("page1-checkout")?;
+        let page1_browser_use = page1
+            .baselines
+            .iter()
+            .find(|baseline| baseline.kind == BaselineKind::BrowserUseDomSerializer)
+            .ok_or("expected a browser-use baseline entry")?;
+        assert!(
+            (page1_browser_use.recall - 0.75).abs() < 1e-9,
+            "got {}",
+            page1_browser_use.recall
+        );
+
+        let page2 = load_page_report("page2-search")?;
+        let page2_browser_use = page2
+            .baselines
+            .iter()
+            .find(|baseline| baseline.kind == BaselineKind::BrowserUseDomSerializer)
+            .ok_or("expected a browser-use baseline entry")?;
+        assert!(
+            (page2_browser_use.recall - 0.8).abs() < 1e-9,
+            "got {}",
+            page2_browser_use.recall
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn recall_scores_less_than_one_when_an_oracle_element_is_missing() {
+        let oracle: BTreeSet<ElementId> = [
+            ElementId::new("button", "Pay now"),
+            ElementId::new("textbox", "Email"),
+            ElementId::new("link", "Terms"),
+        ]
+        .into_iter()
+        .collect();
+
+        let observed_all = oracle.clone();
+        assert_eq!(recall(&oracle, &observed_all), 1.0);
+
+        let mut observed_missing_one = oracle.clone();
+        observed_missing_one.remove(&ElementId::new("link", "Terms"));
+        let partial = recall(&oracle, &observed_missing_one);
+        assert!(
+            partial < 1.0,
+            "expected <1.0 when a known element is missing, got {partial}"
+        );
+        assert!((partial - 2.0 / 3.0).abs() < 1e-9, "got {partial}");
+    }
+
+    #[test]
+    fn recall_is_case_and_whitespace_insensitive() {
+        let oracle: BTreeSet<ElementId> = [ElementId::new("Button", "  Pay Now  ")]
+            .into_iter()
+            .collect();
+        let observed: BTreeSet<ElementId> =
+            [ElementId::new("button", "pay now")].into_iter().collect();
+
+        assert_eq!(recall(&oracle, &observed), 1.0);
+    }
+
+    #[test]
+    fn recall_is_vacuously_one_for_an_empty_oracle() {
+        let oracle: BTreeSet<ElementId> = BTreeSet::new();
+        let observed: BTreeSet<ElementId> = BTreeSet::new();
+
+        assert_eq!(recall(&oracle, &observed), 1.0);
+    }
+
+    #[test]
+    fn playwright_extraction_skips_structural_roles_and_recurses_into_children() {
+        let tree = json!({
+            "role": "WebArea",
+            "name": "Page",
+            "children": [
+                { "role": "heading", "name": "Title", "children": [] },
+                {
+                    "role": "generic",
+                    "name": "",
+                    "children": [
+                        { "role": "button", "name": "Submit", "children": [] }
+                    ]
+                }
+            ]
+        });
+
+        let mut elements = Vec::new();
+        collect_playwright_elements(&tree, &mut elements);
+
+        assert_eq!(elements, vec![ElementId::new("button", "Submit")]);
+    }
+
+    #[test]
+    fn browser_use_extraction_skips_non_interactive_entries() -> TestResult {
+        let root = unique_dir("browser-use-fixture")?;
+        remove_dir_if_exists(&root)?;
+        fs::create_dir_all(&root)?;
+        let path = root.join("dom.json");
+        fs::write(
+            &path,
+            json!([
+                { "role": "button", "name": "Submit", "interactive": true },
+                { "role": "checkbox", "name": "Hidden toggle", "interactive": false }
+            ])
+            .to_string(),
+        )?;
+
+        let baseline = read_browser_use_dom_fixture(&path)?;
+
+        assert_eq!(baseline.kind, BaselineKind::BrowserUseDomSerializer);
+        assert_eq!(baseline.elements, vec![ElementId::new("button", "Submit")]);
+        assert!(baseline.compact_bytes > 0);
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
     }
 }

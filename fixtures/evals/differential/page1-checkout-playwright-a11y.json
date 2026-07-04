@@ -1,0 +1,111 @@
+{
+  "role": "WebArea",
+  "name": "Checkout — Example Shop",
+  "children": [
+    {
+      "role": "banner",
+      "name": "Site header",
+      "children": [
+        { "role": "link", "name": "Example Shop home", "children": [] },
+        {
+          "role": "navigation",
+          "name": "Primary",
+          "children": [
+            { "role": "link", "name": "Shop", "children": [] },
+            { "role": "link", "name": "Deals", "children": [] },
+            { "role": "link", "name": "My account", "children": [] },
+            { "role": "link", "name": "Cart (1 item)", "children": [] }
+          ]
+        }
+      ]
+    },
+    {
+      "role": "main",
+      "name": "",
+      "children": [
+        {
+          "role": "heading",
+          "name": "Checkout",
+          "level": 1,
+          "children": []
+        },
+        {
+          "role": "generic",
+          "name": "",
+          "children": [
+            {
+              "role": "paragraph",
+              "name": "Enter your billing details below to complete your purchase. Orders over $50 ship free within 3-5 business days.",
+              "children": []
+            },
+            {
+              "role": "group",
+              "name": "Billing details",
+              "children": [
+                {
+                  "role": "textbox",
+                  "name": "Email",
+                  "value": "me@example.com",
+                  "children": []
+                },
+                {
+                  "role": "checkbox",
+                  "name": "Remember me",
+                  "checked": false,
+                  "children": []
+                },
+                {
+                  "role": "link",
+                  "name": "Terms",
+                  "children": []
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "role": "generic",
+          "name": "",
+          "children": [
+            {
+              "role": "img",
+              "name": "Secure checkout badge",
+              "children": []
+            },
+            {
+              "role": "generic",
+              "name": "Your total: $64.98, including tax and shipping.",
+              "children": []
+            },
+            {
+              "role": "button",
+              "name": "Pay now",
+              "children": []
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "role": "contentinfo",
+      "name": "Site footer",
+      "children": [
+        {
+          "role": "navigation",
+          "name": "Footer links",
+          "children": [
+            { "role": "link", "name": "About us", "children": [] },
+            { "role": "link", "name": "Contact support", "children": [] },
+            { "role": "link", "name": "Privacy policy", "children": [] },
+            { "role": "link", "name": "Shipping FAQ", "children": [] }
+          ]
+        },
+        {
+          "role": "generic",
+          "name": "© 2026 Example Shop, Inc. All rights reserved.",
+          "children": []
+        }
+      ]
+    }
+  ]
+}
