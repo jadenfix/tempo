@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
@@ -37,6 +37,7 @@ use tempo_engine_host::{
     DriverCommand as HostDriverCommand, DriverResponse, DriverWireError, EngineHost,
     EngineHostConfig, EngineHostError, EngineIpcClient,
 };
+use tempo_net::UrlPolicy;
 use tempo_policy::{decide_action, decide_effect, ConfirmationGate, InputTaint, PolicyDecision};
 use tempo_schema::{Action, ActionBatch, CompiledObservation, NodeId, ObservationDiff, SideEffect};
 use thiserror::Error;
@@ -171,6 +172,7 @@ pub struct AttachedEngineDriver {
     engine: Engine,
     client: Arc<Mutex<EngineIpcClient>>,
     driver_id: Option<String>,
+    url_policy: UrlPolicy,
 }
 
 impl AttachedEngineDriver {
@@ -179,7 +181,13 @@ impl AttachedEngineDriver {
             engine,
             client: Arc::new(Mutex::new(client)),
             driver_id: None,
+            url_policy: UrlPolicy::block_private(),
         }
+    }
+
+    pub fn with_navigation_url_policy(mut self, url_policy: UrlPolicy) -> Self {
+        self.url_policy = url_policy;
+        self
     }
 
     fn request(&self, command: HostDriverCommand) -> Result<DriverResponse, DriverClientError> {
@@ -286,6 +294,7 @@ impl AttachedEngineDriver {
                 engine: self.engine,
                 client: Arc::clone(&self.client),
                 driver_id: Some(driver_id),
+                url_policy: self.url_policy.clone(),
             }),
             Ok(DriverResponse::Error { error }) => Err(driver_wire_unsupported(error)),
             Ok(_) => Err(Unsupported("unexpected engine IPC fork response")),
@@ -302,6 +311,7 @@ impl AttachedEngineDriver {
                 engine: self.engine,
                 client: Arc::clone(&self.client),
                 driver_id: Some(driver_id),
+                url_policy: self.url_policy.clone(),
             }),
             Ok(DriverResponse::Error { error }) => Err(driver_wire_unsupported(error)),
             Ok(_) => Err(Unsupported("unexpected engine IPC create context response")),
@@ -316,6 +326,7 @@ impl fmt::Debug for AttachedEngineDriver {
             .debug_struct("AttachedEngineDriver")
             .field("engine", &self.engine)
             .field("driver_id", &self.driver_id)
+            .field("url_policy", &self.url_policy)
             .finish_non_exhaustive()
     }
 }
@@ -327,6 +338,7 @@ impl DriverTrait for AttachedEngineDriver {
     }
 
     async fn goto(&mut self, url: &str) -> Result<CompiledObservation, TransportError> {
+        enforce_tempod_navigation_url_transport(&self.url_policy, url)?;
         self.request_observation(HostDriverCommand::Goto { url: url.into() }, "goto")
     }
 
@@ -339,6 +351,7 @@ impl DriverTrait for AttachedEngineDriver {
     }
 
     async fn act(&mut self, action: &Action) -> Result<StepOutcome, TransportError> {
+        enforce_action_navigation_url_policy(&self.url_policy, action)?;
         self.request_step(
             HostDriverCommand::Act {
                 action: action.clone(),
@@ -348,6 +361,7 @@ impl DriverTrait for AttachedEngineDriver {
     }
 
     async fn act_batch(&mut self, batch: &ActionBatch) -> Result<StepOutcome, TransportError> {
+        enforce_batch_navigation_url_policy_transport(&self.url_policy, batch)?;
         self.request_step(
             HostDriverCommand::ActBatch {
                 batch: batch.clone(),
@@ -416,6 +430,7 @@ pub struct SessionPool {
     driver: Option<AttachedEngineDriver>,
     mcp: Option<Arc<Mutex<tempo_mcp::TempoMcpServer<AttachedEngineDriver>>>>,
     bidi_contexts: BTreeMap<BrowsingContextId, AttachedEngineDriver>,
+    url_policy: UrlPolicy,
     next_bidi_context_id: u64,
     next_id: u64,
     draining: bool,
@@ -437,6 +452,7 @@ impl fmt::Debug for SessionPool {
             .field("bidi", &self.bidi)
             .field("driver", &self.driver)
             .field("mcp_attached", &self.mcp.is_some())
+            .field("url_policy", &self.url_policy)
             .field("next_id", &self.next_id)
             .field("draining", &self.draining)
             .finish()
@@ -492,6 +508,11 @@ impl SessionPool {
             self.events.clear();
             self.session_act_batch_idempotency.clear();
         }
+        self
+    }
+
+    pub fn with_navigation_url_policy(mut self, url_policy: UrlPolicy) -> Self {
+        self.url_policy = url_policy;
         self
     }
 
@@ -553,6 +574,7 @@ impl SessionPool {
         if self.draining {
             return Err(TempodError::Draining);
         }
+        enforce_tempod_navigation_url(&self.url_policy, &url)?;
         let id = TempodSessionId(format!("session-{}", self.next_id));
         self.next_id = self.next_id.saturating_add(1);
         Ok(ReservedSessionCreate {
@@ -652,7 +674,8 @@ impl SessionPool {
 
     pub fn attach_engine_driver(&mut self, engine: Engine, client: EngineIpcClient) {
         self.close_engine_resources(true);
-        let driver = AttachedEngineDriver::new(engine, client);
+        let driver = AttachedEngineDriver::new(engine, client)
+            .with_navigation_url_policy(self.url_policy.clone());
         self.mcp = Some(Arc::new(Mutex::new(tempo_mcp::TempoMcpServer::new(
             driver.clone(),
         ))));
@@ -795,6 +818,7 @@ impl SessionPool {
         id: &TempodSessionId,
         batch: &ActionBatch,
     ) -> Result<StepOutcome, TempodError> {
+        enforce_batch_navigation_url_policy(&self.url_policy, batch)?;
         let driver = self.session_driver_mut(id)?;
         futures::executor::block_on(driver.act_batch(batch))
             .map_err(|error| TempodError::Driver(error.to_string()))
@@ -1149,6 +1173,11 @@ fn create_session_engine_context_on_driver(
     mut root_driver: AttachedEngineDriver,
     url: &str,
 ) -> Result<Option<AttachedEngineDriver>, TempodError> {
+    if let Some(message) =
+        tempod_resolved_navigation_url_policy_denial(&root_driver.url_policy, url)
+    {
+        return Err(TempodError::Forbidden(message));
+    }
     let options = BrowsingContextCreateOptions {
         kind: BrowsingContextKind::Tab,
         background: true,
@@ -1511,8 +1540,18 @@ fn redacted_step_outcome(outcome: &tempo_agent::StepTripleOutcome) -> serde_json
 
 /// Run tempod forever on an address such as `127.0.0.1:8787`.
 pub fn run_tempod(addr: &str) -> Result<(), TempodError> {
+    run_tempod_with_navigation_url_policy(addr, UrlPolicy::block_private())
+}
+
+/// Run tempod with an explicit navigation URL policy.
+pub fn run_tempod_with_navigation_url_policy(
+    addr: &str,
+    url_policy: UrlPolicy,
+) -> Result<(), TempodError> {
     let listener = TcpListener::bind(addr)?;
-    let pool = Arc::new(Mutex::new(SessionPool::from_env()));
+    let pool = Arc::new(Mutex::new(
+        SessionPool::from_env().with_navigation_url_policy(url_policy),
+    ));
     serve_forever(listener, pool)
 }
 
@@ -1522,8 +1561,23 @@ pub fn run_tempod_with_attached_driver(
     engine: Engine,
     socket_path: impl AsRef<Path>,
 ) -> Result<(), TempodError> {
+    run_tempod_with_attached_driver_and_navigation_url_policy(
+        addr,
+        engine,
+        socket_path,
+        UrlPolicy::block_private(),
+    )
+}
+
+/// Run tempod with an attached engine and explicit navigation URL policy.
+pub fn run_tempod_with_attached_driver_and_navigation_url_policy(
+    addr: &str,
+    engine: Engine,
+    socket_path: impl AsRef<Path>,
+    url_policy: UrlPolicy,
+) -> Result<(), TempodError> {
     let listener = TcpListener::bind(addr)?;
-    let mut pool = SessionPool::from_env();
+    let mut pool = SessionPool::from_env().with_navigation_url_policy(url_policy);
     pool.attach_engine_driver(engine, connect_engine_ipc(socket_path)?);
     serve_forever(listener, Arc::new(Mutex::new(pool)))
 }
@@ -1772,7 +1826,7 @@ fn route_http_request(
             if request.method == "POST" && request.path.ends_with("/act_batch") {
                 let id = session_id_from_action_path(&request.path, "act_batch")?;
                 let body = parse_session_act_batch_request(&request.body)?;
-                let policy = enforce_session_batch_policy(&body)?;
+                let policy = enforce_session_batch_policy(&pool.url_policy, &body)?;
                 let request_fingerprint = session_act_batch_idempotency_fingerprint(&body);
                 if let Some(key) = body.idempotency_key.as_deref()
                     && let Some(response) =
@@ -1857,6 +1911,7 @@ fn reject_explicit_null_field(value: &JsonValue, field: &'static str) -> Result<
 }
 
 fn enforce_session_batch_policy(
+    policy: &UrlPolicy,
     body: &SessionActBatchRequest,
 ) -> Result<SessionBatchPolicyReport, TempodError> {
     if let Some(key) = body.idempotency_key.as_deref() {
@@ -1871,6 +1926,7 @@ fn enforce_session_batch_policy(
             )));
         }
     }
+    enforce_batch_navigation_url_policy(policy, &body.batch)?;
     let forced_tainted_actions = body
         .batch
         .actions
@@ -1958,6 +2014,109 @@ fn action_requires_external_taint_floor(action: &Action) -> bool {
         | Action::Select { .. }
         | Action::Skill { .. } => true,
     }
+}
+
+fn tempod_navigation_url_policy_denial(policy: &UrlPolicy, url: &str) -> Option<String> {
+    policy
+        .enforce(url)
+        .err()
+        .map(|error| format!("navigation URL denied by tempod URL policy: {error}"))
+}
+
+fn tempod_resolved_navigation_url_policy_denial(policy: &UrlPolicy, url: &str) -> Option<String> {
+    if let Some(message) = tempod_navigation_url_policy_denial(policy, url) {
+        return Some(message);
+    }
+    if policy == &UrlPolicy::allow_all() {
+        return None;
+    }
+    let sockets = match resolve_navigation_url_sockets(url) {
+        Ok(sockets) => sockets,
+        Err(reason) => {
+            return Some(format!(
+                "navigation URL denied by tempod URL policy: {reason}"
+            ))
+        }
+    };
+    for socket in sockets {
+        if let Err(error) = policy.enforce_resolved_socket(url, socket) {
+            return Some(format!(
+                "navigation URL denied by tempod URL policy: {error}"
+            ));
+        }
+    }
+    None
+}
+
+fn resolve_navigation_url_sockets(url: &str) -> Result<Vec<SocketAddr>, String> {
+    let parsed = url::Url::parse(url).map_err(|error| format!("invalid URL: {error}"))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "URL has no host".to_string())?;
+    let port = parsed
+        .port_or_known_default()
+        .ok_or_else(|| "URL has no port for its scheme".to_string())?;
+    let sockets = (host, port)
+        .to_socket_addrs()
+        .map_err(|error| format!("failed to resolve {host}:{port}: {error}"))?
+        .collect::<Vec<_>>();
+    if sockets.is_empty() {
+        return Err(format!("failed to resolve {host}:{port}: no addresses"));
+    }
+    Ok(sockets)
+}
+
+fn enforce_tempod_navigation_url(policy: &UrlPolicy, url: &str) -> Result<(), TempodError> {
+    if let Some(message) = tempod_navigation_url_policy_denial(policy, url) {
+        return Err(TempodError::Forbidden(message));
+    }
+    Ok(())
+}
+
+fn enforce_batch_navigation_url_policy(
+    policy: &UrlPolicy,
+    batch: &ActionBatch,
+) -> Result<(), TempodError> {
+    for (index, action) in batch.actions.iter().enumerate() {
+        if let Action::Goto { url } = action
+            && let Some(message) = tempod_navigation_url_policy_denial(policy, url)
+        {
+            return Err(TempodError::Forbidden(format!(
+                "action {index} goto {message}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn enforce_tempod_navigation_url_transport(
+    policy: &UrlPolicy,
+    url: &str,
+) -> Result<(), TransportError> {
+    if tempod_resolved_navigation_url_policy_denial(policy, url).is_some() {
+        return Err(TransportError::UrlBlocked);
+    }
+    Ok(())
+}
+
+fn enforce_action_navigation_url_policy(
+    policy: &UrlPolicy,
+    action: &Action,
+) -> Result<(), TransportError> {
+    if let Action::Goto { url } = action {
+        enforce_tempod_navigation_url_transport(policy, url)?;
+    }
+    Ok(())
+}
+
+fn enforce_batch_navigation_url_policy_transport(
+    policy: &UrlPolicy,
+    batch: &ActionBatch,
+) -> Result<(), TransportError> {
+    for action in &batch.actions {
+        enforce_action_navigation_url_policy(policy, action)?;
+    }
+    Ok(())
 }
 
 fn session_act_batch_idempotency_fingerprint(body: &SessionActBatchRequest) -> JsonValue {
@@ -3257,6 +3416,14 @@ fn route_bidi_driver(
             ) {
                 return denied;
             }
+            if let Some(message) =
+                tempod_resolved_navigation_url_policy_denial(&pool.url_policy, &command.url)
+            {
+                return BidiDispatchResult::new(
+                    200,
+                    BidiMessage::error(Some(id), BidiErrorCode::InvalidArgument, message),
+                );
+            }
             let context = command.context.clone();
             let Some(mut driver) = pool.bidi_driver_for(&context) else {
                 return unknown_browsing_context_result(id);
@@ -3995,9 +4162,13 @@ mod tests {
 
     type TestResult = Result<(), Box<dyn Error>>;
 
+    fn engine_test_pool() -> SessionPool {
+        SessionPool::default().with_navigation_url_policy(UrlPolicy::allow_all())
+    }
+
     #[test]
     fn session_pool_create_list_adopt_kill_and_drain() -> TestResult {
-        let mut pool = SessionPool::default();
+        let mut pool = engine_test_pool();
 
         let session = pool.create("https://pool.test")?;
         let adopted = pool.adopt(&session.id)?;
@@ -4056,7 +4227,7 @@ mod tests {
             connection.write_driver_response(close.id, DriverResponse::Closed)
         });
 
-        let mut pool = SessionPool::default();
+        let mut pool = engine_test_pool();
         pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
 
         let create = route_http_request(
@@ -4173,7 +4344,7 @@ mod tests {
             connection.write_driver_response(close.id, DriverResponse::Closed)
         });
 
-        let mut pool = SessionPool::default();
+        let mut pool = engine_test_pool();
         pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
         let create = route_http_request(
             &mut pool,
@@ -4288,7 +4459,7 @@ mod tests {
             Ok(())
         });
 
-        let mut pool = SessionPool::default();
+        let mut pool = engine_test_pool();
         pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
         let create = route_http_request(
             &mut pool,
@@ -4387,7 +4558,7 @@ mod tests {
             connection.write_driver_response(close.id, DriverResponse::Closed)
         });
 
-        let mut pool = SessionPool::default();
+        let mut pool = engine_test_pool();
         pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
 
         let create = handle_http_request(
@@ -4419,7 +4590,7 @@ mod tests {
             thread::park_timeout(Duration::from_secs(60));
         });
 
-        let mut pool = SessionPool::default();
+        let mut pool = engine_test_pool();
         pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
 
         let started = std::time::Instant::now();
@@ -4470,7 +4641,7 @@ mod tests {
             Ok(())
         });
 
-        let pool = Arc::new(Mutex::new(SessionPool::default()));
+        let pool = Arc::new(Mutex::new(engine_test_pool()));
         pool.lock()
             .map_err(|_| "session pool lock failed")?
             .attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
@@ -5529,6 +5700,28 @@ mod tests {
     }
 
     #[test]
+    fn session_act_batch_rejects_blocked_goto_url_before_driver_lookup() -> TestResult {
+        let mut pool = SessionPool::default();
+        let session = pool.create("https://policy-session.test")?;
+
+        let response = handle_http_request(
+            &mut pool,
+            control_request(
+                "POST",
+                &format!("/sessions/{}/act_batch", session.id.0),
+                Some("http://127.0.0.1"),
+                br#"{"batch":{"actions":[{"kind":"goto","url":"http://127.0.0.1/admin"}],"quiescence":"composite"},"input_tainted":false}"#,
+            ),
+        );
+
+        assert_eq!(response.status, 403);
+        let body: Value = serde_json::from_slice(&response.body)?;
+        let error = body["error"].as_str().ok_or("missing error body")?;
+        assert!(error.contains("action 0 goto navigation URL denied by tempod URL policy"));
+        Ok(())
+    }
+
+    #[test]
     fn session_json_schema_errors_are_client_bad_requests() -> TestResult {
         let mut pool = SessionPool::default();
 
@@ -5664,7 +5857,7 @@ mod tests {
             connection.write_driver_response(close.id, DriverResponse::Closed)
         });
 
-        let mut pool = SessionPool::default();
+        let mut pool = engine_test_pool();
         pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
         let create = route_http_request(
             &mut pool,
@@ -5815,7 +6008,7 @@ mod tests {
             connection.write_driver_response(close.id, DriverResponse::Closed)
         });
 
-        let mut pool = SessionPool::default();
+        let mut pool = engine_test_pool();
         pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
         let create = route_http_request(
             &mut pool,
@@ -5994,7 +6187,7 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let addr = listener.local_addr()?;
-        let mut pool = SessionPool::default();
+        let mut pool = engine_test_pool();
         pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
         let pool = Arc::new(Mutex::new(pool));
         let handle = thread::spawn({
@@ -6063,7 +6256,7 @@ mod tests {
             let mut driver = TestDriver::new();
             futures::executor::block_on(serve_driver_connection(&mut connection, &mut driver))
         });
-        let mut pool = SessionPool::default();
+        let mut pool = engine_test_pool();
         pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
 
         let subscribed = route_bidi_dispatch(
@@ -6305,6 +6498,38 @@ mod tests {
     }
 
     #[test]
+    fn bidi_endpoint_rejects_blocked_navigation_url_before_driver_execution() -> TestResult {
+        let (client_stream, mut server_stream) = UnixStream::pair()?;
+        server_stream.set_nonblocking(true)?;
+        let mut pool = SessionPool::default();
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+
+        let response = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/bidi".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: br#"{"id":19,"method":"browsingContext.navigate","params":{"context":"tempo-root","url":"http://127.0.0.1/admin","inputTainted":false}}"#.to_vec(),
+            },
+        )?;
+
+        assert_eq!(response.status, 200);
+        let value: Value = serde_json::from_slice(&response.body)?;
+        assert_eq!(value["type"], "error");
+        assert_eq!(value["id"], 19);
+        assert_eq!(value["error"], "invalid argument");
+        let message = value["message"]
+            .as_str()
+            .ok_or("BiDi error response should include a message")?;
+        assert!(message.contains("navigation URL denied by tempod URL policy"));
+        assert_no_driver_ipc(&mut server_stream)?;
+        Ok(())
+    }
+
+    #[test]
     fn bidi_endpoint_routes_script_evaluate_to_attached_engine_driver() -> TestResult {
         let mut pool = SessionPool::default();
         let handle = attach_driver_handler(&mut pool, |request| {
@@ -6452,7 +6677,7 @@ mod tests {
             let mut driver = TestDriver::new();
             futures::executor::block_on(serve_driver_connection(&mut connection, &mut driver))
         });
-        let mut pool = SessionPool::default();
+        let mut pool = engine_test_pool();
         pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
 
         let root_nav = route_http_request(
@@ -6784,6 +7009,71 @@ mod tests {
         assert_eq!(value["id"], 12);
         assert_eq!(value["result"]["structuredContent"]["status"], "applied");
         assert_eq!(value["result"]["structuredContent"]["diff"]["seq"], 2);
+        Ok(())
+    }
+
+    #[test]
+    fn mcp_endpoint_rejects_blocked_act_batch_goto_before_driver_execution() -> TestResult {
+        let (client_stream, mut server_stream) = UnixStream::pair()?;
+        server_stream.set_nonblocking(true)?;
+        let mut pool = SessionPool::default();
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+
+        let response = route_http_request(
+            &mut pool,
+            mcp_tool_request(
+                16,
+                "act_batch",
+                json!({
+                    "batch": {
+                        "actions": [{"kind": "goto", "url": "http://127.0.0.1/admin"}],
+                        "quiescence": "composite",
+                    },
+                    "input_tainted": false
+                }),
+            )?,
+        )?;
+
+        assert_eq!(response.status, 200);
+        let value: Value = serde_json::from_slice(&response.body)?;
+        assert_eq!(value["id"], 16);
+        assert_eq!(value["result"]["isError"], true);
+        let error = value["result"]["structuredContent"]["error"]
+            .as_str()
+            .ok_or("MCP tool error should include a message")?;
+        assert!(error.contains("blocked by URL policy"));
+        assert_no_driver_ipc(&mut server_stream)?;
+        Ok(())
+    }
+
+    #[test]
+    fn mcp_endpoint_rejects_blocked_act_goto_before_driver_execution() -> TestResult {
+        let (client_stream, mut server_stream) = UnixStream::pair()?;
+        server_stream.set_nonblocking(true)?;
+        let mut pool = SessionPool::default();
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+
+        let response = route_http_request(
+            &mut pool,
+            mcp_tool_request(
+                17,
+                "act",
+                json!({
+                    "action": {"kind": "goto", "url": "http://127.0.0.1/admin"},
+                    "input_tainted": false
+                }),
+            )?,
+        )?;
+
+        assert_eq!(response.status, 200);
+        let value: Value = serde_json::from_slice(&response.body)?;
+        assert_eq!(value["id"], 17);
+        assert_eq!(value["result"]["isError"], true);
+        let error = value["result"]["structuredContent"]["error"]
+            .as_str()
+            .ok_or("MCP tool error should include a message")?;
+        assert!(error.contains("blocked by URL policy"));
+        assert_no_driver_ipc(&mut server_stream)?;
         Ok(())
     }
 
@@ -7192,6 +7482,7 @@ mod tests {
                 engine: Engine::Cdp,
                 client: Arc::clone(&driver.client),
                 driver_id: Some("fork-1".into()),
+                url_policy: driver.url_policy.clone(),
             },
         );
 
@@ -7305,7 +7596,7 @@ mod tests {
             Ok(())
         });
 
-        let mut pool = SessionPool::default();
+        let mut pool = engine_test_pool();
         pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
         let create = route_http_request(
             &mut pool,
@@ -7357,6 +7648,7 @@ mod tests {
                 engine: Engine::Cdp,
                 client: Arc::new(Mutex::new(EngineIpcClient::from_stream(client_stream))),
                 driver_id: Some("context-wedged".to_string()),
+                url_policy: UrlPolicy::block_private(),
             },
         );
         pool.next_bidi_context_id = 2;
@@ -7386,7 +7678,8 @@ mod tests {
             futures::executor::block_on(serve_driver_connection(&mut connection, &mut driver))
         });
         let mut root_driver =
-            AttachedEngineDriver::new(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+            AttachedEngineDriver::new(Engine::Cdp, EngineIpcClient::from_stream(client_stream))
+                .with_navigation_url_policy(UrlPolicy::allow_all());
 
         let (root_observation, fork_observation) = futures::executor::block_on(async {
             root_driver.goto("https://root.test").await?;
@@ -7576,6 +7869,48 @@ mod tests {
             origin: origin.map(str::to_string),
             body: body.to_vec(),
         }
+    }
+
+    #[test]
+    fn session_create_rejects_blocked_navigation_url_before_state_change() -> TestResult {
+        let mut pool = SessionPool::default();
+
+        let response = handle_http_request(
+            &mut pool,
+            control_request(
+                "POST",
+                "/sessions",
+                Some("http://127.0.0.1"),
+                br#"{"url":"http://127.0.0.1/admin"}"#,
+            ),
+        );
+
+        assert_eq!(response.status, 403);
+        let body: Value = serde_json::from_slice(&response.body)?;
+        let error = body["error"].as_str().ok_or("missing error body")?;
+        assert!(error.contains("navigation URL denied by tempod URL policy"));
+        assert!(pool.list().is_empty());
+
+        match pool.create("http://localhost/admin") {
+            Err(TempodError::Forbidden(message)) => {
+                assert!(message.contains("navigation URL denied by tempod URL policy"));
+            }
+            other => {
+                return Err(format!("expected Forbidden URL policy error, got {other:?}").into());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn session_create_allows_private_navigation_with_explicit_policy() -> TestResult {
+        let mut pool = SessionPool::default().with_navigation_url_policy(UrlPolicy::allow_all());
+
+        let session = pool.create("http://127.0.0.1/admin")?;
+
+        assert_eq!(session.url, "http://127.0.0.1/admin");
+        assert_eq!(pool.list().len(), 1);
+        Ok(())
     }
 
     #[test]
@@ -7887,6 +8222,7 @@ mod tests {
                 engine: Engine::Cdp,
                 client: Arc::clone(&driver.client),
                 driver_id: Some("fork-1".into()),
+                url_policy: driver.url_policy.clone(),
             },
         );
 
@@ -8067,6 +8403,7 @@ mod tests {
                 engine: Engine::Cdp,
                 client: Arc::clone(&driver.client),
                 driver_id: Some("fork-1".into()),
+                url_policy: driver.url_policy.clone(),
             },
         );
 
@@ -8241,6 +8578,7 @@ mod tests {
         F: FnOnce(DriverRequest) -> DriverResponse + Send + 'static,
     {
         let (client_stream, server_stream) = UnixStream::pair()?;
+        pool.url_policy = UrlPolicy::allow_all();
         pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
         Ok(thread::spawn(move || {
             let mut connection = EngineIpcConnection::from_stream(server_stream);
@@ -8272,7 +8610,7 @@ mod tests {
     fn assert_bidi_unknown_context_rejected(id: u64, body: &[u8]) -> Result<(), Box<dyn Error>> {
         let (client_stream, mut server_stream) = UnixStream::pair()?;
         server_stream.set_nonblocking(true)?;
-        let mut pool = SessionPool::default();
+        let mut pool = engine_test_pool();
         pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
 
         let response = route_http_request(
