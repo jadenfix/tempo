@@ -9,11 +9,13 @@ use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use rusqlite::{params, Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::fs::{File, OpenOptions, TryLockError};
-use std::io::Write;
+use std::io::{Read as _, Seek as _, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tempo_driver::{StepOutcome, TransportError};
 use tempo_schema::{Action, CompiledObservation, ObservationDiff};
@@ -444,9 +446,34 @@ impl ResponseCassette {
 }
 
 /// Append-only cassette store used by replay-fork and deterministic re-execution.
+///
+/// Lookups are served by an incremental in-memory index of `key -> byte span`
+/// built lazily over the JSONL file, so `record`/`replay` decode only new tail
+/// bytes plus the single record they touch instead of re-reading and
+/// re-decoding the whole file per call. The index stores offsets, not
+/// payloads, so resident memory stays flat regardless of cassette sizes.
 pub struct CassetteStore {
     path: PathBuf,
     retention_policy: DurableRetentionPolicy,
+    index: Mutex<CassetteIndex>,
+}
+
+/// Byte span of one encoded cassette record line in the backing file.
+#[derive(Clone, Copy, Debug)]
+struct CassetteSpan {
+    offset: u64,
+    len: usize,
+}
+
+#[derive(Debug, Default)]
+struct CassetteIndex {
+    by_key: HashMap<CassetteKey, CassetteSpan>,
+    /// File length covered by the index, always ending on a newline boundary
+    /// (or 0). A shorter file than this means truncation: rebuild from scratch.
+    indexed_bytes: u64,
+    /// Newline-terminated lines covered, for parity with whole-file scan
+    /// error line numbers.
+    indexed_lines: usize,
 }
 
 impl CassetteStore {
@@ -483,6 +510,7 @@ impl CassetteStore {
         Ok(Self {
             path,
             retention_policy,
+            index: Mutex::new(CassetteIndex::default()),
         })
     }
 
@@ -505,37 +533,179 @@ impl CassetteStore {
 
         let append_boundary = repair_cassette_tail_before_append(&self.path, &file)?;
 
-        for existing in read_cassettes_with_retention_policy(&self.path, &self.retention_policy)? {
-            if existing.key == cassette.key {
-                if existing == *cassette {
-                    return Ok(());
-                }
-                return Err(JournalError::CassetteConflict {
-                    key: cassette.key.clone(),
-                });
+        let mut index = self.lock_index();
+        self.catch_up_index(&mut index)?;
+        if index.by_key.contains_key(&cassette.key) {
+            let existing = self.read_indexed_cassette(&index, &cassette.key)?;
+            if existing.as_ref() == Some(cassette) {
+                return Ok(());
             }
+            return Err(JournalError::CassetteConflict {
+                key: cassette.key.clone(),
+            });
         }
 
         let cassette_json = serde_json::to_vec(cassette)?;
         let record =
             encode_durable_record_bytes(&cassette_json, &self.retention_policy, cassette_aad())?;
+        let mut offset = file.metadata()?.len();
         if let CassetteAppendBoundary::NeedsNewline = append_boundary {
             file.write_all(b"\n")?;
+            offset += 1;
         }
         file.write_all(&record)?;
         file.write_all(b"\n")?;
         file.flush()?;
         file.sync_data()?;
+
+        // The append is durable: extend the index in place instead of paying a
+        // tail re-scan on the next call.
+        index.by_key.insert(
+            cassette.key.clone(),
+            CassetteSpan {
+                offset,
+                len: record.len(),
+            },
+        );
+        if index.indexed_bytes == offset {
+            index.indexed_bytes = offset + record.len() as u64 + 1;
+            index.indexed_lines += 1;
+        }
         Ok(())
     }
 
     pub fn replay(&self, key: &CassetteKey) -> Result<Option<ResponseCassette>, JournalError> {
-        for cassette in read_cassettes_with_retention_policy(&self.path, &self.retention_policy)? {
-            if &cassette.key == key {
-                return Ok(Some(cassette));
+        reject_durable_state_in_stealth_mode()?;
+        let mut index = self.lock_index();
+        self.catch_up_index(&mut index)?;
+        self.read_indexed_cassette(&index, key)
+    }
+
+    fn lock_index(&self) -> std::sync::MutexGuard<'_, CassetteIndex> {
+        // A poisoned mutex only means another thread panicked mid-update; the
+        // index is rebuilt defensively, so recover the guard.
+        match self.index.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                let mut guard = poisoned.into_inner();
+                *guard = CassetteIndex::default();
+                guard
             }
         }
-        Ok(None)
+    }
+
+    /// Bring the index up to date with bytes appended since the last call.
+    /// Truncation (tail repair, external rewrite) is detected by a shrinking
+    /// file and triggers a full rebuild.
+    fn catch_up_index(&self, index: &mut CassetteIndex) -> Result<(), JournalError> {
+        let mut file = match File::open(&self.path) {
+            Ok(file) => file,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                *index = CassetteIndex::default();
+                return Ok(());
+            }
+            Err(source) => return Err(JournalError::Io(source)),
+        };
+        let file_len = file.metadata()?.len();
+        if file_len < index.indexed_bytes {
+            *index = CassetteIndex::default();
+        }
+        if file_len == index.indexed_bytes {
+            return Ok(());
+        }
+
+        let base = index.indexed_bytes;
+        file.seek(SeekFrom::Start(base))?;
+        let mut tail = Vec::with_capacity((file_len - base) as usize);
+        file.read_to_end(&mut tail)?;
+
+        let mut cursor = 0usize;
+        while cursor < tail.len() {
+            let newline = tail[cursor..].iter().position(|byte| *byte == b'\n');
+            let (line_end, terminated) = match newline {
+                Some(relative) => (cursor + relative, true),
+                None => (tail.len(), false),
+            };
+            let raw = &tail[cursor..line_end];
+            let line_number = index.indexed_lines + 1;
+
+            if raw.iter().all(u8::is_ascii_whitespace) {
+                if !terminated {
+                    break;
+                }
+                cursor = line_end + 1;
+                index.indexed_bytes = base + cursor as u64;
+                index.indexed_lines = line_number;
+                continue;
+            }
+
+            let decoded =
+                match decode_durable_record_bytes(raw, &self.retention_policy, cassette_aad()) {
+                    Ok(decoded) => decoded,
+                    Err(source) => {
+                        if !terminated && is_incomplete_json_record(raw) {
+                            // Torn tail from an interrupted append: readable
+                            // records before it stay served; the tail is
+                            // re-examined on the next call.
+                            break;
+                        }
+                        return Err(source);
+                    }
+                };
+            let record = match serde_json::from_slice::<ResponseCassette>(&decoded) {
+                Ok(record) => record,
+                Err(source) => {
+                    if !terminated && is_incomplete_json_record(raw) {
+                        break;
+                    }
+                    return Err(JournalError::Corrupt {
+                        line: line_number,
+                        source,
+                    });
+                }
+            };
+            let span = CassetteSpan {
+                offset: base + cursor as u64,
+                len: raw.len(),
+            };
+            // First writer wins, matching the whole-file scan which returned
+            // the earliest record for a key.
+            index.by_key.entry(record.key).or_insert(span);
+            if terminated {
+                cursor = line_end + 1;
+                index.indexed_bytes = base + cursor as u64;
+                index.indexed_lines = line_number;
+            } else {
+                // Complete record without a trailing newline (crash between
+                // record and separator writes): serve it, but leave the
+                // watermark before it so the next catch-up re-anchors on a
+                // newline boundary.
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Read and decode exactly one indexed record.
+    fn read_indexed_cassette(
+        &self,
+        index: &CassetteIndex,
+        key: &CassetteKey,
+    ) -> Result<Option<ResponseCassette>, JournalError> {
+        let Some(span) = index.by_key.get(key) else {
+            return Ok(None);
+        };
+        let mut file = File::open(&self.path)?;
+        file.seek(SeekFrom::Start(span.offset))?;
+        let mut raw = vec![0_u8; span.len];
+        file.read_exact(&mut raw)?;
+        let decoded = decode_durable_record_bytes(&raw, &self.retention_policy, cassette_aad())?;
+        let record: ResponseCassette = serde_json::from_slice(&decoded)
+            .map_err(|source| JournalError::Corrupt { line: 0, source })?;
+        if &record.key != key {
+            return Ok(None);
+        }
+        Ok(Some(record))
     }
 
     /// Replay a request using the current key format, migrating pre-v2 cassette
