@@ -10,7 +10,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use tempo_act::{execute_action, execute_batch, ExecutionStatus};
 use tempo_driver::{DriverTrait, Engine, StepOutcome, TransportError};
-use tempo_handshake::{probe_http_origin, LaneDecision, ProbeHit};
+use tempo_handshake::{probe_http_origin, resolve_checked_http_target, LaneDecision, ProbeHit};
 pub use tempo_handshake::{HttpProbeConfig, Lane as StructuredLane, StructuredSignal};
 use tempo_policy::{
     ConfirmationGate, InputTaint, Origin, OriginError, OriginPolicy, OriginRuleMode,
@@ -1193,14 +1193,14 @@ impl AgentRunner {
         let endpoint = decision
             .mcp_endpoint_url()
             .map_err(|error| error.to_string())?;
-        self.structured_fast_path
-            .config
-            .url_policy
-            .enforce(endpoint.as_str())
-            .map_err(|error| error.to_string())?;
+        let target = resolve_checked_http_target(
+            endpoint.as_str(),
+            &self.structured_fast_path.config.url_policy,
+        )?;
         let client = reqwest::Client::builder()
             .timeout(self.structured_fast_path.config.timeout)
             .redirect(reqwest::redirect::Policy::none())
+            .resolve_to_addrs(target.host(), &[target.socket()])
             .build()
             .map_err(|error| error.to_string())?;
 

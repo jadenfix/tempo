@@ -5,6 +5,7 @@
 //! machine-readable surface is present and the render lane otherwise.
 
 use std::io::Read;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::time::Duration;
 
 use tempo_net::UrlPolicy;
@@ -208,26 +209,79 @@ pub enum HttpProbeError {
     WorkerPanicked,
 }
 
+/// A URL target resolved and checked against the socket-level URL policy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CheckedHttpTarget {
+    host: String,
+    socket: SocketAddr,
+}
+
+impl CheckedHttpTarget {
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    pub fn socket(&self) -> SocketAddr {
+        self.socket
+    }
+}
+
+/// Resolve an HTTP(S) URL, enforce socket-level SSRF policy, and return the
+/// exact socket callers must pin their HTTP client to.
+pub fn resolve_checked_http_target(
+    url: &str,
+    url_policy: &UrlPolicy,
+) -> Result<CheckedHttpTarget, String> {
+    url_policy.enforce(url).map_err(|error| error.to_string())?;
+    let parsed = url::Url::parse(url).map_err(|error| format!("invalid HTTP target: {error}"))?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        scheme => return Err(format!("unsupported HTTP target scheme '{scheme}'")),
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "HTTP target is missing a host".to_string())?
+        .to_string();
+    let port = parsed
+        .port_or_known_default()
+        .ok_or_else(|| "HTTP target is missing a port".to_string())?;
+    let addrs = (host.as_str(), port)
+        .to_socket_addrs()
+        .map_err(|error| format!("failed to resolve HTTP target {host}:{port}: {error}"))?;
+    checked_http_target_from_addrs(url, host, addrs, url_policy)
+}
+
+fn checked_http_target_from_addrs(
+    url: &str,
+    host: String,
+    addrs: impl IntoIterator<Item = SocketAddr>,
+    url_policy: &UrlPolicy,
+) -> Result<CheckedHttpTarget, String> {
+    let mut last_block = None;
+    for socket in addrs {
+        match url_policy.enforce_resolved_socket(url, socket) {
+            Ok(()) => return Ok(CheckedHttpTarget { host, socket }),
+            Err(error) => last_block = Some(error.to_string()),
+        }
+    }
+    Err(last_block.unwrap_or_else(|| "HTTP target resolved to no socket addresses".to_string()))
+}
+
 /// Probe the default structured-web URLs for a target URL's origin with real HTTP requests.
 pub fn probe_http_origin(
     target: &str,
     config: HttpProbeConfig,
 ) -> Result<HttpProbeRun, HttpProbeError> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(config.timeout)
-        .redirect(url_policy_redirect(config.url_policy.clone()))
-        .build()
-        .map_err(|error| HttpProbeError::ClientBuild(error.to_string()))?;
     let origin = canonical_probe_origin(target)?;
 
     let mut handles = Vec::with_capacity(DEFAULT_HTTP_PROBES.len());
     for (index, probe) in DEFAULT_HTTP_PROBES.iter().copied().enumerate() {
-        let client = client.clone();
         let url_policy = config.url_policy.clone();
         let url = format!("{origin}{}", probe.path);
+        let timeout = config.timeout;
         let max_body_bytes = config.max_body_bytes;
         handles.push(std::thread::spawn(move || {
-            fetch_probe(index, probe, url, max_body_bytes, url_policy, client)
+            fetch_probe(index, probe, url, max_body_bytes, url_policy, timeout)
         }));
     }
 
@@ -497,55 +551,47 @@ struct IndexedProbeFetch {
     failure: Option<HttpProbeFailure>,
 }
 
-/// Redirect policy that re-validates every hop against the URL policy.
-///
-/// The reqwest default follows up to 10 redirects with no per-hop check, so a
-/// probed origin could `302 Location: http://169.254.169.254/...` and the
-/// client would follow it into an internal/loopback target, capturing the
-/// internal response body (issue #80). This stops any redirect whose target the
-/// URL policy would block, and caps the hop count.
-fn url_policy_redirect(url_policy: UrlPolicy) -> reqwest::redirect::Policy {
-    reqwest::redirect::Policy::custom(move |attempt| {
-        if attempt.previous().len() >= 10 {
-            return attempt.error(HttpRedirectBlocked("too many redirects".to_string()));
-        }
-        match url_policy.enforce(attempt.url().as_str()) {
-            Ok(()) => attempt.follow(),
-            Err(error) => attempt.error(HttpRedirectBlocked(error.to_string())),
-        }
-    })
-}
-
-#[derive(Debug)]
-struct HttpRedirectBlocked(String);
-
-impl std::fmt::Display for HttpRedirectBlocked {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "redirect blocked by URL policy: {}", self.0)
-    }
-}
-
-impl std::error::Error for HttpRedirectBlocked {}
-
 fn fetch_probe(
     index: usize,
     probe: HttpProbe,
     url: String,
     max_body_bytes: usize,
     url_policy: UrlPolicy,
-    client: reqwest::blocking::Client,
+    timeout: Duration,
 ) -> IndexedProbeFetch {
-    if let Err(error) = url_policy.enforce(&url) {
-        return IndexedProbeFetch {
-            index,
-            response: None,
-            failure: Some(HttpProbeFailure {
-                path: probe.path.to_string(),
-                url,
-                reason: error.to_string(),
-            }),
-        };
-    }
+    let failure = |reason: String| IndexedProbeFetch {
+        index,
+        response: None,
+        failure: Some(HttpProbeFailure {
+            path: probe.path.to_string(),
+            url: url.clone(),
+            reason,
+        }),
+    };
+
+    let target = match resolve_checked_http_target(&url, &url_policy) {
+        Ok(target) => target,
+        Err(error) => return failure(error),
+    };
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .resolve_to_addrs(target.host(), &[target.socket()])
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => {
+            return IndexedProbeFetch {
+                index,
+                response: None,
+                failure: Some(HttpProbeFailure {
+                    path: probe.path.to_string(),
+                    url,
+                    reason: format!("failed to build HTTP probe client: {error}"),
+                }),
+            };
+        }
+    };
 
     match fetch_probe_response(&client, probe.path, &url, max_body_bytes) {
         Ok(response) => IndexedProbeFetch {
@@ -963,18 +1009,49 @@ mod tests {
     }
 
     #[test]
-    fn redirect_policy_blocks_hop_to_private_target() -> TestResult {
-        // Issue #80: a probed origin that 302s to a private/metadata target must
-        // not be followed by the client.
+    fn checked_http_target_blocks_private_resolved_socket() {
+        let result = checked_http_target_from_addrs(
+            "https://public.example/mcp",
+            "public.example".into(),
+            [std::net::SocketAddr::from(([169, 254, 169, 254], 443))],
+            &UrlPolicy::block_private(),
+        );
+
+        match result {
+            Ok(target) => panic!("metadata socket was allowed: {target:?}"),
+            Err(error) => assert!(error.contains("resolved IP"), "{error}"),
+        }
+    }
+
+    #[test]
+    fn checked_http_target_allows_public_resolved_socket() -> TestResult {
+        let target = checked_http_target_from_addrs(
+            "https://public.example/mcp",
+            "public.example".into(),
+            [std::net::SocketAddr::from(([93, 184, 216, 34], 443))],
+            &UrlPolicy::block_private(),
+        )
+        .map_err(io::Error::other)?;
+
+        assert_eq!(target.host(), "public.example");
+        assert_eq!(
+            target.socket(),
+            std::net::SocketAddr::from(([93, 184, 216, 34], 443))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn live_http_probe_does_not_follow_redirects() -> TestResult {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let addr = listener.local_addr()?;
         let handle = thread::spawn(move || -> Result<(), io::Error> {
-            if let Some(stream) = listener.incoming().next() {
+            for stream in listener.incoming().take(DEFAULT_HTTP_PROBES.len()) {
                 let mut stream = stream?;
                 stream.set_read_timeout(Some(StdDuration::from_secs(5)))?;
                 let mut buffer = [0_u8; 512];
                 let _ = stream.read(&mut buffer)?;
-                let body = "internal-secret";
+                let body = "origin-redirect-body";
                 let response = format!(
                     "HTTP/1.1 302 Found\r\nLocation: http://169.254.169.254/latest/meta-data\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
@@ -985,64 +1062,16 @@ mod tests {
             Ok(())
         });
 
-        let client = reqwest::blocking::Client::builder()
-            .redirect(url_policy_redirect(UrlPolicy::block_private()))
-            .build()?;
-        let result = client.get(format!("http://{addr}/start")).send();
-        let _ = handle.join();
+        let run = probe_http_origin(
+            &format!("http://{addr}/app"),
+            HttpProbeConfig::default().allow_private_network_access(),
+        )?;
+        join_server(handle)?;
 
-        match result {
-            Ok(_) => Err(Box::new(io::Error::other(
-                "redirect to metadata host was followed",
-            ))),
-            Err(error) => {
-                assert!(error.is_redirect(), "expected redirect error, got {error}");
-                Ok(())
-            }
-        }
-    }
-
-    #[test]
-    fn redirect_policy_follows_allowed_hop() -> TestResult {
-        // A redirect to an allowed target is still followed.
-        let listener = TcpListener::bind("127.0.0.1:0")?;
-        let addr = listener.local_addr()?;
-        let handle = thread::spawn(move || -> Result<(), io::Error> {
-            let mut incoming = listener.incoming();
-            if let Some(stream) = incoming.next() {
-                let mut stream = stream?;
-                stream.set_read_timeout(Some(StdDuration::from_secs(5)))?;
-                let mut buffer = [0_u8; 512];
-                let _ = stream.read(&mut buffer)?;
-                let location = format!("http://{addr}/final");
-                let response = format!(
-                    "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                );
-                stream.write_all(response.as_bytes())?;
-                stream.flush()?;
-            }
-            if let Some(stream) = incoming.next() {
-                let mut stream = stream?;
-                stream.set_read_timeout(Some(StdDuration::from_secs(5)))?;
-                let mut buffer = [0_u8; 512];
-                let _ = stream.read(&mut buffer)?;
-                let body = "final-ok";
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                stream.write_all(response.as_bytes())?;
-                stream.flush()?;
-            }
-            Ok(())
-        });
-
-        let client = reqwest::blocking::Client::builder()
-            .redirect(url_policy_redirect(UrlPolicy::allow_all()))
-            .build()?;
-        let text = client.get(format!("http://{addr}/start")).send()?.text()?;
-        let _ = handle.join();
-        assert_eq!(text, "final-ok");
+        assert_eq!(run.responses.len(), DEFAULT_HTTP_PROBES.len());
+        assert!(run.responses.iter().all(|response| response.status == 302));
+        assert!(run.report.hits().is_empty());
+        assert_eq!(run.lane_decision().lane, Lane::Render);
         Ok(())
     }
 
