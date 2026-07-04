@@ -5,10 +5,12 @@
 //! it uses the standard library so the control surface works before a larger web
 //! framework is selected for production packaging.
 
+#![recursion_limit = "256"]
+
 use async_trait::async_trait;
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value as JsonValue};
 use sha1::{Digest, Sha1};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -16,7 +18,7 @@ use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use tempo_agent::StepTriple;
@@ -35,11 +37,13 @@ use tempo_engine_host::{
     DriverCommand as HostDriverCommand, DriverResponse, DriverWireError, EngineHost,
     EngineHostConfig, EngineHostError, EngineIpcClient,
 };
-use tempo_policy::{decide_action, decide_effect, InputTaint, PolicyDecision};
+use tempo_policy::{decide_action, decide_effect, ConfirmationGate, InputTaint, PolicyDecision};
 use tempo_schema::{Action, ActionBatch, CompiledObservation, NodeId, ObservationDiff, SideEffect};
 use thiserror::Error;
 
 const MAX_HTTP_BYTES: usize = 64 * 1024;
+const MAX_IDEMPOTENCY_KEY_BYTES: usize = 256;
+const MAX_SESSION_IDEMPOTENCY_RECORDS: usize = 1024;
 const MAX_WS_PAYLOAD_BYTES: u64 = MAX_HTTP_BYTES as u64;
 /// Maximum number of live BiDi browsing contexts (forked drivers) held at once.
 const MAX_BIDI_CONTEXTS: usize = 64;
@@ -63,6 +67,13 @@ const ENGINE_IPC_TIMEOUT: Duration = Duration::from_secs(30);
 const ENGINE_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(test)]
 const ENGINE_TEARDOWN_TIMEOUT: Duration = Duration::from_millis(200);
+/// Bound the session create/fresh-context navigation path. It uses the shared
+/// engine IPC client, so a wedged create/goto must detach the engine state just
+/// like a wedged close path does.
+#[cfg(not(test))]
+const ENGINE_SESSION_CREATE_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const ENGINE_SESSION_CREATE_TIMEOUT: Duration = Duration::from_millis(200);
 const WS_ACCEPT_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const WS_OPCODE_TEXT: u8 = 0x1;
 const WS_OPCODE_BINARY: u8 = 0x2;
@@ -70,6 +81,11 @@ const WS_OPCODE_CLOSE: u8 = 0x8;
 const WS_OPCODE_PING: u8 = 0x9;
 const WS_OPCODE_PONG: u8 = 0xA;
 pub const TEMPO_OTLP_JSONL_ENV: &str = "TEMPO_OTLP_JSONL";
+pub const TEMPO_STEALTH_MODE_ENV: &str = "TEMPO_STEALTH_MODE";
+const OTLP_EXPORT_QUEUE_CAPACITY: usize = 1024;
+/// Machine-readable REST contract used as the source of truth for generated SDKs.
+pub const TEMPOD_OPENAPI_PATH: &str = "/openapi.json";
+const TEMPOD_OPENAPI_CONTENT_TYPE: &str = "application/vnd.oai.openapi+json;version=3.1";
 
 /// Stable tempod session id.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -111,6 +127,38 @@ pub enum TempodSessionEventKind {
     SessionKilled,
     SessionDrained,
     StepTriple { triple: StepTriple },
+}
+
+/// Controls intentional local history retention for the headless control plane.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PrivacyMode {
+    /// Keep in-memory per-session events and allow opt-in OTLP export.
+    #[default]
+    Audit,
+    /// Do not retain per-session events, ignore OTLP export, and purge terminal
+    /// sessions from the in-memory pool.
+    Stealth,
+}
+
+impl PrivacyMode {
+    fn from_env_value(value: Option<std::ffi::OsString>) -> Self {
+        let Some(value) = value else {
+            return Self::Audit;
+        };
+        let value = value.to_string_lossy();
+        if matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on" | "stealth"
+        ) {
+            Self::Stealth
+        } else {
+            Self::Audit
+        }
+    }
+
+    const fn retains_history(self) -> bool {
+        matches!(self, Self::Audit)
+    }
 }
 
 /// Driver handle attached to tempod through the engine-host UDS protocol.
@@ -355,8 +403,11 @@ enum DriverClientError {
 pub struct SessionPool {
     sessions: BTreeMap<TempodSessionId, TempodSession>,
     session_drivers: BTreeMap<TempodSessionId, AttachedEngineDriver>,
+    session_act_batch_idempotency:
+        BTreeMap<(TempodSessionId, String), SessionActBatchIdempotencyEntry>,
     events: BTreeMap<TempodSessionId, Vec<TempodSessionEvent>>,
     otlp_exporter: Option<OtlpJsonExporter>,
+    privacy_mode: PrivacyMode,
     bidi: BidiRouter,
     driver: Option<AttachedEngineDriver>,
     mcp: Option<Arc<Mutex<tempo_mcp::TempoMcpServer<AttachedEngineDriver>>>>,
@@ -372,8 +423,13 @@ impl fmt::Debug for SessionPool {
             .debug_struct("SessionPool")
             .field("sessions", &self.sessions)
             .field("session_drivers", &self.session_drivers.keys())
+            .field(
+                "session_act_batch_idempotency",
+                &self.session_act_batch_idempotency.len(),
+            )
             .field("event_sessions", &self.events.len())
             .field("otlp_exporter", &self.otlp_exporter)
+            .field("privacy_mode", &self.privacy_mode)
             .field("bidi", &self.bidi)
             .field("driver", &self.driver)
             .field("mcp_attached", &self.mcp.is_some())
@@ -383,27 +439,69 @@ impl fmt::Debug for SessionPool {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct SessionActBatchIdempotencyEntry {
+    request_fingerprint: JsonValue,
+    response: JsonValue,
+}
+
+struct ReservedSessionCreate {
+    id: TempodSessionId,
+    url: String,
+    created_ms: u128,
+    root_driver: Option<AttachedEngineDriver>,
+}
+
 impl SessionPool {
     pub fn from_env() -> Self {
-        Self::from_otlp_env_value(std::env::var_os(TEMPO_OTLP_JSONL_ENV))
+        Self::from_env_values(
+            std::env::var_os(TEMPO_OTLP_JSONL_ENV),
+            std::env::var_os(TEMPO_STEALTH_MODE_ENV),
+        )
     }
 
-    fn from_otlp_env_value(value: Option<std::ffi::OsString>) -> Self {
-        match value {
-            Some(path) if !path.is_empty() => {
-                Self::default().with_otlp_exporter(OtlpJsonExporter::new(path))
-            }
-            _ => Self::default(),
+    fn from_env_values(
+        otlp_value: Option<std::ffi::OsString>,
+        stealth_value: Option<std::ffi::OsString>,
+    ) -> Self {
+        let privacy_mode = PrivacyMode::from_env_value(stealth_value);
+        let mut pool = Self::default().with_privacy_mode(privacy_mode);
+        if privacy_mode.retains_history()
+            && let Some(path) = otlp_value
+            && !path.is_empty()
+        {
+            pool = pool.with_otlp_exporter(OtlpJsonExporter::new(path));
         }
+        pool
+    }
+
+    pub fn with_privacy_mode(mut self, privacy_mode: PrivacyMode) -> Self {
+        self.privacy_mode = privacy_mode;
+        if !privacy_mode.retains_history() {
+            self.otlp_exporter = None;
+            self.events.clear();
+            self.session_act_batch_idempotency.clear();
+        }
+        self
+    }
+
+    pub fn privacy_mode(&self) -> PrivacyMode {
+        self.privacy_mode
     }
 
     pub fn with_otlp_exporter(mut self, exporter: OtlpJsonExporter) -> Self {
-        self.otlp_exporter = Some(exporter);
+        if self.privacy_mode.retains_history() {
+            self.otlp_exporter = Some(exporter);
+        }
         self
     }
 
     pub fn set_otlp_exporter(&mut self, exporter: Option<OtlpJsonExporter>) {
-        self.otlp_exporter = exporter;
+        self.otlp_exporter = if self.privacy_mode.retains_history() {
+            exporter
+        } else {
+            None
+        };
     }
 
     pub fn otlp_exporter(&self) -> Option<&OtlpJsonExporter> {
@@ -411,21 +509,68 @@ impl SessionPool {
     }
 
     pub fn create(&mut self, url: impl Into<String>) -> Result<TempodSession, TempodError> {
+        let ReservedSessionCreate {
+            id,
+            url,
+            created_ms,
+            root_driver,
+        } = self.reserve_session_create(url.into())?;
+        let mut session_driver =
+            match create_session_engine_context_from_root_driver(root_driver, &url) {
+                Ok(session_driver) => session_driver,
+                Err(error) => {
+                    if should_abandon_attached_engine_after_session_create_error(&error) {
+                        self.abandon_attached_engine_after_teardown_timeout(
+                            "session engine context create/goto",
+                        );
+                    }
+                    return Err(error);
+                }
+            };
+        match self.commit_reserved_session_create(id, url, created_ms, &mut session_driver) {
+            Ok(session) => Ok(session),
+            Err(error) => {
+                close_rejected_session_driver(session_driver);
+                Err(error)
+            }
+        }
+    }
+
+    fn reserve_session_create(
+        &mut self,
+        url: String,
+    ) -> Result<ReservedSessionCreate, TempodError> {
         if self.draining {
             return Err(TempodError::Draining);
         }
-        let url = url.into();
-        let session_driver = self.create_session_engine_context(&url)?;
         let id = TempodSessionId(format!("session-{}", self.next_id));
         self.next_id = self.next_id.saturating_add(1);
+        Ok(ReservedSessionCreate {
+            id,
+            url,
+            created_ms: current_time_ms(),
+            root_driver: self.driver.clone(),
+        })
+    }
+
+    fn commit_reserved_session_create(
+        &mut self,
+        id: TempodSessionId,
+        url: String,
+        created_ms: u128,
+        session_driver: &mut Option<AttachedEngineDriver>,
+    ) -> Result<TempodSession, TempodError> {
+        if self.draining {
+            return Err(TempodError::Draining);
+        }
         let session = TempodSession {
             id: id.clone(),
             url,
             state: TempodSessionState::Running,
-            created_ms: current_time_ms(),
+            created_ms,
         };
         self.sessions.insert(id, session.clone());
-        if let Some(driver) = session_driver {
+        if let Some(driver) = session_driver.take() {
             self.session_drivers.insert(session.id.clone(), driver);
         }
         self.record_event(
@@ -467,7 +612,9 @@ impl SessionPool {
             session.clone()
         };
         self.close_session_driver(id);
+        self.clear_session_idempotency(id);
         self.record_event(id, TempodSessionEventKind::SessionKilled);
+        self.purge_terminal_session_if_stealth(id);
         Ok(session.clone())
     }
 
@@ -484,7 +631,9 @@ impl SessionPool {
         for id in drained {
             self.record_event(&id, TempodSessionEventKind::SessionDrained);
         }
+        self.session_act_batch_idempotency.clear();
         self.close_engine_resources(true);
+        self.purge_terminal_sessions_if_stealth();
     }
 
     pub fn draining(&self) -> bool {
@@ -622,34 +771,138 @@ impl SessionPool {
         }
     }
 
-    /// Allocate a fresh engine context for a newly-created tempod session and
-    /// navigate it to the session URL. Without an attached engine, tempod still
-    /// supports metadata-only session records for driverless control-plane tests.
-    fn create_session_engine_context(
+    pub fn observe_session(
         &mut self,
-        url: &str,
-    ) -> Result<Option<AttachedEngineDriver>, TempodError> {
-        let Some(root_driver) = self.driver.as_mut() else {
+        id: &TempodSessionId,
+    ) -> Result<CompiledObservation, TempodError> {
+        let driver = self.session_driver_mut(id)?;
+        futures::executor::block_on(driver.observe())
+            .map_err(|error| TempodError::Driver(error.to_string()))
+    }
+
+    pub fn act_batch_session(
+        &mut self,
+        id: &TempodSessionId,
+        batch: &ActionBatch,
+    ) -> Result<StepOutcome, TempodError> {
+        let driver = self.session_driver_mut(id)?;
+        futures::executor::block_on(driver.act_batch(batch))
+            .map_err(|error| TempodError::Driver(error.to_string()))
+    }
+
+    fn cached_session_act_batch_response(
+        &self,
+        id: &TempodSessionId,
+        key: &str,
+        request_fingerprint: &JsonValue,
+    ) -> Result<Option<JsonValue>, TempodError> {
+        if !self.sessions.contains_key(id) {
+            return Err(TempodError::SessionNotFound(id.clone()));
+        }
+        let Some(entry) = self
+            .session_act_batch_idempotency
+            .get(&(id.clone(), key.to_owned()))
+        else {
             return Ok(None);
         };
-        let options = BrowsingContextCreateOptions {
-            kind: BrowsingContextKind::Tab,
-            background: true,
-        };
-        let mut session_driver =
-            futures::executor::block_on(root_driver.create_browsing_context_attached(options))
-                .map_err(|error| {
-                    TempodError::Driver(format!(
-                        "attached engine failed to create session context: {error}"
-                    ))
-                })?;
-        if let Err(error) = futures::executor::block_on(session_driver.goto(url)) {
-            let _ = futures::executor::block_on(session_driver.close());
-            return Err(TempodError::Driver(format!(
-                "attached engine failed to navigate session context: {error}"
-            )));
+        if &entry.request_fingerprint != request_fingerprint {
+            return Err(TempodError::Conflict(
+                "idempotency_key was already used for a different act_batch request".into(),
+            ));
         }
-        Ok(Some(session_driver))
+        Ok(Some(entry.response.clone()))
+    }
+
+    fn ensure_session_idempotency_capacity(
+        &self,
+        id: &TempodSessionId,
+        key: &str,
+    ) -> Result<(), TempodError> {
+        if !self.sessions.contains_key(id) {
+            return Err(TempodError::SessionNotFound(id.clone()));
+        }
+        if self
+            .session_act_batch_idempotency
+            .contains_key(&(id.clone(), key.to_owned()))
+            || self.session_idempotency_record_count(id) < MAX_SESSION_IDEMPOTENCY_RECORDS
+        {
+            return Ok(());
+        }
+        Err(TempodError::Conflict(format!(
+            "session idempotency cache is full; max {MAX_SESSION_IDEMPOTENCY_RECORDS} records"
+        )))
+    }
+
+    fn remember_session_act_batch_response(
+        &mut self,
+        id: &TempodSessionId,
+        key: &str,
+        request_fingerprint: JsonValue,
+        response: JsonValue,
+    ) -> Result<(), TempodError> {
+        if !self.sessions.contains_key(id) {
+            return Err(TempodError::SessionNotFound(id.clone()));
+        }
+        self.ensure_session_idempotency_capacity(id, key)?;
+        self.session_act_batch_idempotency.insert(
+            (id.clone(), key.to_owned()),
+            SessionActBatchIdempotencyEntry {
+                request_fingerprint,
+                response,
+            },
+        );
+        Ok(())
+    }
+
+    fn session_idempotency_record_count(&self, id: &TempodSessionId) -> usize {
+        self.session_act_batch_idempotency
+            .keys()
+            .filter(|(session_id, _)| session_id == id)
+            .count()
+    }
+
+    fn clear_session_idempotency(&mut self, id: &TempodSessionId) {
+        self.session_act_batch_idempotency
+            .retain(|(session_id, _), _| session_id != id);
+    }
+
+    fn purge_terminal_session_if_stealth(&mut self, id: &TempodSessionId) {
+        if self.privacy_mode.retains_history() {
+            return;
+        }
+        self.events.remove(id);
+        self.clear_session_idempotency(id);
+        self.sessions.remove(id);
+    }
+
+    fn purge_terminal_sessions_if_stealth(&mut self) {
+        if self.privacy_mode.retains_history() {
+            return;
+        }
+        let terminal_ids = self
+            .sessions
+            .iter()
+            .filter(|(_, session)| session.state == TempodSessionState::Killed)
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        for id in terminal_ids {
+            self.purge_terminal_session_if_stealth(&id);
+        }
+    }
+
+    fn session_driver_mut(
+        &mut self,
+        id: &TempodSessionId,
+    ) -> Result<&mut AttachedEngineDriver, TempodError> {
+        if !self.sessions.contains_key(id) {
+            return Err(TempodError::SessionNotFound(id.clone()));
+        }
+        self.session_drivers.get_mut(id).ok_or_else(|| {
+            TempodError::DriverUnavailable(format!(
+                "session {} has no attached engine context",
+                id.0
+            ))
+        })
     }
 
     /// Best-effort close of one session-owned engine context. Session lifecycle
@@ -783,8 +1036,10 @@ impl SessionPool {
         if !self.sessions.contains_key(id) {
             return Err(TempodError::SessionNotFound(id.clone()));
         }
-        if let Some(exporter) = &self.otlp_exporter {
-            exporter.export_step(&triple)?;
+        if let Some(exporter) = &self.otlp_exporter
+            && let Err(error) = exporter.export_step(&triple)
+        {
+            eprintln!("tempod: OTLP step export failed (telemetry only): {error}");
         }
         Ok(self.record_event(id, TempodSessionEventKind::StepTriple { triple }))
     }
@@ -810,6 +1065,14 @@ impl SessionPool {
         id: &TempodSessionId,
         event: TempodSessionEventKind,
     ) -> TempodSessionEvent {
+        if !self.privacy_mode.retains_history() {
+            return TempodSessionEvent {
+                session_id: id.clone(),
+                seq: 0,
+                timestamp_ms: current_time_ms(),
+                event,
+            };
+        }
         let events = self.events.entry(id.clone()).or_default();
         let record = TempodSessionEvent {
             session_id: id.clone(),
@@ -852,6 +1115,87 @@ impl Drop for SessionPool {
         if closed.is_err() {
             eprintln!(
                 "tempod: panic while closing engine resources during SessionPool drop; ignoring"
+            );
+        }
+    }
+}
+
+fn create_session_engine_context_on_driver(
+    mut root_driver: AttachedEngineDriver,
+    url: &str,
+) -> Result<Option<AttachedEngineDriver>, TempodError> {
+    let options = BrowsingContextCreateOptions {
+        kind: BrowsingContextKind::Tab,
+        background: true,
+    };
+    let mut session_driver =
+        futures::executor::block_on(root_driver.create_browsing_context_attached(options))
+            .map_err(|error| {
+                TempodError::Driver(format!(
+                    "attached engine failed to create session context: {error}"
+                ))
+            })?;
+    if let Err(error) = futures::executor::block_on(session_driver.goto(url)) {
+        let _ = futures::executor::block_on(session_driver.close());
+        return Err(TempodError::Driver(format!(
+            "attached engine failed to navigate session context: {error}"
+        )));
+    }
+    Ok(Some(session_driver))
+}
+
+fn create_session_engine_context_from_root_driver(
+    root_driver: Option<AttachedEngineDriver>,
+    url: &str,
+) -> Result<Option<AttachedEngineDriver>, TempodError> {
+    let Some(root_driver) = root_driver else {
+        return Ok(None);
+    };
+    let url = url.to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let result = create_session_engine_context_on_driver(root_driver, &url);
+        if let Err(send_error) = tx.send(result)
+            && let Ok(Some(mut driver)) = send_error.0
+        {
+            let _ = futures::executor::block_on(driver.close());
+        }
+    });
+
+    match rx.recv_timeout(ENGINE_SESSION_CREATE_TIMEOUT) {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(TempodError::DriverUnavailable(
+            "attached engine timed out creating session context".into(),
+        )),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err(TempodError::DriverUnavailable(
+                "attached engine session context worker ended without a result".into(),
+            ))
+        }
+    }
+}
+
+fn should_abandon_attached_engine_after_session_create_error(error: &TempodError) -> bool {
+    matches!(error, TempodError::DriverUnavailable(_))
+}
+
+fn close_rejected_session_driver(session_driver: Option<AttachedEngineDriver>) {
+    let Some(mut driver) = session_driver else {
+        return;
+    };
+    match run_teardown_bounded(
+        "rejected session engine context Close",
+        ENGINE_TEARDOWN_TIMEOUT,
+        move || futures::executor::block_on(driver.close()),
+    ) {
+        Some(Ok(())) => {}
+        Some(Err(error)) => {
+            eprintln!("tempod: error closing rejected session engine context: {error}");
+        }
+        None => {
+            eprintln!(
+                "tempod: rejected session engine context close timed out; \
+                 detached cleanup owns the resource"
             );
         }
     }
@@ -970,45 +1314,174 @@ impl Default for EngineSupervisor {
 }
 
 /// JSONL exporter for StepTriple telemetry.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct OtlpJsonExporter {
     path: PathBuf,
+    sender: mpsc::SyncSender<OtlpExportCommand>,
 }
 
 impl OtlpJsonExporter {
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
+        let path = path.into();
+        let (sender, receiver) = mpsc::sync_channel(OTLP_EXPORT_QUEUE_CAPACITY);
+        spawn_otlp_writer(path.clone(), receiver);
+        Self { path, sender }
     }
 
     pub fn export_step(&self, triple: &StepTriple) -> Result<(), TempodError> {
-        if let Some(parent) = self
-            .path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
+        match self
+            .sender
+            .try_send(OtlpExportCommand::Record(otlp_json_record(triple)))
         {
-            std::fs::create_dir_all(parent)?;
+            Ok(()) => Ok(()),
+            Err(mpsc::TrySendError::Full(_)) => Err(TempodError::Driver(
+                "OTLP export queue is full; dropping telemetry record".into(),
+            )),
+            Err(mpsc::TrySendError::Disconnected(_)) => Err(TempodError::Driver(
+                "OTLP export writer stopped; dropping telemetry record".into(),
+            )),
         }
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
-        serde_json::to_writer(
-            &mut file,
-            &json!({
-                "resource": {
-                    "service.name": "tempod",
-                },
-                "name": "tempo.step",
-                "body": triple,
-            }),
-        )?;
-        file.write_all(b"\n")?;
-        file.flush()?;
-        Ok(())
+    }
+
+    pub fn flush(&self) -> Result<(), TempodError> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.sender
+            .send(OtlpExportCommand::Flush(reply_tx))
+            .map_err(|_| TempodError::Driver("OTLP export writer stopped before flush".into()))?;
+        reply_rx
+            .recv()
+            .map_err(|_| TempodError::Driver("OTLP export writer did not flush".into()))?
+            .map_err(|error| TempodError::Driver(format!("OTLP export writer failed: {error}")))
     }
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+}
+
+impl fmt::Debug for OtlpJsonExporter {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OtlpJsonExporter")
+            .field("path", &self.path)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for OtlpJsonExporter {
+    fn eq(&self, other: &Self) -> bool {
+        self.path == other.path
+    }
+}
+
+impl Eq for OtlpJsonExporter {}
+
+enum OtlpExportCommand {
+    Record(JsonValue),
+    Flush(mpsc::Sender<Result<(), String>>),
+}
+
+fn spawn_otlp_writer(path: PathBuf, receiver: mpsc::Receiver<OtlpExportCommand>) {
+    thread::spawn(move || {
+        let mut last_error = None;
+        for command in receiver {
+            match command {
+                OtlpExportCommand::Record(record) => match write_otlp_json_record(&path, &record) {
+                    Ok(()) => last_error = None,
+                    Err(error) => {
+                        let message = error.to_string();
+                        eprintln!("tempod: OTLP step export failed (telemetry only): {message}");
+                        last_error = Some(message);
+                    }
+                },
+                OtlpExportCommand::Flush(reply) => {
+                    let _ = reply.send(match last_error.take() {
+                        Some(error) => Err(error),
+                        None => Ok(()),
+                    });
+                }
+            }
+        }
+    });
+}
+
+fn otlp_json_record(triple: &StepTriple) -> JsonValue {
+    json!({
+        "resource": {
+            "service.name": "tempod",
+        },
+        "name": "tempo.step",
+        "body": redacted_step_triple_body(triple),
+    })
+}
+
+fn write_otlp_json_record(path: &Path, record: &JsonValue) -> Result<(), TempodError> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    serde_json::to_writer(&mut file, record)?;
+    file.write_all(b"\n")?;
+    file.flush()?;
+    Ok(())
+}
+
+fn redacted_step_triple_body(triple: &StepTriple) -> serde_json::Value {
+    json!({
+        "key": triple.key.0,
+        "seq": triple.seq,
+        "action": {
+            "kind": action_kind(&triple.action),
+            "side_effect": triple.action.side_effect(),
+        },
+        "outcome": redacted_step_outcome(&triple.outcome),
+    })
+}
+
+fn action_kind(action: &Action) -> &'static str {
+    match action {
+        Action::Goto { .. } => "goto",
+        Action::Click { .. } => "click",
+        Action::Type { .. } => "type",
+        Action::Select { .. } => "select",
+        Action::Scroll { .. } => "scroll",
+        Action::Wait { .. } => "wait",
+        Action::Extract { .. } => "extract",
+        Action::Skill { .. } => "skill",
+    }
+}
+
+fn redacted_step_outcome(outcome: &tempo_agent::StepTripleOutcome) -> serde_json::Value {
+    match outcome {
+        tempo_agent::StepTripleOutcome::Applied { diff } => json!({
+            "kind": "applied",
+            "diff": {
+                "since_seq": diff.since_seq,
+                "seq": diff.seq,
+                "added": diff.added.len(),
+                "removed": diff.removed.len(),
+                "changed": diff.changed.len(),
+            },
+        }),
+        tempo_agent::StepTripleOutcome::StepError { .. } => json!({
+            "kind": "step_error",
+            "reason": "[redacted]",
+        }),
     }
 }
 
@@ -1101,12 +1574,7 @@ fn handle_stream(mut stream: TcpStream, pool: &Arc<Mutex<SessionPool>>) -> Resul
             // Reject a malformed/oversized request with an error response rather
             // than dropping the connection (issue #84); the connection error, if
             // any, stays isolated to this handler (issue #85).
-            let response = HttpResponse::json(
-                err.status(),
-                json!({
-                    "error": err.to_string(),
-                }),
-            );
+            let response = HttpResponse::json(err.status(), err.body());
             stream.write_all(response.to_bytes().as_slice())?;
             stream.flush()?;
             return Ok(());
@@ -1120,35 +1588,97 @@ fn handle_stream(mut stream: TcpStream, pool: &Arc<Mutex<SessionPool>>) -> Resul
         }
         Ok(None) => {}
         Err(err) => {
-            let response = HttpResponse::json(
-                err.status(),
-                json!({
-                    "error": err.to_string(),
-                }),
-            );
+            let response = HttpResponse::json(err.status(), err.body());
             stream.write_all(response.to_bytes().as_slice())?;
             stream.flush()?;
             return Ok(());
         }
     }
+    if request.method == "POST" && request.path == "/sessions" {
+        let response = handle_create_session_stream_request(pool, request);
+        stream.write_all(response.to_bytes().as_slice())?;
+        stream.flush()?;
+        return Ok(());
+    }
     let response = {
-        let mut pool = pool.lock().map_err(|_| TempodError::PoolLock)?;
-        handle_http_request(&mut pool, request)
+        match pool.lock() {
+            Ok(mut pool) => handle_http_request(&mut pool, request),
+            Err(_) => HttpResponse::json(500, TempodError::PoolLock.body()),
+        }
     };
     stream.write_all(response.to_bytes().as_slice())?;
     stream.flush()?;
     Ok(())
 }
 
+fn handle_create_session_stream_request(
+    pool: &Arc<Mutex<SessionPool>>,
+    request: HttpRequest,
+) -> HttpResponse {
+    match route_create_session_without_holding_pool_lock(pool, request) {
+        Ok(response) => response,
+        Err(err) => HttpResponse::json(err.status(), err.body()),
+    }
+}
+
+fn route_create_session_without_holding_pool_lock(
+    pool: &Arc<Mutex<SessionPool>>,
+    request: HttpRequest,
+) -> Result<HttpResponse, TempodError> {
+    if control_route_requires_origin_check(&request.method, &request.path)
+        && !bidi_origin_allowed(&request)
+    {
+        return Err(TempodError::Forbidden("origin not allowed".into()));
+    }
+    let body: CreateSessionRequest = serde_json::from_slice(&request.body).map_err(|error| {
+        TempodError::BadRequest(format!("invalid session request JSON: {error}"))
+    })?;
+    if body.url.trim().is_empty() {
+        return Err(TempodError::BadRequest("session url is required".into()));
+    }
+
+    let ReservedSessionCreate {
+        id,
+        url,
+        created_ms,
+        root_driver,
+    } = {
+        let mut pool = pool.lock().map_err(|_| TempodError::PoolLock)?;
+        pool.reserve_session_create(body.url)?
+    };
+
+    let mut session_driver = match create_session_engine_context_from_root_driver(root_driver, &url)
+    {
+        Ok(session_driver) => session_driver,
+        Err(error) => {
+            if should_abandon_attached_engine_after_session_create_error(&error) {
+                let mut pool = pool.lock().map_err(|_| TempodError::PoolLock)?;
+                pool.abandon_attached_engine_after_teardown_timeout(
+                    "session engine context create/goto",
+                );
+            }
+            return Err(error);
+        }
+    };
+
+    let session = {
+        let mut pool = pool.lock().map_err(|_| TempodError::PoolLock)?;
+        match pool.commit_reserved_session_create(id, url, created_ms, &mut session_driver) {
+            Ok(session) => session,
+            Err(error) => {
+                drop(pool);
+                close_rejected_session_driver(session_driver);
+                return Err(error);
+            }
+        }
+    };
+    Ok(HttpResponse::json(201, session))
+}
+
 fn handle_http_request(pool: &mut SessionPool, request: HttpRequest) -> HttpResponse {
     match route_http_request(pool, request) {
         Ok(response) => response,
-        Err(err) => HttpResponse::json(
-            err.status(),
-            json!({
-                "error": err.to_string(),
-            }),
-        ),
+        Err(err) => HttpResponse::json(err.status(), err.body()),
     }
 }
 
@@ -1168,6 +1698,11 @@ fn route_http_request(
     }
     match (request.method.as_str(), request.path.as_str()) {
         ("GET", "/health") => Ok(HttpResponse::json(200, json!({"ok": true}))),
+        ("GET", TEMPOD_OPENAPI_PATH) => Ok(HttpResponse::new(
+            200,
+            TEMPOD_OPENAPI_CONTENT_TYPE,
+            tempod_openapi(&request.base_url()).to_string().into_bytes(),
+        )),
         ("GET", tempo_mcp::A2A_AGENT_CARD_PATH) | ("GET", tempo_mcp::A2A_AGENT_JSON_PATH) => Ok(
             HttpResponse::from_mcp(tempo_mcp::agent_card_response(&request.base_url())),
         ),
@@ -1181,7 +1716,10 @@ fn route_http_request(
         }
         ("GET", "/sessions") => Ok(HttpResponse::json(200, pool.list())),
         ("POST", "/sessions") => {
-            let body: CreateSessionRequest = serde_json::from_slice(&request.body)?;
+            let body: CreateSessionRequest =
+                serde_json::from_slice(&request.body).map_err(|error| {
+                    TempodError::BadRequest(format!("invalid session request JSON: {error}"))
+                })?;
             if body.url.trim().is_empty() {
                 return Err(TempodError::BadRequest("session url is required".into()));
             }
@@ -1203,6 +1741,37 @@ fn route_http_request(
             {
                 return Ok(HttpResponse::json(200, pool.events(&id, after_seq)?));
             }
+            if request.method == "GET" && request.path.ends_with("/observe") {
+                let id = session_id_from_action_path(&request.path, "observe")?;
+                return Ok(HttpResponse::json(200, pool.observe_session(&id)?));
+            }
+            if request.method == "POST" && request.path.ends_with("/act_batch") {
+                let id = session_id_from_action_path(&request.path, "act_batch")?;
+                let body = parse_session_act_batch_request(&request.body)?;
+                let policy = enforce_session_batch_policy(&body)?;
+                let request_fingerprint = session_act_batch_idempotency_fingerprint(&body);
+                if let Some(key) = body.idempotency_key.as_deref()
+                    && let Some(response) =
+                        pool.cached_session_act_batch_response(&id, key, &request_fingerprint)?
+                {
+                    return Ok(HttpResponse::json(200, response));
+                }
+                if let Some(key) = body.idempotency_key.as_deref() {
+                    pool.ensure_session_idempotency_capacity(&id, key)?;
+                }
+                let idempotency_key = body.idempotency_key.clone();
+                let outcome = pool.act_batch_session(&id, &body.batch)?;
+                let response = step_outcome_response(outcome, policy);
+                if let Some(key) = idempotency_key {
+                    pool.remember_session_act_batch_response(
+                        &id,
+                        &key,
+                        request_fingerprint,
+                        response.clone(),
+                    )?;
+                }
+                return Ok(HttpResponse::json(200, response));
+            }
             if request.method == "POST" && request.path.ends_with("/adopt") {
                 let id = session_id_from_action_path(&request.path, "adopt")?;
                 return Ok(HttpResponse::json(200, pool.adopt(&id)?));
@@ -1216,6 +1785,1106 @@ fn route_http_request(
                 request.method, request.path
             )))
         }
+    }
+}
+
+fn parse_session_act_batch_request(body: &[u8]) -> Result<SessionActBatchRequest, TempodError> {
+    let value: JsonValue = serde_json::from_slice(body).map_err(|error| {
+        TempodError::BadRequest(format!("invalid act_batch request JSON: {error}"))
+    })?;
+    reject_explicit_null_field(&value, "input_tainted")?;
+    reject_explicit_null_field(&value, "idempotency_key")?;
+    serde_json::from_value(value).map_err(|error| {
+        TempodError::BadRequest(format!("invalid act_batch request JSON: {error}"))
+    })
+}
+
+fn reject_explicit_null_field(value: &JsonValue, field: &'static str) -> Result<(), TempodError> {
+    if value.get(field).is_some_and(JsonValue::is_null) {
+        return Err(TempodError::BadRequest(format!(
+            "{field} must not be null; omit the field to use its default"
+        )));
+    }
+    Ok(())
+}
+
+fn enforce_session_batch_policy(
+    body: &SessionActBatchRequest,
+) -> Result<SessionBatchPolicyReport, TempodError> {
+    if let Some(key) = body.idempotency_key.as_deref() {
+        if key.is_empty() {
+            return Err(TempodError::BadRequest(
+                "idempotency_key must not be empty".into(),
+            ));
+        }
+        if key.len() > MAX_IDEMPOTENCY_KEY_BYTES {
+            return Err(TempodError::BadRequest(format!(
+                "idempotency_key exceeds {MAX_IDEMPOTENCY_KEY_BYTES} bytes"
+            )));
+        }
+    }
+    let forced_tainted_actions = body
+        .batch
+        .actions
+        .iter()
+        .filter(|action| action_requires_external_taint_floor(action))
+        .count();
+    let input_tainted_effective = body.input_tainted.unwrap_or(true) || forced_tainted_actions > 0;
+    let declared_input_tainted = body.input_tainted.unwrap_or(true);
+    let mut report = SessionBatchPolicyReport {
+        input_tainted_declared: body.input_tainted,
+        input_tainted_effective,
+        forced_tainted_actions,
+        max_side_effect: SideEffect::Read,
+        strongest_gate: ConfirmationGate::None,
+        confirmation_required: false,
+        confirmed: body.confirmed,
+        idempotency_required: false,
+        idempotency_key_provided: body.idempotency_key.is_some(),
+    };
+    let mut first_confirmation_index = None;
+    let mut first_idempotency_index = None;
+    for (index, action) in body.batch.actions.iter().enumerate() {
+        let input_taint =
+            InputTaint::new(declared_input_tainted || action_requires_external_taint_floor(action));
+        let decision = decide_action(action, input_taint);
+        report.max_side_effect = report.max_side_effect.max(decision.side_effect);
+        report.strongest_gate = report.strongest_gate.max(decision.gate);
+        if decision.requires_confirmation() {
+            report.confirmation_required = true;
+            first_confirmation_index.get_or_insert(index);
+        }
+        if decision.idempotency_required {
+            report.idempotency_required = true;
+            first_idempotency_index.get_or_insert(index);
+        }
+    }
+    let missing_confirmation = report.confirmation_required && !body.confirmed;
+    let missing_idempotency = report.idempotency_required && body.idempotency_key.is_none();
+    if missing_confirmation || missing_idempotency {
+        let denied_action_index = match (missing_confirmation, missing_idempotency) {
+            (true, true) => match (first_confirmation_index, first_idempotency_index) {
+                (Some(confirmation_index), Some(idempotency_index)) => {
+                    confirmation_index.min(idempotency_index)
+                }
+                (Some(confirmation_index), None) => confirmation_index,
+                (None, Some(idempotency_index)) => idempotency_index,
+                (None, None) => 0,
+            },
+            (true, false) => first_confirmation_index.unwrap_or_default(),
+            (false, true) => first_idempotency_index.unwrap_or_default(),
+            (false, false) => unreachable!("policy denial requires at least one reason"),
+        };
+        let denied_action_kind = body
+            .batch
+            .actions
+            .get(denied_action_index)
+            .map(action_kind)
+            .unwrap_or("batch");
+        let reason = match (missing_confirmation, missing_idempotency) {
+            (true, true) => {
+                "requires human confirmation and idempotency_key before execution".to_string()
+            }
+            (true, false) => "requires human confirmation before execution".to_string(),
+            (false, true) => "requires idempotency_key before execution".to_string(),
+            (false, false) => unreachable!("policy denial requires at least one reason"),
+        };
+        return Err(TempodError::PolicyDenied(Box::new(PolicyDeniedError {
+            reason,
+            denied_action_index,
+            denied_action_kind,
+            policy: report,
+        })));
+    }
+    Ok(report)
+}
+
+fn action_requires_external_taint_floor(action: &Action) -> bool {
+    match action {
+        Action::Goto { .. }
+        | Action::Scroll { .. }
+        | Action::Wait { .. }
+        | Action::Extract { .. } => false,
+        Action::Click { .. }
+        | Action::Type { .. }
+        | Action::Select { .. }
+        | Action::Skill { .. } => true,
+    }
+}
+
+fn session_act_batch_idempotency_fingerprint(body: &SessionActBatchRequest) -> JsonValue {
+    json!({
+        "batch": &body.batch,
+        "input_tainted": body.input_tainted,
+        "confirmed": body.confirmed,
+    })
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SessionBatchPolicyReport {
+    input_tainted_declared: Option<bool>,
+    input_tainted_effective: bool,
+    forced_tainted_actions: usize,
+    max_side_effect: SideEffect,
+    strongest_gate: ConfirmationGate,
+    confirmation_required: bool,
+    confirmed: bool,
+    idempotency_required: bool,
+    idempotency_key_provided: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PolicyDeniedError {
+    reason: String,
+    denied_action_index: usize,
+    denied_action_kind: &'static str,
+    policy: SessionBatchPolicyReport,
+}
+
+impl fmt::Display for PolicyDeniedError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "policy denied: {} at action {} ({}); input_tainted={}",
+            self.reason,
+            self.denied_action_index,
+            self.denied_action_kind,
+            self.policy.input_tainted_effective
+        )
+    }
+}
+
+impl std::error::Error for PolicyDeniedError {}
+
+fn step_outcome_response(
+    outcome: StepOutcome,
+    policy: SessionBatchPolicyReport,
+) -> serde_json::Value {
+    let policy = session_batch_policy_json(&policy);
+    match outcome {
+        StepOutcome::Applied { diff } => json!({
+            "status": "applied",
+            "diff": diff,
+            "policy": policy,
+        }),
+        StepOutcome::StepError { reason } => json!({
+            "status": "step_error",
+            "reason": reason,
+            "policy": policy,
+        }),
+    }
+}
+
+fn policy_denied_error_json(error: &PolicyDeniedError) -> serde_json::Value {
+    json!({
+        "error": error.to_string(),
+        "reason": &error.reason,
+        "denied_action_index": error.denied_action_index,
+        "denied_action_kind": error.denied_action_kind,
+        "policy": session_batch_policy_json(&error.policy),
+    })
+}
+
+fn session_batch_policy_json(policy: &SessionBatchPolicyReport) -> serde_json::Value {
+    json!({
+        "input_tainted_declared": policy.input_tainted_declared,
+        "input_tainted_effective": policy.input_tainted_effective,
+        "forced_tainted_actions": policy.forced_tainted_actions,
+        "max_side_effect": policy.max_side_effect,
+        "strongest_gate": confirmation_gate_name(policy.strongest_gate),
+        "confirmation_required": policy.confirmation_required,
+        "confirmed": policy.confirmed,
+        "idempotency_required": policy.idempotency_required,
+        "idempotency_key_provided": policy.idempotency_key_provided,
+    })
+}
+
+fn confirmation_gate_name(gate: ConfirmationGate) -> &'static str {
+    match gate {
+        ConfirmationGate::None => "none",
+        ConfirmationGate::Confirm => "confirm",
+        ConfirmationGate::ConfirmWithTaintReview => "confirm_with_taint_review",
+    }
+}
+
+/// OpenAPI 3.1 description of tempod's REST control plane.
+///
+/// This is intentionally served by tempod itself instead of living only in docs:
+/// generated SDKs for Swift, TypeScript, Python, Go, Kotlin, Java, and other
+/// languages should consume the live contract that the daemon actually serves.
+pub fn tempod_openapi(base_url: &str) -> serde_json::Value {
+    let base_url = base_url.trim_end_matches('/');
+    json!({
+        "openapi": "3.1.0",
+        "info": {
+            "title": "tempo tempod REST API",
+            "version": env!("CARGO_PKG_VERSION"),
+            "description": "Headless control plane for tempo browser sessions, MCP, WebDriver BiDi, and SDK generation.",
+            "license": {
+                "name": "Apache-2.0"
+            },
+            "x-tempo-sdk-targets": [
+                "swift",
+                "typescript",
+                "python",
+                "go",
+                "kotlin",
+                "java",
+                "csharp",
+                "rust"
+            ],
+            "x-tempo-platforms": [
+                "macos",
+                "ios",
+                "windows",
+                "linux"
+            ]
+        },
+        "servers": [
+            {
+                "url": base_url,
+                "description": "This tempod instance"
+            }
+        ],
+        "tags": [
+            {
+                "name": "metadata",
+                "description": "Public metadata and discovery endpoints."
+            },
+            {
+                "name": "sessions",
+                "description": "Create, list, adopt, close, and observe browser sessions."
+            },
+            {
+                "name": "protocols",
+                "description": "Agent protocol ingress for MCP and WebDriver BiDi clients."
+            },
+            {
+                "name": "operations",
+                "description": "Daemon lifecycle operations."
+            }
+        ],
+        "paths": {
+            "/health": {
+                "get": {
+                    "tags": ["metadata"],
+                    "operationId": "getHealth",
+                    "summary": "Check tempod liveness.",
+                    "responses": {
+                        "200": {
+                            "description": "Daemon is accepting HTTP requests.",
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/Health"}
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/openapi.json": {
+                "get": {
+                    "tags": ["metadata"],
+                    "operationId": "getOpenApi",
+                    "summary": "Fetch the SDK source-of-truth OpenAPI document.",
+                    "responses": {
+                        "200": {
+                            "description": "OpenAPI 3.1 document for this tempod instance.",
+                            "content": {
+                                "application/vnd.oai.openapi+json;version=3.1": {
+                                    "schema": {"type": "object"}
+                                },
+                                "application/json": {
+                                    "schema": {"type": "object"}
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/.well-known/agent-card.json": {
+                "get": {
+                    "tags": ["metadata"],
+                    "operationId": "getAgentCard",
+                    "summary": "Fetch the tempo A2A agent card.",
+                    "responses": {
+                        "200": {
+                            "description": "Agent card advertising tempo's MCP control surface.",
+                            "content": {
+                                "application/a2a+json": {
+                                    "schema": {"type": "object"}
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/.well-known/agent.json": {
+                "get": {
+                    "tags": ["metadata"],
+                    "operationId": "getAgentJson",
+                    "summary": "Fetch the A2A agent-card alias.",
+                    "responses": {
+                        "200": {
+                            "description": "Agent card alias.",
+                            "content": {
+                                "application/a2a+json": {
+                                    "schema": {"type": "object"}
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/sessions": {
+                "get": {
+                    "tags": ["sessions"],
+                    "operationId": "listSessions",
+                    "summary": "List tempod sessions.",
+                    "x-origin-policy": "Browser Origin headers must be loopback.",
+                    "responses": {
+                        "200": {
+                            "description": "Current sessions.",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "array",
+                                        "items": {"$ref": "#/components/schemas/TempodSession"}
+                                    }
+                                }
+                            }
+                        },
+                        "403": {"$ref": "#/components/responses/Forbidden"}
+                    }
+                },
+                "post": {
+                    "tags": ["sessions"],
+                    "operationId": "createSession",
+                    "summary": "Create a new browser session.",
+                    "x-origin-policy": "Browser Origin headers must be loopback.",
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": {"$ref": "#/components/schemas/CreateSessionRequest"}
+                            }
+                        }
+                    },
+                    "responses": {
+                        "201": {
+                            "description": "Session created.",
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/TempodSession"}
+                                }
+                            }
+                        },
+                        "400": {"$ref": "#/components/responses/BadRequest"},
+                        "403": {"$ref": "#/components/responses/Forbidden"},
+                        "500": {"$ref": "#/components/responses/InternalError"},
+                        "503": {"$ref": "#/components/responses/Draining"}
+                    }
+                }
+            },
+            "/sessions/{session_id}/events": {
+                "get": {
+                    "tags": ["sessions"],
+                    "operationId": "listSessionEvents",
+                    "summary": "Read session events after an optional cursor.",
+                    "x-origin-policy": "Browser Origin headers must be loopback.",
+                    "parameters": [
+                        {"$ref": "#/components/parameters/SessionId"},
+                        {
+                            "name": "after_seq",
+                            "in": "query",
+                            "required": false,
+                            "schema": {"type": "integer", "minimum": 0},
+                            "description": "Return only events with seq greater than this cursor."
+                        }
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "Session events.",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "array",
+                                        "items": {"$ref": "#/components/schemas/TempodSessionEvent"}
+                                    }
+                                }
+                            }
+                        },
+                        "400": {"$ref": "#/components/responses/BadRequest"},
+                        "403": {"$ref": "#/components/responses/Forbidden"},
+                        "404": {"$ref": "#/components/responses/NotFound"}
+                    }
+                }
+            },
+            "/sessions/{session_id}/observe": {
+                "get": {
+                    "tags": ["sessions"],
+                    "operationId": "observeSession",
+                    "summary": "Return the current compiled observation for a session.",
+                    "x-origin-policy": "Browser Origin headers must be loopback.",
+                    "parameters": [{"$ref": "#/components/parameters/SessionId"}],
+                    "responses": {
+                        "200": {
+                            "description": "Compiled structured browser observation.",
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/CompiledObservation"}
+                                }
+                            }
+                        },
+                        "403": {"$ref": "#/components/responses/Forbidden"},
+                        "404": {"$ref": "#/components/responses/NotFound"},
+                        "500": {"$ref": "#/components/responses/InternalError"},
+                        "503": {"$ref": "#/components/responses/Draining"}
+                    }
+                }
+            },
+            "/sessions/{session_id}/act_batch": {
+                "post": {
+                    "tags": ["sessions"],
+                    "operationId": "actBatchSession",
+                    "summary": "Execute a typed tempo action batch against a session.",
+                    "x-origin-policy": "Browser Origin headers must be loopback.",
+                    "parameters": [{"$ref": "#/components/parameters/SessionId"}],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": {"$ref": "#/components/schemas/SessionActBatchRequest"}
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Driver step outcome.",
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/SessionStepOutcome"}
+                                }
+                            }
+                        },
+                        "400": {"$ref": "#/components/responses/BadRequest"},
+                        "403": {"$ref": "#/components/responses/PolicyDenied"},
+                        "409": {"$ref": "#/components/responses/Conflict"},
+                        "404": {"$ref": "#/components/responses/NotFound"},
+                        "500": {"$ref": "#/components/responses/InternalError"},
+                        "503": {"$ref": "#/components/responses/Draining"}
+                    }
+                }
+            },
+            "/sessions/{session_id}/adopt": {
+                "post": {
+                    "tags": ["sessions"],
+                    "operationId": "adoptSession",
+                    "summary": "Mark a headless session as adopted by a shell.",
+                    "x-origin-policy": "Browser Origin headers must be loopback.",
+                    "parameters": [{"$ref": "#/components/parameters/SessionId"}],
+                    "responses": {
+                        "200": {
+                            "description": "Updated session.",
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/TempodSession"}
+                                }
+                            }
+                        },
+                        "403": {"$ref": "#/components/responses/Forbidden"},
+                        "404": {"$ref": "#/components/responses/NotFound"},
+                        "503": {"$ref": "#/components/responses/Draining"}
+                    }
+                }
+            },
+            "/sessions/{session_id}": {
+                "delete": {
+                    "tags": ["sessions"],
+                    "operationId": "killSession",
+                    "summary": "Close a session and release its engine context.",
+                    "x-origin-policy": "Browser Origin headers must be loopback.",
+                    "parameters": [{"$ref": "#/components/parameters/SessionId"}],
+                    "responses": {
+                        "200": {
+                            "description": "Killed session.",
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/TempodSession"}
+                                }
+                            }
+                        },
+                        "403": {"$ref": "#/components/responses/Forbidden"},
+                        "404": {"$ref": "#/components/responses/NotFound"}
+                    }
+                }
+            },
+            "/drain": {
+                "post": {
+                    "tags": ["operations"],
+                    "operationId": "drainDaemon",
+                    "summary": "Stop accepting new work and drain engine resources.",
+                    "x-origin-policy": "Browser Origin headers must be loopback.",
+                    "responses": {
+                        "200": {
+                            "description": "Drain state.",
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/DrainResponse"}
+                                }
+                            }
+                        },
+                        "403": {"$ref": "#/components/responses/Forbidden"}
+                    }
+                }
+            },
+            "/mcp": {
+                "get": {
+                    "tags": ["protocols"],
+                    "operationId": "getMcp",
+                    "summary": "MCP metadata endpoint.",
+                    "responses": {
+                        "405": {
+                            "description": "This endpoint does not offer server-initiated streams.",
+                            "content": {
+                                "text/plain; charset=utf-8": {
+                                    "schema": {"type": "string"}
+                                }
+                            }
+                        }
+                    }
+                },
+                "post": {
+                    "tags": ["protocols"],
+                    "operationId": "postMcp",
+                    "summary": "Send one MCP JSON-RPC message.",
+                    "x-origin-policy": "Browser Origin headers must be loopback when present.",
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": {"$ref": "#/components/schemas/JsonRpcMessage"}
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "JSON-RPC response envelope.",
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/JsonRpcResponse"}
+                                }
+                            }
+                        },
+                        "202": {"description": "JSON-RPC notification accepted."},
+                        "400": {"$ref": "#/components/responses/JsonRpcError"},
+                        "403": {"$ref": "#/components/responses/JsonRpcError"},
+                        "500": {"$ref": "#/components/responses/InternalError"},
+                        "503": {"$ref": "#/components/responses/Draining"}
+                    }
+                }
+            },
+            "/bidi": {
+                "get": {
+                    "tags": ["protocols"],
+                    "operationId": "connectBidiWebSocket",
+                    "summary": "Upgrade to a WebDriver BiDi WebSocket session.",
+                    "x-origin-policy": "Browser Origin headers must be loopback when present.",
+                    "responses": {
+                        "101": {"description": "WebSocket upgrade accepted."},
+                        "400": {"$ref": "#/components/responses/BadRequest"},
+                        "403": {"$ref": "#/components/responses/Forbidden"}
+                    }
+                },
+                "post": {
+                    "tags": ["protocols"],
+                    "operationId": "postBidi",
+                    "summary": "Send one WebDriver BiDi command over HTTP.",
+                    "x-origin-policy": "Browser Origin headers must be loopback when present.",
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": {"type": "object"}
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "BiDi command result.",
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/BidiMessage"}
+                                }
+                            }
+                        },
+                        "400": {"$ref": "#/components/responses/BidiProtocolError"},
+                        "403": {"$ref": "#/components/responses/Forbidden"},
+                        "500": {"$ref": "#/components/responses/InternalError"},
+                        "503": {"$ref": "#/components/responses/BidiProtocolError"}
+                    }
+                }
+            }
+        },
+        "components": {
+            "parameters": {
+                "SessionId": {
+                    "name": "session_id",
+                    "in": "path",
+                    "required": true,
+                    "schema": {"type": "string"},
+                    "description": "tempod session id, for example session-0."
+                }
+            },
+            "responses": {
+                "BadRequest": {
+                    "description": "Malformed request.",
+                    "content": {
+                        "application/json": {
+                            "schema": {"$ref": "#/components/schemas/ErrorResponse"}
+                        }
+                    }
+                },
+                "Forbidden": {
+                    "description": "Origin or policy guard rejected the request.",
+                    "content": {
+                        "application/json": {
+                            "schema": {"$ref": "#/components/schemas/ErrorResponse"}
+                        }
+                    }
+                },
+                "PolicyDenied": {
+                    "description": "Origin or action policy rejected execution; policy denials include machine-readable recovery requirements.",
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "oneOf": [
+                                    {"$ref": "#/components/schemas/PolicyErrorResponse"},
+                                    {"$ref": "#/components/schemas/ErrorResponse"}
+                                ]
+                            }
+                        }
+                    }
+                },
+                "JsonRpcError": {
+                    "description": "JSON-RPC error envelope.",
+                    "content": {
+                        "application/json": {
+                            "schema": {"$ref": "#/components/schemas/JsonRpcErrorResponse"}
+                        }
+                    }
+                },
+                "BidiProtocolError": {
+                    "description": "WebDriver BiDi error message envelope.",
+                    "content": {
+                        "application/json": {
+                            "schema": {"$ref": "#/components/schemas/BidiErrorResponse"}
+                        }
+                    }
+                },
+                "Conflict": {
+                    "description": "Request conflicts with previously recorded state.",
+                    "content": {
+                        "application/json": {
+                            "schema": {"$ref": "#/components/schemas/ErrorResponse"}
+                        }
+                    }
+                },
+                "NotFound": {
+                    "description": "Requested session or engine was not found.",
+                    "content": {
+                        "application/json": {
+                            "schema": {"$ref": "#/components/schemas/ErrorResponse"}
+                        }
+                    }
+                },
+                "InternalError": {
+                    "description": "Internal daemon failure or attached driver failure.",
+                    "content": {
+                        "application/json": {
+                            "schema": {"$ref": "#/components/schemas/ErrorResponse"}
+                        }
+                    }
+                },
+                "Draining": {
+                    "description": "Daemon is draining or the requested work requires an attached engine driver that is unavailable.",
+                    "content": {
+                        "application/json": {
+                            "schema": {"$ref": "#/components/schemas/ErrorResponse"}
+                        }
+                    }
+                }
+            },
+            "schemas": {
+                "Health": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["ok"],
+                    "properties": {
+                        "ok": {"type": "boolean"}
+                    }
+                },
+                "CreateSessionRequest": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["url"],
+                    "properties": {
+                        "url": {
+                            "type": "string",
+                            "format": "uri",
+                            "description": "Initial URL for the browser session."
+                        }
+                    }
+                },
+                "TempodSessionState": {
+                    "type": "string",
+                    "enum": ["running", "adopted", "killed"]
+                },
+                "TempodSession": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["id", "url", "state", "created_ms"],
+                    "properties": {
+                        "id": {"type": "string"},
+                        "url": {"type": "string"},
+                        "state": {"$ref": "#/components/schemas/TempodSessionState"},
+                        "created_ms": {
+                            "type": "integer",
+                            "minimum": 0
+                        }
+                    }
+                },
+                "TempodSessionEvent": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["session_id", "seq", "timestamp_ms", "event"],
+                    "properties": {
+                        "session_id": {"type": "string"},
+                        "seq": {
+                            "type": "integer",
+                            "minimum": 0
+                        },
+                        "timestamp_ms": {
+                            "type": "integer",
+                            "minimum": 0
+                        },
+                        "event": {
+                            "$ref": "#/components/schemas/TempodSessionEventKind"
+                        }
+                    }
+                },
+                "TempodSessionEventKind": {
+                    "oneOf": [
+                        {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["kind", "url"],
+                            "properties": {
+                                "kind": {"const": "session_created"},
+                                "url": {"type": "string"}
+                            }
+                        },
+                        {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["kind"],
+                            "properties": {
+                                "kind": {"const": "session_adopted"}
+                            }
+                        },
+                        {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["kind"],
+                            "properties": {
+                                "kind": {"const": "session_killed"}
+                            }
+                        },
+                        {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["kind"],
+                            "properties": {
+                                "kind": {"const": "session_drained"}
+                            }
+                        },
+                        {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["kind", "triple"],
+                            "properties": {
+                                "kind": {"const": "step_triple"},
+                                "triple": {"$ref": "#/components/schemas/StepTriple"}
+                            }
+                        }
+                    ]
+                },
+                "DrainResponse": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["draining", "sessions"],
+                    "properties": {
+                        "draining": {"type": "boolean"},
+                        "sessions": {
+                            "type": "array",
+                            "items": {"$ref": "#/components/schemas/TempodSession"}
+                        }
+                    }
+                },
+                "JsonRpcMessage": {
+                    "type": "object",
+                    "additionalProperties": true,
+                    "required": ["jsonrpc", "method"],
+                    "properties": {
+                        "jsonrpc": {"const": "2.0"},
+                        "id": {"$ref": "#/components/schemas/JsonRpcId"},
+                        "method": {"type": "string"},
+                        "params": {"type": "object"}
+                    }
+                },
+                "JsonRpcId": {
+                    "oneOf": [
+                        {"type": "string"},
+                        {"type": "number"},
+                        {"type": "null"}
+                    ]
+                },
+                "JsonRpcResponse": {
+                    "oneOf": [
+                        {"$ref": "#/components/schemas/JsonRpcSuccessResponse"},
+                        {"$ref": "#/components/schemas/JsonRpcErrorResponse"}
+                    ]
+                },
+                "JsonRpcSuccessResponse": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["jsonrpc", "id", "result"],
+                    "properties": {
+                        "jsonrpc": {"const": "2.0"},
+                        "id": {"$ref": "#/components/schemas/JsonRpcId"},
+                        "result": {}
+                    }
+                },
+                "JsonRpcErrorResponse": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["jsonrpc", "id", "error"],
+                    "properties": {
+                        "jsonrpc": {"const": "2.0"},
+                        "id": {"$ref": "#/components/schemas/JsonRpcId"},
+                        "error": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["code", "message"],
+                            "properties": {
+                                "code": {"type": "integer"},
+                                "message": {"type": "string"}
+                            }
+                        }
+                    }
+                },
+                "BidiMessage": {
+                    "oneOf": [
+                        {"$ref": "#/components/schemas/BidiSuccessResponse"},
+                        {"$ref": "#/components/schemas/BidiErrorResponse"},
+                        {"$ref": "#/components/schemas/BidiEvent"}
+                    ]
+                },
+                "BidiSuccessResponse": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["type", "id", "result"],
+                    "properties": {
+                        "type": {"const": "success"},
+                        "id": {"type": "integer", "minimum": 0},
+                        "result": {}
+                    }
+                },
+                "BidiErrorResponse": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["type", "error", "message"],
+                    "properties": {
+                        "type": {"const": "error"},
+                        "id": {"type": "integer", "minimum": 0},
+                        "error": {"type": "string"},
+                        "message": {"type": "string"}
+                    }
+                },
+                "BidiEvent": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["type", "method", "params"],
+                    "properties": {
+                        "type": {"const": "event"},
+                        "method": {"type": "string"},
+                        "params": {}
+                    }
+                },
+                "SessionActBatchRequest": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["batch"],
+                    "properties": {
+                        "batch": {"$ref": "#/components/schemas/ActionBatch"},
+                        "input_tainted": {
+                            "type": "boolean",
+                            "description": "Caller evidence for whether any action argument was derived from page-originated content. Omitted evidence is treated as tainted; click/type/select/skill actions are tainted even when this is false."
+                        },
+                        "confirmed": {
+                            "type": "boolean",
+                            "default": false,
+                            "description": "Caller assertion that any required human confirmation has completed on the trusted loopback control plane."
+                        },
+                        "idempotency_key": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": MAX_IDEMPOTENCY_KEY_BYTES,
+                            "description": "Required for write-class batches; reusing the same key with the same request replays the stored response instead of executing actions again. The per-session cache is bounded."
+                        }
+                    }
+                },
+                "SessionStepOutcome": {
+                    "oneOf": [
+                        {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["status", "diff", "policy"],
+                            "properties": {
+                                "status": {"const": "applied"},
+                                "diff": {"$ref": "#/components/schemas/ObservationDiff"},
+                                "policy": {"$ref": "#/components/schemas/SessionBatchPolicy"}
+                            }
+                        },
+                        {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["status", "reason", "policy"],
+                            "properties": {
+                                "status": {"const": "step_error"},
+                                "reason": {"type": "string"},
+                                "policy": {"$ref": "#/components/schemas/SessionBatchPolicy"}
+                            }
+                        }
+                    ]
+                },
+                "SessionBatchPolicy": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                        "input_tainted_declared",
+                        "input_tainted_effective",
+                        "forced_tainted_actions",
+                        "max_side_effect",
+                        "strongest_gate",
+                        "confirmation_required",
+                        "confirmed",
+                        "idempotency_required",
+                        "idempotency_key_provided"
+                    ],
+                    "properties": {
+                        "input_tainted_declared": {
+                            "type": ["boolean", "null"],
+                            "description": "Raw caller-provided taint evidence; null means omitted and therefore unknown."
+                        },
+                        "input_tainted_effective": {
+                            "type": "boolean",
+                            "description": "Taint value actually used by the policy gate after fail-closed derivation."
+                        },
+                        "forced_tainted_actions": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "description": "Click, type, select, and skill actions that require page-tainted treatment regardless of caller evidence."
+                        },
+                        "max_side_effect": {"$ref": "#/components/schemas/SideEffect"},
+                        "strongest_gate": {
+                            "type": "string",
+                            "enum": ["none", "confirm", "confirm_with_taint_review"]
+                        },
+                        "confirmation_required": {"type": "boolean"},
+                        "confirmed": {"type": "boolean"},
+                        "idempotency_required": {
+                            "type": "boolean",
+                            "description": "True when the batch contains a write-class action that must be retried with an idempotency key."
+                        },
+                        "idempotency_key_provided": {"type": "boolean"}
+                    }
+                },
+                "NodeId": tempo_schema_component("NodeId"),
+                "Provenance": tempo_schema_component("Provenance"),
+                "TaintSpan": tempo_schema_component("TaintSpan"),
+                "InteractiveElement": tempo_schema_component("InteractiveElement"),
+                "CompiledObservation": tempo_schema_component("CompiledObservation"),
+                "ObservationDiff": tempo_schema_component("ObservationDiff"),
+                "SideEffect": tempo_schema_component("SideEffect"),
+                "Action": tempo_schema_component("Action"),
+                "QuiescencePolicy": tempo_schema_component("QuiescencePolicy"),
+                "ActionBatch": tempo_schema_component("ActionBatch"),
+                "StepStatus": tempo_schema_component("StepStatus"),
+                "Grounding": tempo_schema_component("Grounding"),
+                "ActionOutcome": tempo_schema_component("ActionOutcome"),
+                "StepTriple": tempo_schema_component("StepTriple"),
+                "ErrorResponse": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["error"],
+                    "properties": {
+                        "error": {"type": "string"}
+                    }
+                },
+                "PolicyErrorResponse": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["error", "reason", "denied_action_index", "denied_action_kind", "policy"],
+                    "properties": {
+                        "error": {"type": "string"},
+                        "reason": {"type": "string"},
+                        "denied_action_index": {
+                            "type": "integer",
+                            "minimum": 0
+                        },
+                        "denied_action_kind": {"type": "string"},
+                        "policy": {"$ref": "#/components/schemas/SessionBatchPolicy"}
+                    }
+                }
+            }
+        }
+    })
+}
+
+fn tempo_schema_component(name: &str) -> serde_json::Value {
+    let bundle = tempo_schema::schema_bundle_json_schema();
+    let mut schema = bundle
+        .get("$defs")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|definitions| definitions.get(name))
+        .cloned()
+        .unwrap_or(serde_json::Value::Bool(true));
+    rewrite_tempo_schema_refs_for_openapi(&mut schema);
+    schema
+}
+
+fn rewrite_tempo_schema_refs_for_openapi(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(object) => {
+            if let Some(serde_json::Value::String(reference)) = object.get_mut("$ref")
+                && let Some(name) = reference.strip_prefix("#/$defs/")
+            {
+                *reference = format!("#/components/schemas/{name}");
+            }
+            for child in object.values_mut() {
+                rewrite_tempo_schema_refs_for_openapi(child);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for child in items {
+                rewrite_tempo_schema_refs_for_openapi(child);
+            }
+        }
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_) => {}
     }
 }
 
@@ -1324,6 +2993,7 @@ fn control_route_requires_origin_check(method: &str, path: &str) -> bool {
         ("GET", "/health")
             | ("GET", tempo_mcp::A2A_AGENT_CARD_PATH)
             | ("GET", tempo_mcp::A2A_AGENT_JSON_PATH)
+            | ("GET", TEMPOD_OPENAPI_PATH)
             | ("GET", "/mcp")
             | ("POST", "/mcp")
             | ("GET", "/bidi")
@@ -1942,7 +3612,7 @@ fn session_id_from_path(path: &str) -> Result<TempodSessionId, TempodError> {
     let id = path
         .strip_prefix("/sessions/")
         .ok_or_else(|| TempodError::BadRequest(format!("invalid session path: {path}")))?;
-    if id.is_empty() {
+    if id.is_empty() || id.contains('/') || id.contains('?') {
         return Err(TempodError::BadRequest("session id is required".into()));
     }
     Ok(TempodSessionId(id.into()))
@@ -1976,10 +3646,21 @@ impl HttpRequest {
 }
 
 fn valid_host_header(host: &str) -> bool {
-    !host.is_empty()
-        && host
-            .bytes()
-            .all(|byte| byte.is_ascii_graphic() && !matches!(byte, b'/' | b'\\'))
+    if host.is_empty()
+        || !host.bytes().all(|byte| byte.is_ascii_graphic())
+        || host.contains(['/', '\\'])
+    {
+        return false;
+    }
+    let Ok(parsed) = url::Url::parse(&format!("http://{host}/")) else {
+        return false;
+    };
+    parsed.host_str().is_some()
+        && parsed.username().is_empty()
+        && parsed.password().is_none()
+        && parsed.query().is_none()
+        && parsed.fragment().is_none()
+        && parsed.path() == "/"
 }
 
 fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, TempodError> {
@@ -2003,7 +3684,12 @@ fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, TempodError>
         header_end(&bytes).ok_or_else(|| TempodError::BadRequest("missing HTTP headers".into()))?;
     let headers = String::from_utf8(bytes[..header_end].to_vec())
         .map_err(|err| TempodError::BadRequest(err.to_string()))?;
-    let header_map = header_map(headers.lines());
+    let header_map = header_map(headers.lines())?;
+    if header_map.contains_key("transfer-encoding") {
+        return Err(TempodError::BadRequest(
+            "Transfer-Encoding is not supported".into(),
+        ));
+    }
     let origin = header_map.get("origin").cloned();
     let host = header_map.get("host").cloned();
     let mut lines = headers.lines();
@@ -2058,15 +3744,30 @@ fn header_end(bytes: &[u8]) -> Option<usize> {
     bytes.windows(4).position(|window| window == b"\r\n\r\n")
 }
 
-fn header_map<'a>(lines: impl Iterator<Item = &'a str>) -> BTreeMap<String, String> {
+fn header_map<'a>(
+    lines: impl Iterator<Item = &'a str>,
+) -> Result<BTreeMap<String, String>, TempodError> {
     let mut headers = BTreeMap::new();
     for line in lines {
         let Some((name, value)) = line.split_once(':') else {
             continue;
         };
-        headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+        let name = name.trim().to_ascii_lowercase();
+        if is_sensitive_singleton_header(&name) && headers.contains_key(&name) {
+            return Err(TempodError::BadRequest(format!(
+                "duplicate {name} header is not allowed"
+            )));
+        }
+        headers.insert(name, value.trim().to_string());
     }
-    headers
+    Ok(headers)
+}
+
+fn is_sensitive_singleton_header(name: &str) -> bool {
+    matches!(
+        name,
+        "content-length" | "host" | "origin" | "transfer-encoding"
+    )
 }
 
 fn content_length(headers: &BTreeMap<String, String>) -> Result<usize, TempodError> {
@@ -2088,8 +3789,20 @@ fn content_length(headers: &BTreeMap<String, String>) -> Result<usize, TempodErr
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CreateSessionRequest {
     url: String,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SessionActBatchRequest {
+    batch: ActionBatch,
+    input_tainted: Option<bool>,
+    #[serde(default)]
+    confirmed: bool,
+    #[serde(default)]
+    idempotency_key: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2128,6 +3841,7 @@ impl HttpResponse {
             403 => "Forbidden",
             404 => "Not Found",
             405 => "Method Not Allowed",
+            409 => "Conflict",
             500 => "Internal Server Error",
             503 => "Service Unavailable",
             _ => "OK",
@@ -2152,8 +3866,12 @@ pub enum TempodError {
     Json(#[from] serde_json::Error),
     #[error("bad request: {0}")]
     BadRequest(String),
+    #[error("conflict: {0}")]
+    Conflict(String),
     #[error("forbidden: {0}")]
     Forbidden(String),
+    #[error("{0}")]
+    PolicyDenied(Box<PolicyDeniedError>),
     #[error("session not found: {0:?}")]
     SessionNotFound(TempodSessionId),
     #[error("engine not found: {0}")]
@@ -2164,6 +3882,8 @@ pub enum TempodError {
     PoolLock,
     #[error("driver failed: {0}")]
     Driver(String),
+    #[error("driver unavailable: {0}")]
+    DriverUnavailable(String),
     #[error("engine host failed: {0}")]
     Engine(#[from] EngineHostError),
 }
@@ -2172,10 +3892,21 @@ impl TempodError {
     fn status(&self) -> u16 {
         match self {
             Self::BadRequest(_) => 400,
+            Self::Conflict(_) => 409,
             Self::Forbidden(_) => 403,
+            Self::PolicyDenied(_) => 403,
             Self::SessionNotFound(_) | Self::EngineNotFound(_) => 404,
-            Self::Draining => 503,
+            Self::Draining | Self::DriverUnavailable(_) => 503,
             Self::Io(_) | Self::Json(_) | Self::PoolLock | Self::Driver(_) | Self::Engine(_) => 500,
+        }
+    }
+
+    fn body(&self) -> JsonValue {
+        match self {
+            Self::PolicyDenied(error) => policy_denied_error_json(error),
+            _ => json!({
+                "error": self.to_string(),
+            }),
         }
     }
 }
@@ -2306,6 +4037,158 @@ mod tests {
         assert_eq!(killed.state, TempodSessionState::Killed);
         assert!(!pool.session_drivers.contains_key(&session.id));
 
+        drop(pool);
+        join_driver_handler(server)?;
+        Ok(())
+    }
+
+    #[test]
+    fn session_sdk_routes_observe_and_act_batch_on_session_context() -> TestResult {
+        let (client_stream, server_stream) = UnixStream::pair()?;
+        let server = thread::spawn(move || -> Result<(), EngineHostError> {
+            let mut connection = EngineIpcConnection::from_stream(server_stream);
+
+            let create = connection.read_driver_request()?;
+            assert_eq!(create.driver_id, None);
+            assert!(matches!(
+                create.command,
+                HostDriverCommand::CreateBrowsingContext { .. }
+            ));
+            connection.write_driver_response(
+                create.id,
+                DriverResponse::BrowsingContextCreated {
+                    driver_id: "session-context-sdk".into(),
+                },
+            )?;
+
+            let goto = connection.read_driver_request()?;
+            assert_eq!(goto.driver_id.as_deref(), Some("session-context-sdk"));
+            assert!(matches!(goto.command, HostDriverCommand::Goto { .. }));
+            connection.write_driver_response(
+                goto.id,
+                DriverResponse::Observation {
+                    observation: observation("https://sdk-session.test", 1),
+                },
+            )?;
+
+            let observe = connection.read_driver_request()?;
+            assert_eq!(observe.driver_id.as_deref(), Some("session-context-sdk"));
+            assert_eq!(observe.command, HostDriverCommand::Observe);
+            connection.write_driver_response(
+                observe.id,
+                DriverResponse::Observation {
+                    observation: observation("https://sdk-session.test", 2),
+                },
+            )?;
+
+            let act_batch = connection.read_driver_request()?;
+            assert_eq!(act_batch.driver_id.as_deref(), Some("session-context-sdk"));
+            let batch = match act_batch.command {
+                HostDriverCommand::ActBatch { batch } => batch,
+                other => {
+                    return Err(EngineHostError::UnexpectedFrameMethod {
+                        expected: "act_batch",
+                        actual: format!("{other:?}"),
+                    });
+                }
+            };
+            assert_eq!(batch.actions.len(), 1);
+            connection.write_driver_response(
+                act_batch.id,
+                DriverResponse::Step {
+                    outcome: StepOutcome::Applied {
+                        diff: ObservationDiff {
+                            since_seq: 2,
+                            seq: 3,
+                            added: Vec::new(),
+                            removed: Vec::new(),
+                            changed: Vec::new(),
+                        },
+                    }
+                    .into(),
+                },
+            )?;
+
+            let close = connection.read_driver_request()?;
+            assert_eq!(close.driver_id.as_deref(), Some("session-context-sdk"));
+            assert_eq!(close.command, HostDriverCommand::Close);
+            connection.write_driver_response(close.id, DriverResponse::Closed)
+        });
+
+        let mut pool = SessionPool::default();
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+        let create = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/sessions".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: br#"{"url":"https://sdk-session.test"}"#.to_vec(),
+            },
+        )?;
+        assert_eq!(create.status, 201);
+
+        let observe = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "GET".into(),
+                path: "/sessions/session-0/observe".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: Some("http://127.0.0.1".into()),
+                body: Vec::new(),
+            },
+        )?;
+        assert_eq!(observe.status, 200);
+        let observed: Value = serde_json::from_slice(&observe.body)?;
+        assert_eq!(observed["url"], "https://sdk-session.test");
+        assert_eq!(observed["seq"], 2);
+
+        let act_batch = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/sessions/session-0/act_batch".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: Some("http://127.0.0.1".into()),
+                body: serde_json::to_vec(&json!({
+                    "batch": {
+                        "actions": [{"kind": "scroll", "x": 0.0, "y": 4.0}],
+                        "quiescence": "composite"
+                    },
+                    "input_tainted": false
+                }))?,
+            },
+        )?;
+        assert_eq!(act_batch.status, 200);
+        let outcome: Value = serde_json::from_slice(&act_batch.body)?;
+        assert_eq!(outcome["status"], "applied");
+        assert_eq!(outcome["diff"]["since_seq"], 2);
+        assert_eq!(outcome["diff"]["seq"], 3);
+        assert_eq!(outcome["policy"]["input_tainted_declared"], false);
+        assert_eq!(outcome["policy"]["input_tainted_effective"], false);
+        assert_eq!(outcome["policy"]["forced_tainted_actions"], 0);
+        assert_eq!(outcome["policy"]["max_side_effect"], "read");
+        assert_eq!(outcome["policy"]["strongest_gate"], "none");
+        assert_eq!(outcome["policy"]["confirmation_required"], false);
+        assert_eq!(outcome["policy"]["idempotency_required"], false);
+        assert_eq!(outcome["policy"]["idempotency_key_provided"], false);
+
+        let kill = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "DELETE".into(),
+                path: "/sessions/session-0".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: Vec::new(),
+            },
+        )?;
+        assert_eq!(kill.status, 200);
         drop(pool);
         join_driver_handler(server)?;
         Ok(())
@@ -2471,6 +4354,115 @@ mod tests {
     }
 
     #[test]
+    fn http_create_session_does_not_hang_on_wedged_context_create() -> TestResult {
+        let (client_stream, server_stream) = UnixStream::pair()?;
+        let wedged_engine = thread::spawn(move || {
+            let _held = server_stream;
+            thread::park_timeout(Duration::from_secs(60));
+        });
+
+        let mut pool = SessionPool::default();
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+
+        let started = std::time::Instant::now();
+        let create = handle_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/sessions".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: br#"{"url":"https://wedged-create.test"}"#.to_vec(),
+            },
+        );
+        let elapsed = started.elapsed();
+
+        assert_eq!(create.status, 503);
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "session create hung on a wedged context create: took {elapsed:?}"
+        );
+        assert!(pool.driver.is_none());
+        assert!(pool.mcp.is_none());
+        assert!(pool.session_drivers.is_empty());
+        assert!(pool.bidi_contexts.is_empty());
+
+        wedged_engine.thread().unpark();
+        wedged_engine
+            .join()
+            .map_err(|_| "wedged create fixture thread panicked")?;
+        Ok(())
+    }
+
+    #[test]
+    fn http_create_session_releases_pool_lock_while_engine_create_is_pending() -> TestResult {
+        let (client_stream, server_stream) = UnixStream::pair()?;
+        let (seen_create_tx, seen_create_rx) = std::sync::mpsc::channel();
+        let wedged_engine = thread::spawn(move || -> Result<(), EngineHostError> {
+            let mut connection = EngineIpcConnection::from_stream(server_stream);
+            let create = connection.read_driver_request()?;
+            assert!(create.driver_id.is_none());
+            assert!(matches!(
+                create.command,
+                HostDriverCommand::CreateBrowsingContext { .. }
+            ));
+            let _ = seen_create_tx.send(());
+            thread::park_timeout(Duration::from_secs(60));
+            Ok(())
+        });
+
+        let pool = Arc::new(Mutex::new(SessionPool::default()));
+        pool.lock()
+            .map_err(|_| "session pool lock failed")?
+            .attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+
+        let create_listener = TcpListener::bind("127.0.0.1:0")?;
+        let create_addr = create_listener.local_addr()?;
+        let create_pool = Arc::clone(&pool);
+        let create_server = thread::spawn(move || serve_one(create_listener, create_pool));
+        let create_client = thread::spawn(move || {
+            send_http(
+                create_addr,
+                "POST /sessions HTTP/1.1\r\ncontent-length: 36\r\n\r\n{\"url\":\"https://wedged-create.test\"}",
+            )
+        });
+
+        seen_create_rx.recv_timeout(Duration::from_secs(2))?;
+        {
+            let guard = pool.try_lock();
+            assert!(
+                guard.is_ok(),
+                "POST /sessions must not hold the pool lock while engine create is pending"
+            );
+        }
+
+        let health_listener = TcpListener::bind("127.0.0.1:0")?;
+        let health_addr = health_listener.local_addr()?;
+        let health_pool = Arc::clone(&pool);
+        let health_server = thread::spawn(move || serve_one(health_listener, health_pool));
+        let health_started = std::time::Instant::now();
+        let health_response = send_http(health_addr, "GET /health HTTP/1.1\r\n\r\n")?;
+        let health_elapsed = health_started.elapsed();
+        join_server(health_server)?;
+        assert!(health_response.starts_with("HTTP/1.1 200 OK"));
+        assert!(
+            health_elapsed < ENGINE_SESSION_CREATE_TIMEOUT,
+            "health waited behind pending session create for {health_elapsed:?}"
+        );
+
+        let create_response = create_client
+            .join()
+            .map_err(|_| "create client thread panicked")??;
+        join_server(create_server)?;
+        assert!(create_response.starts_with("HTTP/1.1 503 Service Unavailable"));
+
+        wedged_engine.thread().unpark();
+        join_driver_handler(wedged_engine)?;
+        Ok(())
+    }
+
+    #[test]
     fn session_pool_records_lifecycle_and_step_events() -> TestResult {
         let mut pool = SessionPool::default();
         let session = pool.create("https://events.test")?;
@@ -2509,11 +4501,13 @@ mod tests {
         let root = unique_dir("pool-otlp")?;
         remove_dir_if_exists(&root)?;
         let path = root.join("steps.jsonl");
-        let mut pool = SessionPool::default().with_otlp_exporter(OtlpJsonExporter::new(&path));
+        let exporter = OtlpJsonExporter::new(&path);
+        let mut pool = SessionPool::default().with_otlp_exporter(exporter.clone());
         let session = pool.create("https://events.test")?;
         let step = sample_step_triple(11);
 
         let step_event = pool.record_step(&session.id, step.clone())?;
+        exporter.flush()?;
 
         let bytes = std::fs::read(&path)?;
         let value: Value = serde_json::from_slice(bytes.strip_suffix(b"\n").unwrap_or(&bytes))?;
@@ -2530,10 +4524,36 @@ mod tests {
     }
 
     #[test]
+    fn session_pool_records_step_when_otlp_export_fails() -> TestResult {
+        let root = unique_dir("pool-otlp-export-fails")?;
+        remove_dir_if_exists(&root)?;
+        std::fs::create_dir_all(&root)?;
+        let exporter = OtlpJsonExporter::new(&root);
+        let mut pool = SessionPool::default().with_otlp_exporter(exporter.clone());
+        let session = pool.create("https://events.test")?;
+        let step = sample_step_triple(13);
+
+        let step_event = pool.record_step(&session.id, step.clone())?;
+
+        assert_eq!(
+            step_event.event,
+            TempodSessionEventKind::StepTriple { triple: step }
+        );
+        let events = pool.events(&session.id, None)?;
+        assert!(events
+            .iter()
+            .any(|event| matches!(event.event, TempodSessionEventKind::StepTriple { .. })));
+        assert!(matches!(exporter.flush(), Err(TempodError::Driver(_))));
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[test]
     fn session_pool_from_env_value_configures_otlp_jsonl_exporter() -> TestResult {
         let path = unique_dir("env-otlp")?.join("steps.jsonl");
 
-        let mut pool = SessionPool::from_otlp_env_value(Some(path.as_os_str().to_os_string()));
+        let mut pool = SessionPool::from_env_values(Some(path.as_os_str().to_os_string()), None);
         assert_eq!(
             pool.otlp_exporter()
                 .ok_or("expected env path to configure exporter")?
@@ -2543,14 +4563,61 @@ mod tests {
 
         pool.set_otlp_exporter(None);
         assert!(pool.otlp_exporter().is_none());
-        assert!(SessionPool::from_otlp_env_value(None)
+        assert!(SessionPool::from_env_values(None, None)
             .otlp_exporter()
             .is_none());
         assert!(
-            SessionPool::from_otlp_env_value(Some(std::ffi::OsString::new()))
+            SessionPool::from_env_values(Some(std::ffi::OsString::new()), None)
                 .otlp_exporter()
                 .is_none()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn stealth_mode_ignores_otlp_export_configuration() -> TestResult {
+        let path = unique_dir("stealth-env-otlp")?.join("steps.jsonl");
+        let pool = SessionPool::from_env_values(
+            Some(path.as_os_str().to_os_string()),
+            Some(std::ffi::OsString::from("true")),
+        );
+
+        assert_eq!(pool.privacy_mode(), PrivacyMode::Stealth);
+        assert!(pool.otlp_exporter().is_none());
+
+        let pool = SessionPool::default()
+            .with_privacy_mode(PrivacyMode::Stealth)
+            .with_otlp_exporter(OtlpJsonExporter::new(&path));
+        assert!(pool.otlp_exporter().is_none());
+
+        let mut pool = SessionPool::default().with_privacy_mode(PrivacyMode::Stealth);
+        pool.set_otlp_exporter(Some(OtlpJsonExporter::new(&path)));
+        assert!(pool.otlp_exporter().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn stealth_mode_keeps_no_session_event_history_or_terminal_session_trace() -> TestResult {
+        let mut pool = SessionPool::default().with_privacy_mode(PrivacyMode::Stealth);
+        let session = pool.create("https://private.test")?;
+
+        assert!(pool.events(&session.id, None)?.is_empty());
+
+        let step = sample_step_triple(14);
+        let transient_event = pool.record_step(&session.id, step.clone())?;
+        assert_eq!(
+            transient_event.event,
+            TempodSessionEventKind::StepTriple { triple: step }
+        );
+        assert!(pool.events(&session.id, None)?.is_empty());
+
+        let killed = pool.kill(&session.id)?;
+        assert_eq!(killed.state, TempodSessionState::Killed);
+        assert!(pool.list().is_empty());
+        assert!(matches!(
+            pool.events(&session.id, None),
+            Err(TempodError::SessionNotFound(_))
+        ));
         Ok(())
     }
 
@@ -2565,7 +4632,9 @@ mod tests {
         .with_extension("jsonl");
         let _ = std::fs::remove_file(&bare_path);
 
-        OtlpJsonExporter::new(&bare_path).export_step(&sample_step_triple(12))?;
+        let exporter = OtlpJsonExporter::new(&bare_path);
+        exporter.export_step(&sample_step_triple(12))?;
+        exporter.flush()?;
 
         let bytes = std::fs::read(&bare_path)?;
         let value: Value = serde_json::from_slice(bytes.strip_suffix(b"\n").unwrap_or(&bytes))?;
@@ -2701,6 +4770,42 @@ mod tests {
 
         assert!(response.starts_with("HTTP/1.1 200 OK"));
         assert!(response.contains("https://one.test"));
+        Ok(())
+    }
+
+    #[test]
+    fn http_pool_lock_failure_returns_documented_error_response() -> TestResult {
+        let pool = Arc::new(Mutex::new(SessionPool::default()));
+        let poisoned_pool = Arc::clone(&pool);
+        let poisoner = thread::spawn(move || {
+            let _guard = match poisoned_pool.lock() {
+                Ok(guard) => guard,
+                Err(_) => return,
+            };
+            std::panic::resume_unwind(Box::new("poison session pool"));
+        });
+        let _ = poisoner.join();
+        if pool.lock().is_ok() {
+            return Err("session pool should be poisoned".into());
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let handle = thread::spawn({
+            let pool = Arc::clone(&pool);
+            move || serve_one(listener, pool)
+        });
+
+        let response = send_http(addr, "GET /sessions HTTP/1.1\r\n\r\n")?;
+        join_server(handle)?;
+
+        assert!(response.starts_with("HTTP/1.1 500 Internal Server Error"));
+        let body = response
+            .split("\r\n\r\n")
+            .nth(1)
+            .ok_or("missing HTTP response body")?;
+        let value: Value = serde_json::from_str(body)?;
+        assert_eq!(value["error"], "session pool lock failed");
         Ok(())
     }
 
@@ -2867,6 +4972,227 @@ mod tests {
     }
 
     #[test]
+    fn tempod_serves_openapi_for_sdk_generation() -> TestResult {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let pool = Arc::new(Mutex::new(SessionPool::default()));
+        let handle = thread::spawn(move || serve_one(listener, pool));
+
+        let response = send_http(
+            addr,
+            "GET /openapi.json HTTP/1.1\r\nhost: sdk.tempod.test:8787\r\n\r\n",
+        )?;
+        join_server(handle)?;
+
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(response.contains("content-type: application/vnd.oai.openapi+json;version=3.1"));
+        let body = response
+            .split("\r\n\r\n")
+            .nth(1)
+            .ok_or("missing HTTP response body")?;
+        let spec: Value = serde_json::from_str(body)?;
+        assert_eq!(spec["openapi"], "3.1.0");
+        assert_eq!(spec["servers"][0]["url"], "http://sdk.tempod.test:8787");
+        assert_eq!(
+            spec["info"]["x-tempo-sdk-targets"]
+                .as_array()
+                .ok_or("missing sdk target array")?
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>(),
+            vec![
+                "swift",
+                "typescript",
+                "python",
+                "go",
+                "kotlin",
+                "java",
+                "csharp",
+                "rust"
+            ]
+        );
+        assert_eq!(
+            spec["info"]["x-tempo-platforms"]
+                .as_array()
+                .ok_or("missing platform array")?
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>(),
+            vec!["macos", "ios", "windows", "linux"]
+        );
+        assert!(spec["paths"]["/sessions"]["post"]["operationId"] == "createSession");
+        assert!(
+            spec["paths"]["/sessions/{session_id}/observe"]["get"]["operationId"]
+                == "observeSession"
+        );
+        assert!(
+            spec["paths"]["/sessions/{session_id}/act_batch"]["post"]["operationId"]
+                == "actBatchSession"
+        );
+        assert_eq!(
+            spec["paths"]["/sessions/{session_id}/observe"]["get"]["responses"]["200"]["content"]
+                ["application/json"]["schema"]["$ref"],
+            "#/components/schemas/CompiledObservation"
+        );
+        assert_eq!(
+            spec["paths"]["/sessions/{session_id}/act_batch"]["post"]["requestBody"]["content"]
+                ["application/json"]["schema"]["$ref"],
+            "#/components/schemas/SessionActBatchRequest"
+        );
+        assert_eq!(
+            spec["components"]["schemas"]["SessionActBatchRequest"]["required"],
+            json!(["batch"])
+        );
+        assert_eq!(
+            spec["components"]["schemas"]["SessionActBatchRequest"]["properties"]
+                ["idempotency_key"]["maxLength"],
+            MAX_IDEMPOTENCY_KEY_BYTES
+        );
+        assert_eq!(
+            spec["paths"]["/sessions/{session_id}/act_batch"]["post"]["responses"]["403"]["$ref"],
+            "#/components/responses/PolicyDenied"
+        );
+        assert_eq!(
+            spec["paths"]["/sessions/{session_id}/act_batch"]["post"]["responses"]["409"]["$ref"],
+            "#/components/responses/Conflict"
+        );
+        assert_eq!(
+            spec["paths"]["/mcp"]["post"]["responses"]["200"]["content"]["application/json"]
+                ["schema"]["$ref"],
+            "#/components/schemas/JsonRpcResponse"
+        );
+        assert_eq!(
+            spec["paths"]["/mcp"]["post"]["responses"]["400"]["$ref"],
+            "#/components/responses/JsonRpcError"
+        );
+        assert_eq!(
+            spec["paths"]["/mcp"]["post"]["responses"]["403"]["$ref"],
+            "#/components/responses/JsonRpcError"
+        );
+        assert_eq!(
+            spec["paths"]["/bidi"]["post"]["responses"]["200"]["content"]["application/json"]
+                ["schema"]["$ref"],
+            "#/components/schemas/BidiMessage"
+        );
+        assert_eq!(
+            spec["paths"]["/bidi"]["post"]["responses"]["400"]["$ref"],
+            "#/components/responses/BidiProtocolError"
+        );
+        assert_eq!(
+            spec["paths"]["/bidi"]["post"]["responses"]["503"]["$ref"],
+            "#/components/responses/BidiProtocolError"
+        );
+        for (path, method) in [
+            ("/sessions", "post"),
+            ("/sessions/{session_id}/observe", "get"),
+            ("/sessions/{session_id}/act_batch", "post"),
+            ("/mcp", "post"),
+            ("/bidi", "post"),
+        ] {
+            assert_eq!(
+                spec["paths"][path][method]["responses"]["500"]["$ref"],
+                "#/components/responses/InternalError",
+                "{method} {path} must document internal/driver failure responses"
+            );
+        }
+        assert_eq!(
+            spec["components"]["responses"]["InternalError"]["content"]["application/json"]
+                ["schema"]["$ref"],
+            "#/components/schemas/ErrorResponse"
+        );
+        assert_eq!(
+            spec["components"]["responses"]["JsonRpcError"]["content"]["application/json"]
+                ["schema"]["$ref"],
+            "#/components/schemas/JsonRpcErrorResponse"
+        );
+        assert_eq!(
+            spec["components"]["responses"]["BidiProtocolError"]["content"]["application/json"]
+                ["schema"]["$ref"],
+            "#/components/schemas/BidiErrorResponse"
+        );
+        assert_eq!(
+            spec["components"]["schemas"]["JsonRpcErrorResponse"]["properties"]["error"]
+                ["properties"]["code"]["type"],
+            "integer"
+        );
+        assert_eq!(
+            spec["components"]["schemas"]["BidiErrorResponse"]["properties"]["type"]["const"],
+            "error"
+        );
+        let unavailable_description = spec["components"]["responses"]["Draining"]["description"]
+            .as_str()
+            .ok_or("missing Draining response description")?;
+        assert!(unavailable_description.contains("attached engine driver"));
+        assert_eq!(
+            spec["components"]["schemas"]["SessionStepOutcome"]["oneOf"][0]["properties"]["policy"]
+                ["$ref"],
+            "#/components/schemas/SessionBatchPolicy"
+        );
+        assert!(
+            spec["components"]["schemas"]["SessionBatchPolicy"]["properties"]
+                ["input_tainted_effective"]
+                .is_object()
+        );
+        assert!(
+            spec["components"]["schemas"]["SessionBatchPolicy"]["properties"]
+                ["idempotency_required"]
+                .is_object()
+        );
+        assert!(
+            spec["components"]["schemas"]["SessionBatchPolicy"]["required"]
+                .as_array()
+                .ok_or("SessionBatchPolicy required must be an array")?
+                .contains(&json!("input_tainted_declared"))
+        );
+        assert_eq!(
+            spec["components"]["schemas"]["TempodSessionEvent"]["additionalProperties"],
+            false
+        );
+        assert_eq!(
+            spec["components"]["schemas"]["TempodSessionEvent"]["properties"]["event"]["$ref"],
+            "#/components/schemas/TempodSessionEventKind"
+        );
+        assert!(
+            spec["components"]["schemas"]["TempodSessionEventKind"]["oneOf"]
+                .as_array()
+                .ok_or("TempodSessionEventKind oneOf must be an array")?
+                .iter()
+                .any(
+                    |schema| schema["properties"]["kind"]["const"] == "step_triple"
+                        && schema["properties"]["triple"]["$ref"]
+                            == "#/components/schemas/StepTriple"
+                )
+        );
+        assert_eq!(
+            spec["components"]["schemas"]["PolicyErrorResponse"]["properties"]["policy"]["$ref"],
+            "#/components/schemas/SessionBatchPolicy"
+        );
+        assert!(spec["paths"]["/mcp"]["post"]["operationId"] == "postMcp");
+        assert!(spec["paths"]["/bidi"]["post"]["operationId"] == "postBidi");
+        assert!(
+            spec["components"]["schemas"]["TempodSession"]["properties"]["id"]["type"] == "string"
+        );
+        for schema in [
+            "CompiledObservation",
+            "ObservationDiff",
+            "Action",
+            "ActionBatch",
+            "StepTriple",
+        ] {
+            assert!(
+                spec["components"]["schemas"][schema].is_object(),
+                "missing OpenAPI component schema {schema}"
+            );
+        }
+        assert_eq!(
+            spec["components"]["schemas"]["CompiledObservation"]["properties"]["elements"]["items"]
+                ["$ref"],
+            "#/components/schemas/InteractiveElement"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn tempod_serves_a2a_agent_json_alias() -> TestResult {
         let mut pool = SessionPool::default();
         let response = route_http_request(
@@ -2893,22 +5219,483 @@ mod tests {
 
     #[test]
     fn agent_card_falls_back_when_host_header_is_not_authority() -> TestResult {
+        for host in [
+            "localhost/path",
+            "user@localhost:8787",
+            "localhost:8787?poison=1",
+            "localhost:8787#poison",
+            "localhost:not-a-port",
+        ] {
+            let mut pool = SessionPool::default();
+            let response = route_http_request(
+                &mut pool,
+                HttpRequest {
+                    method: "GET".into(),
+                    path: tempo_mcp::A2A_AGENT_CARD_PATH.into(),
+                    headers: BTreeMap::new(),
+                    host: Some(host.into()),
+                    origin: None,
+                    body: Vec::new(),
+                },
+            )?;
+
+            assert_eq!(response.status, 200);
+            let card: Value = serde_json::from_slice(&response.body)?;
+            assert_eq!(
+                card["url"], "http://localhost/mcp",
+                "invalid Host should not poison agent-card URL: {host}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn metadata_base_url_accepts_authority_host_headers() -> TestResult {
+        for (host, expected_url) in [
+            ("localhost:8787", "http://localhost:8787/mcp"),
+            ("[::1]:8787", "http://[::1]:8787/mcp"),
+            ("EXAMPLE.test", "http://EXAMPLE.test/mcp"),
+        ] {
+            let mut pool = SessionPool::default();
+            let response = route_http_request(
+                &mut pool,
+                HttpRequest {
+                    method: "GET".into(),
+                    path: tempo_mcp::A2A_AGENT_CARD_PATH.into(),
+                    headers: BTreeMap::new(),
+                    host: Some(host.into()),
+                    origin: None,
+                    body: Vec::new(),
+                },
+            )?;
+
+            assert_eq!(response.status, 200);
+            let card: Value = serde_json::from_slice(&response.body)?;
+            assert_eq!(card["url"], expected_url);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn openapi_route_is_public_metadata_but_mutating_routes_stay_origin_guarded() -> TestResult {
         let mut pool = SessionPool::default();
-        let response = route_http_request(
+
+        let openapi = handle_http_request(
+            &mut pool,
+            control_request("GET", TEMPOD_OPENAPI_PATH, Some("http://evil.example"), b""),
+        );
+        assert_eq!(openapi.status, 200);
+
+        let create = handle_http_request(
+            &mut pool,
+            control_request(
+                "POST",
+                "/sessions",
+                Some("http://evil.example"),
+                br#"{"url":"https://blocked.test"}"#,
+            ),
+        );
+        assert_eq!(create.status, 403);
+        assert!(
+            pool.list().is_empty(),
+            "cross-origin create must still be blocked"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn session_action_routes_reject_nested_session_ids() -> TestResult {
+        let mut pool = SessionPool::default();
+
+        let observe = handle_http_request(
+            &mut pool,
+            control_request(
+                "GET",
+                "/sessions/session-0/nested/observe",
+                Some("http://127.0.0.1"),
+                b"",
+            ),
+        );
+        assert_eq!(observe.status, 400);
+
+        let act_batch = handle_http_request(
+            &mut pool,
+            control_request(
+                "POST",
+                "/sessions/session-0/nested/act_batch",
+                Some("http://127.0.0.1"),
+                br#"{"batch":{"actions":[],"quiescence":"composite"},"input_tainted":false}"#,
+            ),
+        );
+        assert_eq!(act_batch.status, 400);
+        Ok(())
+    }
+
+    #[test]
+    fn session_act_batch_forces_taint_for_page_targeted_actions() -> TestResult {
+        let mut pool = SessionPool::default();
+        let session = pool.create("https://policy-session.test")?;
+
+        let response = handle_http_request(
+            &mut pool,
+            control_request(
+                "POST",
+                &format!("/sessions/{}/act_batch", session.id.0),
+                Some("http://127.0.0.1"),
+                br#"{"batch":{"actions":[{"kind":"click","node":"buy"}],"quiescence":"composite"},"input_tainted":false}"#,
+            ),
+        );
+
+        assert_eq!(response.status, 403);
+        let body: Value = serde_json::from_slice(&response.body)?;
+        let error = body["error"].as_str().ok_or("missing error body")?;
+        assert!(error.contains("policy denied"));
+        assert!(error.contains("input_tainted=true"));
+        assert_eq!(
+            body["reason"],
+            "requires human confirmation and idempotency_key before execution"
+        );
+        assert_eq!(body["denied_action_kind"], "click");
+        assert_eq!(body["policy"]["input_tainted_effective"], true);
+        assert_eq!(body["policy"]["forced_tainted_actions"], 1);
+        assert_eq!(body["policy"]["idempotency_required"], true);
+        assert_eq!(body["policy"]["idempotency_key_provided"], false);
+        Ok(())
+    }
+
+    #[test]
+    fn session_act_batch_denial_reports_matching_first_action_index_and_kind() -> TestResult {
+        let mut pool = SessionPool::default();
+        let session = pool.create("https://policy-session.test")?;
+
+        let response = handle_http_request(
+            &mut pool,
+            control_request(
+                "POST",
+                &format!("/sessions/{}/act_batch", session.id.0),
+                Some("http://127.0.0.1"),
+                br#"{"batch":{"actions":[{"kind":"click","node":"buy"},{"kind":"type","node":"email","text":"user@example.test"}],"quiescence":"composite"},"input_tainted":false}"#,
+            ),
+        );
+
+        assert_eq!(response.status, 403);
+        let body: Value = serde_json::from_slice(&response.body)?;
+        assert_eq!(body["denied_action_index"], 0);
+        assert_eq!(body["denied_action_kind"], "click");
+        Ok(())
+    }
+
+    #[test]
+    fn session_act_batch_denial_reports_later_write_missing_idempotency_after_read() -> TestResult {
+        let mut pool = SessionPool::default();
+        let session = pool.create("https://policy-session.test")?;
+
+        let confirmed_response = handle_http_request(
+            &mut pool,
+            control_request(
+                "POST",
+                &format!("/sessions/{}/act_batch", session.id.0),
+                Some("http://127.0.0.1"),
+                br#"{"batch":{"actions":[{"kind":"goto","url":"https://policy-session.test/next"},{"kind":"click","node":"buy"}],"quiescence":"composite"},"input_tainted":false,"confirmed":true}"#,
+            ),
+        );
+
+        assert_eq!(confirmed_response.status, 403);
+        let confirmed_body: Value = serde_json::from_slice(&confirmed_response.body)?;
+        assert_eq!(
+            confirmed_body["reason"],
+            "requires idempotency_key before execution"
+        );
+        assert_eq!(confirmed_body["denied_action_index"], 1);
+        assert_eq!(confirmed_body["denied_action_kind"], "click");
+        assert_eq!(confirmed_body["policy"]["input_tainted_effective"], true);
+        assert_eq!(confirmed_body["policy"]["forced_tainted_actions"], 1);
+
+        let unconfirmed_response = handle_http_request(
+            &mut pool,
+            control_request(
+                "POST",
+                &format!("/sessions/{}/act_batch", session.id.0),
+                Some("http://127.0.0.1"),
+                br#"{"batch":{"actions":[{"kind":"goto","url":"https://policy-session.test/next"},{"kind":"click","node":"buy"}],"quiescence":"composite"},"input_tainted":false}"#,
+            ),
+        );
+
+        assert_eq!(unconfirmed_response.status, 403);
+        let unconfirmed_body: Value = serde_json::from_slice(&unconfirmed_response.body)?;
+        assert_eq!(
+            unconfirmed_body["reason"],
+            "requires human confirmation and idempotency_key before execution"
+        );
+        assert_eq!(unconfirmed_body["denied_action_index"], 1);
+        assert_eq!(unconfirmed_body["denied_action_kind"], "click");
+        Ok(())
+    }
+
+    #[test]
+    fn session_json_schema_errors_are_client_bad_requests() -> TestResult {
+        let mut pool = SessionPool::default();
+
+        let create = handle_http_request(
+            &mut pool,
+            control_request(
+                "POST",
+                "/sessions",
+                Some("http://127.0.0.1"),
+                br#"{"url":}"#,
+            ),
+        );
+        assert_eq!(create.status, 400);
+        let create_body: Value = serde_json::from_slice(&create.body)?;
+        assert!(create_body["error"]
+            .as_str()
+            .ok_or("missing create JSON error")?
+            .contains("invalid session request JSON"));
+
+        let session = pool.create("https://schema-errors.test")?;
+        let act_batch = handle_http_request(
+            &mut pool,
+            control_request(
+                "POST",
+                &format!("/sessions/{}/act_batch", session.id.0),
+                Some("http://127.0.0.1"),
+                br#"{"batch":{"actions":[],"quiescence":"composite"},"unexpected":true}"#,
+            ),
+        );
+        assert_eq!(act_batch.status, 400);
+        let act_body: Value = serde_json::from_slice(&act_batch.body)?;
+        assert!(act_body["error"]
+            .as_str()
+            .ok_or("missing act_batch JSON error")?
+            .contains("invalid act_batch request JSON"));
+        Ok(())
+    }
+
+    #[test]
+    fn session_act_batch_rejects_explicit_null_contract_fields() -> TestResult {
+        let mut pool = SessionPool::default();
+        let session = pool.create("https://null-contract.test")?;
+        let cases: [(&[u8], &str); 2] = [
+            (
+                br#"{"batch":{"actions":[],"quiescence":"composite"},"input_tainted":null}"#,
+                "input_tainted",
+            ),
+            (
+                br#"{"batch":{"actions":[],"quiescence":"composite"},"idempotency_key":null}"#,
+                "idempotency_key",
+            ),
+        ];
+
+        for (body, field) in cases {
+            let response = handle_http_request(
+                &mut pool,
+                control_request(
+                    "POST",
+                    &format!("/sessions/{}/act_batch", session.id.0),
+                    Some("http://127.0.0.1"),
+                    body,
+                ),
+            );
+            assert_eq!(response.status, 400);
+            let body: Value = serde_json::from_slice(&response.body)?;
+            let error = body["error"].as_str().ok_or("missing null field error")?;
+            assert!(error.contains(field));
+            assert!(error.contains("must not be null"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn session_act_batch_replays_idempotent_write_without_driver_reexecution() -> TestResult {
+        let (client_stream, server_stream) = UnixStream::pair()?;
+        let server = thread::spawn(move || -> Result<(), EngineHostError> {
+            let mut connection = EngineIpcConnection::from_stream(server_stream);
+
+            let create = connection.read_driver_request()?;
+            assert!(matches!(
+                create.command,
+                HostDriverCommand::CreateBrowsingContext { .. }
+            ));
+            connection.write_driver_response(
+                create.id,
+                DriverResponse::BrowsingContextCreated {
+                    driver_id: "session-idempotent".into(),
+                },
+            )?;
+
+            let goto = connection.read_driver_request()?;
+            assert_eq!(goto.driver_id.as_deref(), Some("session-idempotent"));
+            assert!(matches!(goto.command, HostDriverCommand::Goto { .. }));
+            connection.write_driver_response(
+                goto.id,
+                DriverResponse::Observation {
+                    observation: observation("https://idempotent.test", 1),
+                },
+            )?;
+
+            let act_batch = connection.read_driver_request()?;
+            assert_eq!(act_batch.driver_id.as_deref(), Some("session-idempotent"));
+            let batch = match act_batch.command {
+                HostDriverCommand::ActBatch { batch } => batch,
+                other => {
+                    return Err(EngineHostError::UnexpectedFrameMethod {
+                        expected: "act_batch",
+                        actual: format!("{other:?}"),
+                    });
+                }
+            };
+            assert_eq!(batch.actions.len(), 1);
+            assert!(matches!(batch.actions[0], Action::Click { .. }));
+            connection.write_driver_response(
+                act_batch.id,
+                DriverResponse::Step {
+                    outcome: StepOutcome::Applied {
+                        diff: ObservationDiff {
+                            since_seq: 1,
+                            seq: 2,
+                            added: Vec::new(),
+                            removed: Vec::new(),
+                            changed: Vec::new(),
+                        },
+                    }
+                    .into(),
+                },
+            )?;
+
+            let close = connection.read_driver_request()?;
+            assert_eq!(close.driver_id.as_deref(), Some("session-idempotent"));
+            assert_eq!(close.command, HostDriverCommand::Close);
+            connection.write_driver_response(close.id, DriverResponse::Closed)
+        });
+
+        let mut pool = SessionPool::default();
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+        let create = route_http_request(
             &mut pool,
             HttpRequest {
-                method: "GET".into(),
-                path: tempo_mcp::A2A_AGENT_CARD_PATH.into(),
+                method: "POST".into(),
+                path: "/sessions".into(),
                 headers: BTreeMap::new(),
-                host: Some("localhost/path".into()),
+                host: None,
                 origin: None,
+                body: br#"{"url":"https://idempotent.test"}"#.to_vec(),
+            },
+        )?;
+        assert_eq!(create.status, 201);
+
+        let request_body = serde_json::to_vec(&json!({
+            "batch": {
+                "actions": [{"kind": "click", "node": "buy"}],
+                "quiescence": "composite"
+            },
+            "input_tainted": false,
+            "confirmed": true,
+            "idempotency_key": "click-buy-1"
+        }))?;
+        let first = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/sessions/session-0/act_batch".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: Some("http://127.0.0.1".into()),
+                body: request_body.clone(),
+            },
+        )?;
+        assert_eq!(first.status, 200);
+        let first_body: Value = serde_json::from_slice(&first.body)?;
+        assert_eq!(first_body["diff"]["seq"], 2);
+        assert_eq!(first_body["policy"]["input_tainted_effective"], true);
+        assert_eq!(first_body["policy"]["idempotency_required"], true);
+        assert_eq!(first_body["policy"]["idempotency_key_provided"], true);
+
+        let replay = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/sessions/session-0/act_batch".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: Some("http://127.0.0.1".into()),
+                body: request_body,
+            },
+        )?;
+        assert_eq!(replay.status, 200);
+        let replay_body: Value = serde_json::from_slice(&replay.body)?;
+        assert_eq!(replay_body, first_body);
+
+        let conflict = handle_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/sessions/session-0/act_batch".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: Some("http://127.0.0.1".into()),
+                body: serde_json::to_vec(&json!({
+                    "batch": {
+                        "actions": [{"kind": "click", "node": "other"}],
+                        "quiescence": "composite"
+                    },
+                    "input_tainted": false,
+                    "confirmed": true,
+                    "idempotency_key": "click-buy-1"
+                }))?,
+            },
+        );
+        assert_eq!(conflict.status, 409);
+        let conflict_body: Value = serde_json::from_slice(&conflict.body)?;
+        assert!(conflict_body["error"]
+            .as_str()
+            .ok_or("missing conflict error")?
+            .contains("idempotency_key"));
+
+        let kill = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "DELETE".into(),
+                path: "/sessions/session-0".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: Some("http://127.0.0.1".into()),
                 body: Vec::new(),
             },
         )?;
+        assert_eq!(kill.status, 200);
+        join_driver_handler(server)?;
+        Ok(())
+    }
 
-        assert_eq!(response.status, 200);
-        let card: Value = serde_json::from_slice(&response.body)?;
-        assert_eq!(card["url"], "http://localhost/mcp");
+    #[test]
+    fn session_act_batch_rejects_new_idempotency_key_when_cache_is_full() -> TestResult {
+        let mut pool = SessionPool::default();
+        let session = pool.create("https://idempotency-cap.test")?;
+        for index in 0..MAX_SESSION_IDEMPOTENCY_RECORDS {
+            pool.remember_session_act_batch_response(
+                &session.id,
+                &format!("key-{index}"),
+                json!({"index": index}),
+                json!({"status": "applied", "index": index}),
+            )?;
+        }
+
+        let response = handle_http_request(
+            &mut pool,
+            control_request(
+                "POST",
+                &format!("/sessions/{}/act_batch", session.id.0),
+                Some("http://127.0.0.1"),
+                br#"{"batch":{"actions":[{"kind":"click","node":"buy"}],"quiescence":"composite"},"input_tainted":false,"confirmed":true,"idempotency_key":"key-new"}"#,
+            ),
+        );
+
+        assert_eq!(response.status, 409);
+        let body: Value = serde_json::from_slice(&response.body)?;
+        assert!(body["error"]
+            .as_str()
+            .ok_or("missing idempotency cap error")?
+            .contains("idempotency cache is full"));
         Ok(())
     }
 
@@ -3628,6 +6415,33 @@ mod tests {
         let observe: Value = serde_json::from_slice(&observe_response.body)?;
         assert_eq!(observe["id"], 11);
         assert_eq!(observe["error"]["code"], -32002);
+        Ok(())
+    }
+
+    #[test]
+    fn mcp_endpoint_rejects_invalid_json_rpc_ids_before_dispatch() -> TestResult {
+        let mut pool = SessionPool::default();
+        let response = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/mcp".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: br#"{"jsonrpc":"2.0","id":{},"method":"tools/list"}"#.to_vec(),
+            },
+        )?;
+
+        assert_eq!(response.status, 400);
+        let error: Value = serde_json::from_slice(&response.body)?;
+        assert_eq!(error["jsonrpc"], "2.0");
+        assert_eq!(error["id"], Value::Null);
+        assert_eq!(error["error"]["code"], -32600);
+        assert!(error["error"]["message"]
+            .as_str()
+            .ok_or("missing JSON-RPC error message")?
+            .contains("id must be a string, number, or null"));
         Ok(())
     }
 
@@ -4397,12 +7211,56 @@ mod tests {
         };
 
         exporter.export_step(&triple)?;
+        exporter.flush()?;
         let bytes = std::fs::read(&path)?;
         let value: Value = serde_json::from_slice(bytes.strip_suffix(b"\n").unwrap_or(&bytes))?;
 
         assert_eq!(value["resource"]["service.name"], "tempod");
         assert_eq!(value["name"], "tempo.step");
         assert_eq!(value["body"]["seq"], 1);
+        assert_eq!(value["body"]["action"]["kind"], "scroll");
+        assert_eq!(value["body"]["outcome"]["kind"], "applied");
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn otlp_export_redacts_action_payloads_and_error_reasons() -> TestResult {
+        let root = unique_dir("otlp-redacted")?;
+        remove_dir_if_exists(&root)?;
+        let path = root.join("steps.jsonl");
+        let exporter = OtlpJsonExporter::new(&path);
+        let triple = StepTriple {
+            key: IdempotencyKey("step-secret".into()),
+            seq: 2,
+            action: Action::Type {
+                node: tempo_schema::NodeId("password-field".into()),
+                text: "Bearer secret-token".into(),
+            },
+            outcome: StepTripleOutcome::StepError {
+                reason: "remote endpoint echoed secret-token".into(),
+            },
+        };
+
+        exporter.export_step(&triple)?;
+        exporter.flush()?;
+        let text = std::fs::read_to_string(&path)?;
+        let value: Value = serde_json::from_str(text.strip_suffix('\n').unwrap_or(text.as_str()))?;
+
+        assert_eq!(value["body"]["action"]["kind"], "type");
+        assert_eq!(value["body"]["outcome"]["kind"], "step_error");
+        assert_eq!(value["body"]["outcome"]["reason"], "[redacted]");
+        assert!(!text.contains("secret-token"));
+        assert!(!text.contains("password-field"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path)?.permissions().mode() & 0o777,
+                0o600
+            );
+        }
 
         remove_dir_if_exists(&root)?;
         Ok(())
@@ -4576,6 +7434,31 @@ mod tests {
         // The daemon thread must return cleanly (no panic / process death).
         join_server(handle)?;
         assert!(response.starts_with("HTTP/1.1 400"));
+        Ok(())
+    }
+
+    #[test]
+    fn ambiguous_http_framing_and_origin_headers_are_rejected() -> TestResult {
+        for request in [
+            "POST /sessions HTTP/1.1\r\ncontent-length: 26\r\nContent-Length: 26\r\n\r\n{\"url\":\"https://one.test\"}",
+            "POST /sessions HTTP/1.1\r\ntransfer-encoding: chunked\r\n\r\n0\r\n\r\n",
+            "POST /sessions HTTP/1.1\r\ntransfer-encoding: identity\r\ncontent-length: 26\r\n\r\n{\"url\":\"https://one.test\"}",
+            "POST /sessions HTTP/1.1\r\norigin: http://127.0.0.1\r\nOrigin: http://127.0.0.1\r\ncontent-length: 26\r\n\r\n{\"url\":\"https://one.test\"}",
+            "GET /openapi.json HTTP/1.1\r\nhost: localhost\r\nHost: other.localhost\r\n\r\n",
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0")?;
+            let addr = listener.local_addr()?;
+            let pool = Arc::new(Mutex::new(SessionPool::default()));
+            let handle = thread::spawn(move || serve_one(listener, pool));
+
+            let response = send_http(addr, request)?;
+            join_server(handle)?;
+
+            assert!(
+                response.starts_with("HTTP/1.1 400"),
+                "ambiguous request should be rejected: {request:?}; response={response:?}"
+            );
+        }
         Ok(())
     }
 

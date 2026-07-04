@@ -13,6 +13,7 @@ use tempo_headless::{TempodSession, TempodSessionEvent, TempodSessionId};
 use thiserror::Error;
 
 pub const DEFAULT_TEMPOD_ADDR: &str = "127.0.0.1:8787";
+pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
 const USAGE: &str = "\
 tempo-shell
@@ -146,6 +147,7 @@ where
 pub struct ShellClient {
     tempod_addr: String,
     timeout: Duration,
+    max_response_bytes: usize,
 }
 
 impl ShellClient {
@@ -153,11 +155,17 @@ impl ShellClient {
         Self {
             tempod_addr: tempod_addr.into(),
             timeout: Duration::from_secs(5),
+            max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
         }
     }
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    pub fn with_max_response_bytes(mut self, max_response_bytes: usize) -> Self {
+        self.max_response_bytes = max_response_bytes;
         self
     }
 
@@ -271,7 +279,15 @@ impl ShellClient {
         stream.shutdown(std::net::Shutdown::Write)?;
 
         let mut bytes = Vec::new();
-        stream.read_to_end(&mut bytes)?;
+        let limit = u64::try_from(self.max_response_bytes)
+            .unwrap_or(u64::MAX - 1)
+            .saturating_add(1);
+        stream.take(limit).read_to_end(&mut bytes)?;
+        if bytes.len() > self.max_response_bytes {
+            return Err(ShellError::ResponseTooLarge {
+                max_bytes: self.max_response_bytes,
+            });
+        }
         parse_http_response(&bytes)
     }
 }
@@ -386,17 +402,79 @@ fn parse_http_response(bytes: &[u8]) -> Result<HttpResponse, ShellError> {
         .ok_or_else(|| ShellError::Protocol("missing HTTP response headers".into()))?;
     let headers = String::from_utf8(bytes[..header_end].to_vec())
         .map_err(|err| ShellError::Protocol(err.to_string()))?;
-    let status = headers
-        .lines()
+    let mut lines = headers.lines();
+    let status_line = lines
         .next()
-        .and_then(|line| line.split_whitespace().nth(1))
+        .ok_or_else(|| ShellError::Protocol("missing HTTP status".into()))?;
+    let mut status_parts = status_line.split_ascii_whitespace();
+    let version = status_parts
+        .next()
+        .ok_or_else(|| ShellError::Protocol("missing HTTP version".into()))?;
+    if !matches!(version, "HTTP/1.0" | "HTTP/1.1") {
+        return Err(ShellError::Protocol(format!(
+            "unsupported HTTP version: {version}"
+        )));
+    }
+    let status = status_parts
+        .next()
         .ok_or_else(|| ShellError::Protocol("missing HTTP status".into()))?
         .parse()
         .map_err(|err: std::num::ParseIntError| ShellError::Protocol(err.to_string()))?;
-    Ok(HttpResponse {
-        status,
-        body: bytes[header_end + 4..].to_vec(),
-    })
+    if !(100..=599).contains(&status) {
+        return Err(ShellError::Protocol(format!(
+            "invalid HTTP status: {status}"
+        )));
+    }
+
+    let mut content_length = None;
+    for line in lines {
+        let (name, value) = line
+            .split_once(':')
+            .ok_or_else(|| ShellError::Protocol(format!("malformed HTTP header: {line}")))?;
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(ShellError::Protocol("empty HTTP header name".into()));
+        }
+        let value = value.trim();
+        if name.eq_ignore_ascii_case("content-length") {
+            let length = value
+                .parse::<usize>()
+                .map_err(|err| ShellError::Protocol(format!("invalid content-length: {err}")))?;
+            if content_length.is_some_and(|existing| existing != length) {
+                return Err(ShellError::Protocol(
+                    "conflicting content-length headers".into(),
+                ));
+            }
+            content_length = Some(length);
+        } else if name.eq_ignore_ascii_case("transfer-encoding")
+            && !value
+                .split(',')
+                .all(|coding| coding.trim().eq_ignore_ascii_case("identity"))
+        {
+            return Err(ShellError::Protocol(format!(
+                "unsupported transfer-encoding: {value}"
+            )));
+        }
+    }
+
+    let body = &bytes[header_end + 4..];
+    let body = if let Some(length) = content_length {
+        match body.len().cmp(&length) {
+            std::cmp::Ordering::Less => {
+                return Err(ShellError::Protocol("truncated HTTP response body".into()));
+            }
+            std::cmp::Ordering::Greater => {
+                return Err(ShellError::Protocol(
+                    "HTTP response body exceeds content-length".into(),
+                ));
+            }
+            std::cmp::Ordering::Equal => body.to_vec(),
+        }
+    } else {
+        body.to_vec()
+    };
+
+    Ok(HttpResponse { status, body })
 }
 
 fn safe_path_segment(segment: &str) -> Result<&str, ShellError> {
@@ -431,6 +509,8 @@ pub enum ShellError {
     Http { status: u16, body: String },
     #[error("tempod MCP failed: {0}")]
     Mcp(String),
+    #[error("tempod response exceeded {max_bytes} bytes")]
+    ResponseTooLarge { max_bytes: usize },
     #[error("invalid tempod HTTP response: {0}")]
     Protocol(String),
 }
@@ -439,7 +519,12 @@ impl ShellError {
     pub fn exit_code(&self) -> u8 {
         match self {
             Self::Usage(_) => 2,
-            Self::Io(_) | Self::Json(_) | Self::Http { .. } | Self::Mcp(_) | Self::Protocol(_) => 1,
+            Self::Io(_)
+            | Self::Json(_)
+            | Self::Http { .. }
+            | Self::Mcp(_)
+            | Self::ResponseTooLarge { .. }
+            | Self::Protocol(_) => 1,
         }
     }
 }
@@ -528,6 +613,54 @@ mod tests {
                 name: "screenshot".into(),
                 arguments: json!({"set_of_marks": true}),
             }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parse_http_response_respects_content_length() -> TestResult {
+        let response = parse_http_response(b"HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\nhello")?;
+
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, b"hello");
+        Ok(())
+    }
+
+    #[test]
+    fn parse_http_response_rejects_incomplete_content_length_body() -> TestResult {
+        let err = match parse_http_response(b"HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\nhell") {
+            Ok(_) => return Err("truncated body should be rejected".into()),
+            Err(err) => err,
+        };
+
+        assert!(matches!(err, ShellError::Protocol(message) if message.contains("truncated")));
+        Ok(())
+    }
+
+    #[test]
+    fn parse_http_response_rejects_extra_content_length_body() -> TestResult {
+        let err = match parse_http_response(b"HTTP/1.1 200 OK\r\ncontent-length: 4\r\n\r\nhello") {
+            Ok(_) => return Err("extra body bytes should be rejected".into()),
+            Err(err) => err,
+        };
+
+        assert!(
+            matches!(err, ShellError::Protocol(message) if message.contains("exceeds content-length"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parse_http_response_rejects_unsupported_transfer_encoding() -> TestResult {
+        let err = match parse_http_response(
+            b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+        ) {
+            Ok(_) => return Err("chunked response should be rejected".into()),
+            Err(err) => err,
+        };
+
+        assert!(
+            matches!(err, ShellError::Protocol(message) if message.contains("transfer-encoding"))
         );
         Ok(())
     }
@@ -669,6 +802,41 @@ mod tests {
         })?;
 
         assert_eq!(String::from_utf8(output)?, "[]\n");
+        Ok(())
+    }
+
+    #[test]
+    fn client_rejects_oversized_tempod_response() -> TestResult {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let handle = thread::spawn(move || -> Result<(), std::io::Error> {
+            let (mut stream, _) = listener.accept()?;
+            let mut response =
+                b"HTTP/1.1 200 OK\r\ncontent-length: 32\r\nconnection: close\r\n\r\n".to_vec();
+            response.extend([b'x'; 32]);
+            match stream.write_all(&response) {
+                Ok(()) => Ok(()),
+                Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+                Err(err) => Err(err),
+            }
+        });
+
+        let err = match ShellClient::new(addr.to_string())
+            .with_max_response_bytes(64)
+            .health()
+        {
+            Ok(_) => return Err("oversized response should be rejected before JSON parse".into()),
+            Err(err) => err,
+        };
+
+        assert!(matches!(
+            err,
+            ShellError::ResponseTooLarge { max_bytes: 64 }
+        ));
+        match handle.join() {
+            Ok(result) => result?,
+            Err(_) => return Err("server thread failed".into()),
+        }
         Ok(())
     }
 
