@@ -111,6 +111,10 @@ pub enum DriverCommand {
 }
 
 /// Navigation request mapped to tempo's semantic action space.
+///
+/// `input_tainted` and `confirmed` are ADVISORY caller claims (#254): the
+/// policy gate in the endpoint recomputes taint server-side and only lets
+/// these fields escalate, never weaken, its decision (`tempo_policy::trust`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NavigateCommand {
     pub context: BrowsingContextId,
@@ -624,8 +628,10 @@ pub struct NavigateParameters {
     pub url: String,
     #[serde(default)]
     pub wait: ReadinessState,
+    /// Advisory caller claim (#254): sanitized escalate-only by the endpoint.
     #[serde(default, rename = "inputTainted", alias = "input_tainted")]
     pub input_tainted: Option<bool>,
+    /// Advisory caller claim (#254): never bypasses the confirmation gate.
     #[serde(default)]
     pub confirmed: bool,
 }
@@ -676,8 +682,10 @@ pub struct ScriptEvaluateParameters {
     pub await_promise: bool,
     #[serde(default)]
     pub result_ownership: ResultOwnership,
+    /// Advisory caller claim (#254): sanitized escalate-only by the endpoint.
     #[serde(default, alias = "input_tainted")]
     pub input_tainted: Option<bool>,
+    /// Advisory caller claim (#254): never bypasses the confirmation gate.
     #[serde(default)]
     pub confirmed: bool,
 }

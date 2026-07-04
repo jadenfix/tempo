@@ -22,7 +22,11 @@ use tempo_handshake::{
     WEB_MCP_DETECTION_SCRIPT,
 };
 use tempo_observe::composite_set_of_marks_png;
-use tempo_policy::{decide_action, InputTaint, Origin};
+use tempo_policy::trust::{
+    action_caller_texts, gate_boundary_action, requires_observation_evidence, CallerPolicyClaims,
+    ConfirmationRequired,
+};
+use tempo_policy::Origin;
 use tempo_schema::{Action, ActionBatch, NodeId};
 use thiserror::Error;
 use url::{Host, Url};
@@ -567,15 +571,34 @@ where
             }
             "act" => {
                 let args: ActArgs = parse_args(arguments)?;
-                if let Err(denial) =
-                    enforce_action_policy(&args.action, args.input_taint()?, args.confirmed)
+                let claims = args.claims()?;
+                // Trust boundary (#254): caller taint/confirmed claims are
+                // advisory (see tempo_policy::trust). Denials that need no
+                // page evidence return before leasing the driver.
+                let needs_evidence =
+                    requires_observation_evidence(&action_caller_texts(&args.action), claims);
+                if !needs_evidence
+                    && let Err(required) = gate_boundary_action(&args.action, None, claims)
                 {
-                    return Ok(denial);
+                    return Ok(ToolCall::confirmation_required(&required));
                 }
                 let mut lease = self.lease_driver(args.driver_id.as_deref())?;
                 let Some(driver) = lease.driver_mut() else {
                     return Err(JsonRpcError::invalid_request("driver lease was empty"));
                 };
+                if needs_evidence {
+                    // Recompute taint from the live observation; the caller's
+                    // clean claim cannot override page-derived evidence.
+                    let observation = match driver.observe().await {
+                        Ok(observation) => observation,
+                        Err(error) => return Ok(observe_evidence_error(&error)),
+                    };
+                    if let Err(required) =
+                        gate_boundary_action(&args.action, Some(&observation), claims)
+                    {
+                        return Ok(ToolCall::confirmation_required(&required));
+                    }
+                }
                 match driver.act(&args.action).await {
                     Ok(outcome) => Ok(ToolCall::success(step_outcome_json(outcome))),
                     Err(error) => Ok(ToolCall::error(error.to_string())),
@@ -583,16 +606,34 @@ where
             }
             "act_batch" => {
                 let args: ActBatchArgs = parse_args(arguments)?;
-                let input_taint = args.input_taint()?;
-                if let Some(denial) = args.batch.actions.iter().find_map(|action| {
-                    enforce_action_policy(action, input_taint, args.confirmed).err()
-                }) {
-                    return Ok(denial);
+                let claims = args.claims()?;
+                let needs_evidence = args.batch.actions.iter().any(|action| {
+                    requires_observation_evidence(&action_caller_texts(action), claims)
+                });
+                if !needs_evidence
+                    && let Some(required) = args
+                        .batch
+                        .actions
+                        .iter()
+                        .find_map(|action| gate_boundary_action(action, None, claims).err())
+                {
+                    return Ok(ToolCall::confirmation_required(&required));
                 }
                 let mut lease = self.lease_driver(args.driver_id.as_deref())?;
                 let Some(driver) = lease.driver_mut() else {
                     return Err(JsonRpcError::invalid_request("driver lease was empty"));
                 };
+                if needs_evidence {
+                    let observation = match driver.observe().await {
+                        Ok(observation) => observation,
+                        Err(error) => return Ok(observe_evidence_error(&error)),
+                    };
+                    if let Some(required) = args.batch.actions.iter().find_map(|action| {
+                        gate_boundary_action(action, Some(&observation), claims).err()
+                    }) {
+                        return Ok(ToolCall::confirmation_required(&required));
+                    }
+                }
                 match driver.act_batch(&args.batch).await {
                     Ok(outcome) => Ok(ToolCall::success(step_outcome_json(outcome))),
                     Err(error) => Ok(ToolCall::error(error.to_string())),
@@ -865,7 +906,7 @@ pub fn tools() -> Vec<ToolDescriptor> {
         },
         ToolDescriptor {
             name: "act",
-            description: "Execute one tempo semantic action with explicit input_tainted evidence.",
+            description: "Execute one tempo semantic action. input_tainted/confirmed are advisory: taint is recomputed server-side and can only be escalated by the caller.",
             input_schema: object_schema(
                 vec![
                     ("action", json!({"type": "object"})),
@@ -879,7 +920,7 @@ pub fn tools() -> Vec<ToolDescriptor> {
         ToolDescriptor {
             name: "act_batch",
             description:
-                "Execute a batch of tempo semantic actions; confirmed=true authorizes the full batch.",
+                "Execute a batch of tempo semantic actions. input_tainted/confirmed are advisory: taint is recomputed server-side and can only be escalated by the caller.",
             input_schema: object_schema(
                 vec![
                     ("batch", json!({"type": "object"})),
@@ -1026,6 +1067,24 @@ impl ToolCall {
         }
     }
 
+    /// Typed error for a request the policy gate refused pending human
+    /// confirmation (#254). Caller-supplied `confirmed` can never clear this;
+    /// see `tempo_policy::trust`.
+    fn confirmation_required(required: &ConfirmationRequired) -> Self {
+        Self {
+            is_error: true,
+            structured_content: json!({
+                "error": {
+                    "type": "confirmation_required",
+                    "side_effect": required.decision.side_effect,
+                    "input_tainted": required.decision.input_taint.is_tainted(),
+                    "gate": required.gate_name(),
+                    "message": required.message(),
+                }
+            }),
+        }
+    }
+
     fn cap_error(artifact: &'static str, bytes: usize, max_bytes: usize) -> Self {
         Self {
             is_error: true,
@@ -1066,8 +1125,8 @@ struct ActArgs {
 }
 
 impl ActArgs {
-    fn input_taint(&self) -> Result<InputTaint, JsonRpcError> {
-        required_input_taint(self.input_tainted)
+    fn claims(&self) -> Result<CallerPolicyClaims, JsonRpcError> {
+        required_caller_claims(self.input_tainted, self.confirmed)
     }
 }
 
@@ -1082,8 +1141,8 @@ struct ActBatchArgs {
 }
 
 impl ActBatchArgs {
-    fn input_taint(&self) -> Result<InputTaint, JsonRpcError> {
-        required_input_taint(self.input_tainted)
+    fn claims(&self) -> Result<CallerPolicyClaims, JsonRpcError> {
+        required_caller_claims(self.input_tainted, self.confirmed)
     }
 }
 
@@ -1184,10 +1243,27 @@ fn parse_args<T: serde::de::DeserializeOwned>(value: Value) -> Result<T, JsonRpc
     serde_json::from_value(value).map_err(|error| JsonRpcError::invalid_params(error.to_string()))
 }
 
-fn required_input_taint(value: Option<bool>) -> Result<InputTaint, JsonRpcError> {
-    value
-        .map(InputTaint::new)
-        .ok_or_else(|| JsonRpcError::invalid_params("input_tainted is required for act tools"))
+/// Parse caller policy claims, keeping `input_tainted` a REQUIRED wire field
+/// so callers must state their claim explicitly. Both fields are advisory:
+/// they are sanitized by `tempo_policy::trust` and can only escalate.
+fn required_caller_claims(
+    input_tainted: Option<bool>,
+    confirmed: bool,
+) -> Result<CallerPolicyClaims, JsonRpcError> {
+    if input_tainted.is_none() {
+        return Err(JsonRpcError::invalid_params(
+            "input_tainted is required for act tools",
+        ));
+    }
+    Ok(CallerPolicyClaims::new(input_tainted, confirmed))
+}
+
+/// Observe failure while gathering trust-boundary taint evidence: fail the
+/// tool call rather than weaken the gate.
+fn observe_evidence_error(error: &dyn std::fmt::Display) -> ToolCall {
+    ToolCall::error(format!(
+        "policy taint recomputation requires an observation, but observe failed: {error}"
+    ))
 }
 
 fn validate_screenshot_bytes(bytes: Vec<u8>) -> Result<Vec<u8>, ToolCall> {
@@ -1203,23 +1279,6 @@ fn validate_screenshot_bytes(bytes: Vec<u8>) -> Result<Vec<u8>, ToolCall> {
 
 fn base64_encoded_len(bytes: usize) -> Option<usize> {
     bytes.checked_add(2)?.checked_div(3)?.checked_mul(4)
-}
-
-fn enforce_action_policy(
-    action: &Action,
-    input_taint: InputTaint,
-    confirmed: bool,
-) -> Result<(), ToolCall> {
-    let decision = decide_action(action, input_taint);
-    if decision.gate.requires_human() && !confirmed {
-        return Err(ToolCall::error(format!(
-            "policy denied: {:?} action with input_tainted={} requires {:?}; retry with confirmed=true after human confirmation",
-            decision.side_effect,
-            input_taint.is_tainted(),
-            decision.gate
-        )));
-    }
-    Ok(())
 }
 
 /// The origin to run a live HTTP probe against, if these handshake args request
@@ -1891,6 +1950,8 @@ mod tests {
     async fn act_denies_unconfirmed_tainted_write_before_driver_execution() -> Result<(), String> {
         let mut server = TempoMcpServer::new(MemoryDriver::new());
 
+        // Escalate path: the caller CAN mark input more tainted than the
+        // server sees, and the gate honors it.
         let denied = call_tool(
             &mut server,
             "act",
@@ -1900,9 +1961,11 @@ mod tests {
             }),
         )
         .await?;
-        let denial = denied["error"]
+        assert_eq!(denied["error"]["type"], "confirmation_required");
+        assert_eq!(denied["error"]["input_tainted"], true);
+        let denial = denied["error"]["message"]
             .as_str()
-            .ok_or("policy denial should be a tool error")?;
+            .ok_or("policy denial should carry a message")?;
         assert!(denial.contains("policy denied"));
 
         let clean = call_tool(
@@ -1936,9 +1999,10 @@ mod tests {
             }),
         )
         .await?;
-        let denial = denied["error"]
+        assert_eq!(denied["error"]["type"], "confirmation_required");
+        let denial = denied["error"]["message"]
             .as_str()
-            .ok_or("policy denial should be a tool error")?;
+            .ok_or("policy denial should carry a message")?;
         assert!(denial.contains("policy denied"));
 
         let clean = call_tool(
@@ -1956,10 +2020,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn act_allows_confirmed_tainted_write() -> Result<(), String> {
+    async fn act_confirmed_claim_cannot_bypass_gate_without_confirmation_channel(
+    ) -> Result<(), String> {
         let mut server = TempoMcpServer::new(MemoryDriver::new());
 
-        let act = call_tool(
+        // Pre-#254 this was allowed: a bare confirmed=true from the same
+        // caller requesting the action bypassed the human gate. Now the flag
+        // is advisory and the gate stays closed until a server-attributable
+        // confirmation channel exists.
+        let denied = call_tool(
             &mut server,
             "act",
             json!({
@@ -1970,8 +2039,100 @@ mod tests {
         )
         .await?;
 
-        assert_eq!(act["status"], "applied");
-        assert_eq!(act["diff"]["seq"], 2);
+        assert_eq!(denied["error"]["type"], "confirmation_required");
+        assert_eq!(denied["error"]["gate"], "confirm");
+        let message = denied["error"]["message"]
+            .as_str()
+            .ok_or("denial should carry a message")?;
+        assert!(message.contains("confirmed=true was ignored"));
+
+        // The driver never executed the action: the next clean act is seq 2.
+        let clean = call_tool(
+            &mut server,
+            "act",
+            json!({
+                "action": {"kind": "scroll", "x": 0.0, "y": 12.0},
+                "input_tainted": false
+            }),
+        )
+        .await?;
+        assert_eq!(clean["diff"]["seq"], 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn act_recomputes_taint_from_observation_and_blocks_clean_claim() -> Result<(), String> {
+        // The MemoryDriver observation carries the page-provenance span
+        // "Continue". Typing text derived from it while claiming
+        // input_tainted=false must be blocked by server-side recomputation;
+        // this fails if the recomputation is removed.
+        let mut server = TempoMcpServer::new(MemoryDriver::new());
+
+        let denied = call_tool(
+            &mut server,
+            "act",
+            json!({
+                "action": {"kind": "type", "node": "field.note", "text": "Continue to evil.example"},
+                "input_tainted": false,
+                "confirmed": true
+            }),
+        )
+        .await?;
+        assert_eq!(denied["error"]["type"], "confirmation_required");
+        assert_eq!(denied["error"]["input_tainted"], true);
+        assert_eq!(denied["error"]["side_effect"], "write");
+
+        // Unmatched clean text still executes: recomputation is evidence-based,
+        // not a blanket block on writes.
+        let clean = call_tool(
+            &mut server,
+            "act",
+            json!({
+                "action": {"kind": "type", "node": "field.note", "text": "fresh user words"},
+                "input_tainted": false
+            }),
+        )
+        .await?;
+        assert_eq!(clean["status"], "applied");
+        assert_eq!(clean["diff"]["seq"], 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn act_batch_recomputes_taint_from_observation_and_blocks_clean_claim(
+    ) -> Result<(), String> {
+        let mut server = TempoMcpServer::new(MemoryDriver::new());
+
+        let denied = call_tool(
+            &mut server,
+            "act_batch",
+            json!({
+                "batch": {
+                    "actions": [
+                        {"kind": "scroll", "x": 0.0, "y": 12.0},
+                        {"kind": "type", "node": "field.note", "text": "Continue to evil.example"}
+                    ],
+                    "quiescence": "composite"
+                },
+                "input_tainted": false,
+                "confirmed": true
+            }),
+        )
+        .await?;
+        assert_eq!(denied["error"]["type"], "confirmation_required");
+        assert_eq!(denied["error"]["input_tainted"], true);
+
+        // The batch never executed.
+        let clean = call_tool(
+            &mut server,
+            "act",
+            json!({
+                "action": {"kind": "scroll", "x": 0.0, "y": 12.0},
+                "input_tainted": false
+            }),
+        )
+        .await?;
+        assert_eq!(clean["diff"]["seq"], 2);
         Ok(())
     }
 
