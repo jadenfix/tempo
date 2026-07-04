@@ -195,6 +195,10 @@ impl UrlPolicy {
         url: &str,
         resolved_socket: SocketAddr,
     ) -> Result<(), UrlBlocked> {
+        if self.mode == UrlPolicyMode::AllowAll {
+            return Ok(());
+        }
+
         self.enforce_resolved_ip(url, resolved_socket.ip())
     }
 }
@@ -2419,6 +2423,10 @@ mod tests {
         UrlPolicy::allow_all().enforce_resolved_ip(
             "file:///etc/passwd",
             IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+        )?;
+        UrlPolicy::allow_all().enforce_resolved_socket(
+            "file:///etc/passwd",
+            SocketAddr::from(([127, 0, 0, 1], 22)),
         )?;
         Ok(())
     }

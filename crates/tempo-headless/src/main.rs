@@ -35,6 +35,7 @@ impl TempodOptions {
     fn parse(args: impl IntoIterator<Item = String>) -> Result<Self, String> {
         let mut addr = None;
         let mut engine = Engine::Cdp;
+        let mut engine_was_set = false;
         let mut engine_socket = None;
         let mut args = args.into_iter();
 
@@ -45,6 +46,7 @@ impl TempodOptions {
                         .next()
                         .ok_or_else(|| "--engine requires cdp or servo".to_string())?;
                     engine = parse_engine(&value)?;
+                    engine_was_set = true;
                 }
                 "--engine-socket" => {
                     let value = args
@@ -62,6 +64,13 @@ impl TempodOptions {
                     }
                 }
             }
+        }
+
+        if engine_was_set && engine_socket.is_none() {
+            return Err(format!(
+                "--engine only applies with --engine-socket; otherwise tempod starts without an attached engine\n{}",
+                usage()
+            ));
         }
 
         Ok(Self {
@@ -82,4 +91,35 @@ fn parse_engine(value: &str) -> Result<Engine, String> {
 
 fn usage() -> String {
     "usage: tempod [ADDR] [--engine cdp|servo] [--engine-socket PATH]".into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_engine_requires_engine_socket() {
+        let error = TempodOptions::parse(["--engine".to_string(), "servo".to_string()])
+            .err()
+            .expect("--engine without --engine-socket should be rejected");
+
+        assert!(error.contains("--engine only applies with --engine-socket"));
+    }
+
+    #[test]
+    fn explicit_engine_with_socket_is_accepted() {
+        let options = TempodOptions::parse([
+            "--engine".to_string(),
+            "servo".to_string(),
+            "--engine-socket".to_string(),
+            "/tmp/tempo-engine.sock".to_string(),
+        ])
+        .expect("--engine with --engine-socket should parse");
+
+        assert_eq!(options.engine, Engine::Servo);
+        assert_eq!(
+            options.engine_socket,
+            Some(PathBuf::from("/tmp/tempo-engine.sock"))
+        );
+    }
 }

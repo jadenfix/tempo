@@ -222,14 +222,14 @@ impl CassetteKey {
     /// former FNV-1a-64) let an attacker craft two distinct requests sharing one key
     /// and thereby substitute a chosen recorded response during replay. SHA-256 is
     /// collision-resistant and its 256-bit output removes birthday collisions on
-    /// large corpora. Fields are length-unambiguously separated by NUL bytes.
+    /// large corpora. Fields are versioned and length-prefixed so page-controlled
+    /// NUL bytes cannot move data across component boundaries.
     pub fn from_request(method: &str, url: &str, body: &[u8]) -> Self {
         let mut hasher = Sha256::new();
-        hasher.update(method.as_bytes());
-        hasher.update([0]);
-        hasher.update(url.as_bytes());
-        hasher.update([0]);
-        hasher.update(body);
+        hasher.update(b"tempo-session:cassette-key:v2\0");
+        update_length_prefixed(&mut hasher, method.as_bytes());
+        update_length_prefixed(&mut hasher, url.as_bytes());
+        update_length_prefixed(&mut hasher, body);
         let digest = hasher.finalize();
 
         let mut key = String::with_capacity(digest.len() * 2);
@@ -239,6 +239,11 @@ impl CassetteKey {
         }
         Self(key)
     }
+}
+
+fn update_length_prefixed(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update((value.len() as u64).to_be_bytes());
+    hasher.update(value);
 }
 
 /// Byte-stable replay record. No host-local paths or timestamps are stored.
@@ -1253,10 +1258,13 @@ mod tests {
             .chars()
             .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
 
-        // Known SHA-256 of "GET\0https://example.com/api\0payload".
+        // Known SHA-256 of the v2 versioned, length-prefixed request tuple.
         let expected = {
             let mut hasher = Sha256::new();
-            hasher.update(b"GET\0https://example.com/api\0payload");
+            hasher.update(b"tempo-session:cassette-key:v2\0");
+            update_length_prefixed(&mut hasher, b"GET");
+            update_length_prefixed(&mut hasher, b"https://example.com/api");
+            update_length_prefixed(&mut hasher, b"payload");
             let digest = hasher.finalize();
             let mut key = String::with_capacity(digest.len() * 2);
             for byte in digest {
@@ -1271,6 +1279,10 @@ mod tests {
         let split = CassetteKey::from_request("GET", "x", b"");
         let joined = CassetteKey::from_request("GETx", "", b"");
         assert_ne!(split, joined);
+
+        let nul_in_url = CassetteKey::from_request("GET", "x\0", b"y");
+        let nul_in_body = CassetteKey::from_request("GET", "x", b"\0y");
+        assert_ne!(nul_in_url, nul_in_body);
 
         let other_method = CassetteKey::from_request("POST", "https://example.com/api", b"payload");
         assert_ne!(a, other_method);
