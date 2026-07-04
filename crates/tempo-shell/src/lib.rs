@@ -1317,7 +1317,7 @@ mod tests {
         let (client_stream, server_stream) = UnixStream::pair()?;
         pool.lock()
             .map_err(|_| "session pool lock failed")?
-            .attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+            .attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream))?;
         Ok(thread::spawn(move || {
             let mut connection = EngineIpcConnection::from_stream(server_stream);
             let mut driver = TestDriver::new();

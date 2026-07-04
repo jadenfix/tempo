@@ -16,6 +16,9 @@ use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex, Weak};
+use std::time::Duration;
 use tempo_driver::{
     BrowsingContextCreateOptions, DriverTrait, StepOutcome, TransportError, Unsupported,
 };
@@ -584,6 +587,219 @@ impl EngineIpcClient {
 
     pub fn into_inner(self) -> UnixStream {
         self.stream
+    }
+}
+
+/// Thread-safe, multiplexing wrapper over one engine-host UDS connection.
+///
+/// [`EngineIpcClient`] serializes callers for a full round-trip: the request
+/// frame is written and the response frame is read while the caller exclusively
+/// owns the stream, so a slow response for one command blocks every other
+/// command on the connection (issue #230). This client instead:
+///
+/// * writes request frames under a short-held writer lock (bounded by the
+///   socket write timeout, never held across a response wait),
+/// * parks each caller on its own channel keyed by the request's frame id, and
+/// * runs one detached reader thread that matches response frames to waiting
+///   callers by id, so responses may return out of order and many requests can
+///   be in flight concurrently.
+///
+/// Every wait is bounded: callers pass an explicit `timeout` to
+/// [`SharedEngineIpcClient::request_for`] and a request that outlives it fails
+/// with [`EngineHostError::IpcTimeout`] while its late response, if any, is
+/// discarded by the reader. A read failure (or peer disconnect) fails all
+/// in-flight requests and marks the client dead so later requests fail fast
+/// instead of queueing behind a wedged connection.
+///
+/// The engine host currently answers requests in order; this client does not
+/// depend on that, so the host loop can start pipelining (responding by frame
+/// id, out of order) without further daemon changes.
+#[derive(Clone)]
+pub struct SharedEngineIpcClient {
+    inner: Arc<SharedIpcInner>,
+}
+
+struct SharedIpcInner {
+    writer: Mutex<SharedIpcWriter>,
+    pending: Mutex<SharedIpcPending>,
+}
+
+struct SharedIpcWriter {
+    stream: UnixStream,
+    next_id: u64,
+}
+
+#[derive(Default)]
+struct SharedIpcPending {
+    waiters: BTreeMap<u64, mpsc::Sender<Result<DriverResponse, String>>>,
+    /// Once set, the connection is unusable and every request fails fast with
+    /// this reason instead of waiting on a dead stream.
+    dead: Option<String>,
+}
+
+impl SharedEngineIpcClient {
+    /// Wrap an authenticated [`EngineIpcClient`], preserving its frame-id
+    /// counter. Convert before issuing concurrent requests; the wrapped client
+    /// must have no response outstanding.
+    pub fn from_client(client: EngineIpcClient) -> Result<Self, EngineHostError> {
+        Self::new(client.stream, client.next_id)
+    }
+
+    /// Wrap a raw connected stream (no auth exchange is performed here).
+    pub fn from_stream(stream: UnixStream) -> Result<Self, EngineHostError> {
+        Self::new(stream, 1)
+    }
+
+    fn new(stream: UnixStream, next_id: u64) -> Result<Self, EngineHostError> {
+        let reader = stream.try_clone()?;
+        // Responses are awaited via per-request `recv_timeout` bounds, not a
+        // socket read timeout: the dedicated reader must be able to sit idle
+        // indefinitely without surfacing spurious timeouts (and without ever
+        // desynchronizing mid-frame).
+        reader.set_read_timeout(None)?;
+        let inner = Arc::new(SharedIpcInner {
+            writer: Mutex::new(SharedIpcWriter { stream, next_id }),
+            pending: Mutex::new(SharedIpcPending::default()),
+        });
+        let weak = Arc::downgrade(&inner);
+        std::thread::spawn(move || shared_ipc_reader_loop(reader, &weak));
+        Ok(Self { inner })
+    }
+
+    /// Send one driver command and wait up to `timeout` for its response.
+    /// Safe to call from many threads concurrently; responses are matched to
+    /// callers by frame id, so a slow command does not delay an unrelated one.
+    pub fn request_for(
+        &self,
+        driver_id: Option<&str>,
+        command: DriverCommand,
+        timeout: Duration,
+    ) -> Result<DriverResponse, EngineHostError> {
+        let payload = serde_json::to_value(DriverRequestPayload {
+            driver_id: driver_id.map(str::to_string),
+            command,
+        })?;
+        let (tx, rx) = mpsc::channel();
+
+        // Lock order is writer -> pending everywhere; the reader takes only
+        // `pending`, so no cycle exists. Registration happens before the frame
+        // is written so the reader can never see a response for an id that is
+        // not yet registered.
+        let id = {
+            let mut writer = self
+                .inner
+                .writer
+                .lock()
+                .map_err(|_| EngineHostError::IpcClosed {
+                    reason: "engine IPC writer lock poisoned".into(),
+                })?;
+            let id = writer.next_id;
+            writer.next_id = writer
+                .next_id
+                .checked_add(1)
+                .ok_or(EngineHostError::RequestIdExhausted)?;
+            {
+                let mut pending =
+                    self.inner
+                        .pending
+                        .lock()
+                        .map_err(|_| EngineHostError::IpcClosed {
+                            reason: "engine IPC pending lock poisoned".into(),
+                        })?;
+                if let Some(reason) = &pending.dead {
+                    return Err(EngineHostError::IpcClosed {
+                        reason: reason.clone(),
+                    });
+                }
+                pending.waiters.insert(id, tx);
+            }
+            // The write is bounded by the stream's write timeout and never
+            // overlaps a response wait.
+            if let Err(error) = write_frame(
+                &mut writer.stream,
+                &WireFrame::new(id, DRIVER_REQUEST_METHOD, payload),
+            ) {
+                self.forget_waiter(id);
+                return Err(error);
+            }
+            id
+        };
+
+        match rx.recv_timeout(timeout) {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(reason)) => Err(EngineHostError::IpcClosed { reason }),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // Deregister so the reader discards the late response instead
+                // of delivering it to a caller that has already given up.
+                self.forget_waiter(id);
+                Err(EngineHostError::IpcTimeout { timeout })
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(EngineHostError::IpcClosed {
+                reason: "engine IPC reader exited without a response".into(),
+            }),
+        }
+    }
+
+    fn forget_waiter(&self, id: u64) {
+        if let Ok(mut pending) = self.inner.pending.lock() {
+            pending.waiters.remove(&id);
+        }
+    }
+}
+
+impl std::fmt::Debug for SharedEngineIpcClient {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("SharedEngineIpcClient").finish()
+    }
+}
+
+/// Reader half of [`SharedEngineIpcClient`]: matches response frames to waiting
+/// requests by frame id. Holds only a `Weak` handle so a fully-dropped client
+/// does not keep the connection state alive; the thread exits on read failure,
+/// peer disconnect, or once every client handle is gone.
+fn shared_ipc_reader_loop(mut stream: UnixStream, inner: &Weak<SharedIpcInner>) {
+    let reason = loop {
+        let frame = match read_expected_frame(&mut stream, DRIVER_RESPONSE_METHOD) {
+            Ok(frame) => frame,
+            Err(error) => break error.to_string(),
+        };
+        // Chunked screenshot continuations are written contiguously by the
+        // host, so reassembling inline (blocking this reader until the final
+        // chunk) mirrors the wire contract; a framing violation kills the
+        // connection below, exactly as it did for the exclusive client.
+        let response = if payload_kind(&frame.payload) == Some("screenshot_chunk") {
+            match read_chunked_screenshot_response(&mut stream, frame.id, frame.payload) {
+                Ok(response) => Ok(response),
+                Err(error) => break error.to_string(),
+            }
+        } else {
+            // A malformed payload only fails the one request it answers; the
+            // frame boundary itself was still consistent.
+            serde_json::from_value::<DriverResponse>(frame.payload)
+                .map_err(|error| format!("engine frame JSON failed: {error}"))
+        };
+        let Some(inner) = inner.upgrade() else {
+            return;
+        };
+        let Ok(mut pending) = inner.pending.lock() else {
+            break "engine IPC pending lock poisoned".to_string();
+        };
+        // An unknown id is a response whose requester already timed out and
+        // deregistered; discard it so the slot cannot be delivered stale.
+        if let Some(waiter) = pending.waiters.remove(&frame.id) {
+            let _ = waiter.send(response);
+        }
+    };
+
+    let Some(inner) = inner.upgrade() else {
+        return;
+    };
+    let Ok(mut pending) = inner.pending.lock() else {
+        return;
+    };
+    pending.dead = Some(reason.clone());
+    for (_, waiter) in std::mem::take(&mut pending.waiters) {
+        let _ = waiter.send(Err(reason.clone()));
     }
 }
 
@@ -1296,6 +1512,10 @@ pub enum EngineHostError {
     ResponseIdMismatch { expected: u64, actual: u64 },
     #[error("engine request id counter exhausted")]
     RequestIdExhausted,
+    #[error("engine IPC request timed out after {timeout:?}")]
+    IpcTimeout { timeout: Duration },
+    #[error("engine IPC connection closed: {reason}")]
+    IpcClosed { reason: String },
     #[error("engine screenshot chunk stream is invalid: {reason}")]
     InvalidScreenshotChunk { reason: String },
     #[error("engine screenshot chunk index counter exhausted")]
@@ -1493,6 +1713,189 @@ mod tests {
             connection.read_driver_request(),
             Err(EngineHostError::Json(_))
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn shared_client_matches_out_of_order_responses_by_frame_id() -> TestResult {
+        // Two requests go out concurrently; the fake engine answers them in
+        // REVERSE order. Each caller must receive its own response — proof the
+        // shared client multiplexes by frame id instead of assuming in-order
+        // replies (issue #230).
+        let (client_stream, server_stream) = UnixStream::pair()?;
+        let shared = SharedEngineIpcClient::from_stream(client_stream)?;
+
+        let first_client = shared.clone();
+        let first = thread::spawn(move || {
+            first_client.request_for(
+                Some("driver-a"),
+                DriverCommand::Extract {
+                    node: tempo_schema::NodeId("node-a".into()),
+                },
+                Duration::from_secs(5),
+            )
+        });
+        let mut connection = EngineIpcConnection::from_stream(server_stream);
+        let request_a = connection.read_driver_request()?;
+        assert_eq!(request_a.driver_id.as_deref(), Some("driver-a"));
+
+        let second_client = shared.clone();
+        let second = thread::spawn(move || {
+            second_client.request_for(
+                Some("driver-b"),
+                DriverCommand::Extract {
+                    node: tempo_schema::NodeId("node-b".into()),
+                },
+                Duration::from_secs(5),
+            )
+        });
+        let request_b = connection.read_driver_request()?;
+        assert_eq!(request_b.driver_id.as_deref(), Some("driver-b"));
+
+        // Answer B first, then A.
+        connection.write_driver_response(
+            request_b.id,
+            DriverResponse::Extracted {
+                value: json!("value-b"),
+            },
+        )?;
+        connection.write_driver_response(
+            request_a.id,
+            DriverResponse::Extracted {
+                value: json!("value-a"),
+            },
+        )?;
+
+        let response_a = first.join().map_err(|_| "first requester panicked")??;
+        let response_b = second.join().map_err(|_| "second requester panicked")??;
+        assert_eq!(
+            response_a,
+            DriverResponse::Extracted {
+                value: json!("value-a")
+            }
+        );
+        assert_eq!(
+            response_b,
+            DriverResponse::Extracted {
+                value: json!("value-b")
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn shared_client_bounds_a_wedged_request_and_discards_its_late_response() -> TestResult {
+        let (client_stream, server_stream) = UnixStream::pair()?;
+        let shared = SharedEngineIpcClient::from_stream(client_stream)?;
+        let mut connection = EngineIpcConnection::from_stream(server_stream);
+
+        // The engine reads the request but never answers within the bound.
+        let started = Instant::now();
+        let timed_out = shared.request_for(
+            None,
+            DriverCommand::Extract {
+                node: tempo_schema::NodeId("wedged".into()),
+            },
+            Duration::from_millis(100),
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(matches!(timed_out, Err(EngineHostError::IpcTimeout { .. })));
+        let wedged_request = connection.read_driver_request()?;
+
+        // The late response for the abandoned request must be discarded, NOT
+        // delivered to the next caller, and the connection must stay usable.
+        connection.write_driver_response(
+            wedged_request.id,
+            DriverResponse::Extracted {
+                value: json!("late"),
+            },
+        )?;
+        let follow_up_client = shared.clone();
+        let follow_up = thread::spawn(move || {
+            follow_up_client.request_for(
+                None,
+                DriverCommand::Extract {
+                    node: tempo_schema::NodeId("fresh".into()),
+                },
+                Duration::from_secs(5),
+            )
+        });
+        let fresh_request = connection.read_driver_request()?;
+        connection.write_driver_response(
+            fresh_request.id,
+            DriverResponse::Extracted {
+                value: json!("fresh"),
+            },
+        )?;
+        let response = follow_up
+            .join()
+            .map_err(|_| "follow-up requester panicked")??;
+        assert_eq!(
+            response,
+            DriverResponse::Extracted {
+                value: json!("fresh")
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn shared_client_disconnect_fails_pending_and_later_requests_fast() -> TestResult {
+        let (client_stream, server_stream) = UnixStream::pair()?;
+        let shared = SharedEngineIpcClient::from_stream(client_stream)?;
+        let mut connection = EngineIpcConnection::from_stream(server_stream);
+
+        let pending_client = shared.clone();
+        let pending = thread::spawn(move || {
+            pending_client.request_for(
+                None,
+                DriverCommand::Extract {
+                    node: tempo_schema::NodeId("pending".into()),
+                },
+                Duration::from_secs(30),
+            )
+        });
+        let _ = connection.read_driver_request()?;
+        drop(connection); // Engine dies mid-request.
+
+        let pending_result = pending.join().map_err(|_| "pending requester panicked")?;
+        assert!(matches!(
+            pending_result,
+            Err(EngineHostError::IpcClosed { .. })
+        ));
+
+        // Later requests fail fast instead of waiting out their timeout.
+        let started = Instant::now();
+        let later = shared.request_for(
+            None,
+            DriverCommand::Extract {
+                node: tempo_schema::NodeId("later".into()),
+            },
+            Duration::from_secs(30),
+        );
+        assert!(matches!(later, Err(_)));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        Ok(())
+    }
+
+    #[test]
+    fn shared_client_reassembles_chunked_screenshot_responses() -> TestResult {
+        let screenshot = patterned_bytes(MAX_FRAME_BYTES as usize + 128 * 1024);
+        let expected = screenshot.clone();
+        let (client_stream, server_stream) = UnixStream::pair()?;
+        let shared = SharedEngineIpcClient::from_stream(client_stream)?;
+        let mut connection = EngineIpcConnection::from_stream(server_stream);
+
+        let requester = thread::spawn(move || {
+            shared.request_for(None, DriverCommand::Screenshot, Duration::from_secs(10))
+        });
+        let request = connection.read_driver_request()?;
+        assert_eq!(request.command, DriverCommand::Screenshot);
+        connection
+            .write_driver_response(request.id, DriverResponse::Screenshot { bytes: screenshot })?;
+
+        let response = requester.join().map_err(|_| "requester panicked")??;
+        assert_eq!(response, DriverResponse::Screenshot { bytes: expected });
         Ok(())
     }
 
