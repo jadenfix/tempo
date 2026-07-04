@@ -10,7 +10,10 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use base64::Engine as _;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tempo_driver::{DriverTrait, Engine, StepOutcome};
+use tempo_driver::{
+    output_cap_message, DriverTrait, Engine, StepOutcome, MAX_EXTRACT_JSON_BYTES,
+    MAX_PROTOCOL_RESPONSE_BYTES, MAX_SCREENSHOT_BYTES,
+};
 use tempo_handshake::{
     decide_lane, probe_http_origin, probe_urls, HttpProbeConfig, HttpProbeFailure,
     Lane as HandshakeLane, ProbeHit, ProbeReport, ProbeResponse, StructuredSignal, WebMcpDetection,
@@ -27,6 +30,7 @@ pub const A2A_AGENT_CARD_PATH: &str = "/.well-known/agent-card.json";
 pub const A2A_AGENT_JSON_PATH: &str = "/.well-known/agent.json";
 pub const A2A_AGENT_CARD_CONTENT_TYPE: &str = "application/a2a+json";
 const DRIVER_REQUIRED_ERROR_CODE: i64 = -32002;
+const RESPONSE_TOO_LARGE_ERROR_CODE: i64 = -32003;
 /// Upper bound on concurrently live forked drivers per session. Forks each hold a
 /// live browser context/target for real engines, so refuse to accumulate beyond
 /// this cap and require the client to `close_fork` before creating more.
@@ -201,7 +205,7 @@ where
 
         let reply = self.handle_message(&message).await;
         match reply {
-            Ok(result) => McpHttpResponse::json(200, json_rpc_result(id, result)),
+            Ok(result) => json_rpc_success_response(id, result),
             Err(error) => McpHttpResponse::json(200, json_rpc_error(id, error.code, error.message)),
         }
     }
@@ -250,7 +254,7 @@ where
             .cloned()
             .unwrap_or_else(|| json!({}));
         let call = self.call_tool(name, arguments).await?;
-        Ok(tool_call_json(call))
+        tool_call_json(call)
     }
 
     async fn call_tool(&mut self, name: &str, arguments: Value) -> Result<ToolCall, JsonRpcError> {
@@ -348,7 +352,11 @@ where
                 let node = args.node_id()?;
                 let driver = self.driver_for_mut(driver_id.as_deref())?;
                 match driver.extract(&node).await {
-                    Ok(value) => Ok(ToolCall::success(value)),
+                    Ok(value) => Ok(ToolCall::success_json_bounded(
+                        "extract_json",
+                        value,
+                        MAX_EXTRACT_JSON_BYTES,
+                    )),
                     Err(error) => Ok(ToolCall::error(error.to_string())),
                 }
             }
@@ -365,15 +373,32 @@ where
                 };
                 match driver.screenshot().await {
                     Ok(bytes) => {
+                        let bytes = match validate_screenshot_bytes(bytes) {
+                            Ok(bytes) => bytes,
+                            Err(call) => return Ok(call),
+                        };
                         let bytes = match observation {
                             Some(observation) => {
                                 match composite_set_of_marks_png(&bytes, &observation) {
-                                    Ok(bytes) => bytes,
+                                    Ok(bytes) => match validate_screenshot_bytes(bytes) {
+                                        Ok(bytes) => bytes,
+                                        Err(call) => return Ok(call),
+                                    },
                                     Err(error) => return Ok(ToolCall::error(error.to_string())),
                                 }
                             }
                             None => bytes,
                         };
+                        if base64_encoded_len(bytes.len())
+                            .map(|len| len > MAX_PROTOCOL_RESPONSE_BYTES)
+                            .unwrap_or(true)
+                        {
+                            return Ok(ToolCall::cap_error(
+                                "screenshot_base64",
+                                base64_encoded_len(bytes.len()).unwrap_or(usize::MAX),
+                                MAX_PROTOCOL_RESPONSE_BYTES,
+                            ));
+                        }
                         Ok(ToolCall::success(json!({
                             "mime_type": "image/png",
                             "encoding": "base64",
@@ -489,7 +514,7 @@ pub fn handle_post_driverless_with_config(
 
     let reply = handle_driverless_message(&message, handshake_probe_config);
     match reply {
-        Ok(result) => McpHttpResponse::json(200, json_rpc_result(id, result)),
+        Ok(result) => json_rpc_success_response(id, result),
         Err(error) => McpHttpResponse::json(200, json_rpc_error(id, error.code, error.message)),
     }
 }
@@ -636,6 +661,13 @@ impl JsonRpcError {
             message: message.into(),
         }
     }
+
+    fn response_too_large(message: impl Into<String>) -> Self {
+        Self {
+            code: RESPONSE_TOO_LARGE_ERROR_CODE,
+            message: message.into(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -656,6 +688,29 @@ impl ToolCall {
         Self {
             is_error: true,
             structured_content: json!({"error": message.into()}),
+        }
+    }
+
+    fn success_json_bounded(artifact: &'static str, value: Value, max_bytes: usize) -> Self {
+        match serde_json::to_vec(&value) {
+            Ok(bytes) if bytes.len() <= max_bytes => Self::success(value),
+            Ok(bytes) => Self::cap_error(artifact, bytes.len(), max_bytes),
+            Err(error) => Self::error(error.to_string()),
+        }
+    }
+
+    fn cap_error(artifact: &'static str, bytes: usize, max_bytes: usize) -> Self {
+        Self {
+            is_error: true,
+            structured_content: json!({
+                "error": {
+                    "type": "response_too_large",
+                    "artifact": artifact,
+                    "bytes": bytes,
+                    "max_bytes": max_bytes,
+                    "message": output_cap_message(artifact, bytes, max_bytes),
+                }
+            }),
         }
     }
 }
@@ -806,6 +861,21 @@ fn required_input_taint(value: Option<bool>) -> Result<InputTaint, JsonRpcError>
     value
         .map(InputTaint::new)
         .ok_or_else(|| JsonRpcError::invalid_params("input_tainted is required for act tools"))
+}
+
+fn validate_screenshot_bytes(bytes: Vec<u8>) -> Result<Vec<u8>, ToolCall> {
+    if bytes.len() > MAX_SCREENSHOT_BYTES {
+        return Err(ToolCall::cap_error(
+            "screenshot",
+            bytes.len(),
+            MAX_SCREENSHOT_BYTES,
+        ));
+    }
+    Ok(bytes)
+}
+
+fn base64_encoded_len(bytes: usize) -> Option<usize> {
+    bytes.checked_add(2)?.checked_div(3)?.checked_mul(4)
 }
 
 fn enforce_action_policy(
@@ -1034,12 +1104,12 @@ fn driverless_tools_call(
 
     let args: HandshakeArgs = parse_args(arguments)?;
     let probe = run_handshake_probe_blocking(&args, &handshake_probe_config);
-    Ok(tool_call_json(ToolCall::success(handshake_result_json(
+    tool_call_json(ToolCall::success(handshake_result_json(
         &ProbeReport::new(),
         args,
         probe,
         None,
-    ))))
+    )))
 }
 
 /// Build the handshake tool result. `probe` carries the outcome of the live HTTP
@@ -1152,13 +1222,48 @@ fn json_rpc_error(id: Value, code: i64, message: impl Into<String>) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message.into()}})
 }
 
-fn tool_call_json(call: ToolCall) -> Value {
-    let text = call.structured_content.to_string();
-    json!({
+fn json_rpc_success_response(id: Value, result: Value) -> McpHttpResponse {
+    let value = json_rpc_result(id.clone(), result);
+    match json_response_with_cap(200, value, MAX_PROTOCOL_RESPONSE_BYTES) {
+        Ok(response) => response,
+        Err(message) => McpHttpResponse::json(
+            200,
+            json_rpc_error(id, RESPONSE_TOO_LARGE_ERROR_CODE, message),
+        ),
+    }
+}
+
+fn json_response_with_cap(
+    status: u16,
+    value: Value,
+    max_bytes: usize,
+) -> Result<McpHttpResponse, String> {
+    match serde_json::to_vec(&value) {
+        Ok(body) if body.len() <= max_bytes => Ok(McpHttpResponse {
+            status,
+            content_type: "application/json",
+            body,
+        }),
+        Ok(body) => Err(output_cap_message("mcp_response", body.len(), max_bytes)),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn tool_call_json(call: ToolCall) -> Result<Value, JsonRpcError> {
+    let text = serde_json::to_string(&call.structured_content)
+        .map_err(|error| JsonRpcError::response_too_large(error.to_string()))?;
+    if text.len() > MAX_PROTOCOL_RESPONSE_BYTES {
+        return Err(JsonRpcError::response_too_large(output_cap_message(
+            "mcp_tool_content",
+            text.len(),
+            MAX_PROTOCOL_RESPONSE_BYTES,
+        )));
+    }
+    Ok(json!({
         "content": [{"type": "text", "text": text}],
         "structuredContent": call.structured_content,
         "isError": call.is_error,
-    })
+    }))
 }
 
 fn tool_descriptor_json() -> Vec<Value> {
@@ -1557,6 +1662,52 @@ mod tests {
         let marked_bytes = decode_base64_field(&marked, "data")?;
         assert!(marked_bytes.starts_with(PNG_SIGNATURE));
         assert_ne!(marked_bytes, raw_bytes);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn extract_tool_rejects_oversized_json() -> Result<(), String> {
+        let mut server = TempoMcpServer::new(
+            MemoryDriver::new().with_extract(json!({"blob": "x".repeat(MAX_EXTRACT_JSON_BYTES)})),
+        );
+
+        let result =
+            call_tool(&mut server, "extract", json!({"node_id": "button.primary"})).await?;
+        assert_eq!(result["error"]["type"], "response_too_large");
+        assert_eq!(result["error"]["artifact"], "extract_json");
+        assert_eq!(result["error"]["max_bytes"], MAX_EXTRACT_JSON_BYTES);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn screenshot_tool_rejects_oversized_bytes_before_base64() -> Result<(), String> {
+        let mut server =
+            TempoMcpServer::new(
+                MemoryDriver::new().with_screenshot(vec![0_u8; MAX_SCREENSHOT_BYTES + 1]),
+            );
+
+        let result = call_tool(&mut server, "screenshot", json!({})).await?;
+        assert_eq!(result["error"]["type"], "response_too_large");
+        assert_eq!(result["error"]["artifact"], "screenshot");
+        assert_eq!(result["error"]["bytes"], MAX_SCREENSHOT_BYTES + 1);
+        assert_eq!(result["error"]["max_bytes"], MAX_SCREENSHOT_BYTES);
+        Ok(())
+    }
+
+    #[test]
+    fn mcp_json_rpc_response_serialization_is_capped() -> Result<(), String> {
+        let response = json_rpc_success_response(
+            json!(99),
+            json!({"blob": "x".repeat(MAX_PROTOCOL_RESPONSE_BYTES)}),
+        );
+        let value = response.json_value().map_err(|error| error.to_string())?;
+
+        assert_eq!(response.status, 200);
+        assert_eq!(value["error"]["code"], RESPONSE_TOO_LARGE_ERROR_CODE);
+        assert!(value["error"]["message"]
+            .as_str()
+            .ok_or("missing cap message")?
+            .contains("mcp_response exceeded output cap"));
         Ok(())
     }
 
@@ -2181,6 +2332,8 @@ mod tests {
         web_mcp_available: bool,
         web_mcp_has_tools: bool,
         web_mcp_method_only: bool,
+        extract_value: Option<Value>,
+        screenshot_bytes: Option<Vec<u8>>,
         // Shared across forks (fork() clones this handle) so tests can assert that
         // close() actually ran on a forked driver rather than it merely being dropped.
         closed: Arc<AtomicUsize>,
@@ -2193,6 +2346,8 @@ mod tests {
                 web_mcp_available: false,
                 web_mcp_has_tools: false,
                 web_mcp_method_only: false,
+                extract_value: None,
+                screenshot_bytes: None,
                 observation: CompiledObservation {
                     schema_version: tempo_schema::SCHEMA_VERSION.into(),
                     url: "https://example.test/".into(),
@@ -2234,6 +2389,16 @@ mod tests {
             self.web_mcp_available = true;
             self.web_mcp_has_tools = false;
             self.web_mcp_method_only = true;
+            self
+        }
+
+        fn with_extract(mut self, value: Value) -> Self {
+            self.extract_value = Some(value);
+            self
+        }
+
+        fn with_screenshot(mut self, bytes: Vec<u8>) -> Self {
+            self.screenshot_bytes = Some(bytes);
             self
         }
     }
@@ -2292,7 +2457,10 @@ mod tests {
         }
 
         async fn extract(&mut self, node: &NodeId) -> Result<Value, TransportError> {
-            Ok(json!({"node": node.0, "text": "Continue"}))
+            Ok(self
+                .extract_value
+                .clone()
+                .unwrap_or_else(|| json!({"node": node.0, "text": "Continue"})))
         }
 
         async fn evaluate_script(
@@ -2319,7 +2487,10 @@ mod tests {
         }
 
         async fn screenshot(&mut self) -> Result<Vec<u8>, TransportError> {
-            Ok(TEST_SCREENSHOT_PNG.to_vec())
+            Ok(self
+                .screenshot_bytes
+                .clone()
+                .unwrap_or_else(|| TEST_SCREENSHOT_PNG.to_vec()))
         }
 
         async fn close(&mut self) -> Result<(), TransportError> {

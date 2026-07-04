@@ -13,7 +13,7 @@ use chromiumoxide::cdp::browser_protocol::accessibility::{
 use chromiumoxide::cdp::browser_protocol::dom::{
     DescribeNodeParams, GetDocumentParams, NodeId as DomNodeId, QuerySelectorParams,
 };
-use chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotFormat;
+use chromiumoxide::cdp::browser_protocol::page::{CaptureScreenshotFormat, Viewport};
 use chromiumoxide::cdp::js_protocol::runtime::EvaluateParams;
 use chromiumoxide::error::CdpError;
 use chromiumoxide::page::{Page, ScreenshotParams};
@@ -22,6 +22,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
 use tempo_driver::{
     BrowsingContextCreateOptions, DriverTrait, Engine, StepOutcome, TransportError, Unsupported,
+    MAX_SCREENSHOT_BYTES, MAX_SCREENSHOT_HEIGHT, MAX_SCREENSHOT_WIDTH,
 };
 use tempo_net::UrlPolicy;
 use tempo_schema::{
@@ -556,8 +557,15 @@ impl DriverTrait for CdpTempoDriver {
     async fn screenshot(&mut self) -> Result<Vec<u8>, TransportError> {
         let params = ScreenshotParams::builder()
             .format(CaptureScreenshotFormat::Png)
+            .clip(screenshot_viewport_clip()?)
+            .capture_beyond_viewport(false)
             .build();
-        self.page()?.screenshot(params).await.map_err(map_cdp_error)
+        let bytes = self
+            .page()?
+            .screenshot(params)
+            .await
+            .map_err(map_cdp_error)?;
+        validate_screenshot_bytes(bytes)
     }
 
     async fn close(&mut self) -> Result<(), TransportError> {
@@ -570,6 +578,28 @@ impl DriverTrait for CdpTempoDriver {
         self.handler_task.abort();
         Ok(())
     }
+}
+
+fn screenshot_viewport_clip() -> Result<Viewport, TransportError> {
+    Viewport::builder()
+        .x(0.0)
+        .y(0.0)
+        .width(f64::from(MAX_SCREENSHOT_WIDTH))
+        .height(f64::from(MAX_SCREENSHOT_HEIGHT))
+        .scale(1.0)
+        .build()
+        .map_err(TransportError::Other)
+}
+
+fn validate_screenshot_bytes(bytes: Vec<u8>) -> Result<Vec<u8>, TransportError> {
+    if bytes.len() > MAX_SCREENSHOT_BYTES {
+        return Err(TransportError::OutputTooLarge {
+            artifact: "screenshot",
+            bytes: bytes.len(),
+            max_bytes: MAX_SCREENSHOT_BYTES,
+        });
+    }
+    Ok(bytes)
 }
 
 fn map_cdp_error(error: CdpError) -> TransportError {
@@ -1418,6 +1448,39 @@ mod tests {
         assert!(script.contains(&format!("const selector = {encoded};")));
         assert!(script.contains("document.querySelector(selector)"));
         assert!(script.contains("serialize(root, 0)"));
+        Ok(())
+    }
+
+    #[test]
+    fn screenshot_clip_uses_max_dimensions() -> Result<(), Box<dyn std::error::Error>> {
+        let clip = screenshot_viewport_clip()?;
+
+        assert_eq!(clip.x, 0.0);
+        assert_eq!(clip.y, 0.0);
+        assert_eq!(clip.width, f64::from(MAX_SCREENSHOT_WIDTH));
+        assert_eq!(clip.height, f64::from(MAX_SCREENSHOT_HEIGHT));
+        assert_eq!(clip.scale, 1.0);
+        Ok(())
+    }
+
+    #[test]
+    fn screenshot_bytes_are_capped() -> Result<(), Box<dyn std::error::Error>> {
+        let error = validate_screenshot_bytes(vec![0_u8; MAX_SCREENSHOT_BYTES + 1])
+            .err()
+            .ok_or("oversized screenshot unexpectedly succeeded")?;
+
+        match error {
+            TransportError::OutputTooLarge {
+                artifact,
+                bytes,
+                max_bytes,
+            } => {
+                assert_eq!(artifact, "screenshot");
+                assert_eq!(bytes, MAX_SCREENSHOT_BYTES + 1);
+                assert_eq!(max_bytes, MAX_SCREENSHOT_BYTES);
+            }
+            other => return Err(format!("unexpected error: {other}").into()),
+        }
         Ok(())
     }
 

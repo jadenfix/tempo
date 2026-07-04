@@ -16,6 +16,20 @@ use tempo_schema::{Action, ActionBatch, CompiledObservation, NodeId, Observation
 use thiserror::Error;
 
 const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+/// Maximum screenshot capture width in device independent pixels.
+pub const MAX_SCREENSHOT_WIDTH: u32 = 4096;
+/// Maximum screenshot capture height in device independent pixels.
+pub const MAX_SCREENSHOT_HEIGHT: u32 = 4096;
+/// Maximum raw screenshot bytes returned by a driver.
+pub const MAX_SCREENSHOT_BYTES: usize = 2 * 1024 * 1024;
+/// Maximum serialized JSON bytes returned by a typed extract operation.
+pub const MAX_EXTRACT_JSON_BYTES: usize = 1024 * 1024;
+/// Maximum serialized protocol response bytes for MCP/BiDi envelopes.
+pub const MAX_PROTOCOL_RESPONSE_BYTES: usize = 6 * 1024 * 1024;
+
+pub fn output_cap_message(artifact: &str, bytes: usize, max_bytes: usize) -> String {
+    format!("{artifact} exceeded output cap: {bytes} bytes > {max_bytes} bytes")
+}
 
 /// Transport / backend failures: crashed engine, navigation timeout, SSRF block.
 /// Distinct from a step error, which is a *grounding* failure the agent can react to.
@@ -29,6 +43,12 @@ pub enum TransportError {
     UrlBlocked,
     #[error("engine error: {0}")]
     Other(String),
+    #[error("{artifact} exceeded output cap: {bytes} bytes > {max_bytes} bytes")]
+    OutputTooLarge {
+        artifact: &'static str,
+        bytes: usize,
+        max_bytes: usize,
+    },
 }
 
 /// Outcome of an action: either it grounded and produced a diff, or it was a step error
