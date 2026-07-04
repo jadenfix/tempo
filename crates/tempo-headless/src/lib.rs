@@ -28,8 +28,8 @@ use tempo_bidi::{
     NetworkResponse as BidiNetworkResponse, RoutedCommand, ScriptEvaluateResult,
 };
 use tempo_driver::{
-    BrowsingContextCreateOptions, BrowsingContextKind, DriverTrait, Engine, StepOutcome,
-    TransportError, Unsupported,
+    output_cap_message, BrowsingContextCreateOptions, BrowsingContextKind, DriverTrait, Engine,
+    StepOutcome, TransportError, Unsupported, MAX_PROTOCOL_RESPONSE_BYTES, MAX_SCREENSHOT_BYTES,
 };
 use tempo_engine_host::{
     DriverCommand as HostDriverCommand, DriverResponse, DriverWireError, EngineHost,
@@ -1363,7 +1363,7 @@ fn serve_bidi_websocket(
                     route_bidi_websocket(&mut pool, frame.payload)
                 };
                 for message in messages {
-                    let payload = serde_json::to_vec(&message)?;
+                    let payload = bidi_message_payload(&message)?;
                     write_websocket_frame(&mut stream, WS_OPCODE_TEXT, &payload)?;
                 }
             }
@@ -1590,6 +1590,18 @@ fn route_bidi_driver(
             };
             match futures::executor::block_on(driver.screenshot()) {
                 Ok(bytes) => {
+                    if bytes.len() > MAX_SCREENSHOT_BYTES {
+                        let bytes_len = bytes.len();
+                        pool.bidi_contexts.insert(context, driver);
+                        return BidiDispatchResult::new(
+                            200,
+                            BidiMessage::error(
+                                Some(id),
+                                BidiErrorCode::UnknownError,
+                                output_cap_message("screenshot", bytes_len, MAX_SCREENSHOT_BYTES),
+                            ),
+                        );
+                    }
                     pool.bidi_contexts.insert(context, driver);
                     BidiDispatchResult::new(
                         200,
@@ -1871,10 +1883,11 @@ impl BidiDispatchResult {
     }
 
     fn with_events(status: u16, message: BidiMessage, events: Vec<BidiMessage>) -> Self {
+        let (message, response) = capped_bidi_response(status, message);
         Self {
-            response: bidi_response(status, message.clone()),
+            response,
             message,
-            events,
+            events: events.into_iter().map(capped_bidi_message).collect(),
         }
     }
 }
@@ -1890,7 +1903,50 @@ fn screenshot_context(command: &BidiDriverCommand) -> BrowsingContextId {
     }
 }
 
-fn bidi_response(status: u16, message: BidiMessage) -> HttpResponse {
+fn capped_bidi_response(status: u16, message: BidiMessage) -> (BidiMessage, HttpResponse) {
+    match capped_bidi_payload(message) {
+        Ok((message, body)) => (message, HttpResponse::new(status, "application/json", body)),
+        Err(error) => (error.clone(), bidi_response_unchecked(status, error)),
+    }
+}
+
+fn capped_bidi_message(message: BidiMessage) -> BidiMessage {
+    match capped_bidi_payload(message) {
+        Ok((message, _body)) => message,
+        Err(error) => error,
+    }
+}
+
+fn bidi_message_payload(message: &BidiMessage) -> Result<Vec<u8>, TempodError> {
+    let capped = capped_bidi_message(message.clone());
+    serde_json::to_vec(&capped).map_err(Into::into)
+}
+
+fn capped_bidi_payload(message: BidiMessage) -> Result<(BidiMessage, Vec<u8>), BidiMessage> {
+    match serde_json::to_vec(&message) {
+        Ok(body) if body.len() <= MAX_PROTOCOL_RESPONSE_BYTES => Ok((message, body)),
+        Ok(body) => Err(BidiMessage::error(
+            bidi_message_id(&message),
+            BidiErrorCode::UnknownError,
+            output_cap_message("bidi_response", body.len(), MAX_PROTOCOL_RESPONSE_BYTES),
+        )),
+        Err(error) => Err(BidiMessage::error(
+            bidi_message_id(&message),
+            BidiErrorCode::UnknownError,
+            error.to_string(),
+        )),
+    }
+}
+
+fn bidi_message_id(message: &BidiMessage) -> Option<tempo_bidi::CommandId> {
+    match message {
+        BidiMessage::Success { id, .. } => Some(*id),
+        BidiMessage::Error { id, .. } => *id,
+        BidiMessage::Event { .. } => None,
+    }
+}
+
+fn bidi_response_unchecked(status: u16, message: BidiMessage) -> HttpResponse {
     match serde_json::to_vec(&message) {
         Ok(body) => HttpResponse::new(status, "application/json", body),
         Err(error) => HttpResponse::json(
@@ -3331,6 +3387,62 @@ mod tests {
         assert_eq!(value["id"], 8);
         assert_eq!(value["result"]["result"], "Tempo");
         assert_eq!(value["result"]["realm"], "tempo-root");
+        Ok(())
+    }
+
+    #[test]
+    fn bidi_response_serialization_is_capped() -> TestResult {
+        let result = BidiDispatchResult::new(
+            200,
+            BidiMessage::Success {
+                id: 77,
+                result: json!({"blob": "x".repeat(MAX_PROTOCOL_RESPONSE_BYTES)}),
+            },
+        );
+        let value: Value = serde_json::from_slice(&result.response.body)?;
+
+        assert_eq!(value["type"], "error");
+        assert_eq!(value["id"], 77);
+        assert_eq!(value["error"], "unknown error");
+        assert!(value["message"]
+            .as_str()
+            .ok_or("BiDi cap error should include a message")?
+            .contains("bidi_response exceeded output cap"));
+        Ok(())
+    }
+
+    #[test]
+    fn bidi_endpoint_rejects_oversized_screenshot_bytes_before_base64() -> TestResult {
+        let mut pool = SessionPool::default();
+        let handle = attach_driver_handler(&mut pool, |request| {
+            assert_eq!(request.command, HostDriverCommand::Screenshot);
+            DriverResponse::Screenshot {
+                bytes: vec![0_u8; MAX_SCREENSHOT_BYTES + 1],
+            }
+        })?;
+
+        let response = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/bidi".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: br#"{"id":31,"method":"browsingContext.captureScreenshot","params":{"context":"tempo-root"}}"#.to_vec(),
+            },
+        )?;
+        join_driver_handler(handle)?;
+
+        assert_eq!(response.status, 200);
+        let value: Value = serde_json::from_slice(&response.body)?;
+        assert_eq!(value["type"], "error");
+        assert_eq!(value["id"], 31);
+        assert_eq!(value["error"], "unknown error");
+        assert!(value["message"]
+            .as_str()
+            .ok_or("BiDi screenshot cap error should include a message")?
+            .contains("screenshot exceeded output cap"));
         Ok(())
     }
 
