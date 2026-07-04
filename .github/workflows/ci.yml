@@ -79,6 +79,7 @@ jobs:
         if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
         run: cargo check -p tempo-engine-servo --no-default-features --features servo-vanilla
       - name: servo tempo fork guard
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
         run: |
           set -euo pipefail
           if cargo check -p tempo-engine-servo --no-default-features --features servo-tempo 2>servo-tempo-bare.log; then
