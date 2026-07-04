@@ -10,7 +10,10 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use tempo_session::{read_journal_entries, JournalError, JournalEvent};
+use tempo_session::{
+    read_journal_entries_with_retention_policy, DurableRetentionPolicy, JournalEntry, JournalError,
+    JournalEvent,
+};
 use thiserror::Error;
 
 /// Runtime lane used for an eval case.
@@ -300,7 +303,28 @@ pub fn eval_record_from_session_journal(
     journal_path: impl AsRef<Path>,
     descriptor: SessionEvalDescriptor,
 ) -> Result<EvalRecord, EvalError> {
-    let entries = read_journal_entries(journal_path)?;
+    eval_record_from_session_journal_with_retention_policy(
+        journal_path,
+        descriptor,
+        &DurableRetentionPolicy::PlaintextUnsafe,
+    )
+}
+
+/// Convert a real session journal into one eval record using the caller's durable
+/// retention policy.
+pub fn eval_record_from_session_journal_with_retention_policy(
+    journal_path: impl AsRef<Path>,
+    descriptor: SessionEvalDescriptor,
+    retention_policy: &DurableRetentionPolicy,
+) -> Result<EvalRecord, EvalError> {
+    let entries = read_journal_entries_with_retention_policy(journal_path, retention_policy)?;
+    eval_record_from_journal_entries(&entries, descriptor)
+}
+
+fn eval_record_from_journal_entries(
+    entries: &[JournalEntry],
+    descriptor: SessionEvalDescriptor,
+) -> Result<EvalRecord, EvalError> {
     let mut observation_bytes = Vec::new();
     let mut observation_tokens = Vec::new();
     let mut observe_latencies = Vec::new();
@@ -311,7 +335,7 @@ pub fn eval_record_from_session_journal(
     let mut last_action_start_ms = None;
     let mut end_ms = None;
 
-    for entry in &entries {
+    for entry in entries {
         end_ms = Some(entry.timestamp_ms);
         match &entry.event {
             JournalEvent::SessionStarted { .. } => {
@@ -690,7 +714,9 @@ mod tests {
         Action, CompiledObservation, InteractiveElement, NodeId, ObservationDiff, Provenance,
         TaintSpan,
     };
-    use tempo_session::{RunId, SessionId, SessionJournal};
+    use tempo_session::{
+        DurableEncryptionKey, DurableRetentionPolicy, RunId, SessionId, SessionJournal,
+    };
 
     type TestResult = Result<(), Box<dyn Error>>;
 
@@ -1045,6 +1071,65 @@ mod tests {
         assert_eq!(record.lane, Lane::Servo);
         assert!(record.max_observation_bytes > 0);
         assert!(record.max_observation_tokens > 0);
+        assert_eq!(record.step_count, 1);
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn session_journal_adapter_reads_encrypted_journal() -> TestResult {
+        let root = unique_dir("encrypted-journal")?;
+        remove_dir_if_exists(&root)?;
+        fs::create_dir_all(&root)?;
+        let journal_path = root.join("session.jsonl");
+        let policy = DurableRetentionPolicy::encrypted(DurableEncryptionKey::from_bytes([31; 32]));
+        let mut journal = SessionJournal::open_with_retention_policy(
+            &journal_path,
+            RunId("run".into()),
+            SessionId("session".into()),
+            policy.clone(),
+        )?;
+        journal.append(JournalEvent::SessionStarted {
+            url: "https://journal.test".into(),
+        })?;
+        journal.append(JournalEvent::Observation {
+            observation: observation(),
+        })?;
+        let action = Action::Click {
+            node: NodeId("submit".into()),
+        };
+        journal.append(JournalEvent::ActionPlanned {
+            action: action.clone(),
+        })?;
+        journal.append(JournalEvent::StepApplied {
+            action,
+            diff: ObservationDiff {
+                since_seq: 1,
+                seq: 2,
+                added: vec![],
+                removed: vec![],
+                changed: vec![],
+            },
+        })?;
+        drop(journal);
+
+        let record = eval_record_from_session_journal_with_retention_policy(
+            &journal_path,
+            SessionEvalDescriptor {
+                suite: "journal-suite".into(),
+                case_id: "case-1".into(),
+                origin: "https://journal.test".into(),
+                lane: Lane::Servo,
+                success: true,
+                fallback_used: false,
+                baseline_wall_clock_ms: Some(200),
+                unconfirmed_high_risk_actions: 0,
+            },
+            &policy,
+        )?;
+
+        assert_eq!(record.suite, "journal-suite");
         assert_eq!(record.step_count, 1);
 
         remove_dir_if_exists(&root)?;

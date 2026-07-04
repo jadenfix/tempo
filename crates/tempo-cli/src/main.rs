@@ -23,15 +23,16 @@ use tempo_compat::{
 use tempo_driver::{DriverTrait, TransportError};
 use tempo_engine_cdp::{CdpConfig, CdpTempoDriver};
 use tempo_evals::{
-    eval_record_from_session_journal, read_eval_records, write_scorecard, EvalBudget, EvalError,
-    Lane, Scorecard, SessionEvalDescriptor,
+    eval_record_from_session_journal_with_retention_policy, read_eval_records, write_scorecard,
+    EvalBudget, EvalError, Lane, Scorecard, SessionEvalDescriptor,
 };
 use tempo_observe::{
     observation_corpus_report, CompileOptions, ObservationCorpusReport, ObservationInput,
 };
 use tempo_schema::Action;
 use tempo_session::{
-    read_journal_entries, DurableRetentionPolicy, JournalEntry, JournalError, JournalEvent,
+    durable_retention_policy_from_env, read_journal_entries_with_retention_policy,
+    DurableRetentionPolicy, JournalEntry, JournalError, JournalEvent,
 };
 use tempo_taint::{run_taint_gate, TaintRedTeamCase};
 use thiserror::Error;
@@ -79,6 +80,19 @@ where
     S: Into<String>,
 {
     Command::parse(args)?.execute(stdout)
+}
+
+#[cfg(test)]
+fn run_with_writer_with_retention_policy<I, S>(
+    args: I,
+    stdout: &mut dyn Write,
+    retention_policy: DurableRetentionPolicy,
+) -> Result<(), CliError>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    Command::parse(args)?.execute_with_retention_policy(stdout, Some(retention_policy))
 }
 
 #[derive(Debug, PartialEq)]
@@ -162,6 +176,14 @@ impl Command {
     }
 
     fn execute(self, stdout: &mut dyn Write) -> Result<(), CliError> {
+        self.execute_with_retention_policy(stdout, None)
+    }
+
+    fn execute_with_retention_policy(
+        self,
+        stdout: &mut dyn Write,
+        retention_policy: Option<DurableRetentionPolicy>,
+    ) -> Result<(), CliError> {
         match self {
             Self::Help => {
                 stdout.write_all(USAGE.as_bytes())?;
@@ -195,7 +217,12 @@ impl Command {
                 descriptor,
                 output,
             } => {
-                let record = eval_record_from_session_journal(journal, descriptor)?;
+                let retention_policy = retention_policy_from_cli_or_env(retention_policy)?;
+                let record = eval_record_from_session_journal_with_retention_policy(
+                    journal,
+                    descriptor,
+                    &retention_policy,
+                )?;
                 write_json(&output, &record, stdout)
             }
             Self::CompatLanes {
@@ -260,7 +287,9 @@ impl Command {
                 }
             }
             Self::Replay { journal, output } => {
-                let entries = read_journal_entries(&journal)?;
+                let retention_policy = retention_policy_from_cli_or_env(retention_policy)?;
+                let entries =
+                    read_journal_entries_with_retention_policy(&journal, &retention_policy)?;
                 let summary = ReplaySummary::from_entries(&journal, &entries)?;
                 write_json(&output, &summary, stdout)
             }
@@ -286,11 +315,20 @@ impl Command {
                     allow_private_network,
                     confirmation_mode,
                     structured_fast_path: StructuredFastPath::live(),
-                    retention_policy: None,
+                    retention_policy,
                 })?;
                 write_json(&output, &report, stdout)
             }
         }
+    }
+}
+
+fn retention_policy_from_cli_or_env(
+    retention_policy: Option<DurableRetentionPolicy>,
+) -> Result<DurableRetentionPolicy, JournalError> {
+    match retention_policy {
+        Some(retention_policy) => Ok(retention_policy),
+        None => durable_retention_policy_from_env(),
     }
 }
 
@@ -1194,7 +1232,7 @@ mod tests {
         Action, CompiledObservation, InteractiveElement, NodeId, ObservationDiff, Provenance,
         SideEffect, TaintSpan, SCHEMA_VERSION,
     };
-    use tempo_session::{RunId, SessionId, SessionJournal};
+    use tempo_session::{DurableEncryptionKey, RunId, SessionId, SessionJournal};
 
     type TestResult = Result<(), Box<dyn Error>>;
 
@@ -1575,7 +1613,7 @@ mod tests {
         write_journal(&journal)?;
         let mut stdout = Vec::new();
 
-        run_with_writer(
+        run_with_writer_with_retention_policy(
             [
                 "session-eval".to_string(),
                 "--journal".into(),
@@ -1596,6 +1634,7 @@ mod tests {
                 input_string(&output),
             ],
             &mut stdout,
+            DurableRetentionPolicy::PlaintextUnsafe,
         )?;
 
         let record: tempo_evals::EvalRecord = serde_json::from_reader(File::open(&output)?)?;
@@ -1607,19 +1646,60 @@ mod tests {
     }
 
     #[test]
+    fn session_eval_command_reads_encrypted_journal() -> TestResult {
+        let dir = unique_dir("session-eval-encrypted")?;
+        let journal = dir.join("session.jsonl");
+        let output = dir.join("record.json");
+        let policy = encrypted_test_policy(32);
+        write_journal_with_retention_policy(&journal, policy.clone())?;
+        let mut stdout = Vec::new();
+
+        run_with_writer_with_retention_policy(
+            [
+                "session-eval".to_string(),
+                "--journal".into(),
+                input_string(&journal),
+                "--suite".into(),
+                "journal".into(),
+                "--case-id".into(),
+                "case-a".into(),
+                "--origin".into(),
+                "https://session.test".into(),
+                "--lane".into(),
+                "servo".into(),
+                "--success".into(),
+                "true".into(),
+                "--fallback-used".into(),
+                "false".into(),
+                "--output".into(),
+                input_string(&output),
+            ],
+            &mut stdout,
+            policy,
+        )?;
+
+        let record: tempo_evals::EvalRecord = serde_json::from_reader(File::open(&output)?)?;
+        assert_eq!(record.suite, "journal");
+        assert_eq!(record.step_count, 1);
+        remove_dir(&dir)?;
+        Ok(())
+    }
+
+    #[test]
     fn replay_command_summarizes_journal_events() -> TestResult {
         let dir = unique_dir("replay")?;
         let journal = dir.join("session.jsonl");
         write_journal(&journal)?;
         let mut stdout = Vec::new();
 
-        run_with_writer(
+        run_with_writer_with_retention_policy(
             [
                 "replay".to_string(),
                 "--journal".into(),
                 input_string(&journal),
             ],
             &mut stdout,
+            DurableRetentionPolicy::PlaintextUnsafe,
         )?;
 
         let value: Value = serde_json::from_slice(&stdout)?;
@@ -1643,6 +1723,32 @@ mod tests {
     }
 
     #[test]
+    fn replay_command_reads_encrypted_journal() -> TestResult {
+        let dir = unique_dir("replay-encrypted")?;
+        let journal = dir.join("session.jsonl");
+        let policy = encrypted_test_policy(33);
+        write_journal_with_retention_policy(&journal, policy.clone())?;
+        let mut stdout = Vec::new();
+
+        run_with_writer_with_retention_policy(
+            [
+                "replay".to_string(),
+                "--journal".into(),
+                input_string(&journal),
+            ],
+            &mut stdout,
+            policy,
+        )?;
+
+        let value: Value = serde_json::from_slice(&stdout)?;
+        assert_eq!(value["entries"], 5);
+        assert_eq!(value["session_started"], true);
+        assert_eq!(value["applied_steps"], 1);
+        remove_dir(&dir)?;
+        Ok(())
+    }
+
+    #[test]
     fn replay_command_reports_pending_planned_step() -> TestResult {
         let dir = unique_dir("replay-pending")?;
         let journal = dir.join("session.jsonl");
@@ -1657,13 +1763,14 @@ mod tests {
         drop(session);
         let mut stdout = Vec::new();
 
-        run_with_writer(
+        run_with_writer_with_retention_policy(
             [
                 "replay".to_string(),
                 "--journal".into(),
                 input_string(&journal),
             ],
             &mut stdout,
+            DurableRetentionPolicy::PlaintextUnsafe,
         )?;
 
         let value: Value = serde_json::from_slice(&stdout)?;
@@ -1910,8 +2017,19 @@ mod tests {
     }
 
     fn write_journal(path: &Path) -> TestResult {
-        let mut journal =
-            SessionJournal::open(path, RunId("run-a".into()), SessionId("session-a".into()))?;
+        write_journal_with_retention_policy(path, DurableRetentionPolicy::PlaintextUnsafe)
+    }
+
+    fn write_journal_with_retention_policy(
+        path: &Path,
+        retention_policy: DurableRetentionPolicy,
+    ) -> TestResult {
+        let mut journal = SessionJournal::open_with_retention_policy(
+            path,
+            RunId("run-a".into()),
+            SessionId("session-a".into()),
+            retention_policy,
+        )?;
         let action = Action::Scroll { x: 0.0, y: 10.0 };
         journal.append(JournalEvent::SessionStarted {
             url: "https://session.test".into(),
@@ -1934,6 +2052,10 @@ mod tests {
         })?;
         journal.append(JournalEvent::SessionClosed)?;
         Ok(())
+    }
+
+    fn encrypted_test_policy(seed: u8) -> DurableRetentionPolicy {
+        DurableRetentionPolicy::encrypted(DurableEncryptionKey::from_bytes([seed; 32]))
     }
 
     fn observation(seq: u64) -> CompiledObservation {
