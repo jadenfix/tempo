@@ -56,10 +56,15 @@ pub struct InteractiveElement {
     /// Accessible name / label, taint-labeled.
     pub name: Vec<TaintSpan>,
     /// Current value where applicable (inputs, selects), taint-labeled.
-    #[serde(default)]
+    ///
+    /// Omitted from the wire when empty (the common case — most elements have no
+    /// value); `#[serde(default)]` reconstructs the empty vec on read. The field
+    /// is already non-`required` in the published JSON Schema, so this is a
+    /// pure byte-size reduction, not a contract change (see the schema below).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub value: Vec<TaintSpan>,
-    /// Bounding box in CSS pixels: [x, y, w, h].
-    #[serde(default)]
+    /// Bounding box in CSS pixels: [x, y, w, h]. Omitted when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bounds: Option<[f32; 4]>,
     /// Ranker score — higher means more likely to be task-relevant.
     pub rank: f32,
@@ -75,7 +80,8 @@ pub struct CompiledObservation {
     pub seq: u64,
     pub elements: Vec<InteractiveElement>,
     /// Optional set-of-marks overlay: NodeId -> mark label drawn over the screenshot.
-    #[serde(default)]
+    /// Omitted from the wire when empty; already non-`required` in the JSON Schema.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub marks: Vec<(NodeId, u32)>,
 }
 
@@ -207,7 +213,7 @@ pub enum StepStatus {
 /// Grounding evidence for a semantic action.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Grounding {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node: Option<NodeId>,
     pub selector_existed: bool,
     pub matched_element: bool,
@@ -217,11 +223,11 @@ pub struct Grounding {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ActionOutcome {
     pub status: StepStatus,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     pub grounding: Grounding,
     pub observation: CompiledObservation,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diff: Option<ObservationDiff>,
 }
 
@@ -230,7 +236,7 @@ pub struct ActionOutcome {
 pub struct StepTriple {
     pub seq: u64,
     pub observation_before: CompiledObservation,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decision: Option<Value>,
     pub action: Action,
     pub outcome: ActionOutcome,

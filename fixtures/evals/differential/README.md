@@ -153,8 +153,14 @@ smaller — it is modestly heavier** than both baselines:
 
 | page          | tempo (bytes/tokens) | playwright-mcp | browser-use |
 |---------------|----------------------|----------------|-------------|
-| page1-checkout| 813 / 204            | 704 / 176      | 587 / 147   |
-| page2-search  | 1280 / 320           | 1246 / 312     | 926 / 232   |
+| page1-checkout| 780 / 195            | 704 / 176      | 587 / 147   |
+| page2-search  | 1236 / 309           | 1246 / 312     | 926 / 232   |
+
+(tempo shrank from 813/1280 after `InteractiveElement.value`, `bounds`, and
+`CompiledObservation.marks` gained `skip_serializing_if` — empty/absent fields
+are no longer emitted. It remains modestly heavier than browser-use here; the
+larger per-element premium is `node_id` + provenance + `rank` + `bounds`, which
+a lean LLM-only projection would strip — see #446/#459.)
 
 Why: each tempo element carries stable-handle (`node_id`), taint-provenance,
 `rank`, and `bounds` metadata that a plain aria-YAML line or a bracket-line does
