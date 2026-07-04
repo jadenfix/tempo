@@ -59,6 +59,7 @@ Trust boundaries & security:
 - [ ] Untrusted data is size-checked, provenance-tracked, and cannot cause side effects or leak secret headers; a policy (URL, egress, redaction) is enforced across the whole path — redirects, retries, interception — not just the entrypoint.
 - [ ] Untrusted descriptors and attestations (OpenAPI/WebMCP catalogs, handshake evidence) are origin-bound and cannot themselves drive side effects or inject secret headers.
 - [ ] Tests and docs that verify redaction do not commit realistic secret, token, password, API-key, or credential literals. Use scanner-safe inert fragments while still proving the sensitive value never appears in debug/display/error/export output.
+- [ ] Secret-bearing clients parse and validate configured base URLs before constructing requests: reject userinfo/query/fragment/path injection, require a pinned secure production origin, and make loopback/insecure fixtures use an explicitly named test opt-in.
 - [ ] A detector or guard runs on data that actually reaches it: check that upstream filtering/compilation didn't strip the very signal the check needs.
 
 Performance on hot paths (a regression here is a correctness bug for this project):
