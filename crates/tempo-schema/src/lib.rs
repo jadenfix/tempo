@@ -17,7 +17,7 @@ pub const SCHEMA_VERSION: &str = "2.0.0";
 ///
 /// Grounding contract: an action planned against a `NodeId` in observation N must still
 /// resolve at execution; a miss is a *step error*, never a transport error.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct NodeId(pub String);
 
 /// Provenance of a span of observed text. The core of the trust boundary (final.md §2.7):

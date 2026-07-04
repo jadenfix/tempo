@@ -357,6 +357,18 @@ impl StableIdMapper {
         Self::default()
     }
 
+    /// Map a full raw snapshot to stable NodeIds while advancing the mapper's
+    /// generation and applying bounded-retention cleanup.
+    pub fn map_snapshot(&mut self, seq: u64, raw_elements: &[RawElement]) -> Vec<NodeId> {
+        self.begin_snapshot(seq);
+        let node_ids = raw_elements
+            .iter()
+            .map(|raw| self.node_id_for(raw))
+            .collect();
+        self.evict_stale();
+        node_ids
+    }
+
     /// Begin a new snapshot generation. Resets the per-snapshot occurrence
     /// counters used to disambiguate colliding fingerprints.
     fn begin_snapshot(&mut self, seq: u64) {
