@@ -12,6 +12,10 @@ use std::time::Duration;
 use tempo_headless::{TempodSession, TempodSessionEvent, TempodSessionId};
 use thiserror::Error;
 
+pub mod ui;
+#[cfg(feature = "window")]
+pub mod window;
+
 pub const DEFAULT_TEMPOD_ADDR: &str = "127.0.0.1:8787";
 pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 // Mirrors tempo-engine-host::MAX_SCREENSHOT_BYTES without depending on that crate
@@ -685,7 +689,7 @@ fn safe_path_segment(segment: &str) -> Result<&str, ShellError> {
     }
 }
 
-fn validate_auth_token(token: &str) -> Result<(), ShellError> {
+pub(crate) fn validate_auth_token(token: &str) -> Result<(), ShellError> {
     if token.is_empty() {
         return Err(ShellError::Usage("auth token is required".into()));
     }

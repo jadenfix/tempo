@@ -9,6 +9,19 @@ license.workspace = true
 name = "tempo"
 path = "src/main.rs"
 
+# The GUI binary only builds when the `window` feature is on, so the default
+# `cargo build/check --workspace` (and CI's display-less `check` job) skip it.
+[[bin]]
+name = "tempo-window"
+path = "src/bin/tempo-window.rs"
+required-features = ["window"]
+
+[features]
+# First GUI stack in this crate: `eframe` bundles winit + egui + a glow (GL)
+# backend. OFF by default so headless CI never compiles it (no display / GL
+# system libs on the `check` runner). Build the window with `--features window`.
+window = ["dep:eframe"]
+
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -17,6 +30,14 @@ tempo-driver = { path = "../tempo-driver" }
 tempo-headless = { path = "../tempo-headless" }
 tempo-mcp = { path = "../tempo-mcp" }
 thiserror = { workspace = true }
+# winit + egui + glow, one dependency. default-features off trims accesskit and
+# web-only bits; wayland/x11 are Linux-only (cfg-gated, inert elsewhere).
+eframe = { version = "0.35", optional = true, default-features = false, features = [
+    "default_fonts",
+    "glow",
+    "wayland",
+    "x11",
+] }
 
 [dev-dependencies]
 futures = "0.3"
