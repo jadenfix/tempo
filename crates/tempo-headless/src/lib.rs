@@ -1764,7 +1764,7 @@ fn serve_one_trusted(
     handle_connection(stream, &pool, &auth, &limiter, http_permit)
 }
 
-/// Apply per-connection socket timeouts, then handle the connection. Timeouts
+/// Apply per-connection socket options, then handle the connection. Timeouts
 /// bound how long a stalled client can occupy a handler thread (slowloris).
 fn handle_connection(
     stream: TcpStream,
@@ -1773,16 +1773,20 @@ fn handle_connection(
     limiter: &ConnectionLimiter,
     http_permit: ConnectionPermit,
 ) -> Result<(), TempodError> {
-    apply_socket_timeouts(&stream)?;
+    apply_socket_options(&stream)?;
     handle_stream(stream, pool, auth, limiter, http_permit)
 }
 
-/// Apply read and write timeouts to an accepted connection. A stalled client
-/// (slowloris) is aborted after `SOCKET_TIMEOUT` instead of occupying a handler
-/// thread forever.
-fn apply_socket_timeouts(stream: &TcpStream) -> Result<(), TempodError> {
+/// Apply read/write timeouts and disable Nagle on an accepted connection. A
+/// stalled client (slowloris) is aborted after `SOCKET_TIMEOUT` instead of
+/// occupying a handler thread forever. TCP_NODELAY matters because this is a
+/// request/response control plane: with Nagle on, a small response or BiDi
+/// event written after another small write can sit in the kernel until the
+/// peer's delayed ACK (tens of milliseconds) instead of going out immediately.
+fn apply_socket_options(stream: &TcpStream) -> Result<(), TempodError> {
     stream.set_read_timeout(Some(SOCKET_TIMEOUT))?;
     stream.set_write_timeout(Some(SOCKET_TIMEOUT))?;
+    stream.set_nodelay(true)?;
     Ok(())
 }
 
@@ -2329,24 +2333,38 @@ fn write_websocket_frame(
     opcode: u8,
     payload: &[u8],
 ) -> Result<(), TempodError> {
-    let mut header = vec![0x80 | (opcode & 0x0f)];
-    if payload.len() < 126 {
-        let len = u8::try_from(payload.len())
-            .map_err(|err| TempodError::BadRequest(format!("invalid websocket length: {err}")))?;
-        header.push(len);
-    } else if u16::try_from(payload.len()).is_ok() {
-        let len = u16::try_from(payload.len())
-            .map_err(|err| TempodError::BadRequest(format!("invalid websocket length: {err}")))?;
-        header.push(126);
-        header.extend_from_slice(&len.to_be_bytes());
+    // Server-to-client frame header is at most 10 bytes (no mask): build it on
+    // the stack instead of allocating a Vec per frame.
+    let mut header = [0_u8; 10];
+    header[0] = 0x80 | (opcode & 0x0f);
+    let header_len = if payload.len() < 126 {
+        header[1] = payload.len() as u8;
+        2
+    } else if let Ok(len) = u16::try_from(payload.len()) {
+        header[1] = 126;
+        header[2..4].copy_from_slice(&len.to_be_bytes());
+        4
     } else {
         let len = u64::try_from(payload.len())
             .map_err(|err| TempodError::BadRequest(format!("invalid websocket length: {err}")))?;
-        header.push(127);
-        header.extend_from_slice(&len.to_be_bytes());
+        header[1] = 127;
+        header[2..10].copy_from_slice(&len.to_be_bytes());
+        10
+    };
+
+    // Small frames (the common case: BiDi responses/events, pings) go out in
+    // one write syscall and one TCP segment. Large payloads keep two writes
+    // rather than paying a multi-hundred-KB copy to save one syscall.
+    const INLINE_COPY_LIMIT: usize = 8 * 1024;
+    if payload.len() <= INLINE_COPY_LIMIT {
+        let mut frame = Vec::with_capacity(header_len + payload.len());
+        frame.extend_from_slice(&header[..header_len]);
+        frame.extend_from_slice(payload);
+        stream.write_all(&frame)?;
+    } else {
+        stream.write_all(&header[..header_len])?;
+        stream.write_all(payload)?;
     }
-    stream.write_all(&header)?;
-    stream.write_all(payload)?;
     stream.flush()?;
     Ok(())
 }
@@ -7374,18 +7392,20 @@ mod tests {
     // ---- Issue #86: read timeout is applied per connection ----
 
     #[test]
-    fn apply_socket_timeouts_sets_read_and_write_deadlines() -> TestResult {
+    fn apply_socket_options_sets_deadlines_and_nodelay() -> TestResult {
         // Real 30s slowloris timeouts are impractical to exercise in a unit test,
-        // so verify deterministically that the helper installs both deadlines on
-        // the accepted socket; serve_forever/serve_one call it per connection.
+        // so verify deterministically that the helper installs both deadlines and
+        // TCP_NODELAY on the accepted socket; serve_forever/serve_one call it per
+        // connection.
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let addr = listener.local_addr()?;
         let client = TcpStream::connect(addr)?;
         let (server, _addr) = listener.accept()?;
 
-        apply_socket_timeouts(&server)?;
+        apply_socket_options(&server)?;
         assert_eq!(server.read_timeout()?, Some(SOCKET_TIMEOUT));
         assert_eq!(server.write_timeout()?, Some(SOCKET_TIMEOUT));
+        assert!(server.nodelay()?);
         drop(client);
         Ok(())
     }

@@ -283,21 +283,66 @@ impl WireFrame {
 
 /// Serialize a frame as `[u32 big-endian byte length][JSON bytes]`.
 pub fn write_frame(writer: &mut impl Write, frame: &WireFrame) -> Result<(), EngineHostError> {
-    let bytes = serde_json::to_vec(frame)?;
-    if bytes.len() > MAX_FRAME_BYTES as usize {
+    write_frame_serializable(writer, frame, &mut Vec::with_capacity(256))
+}
+
+/// [`write_frame`] with a caller-owned scratch buffer: long-lived connections
+/// reuse one allocation across frames instead of allocating per message.
+pub fn write_frame_with(
+    writer: &mut impl Write,
+    frame: &WireFrame,
+    scratch: &mut Vec<u8>,
+) -> Result<(), EngineHostError> {
+    write_frame_serializable(writer, frame, scratch)
+}
+
+/// Core frame writer: serialize after a 4-byte length placeholder and emit the
+/// whole frame in a single `write_all`. One syscall per frame instead of two —
+/// on a Unix socket the length prefix and payload land in one `write(2)`.
+fn write_frame_serializable<T: Serialize>(
+    writer: &mut impl Write,
+    frame: &T,
+    scratch: &mut Vec<u8>,
+) -> Result<(), EngineHostError> {
+    scratch.clear();
+    scratch.extend_from_slice(&[0_u8; 4]);
+    serde_json::to_writer(&mut *scratch, frame)?;
+    let len = scratch.len() - 4;
+    if len > MAX_FRAME_BYTES as usize {
         return Err(EngineHostError::FrameTooLarge {
-            len: bytes.len(),
+            len,
             max: MAX_FRAME_BYTES as usize,
         });
     }
-    writer.write_all(&(bytes.len() as u32).to_be_bytes())?;
-    writer.write_all(&bytes)?;
+    let prefix = (len as u32).to_be_bytes();
+    scratch[..4].copy_from_slice(&prefix);
+    writer.write_all(scratch)?;
     writer.flush()?;
     Ok(())
 }
 
+/// Borrowed frame used by request paths to serialize typed payloads directly,
+/// skipping the intermediate `serde_json::Value` tree the owned [`WireFrame`]
+/// forces. Field names and order match [`WireFrame`] exactly.
+#[derive(Serialize)]
+struct WireFrameRef<'a, T: Serialize> {
+    id: u64,
+    method: &'a str,
+    payload: &'a T,
+}
+
 /// Read one length-prefixed JSON frame.
 pub fn read_frame(reader: &mut impl Read) -> Result<WireFrame, EngineHostError> {
+    read_frame_with(reader, &mut Vec::new())
+}
+
+/// [`read_frame`] with a caller-owned scratch buffer. The buffer's capacity is
+/// bounded by [`MAX_FRAME_BYTES`], so a long-lived connection holds at most one
+/// frame-sized allocation instead of allocating per message.
+pub fn read_frame_with(
+    reader: &mut impl Read,
+    scratch: &mut Vec<u8>,
+) -> Result<WireFrame, EngineHostError> {
     let mut len = [0_u8; 4];
     reader.read_exact(&mut len)?;
     let len = u32::from_be_bytes(len) as usize;
@@ -307,9 +352,10 @@ pub fn read_frame(reader: &mut impl Read) -> Result<WireFrame, EngineHostError> 
             max: MAX_FRAME_BYTES as usize,
         });
     }
-    let mut bytes = vec![0_u8; len];
-    reader.read_exact(&mut bytes)?;
-    Ok(serde_json::from_slice(&bytes)?)
+    scratch.clear();
+    scratch.resize(len, 0);
+    reader.read_exact(scratch)?;
+    Ok(serde_json::from_slice(scratch)?)
 }
 
 /// Driver command payload carried inside a `driver.request` frame.
@@ -514,9 +560,14 @@ impl Drop for EngineIpcServer {
 }
 
 /// Client used by an engine process to send driver requests over the host UDS.
+///
+/// Owns reusable read/write scratch buffers (bounded by [`MAX_FRAME_BYTES`]),
+/// so steady-state requests allocate nothing for framing.
 pub struct EngineIpcClient {
     stream: UnixStream,
     next_id: u64,
+    write_scratch: Vec<u8>,
+    read_scratch: Vec<u8>,
 }
 
 impl EngineIpcClient {
@@ -530,25 +581,31 @@ impl EngineIpcClient {
         path: impl AsRef<Path>,
         token: &str,
     ) -> Result<Self, EngineHostError> {
-        let mut client = Self {
-            stream: UnixStream::connect(path)?,
-            next_id: 1,
-        };
+        let mut client = Self::from_stream(UnixStream::connect(path)?);
         client.authenticate(token)?;
         Ok(client)
     }
 
     pub fn from_stream(stream: UnixStream) -> Self {
-        Self { stream, next_id: 1 }
+        Self {
+            stream,
+            next_id: 1,
+            write_scratch: Vec::new(),
+            read_scratch: Vec::new(),
+        }
     }
 
     pub fn authenticate(&mut self, token: &str) -> Result<(), EngineHostError> {
-        let payload = serde_json::to_value(AuthPayload {
-            token: token.to_string(),
-        })?;
-        write_frame(
+        write_frame_serializable(
             &mut self.stream,
-            &WireFrame::new(0, DRIVER_AUTH_METHOD, payload),
+            &WireFrameRef {
+                id: 0,
+                method: DRIVER_AUTH_METHOD,
+                payload: &AuthPayload {
+                    token: token.to_string(),
+                },
+            },
+            &mut self.write_scratch,
         )
     }
 
@@ -566,16 +623,27 @@ impl EngineIpcClient {
             .next_id
             .checked_add(1)
             .ok_or(EngineHostError::RequestIdExhausted)?;
-        let payload = serde_json::to_value(DriverRequestPayload {
+        // Serialize the typed payload straight into the frame buffer: the old
+        // path built a serde_json::Value tree of the whole command first.
+        let payload = DriverRequestPayload {
             driver_id: driver_id.map(str::to_string),
             command,
-        })?;
-        write_frame(
+        };
+        write_frame_serializable(
             &mut self.stream,
-            &WireFrame::new(id, DRIVER_REQUEST_METHOD, payload),
+            &WireFrameRef {
+                id,
+                method: DRIVER_REQUEST_METHOD,
+                payload: &payload,
+            },
+            &mut self.write_scratch,
         )?;
 
-        let response = read_expected_frame(&mut self.stream, DRIVER_RESPONSE_METHOD)?;
+        let response = read_expected_frame_with(
+            &mut self.stream,
+            DRIVER_RESPONSE_METHOD,
+            &mut self.read_scratch,
+        )?;
         if response.id != id {
             return Err(EngineHostError::ResponseIdMismatch {
                 expected: id,
@@ -1218,17 +1286,6 @@ fn read_chunked_screenshot_response(
     }
 }
 
-fn write_driver_response_payload(
-    writer: &mut impl Write,
-    request_id: u64,
-    payload: Value,
-) -> Result<(), EngineHostError> {
-    write_frame(
-        writer,
-        &WireFrame::new(request_id, DRIVER_RESPONSE_METHOD, payload),
-    )
-}
-
 fn write_screenshot_response(
     writer: &mut impl Write,
     request_id: u64,
@@ -1245,22 +1302,44 @@ fn write_screenshot_response(
     write_screenshot_chunks(writer, request_id, &bytes)
 }
 
+/// Borrowed twin of [`ScreenshotChunkPayload`]: identical JSON output without
+/// copying each chunk out of the screenshot buffer first (the old `to_vec()`
+/// doubled memory traffic for multi-megabyte screenshots).
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum ScreenshotChunkRef<'a> {
+    ScreenshotChunk {
+        chunk_index: u64,
+        final_chunk: bool,
+        #[serde(with = "base64_bytes")]
+        bytes: &'a [u8],
+    },
+}
+
 fn write_screenshot_chunks(
     writer: &mut impl Write,
     request_id: u64,
     bytes: &[u8],
 ) -> Result<(), EngineHostError> {
     let chunk_size = max_screenshot_chunk_bytes();
+    let mut scratch = Vec::new();
     for (chunk_index, chunk) in bytes.chunks(chunk_size).enumerate() {
         let chunk_index = u64::try_from(chunk_index)
             .map_err(|_| EngineHostError::ScreenshotChunkIndexExhausted)?;
         let final_chunk = (chunk_index as usize + 1) * chunk_size >= bytes.len();
-        let payload = serde_json::to_value(ScreenshotChunkPayload::ScreenshotChunk {
-            chunk_index,
-            final_chunk,
-            bytes: chunk.to_vec(),
-        })?;
-        write_driver_response_payload(writer, request_id, payload)?;
+        write_frame_serializable(
+            writer,
+            &WireFrameRef {
+                id: request_id,
+                method: DRIVER_RESPONSE_METHOD,
+                payload: &ScreenshotChunkRef::ScreenshotChunk {
+                    chunk_index,
+                    final_chunk,
+                    bytes: chunk,
+                },
+            },
+            &mut scratch,
+        )?;
     }
     Ok(())
 }
@@ -1306,7 +1385,15 @@ fn read_expected_frame(
     reader: &mut impl Read,
     expected_method: &'static str,
 ) -> Result<WireFrame, EngineHostError> {
-    let frame = read_frame(reader)?;
+    read_expected_frame_with(reader, expected_method, &mut Vec::new())
+}
+
+fn read_expected_frame_with(
+    reader: &mut impl Read,
+    expected_method: &'static str,
+    scratch: &mut Vec<u8>,
+) -> Result<WireFrame, EngineHostError> {
+    let frame = read_frame_with(reader, scratch)?;
     if frame.method != expected_method {
         return Err(EngineHostError::UnexpectedFrameMethod {
             expected: expected_method,
