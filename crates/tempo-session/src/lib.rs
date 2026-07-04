@@ -577,7 +577,7 @@ impl CassetteStore {
             Err(TryLockError::Error(source)) => return Err(JournalError::Io(source)),
         }
 
-        let append_boundary = repair_cassette_tail_before_append(&self.path, &file)?;
+        let append_boundary = repair_cassette_tail_before_append(&file)?;
 
         let mut index = self.lock_index();
         self.catch_up_index(&mut index)?;
@@ -592,29 +592,32 @@ impl CassetteStore {
         }
 
         let cassette_json = serde_json::to_vec(cassette)?;
-        let record =
+        let mut frame =
             encode_durable_record_bytes(&cassette_json, &self.retention_policy, cassette_aad())?;
+        let record_len = frame.len();
+        frame.push(b'\n');
         let mut offset = file.metadata()?.len();
         if let CassetteAppendBoundary::NeedsNewline = append_boundary {
-            file.write_all(b"\n")?;
+            frame.insert(0, b'\n');
             offset += 1;
         }
-        file.write_all(&record)?;
-        file.write_all(b"\n")?;
-        file.flush()?;
-        file.sync_data()?;
+        // One write_all per record, no per-record fsync: durability is the OS
+        // page cache, the same posture as the journal's WAL
+        // `synchronous=NORMAL` (fsync deferred to checkpoints). A torn append
+        // after a crash is repaired by `repair_cassette_tail_before_append`.
+        file.write_all(&frame)?;
 
-        // The append is durable: extend the index in place instead of paying a
-        // tail re-scan on the next call.
+        // The append is visible to every subsequent read on this store: extend
+        // the index in place instead of paying a tail re-scan on the next call.
         index.by_key.insert(
             cassette.key.clone(),
             CassetteSpan {
                 offset,
-                len: record.len(),
+                len: record_len,
             },
         );
         if index.indexed_bytes == offset {
-            index.indexed_bytes = offset + record.len() as u64 + 1;
+            index.indexed_bytes = offset + record_len as u64 + 1;
             index.indexed_lines += 1;
         }
         Ok(())
@@ -1606,22 +1609,55 @@ enum CassetteAppendBoundary {
     NeedsNewline,
 }
 
+/// Chunk size for the backwards scan that locates the last newline of a file
+/// whose tail is unterminated. Bounds each read; the scan touches only the
+/// unterminated segment, never the whole file.
+const CASSETTE_TAIL_SCAN_CHUNK: u64 = 64 * 1024;
+
 /// Repair a trailing incomplete JSON record before append without deleting a complete
 /// record that still needs authentication/decode by the caller.
-fn repair_cassette_tail_before_append(
-    path: &Path,
-    file: &File,
-) -> Result<CassetteAppendBoundary, JournalError> {
-    let bytes = std::fs::read(path)?;
-    if bytes.is_empty() || bytes.last() == Some(&b'\n') {
+///
+/// The healthy path (file empty or newline-terminated) costs one metadata call
+/// plus a single-byte read. Only a torn tail — rare, post-crash — walks
+/// backwards to the previous newline, and reads just that segment.
+fn repair_cassette_tail_before_append(file: &File) -> Result<CassetteAppendBoundary, JournalError> {
+    let file_len = file.metadata()?.len();
+    if file_len == 0 {
         return Ok(CassetteAppendBoundary::Ready);
     }
-    let keep = bytes
-        .iter()
-        .rposition(|byte| *byte == b'\n')
-        .map(|idx| idx as u64 + 1)
-        .unwrap_or(0);
-    if is_incomplete_json_record(&bytes[keep as usize..]) {
+    // `&File` implements Read + Seek; reads leave the append-mode writes
+    // unaffected (O_APPEND writes always go to EOF).
+    let mut reader = file;
+    let mut last = [0u8; 1];
+    reader.seek(SeekFrom::End(-1))?;
+    reader.read_exact(&mut last)?;
+    if last == [b'\n'] {
+        return Ok(CassetteAppendBoundary::Ready);
+    }
+
+    // Unterminated tail: scan backwards in bounded chunks for the last newline,
+    // accumulating only the trailing segment.
+    let mut tail: Vec<u8> = Vec::new();
+    let mut chunk_end = file_len;
+    let keep = loop {
+        let chunk_start = chunk_end.saturating_sub(CASSETTE_TAIL_SCAN_CHUNK);
+        let mut chunk = vec![0u8; (chunk_end - chunk_start) as usize];
+        reader.seek(SeekFrom::Start(chunk_start))?;
+        reader.read_exact(&mut chunk)?;
+        if let Some(idx) = chunk.iter().rposition(|byte| *byte == b'\n') {
+            chunk.drain(..=idx);
+            chunk.extend_from_slice(&tail);
+            tail = chunk;
+            break chunk_start + idx as u64 + 1;
+        }
+        chunk.extend_from_slice(&tail);
+        tail = chunk;
+        if chunk_start == 0 {
+            break 0;
+        }
+        chunk_end = chunk_start;
+    };
+    if is_incomplete_json_record(&tail) {
         file.set_len(keep)?;
         file.sync_all()?;
         return Ok(CassetteAppendBoundary::Ready);
