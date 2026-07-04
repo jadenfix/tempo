@@ -7,7 +7,7 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|arg| arg == "-h" || arg == "--help") {
         eprintln!("{}", usage());
-        std::process::exit(2);
+        std::process::exit(0);
     }
     let config_overrides = match TempodOptions::config_overrides(&args) {
         Ok(overrides) => overrides,

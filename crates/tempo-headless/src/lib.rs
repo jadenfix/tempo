@@ -2591,6 +2591,13 @@ async fn guard_control_plane(
     {
         return tempod_error_response(&err).into_response();
     }
+    if method == "GET"
+        && path == TEMPOD_METRICS_PATH
+        && !loopback_host_header_allowed(request.headers())
+    {
+        return tempod_error_response(&TempodError::Forbidden("host not allowed".into()))
+            .into_response();
+    }
     if control_route_requires_origin_check(method, path)
         && !tempo_mcp::origin_allowed(header_str(request.headers(), header::ORIGIN))
     {
@@ -2710,9 +2717,10 @@ fn process_start() -> std::time::Instant {
 }
 
 /// GET /metrics — Prometheus text exposition (from #324). Deliberately behind
-/// the loopback-Origin guard (and bearer auth on remote binds): exposition is
-/// control-plane data. Scrapers send no Origin header, so they pass the
-/// guard. Short in-memory pool lock only.
+/// the loopback-Origin guard and a loopback Host guard (plus bearer auth on
+/// remote binds): exposition is control-plane data. Scrapers send no Origin
+/// header, so they pass the Origin guard, but browser DNS-rebinding requests
+/// still carry an attacker Host and are denied before the scrape.
 async fn metrics(State(state): State<TempodAppState>) -> Response {
     if !metrics_enabled() {
         return HttpResponse::json(
@@ -2768,9 +2776,16 @@ fn header_str(headers: &HeaderMap, name: header::HeaderName) -> Option<&str> {
     headers.get(name).and_then(|value| value.to_str().ok())
 }
 
+fn loopback_host_header_allowed(headers: &HeaderMap) -> bool {
+    match header_str(headers, header::HOST) {
+        Some(host) => loopback_host_allowed(Some(host)),
+        None => true,
+    }
+}
+
 fn base_url_from_headers(headers: &HeaderMap) -> String {
     let host = header_str(headers, header::HOST)
-        .filter(|host| valid_host_header(host))
+        .filter(|host| loopback_host_allowed(Some(host)))
         .unwrap_or("localhost");
     format!("http://{host}")
 }
@@ -4378,6 +4393,29 @@ fn valid_host_header(host: &str) -> bool {
         && host
             .bytes()
             .all(|byte| byte.is_ascii_graphic() && !matches!(byte, b'/' | b'\\'))
+}
+
+fn loopback_host_allowed(host: Option<&str>) -> bool {
+    let Some(host) = host.map(str::trim).filter(|host| valid_host_header(host)) else {
+        return false;
+    };
+    let Ok(url) = Url::parse(&format!("http://{host}/")) else {
+        return false;
+    };
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return false;
+    }
+    match url.host() {
+        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(addr)) => addr.is_loopback(),
+        Some(url::Host::Ipv6(addr)) => addr.is_loopback(),
+        None => false,
+    }
 }
 
 #[derive(Deserialize)]
@@ -6793,7 +6831,7 @@ mod tests {
             .ok_or("missing HTTP response body")?;
         let card: Value = serde_json::from_str(body)?;
         assert_eq!(card["name"], "tempo");
-        assert_eq!(card["url"], "http://tempod.test:7777/mcp");
+        assert_eq!(card["url"], "http://localhost/mcp");
         assert_eq!(card["preferredTransport"], "MCP");
         assert!(card["skills"]
             .as_array()
@@ -6846,6 +6884,27 @@ mod tests {
         assert_eq!(response.status, 200);
         let card: Value = serde_json::from_slice(&response.body)?;
         assert_eq!(card["url"], "http://localhost/mcp");
+        Ok(())
+    }
+
+    #[test]
+    fn openapi_falls_back_when_host_header_is_not_loopback() -> TestResult {
+        let mut pool = SessionPool::default();
+        let response = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "GET".into(),
+                path: TEMPOD_OPENAPI_PATH.into(),
+                headers: BTreeMap::new(),
+                host: Some("attacker.example:8787".into()),
+                origin: None,
+                body: Vec::new(),
+            },
+        )?;
+
+        assert_eq!(response.status, 200);
+        let openapi: Value = serde_json::from_slice(&response.body)?;
+        assert_eq!(openapi["servers"][0]["url"], "http://localhost");
         Ok(())
     }
 
@@ -9100,6 +9159,27 @@ mod tests {
             control_request("GET", TEMPOD_METRICS_PATH, Some("http://evil.example"), b""),
         );
         assert_eq!(blocked.status, 403);
+        Ok(())
+    }
+
+    #[test]
+    fn metrics_endpoint_rejects_non_loopback_host_without_origin() -> TestResult {
+        let mut pool = SessionPool::default();
+        let blocked = handle_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "GET".into(),
+                path: TEMPOD_METRICS_PATH.into(),
+                headers: BTreeMap::new(),
+                host: Some("attacker.example:8787".into()),
+                origin: None,
+                body: Vec::new(),
+            },
+        );
+
+        assert_eq!(blocked.status, 403);
+        let body: Value = serde_json::from_slice(&blocked.body)?;
+        assert_eq!(body["error"], "forbidden: host not allowed");
         Ok(())
     }
 
