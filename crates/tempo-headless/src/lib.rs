@@ -38,6 +38,7 @@ use tempo_engine_host::{
 use tempo_policy::{decide_action, decide_effect, InputTaint, PolicyDecision};
 use tempo_schema::{Action, ActionBatch, CompiledObservation, NodeId, ObservationDiff, SideEffect};
 use thiserror::Error;
+use url::Url;
 
 const MAX_HTTP_BYTES: usize = 64 * 1024;
 const MAX_WS_PAYLOAD_BYTES: u64 = MAX_HTTP_BYTES as u64;
@@ -1079,11 +1080,12 @@ impl OtlpJsonExporter {
 
 /// Build the redacted OTLP record written for a step (issue #214, weakness 3).
 ///
-/// We keep telemetry-useful, non-sensitive fields (idempotency key, seq, action
-/// kind, coordinates, millis, skill name, observation-diff counts) and replace
-/// anything that can carry raw secrets with a constant marker: typed text,
-/// select values, skill inputs, node ids, and step-error reasons. URL secrets
-/// (userinfo, query, fragment) are stripped rather than marked.
+/// We keep telemetry-useful, non-sensitive fields (seq, action kind,
+/// coordinates, millis, skill name, observation-diff counts) and replace
+/// anything that can carry raw secrets with a constant marker: the idempotency
+/// key, typed text, select values, skill inputs, node ids, and step-error
+/// reasons. `Goto` URLs are reduced to origin + shape metadata (see
+/// [`redact_goto_url`]).
 fn redacted_export_record(triple: &StepTriple) -> serde_json::Value {
     json!({
         "resource": {
@@ -1091,7 +1093,11 @@ fn redacted_export_record(triple: &StepTriple) -> serde_json::Value {
         },
         "name": "tempo.step",
         "body": {
-            "key": triple.key,
+            // `IdempotencyKey` is public and deserializable, so callers can
+            // construct arbitrary keys; it must not be assumed generated/secret-free.
+            // Emit the constant marker instead of the raw key — `seq` already
+            // provides step ordering (issue #214 review, medium finding).
+            "key": REDACTED_MARKER,
             "seq": triple.seq,
             "action": redact_action(&triple.action),
             "outcome": redact_step_outcome(&triple.outcome),
@@ -1108,7 +1114,7 @@ fn redacted_export_record(triple: &StepTriple) -> serde_json::Value {
 /// secrets in an attribute value, so neither the id nor a hash of it is exported.
 fn redact_action(action: &Action) -> serde_json::Value {
     match action {
-        Action::Goto { url } => json!({ "kind": "goto", "url": strip_url_secrets(url) }),
+        Action::Goto { url } => json!({ "kind": "goto", "url": redact_goto_url(url) }),
         Action::Click { node: _ } => json!({ "kind": "click", "node": REDACTED_MARKER }),
         // Typed text frequently carries credentials; the node id can be a
         // secret-bearing selector — mark both.
@@ -1155,39 +1161,47 @@ fn redact_step_outcome(outcome: &StepTripleOutcome) -> serde_json::Value {
     }
 }
 
-/// Strip URL secrets for telemetry while keeping scheme/host/path:
+/// Redact a `Goto` URL for telemetry: emit only the origin plus non-sensitive
+/// shape metadata, never the path (issue #214 review, high finding).
 ///
-/// * the query string and fragment (secrets carried in `?token=...` etc.), and
-/// * userinfo (`user:pass@` between `//` and the host — issue #214 review,
-///   medium finding).
+/// The path can itself carry secrets (`/reset/SECRET`, signed object keys,
+/// account ids), so — unlike userinfo/query/fragment which were merely stripped
+/// — we drop the path entirely and export only:
 ///
-/// Stripping (removing the secret parts) is not dictionary-searchable, so URLs
-/// stay as a stripped URL rather than being replaced with the constant marker.
-/// URLs without userinfo are returned unchanged apart from query/fragment.
-fn strip_url_secrets(url: &str) -> String {
-    // Strip query + fragment first so a `?`/`#` can never be mistaken for part
-    // of the authority below.
-    let without_query = match url.find(['?', '#']) {
-        Some(index) => &url[..index],
-        None => url,
+/// * `origin`: `<scheme>://<host[:port]>` with userinfo removed and the port
+///   included only when it is non-default for the scheme,
+/// * `path_segments`: count of non-empty `/`-separated path segments,
+/// * `has_query` / `has_fragment`: booleans, so telemetry keeps shape without
+///   the secret-bearing contents.
+///
+/// If the URL fails to parse (or has no host to form an origin), fall back to
+/// the constant [`REDACTED_MARKER`] rather than emitting anything raw. Panic-free:
+/// no `unwrap`/`expect`.
+fn redact_goto_url(url: &str) -> serde_json::Value {
+    let Ok(parsed) = Url::parse(url) else {
+        return json!(REDACTED_MARKER);
     };
-    // Locate the authority: the substring after `://` up to the next `/`.
-    let Some(scheme_end) = without_query.find("://") else {
-        return without_query.to_string();
+    // Without a host we cannot form a safe origin; redact wholesale.
+    let Some(host) = parsed.host_str() else {
+        return json!(REDACTED_MARKER);
     };
-    let authority_start = scheme_end + 3;
-    let after_scheme = &without_query[authority_start..];
-    let authority_len = after_scheme.find('/').unwrap_or(after_scheme.len());
-    let authority = &after_scheme[..authority_len];
-    // Userinfo is everything up to the last `@` within the authority; drop it.
-    match authority.rfind('@') {
-        Some(at) => format!(
-            "{}{}",
-            &without_query[..authority_start],
-            &after_scheme[at + 1..]
-        ),
-        None => without_query.to_string(),
-    }
+    // `Url::port` returns `None` for the scheme's default port, giving us the
+    // "optional port" behaviour for free; userinfo is never part of this.
+    let origin = match parsed.port() {
+        Some(port) => format!("{}://{}:{}", parsed.scheme(), host, port),
+        None => format!("{}://{}", parsed.scheme(), host),
+    };
+    let path_segments = parsed
+        .path()
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .count();
+    json!({
+        "origin": origin,
+        "path_segments": path_segments,
+        "has_query": parsed.query().is_some(),
+        "has_fragment": parsed.fragment().is_some(),
+    })
 }
 
 /// Run tempod forever on an address such as `127.0.0.1:8787`.
@@ -4681,10 +4695,13 @@ mod tests {
 
         let goto_path = root.join("goto.jsonl");
         let goto = StepTriple {
-            key: IdempotencyKey("step-goto".into()),
+            // Arbitrary caller-supplied key (public/deserializable type): it must
+            // be redacted, never exported verbatim (issue #214 review, medium).
+            key: IdempotencyKey("secret-key-SECRET123".into()),
             seq: 6,
             action: Action::Goto {
-                url: "https://user:SECRET123@example.test/p?token=T".into(),
+                // Secret in the PATH plus userinfo/query/fragment: none may leak.
+                url: "https://user:pass@example.test/reset/SECRET123?token=T#frag".into(),
             },
             outcome: StepTripleOutcome::StepError {
                 reason: "boom".into(),
@@ -4694,7 +4711,7 @@ mod tests {
         let goto_text = String::from_utf8(std::fs::read(&goto_path)?)?;
         assert!(
             !goto_text.contains("SECRET123"),
-            "URL userinfo secret must be stripped"
+            "URL path secret (and userinfo) must not leak"
         );
         assert!(
             !goto_text.contains("user:"),
@@ -4705,15 +4722,59 @@ mod tests {
             "URL query secret must be stripped"
         );
         assert!(
+            !goto_text.contains("/reset"),
+            "URL path must not be exported"
+        );
+        assert!(
             !goto_text.contains("sha256:"),
             "no dictionary-searchable hash may be emitted"
         );
         let goto_value: Value = serde_json::from_str(goto_text.trim_end())?;
-        assert_eq!(
-            goto_value["body"]["action"]["url"],
-            "https://example.test/p"
-        );
+        // The idempotency key is redacted, not written verbatim.
+        assert_eq!(goto_value["body"]["key"], REDACTED_MARKER);
         assert_eq!(goto_value["body"]["action"]["kind"], "goto");
+        // Only the origin plus non-sensitive shape metadata is exported.
+        assert_eq!(
+            goto_value["body"]["action"]["url"]["origin"],
+            "https://example.test"
+        );
+        assert_eq!(goto_value["body"]["action"]["url"]["path_segments"], 2);
+        assert_eq!(goto_value["body"]["action"]["url"]["has_query"], true);
+        assert_eq!(goto_value["body"]["action"]["url"]["has_fragment"], true);
+
+        // A URL with an explicit non-default port keeps `host:port` in the
+        // origin, and userinfo is dropped.
+        let port_path = root.join("goto-port.jsonl");
+        let port_goto = StepTriple {
+            key: IdempotencyKey("step-goto-port".into()),
+            seq: 7,
+            action: Action::Goto {
+                url: "https://user:pass@example.test:8443/a/b".into(),
+            },
+            outcome: StepTripleOutcome::Applied {
+                diff: ObservationDiff {
+                    since_seq: 6,
+                    seq: 7,
+                    added: vec![],
+                    removed: vec![],
+                    changed: vec![],
+                },
+            },
+        };
+        OtlpJsonExporter::new(&port_path).export_step(&port_goto)?;
+        let port_text = String::from_utf8(std::fs::read(&port_path)?)?;
+        assert!(
+            !port_text.contains("user:"),
+            "URL userinfo must be stripped from a port-bearing URL"
+        );
+        let port_value: Value = serde_json::from_str(port_text.trim_end())?;
+        assert_eq!(
+            port_value["body"]["action"]["url"]["origin"],
+            "https://example.test:8443"
+        );
+        assert_eq!(port_value["body"]["action"]["url"]["path_segments"], 2);
+        assert_eq!(port_value["body"]["action"]["url"]["has_query"], false);
+        assert_eq!(port_value["body"]["action"]["url"]["has_fragment"], false);
 
         remove_dir_if_exists(&root)?;
         Ok(())
