@@ -624,6 +624,22 @@ struct SharedIpcInner {
     pending: Mutex<SharedIpcPending>,
 }
 
+impl Drop for SharedIpcInner {
+    fn drop(&mut self) {
+        // The detached reader thread holds its own clone of this socket and can
+        // block in `read` indefinitely. Without an explicit shutdown the
+        // underlying socket would stay open after the last client handle is
+        // dropped, so the engine peer would never observe EOF and its serve
+        // loop would never exit (and the reader thread would leak). Shutdown
+        // wakes the reader (its read returns EOF) and closes the connection
+        // for the peer; this runs only once no clones remain (the reader holds
+        // a `Weak`).
+        if let Ok(writer) = self.writer.get_mut() {
+            let _ = writer.stream.shutdown(std::net::Shutdown::Both);
+        }
+    }
+}
+
 struct SharedIpcWriter {
     stream: UnixStream,
     next_id: u64,
@@ -1873,7 +1889,7 @@ mod tests {
             },
             Duration::from_secs(30),
         );
-        assert!(matches!(later, Err(_)));
+        assert!(later.is_err());
         assert!(started.elapsed() < Duration::from_secs(2));
         Ok(())
     }

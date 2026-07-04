@@ -1729,7 +1729,7 @@ mod tests {
 
     #[tokio::test]
     async fn initialize_and_tool_list_follow_mcp_shape() -> Result<(), String> {
-        let mut server = TempoMcpServer::new(MemoryDriver::new());
+        let server = TempoMcpServer::new(MemoryDriver::new());
         let initialize = server
             .handle_post(None, br#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#)
             .await
@@ -2387,7 +2387,7 @@ mod tests {
         );
 
         let (origin, fixture) = serve_handshake_fixture().map_err(|error| error.to_string())?;
-        let mut server = TempoMcpServer::new(MemoryDriver::new()).with_handshake_probe_config(
+        let server = TempoMcpServer::new(MemoryDriver::new()).with_handshake_probe_config(
             HttpProbeConfig::default().with_url_policy(UrlPolicy::allow_all()),
         );
         let body = json!({
@@ -2475,7 +2475,7 @@ mod tests {
 
     #[tokio::test]
     async fn protocol_errors_and_notifications_have_http_semantics() -> Result<(), String> {
-        let mut server = TempoMcpServer::new(MemoryDriver::new());
+        let server = TempoMcpServer::new(MemoryDriver::new());
         let malformed = server.handle_post(None, b"{not-json").await;
         assert_eq!(malformed.status, 400);
         assert_eq!(

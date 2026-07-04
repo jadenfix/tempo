@@ -753,8 +753,9 @@ impl SessionPool {
     /// its fork / MCP closes are still bounded through the same worker.
     ///
     /// `AttachedEngineDriver` and `TempoMcpServer<AttachedEngineDriver>` are
-    /// `Send + 'static` (`Arc<Mutex<..>>` + `Copy` `Engine`; forks are
-    /// `Box<dyn DriverTrait>`, which is `Send`), so they move to the worker thread.
+    /// `Send + 'static` (shared multiplexed IPC client + `Copy` `Engine`; forks
+    /// are `Box<dyn DriverTrait>`, which is `Send`), so they move to the worker
+    /// thread.
     fn bounded_engine_teardown(&mut self, close_root: bool, timeout: Duration) {
         // Collect everything to close and clean up `self` up front.
         let forks: Vec<AttachedEngineDriver> = std::mem::take(&mut self.bidi_contexts)
@@ -4131,12 +4132,14 @@ mod tests {
         Ok(Arc::new(Mutex::new(pool)))
     }
 
+    type ServerHandles = Vec<thread::JoinHandle<Result<(), TempodError>>>;
+
     /// Spawn `count` single-request server threads accepting on one listener.
     fn spawn_servers(
         listener: &TcpListener,
         pool: &Arc<Mutex<SessionPool>>,
         count: usize,
-    ) -> Result<Vec<thread::JoinHandle<Result<(), TempodError>>>, Box<dyn Error>> {
+    ) -> Result<ServerHandles, Box<dyn Error>> {
         let mut handles = Vec::with_capacity(count);
         for _ in 0..count {
             let listener = listener.try_clone()?;
