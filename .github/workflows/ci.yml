@@ -77,6 +77,32 @@ jobs:
       - name: servo tempo fork build gate
         run: bash scripts/cargo-servo-tempo.sh
 
+  windows-core:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.96.1
+      - name: cargo check (portable core crates)
+        run: >
+          cargo check --locked
+          -p tempo-schema
+          -p tempo-driver
+          -p tempo-observe
+          -p tempo-taint
+          -p tempo-act
+          -p tempo-policy
+          -p tempo-net
+          -p tempo-handshake
+          -p tempo-session
+          -p tempo-skills
+          -p tempo-speculate
+          -p tempo-agent
+          -p tempo-bidi
+          -p tempo-mcp
+          -p tempo-evals
+          -p tempo-compat
+          -p tempo-config
+
   bench-smoke:
     runs-on: ubuntu-latest
     steps:

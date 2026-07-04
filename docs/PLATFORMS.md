@@ -28,6 +28,11 @@ committed implementation work:
 - **Cross-platform secure IPC**: #260 owns native secure transports and peer
   authentication. Windows named pipes, Android app-private sockets, and mobile
   packaging must satisfy that issue's security bar rather than bypass it.
+- **Portable core CI**: the `windows-core` CI job checks the engine-agnostic
+  crates on native `windows-latest`. That is the compatibility bar for the
+  contract, observation/action, policy/taint, network, session, agent, MCP/BiDi,
+  eval, and config layers; it intentionally excludes the Unix engine-host and
+  tempod transport crates until #260 lands.
 - **Servo availability source of truth**: #294 is the conservative platform
   availability matrix. Tempo follows upstream Servo availability for macOS,
   Linux, Windows, Android, and OpenHarmony; this document focuses on app/shell
