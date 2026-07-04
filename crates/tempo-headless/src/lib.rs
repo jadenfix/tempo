@@ -37,6 +37,7 @@ use tempo_engine_host::{
     DriverCommand as HostDriverCommand, DriverResponse, DriverWireError, EngineHost,
     EngineHostConfig, EngineHostError, EngineIpcClient,
 };
+use tempo_net::UrlPolicy;
 use tempo_policy::{decide_action, decide_effect, ConfirmationGate, InputTaint, PolicyDecision};
 use tempo_schema::{Action, ActionBatch, CompiledObservation, NodeId, ObservationDiff, SideEffect};
 use thiserror::Error;
@@ -549,6 +550,7 @@ impl SessionPool {
         if self.draining {
             return Err(TempodError::Draining);
         }
+        enforce_tempod_navigation_url(&url)?;
         let id = TempodSessionId(format!("session-{}", self.next_id));
         self.next_id = self.next_id.saturating_add(1);
         Ok(ReservedSessionCreate {
@@ -791,6 +793,7 @@ impl SessionPool {
         id: &TempodSessionId,
         batch: &ActionBatch,
     ) -> Result<StepOutcome, TempodError> {
+        enforce_batch_navigation_url_policy(batch)?;
         let driver = self.session_driver_mut(id)?;
         futures::executor::block_on(driver.act_batch(batch))
             .map_err(|error| TempodError::Driver(error.to_string()))
@@ -1136,6 +1139,7 @@ fn create_session_engine_context_on_driver(
     mut root_driver: AttachedEngineDriver,
     url: &str,
 ) -> Result<Option<AttachedEngineDriver>, TempodError> {
+    enforce_tempod_navigation_url(url)?;
     let options = BrowsingContextCreateOptions {
         kind: BrowsingContextKind::Tab,
         background: true,
@@ -1859,6 +1863,7 @@ fn enforce_session_batch_policy(
             )));
         }
     }
+    enforce_batch_navigation_url_policy(&body.batch)?;
     let forced_tainted_actions = body
         .batch
         .actions
@@ -1946,6 +1951,33 @@ fn action_requires_external_taint_floor(action: &Action) -> bool {
         | Action::Select { .. }
         | Action::Skill { .. } => true,
     }
+}
+
+fn tempod_navigation_url_policy_denial(url: &str) -> Option<String> {
+    UrlPolicy::block_private()
+        .enforce(url)
+        .err()
+        .map(|error| format!("navigation URL denied by tempod URL policy: {error}"))
+}
+
+fn enforce_tempod_navigation_url(url: &str) -> Result<(), TempodError> {
+    if let Some(message) = tempod_navigation_url_policy_denial(url) {
+        return Err(TempodError::Forbidden(message));
+    }
+    Ok(())
+}
+
+fn enforce_batch_navigation_url_policy(batch: &ActionBatch) -> Result<(), TempodError> {
+    for (index, action) in batch.actions.iter().enumerate() {
+        if let Action::Goto { url } = action
+            && let Some(message) = tempod_navigation_url_policy_denial(url)
+        {
+            return Err(TempodError::Forbidden(format!(
+                "action {index} goto {message}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn session_act_batch_idempotency_fingerprint(body: &SessionActBatchRequest) -> JsonValue {
@@ -3244,6 +3276,12 @@ fn route_bidi_driver(
                 command.confirmed,
             ) {
                 return denied;
+            }
+            if let Some(message) = tempod_navigation_url_policy_denial(&command.url) {
+                return BidiDispatchResult::new(
+                    200,
+                    BidiMessage::error(Some(id), BidiErrorCode::InvalidArgument, message),
+                );
             }
             let context = command.context.clone();
             let Some(mut driver) = pool.bidi_driver_for(&context) else {
@@ -5479,6 +5517,28 @@ mod tests {
     }
 
     #[test]
+    fn session_act_batch_rejects_blocked_goto_url_before_driver_lookup() -> TestResult {
+        let mut pool = SessionPool::default();
+        let session = pool.create("https://policy-session.test")?;
+
+        let response = handle_http_request(
+            &mut pool,
+            control_request(
+                "POST",
+                &format!("/sessions/{}/act_batch", session.id.0),
+                Some("http://127.0.0.1"),
+                br#"{"batch":{"actions":[{"kind":"goto","url":"http://127.0.0.1/admin"}],"quiescence":"composite"},"input_tainted":false}"#,
+            ),
+        );
+
+        assert_eq!(response.status, 403);
+        let body: Value = serde_json::from_slice(&response.body)?;
+        let error = body["error"].as_str().ok_or("missing error body")?;
+        assert!(error.contains("action 0 goto navigation URL denied by tempod URL policy"));
+        Ok(())
+    }
+
+    #[test]
     fn session_json_schema_errors_are_client_bad_requests() -> TestResult {
         let mut pool = SessionPool::default();
 
@@ -6250,6 +6310,38 @@ mod tests {
             .ok_or("BiDi error response should include a message")?;
         assert!(message.contains("policy denied"));
         assert!(message.contains("input_tainted=true"));
+        assert_no_driver_ipc(&mut server_stream)?;
+        Ok(())
+    }
+
+    #[test]
+    fn bidi_endpoint_rejects_blocked_navigation_url_before_driver_execution() -> TestResult {
+        let (client_stream, mut server_stream) = UnixStream::pair()?;
+        server_stream.set_nonblocking(true)?;
+        let mut pool = SessionPool::default();
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+
+        let response = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/bidi".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: br#"{"id":19,"method":"browsingContext.navigate","params":{"context":"tempo-root","url":"http://127.0.0.1/admin","inputTainted":false}}"#.to_vec(),
+            },
+        )?;
+
+        assert_eq!(response.status, 200);
+        let value: Value = serde_json::from_slice(&response.body)?;
+        assert_eq!(value["type"], "error");
+        assert_eq!(value["id"], 19);
+        assert_eq!(value["error"], "invalid argument");
+        let message = value["message"]
+            .as_str()
+            .ok_or("BiDi error response should include a message")?;
+        assert!(message.contains("navigation URL denied by tempod URL policy"));
         assert_no_driver_ipc(&mut server_stream)?;
         Ok(())
     }
@@ -7524,6 +7616,37 @@ mod tests {
             origin: origin.map(str::to_string),
             body: body.to_vec(),
         }
+    }
+
+    #[test]
+    fn session_create_rejects_blocked_navigation_url_before_state_change() -> TestResult {
+        let mut pool = SessionPool::default();
+
+        let response = handle_http_request(
+            &mut pool,
+            control_request(
+                "POST",
+                "/sessions",
+                Some("http://127.0.0.1"),
+                br#"{"url":"http://127.0.0.1/admin"}"#,
+            ),
+        );
+
+        assert_eq!(response.status, 403);
+        let body: Value = serde_json::from_slice(&response.body)?;
+        let error = body["error"].as_str().ok_or("missing error body")?;
+        assert!(error.contains("navigation URL denied by tempod URL policy"));
+        assert!(pool.list().is_empty());
+
+        match pool.create("http://localhost/admin") {
+            Err(TempodError::Forbidden(message)) => {
+                assert!(message.contains("navigation URL denied by tempod URL policy"));
+            }
+            other => {
+                return Err(format!("expected Forbidden URL policy error, got {other:?}").into());
+            }
+        }
+        Ok(())
     }
 
     #[test]
