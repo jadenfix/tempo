@@ -1460,6 +1460,7 @@ mod tests {
         ObservationDiff {
             since_seq,
             seq,
+            omitted: 0,
             added: vec![],
             removed: vec![],
             changed: vec![],
