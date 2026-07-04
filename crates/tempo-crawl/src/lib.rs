@@ -22,7 +22,8 @@ pub use tempo_net::{
     IdentityMode, NetworkRequest, NetworkResponseRecord, OriginCrawlSnapshot, ProfileId,
     ProxyRoute, RejectedCrawlDispatch, RequestId, RobotsRules, SignatureError, SignatureHeaders,
     UrlBlocked, UrlPolicy, WebBotAuthSigningKey, DEFAULT_CRAWL_MAX_CONCURRENT_PER_ORIGIN,
-    DEFAULT_CRAWL_MAX_GLOBAL_INFLIGHT, DEFAULT_CRAWL_MIN_DELAY_TICKS,
+    DEFAULT_CRAWL_MAX_GLOBAL_INFLIGHT, DEFAULT_CRAWL_MAX_GLOBAL_PENDING,
+    DEFAULT_CRAWL_MAX_PENDING_PER_ORIGIN, DEFAULT_CRAWL_MIN_DELAY_TICKS,
 };
 
 #[deprecated(
@@ -54,6 +55,18 @@ impl CrawlFrontier {
         Self {
             inner: tempo_net::CrawlFrontier::new(policy),
         }
+    }
+
+    /// Bound the total pending queue for this frontier before dispatch.
+    pub fn with_max_global_pending(mut self, max_pending: usize) -> Self {
+        self.inner = self.inner.with_max_global_pending(max_pending);
+        self
+    }
+
+    /// Bound pending queue entries for any one origin before dispatch.
+    pub fn with_max_pending_per_origin(mut self, max_pending: usize) -> Self {
+        self.inner = self.inner.with_max_pending_per_origin(max_pending);
+        self
     }
 
     pub fn scheduler(&self) -> &CrawlScheduler {
@@ -293,6 +306,31 @@ mod tests {
         assert!(!frontier
             .scheduler()
             .is_url_active("http://127.0.0.1/private")?);
+        Ok(())
+    }
+
+    #[test]
+    fn facade_frontier_enforces_pending_caps() -> Result<(), CrawlError> {
+        let mut frontier = frontier(CrawlPolicy::default().without_robots_txt())
+            .with_max_global_pending(4)
+            .with_max_pending_per_origin(2);
+
+        assert!(frontier.enqueue(crawl_request("a1", "https://a.example/one"))?);
+        assert!(frontier.enqueue(crawl_request("a2", "https://a.example/two"))?);
+        let Err(error) = frontier.enqueue(crawl_request("a3", "https://a.example/three")) else {
+            panic!("third same-origin pending request should be capped");
+        };
+        assert_eq!(error.reason.code, BlockCode::CrawlLimit);
+        assert!(error.reason.detail.contains("per-origin pending crawl cap"));
+
+        assert!(frontier.enqueue(crawl_request("b1", "https://b.example/one"))?);
+        assert!(frontier.enqueue(crawl_request("c1", "https://c.example/one"))?);
+        let Err(error) = frontier.enqueue(crawl_request("d1", "https://d.example/one")) else {
+            panic!("global pending request cap should be enforced");
+        };
+        assert_eq!(error.reason.code, BlockCode::CrawlLimit);
+        assert!(error.reason.detail.contains("global pending crawl cap"));
+        assert_eq!(frontier.snapshot().pending, 4);
         Ok(())
     }
 
