@@ -17,8 +17,8 @@
 //!   ceiling is a typed, journal-derived stop, never a panic.
 
 use crate::{
-    is_policy_denial_reason, policy_denied_reason, AgentError, AgentRunner, DriverStep,
-    IdempotencyKey, TokenBudget, RESUME_INTERRUPTED_REASON,
+    is_policy_denial_reason, policy_denied_reason, read_body_capped, AgentError, AgentRunner,
+    CappedBodyError, DriverStep, IdempotencyKey, TokenBudget, RESUME_INTERRUPTED_REASON,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -397,45 +397,6 @@ enum Failure {
     Malformed(String),
 }
 
-enum CappedBodyError {
-    TooLarge { max_bytes: usize },
-    Transport(String),
-}
-
-/// Reads a response body while enforcing a hard byte cap, mirroring the MCP
-/// client's `max_body_bytes` guard (#212/#215): reject early when the
-/// advertised `Content-Length` exceeds the cap, then accumulate chunks and
-/// error as soon as the received bytes would cross it.
-async fn read_body_capped(
-    response: reqwest::Response,
-    max_body_bytes: usize,
-) -> Result<String, CappedBodyError> {
-    let cap = max_body_bytes as u64;
-    if let Some(content_length) = response.content_length()
-        && content_length > cap
-    {
-        return Err(CappedBodyError::TooLarge {
-            max_bytes: max_body_bytes,
-        });
-    }
-
-    let mut response = response;
-    let mut body: Vec<u8> = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|error| CappedBodyError::Transport(error.to_string()))?
-    {
-        if body.len() as u64 + chunk.len() as u64 > cap {
-            return Err(CappedBodyError::TooLarge {
-                max_bytes: max_body_bytes,
-            });
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(String::from_utf8_lossy(&body).into_owned())
-}
-
 fn truncate_detail(text: &str) -> String {
     let trimmed = text.trim();
     if trimmed.len() <= MAX_API_ERROR_DETAIL_BYTES {
@@ -691,6 +652,10 @@ struct DecidedRunState {
     usage: DecisionUsage,
     rounds: Vec<DecisionRoundReport>,
     actions_completed: usize,
+    /// Run-global step counter (journaled outcomes across all decisions,
+    /// prior runs included) so idempotency keys stay unique across rounds,
+    /// matching every other `IdempotencyKey::for_action` call site.
+    steps_executed: usize,
     current_origin: Option<Origin>,
 }
 
@@ -744,6 +709,12 @@ impl AgentRunner {
             usage: DecisionUsage::default(),
             rounds: Vec::new(),
             actions_completed: 0,
+            steps_executed: resume
+                .completed
+                .iter()
+                .chain(resume.pending.iter())
+                .map(|round| round.executed)
+                .sum(),
             current_origin: None,
         };
 
@@ -890,38 +861,47 @@ impl AgentRunner {
         D: DriverTrait + ?Sized,
     {
         for (index, action) in actions.iter().enumerate().skip(executed) {
+            let intent_already_journaled = dangling_planned && index == executed;
+
+            // Model-decided skills are out of scope for the first decided loop:
+            // fail the step with a typed, journaled error rather than silently
+            // skipping the skill store and its policy snapshot machinery (#98).
+            // This precedes the interruption check: rejecting a skill never
+            // runs a side effect, so crash-recovery surfaces the same typed
+            // reason as live execution instead of a generic interruption.
+            if matches!(action, Action::Skill { .. }) {
+                let reason =
+                    "decided loop does not execute skill actions; decide concrete actions instead"
+                        .to_string();
+                if !intent_already_journaled {
+                    state.journal.append(JournalEvent::ActionPlanned {
+                        action: action.clone(),
+                    })?;
+                }
+                state.journal.append(JournalEvent::StepError {
+                    action: action.clone(),
+                    reason: reason.clone(),
+                })?;
+                state.actions_completed += 1;
+                state.steps_executed += 1;
+                return Ok(Some(DecidedRunStatus::StepError { reason }));
+            }
+
             // A step whose intent was journaled in a prior run but never
             // completed may already have run its side effect: do not repeat it.
-            if dangling_planned && index == executed {
+            if intent_already_journaled {
                 let reason = RESUME_INTERRUPTED_REASON.to_string();
                 state.journal.append(JournalEvent::StepError {
                     action: action.clone(),
                     reason: reason.clone(),
                 })?;
                 state.actions_completed += 1;
+                state.steps_executed += 1;
                 return Ok(Some(DecidedRunStatus::Interrupted { reason }));
             }
 
-            // Model-decided skills are out of scope for the first decided loop:
-            // fail the step with a typed, journaled error rather than silently
-            // skipping the skill store and its policy snapshot machinery (#98).
-            if matches!(action, Action::Skill { .. }) {
-                let reason =
-                    "decided loop does not execute skill actions; decide concrete actions instead"
-                        .to_string();
-                state.journal.append(JournalEvent::ActionPlanned {
-                    action: action.clone(),
-                })?;
-                state.journal.append(JournalEvent::StepError {
-                    action: action.clone(),
-                    reason: reason.clone(),
-                })?;
-                state.actions_completed += 1;
-                return Ok(Some(DecidedRunStatus::StepError { reason }));
-            }
-
             let step = DriverStep::clean(action.clone());
-            let key = IdempotencyKey::for_action(index, action)?;
+            let key = IdempotencyKey::for_action(state.steps_executed, action)?;
             let policy_origin = self.origin_for_step(&step, state.current_origin.as_ref())?;
             let policy =
                 self.step_policy(&step, &key, policy_origin.as_ref(), action.side_effect())?;
@@ -935,6 +915,7 @@ impl AgentRunner {
                     reason: reason.clone(),
                 })?;
                 state.actions_completed += 1;
+                state.steps_executed += 1;
                 return Ok(Some(DecidedRunStatus::PolicyDenied { reason }));
             }
 
@@ -964,6 +945,7 @@ impl AgentRunner {
             };
             state.journal.append(outcome)?;
             state.actions_completed += 1;
+            state.steps_executed += 1;
 
             let next = driver.observe().await.map_err(|source| {
                 decided_transport_error(&mut state.journal, "decided post-action observe", source)
@@ -1530,6 +1512,81 @@ mod tests {
         Ok(())
     }
 
+    /// Serves one request with a close-delimited body that OMITS
+    /// `Content-Length`, so the early advertised-length rejection in
+    /// `read_body_capped` is skipped and only the chunk-accumulation guard can
+    /// enforce the cap (mirrors the #215 MCP regression test).
+    fn serve_streamed_response_without_content_length(
+        body: String,
+    ) -> std::io::Result<(String, FixtureHandle)> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
+        let origin = format!("http://{}", listener.local_addr()?);
+        let handle = thread::spawn(move || -> std::io::Result<()> {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _peer)) => {
+                        stream.set_nonblocking(false)?;
+                        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+                        let _request = read_http_request(&mut stream)?;
+                        let head = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n";
+                        // Best-effort writes: the client aborts mid-body once
+                        // the accumulated bytes cross the cap.
+                        let _ = stream
+                            .write_all(head.as_bytes())
+                            .and_then(|()| stream.write_all(body.as_bytes()))
+                            .and_then(|()| stream.flush());
+                        // Dropping the stream closes the connection, delimiting the body.
+                        return Ok(());
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "streamed fixture did not receive a request",
+            ))
+        });
+        Ok((origin, handle))
+    }
+
+    #[tokio::test]
+    async fn anthropic_decider_caps_streamed_body_without_content_length() -> TestResult {
+        let oversized = decision_response(
+            serde_json::json!([{ "kind": "wait", "millis": 1 }]),
+            false,
+            (1, 1, 0),
+        )
+        .to_string()
+        .replace("fixture", &"x".repeat(256 * 1024));
+        let (origin, server) = serve_streamed_response_without_content_length(oversized)?;
+        let mut decider =
+            AnthropicDecider::new(fixture_config(&origin).with_max_body_bytes(64 * 1024))?;
+        let schema = tempo_schema::action_json_schema();
+        let obs = observation("https://example.com", 1);
+        let request = DecisionRequest {
+            goal: "wait",
+            action_schema: &schema,
+            observation: &obs,
+            budget_remaining: 100,
+        };
+
+        let error = match decider.decide(&request).await {
+            Err(error) => error,
+            Ok(_) => return Err("expected a response-size error".into()),
+        };
+        assert!(
+            matches!(error, DeciderError::ResponseTooLarge { max_bytes: 65_536 }),
+            "expected size-cap rejection from the accumulation guard, got: {error:?}"
+        );
+        server.join().map_err(|_| "fixture thread panicked")??;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn decided_run_stops_typed_at_budget_ceiling_and_resumes_without_reinference(
     ) -> TestResult {
@@ -1706,6 +1763,117 @@ mod tests {
             JournalEvent::StepError { reason, .. } if reason == RESUME_INTERRUPTED_REASON
         )));
         remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn decided_resume_surfaces_skill_rejection_after_crash() -> TestResult {
+        let (root, journal_path) = journal_root("decided-skill-crash")?;
+        let ids = AgentRunIds::new("run-decided-skill", "session-decided-skill");
+        let skill = Action::Skill {
+            name: "search".into(),
+            input: serde_json::json!({ "q": "tempo" }),
+        };
+        {
+            // A prior run journaled the skill rejection's intent but crashed
+            // before its StepError outcome landed.
+            let mut journal = SessionJournal::open(
+                &journal_path,
+                RunId(ids.run_id.0.clone()),
+                SessionId(ids.session_id.0.clone()),
+            )?;
+            journal.append(JournalEvent::SessionStarted {
+                url: "https://example.com".into(),
+            })?;
+            journal.append(JournalEvent::ModelDecision {
+                actions: vec![skill.clone()],
+                rationale: None,
+                input_tokens: 10,
+                output_tokens: 5,
+                cache_read_input_tokens: 0,
+            })?;
+            journal.append(JournalEvent::ActionPlanned {
+                action: skill.clone(),
+            })?;
+        }
+
+        let mut driver = TestDriver::new().with_elements(vec![button("submit")]);
+        driver.goto("https://example.com").await?;
+        let runner = AgentRunner::new(&journal_path, ids).with_token_budget(TokenBudget::new(100));
+        let mut decider = FixedUsageDecider {
+            actions: Vec::new(),
+            usage: DecisionUsage::default(),
+            calls: 0,
+        };
+        let spec = DecidedTaskSpec::new("https://example.com", "search");
+
+        let report = runner
+            .run_decided_task(&mut driver, &mut decider, &spec)
+            .await?;
+
+        // Skill rejection never runs a side effect, so crash-recovery surfaces
+        // the same typed reason as live execution — not a generic Interrupted.
+        let DecidedRunStatus::StepError { reason } = &report.status else {
+            return Err(format!("expected skill StepError, got: {:?}", report.status).into());
+        };
+        assert!(reason.contains("does not execute skill actions"));
+        assert_eq!(decider.calls, 0);
+        let entries = read_journal_entries(&journal_path)?;
+        assert!(entries.iter().any(|entry| matches!(
+            &entry.event,
+            JournalEvent::StepError { reason, .. }
+                if reason.contains("does not execute skill actions")
+        )));
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn decided_run_respects_configured_round_ceiling() -> TestResult {
+        let (root, journal_path) = journal_root("decided-round-limit")?;
+        let mut driver = TestDriver::new().with_elements(vec![button("submit")]);
+        let runner = AgentRunner::new(
+            &journal_path,
+            AgentRunIds::new("run-decided-rounds", "session-decided-rounds"),
+        )
+        .with_token_budget(TokenBudget::new(1_000));
+        // Never reports done, so only the configured ceiling can stop the run.
+        let mut decider = FixedUsageDecider {
+            actions: vec![click("submit")],
+            usage: DecisionUsage::default(),
+            calls: 0,
+        };
+        let spec = DecidedTaskSpec::new("https://example.com", "click submit").with_max_rounds(2);
+
+        let report = runner
+            .run_decided_task(&mut driver, &mut decider, &spec)
+            .await?;
+
+        assert_eq!(
+            report.status,
+            DecidedRunStatus::RoundLimitReached { max_rounds: 2 }
+        );
+        assert_eq!(decider.calls, 2);
+        assert_eq!(report.rounds.len(), 2);
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn config_model_override_reaches_the_request_body() -> TestResult {
+        let config = AnthropicConfig::new("test-key").with_model("claude-custom-model");
+        let schema = tempo_schema::action_json_schema();
+        let obs = observation("https://example.com", 1);
+        let request = DecisionRequest {
+            goal: "click submit",
+            action_schema: &schema,
+            observation: &obs,
+            budget_remaining: 100,
+        };
+
+        let body = decide_request_body(&config, &request)
+            .map_err(|error| -> Box<dyn Error> { error.to_string().into() })?;
+        assert_eq!(body["model"], serde_json::json!("claude-custom-model"));
         Ok(())
     }
 

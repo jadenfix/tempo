@@ -1764,28 +1764,61 @@ async fn post_mcp_json(
     })
 }
 
-/// Reads an MCP HTTP response body into a `String` while enforcing a hard byte
-/// cap, so an attacker-controlled endpoint cannot exhaust memory by streaming an
-/// unbounded body (see issue #212). Mirrors the probe path's `take`-style bound
-/// in `tempo-handshake`, but for the async client: rejects early when the
-/// advertised `Content-Length` already exceeds the cap, then accumulates chunks
-/// and errors as soon as the received bytes would cross the cap.
+/// MCP-flavored wrapper over [`read_body_capped`]: collapses the typed cap
+/// errors onto this client's string-error plumbing.
 async fn read_mcp_body_capped(
     response: reqwest::Response,
     max_body_bytes: usize,
 ) -> Result<String, String> {
+    read_body_capped(response, max_body_bytes)
+        .await
+        .map_err(|error| match error {
+            CappedBodyError::TooLarge { max_bytes } => {
+                format!("MCP response body exceeded {max_bytes} bytes")
+            }
+            CappedBodyError::Transport(reason) => reason,
+        })
+}
+
+/// Typed failure from [`read_body_capped`], so callers can distinguish a
+/// retryable transport fault from a fatal size-cap breach.
+pub(crate) enum CappedBodyError {
+    TooLarge { max_bytes: usize },
+    Transport(String),
+}
+
+/// Reads an HTTP response body into a `String` while enforcing a hard byte
+/// cap, so an attacker-controlled endpoint cannot exhaust memory by streaming
+/// an unbounded body (see issue #212). Mirrors the probe path's `take`-style
+/// bound in `tempo-handshake`, but for the async client: rejects early when
+/// the advertised `Content-Length` already exceeds the cap, then accumulates
+/// chunks and errors as soon as the received bytes would cross the cap.
+/// Shared by the MCP client above and the Anthropic decider (#248); each
+/// caller maps [`CappedBodyError`] onto its own error type.
+pub(crate) async fn read_body_capped(
+    response: reqwest::Response,
+    max_body_bytes: usize,
+) -> Result<String, CappedBodyError> {
     let cap = max_body_bytes as u64;
     if let Some(content_length) = response.content_length()
         && content_length > cap
     {
-        return Err(format!("MCP response body exceeded {max_body_bytes} bytes"));
+        return Err(CappedBodyError::TooLarge {
+            max_bytes: max_body_bytes,
+        });
     }
 
     let mut response = response;
     let mut body: Vec<u8> = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|error| error.to_string())? {
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| CappedBodyError::Transport(error.to_string()))?
+    {
         if body.len() as u64 + chunk.len() as u64 > cap {
-            return Err(format!("MCP response body exceeded {max_body_bytes} bytes"));
+            return Err(CappedBodyError::TooLarge {
+                max_bytes: max_body_bytes,
+            });
         }
         body.extend_from_slice(&chunk);
     }
@@ -3875,6 +3908,10 @@ mod tests {
                 match listener.accept() {
                     Ok((mut stream, _peer)) => {
                         handled += 1;
+                        // Accepted sockets can inherit the listener's
+                        // nonblocking flag (macOS), flaking reads with
+                        // WouldBlock; force blocking mode explicitly.
+                        stream.set_nonblocking(false)?;
                         stream.set_read_timeout(Some(std::time::Duration::from_secs(1)))?;
                         let request = read_http_request(&mut stream)?;
                         let response = if request.starts_with("GET /mcp/catalog.json ") {
@@ -3995,6 +4032,10 @@ mod tests {
             while std::time::Instant::now() < deadline {
                 match listener.accept() {
                     Ok((mut stream, _peer)) => {
+                        // Accepted sockets can inherit the listener's
+                        // nonblocking flag (macOS), flaking reads with
+                        // WouldBlock; force blocking mode explicitly.
+                        stream.set_nonblocking(false)?;
                         stream.set_read_timeout(Some(std::time::Duration::from_secs(1)))?;
                         let _request = read_http_request(&mut stream)?;
                         let response =
@@ -4033,6 +4074,10 @@ mod tests {
             while std::time::Instant::now() < deadline {
                 match listener.accept() {
                     Ok((mut stream, _peer)) => {
+                        // Accepted sockets can inherit the listener's
+                        // nonblocking flag (macOS), flaking reads with
+                        // WouldBlock; force blocking mode explicitly.
+                        stream.set_nonblocking(false)?;
                         stream.set_read_timeout(Some(std::time::Duration::from_secs(1)))?;
                         let _request = read_http_request(&mut stream)?;
                         // Status + headers WITHOUT Content-Length; `Connection: close`
