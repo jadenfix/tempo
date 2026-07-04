@@ -47,6 +47,7 @@ Correctness & honesty of the contract:
 - [ ] Runtime-visible contract changes update every public description in the same slice: OpenAPI paths/statuses/schemas, agent cards, SDK-facing docs, and compatibility fixtures. A route or response field that exists at runtime but is absent from the contract is a blocker for SDK workflows.
 - [ ] Public Rust schema struct changes update source callers too: `serde(default)` preserves old JSON compatibility, but it does not make existing struct literals compile. Scan/update workspace literals and downstream crates.
 - [ ] Compact wire-format changes that omit default, empty, or optional fields preserve both directions of compatibility: compact serialization, populated serialization, and default-filled deserialization all have reverted-fix-sensitive tests.
+- [ ] Borrowed serializers, budget probes, counting sinks, and other wire-shape proxies mirror every `serde` default/skip rule on the public type they approximate. A proxy that counts or emits bytes differently from the real payload can create false truncation or false fit decisions.
 
 Resource, lifecycle & availability:
 - [ ] Everything that can grow is bounded: input/response sizes, queues, maps, caches, retries, spawned tasks, and session/connection counts. Unbounded growth on remote-driven input is a blocker.
