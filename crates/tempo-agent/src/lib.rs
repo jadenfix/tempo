@@ -4010,6 +4010,47 @@ mod tests {
         Ok((origin, handle))
     }
 
+    /// Serves a single `POST /mcp` request with the supplied JSON body but
+    /// deliberately OMITS `Content-Length`, streaming an HTTP/1.0-style
+    /// close-delimited body (the connection is closed to signal end-of-body).
+    /// This exercises the chunk-accumulation branch of `read_mcp_body_capped`
+    /// rather than the early `Content-Length > cap` rejection (#212 review).
+    fn serve_single_mcp_response_no_content_length(
+        body: String,
+    ) -> std::io::Result<(String, FixtureHandle)> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
+        let origin = format!("http://{}", listener.local_addr()?);
+        let handle = thread::spawn(move || -> std::io::Result<()> {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while std::time::Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _peer)) => {
+                        stream.set_read_timeout(Some(std::time::Duration::from_secs(1)))?;
+                        let _request = read_http_request(&mut stream)?;
+                        // Status + headers WITHOUT Content-Length; `Connection: close`
+                        // means the client reads the body until EOF.
+                        let head = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n";
+                        stream.write_all(head.as_bytes())?;
+                        stream.write_all(body.as_bytes())?;
+                        stream.flush()?;
+                        // Dropping the stream closes the connection, delimiting the body.
+                        return Ok(());
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "single MCP fixture did not receive a request",
+            ))
+        });
+        Ok((origin, handle))
+    }
+
     #[tokio::test]
     async fn post_mcp_json_rejects_body_over_cap() -> TestResult {
         let request = serde_json::json!({
@@ -4078,6 +4119,50 @@ mod tests {
         assert_eq!(
             response.body.get("id").and_then(|id| id.as_str()),
             Some("cap-test")
+        );
+        Ok(())
+    }
+
+    /// Regression for #212 review: a response that OMITS `Content-Length` and
+    /// streams an oversized close-delimited body must still be rejected by the
+    /// chunk-accumulation guard in `read_mcp_body_capped`. Because there is no
+    /// advertised length, the early `content_length() > cap` check is skipped,
+    /// so this only passes when the accumulation loop enforces the cap. A naive
+    /// unbounded `.text()` reader would slurp the whole body and fail this test.
+    #[tokio::test]
+    async fn post_mcp_json_rejects_streamed_body_over_cap_without_content_length() -> TestResult {
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "cap-test",
+            "method": "tools/call",
+        });
+        // Otherwise-valid JSON-RPC response whose body dwarfs the cap.
+        let oversized = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "cap-test",
+            "result": {"content": [{"type": "text", "text": "x".repeat(256 * 1024)}]},
+        })
+        .to_string();
+        assert!(oversized.len() > 64 * 1024);
+
+        let (origin, server) = serve_single_mcp_response_no_content_length(oversized)?;
+        let endpoint = format!("{origin}/mcp");
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|error| error.to_string())?;
+
+        let result = post_mcp_json(&client, &endpoint, &request, None, false, 64 * 1024).await;
+        server
+            .join()
+            .map_err(|_| "single MCP fixture thread panicked")??;
+
+        let Err(error) = result else {
+            return Err("oversized streamed MCP response body must be rejected".into());
+        };
+        assert!(
+            error.contains("exceeded"),
+            "unexpected error message: {error}"
         );
         Ok(())
     }
