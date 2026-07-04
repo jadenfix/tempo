@@ -5,6 +5,10 @@
 //! force a post-action diff for grounding verification, and provide the composed
 //! quiescence state machine used by real engines.
 
+pub mod detect;
+
+pub use detect::detect_human_takeover;
+
 use tempo_driver::{DriverTrait, Engine, StepOutcome, TransportError};
 use tempo_schema::{Action, ActionBatch, ObservationDiff, SideEffect};
 

@@ -365,6 +365,7 @@ fn eval_record_from_journal_entries(
             JournalEvent::TransportError { .. }
             | JournalEvent::ModelDecision { .. }
             | JournalEvent::StructuredFastPathSelected { .. }
+            | JournalEvent::HumanTakeoverRequired { .. }
             | JournalEvent::CassetteRecorded { .. }
             | JournalEvent::SessionClosed => {}
         }

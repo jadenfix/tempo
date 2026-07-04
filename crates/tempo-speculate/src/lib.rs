@@ -549,6 +549,7 @@ fn session_start_url(entries: &[JournalEntry]) -> Result<String, SpeculateError>
             | JournalEvent::ActionPlanned { .. }
             | JournalEvent::StepApplied { .. }
             | JournalEvent::StepError { .. }
+            | JournalEvent::HumanTakeoverRequired { .. }
             | JournalEvent::TransportError { .. }
             | JournalEvent::CassetteRecorded { .. }
             | JournalEvent::SessionClosed => None,
@@ -575,6 +576,7 @@ fn replay_steps(entries: &[JournalEntry]) -> Vec<ReplayStep> {
             | JournalEvent::Observation { .. }
             | JournalEvent::ModelDecision { .. }
             | JournalEvent::ActionPlanned { .. }
+            | JournalEvent::HumanTakeoverRequired { .. }
             | JournalEvent::TransportError { .. }
             | JournalEvent::CassetteRecorded { .. }
             | JournalEvent::SessionClosed => {}
