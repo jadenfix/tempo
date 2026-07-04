@@ -200,10 +200,50 @@ impl ShellApp {
         }
 
         if let Some(texture) = &self.screenshot_texture {
-            ui.label("page state (periodic snapshot — not a live viewport):");
+            let marked = self
+                .model
+                .active_tab()
+                .and_then(|tab| tab.screenshot.as_ref())
+                .is_some_and(|image| image.set_of_marks);
+            let caption = if marked {
+                "page state (periodic snapshot, set-of-marks overlay — not a live viewport):"
+            } else {
+                "page state (periodic snapshot — not a live viewport):"
+            };
+            ui.label(caption);
             let sized = egui::load::SizedTexture::from_handle(texture);
             ui.add(egui::Image::new(sized).max_width(ui.available_width()));
         }
+    }
+
+    /// Render the agent panel's journal/event stream: a scrolling, ordered log of
+    /// the active session's `/sessions/{id}/events`. Read-only; the reducer owns
+    /// all state. Tainted steps are flagged inline.
+    fn show_agent_journal(&self, ui: &mut egui::Ui) {
+        ui.separator();
+        ui.label("agent journal (session events):");
+        if self.model.journal.entries.is_empty() {
+            ui.label("(no events yet)");
+            return;
+        }
+        egui::ScrollArea::vertical()
+            .max_height(200.0)
+            .stick_to_bottom(true)
+            .show(ui, |ui| {
+                for entry in &self.model.journal.entries {
+                    let mut line = format!("#{} {}", entry.seq, entry.kind);
+                    if !entry.detail.is_empty() {
+                        line.push_str(&format!(" — {}", entry.detail));
+                    }
+                    let text = egui::RichText::new(line).monospace();
+                    let text = if entry.tainted {
+                        text.color(egui::Color32::from_rgb(220, 50, 50))
+                    } else {
+                        text
+                    };
+                    ui.label(text);
+                }
+            });
     }
 }
 
@@ -292,11 +332,12 @@ impl eframe::App for ShellApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         if self.due_for_poll() {
             self.dispatch(UiAction::Refresh);
-            // Keep the active tab's page-state snapshot fresh on the same cadence
-            // (the DoD's "refreshed on an interval"; the button below is the
-            // manual path). Cheap no-op when there is no active tab.
+            // Keep the active tab's page-state snapshot and journal/event stream
+            // fresh on the same cadence (the DoD's "refreshed on an interval"; the
+            // buttons below are the manual paths). Cheap no-ops with no active tab.
             if self.model.active_tab().is_some() {
                 self.dispatch(UiAction::RefreshScreenshot);
+                self.dispatch(UiAction::PollEvents);
             }
             self.last_poll = Some(Instant::now());
         }
@@ -317,6 +358,16 @@ impl eframe::App for ShellApp {
                     None => "health: unknown",
                 };
                 ui.label(health);
+                // Always-visible taint badge: reflects contains_untrusted over the
+                // active session's latest observation (from the events stream).
+                let taint = model.journal.taint;
+                let badge = egui::RichText::new(taint.label());
+                let badge = if taint.is_tainted() {
+                    badge.color(egui::Color32::from_rgb(220, 50, 50)).strong()
+                } else {
+                    badge
+                };
+                ui.label(badge);
             });
             ui.horizontal(|ui| {
                 ui.label("new tab URL:");
@@ -370,6 +421,12 @@ impl eframe::App for ShellApp {
                     if ui.button("Refresh page").clicked() {
                         pending = Some(UiAction::RefreshScreenshot);
                     }
+                    // Set-of-marks overlay toggle; the flip re-requests the image
+                    // on the next screenshot refresh (marks_overlay is on the model).
+                    let mut marks = model.marks_overlay;
+                    if ui.checkbox(&mut marks, "set-of-marks").changed() {
+                        pending = Some(UiAction::ToggleMarks);
+                    }
                 });
                 ui.label(&tab.status);
             }
@@ -383,6 +440,7 @@ impl eframe::App for ShellApp {
         }
 
         self.show_page_state(ui);
+        self.show_agent_journal(ui);
 
         // Keep the poll cadence alive even when the user is idle.
         ui.ctx().request_repaint_after(self.poll_interval);

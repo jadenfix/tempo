@@ -8730,6 +8730,7 @@ dependencies = [
  "tempo-headless",
  "tempo-mcp",
  "tempo-schema",
+ "tempo-taint",
  "thiserror 2.0.18",
 ]
 

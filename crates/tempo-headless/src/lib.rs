@@ -35,6 +35,12 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::Duration;
 use tempo_agent::{StepTriple, StepTripleOutcome};
+// Re-exported so consumers of `TempodSessionEventKind::StepTriple` (e.g. the
+// shell agent panel) can name the event payload without a direct tempo-agent dep.
+pub use tempo_agent::{
+    IdempotencyKey as SessionStepKey, StepTriple as SessionStepTriple,
+    StepTripleOutcome as SessionStepOutcome,
+};
 use tempo_bidi::{
     browsing_context_load, network_before_request_sent, network_response_completed, BidiErrorCode,
     BidiEventMethod, BidiMessage, BidiRouter, BrowsingContextId, BrowsingContextInfo,
