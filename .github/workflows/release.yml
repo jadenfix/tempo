@@ -1,0 +1,63 @@
+name: release
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-14
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@a75363d06101555fc97c6c7e1e65670b99104d98
+      - name: Build release binaries
+        run: cargo build --release --locked -p tempo-headless -p tempo-cli
+      - name: Smoke-test binaries
+        run: |
+          target/release/tempod --help >/dev/null 2>&1
+          target/release/tempo-cli --help >/dev/null 2>&1
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME:-dev}"
+          staging="tempo-${version}-${{ matrix.target }}"
+          mkdir -p "$staging"
+          cp target/release/tempod target/release/tempo-cli "$staging/"
+          cp README.md LICENSE "$staging/"
+          tar czf "$staging.tar.gz" "$staging"
+          shasum -a 256 "$staging.tar.gz" > "$staging.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tempo-${{ matrix.target }}
+          path: tempo-*.tar.gz*
+          if-no-files-found: error
+
+  # Single publish step so the two matrix builds never race to create the
+  # same release (a known intermittent-422 failure mode).
+  publish:
+    if: github.event_name == 'push'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
+        with:
+          files: |
+            tempo-*.tar.gz
+            tempo-*.tar.gz.sha256

@@ -120,6 +120,8 @@ Layer → crate → responsibility (beater reuse in italics).
 - `tempo-mcp` — tempo *as* an MCP server: tools `observe / act / fork / extract / screenshot / handshake` (spec pattern from *`beater.js/crates/beater-runtime/src/mcp.rs`*).
 - `tempo-bidi` — WebDriver BiDi subset endpoint (session, browsingContext, script, network events) mapped onto DriverTrait v2 — standard-tooling interop without waiting on upstream Servo WebDriver conformance.
 - `tempo-toolexec` — sandboxed tool exec bridge to *beatbox* (wasmtime/python/js/exec lanes, fs/net/env policies, double-jail) for downloads, file ops, post-extraction compute.
+- `tempo-telemetry` — the observability backbone: process-wide metrics registry (counters/gauges/histograms with p50/p95), Prometheus text exposition served by tempod at `GET /metrics`, JSON snapshots for budget gates, and structured JSON-lines logging with a bounded ring buffer. Zero external deps beyond serde; histogram buckets align with the §10 latency budget bars so CI reads budgets off the exposition directly.
+- `tempo-config` — layered, validated configuration: defaults → JSON config file → `TEMPO_*` env (CLI flags apply on top). Strict unknown-key rejection, typed per-variable errors, and the canonical documented registry of every environment variable the binaries honor.
 
 **L6 — Shells & binaries**
 - `tempo-shell` (bin `tempo`) — the windowed human browser: winit + egui/wgpu chrome (tabs, omnibox, agent panel, confirm dialogs, taint/policy indicators, set-of-marks debug view). Hosts foreground WebViews in-proc and registers them with tempod as drivable surfaces, so human and agent share one session. servoshell + Verso are the reference.
@@ -365,6 +367,8 @@ tempo is not just a faster automation target — it is designed so the capabilit
 | `tempo-toolexec` | round-trips `execute()` + async job to a live `beatboxd`; **the taint⋈sandbox test** proves a tainted transform runs with `net:Deny`+`secrets:[]` and cannot reach a canary exfil endpoint; maps `ExecutionResult` → StepOutcome/audit; `Denied` → step error |
 | `tempo-shell` | renders a real site via vanilla libservo; human can browse (tabs/omnibox/back-forward); **agent-in-shared-session works** (watch agent drive, take over, hand back); confirm dialogs fire on Send/Purchase/Delete; taint indicator visible |
 | `tempo-headless` (tempod) | session pool create/list/adopt/kill over HTTP+MCP; OTLP export of every StepTriple; supervises engine hosts; graceful drain |
+| `tempo-telemetry` | registry + exposition proven by tests (labels, histograms, quantiles, poisoned-lock survival); `/metrics` served behind the origin guard; route labels provably bounded-cardinality; structured log events replace bare `eprintln!` in the daemon |
+| `tempo-config` | precedence (defaults < file < env) proven by tests; unknown config keys rejected; every env var is a documented constant; validation errors name the field/variable and the expected format |
 | `tempo-evals` / `tempo-compat` | eval suites run in CI with regression gates; nightly top-1k scorecard emits the per-origin lane table + fallback-rate; injection corpus gate is wired (§8.2 M5) |
 
 ### 8.2 Milestone gates (evidence required to claim each)
@@ -415,6 +419,30 @@ Team-shape risk (only E2/E3 deep in Servo) is mitigated structurally by contract
 - **Security CI.** Indirect-injection page corpus **must produce zero unconfirmed Send/Purchase/Delete**; SSRF probe suite; property tests on the policy gate; replay-determinism checks on cassettes.
 
 ---
+
+## 11. Infrastructure & operational readiness (living addendum)
+
+The sections above describe the destination; this section tracks the *operational substrate* — the unglamorous infrastructure that decides whether tempo can actually be run as a fleet, forked by outsiders, and optimized with evidence instead of guesses. Updated as gaps close (last update: 2026-07-04).
+
+### 11.1 What the substrate provides (with the paired observability/config PR)
+
+- **Observability** (`tempo-telemetry`): Prometheus exposition at `GET /metrics` (origin-guarded, scraper-friendly), request/latency instrumentation at tempod's HTTP funnel with bounded-cardinality route labels, uptime/build/active-session/draining gauges, and structured JSON-lines logging with an in-memory ring. Histogram buckets are aligned with the §10 budget bars so budget regressions are readable straight off the exposition.
+- **Configuration** (`tempo-config`): one documented, validated, layered surface (defaults → JSON file → `TEMPO_*` env) replacing scattered env reads; strict unknown-key rejection so typos fail at startup, not silently.
+- **Performance floor**: criterion benchmark harness across the hot paths (merged) plus a shipping profile (thin LTO, codegen-units=1, stripped) so release binaries and benches measure what users run.
+- **Forkability & governance**: LICENSE (Apache-2.0, matching the long-declared workspace license), CONTRIBUTING (invariants + CI gates + multi-agent conventions), SECURITY (scope ordered by §2's threat model), `cargo-deny` supply-chain CI (advisories/bans/sources/licenses), and a tag-triggered release pipeline producing checksummed macOS/Linux binaries. tempo builds standalone from a fresh clone — beater reuse is rev-pinned git deps, not sibling-path coupling.
+
+### 11.2 Recently landed adjacent work (context, not duplicated here)
+
+The 2026-07-04 wave merged: per-session concurrent dispatch in tempod (#305), remote-bind bearer auth (#276), journal WAL mode (#304), privacy redaction across net/observe (#268), agent budget/replay guards (#269), and the perf chain — criterion harness (#302), observe-pipeline allocation cuts (#309), cassette/origin-rule indexing (#310), transport framing/syscall reduction (#311), CDP page-settled sampling (#312). The paired observability PR wires `TempodConfig` into tempod (defaults < file < env < flags), so config adoption is no longer a gap.
+
+### 11.3 Next most-critical gaps (ranked)
+
+1. **Session admission control** — the pool is an unbounded map; `limits.max_sessions` + idle eviction from `tempo-config` should now be enforced at create/adopt (unblocked: #305's dispatch rework has landed).
+2. **Readiness vs liveness** — `/health` is liveness only; a readiness probe should reflect drain state and engine-host health so fleet load-balancers stop routing before drain completes.
+3. **Engine-host restart backoff** — restart-on-exit is immediate today; a crash-looping engine needs exponential backoff + a `tempo-telemetry` counter so loops are visible, not silent.
+4. **Structured logging adoption** — the daemon's remaining `eprintln!` sites and the engine-host/net crates should emit `tempo-telemetry` events so fleet operators get one log shape.
+5. **Budget gates on live telemetry** — CI budget evaluators (§10) should consume `tempo-telemetry` JSON snapshots from eval runs, closing the loop between the exposition and the §8.2 milestone evidence.
+6. **Host-header validation on control routes** — the loopback-Origin guard alone does not stop a DNS-rebinding page issuing *same-origin* fetches (which carry no Origin header); control routes should also require a loopback/expected Host.
 
 ## Appendix — key beater files reused
 
