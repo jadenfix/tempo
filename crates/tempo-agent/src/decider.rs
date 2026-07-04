@@ -1020,17 +1020,16 @@ impl AgentRunner {
     /// reconstruct the full observation locally, instead of paying a full
     /// re-observe. This shrinks the post-action re-observation (only the delta
     /// crosses the driver transport) without changing what the consumers see:
-    /// [`reconstruct_observation`] rebuilds the element set exactly and carries
-    /// the URL/marks forward, which is equivalent to a full observe precisely
-    /// because a same-document action cannot change the origin (the browser's
-    /// same-origin history invariant) — so the recomputed policy origin is
-    /// unchanged.
+    /// [`reconstruct_observation`] rebuilds a byte-equivalent observation, or
+    /// declines (and we full-observe) when it cannot.
     ///
     /// Correctness gates (any failure falls back to a full `observe()`):
-    ///   * navigating actions (`Goto`/`Click`/`Skill`) always full-observe — a
-    ///     diff carries no URL, so the post-navigation origin must be read fresh;
-    ///   * a diff that was not computed against our exact base, or that a page
-    ///     with a set-of-marks overlay cannot reproduce, is rejected by
+    ///   * navigating actions (`Goto`/`Click`/`Type`/`Select`/`Skill`) always
+    ///     full-observe — a diff carries no URL, and `Type`/`Select` can trigger
+    ///     an input/`onchange` navigation, so the post-action origin (#254) and
+    ///     URL-keyed takeover detection (#343) must read the URL fresh;
+    ///   * a diff that adds an element, was not computed against our exact base,
+    ///     or that a marked page cannot reproduce is declined by
     ///     [`reconstruct_observation`] and full-observed instead.
     async fn reobserve_after_action<D>(
         &self,
@@ -1097,19 +1096,28 @@ impl AgentRunner {
 /// Whether executing `action` can cause a cross-document navigation, i.e. move
 /// the page to a new URL/origin.
 ///
-/// Only these actions force a full post-action re-observe (#235): an
+/// These actions force a full post-action re-observe (#235): an
 /// [`ObservationDiff`] carries element deltas + `seq` but not the URL, and the
-/// tracked policy origin (#254 taint / policy gating) is derived from
-/// `observation.url`. Same-document actions cannot change the origin — the
-/// browser only permits same-origin history mutation — so their post-action URL
-/// is unchanged and a diff-based reconstruction is equivalent to a full observe.
-/// `Skill` is included defensively: the decided loop rejects skills before they
-/// execute, so it never reaches the post-action re-observe.
+/// tracked policy origin (#254 taint / policy gating) plus the URL-keyed
+/// takeover detection (#343) both read `observation.url`. A diff that carries a
+/// stale URL would recompute the origin against the *old* page — a silent policy
+/// bypass — so anything that can navigate must read the URL fresh.
+///
+/// `Type` and `Select` are treated as navigating: a `<select onchange>`
+/// jump-menu or an input handler can assign `location`, swapping the document
+/// cross-origin, and a content diff cannot reveal that. Only genuinely
+/// same-document actions (`Scroll`/`Wait`/`Extract`) take the diff path.
+/// `Skill` is rejected by the decided loop before it executes, so it never
+/// reaches the post-action re-observe; it is listed defensively.
 fn action_may_navigate(action: &Action) -> bool {
-    matches!(
-        action,
-        Action::Goto { .. } | Action::Click { .. } | Action::Skill { .. }
-    )
+    match action {
+        Action::Goto { .. }
+        | Action::Click { .. }
+        | Action::Type { .. }
+        | Action::Select { .. }
+        | Action::Skill { .. } => true,
+        Action::Scroll { .. } | Action::Wait { .. } | Action::Extract { .. } => false,
+    }
 }
 
 /// Rebuild the full post-action observation from the pre-action observation
@@ -1117,30 +1125,50 @@ fn action_may_navigate(action: &Action) -> bool {
 /// cannot be applied equivalently to a full re-observe (so the caller falls back
 /// to a full `observe()`).
 ///
-/// Equivalence argument. Elements are identified by stable `NodeId`, so applying
-/// `removed`/`changed`/`added` to `base.elements` reproduces the engine's current
-/// element set with its current per-element content exactly — this is the inverse
-/// of the engine's diff. `seq` is taken from the diff; `url`, `marks`, and
-/// `schema_version` are carried from `base`. The caller only takes this path for
-/// same-document actions, so the URL (hence the policy origin, #254) is unchanged;
-/// and the takeover detector (#343) and taint recomputation both read the element
-/// set / URL, which are preserved. Surviving elements keep their base order and
-/// additions are appended, a deterministic order the order-insensitive consumers
-/// do not depend on.
+/// Equivalence argument. A driver's `observe` lays elements out in an engine
+/// order (document order for the live CDP/servo engines) that a *content* diff
+/// does not carry: [`ObservationDiff`] names which `NodeId`s were added/removed
+/// and which elements changed, but not *where* an addition sits. So a local
+/// reconstruction is only byte-equivalent to a full observe when it never has to
+/// place an element:
+///   * `removed` — dropping elements never reorders the survivors under any order
+///     that is stable under deletion (document and rank order both are);
+///   * `changed` — a same-`NodeId` content update is applied in place, so the
+///     element keeps its position (a DOM attribute change does not move a node);
+///   * `added` — an addition has no recoverable position, so a non-empty `added`
+///     set forces the fallback below. This is the fix for the tail-append bug:
+///     appending additions at the end diverges from a full observe that inserts
+///     them at their natural position (and a real engine emits `added` in
+///     hash-map, not document, order).
+///
+/// With `added` empty, the reconstructed vector is exactly the survivors of
+/// `base.elements` (content-updated in place) in their original order — what a
+/// full observe of the same page yields. `seq` comes from the diff; `url`,
+/// `marks`, and `schema_version` are carried from `base`, unchanged because the
+/// caller only takes this path for same-document actions (URL/origin #254) whose
+/// pages produce empty marks (guarded). The takeover detector (#343) and taint
+/// recomputation read this preserved element set / URL.
 ///
 /// Fallback conditions (return `None`):
 ///   * `diff.since_seq != base.seq` — the diff was not computed against our base
 ///     (a stale/evicted base or a diff-unsupported engine), so applying it is
 ///     unsound;
+///   * `!diff.added.is_empty()` — an addition's position is not recoverable from
+///     the diff, so a full observe is required to place it;
 ///   * the delta is structurally inconsistent with `base` (a `changed`/`removed`
-///     node absent from `base`, or an `added` node already present) — again a
-///     sign the diff was taken against a different base;
+///     node absent from `base`) — a sign the diff was taken against a different
+///     base;
 ///   * `base` carries a set-of-marks overlay, which the diff cannot reproduce.
 fn reconstruct_observation(
     base: &CompiledObservation,
     diff: &ObservationDiff,
 ) -> Option<CompiledObservation> {
     if diff.since_seq != base.seq {
+        return None;
+    }
+    // An addition has no recoverable position in `base`'s element order, so it
+    // cannot be placed to match a full observe: fall back rather than guess.
+    if !diff.added.is_empty() {
         return None;
     }
     // A diff carries no set-of-marks overlay; only reconstruct when there is
@@ -1169,13 +1197,6 @@ fn reconstruct_observation(
     {
         return None;
     }
-    if diff
-        .added
-        .iter()
-        .any(|element| base_ids.contains(element.node_id.0.as_str()))
-    {
-        return None;
-    }
 
     let changed: std::collections::HashMap<&str, &tempo_schema::InteractiveElement> = diff
         .changed
@@ -1183,7 +1204,7 @@ fn reconstruct_observation(
         .map(|element| (element.node_id.0.as_str(), element))
         .collect();
 
-    let mut elements = Vec::with_capacity(base.elements.len() + diff.added.len());
+    let mut elements = Vec::with_capacity(base.elements.len());
     for element in &base.elements {
         let id = element.node_id.0.as_str();
         if removed.contains(id) {
@@ -1194,7 +1215,6 @@ fn reconstruct_observation(
             None => elements.push(element.clone()),
         }
     }
-    elements.extend(diff.added.iter().cloned());
 
     Some(CompiledObservation {
         schema_version: base.schema_version.clone(),
@@ -2335,9 +2355,12 @@ mod tests {
         element
     }
 
-    fn captcha_element() -> tempo_schema::InteractiveElement {
+    /// A CAPTCHA widget carrying the given `NodeId`, so a test can make an
+    /// existing element *change into* a challenge (a same-`NodeId` diff `changed`
+    /// entry) rather than appear as a new node.
+    fn captcha_with_id(id: &str) -> tempo_schema::InteractiveElement {
         tempo_schema::InteractiveElement {
-            node_id: NodeId("captcha".into()),
+            node_id: NodeId(id.into()),
             role: "iframe".into(),
             name: vec![tempo_schema::TaintSpan {
                 provenance: tempo_schema::Provenance::Page,
@@ -2349,10 +2372,24 @@ mod tests {
         }
     }
 
+    // `Scroll`/`Wait` are same-document, so they take the diff path; `Type` and
+    // `Select` are navigating (they can trigger an `onchange`/input redirect), so
+    // they always full-observe.
+    fn scroll_action() -> Action {
+        Action::Scroll { x: 0.0, y: 200.0 }
+    }
+
     fn type_action(node: &str) -> Action {
         Action::Type {
             node: NodeId(node.into()),
             text: "hello".into(),
+        }
+    }
+
+    fn select_action(node: &str) -> Action {
+        Action::Select {
+            node: NodeId(node.into()),
+            value: "jump".into(),
         }
     }
 
@@ -2369,6 +2406,9 @@ mod tests {
         pages: VecDeque<Vec<tempo_schema::InteractiveElement>>,
         history: std::collections::HashMap<u64, CompiledObservation>,
         reject_diff: bool,
+        /// When set, the next `act` navigates the page to this URL — models a
+        /// `<select onchange=location=…>` / input-handler redirect.
+        navigate_on_act: Option<String>,
         calls: Arc<Mutex<Vec<&'static str>>>,
     }
 
@@ -2385,8 +2425,18 @@ mod tests {
                 pages: pages.into(),
                 history: std::collections::HashMap::new(),
                 reject_diff,
+                navigate_on_act: None,
                 calls: Arc::new(Mutex::new(Vec::new())),
             }
+        }
+
+        /// A real engine lays elements out in a canonical (here, `node_id`) order
+        /// that a *content* diff does not carry, so a newly added element lands
+        /// in the middle — not at the tail a naive reconstruction would append to.
+        fn ordered_elements(&self) -> Vec<tempo_schema::InteractiveElement> {
+            let mut elements = self.elements.clone();
+            elements.sort_by(|left, right| left.node_id.0.cmp(&right.node_id.0));
+            elements
         }
 
         fn snapshot(&mut self) -> CompiledObservation {
@@ -2394,7 +2444,7 @@ mod tests {
                 schema_version: tempo_schema::SCHEMA_VERSION.into(),
                 url: self.url.clone(),
                 seq: self.seq,
-                elements: self.elements.clone(),
+                elements: self.ordered_elements(),
                 marks: vec![],
             };
             self.history
@@ -2512,6 +2562,9 @@ mod tests {
             if let Some(next) = self.pages.pop_front() {
                 self.elements = next;
             }
+            if let Some(url) = self.navigate_on_act.take() {
+                self.url = url;
+            }
             self.seq += 1;
             let _ = self.snapshot();
             Ok(tempo_driver::StepOutcome::Applied {
@@ -2583,23 +2636,28 @@ mod tests {
             .collect()
     }
 
-    /// (a) Equivalence: a decided run that reconstructs from `observe_diff`
-    /// journals byte-identical observations and decisions to one forced onto the
-    /// full-observe fallback, over the same scripted multi-step page script.
+    /// (a) Equivalence, non-circular: the driver lays elements out in a canonical
+    /// order like a real engine, so a step that adds an element would be
+    /// mis-ordered by a tail-append reconstruction. A run that reconstructs from
+    /// `observe_diff` on the diff-safe (change-only) step must still journal
+    /// byte-identical observations and decisions to one forced onto full observe,
+    /// and must fall back — not reconstruct — on the add step.
     #[tokio::test]
     async fn decided_incremental_observe_matches_full_observe() -> TestResult {
-        // Two same-document (`Type`) steps: element mutates, then one is added.
+        // Step 1 changes "b" (diff-safe). Step 2 adds "a", which sorts *before*
+        // "b" in the canonical order, so a tail-append would produce ["b","a"]
+        // while a full observe yields ["a","b"]: the add step must full-observe.
         let script = || {
             (
-                vec![el("a", 0.9)],
+                vec![el("b", 0.9)],
                 vec![
-                    vec![el("a", 0.5)],               // step 1: change rank of "a"
-                    vec![el("a", 0.5), el("b", 0.7)], // step 2: add "b"
+                    vec![el("b", 0.5)],               // step 1: change "b"
+                    vec![el("a", 0.5), el("b", 0.5)], // step 2: add "a" (sorts first)
                 ],
             )
         };
-        let batches = || vec![vec![type_action("a")], vec![type_action("a")], vec![]];
-        let spec = DecidedTaskSpec::new("https://example.com", "fill the form");
+        let batches = || vec![vec![scroll_action()], vec![scroll_action()], vec![]];
+        let spec = DecidedTaskSpec::new("https://example.com", "settle the page");
 
         let (root_inc, journal_inc) = journal_root("incremental-observe-inc")?;
         let (init, pages) = script();
@@ -2621,9 +2679,20 @@ mod tests {
             .await?;
         let full_entries = read_journal_entries(&journal_full)?;
 
-        // The reconstructed observations equal the full-observe ones.
+        // The add step's observation must contain "a" *before* "b" — the proof
+        // the reconstruction did not tail-append.
+        let inc_obs = observation_events(&inc_entries);
+        let last = inc_obs.last().ok_or("no observation journaled")?;
+        let ids: Vec<&str> = last.elements.iter().map(|e| e.node_id.0.as_str()).collect();
         assert_eq!(
-            observation_events(&inc_entries),
+            ids,
+            vec!["a", "b"],
+            "add step was mis-ordered (tail-appended)"
+        );
+
+        // Reconstructed observations and decisions match the full-observe run.
+        assert_eq!(
+            inc_obs,
             observation_events(&full_entries),
             "reconstructed observations diverged from full observe"
         );
@@ -2633,8 +2702,8 @@ mod tests {
             "decisions diverged"
         );
 
-        // The incremental run actually took the diff path and paid fewer full
-        // observes than the forced-fallback run.
+        // The change-only step took the diff path, so the incremental run paid
+        // fewer full observes than the forced-fallback run.
         let inc_calls = inc_calls.lock().map_err(|_| "poisoned")?.clone();
         let full_calls = full_calls.lock().map_err(|_| "poisoned")?.clone();
         assert!(
@@ -2653,20 +2722,23 @@ mod tests {
         Ok(())
     }
 
-    /// (c) A CAPTCHA that appears as a diff `added` element after a same-document
-    /// action is still detected: the takeover detector runs on the reconstructed
-    /// observation, so the run hard-pauses without a full re-observe.
+    /// (b/c) A CAPTCHA that an existing element turns into (a same-`NodeId`
+    /// `changed` diff entry, which stays on the diff path) is still detected: the
+    /// takeover detector runs on the reconstructed observation, so the run
+    /// hard-pauses through the diff path without a full re-observe.
     #[tokio::test]
     async fn decided_incremental_observe_still_detects_takeover_mid_run() -> TestResult {
         let (root, journal) = journal_root("incremental-observe-takeover")?;
+        // "frame" starts benign, then becomes a reCAPTCHA in place (changed, not
+        // added) so the diff path carries it.
         let mut driver = DiffDriver::new(
-            vec![el("a", 0.9)],
-            vec![vec![el("a", 0.9), captcha_element()]],
+            vec![el("frame", 0.9)],
+            vec![vec![captcha_with_id("frame")]],
             false,
         );
         let calls = Arc::clone(&driver.calls);
-        let mut decider = ScriptedDecider::new(vec![vec![type_action("a")], vec![]]);
-        let spec = DecidedTaskSpec::new("https://example.com", "type then stop");
+        let mut decider = ScriptedDecider::new(vec![vec![scroll_action()], vec![]]);
+        let spec = DecidedTaskSpec::new("https://example.com", "scroll then stop");
 
         let report = AgentRunner::new(&journal, AgentRunIds::new("run-tk", "session-tk"))
             .run_decided_task(&mut driver, &mut decider, &spec)
@@ -2676,7 +2748,7 @@ mod tests {
             return Err(format!("expected HumanTakeoverRequired, got {:?}", report.status).into());
         };
         assert_eq!(takeover.kind, tempo_schema::TakeoverKind::Captcha);
-        // The takeover was surfaced from the diff path, not a full re-observe.
+        // Surfaced from the diff path (no fallback full observe was needed).
         let calls = calls.lock().map_err(|_| "poisoned")?.clone();
         assert!(calls.contains(&"observe_diff"));
 
@@ -2684,9 +2756,42 @@ mod tests {
         Ok(())
     }
 
+    /// A navigating `Select`/`Type` (an `onchange`/input redirect) must take the
+    /// full-observe path so the post-action origin is recomputed from the FRESH
+    /// URL — never carried stale from a diff (which would gate the next action
+    /// against the wrong origin, a silent policy bypass, and miss URL-keyed
+    /// takeover detection).
+    #[tokio::test]
+    async fn decided_navigating_select_full_observes_fresh_url() -> TestResult {
+        let (root, journal) = journal_root("incremental-observe-navigate")?;
+        let mut driver = DiffDriver::new(vec![el("sel", 0.9)], vec![], false);
+        // The Select navigates cross-origin; the page's elements do not change,
+        // so a diff would be empty and (if wrongly taken) carry the old URL.
+        driver.navigate_on_act = Some("https://evil.example.net/".into());
+        let mut decider = ScriptedDecider::new(vec![vec![select_action("sel")], vec![]]);
+        let spec = DecidedTaskSpec::new("https://example.com", "select a jump menu");
+
+        AgentRunner::new(&journal, AgentRunIds::new("run-nav", "session-nav"))
+            .run_decided_task(&mut driver, &mut decider, &spec)
+            .await?;
+
+        let entries = read_journal_entries(&journal)?;
+        let last = observation_events(&entries)
+            .pop()
+            .ok_or("no observation journaled")?;
+        assert_eq!(
+            last.url, "https://evil.example.net/",
+            "post-navigation observation carried a stale URL (origin not recomputed)"
+        );
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
     /// (d) Overlap/ordering: effects are never reordered by the incremental path
     /// and each decision is made on the recorded (settled) observation. Two
-    /// identical runs also produce byte-identical journals (determinism).
+    /// identical runs also produce byte-identical journals (determinism). Both
+    /// steps here are change-only, so they exercise the diff path.
     #[tokio::test]
     async fn decided_incremental_observe_preserves_effect_ordering() -> TestResult {
         let run = |label: String| async move {
@@ -2694,11 +2799,11 @@ mod tests {
             let (root, journal) = journal_root(&label)?;
             let mut driver = DiffDriver::new(
                 vec![el("a", 0.9)],
-                vec![vec![el("a", 0.5)], vec![el("a", 0.5), el("b", 0.7)]],
+                vec![vec![el("a", 0.5)], vec![el("a", 0.2)]],
                 false,
             );
             let mut decider =
-                ScriptedDecider::new(vec![vec![type_action("a")], vec![type_action("a")], vec![]]);
+                ScriptedDecider::new(vec![vec![scroll_action()], vec![scroll_action()], vec![]]);
             AgentRunner::new(&journal, AgentRunIds::new(&label, &label))
                 .run_decided_task(&mut driver, &mut decider, &spec)
                 .await?;
@@ -2758,24 +2863,24 @@ mod tests {
     }
 
     #[test]
-    fn reconstruct_observation_inverts_a_consistent_diff() {
+    fn reconstruct_observation_inverts_a_change_and_remove_diff() {
         let base = CompiledObservation {
             schema_version: tempo_schema::SCHEMA_VERSION.into(),
             url: "https://example.com/".into(),
             seq: 4,
-            elements: vec![el("a", 0.9), el("b", 0.5)],
+            elements: vec![el("a", 0.9), el("b", 0.5), el("c", 0.3)],
             marks: vec![],
         };
-        // Change "a", remove "b", add "c".
+        // Change "a" in place, remove "b" — no additions, so order is preserved.
         let diff = ObservationDiff {
             since_seq: 4,
             seq: 5,
-            added: vec![el("c", 0.7)],
+            added: vec![],
             removed: vec![NodeId("b".into())],
             changed: vec![el("a", 0.2)],
         };
         let Some(rebuilt) = reconstruct_observation(&base, &diff) else {
-            panic!("consistent diff must reconstruct");
+            panic!("change/remove diff must reconstruct");
         };
         assert_eq!(rebuilt.seq, 5);
         assert_eq!(rebuilt.url, base.url);
@@ -2784,6 +2889,7 @@ mod tests {
             .iter()
             .map(|e| e.node_id.0.as_str())
             .collect();
+        // Survivors keep their original order; "a" stays first with new content.
         assert_eq!(ids, vec!["a", "c"]);
         assert_eq!(rebuilt.elements[0].rank, 0.2, "changed content not applied");
     }
@@ -2813,7 +2919,17 @@ mod tests {
             }
         )
         .is_none());
-        // "no base" full-add: an added node already present in the base.
+        // ANY addition forces the fallback: an addition has no recoverable
+        // position, so it must not be tail-appended (Blocker 1). This holds for a
+        // brand-new node and for the "no base" full-add shape alike.
+        assert!(reconstruct_observation(
+            &base,
+            &ObservationDiff {
+                added: vec![el("new", 0.9)],
+                ..ok.clone()
+            }
+        )
+        .is_none());
         assert!(reconstruct_observation(
             &base,
             &ObservationDiff {
@@ -2848,20 +2964,19 @@ mod tests {
     }
 
     #[test]
-    fn only_navigating_actions_force_full_observe() {
+    fn navigation_capable_actions_force_full_observe() {
+        // Navigating: read the URL fresh (Type/Select can trigger a redirect).
         assert!(action_may_navigate(&click("x")));
         assert!(action_may_navigate(&Action::Goto {
             url: "https://e.com".into()
         }));
+        assert!(action_may_navigate(&type_action("x")));
+        assert!(action_may_navigate(&select_action("x")));
         assert!(action_may_navigate(&Action::Skill {
             name: "s".into(),
             input: serde_json::Value::Null
         }));
-        assert!(!action_may_navigate(&type_action("x")));
-        assert!(!action_may_navigate(&Action::Select {
-            node: NodeId("x".into()),
-            value: "v".into()
-        }));
+        // Same-document: eligible for the diff path.
         assert!(!action_may_navigate(&Action::Scroll { x: 0.0, y: 1.0 }));
         assert!(!action_may_navigate(&Action::Wait { millis: 1 }));
         assert!(!action_may_navigate(&Action::Extract {
