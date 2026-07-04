@@ -40,6 +40,7 @@ const RESPONSE_TOO_LARGE_ERROR_CODE: i64 = -32003;
 /// The targeted driver (root or fork) is owned by another in-flight tool call
 /// and was not returned within [`DRIVER_LEASE_TIMEOUT`].
 const DRIVER_BUSY_ERROR_CODE: i64 = -32004;
+const TOOL_TEXT_SUMMARY_MAX_CHARS: usize = 240;
 /// Upper bound on concurrently live forked drivers per session. Forks each hold a
 /// live browser context/target for real engines, so refuse to accumulate beyond
 /// this cap and require the client to `close_fork` before creating more.
@@ -766,12 +767,11 @@ where
                                 MAX_PROTOCOL_RESPONSE_BYTES,
                             ));
                         }
-                        Ok(ToolCall::success(json!({
-                            "mime_type": "image/png",
-                            "encoding": "base64",
-                            "set_of_marks": args.set_of_marks,
-                            "data": base64::engine::general_purpose::STANDARD.encode(bytes),
-                        })))
+                        Ok(ToolCall::image(
+                            "image/png",
+                            args.set_of_marks,
+                            base64::engine::general_purpose::STANDARD.encode(bytes),
+                        ))
                     }
                     Err(error) => Ok(ToolCall::error(error.to_string())),
                 }
@@ -969,7 +969,7 @@ pub fn tools() -> Vec<ToolDescriptor> {
         },
         ToolDescriptor {
             name: "screenshot",
-            description: "Capture a PNG screenshot as base64.",
+            description: "Capture a PNG screenshot as MCP image content.",
             input_schema: object_schema(
                 vec![
                     ("set_of_marks", json!({"type": "boolean"})),
@@ -1034,13 +1034,6 @@ impl JsonRpcError {
         }
     }
 
-    fn response_too_large(message: impl Into<String>) -> Self {
-        Self {
-            code: RESPONSE_TOO_LARGE_ERROR_CODE,
-            message: message.into(),
-        }
-    }
-
     fn driver_busy(message: impl Into<String>) -> Self {
         Self {
             code: DRIVER_BUSY_ERROR_CODE,
@@ -1053,20 +1046,43 @@ impl JsonRpcError {
 struct ToolCall {
     is_error: bool,
     structured_content: Value,
+    content: Vec<Value>,
 }
 
 impl ToolCall {
     fn success(value: Value) -> Self {
+        let summary = tool_content_summary(&value);
         Self {
             is_error: false,
             structured_content: value,
+            content: vec![text_content_block(summary)],
         }
     }
 
     fn error(message: impl Into<String>) -> Self {
+        let message = message.into();
         Self {
             is_error: true,
-            structured_content: json!({"error": message.into()}),
+            structured_content: json!({"error": message.clone()}),
+            content: vec![text_content_block(format!(
+                "error: {}",
+                truncate_summary(&message)
+            ))],
+        }
+    }
+
+    fn image(mime_type: &'static str, set_of_marks: bool, data: String) -> Self {
+        Self {
+            is_error: false,
+            structured_content: json!({
+                "mime_type": mime_type,
+                "set_of_marks": set_of_marks,
+            }),
+            content: vec![json!({
+                "type": "image",
+                "data": data,
+                "mimeType": mime_type,
+            })],
         }
     }
 
@@ -1093,10 +1109,12 @@ impl ToolCall {
                     "message": required.message(),
                 }
             }),
+            content: vec![text_content_block(required.message())],
         }
     }
 
     fn cap_error(artifact: &'static str, bytes: usize, max_bytes: usize) -> Self {
+        let message = output_cap_message(artifact, bytes, max_bytes);
         Self {
             is_error: true,
             structured_content: json!({
@@ -1105,9 +1123,10 @@ impl ToolCall {
                     "artifact": artifact,
                     "bytes": bytes,
                     "max_bytes": max_bytes,
-                    "message": output_cap_message(artifact, bytes, max_bytes),
+                    "message": message.clone(),
                 }
             }),
+            content: vec![text_content_block(message)],
         }
     }
 }
@@ -1663,20 +1682,126 @@ fn json_response_with_cap(
 }
 
 fn tool_call_json(call: ToolCall) -> Result<Value, JsonRpcError> {
-    let text = serde_json::to_string(&call.structured_content)
-        .map_err(|error| JsonRpcError::response_too_large(error.to_string()))?;
-    if text.len() > MAX_PROTOCOL_RESPONSE_BYTES {
-        return Err(JsonRpcError::response_too_large(output_cap_message(
-            "mcp_tool_content",
-            text.len(),
-            MAX_PROTOCOL_RESPONSE_BYTES,
-        )));
-    }
     Ok(json!({
-        "content": [{"type": "text", "text": text}],
+        "content": call.content,
         "structuredContent": call.structured_content,
         "isError": call.is_error,
     }))
+}
+
+fn text_content_block(text: impl Into<String>) -> Value {
+    json!({"type": "text", "text": text.into()})
+}
+
+fn tool_content_summary(value: &Value) -> String {
+    let Some(object) = value.as_object() else {
+        return match value {
+            Value::Null => "null".into(),
+            Value::Bool(value) => format!("boolean {value}"),
+            Value::Number(value) => format!("number {value}"),
+            Value::String(value) => truncate_summary(value),
+            Value::Array(values) => format!("array {} items", values.len()),
+            Value::Object(object) => format!("object fields={}", object.len()),
+        };
+    };
+
+    if let Some(error) = object.get("error") {
+        return format!("error: {}", error_summary(error));
+    }
+
+    if object.contains_key("schema_version")
+        && object.contains_key("seq")
+        && object.contains_key("elements")
+    {
+        let seq = display_json_scalar(object.get("seq"));
+        let elements = json_array_len(object.get("elements"));
+        let omitted = object.get("omitted").and_then(Value::as_u64).unwrap_or(0);
+        return format!("observation seq={seq}, elements={elements}, omitted={omitted}");
+    }
+
+    if object.contains_key("since_seq")
+        && object.contains_key("seq")
+        && object.contains_key("added")
+        && object.contains_key("removed")
+        && object.contains_key("changed")
+    {
+        let seq = display_json_scalar(object.get("seq"));
+        return format!(
+            "observation_diff seq={seq}, added={}, changed={}, removed={}",
+            json_array_len(object.get("added")),
+            json_array_len(object.get("changed")),
+            json_array_len(object.get("removed"))
+        );
+    }
+
+    if let Some(status) = object.get("status").and_then(Value::as_str) {
+        if let Some(diff) = object.get("diff") {
+            return format!(
+                "action status={status}, diff {}",
+                tool_content_summary(diff)
+            );
+        }
+        return format!("action status={status}");
+    }
+
+    if let Some(node) = object.get("node").and_then(Value::as_str) {
+        return format!("extract node={node}, fields={}", object.len());
+    }
+
+    if let Some(driver_id) = object.get("driver_id").and_then(Value::as_str) {
+        return format!("fork driver_id={driver_id}");
+    }
+
+    if object.contains_key("lane") || object.contains_key("lane_decision") {
+        return format!("handshake fields={}", object.len());
+    }
+
+    format!("object fields={}", object.len())
+}
+
+fn error_summary(error: &Value) -> String {
+    match error {
+        Value::String(message) => truncate_summary(message),
+        Value::Object(object) => object
+            .get("message")
+            .and_then(Value::as_str)
+            .map(truncate_summary)
+            .or_else(|| {
+                object
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .map(|kind| kind.to_string())
+            })
+            .unwrap_or_else(|| format!("object fields={}", object.len())),
+        other => tool_content_summary(other),
+    }
+}
+
+fn display_json_scalar(value: Option<&Value>) -> String {
+    match value {
+        Some(Value::String(value)) => value.clone(),
+        Some(Value::Number(value)) => value.to_string(),
+        Some(Value::Bool(value)) => value.to_string(),
+        Some(Value::Null) | None => "unknown".into(),
+        Some(Value::Array(values)) => format!("array:{}", values.len()),
+        Some(Value::Object(object)) => format!("object:{}", object.len()),
+    }
+}
+
+fn json_array_len(value: Option<&Value>) -> usize {
+    value.and_then(Value::as_array).map_or(0, Vec::len)
+}
+
+fn truncate_summary(text: &str) -> String {
+    if text.chars().count() <= TOOL_TEXT_SUMMARY_MAX_CHARS {
+        return text.to_string();
+    }
+    let mut truncated = text
+        .chars()
+        .take(TOOL_TEXT_SUMMARY_MAX_CHARS.saturating_sub(3))
+        .collect::<String>();
+    truncated.push_str("...");
+    truncated
 }
 
 fn tool_descriptor_json() -> Vec<Value> {
@@ -1737,9 +1862,12 @@ fn step_outcome_json(outcome: StepOutcome) -> Value {
 
 fn step_outcome_tool_call(outcome: StepOutcome) -> ToolCall {
     let is_error = matches!(outcome, StepOutcome::StepError { .. });
+    let structured_content = step_outcome_json(outcome);
+    let summary = tool_content_summary(&structured_content);
     ToolCall {
         is_error,
-        structured_content: step_outcome_json(outcome),
+        structured_content,
+        content: vec![text_content_block(summary)],
     }
 }
 
@@ -1956,11 +2084,34 @@ mod tests {
             call_tool(&mut server, "extract", json!({"node_id": "button.primary"})).await?;
         assert_eq!(extract["node"], "button.primary");
 
-        let screenshot = call_tool(&mut server, "screenshot", json!({})).await?;
-        assert_eq!(screenshot["encoding"], "base64");
-        assert_eq!(screenshot["set_of_marks"], false);
-        let bytes = decode_base64_field(&screenshot, "data")?;
+        let screenshot = call_tool_envelope(&mut server, "screenshot", json!({})).await?;
+        let screenshot_meta = &screenshot["result"]["structuredContent"];
+        assert_eq!(screenshot_meta["mime_type"], "image/png");
+        assert_eq!(screenshot_meta["set_of_marks"], false);
+        assert!(screenshot_meta.get("data").is_none());
+        assert!(screenshot_meta.get("encoding").is_none());
+        let bytes = decode_image_content(&screenshot)?;
         assert_eq!(bytes, TEST_SCREENSHOT_PNG);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tool_result_text_content_is_summary_not_structured_payload() -> Result<(), String> {
+        let mut server = TempoMcpServer::new(MemoryDriver::new());
+        let envelope = call_tool_envelope(&mut server, "observe", json!({})).await?;
+        let result = &envelope["result"];
+        let structured = &result["structuredContent"];
+        let summary = result["content"][0]["text"]
+            .as_str()
+            .ok_or("tool result text content must be text")?;
+        let structured_json =
+            serde_json::to_string(structured).map_err(|error| error.to_string())?;
+
+        assert_eq!(result["content"][0]["type"], "text");
+        assert_eq!(summary, "observation seq=1, elements=1, omitted=0");
+        assert!(summary.len() < structured_json.len());
+        assert_ne!(summary, structured_json);
+        assert!(!summary.contains("button.primary"));
         Ok(())
     }
 
@@ -2270,14 +2421,18 @@ mod tests {
     async fn screenshot_tool_can_overlay_set_of_marks() -> Result<(), String> {
         let mut server = TempoMcpServer::new(MemoryDriver::new());
 
-        let raw = call_tool(&mut server, "screenshot", json!({})).await?;
-        let marked = call_tool(&mut server, "screenshot", json!({"set_of_marks": true})).await?;
+        let raw = call_tool_envelope(&mut server, "screenshot", json!({})).await?;
+        let marked =
+            call_tool_envelope(&mut server, "screenshot", json!({"set_of_marks": true})).await?;
 
-        assert_eq!(marked["mime_type"], "image/png");
-        assert_eq!(marked["encoding"], "base64");
-        assert_eq!(marked["set_of_marks"], true);
-        let raw_bytes = decode_base64_field(&raw, "data")?;
-        let marked_bytes = decode_base64_field(&marked, "data")?;
+        assert_eq!(
+            marked["result"]["structuredContent"]["mime_type"],
+            "image/png"
+        );
+        assert_eq!(marked["result"]["structuredContent"]["set_of_marks"], true);
+        assert!(marked["result"]["structuredContent"].get("data").is_none());
+        let raw_bytes = decode_image_content(&raw)?;
+        let marked_bytes = decode_image_content(&marked)?;
         assert!(marked_bytes.starts_with(PNG_SIGNATURE));
         assert_ne!(marked_bytes, raw_bytes);
         Ok(())
@@ -3031,6 +3186,17 @@ mod tests {
         base64::engine::general_purpose::STANDARD
             .decode(encoded)
             .map_err(|error| error.to_string())
+    }
+
+    fn decode_image_content(envelope: &Value) -> Result<Vec<u8>, String> {
+        let image = &envelope["result"]["content"][0];
+        if image["type"] != "image" {
+            return Err(format!("expected MCP image content, got {image}"));
+        }
+        if image["mimeType"] != "image/png" {
+            return Err(format!("expected image/png content, got {image}"));
+        }
+        decode_base64_field(image, "data")
     }
 
     fn serve_handshake_fixture(

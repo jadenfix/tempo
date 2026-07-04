@@ -42,12 +42,11 @@ pays tokens for — and extracts its interactive elements by parsing the *same*
 text. Both numbers come from one committed artifact, so there is no hidden
 second list to fudge.
 
-Tempo is counted the way the crate already counts observation budgets
-everywhere else: `serde_json::to_vec(&CompiledObservation).len()` (see
-`tempo-agent`'s observation byte budget and `tempo-agent::decider`, which sends
-the observation to the model as JSON). Tokens are `estimated_tokens(bytes)` =
-`~4 bytes/token`, a documented heuristic (not a real tokenizer), applied
-identically to all three formats.
+Tempo is counted as the MCP `tools/call` observation result envelope: a compact
+one-line text summary plus `structuredContent` carrying the
+`CompiledObservation`. Tokens are `estimated_tokens(bytes)` = `~4 bytes/token`,
+a documented heuristic (not a real tokenizer), applied identically to all three
+formats.
 
 ## These are hand-authored, not live captures
 
@@ -147,20 +146,19 @@ element and confirm recall falls below 1.0.
 
 ## Honesty note on the token result
 
-This is the important correction from the #361 review. Counted in the tools'
-**real compact wire formats**, tempo's `CompiledObservation` JSON is **not
-smaller — it is modestly heavier** than both baselines:
+This is the important correction from the #361/#444 reviews. Counted in the
+tools' **real compact wire formats** and Tempo's MCP result envelope, tempo is
+**not smaller — it is heavier** than both baselines:
 
 | page          | tempo (bytes/tokens) | playwright-mcp | browser-use |
 |---------------|----------------------|----------------|-------------|
-| page1-checkout| 780 / 195            | 704 / 176      | 587 / 147   |
-| page2-search  | 1236 / 309           | 1246 / 312     | 926 / 232   |
+| page1-checkout| 929 / 233            | 704 / 176      | 587 / 147   |
+| page2-search  | 1396 / 349           | 1246 / 312     | 926 / 232   |
 
-(tempo shrank from 813/1280 after `InteractiveElement.value`, `bounds`, and
-`CompiledObservation.marks` gained `skip_serializing_if` — empty/absent fields
-are no longer emitted. It remains modestly heavier than browser-use here; the
-larger per-element premium is `node_id` + provenance + `rank` + `bounds`, which
-a lean LLM-only projection would strip — see #446/#459.)
+(tempo now includes the MCP result wrapper, but no longer duplicates the full
+structured payload as escaped text. It remains heavier than browser-use here;
+the larger per-element premium is `node_id` + provenance + `rank` + `bounds`,
+which a lean LLM-only projection would strip — see #446/#459.)
 
 Why: each tempo element carries stable-handle (`node_id`), taint-provenance,
 `rank`, and `bounds` metadata that a plain aria-YAML line or a bracket-line does

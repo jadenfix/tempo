@@ -5,6 +5,7 @@
 //! per-origin lane choices, fallback rates, and typed gate violations.
 
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
@@ -1053,11 +1054,11 @@ pub struct BaselineComparison {
     pub recall: f64,
 }
 
-/// Differential report for one fixture page: tempo's compiled observation vs
-/// each recorded baseline, on both size (`tokens_per_observation`, split as
-/// `tempo`/`baselines[].tokens`) and interactive-element recall against the
-/// CDP AX tree oracle (`element_recall`, split as `tempo_recall`/
-/// `baselines[].recall`) — the two DoD metrics from #361/#241.
+/// Differential report for one fixture page: tempo's MCP observation result
+/// envelope vs each recorded baseline, on both size (`tokens_per_observation`,
+/// split as `tempo`/`baselines[].tokens`) and interactive-element recall
+/// against the CDP AX tree oracle (`element_recall`, split as
+/// `tempo_recall`/`baselines[].recall`) — the two DoD metrics from #361/#241.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DifferentialReport {
     pub page: String,
@@ -1068,8 +1069,8 @@ pub struct DifferentialReport {
 }
 
 impl DifferentialReport {
-    /// True if tempo's compiled observation is strictly smaller, by the
-    /// crate's approx-token heuristic, than every recorded baseline on this
+    /// True if tempo's MCP observation result envelope is strictly smaller, by
+    /// the crate's approx-token heuristic, than every recorded baseline on this
     /// page.
     pub fn tempo_tokens_lower_than_all_baselines(&self) -> bool {
         self.baselines
@@ -1098,9 +1099,7 @@ pub fn differential_report(
     baselines: &[BaselineSnapshot],
     oracle: &[ElementId],
 ) -> Result<DifferentialReport, EvalError> {
-    let tempo_bytes = serde_json::to_vec(tempo_obs)
-        .map_err(|source| EvalError::ObservationSerialize { source })?
-        .len() as u64;
+    let tempo_bytes = tempo_mcp_observation_envelope_bytes(tempo_obs)?;
     let tempo_elements: BTreeSet<ElementId> =
         tempo_obs.elements.iter().map(tempo_element_id).collect();
     let oracle_set: BTreeSet<ElementId> = oracle.iter().cloned().collect();
@@ -1125,6 +1124,31 @@ pub fn differential_report(
         tempo_recall,
         baselines: baseline_comparisons,
     })
+}
+
+pub fn tempo_mcp_observation_envelope_bytes(
+    observation: &CompiledObservation,
+) -> Result<u64, EvalError> {
+    let envelope = json!({
+        "content": [{
+            "type": "text",
+            "text": tempo_mcp_observation_summary(observation),
+        }],
+        "structuredContent": observation,
+        "isError": false,
+    });
+    Ok(serde_json::to_vec(&envelope)
+        .map_err(|source| EvalError::ObservationSerialize { source })?
+        .len() as u64)
+}
+
+fn tempo_mcp_observation_summary(observation: &CompiledObservation) -> String {
+    format!(
+        "observation seq={}, elements={}, omitted={}",
+        observation.seq,
+        observation.elements.len(),
+        observation.omitted
+    )
 }
 
 fn tempo_element_id(element: &InteractiveElement) -> ElementId {
@@ -2480,22 +2504,21 @@ mod tests {
     ) -> TestResult {
         // Honest, post-review result. Counted in the tools' REAL compact
         // LLM-facing wire formats (Playwright aria-YAML; browser-use
-        // bracket-lines) rather than a bloated internal JSON tree, tempo's
-        // CompiledObservation serialization is NOT smaller — it is modestly
-        // HEAVIER, because each tempo element carries stable-handle
-        // (`node_id`), taint-provenance, `rank`, and `bounds` metadata that a
-        // plain aria-YAML or bracket line does not, and that per-element
-        // premium outweighs the bytes tempo saves by emitting only the ranked
-        // task-relevant subset. tempo's 10-50x token thesis (final.md §10) is
-        // vs RAW CDP/DOM full-HTML dumps, which are not fixtured here (that
-        // comparison is deferred with the live slice, #363). See the README
-        // "Honesty note on the token result".
+        // bracket-lines) and Tempo's MCP observation result envelope, tempo is
+        // NOT smaller — it is HEAVIER, because each tempo element carries
+        // stable-handle (`node_id`), taint-provenance, `rank`, and `bounds`
+        // metadata that a plain aria-YAML or bracket line does not, and that
+        // per-element premium outweighs the bytes tempo saves by emitting only
+        // the ranked task-relevant subset. tempo's 10-50x token thesis
+        // (final.md §10) is vs RAW CDP/DOM full-HTML dumps, which are not
+        // fixtured here (that comparison is deferred with the live slice,
+        // #363). See the README "Honesty note on the token result".
         //
-        // Measured (bytes/tokens): page1 tempo 780/195 vs playwright 704/176
-        // vs browser-use 587/147; page2 tempo 1236/309 vs playwright 1246/312
-        // vs browser-use 926/232. (tempo shed the empty `"value":[]` arrays
-        // once `InteractiveElement.value` gained `skip_serializing_if` — it is
-        // still heavier than browser-use here, the honest direction below.)
+        // Measured (bytes/tokens): page1 tempo 929/233 vs playwright 704/176
+        // vs browser-use 587/147; page2 tempo 1396/349 vs playwright 1246/312
+        // vs browser-use 926/232. Tempo's MCP result wrapper no longer
+        // duplicates the full structured payload as escaped text, but the
+        // honest direction below is still that compact baselines are smaller.
         for stem in PAGES {
             let report = load_page_report(stem)?;
 
