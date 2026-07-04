@@ -1008,6 +1008,7 @@ fn run_cdp_task(config: RunCdpTaskConfig) -> Result<RunCdpTaskReport, CliError> 
         if let Some(chrome) = config.chrome {
             cdp_config = cdp_config.with_executable(chrome);
         }
+        cdp_config = cdp_config.with_no_sandbox_env_opt_in();
         let mut driver = CdpTempoDriver::launch_with(cdp_config).await?;
         if config.allow_private_network {
             driver = driver.allow_private_network_access();

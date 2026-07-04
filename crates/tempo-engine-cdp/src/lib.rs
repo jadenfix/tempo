@@ -25,6 +25,7 @@ use chromiumoxide::cdp::browser_protocol::target::{
 };
 use chromiumoxide::cdp::js_protocol::runtime::EvaluateParams;
 use chromiumoxide::error::CdpError;
+use chromiumoxide::handler::HandlerConfig;
 use chromiumoxide::page::{Page, ScreenshotParams};
 use futures::StreamExt;
 use std::collections::{BTreeMap, HashMap};
@@ -321,6 +322,7 @@ impl CdpTempoDriver {
 
     async fn snapshot(&self) -> Result<(String, String), TransportError> {
         let url = self.current_url().await?;
+        self.enforce_url_policy(&url)?;
         let dom_html = self.page()?.content().await.map_err(map_cdp_error)?;
         Ok((url, dom_html))
     }
@@ -458,7 +460,7 @@ impl CdpTempoDriver {
     }
 
     fn selector_for_node(&self, node: &NodeId) -> Option<String> {
-        grounded_selector(&self.selectors_by_node, node)
+        selector_or_legacy_fallback(&self.selectors_by_node, node)
     }
 
     async fn refresh_selector_for_node(
@@ -695,7 +697,6 @@ impl DriverTrait for CdpTempoDriver {
             return Err(TransportError::UrlBlocked);
         }
         let (final_url, dom_html) = self.snapshot().await?;
-        self.enforce_url_policy(&final_url)?;
         self.record_snapshot(final_url, dom_html).await
     }
 
@@ -760,7 +761,11 @@ impl DriverTrait for CdpTempoDriver {
         _options: BrowsingContextCreateOptions,
     ) -> Result<Box<dyn DriverTrait>, Unsupported> {
         let browser_ws = self.browser.websocket_address().clone();
-        let (browser, mut handler) = Browser::connect(browser_ws)
+        let handler_config = HandlerConfig {
+            cache_enabled: false,
+            ..HandlerConfig::default()
+        };
+        let (browser, mut handler) = Browser::connect_with_config(browser_ws, handler_config)
             .await
             .map_err(|_error| Unsupported("fresh CDP browsing context"))?;
         let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
@@ -1337,6 +1342,19 @@ fn grounded_selector(
     node: &NodeId,
 ) -> Option<String> {
     selectors_by_node.get(node).cloned()
+}
+
+fn selector_or_legacy_fallback(
+    selectors_by_node: &BTreeMap<NodeId, String>,
+    node: &NodeId,
+) -> Option<String> {
+    grounded_selector(selectors_by_node, node).or_else(|| {
+        if node.0.starts_with("node:") {
+            None
+        } else {
+            Some(node.0.clone())
+        }
+    })
 }
 
 fn extraction_found(value: &serde_json::Value) -> bool {
@@ -2255,10 +2273,18 @@ mod tests {
     }
 
     #[test]
-    fn selector_shaped_node_id_without_grounding_is_not_a_selector() {
+    fn selector_shaped_node_id_without_grounding_falls_back_for_legacy_actions() {
         let selectors = BTreeMap::new();
         assert_eq!(
             grounded_selector(&selectors, &NodeId("[id=\"save\"]".into())),
+            None
+        );
+        assert_eq!(
+            selector_or_legacy_fallback(&selectors, &NodeId("[id=\"save\"]".into())),
+            Some("[id=\"save\"]".into())
+        );
+        assert_eq!(
+            selector_or_legacy_fallback(&selectors, &NodeId("node:abc123".into())),
             None
         );
     }
