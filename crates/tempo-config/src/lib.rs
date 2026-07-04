@@ -122,6 +122,15 @@ pub struct TempodConfig {
     pub telemetry: TelemetryConfig,
 }
 
+/// CLI values that should be applied after file/env config and validated with
+/// the final effective configuration.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TempodConfigOverrides {
+    pub bind_addr: Option<String>,
+    pub engine: Option<EngineKind>,
+    pub engine_socket: Option<String>,
+}
+
 impl Default for TempodConfig {
     fn default() -> Self {
         Self {
@@ -142,17 +151,39 @@ impl TempodConfig {
         Self::load_with(file_path.as_deref().map(Path::new), &env)
     }
 
+    /// Loads from the real process environment, then applies CLI overrides
+    /// before final validation.
+    pub fn load_from_process_env_with_overrides(
+        overrides: &TempodConfigOverrides,
+    ) -> Result<Self, ConfigError> {
+        let env = |key: &str| std::env::var(key).ok();
+        let file_path = env(ENV_CONFIG_PATH);
+        Self::load_with_overrides(file_path.as_deref().map(Path::new), &env, overrides)
+    }
+
     /// Loads with an injected environment lookup (testable, hermetic).
     /// Layering: defaults → `file` (when provided) → `env`.
     pub fn load_with(
         file: Option<&Path>,
         env: &dyn Fn(&str) -> Option<String>,
     ) -> Result<Self, ConfigError> {
+        Self::load_with_overrides(file, env, &TempodConfigOverrides::default())
+    }
+
+    /// Loads with explicit top-layer overrides. CLI callers use this so a
+    /// lower-precedence env value cannot fail validation before the CLI value
+    /// that replaces it has been applied.
+    pub fn load_with_overrides(
+        file: Option<&Path>,
+        env: &dyn Fn(&str) -> Option<String>,
+        overrides: &TempodConfigOverrides,
+    ) -> Result<Self, ConfigError> {
         let mut config = match file {
             Some(path) => Self::from_file(path)?,
             None => Self::default(),
         };
-        config.apply_env(env)?;
+        config.apply_env(env, overrides)?;
+        config.apply_overrides(overrides);
         config.validate()?;
         Ok(config)
     }
@@ -169,14 +200,24 @@ impl TempodConfig {
         })
     }
 
-    fn apply_env(&mut self, env: &dyn Fn(&str) -> Option<String>) -> Result<(), ConfigError> {
-        if let Some(value) = env(ENV_BIND_ADDR) {
+    fn apply_env(
+        &mut self,
+        env: &dyn Fn(&str) -> Option<String>,
+        overrides: &TempodConfigOverrides,
+    ) -> Result<(), ConfigError> {
+        if overrides.bind_addr.is_none()
+            && let Some(value) = env(ENV_BIND_ADDR)
+        {
             self.bind_addr = value;
         }
-        if let Some(value) = env(ENV_ENGINE) {
+        if overrides.engine.is_none()
+            && let Some(value) = env(ENV_ENGINE)
+        {
             self.engine = value.parse()?;
         }
-        if let Some(value) = env(ENV_ENGINE_SOCKET) {
+        if overrides.engine_socket.is_none()
+            && let Some(value) = env(ENV_ENGINE_SOCKET)
+        {
             self.engine_socket = Some(value);
         }
         if let Some(value) = env(ENV_METRICS_ENABLED) {
@@ -193,6 +234,18 @@ impl TempodConfig {
             };
         }
         Ok(())
+    }
+
+    fn apply_overrides(&mut self, overrides: &TempodConfigOverrides) {
+        if let Some(bind_addr) = &overrides.bind_addr {
+            self.bind_addr = bind_addr.clone();
+        }
+        if let Some(engine) = overrides.engine {
+            self.engine = engine;
+        }
+        if let Some(engine_socket) = &overrides.engine_socket {
+            self.engine_socket = Some(engine_socket.clone());
+        }
     }
 
     /// Structural validation with actionable messages; run after layering.
@@ -213,6 +266,12 @@ impl TempodConfig {
             return Err(ConfigError::InvalidField {
                 field: "engine_socket",
                 reason: "must be a non-empty path when set".to_string(),
+            });
+        }
+        if self.engine == EngineKind::Servo && self.engine_socket.is_none() {
+            return Err(ConfigError::InvalidField {
+                field: "engine_socket",
+                reason: "must be set when engine is servo".to_string(),
             });
         }
         Ok(())
@@ -327,10 +386,14 @@ mod tests {
     #[test]
     fn partial_file_overlays_defaults() -> Result<(), Box<dyn std::error::Error>> {
         let file = write_config(
-            r#"{ "engine": "servo", "telemetry": { "metrics_enabled": false, "log_level": "debug" } }"#,
+            r#"{ "engine": "servo", "engine_socket": "/tmp/tempo-engine.sock", "telemetry": { "metrics_enabled": false, "log_level": "debug" } }"#,
         )?;
         let config = TempodConfig::load_with(Some(file.path()), &no_env)?;
         assert_eq!(config.engine, EngineKind::Servo);
+        assert_eq!(
+            config.engine_socket.as_deref(),
+            Some("/tmp/tempo-engine.sock")
+        );
         assert!(!config.telemetry.metrics_enabled);
         assert_eq!(config.telemetry.log_level, "debug");
         // Untouched fields keep their defaults.
@@ -356,6 +419,29 @@ mod tests {
         assert_eq!(config.bind_addr, "0.0.0.0:9000");
         assert!(!config.telemetry.metrics_enabled);
         assert_eq!(config.telemetry.log_level, "debug");
+        Ok(())
+    }
+
+    #[test]
+    fn overrides_apply_before_env_validation() -> Result<(), Box<dyn std::error::Error>> {
+        let env = env_of(&[
+            (ENV_BIND_ADDR, "not-an-addr"),
+            (ENV_ENGINE, "chrome"),
+            (ENV_ENGINE_SOCKET, ""),
+        ]);
+        let overrides = TempodConfigOverrides {
+            bind_addr: Some("127.0.0.1:8787".to_string()),
+            engine: Some(EngineKind::Servo),
+            engine_socket: Some("/tmp/tempo-engine.sock".to_string()),
+        };
+
+        let config = TempodConfig::load_with_overrides(None, &env, &overrides)?;
+        assert_eq!(config.bind_addr, "127.0.0.1:8787");
+        assert_eq!(config.engine, EngineKind::Servo);
+        assert_eq!(
+            config.engine_socket.as_deref(),
+            Some("/tmp/tempo-engine.sock")
+        );
         Ok(())
     }
 
@@ -414,6 +500,13 @@ mod tests {
             }
             other => panic!("expected InvalidField(log_level), got {other:?}"),
         }
+        let env = env_of(&[(ENV_ENGINE, "servo")]);
+        match TempodConfig::load_with(None, &env) {
+            Err(ConfigError::InvalidField { field, .. }) => {
+                assert_eq!(field, "engine_socket");
+            }
+            other => panic!("expected InvalidField(engine_socket), got {other:?}"),
+        }
     }
 
     #[test]
@@ -464,6 +557,7 @@ mod tests {
     fn round_trips_through_pretty_json() -> Result<(), Box<dyn std::error::Error>> {
         let config = TempodConfig {
             engine: EngineKind::Servo,
+            engine_socket: Some("/tmp/tempo-engine.sock".to_string()),
             telemetry: TelemetryConfig {
                 metrics_enabled: false,
                 ..TelemetryConfig::default()

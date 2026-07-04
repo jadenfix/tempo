@@ -3,17 +3,29 @@ use tempo_config::TempodConfig;
 use tempo_driver::Engine;
 
 fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|arg| arg == "-h" || arg == "--help") {
+        eprintln!("{}", usage());
+        std::process::exit(2);
+    }
+    let config_overrides = match TempodOptions::config_overrides(&args) {
+        Ok(overrides) => overrides,
+        Err(err) => {
+            eprintln!("{err}");
+            std::process::exit(2);
+        }
+    };
     // Layered configuration: built-in defaults < JSON file named by
     // TEMPO_CONFIG < TEMPO_* environment variables. The CLI flags parsed
     // below are the top layer and override whatever the layers produced.
-    let layered = match TempodConfig::load_from_process_env() {
+    let layered = match TempodConfig::load_from_process_env_with_overrides(&config_overrides) {
         Ok(config) => config,
         Err(err) => {
             eprintln!("tempod configuration error: {err}");
             std::process::exit(2);
         }
     };
-    let options = match TempodOptions::parse(std::env::args().skip(1), &layered) {
+    let options = match TempodOptions::parse(args, &layered) {
         Ok(options) => options,
         Err(err) => {
             eprintln!("{err}");
@@ -65,6 +77,48 @@ struct TempodOptions {
 }
 
 impl TempodOptions {
+    fn config_overrides(args: &[String]) -> Result<tempo_config::TempodConfigOverrides, String> {
+        let mut overrides = tempo_config::TempodConfigOverrides::default();
+        let mut args = args.iter();
+
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--engine" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| "--engine requires cdp or servo".to_string())?;
+                    overrides.engine = Some(match value.as_str() {
+                        "cdp" => tempo_config::EngineKind::Cdp,
+                        "servo" => tempo_config::EngineKind::Servo,
+                        _ => return Err(format!("unknown engine: {value}\n{}", usage())),
+                    });
+                }
+                "--engine-socket" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| "--engine-socket requires a path".to_string())?;
+                    overrides.engine_socket = Some(value.clone());
+                }
+                "--allow-remote" => {}
+                "--auth-token" => {
+                    args.next()
+                        .ok_or_else(|| "--auth-token requires a bearer token".to_string())?;
+                }
+                "-h" | "--help" => {}
+                value if value.starts_with('-') => {
+                    return Err(format!("unknown tempod option: {value}\n{}", usage()));
+                }
+                value => {
+                    if overrides.bind_addr.replace(value.to_string()).is_some() {
+                        return Err(format!("tempod accepts at most one address\n{}", usage()));
+                    }
+                }
+            }
+        }
+
+        Ok(overrides)
+    }
+
     fn parse(
         args: impl IntoIterator<Item = String>,
         defaults: &TempodConfig,
@@ -125,9 +179,17 @@ impl TempodOptions {
             }
         }
 
-        if engine_was_set && engine_socket.is_none() {
+        if engine_socket.is_none() && engine_was_set {
             return Err(format!(
                 "--engine only applies with --engine-socket; otherwise tempod starts without an attached engine\n{}",
+                usage()
+            ));
+        }
+        if engine_socket.is_none() && engine != Engine::Cdp {
+            return Err(format!(
+                "configured engine {} requires --engine-socket or {}\n{}",
+                defaults.engine.as_str(),
+                tempo_config::ENV_ENGINE_SOCKET,
                 usage()
             ));
         }
@@ -254,6 +316,41 @@ mod tests {
             Some(PathBuf::from("/tmp/flag-engine.sock"))
         );
         Ok(())
+    }
+
+    #[test]
+    fn cli_overrides_are_visible_before_config_validation() -> Result<(), String> {
+        let overrides = TempodOptions::config_overrides(&[
+            "127.0.0.1:1234".to_string(),
+            "--engine".to_string(),
+            "servo".to_string(),
+            "--engine-socket".to_string(),
+            "/tmp/flag-engine.sock".to_string(),
+            "--auth-token".to_string(),
+            "secret-token".to_string(),
+        ])?;
+
+        assert_eq!(overrides.bind_addr.as_deref(), Some("127.0.0.1:1234"));
+        assert_eq!(overrides.engine, Some(tempo_config::EngineKind::Servo));
+        assert_eq!(
+            overrides.engine_socket.as_deref(),
+            Some("/tmp/flag-engine.sock")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn configured_engine_requires_engine_socket() {
+        let defaults = TempodConfig {
+            engine: tempo_config::EngineKind::Servo,
+            ..TempodConfig::default()
+        };
+        let error = match TempodOptions::parse_with_env(std::iter::empty(), None, &defaults) {
+            Ok(_) => panic!("configured servo without engine_socket should be rejected"),
+            Err(error) => error,
+        };
+
+        assert!(error.contains("configured engine servo requires"));
     }
 
     #[test]
