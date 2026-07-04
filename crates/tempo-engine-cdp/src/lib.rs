@@ -10,16 +10,27 @@ use chromiumoxide::browser::{Browser, BrowserConfig, HeadlessMode};
 use chromiumoxide::cdp::browser_protocol::accessibility::{
     AxNode, AxValue, GetPartialAxTreeParams,
 };
+use chromiumoxide::cdp::browser_protocol::browser::BrowserContextId;
 use chromiumoxide::cdp::browser_protocol::dom::{
     DescribeNodeParams, GetDocumentParams, NodeId as DomNodeId, QuerySelectorParams,
 };
+use chromiumoxide::cdp::browser_protocol::fetch::{
+    ContinueRequestParams, EnableParams as FetchEnableParams, EventRequestPaused,
+    FailRequestParams, RequestPattern,
+};
+use chromiumoxide::cdp::browser_protocol::network::ErrorReason;
 use chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotFormat;
+use chromiumoxide::cdp::browser_protocol::target::{
+    CreateBrowserContextParams, CreateTargetParams,
+};
 use chromiumoxide::cdp::js_protocol::runtime::EvaluateParams;
 use chromiumoxide::error::CdpError;
 use chromiumoxide::page::{Page, ScreenshotParams};
 use futures::StreamExt;
 use std::collections::{BTreeMap, HashMap};
+use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tempo_driver::{
     BrowsingContextCreateOptions, DriverTrait, Engine, StepOutcome, TransportError, Unsupported,
@@ -61,6 +72,9 @@ pub struct CdpConfig {
     pub no_sandbox: bool,
     /// How long to wait for the browser process to expose DevTools.
     pub launch_timeout: Duration,
+    /// Extra Chromium command-line arguments. Intended for narrowly scoped
+    /// fixtures and platform integration knobs.
+    pub args: Vec<String>,
 }
 
 impl CdpConfig {
@@ -71,6 +85,11 @@ impl CdpConfig {
 
     pub fn with_no_sandbox_for_ci(mut self) -> Self {
         self.no_sandbox = true;
+        self
+    }
+
+    pub fn with_arg(mut self, arg: impl Into<String>) -> Self {
+        self.args.push(arg.into());
         self
     }
 
@@ -93,12 +112,16 @@ impl CdpConfig {
             .launch_timeout(self.launch_timeout)
             .user_data_dir(user_data_dir)
             .incognito()
+            .enable_request_intercept()
             .disable_cache();
         if self.no_sandbox {
             builder = builder.no_sandbox();
         }
         if let Some(path) = &self.executable {
             builder = builder.chrome_executable(path);
+        }
+        if !self.args.is_empty() {
+            builder = builder.args(self.args.clone());
         }
         builder.build().map_err(TransportError::Other)
     }
@@ -110,6 +133,7 @@ impl Default for CdpConfig {
             executable: None,
             no_sandbox: false,
             launch_timeout: Duration::from_secs(20),
+            args: Vec::new(),
         }
     }
 }
@@ -119,13 +143,16 @@ pub struct CdpTempoDriver {
     browser: Browser,
     page: Option<Page>,
     handler_task: JoinHandle<()>,
+    request_policy_task: Option<JoinHandle<()>>,
+    browser_context_id: Option<BrowserContextId>,
     profile_dir: Option<tempfile::TempDir>,
     owns_browser: bool,
     seq: u64,
     history: BTreeMap<u64, CompiledObservation>,
     stable_id_mapper: StableIdMapper,
     selectors_by_node: BTreeMap<NodeId, String>,
-    url_policy: UrlPolicy,
+    url_policy: Arc<Mutex<UrlPolicy>>,
+    blocked_request_url: Arc<Mutex<Option<String>>>,
 }
 
 impl CdpTempoDriver {
@@ -151,35 +178,77 @@ impl CdpTempoDriver {
             .new_page("about:blank")
             .await
             .map_err(map_cdp_error)?;
+        let url_policy = Arc::new(Mutex::new(UrlPolicy::block_private()));
+        let blocked_request_url = Arc::new(Mutex::new(None));
+        let request_policy_task =
+            install_request_policy(&page, url_policy.clone(), blocked_request_url.clone()).await?;
 
         Ok(Self {
             browser,
             page: Some(page),
             handler_task,
+            request_policy_task: Some(request_policy_task),
+            browser_context_id: None,
             profile_dir: Some(profile_dir),
             owns_browser: true,
             seq: 0,
             history: BTreeMap::new(),
             stable_id_mapper: StableIdMapper::new(),
             selectors_by_node: BTreeMap::new(),
-            url_policy: UrlPolicy::block_private(),
+            url_policy,
+            blocked_request_url,
         })
     }
 
     /// Allow loopback/private navigation for trusted live fixtures.
     pub fn allow_private_network_access(mut self) -> Self {
-        self.url_policy = UrlPolicy::allow_all();
+        self.set_url_policy(UrlPolicy::allow_all());
         self
     }
 
     /// Override the shared pre-navigation URL policy used by the CDP lane.
     pub fn with_url_policy(mut self, url_policy: UrlPolicy) -> Self {
-        self.url_policy = url_policy;
+        self.set_url_policy(url_policy);
         self
     }
 
+    fn set_url_policy(&mut self, url_policy: UrlPolicy) {
+        if let Ok(mut active_policy) = self.url_policy.lock() {
+            *active_policy = url_policy;
+        }
+    }
+
+    fn current_url_policy(&self) -> Result<UrlPolicy, TransportError> {
+        self.url_policy
+            .lock()
+            .map(|policy| policy.clone())
+            .map_err(|_error| TransportError::Other("CDP URL policy lock poisoned".into()))
+    }
+
     fn enforce_url_policy(&self, url: &str) -> Result<(), TransportError> {
-        enforce_url_policy(url, &self.url_policy)
+        enforce_url_policy(url, &self.current_url_policy()?)
+    }
+
+    fn clear_blocked_request(&self) -> Result<(), TransportError> {
+        *self.blocked_request_url.lock().map_err(|_error| {
+            TransportError::Other("CDP blocked request lock poisoned".into())
+        })? = None;
+        Ok(())
+    }
+
+    fn take_blocked_request(&self) -> Result<Option<String>, TransportError> {
+        Ok(self
+            .blocked_request_url
+            .lock()
+            .map_err(|_error| TransportError::Other("CDP blocked request lock poisoned".into()))?
+            .take())
+    }
+
+    fn map_navigation_error(&self, error: CdpError) -> TransportError {
+        match self.take_blocked_request() {
+            Ok(Some(_url)) => TransportError::UrlBlocked,
+            _ => TransportError::Other(error.to_string()),
+        }
     }
 
     fn page(&self) -> Result<&Page, TransportError> {
@@ -541,6 +610,9 @@ impl CdpTempoDriver {
 impl Drop for CdpTempoDriver {
     fn drop(&mut self) {
         self.handler_task.abort();
+        if let Some(task) = self.request_policy_task.take() {
+            task.abort();
+        }
     }
 }
 
@@ -552,14 +624,18 @@ impl DriverTrait for CdpTempoDriver {
 
     async fn goto(&mut self, url: &str) -> Result<CompiledObservation, TransportError> {
         self.enforce_url_policy(url)?;
+        self.clear_blocked_request()?;
         self.page()?
             .goto(url)
             .await
-            .map_err(|error| TransportError::Other(error.to_string()))?;
+            .map_err(|error| self.map_navigation_error(error))?;
         self.page()?
             .wait_for_navigation()
             .await
-            .map_err(|error| TransportError::Other(error.to_string()))?;
+            .map_err(|error| self.map_navigation_error(error))?;
+        if self.take_blocked_request()?.is_some() {
+            return Err(TransportError::UrlBlocked);
+        }
         let (final_url, dom_html) = self.snapshot().await?;
         self.enforce_url_policy(&final_url)?;
         self.record_snapshot(final_url, dom_html).await
@@ -630,15 +706,35 @@ impl DriverTrait for CdpTempoDriver {
             .await
             .map_err(|_error| Unsupported("fresh CDP browsing context"))?;
         let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
-        let page = browser
-            .new_page("about:blank")
+        let browser_context_id = browser
+            .create_browser_context(
+                CreateBrowserContextParams::builder()
+                    .dispose_on_detach(true)
+                    .build(),
+            )
             .await
             .map_err(|_error| Unsupported("fresh CDP browsing context"))?;
+        let page_params = CreateTargetParams::builder()
+            .url("about:blank")
+            .browser_context_id(browser_context_id.clone())
+            .build()
+            .map_err(|_error| Unsupported("fresh CDP browsing context"))?;
+        let page = browser
+            .new_page(page_params)
+            .await
+            .map_err(|_error| Unsupported("fresh CDP browsing context"))?;
+        let blocked_request_url = Arc::new(Mutex::new(None));
+        let request_policy_task =
+            install_request_policy(&page, self.url_policy.clone(), blocked_request_url.clone())
+                .await
+                .map_err(|_error| Unsupported("fresh CDP browsing context"))?;
 
         Ok(Box::new(Self {
             browser,
             page: Some(page),
             handler_task,
+            request_policy_task: Some(request_policy_task),
+            browser_context_id: Some(browser_context_id),
             profile_dir: None,
             owns_browser: false,
             seq: 0,
@@ -646,6 +742,7 @@ impl DriverTrait for CdpTempoDriver {
             stable_id_mapper: StableIdMapper::new(),
             selectors_by_node: BTreeMap::new(),
             url_policy: self.url_policy.clone(),
+            blocked_request_url,
         }))
     }
 
@@ -698,16 +795,124 @@ impl DriverTrait for CdpTempoDriver {
     }
 
     async fn close(&mut self) -> Result<(), TransportError> {
+        if let Some(task) = self.request_policy_task.take() {
+            task.abort();
+        }
         if self.owns_browser {
             self.browser.close().await.map_err(map_cdp_error)?;
             let _ = self.browser.wait().await;
-        } else if let Some(page) = self.page.take() {
-            page.close().await.map_err(map_cdp_error)?;
+        } else {
+            let page_result = if let Some(page) = self.page.take() {
+                page.close().await.map_err(map_cdp_error)
+            } else {
+                Ok(())
+            };
+            let context_result = if let Some(browser_context_id) = self.browser_context_id.take() {
+                self.browser
+                    .dispose_browser_context(browser_context_id)
+                    .await
+                    .map_err(map_cdp_error)
+            } else {
+                Ok(())
+            };
+            page_result?;
+            context_result?;
         }
         self.handler_task.abort();
         self.profile_dir.take();
         Ok(())
     }
+}
+
+async fn install_request_policy(
+    page: &Page,
+    url_policy: Arc<Mutex<UrlPolicy>>,
+    blocked_request_url: Arc<Mutex<Option<String>>>,
+) -> Result<JoinHandle<()>, TransportError> {
+    let mut request_paused = page
+        .event_listener::<EventRequestPaused>()
+        .await
+        .map_err(map_cdp_error)?;
+    page.execute(
+        FetchEnableParams::builder()
+            .pattern(RequestPattern::builder().url_pattern("*").build())
+            .build(),
+    )
+    .await
+    .map_err(map_cdp_error)?;
+
+    let page = page.clone();
+    Ok(tokio::spawn(async move {
+        while let Some(event) = request_paused.next().await {
+            let request_url = event.request.url.clone();
+            let policy = match url_policy.lock() {
+                Ok(policy) => Some(policy.clone()),
+                Err(_error) => None,
+            };
+            let allowed = match policy {
+                Some(policy) => enforce_request_url_policy(&request_url, &policy)
+                    .await
+                    .is_ok(),
+                None => false,
+            };
+
+            let request_handled = if allowed {
+                page.execute(ContinueRequestParams::new(event.request_id.clone()))
+                    .await
+                    .is_ok()
+            } else {
+                if let Ok(mut blocked) = blocked_request_url.lock() {
+                    *blocked = Some(request_url);
+                }
+                page.execute(FailRequestParams::new(
+                    event.request_id.clone(),
+                    ErrorReason::BlockedByClient,
+                ))
+                .await
+                .is_ok()
+            };
+
+            if !request_handled {
+                break;
+            }
+        }
+    }))
+}
+
+async fn enforce_request_url_policy(url: &str, policy: &UrlPolicy) -> Result<(), TransportError> {
+    enforce_url_policy(url, policy)?;
+    if *policy == UrlPolicy::allow_all() {
+        return Ok(());
+    }
+
+    let parsed = url::Url::parse(url).map_err(|_error| TransportError::UrlBlocked)?;
+    let host = parsed.host_str().ok_or(TransportError::UrlBlocked)?;
+    let port = parsed
+        .port_or_known_default()
+        .ok_or(TransportError::UrlBlocked)?;
+    let mut addrs = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|_error| TransportError::UrlBlocked)?;
+    let mut saw_addr = false;
+    while let Some(resolved_socket) = addrs.next() {
+        saw_addr = true;
+        enforce_url_policy_with_resolved_socket(url, policy, resolved_socket)?;
+    }
+    if saw_addr {
+        Ok(())
+    } else {
+        Err(TransportError::UrlBlocked)
+    }
+}
+
+fn enforce_url_policy_with_resolved_socket(
+    url: &str,
+    policy: &UrlPolicy,
+    resolved_socket: SocketAddr,
+) -> Result<(), TransportError> {
+    policy
+        .enforce_resolved_socket(url, resolved_socket)
+        .map_err(|_error| TransportError::UrlBlocked)
 }
 
 fn map_cdp_error(error: CdpError) -> TransportError {
@@ -1495,7 +1700,7 @@ mod tests {
     use chromiumoxide::cdp::browser_protocol::accessibility::{AxNodeId, AxValueType};
     use chromiumoxide::cdp::browser_protocol::dom::BackendNodeId;
     use std::io::Write;
-    use std::net::TcpListener;
+    use std::net::{SocketAddr, TcpListener};
 
     #[test]
     fn extracts_selector_backed_interactive_elements_from_real_dom_html() {
@@ -1818,6 +2023,30 @@ mod tests {
         assert!(enforce_url_policy("http://93.184.216.34/", &policy).is_ok());
     }
 
+    #[test]
+    fn blocks_public_hostname_when_resolved_socket_is_private() {
+        let policy = UrlPolicy::block_private();
+        let loopback: SocketAddr = "127.0.0.1:443".parse().unwrap();
+        let public: SocketAddr = "93.184.216.34:443".parse().unwrap();
+
+        assert!(matches!(
+            enforce_url_policy_with_resolved_socket("https://public.example/", &policy, loopback),
+            Err(TransportError::UrlBlocked)
+        ));
+        assert!(enforce_url_policy_with_resolved_socket(
+            "https://public.example/",
+            &policy,
+            public
+        )
+        .is_ok());
+        assert!(enforce_url_policy_with_resolved_socket(
+            "https://public.example/",
+            &UrlPolicy::allow_all(),
+            loopback,
+        )
+        .is_ok());
+    }
+
     #[tokio::test]
     async fn live_cdp_driver_navigates_observes_acts_and_screenshots(
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1925,6 +2154,56 @@ mod tests {
             .evaluate_script("Promise.resolve(document.body.dataset.clicked)", true)
             .await?;
         assert_eq!(clicked, serde_json::json!("yes"));
+        driver.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_cdp_child_browsing_context_isolates_storage(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(chrome) = std::env::var_os("TEMPO_CDP_CHROME") else {
+            eprintln!("skipping live CDP context isolation test; TEMPO_CDP_CHROME is unset");
+            return Ok(());
+        };
+        let url = serve_fixture()?;
+        let config = CdpConfig::default()
+            .with_executable(chrome.to_string_lossy())
+            .with_no_sandbox_env_opt_in();
+        let mut driver = CdpTempoDriver::launch_with(config)
+            .await?
+            .allow_private_network_access();
+
+        driver.goto(&url).await?;
+        let root_value = driver
+            .evaluate_script(
+                "Promise.resolve((() => { localStorage.setItem('tempoIsolation', 'root'); document.cookie = 'tempoIsolation=root; SameSite=Lax'; return localStorage.getItem('tempoIsolation'); })())",
+                true,
+            )
+            .await?;
+        assert_eq!(root_value, serde_json::json!("root"));
+
+        let mut child = driver
+            .create_browsing_context(tempo_driver::BrowsingContextCreateOptions {
+                kind: tempo_driver::BrowsingContextKind::Tab,
+                background: false,
+            })
+            .await
+            .map_err(|error| std::io::Error::other(error.0))?;
+        child.goto(&url).await?;
+        let child_value = child
+            .evaluate_script(
+                "Promise.resolve(localStorage.getItem('tempoIsolation') === null ? '__missing__' : localStorage.getItem('tempoIsolation'))",
+                true,
+            )
+            .await?;
+        let child_cookie = child
+            .evaluate_script("Promise.resolve(document.cookie)", true)
+            .await?;
+
+        assert_eq!(child_value, serde_json::json!("__missing__"));
+        assert_eq!(child_cookie, serde_json::json!(""));
+
+        child.close().await?;
         driver.close().await?;
         Ok(())
     }
