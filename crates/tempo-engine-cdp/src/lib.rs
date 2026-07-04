@@ -19,11 +19,13 @@ use chromiumoxide::cdp::browser_protocol::fetch::{
     FailRequestParams, RequestPattern, RequestStage,
 };
 use chromiumoxide::cdp::browser_protocol::network::ErrorReason;
-use chromiumoxide::cdp::browser_protocol::page::{CaptureScreenshotFormat, Viewport};
+use chromiumoxide::cdp::browser_protocol::page::{
+    CaptureScreenshotFormat, CreateIsolatedWorldParams, Viewport,
+};
 use chromiumoxide::cdp::browser_protocol::target::{
     CreateBrowserContextParams, CreateTargetParams,
 };
-use chromiumoxide::cdp::js_protocol::runtime::EvaluateParams;
+use chromiumoxide::cdp::js_protocol::runtime::{EvaluateParams, ExecutionContextId};
 use chromiumoxide::error::CdpError;
 use chromiumoxide::page::{Page, ScreenshotParams};
 use futures::StreamExt;
@@ -184,6 +186,9 @@ pub struct CdpTempoDriver {
     url_policy: Arc<Mutex<UrlPolicy>>,
     blocked_request_url: Arc<Mutex<Option<String>>>,
     request_policy_tracker: Arc<RequestPolicyTracker>,
+    /// Cached isolated-world execution context for the stability probe.
+    /// Invalidated by navigation; recreated on demand.
+    probe_context: Mutex<Option<ExecutionContextId>>,
 }
 
 impl CdpTempoDriver {
@@ -265,6 +270,7 @@ impl CdpTempoDriver {
             url_policy,
             blocked_request_url,
             request_policy_tracker,
+            probe_context: Mutex::new(None),
         })
     }
 
@@ -738,33 +744,213 @@ impl CdpTempoDriver {
         let deadline = Instant::now() + Duration::from_secs(2);
         let mut tracker = CompositeQuiescenceTracker::new(3);
 
+        // Ramp the sampling interval instead of a fixed 50ms: a page that is
+        // already quiet settles after ~75ms of evidence instead of ~100ms,
+        // while a busy page converges to the same 50ms cadence. The ramp is
+        // deliberately conservative — the quiet-evidence window stays within
+        // 25% of the legacy 100ms so late-starting JS (hydration, analytics)
+        // has nearly the same chance to be observed before settle.
+        let mut poll_index = 0_usize;
         loop {
             self.enforce_current_url_policy().await?;
             let cursor = self.request_policy_cursor();
-            let ready_result = self.page()?.evaluate("document.readyState").await;
-            let ready_state = self
-                .map_cdp_result_since(cursor, ready_result)
-                .await?
-                .into_value::<String>()
-                .map_err(|error| TransportError::Other(error.to_string()))?;
-            self.enforce_current_url_policy().await?;
-            let content_result = self.page()?.content().await;
-            let dom_html = self.map_cdp_result_since(cursor, content_result).await?;
-            self.enforce_no_blocked_request_since(cursor)?;
-            let sample = PageStabilitySample {
-                ready: ready_state != "loading",
-                dom_hash: fnv1a64(dom_html.as_bytes()),
-            };
+            let sample = self.sample_page_stability_since(cursor).await?;
             if tracker.observe(sample) {
                 return Ok(());
             }
             if Instant::now() >= deadline {
                 return Err(TransportError::NavTimeout);
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            let interval = QUIESCENCE_POLL_INTERVALS_MS
+                .get(poll_index)
+                .copied()
+                .unwrap_or(QUIESCENCE_POLL_INTERVAL_CAP_MS);
+            poll_index += 1;
+            tokio::time::sleep(Duration::from_millis(interval)).await;
         }
     }
+
+    /// One O(1) stability sample: a single `Runtime.evaluate` in a CDP
+    /// isolated world that installs a page-wide MutationObserver once and
+    /// returns `readyState|mutationGen`.
+    ///
+    /// The previous sampler pulled the full serialized DOM over CDP and hashed
+    /// it on every poll — O(page size) CPU and transfer per tick, which
+    /// dominated settle latency on large pages. The observer generation is
+    /// also more sensitive: two polls that straddle a mutate-and-revert see a
+    /// generation bump where equal DOM hashes would alias.
+    ///
+    /// The probe runs in an isolated world so page JS cannot read or freeze
+    /// the counter (main-world globals like `__tempoMutGen` would be page-
+    /// writable, letting a hostile page fake stability while still mutating).
+    /// Isolated-world reads of `document.readyState` also bypass main-world
+    /// getter monkey-patching. If the isolated world or observer cannot be
+    /// set up, the sampler falls back to the CDP-trusted DOM-hash path.
+    async fn sample_page_stability_since(
+        &self,
+        cursor: u64,
+    ) -> Result<PageStabilitySample, TransportError> {
+        if let Some(sample) = self.probe_stability_isolated(cursor).await? {
+            self.enforce_no_blocked_request_since(cursor)?;
+            return Ok(sample);
+        }
+        self.enforce_no_blocked_request_since(cursor)?;
+
+        // Fallback: readyState + full-DOM hash via CDP (the legacy sampler).
+        let ready_result = self.page()?.evaluate("document.readyState").await;
+        let ready_state = self
+            .map_cdp_result_since(cursor, ready_result)
+            .await?
+            .into_value::<String>()
+            .map_err(|error| TransportError::Other(error.to_string()))?;
+        self.enforce_current_url_policy().await?;
+        let content_result = self.page()?.content().await;
+        let dom_html = self.map_cdp_result_since(cursor, content_result).await?;
+        self.enforce_no_blocked_request_since(cursor)?;
+        Ok(PageStabilitySample {
+            ready: ready_state != "loading",
+            dom_hash: fnv1a64(dom_html.as_bytes()),
+        })
+    }
+
+    /// Evaluate the stability probe in the cached isolated world, recreating
+    /// the world once if navigation invalidated the execution context.
+    /// Returns `Ok(None)` when the isolated-world path is unavailable and the
+    /// caller should use the fallback sampler.
+    async fn probe_stability_isolated(
+        &self,
+        cursor: u64,
+    ) -> Result<Option<PageStabilitySample>, TransportError> {
+        for recreate in [false, true] {
+            let Some(context_id) = self.probe_context_id(recreate, cursor).await? else {
+                return Ok(None);
+            };
+            let params = match EvaluateParams::builder()
+                .expression(STABILITY_PROBE_SCRIPT)
+                .context_id(context_id)
+                .return_by_value(true)
+                .build()
+            {
+                Ok(params) => params,
+                Err(_) => return Ok(None),
+            };
+            let evaluated = match self.page()?.execute(params).await {
+                Ok(response) => response.result,
+                // Stale context after navigation: recreate the world once.
+                Err(_) if !recreate => {
+                    self.enforce_no_blocked_request_soon_since(cursor).await?;
+                    continue;
+                }
+                Err(_) => {
+                    self.enforce_no_blocked_request_soon_since(cursor).await?;
+                    return Ok(None);
+                }
+            };
+            if evaluated.exception_details.is_some() {
+                return Ok(None);
+            }
+            let Some(probe) = evaluated
+                .result
+                .value
+                .as_ref()
+                .and_then(serde_json::Value::as_str)
+            else {
+                // No value usually means the context died mid-eval; retry once.
+                if !recreate {
+                    continue;
+                }
+                return Ok(None);
+            };
+            return Ok(parse_stability_probe(probe));
+        }
+        Ok(None)
+    }
+
+    /// Cached isolated-world context for the probe; created lazily and
+    /// recreated on demand after navigation destroys it.
+    async fn probe_context_id(
+        &self,
+        recreate: bool,
+        cursor: u64,
+    ) -> Result<Option<ExecutionContextId>, TransportError> {
+        if !recreate
+            && let Ok(guard) = self.probe_context.lock()
+            && let Some(id) = *guard
+        {
+            return Ok(Some(id));
+        }
+
+        let page = self.page()?;
+        let frame_id = match page.mainframe().await {
+            Ok(Some(frame_id)) => frame_id,
+            Ok(None) => return Ok(None),
+            Err(_) => {
+                self.enforce_no_blocked_request_soon_since(cursor).await?;
+                return Ok(None);
+            }
+        };
+        let created = match page
+            .execute(CreateIsolatedWorldParams {
+                frame_id,
+                world_name: Some("__tempo_stability_probe".into()),
+                grant_univeral_access: None,
+            })
+            .await
+        {
+            Ok(response) => response.result,
+            Err(_) => {
+                self.enforce_no_blocked_request_soon_since(cursor).await?;
+                return Ok(None);
+            }
+        };
+        let id = created.execution_context_id;
+        if let Ok(mut guard) = self.probe_context.lock() {
+            *guard = Some(id);
+        }
+        Ok(Some(id))
+    }
 }
+
+/// Parse a `readyState|generation` probe string into a stability sample.
+/// `generation < 0` (observer unavailable) and malformed strings yield `None`,
+/// which routes the caller to the DOM-hash fallback.
+fn parse_stability_probe(probe: &str) -> Option<PageStabilitySample> {
+    let (ready_state, generation) = probe.split_once('|')?;
+    let generation = generation.parse::<i64>().ok()?;
+    if generation < 0 {
+        return None;
+    }
+    Some(PageStabilitySample {
+        ready: ready_state != "loading",
+        dom_hash: generation as u64,
+    })
+}
+
+/// Poll ramp for composite quiescence sampling, capped at the legacy 50ms.
+/// Quiet pages produce three stable samples spanning ~75ms (vs 100ms before)
+/// with O(1) sampling cost.
+const QUIESCENCE_POLL_INTERVALS_MS: [u64; 2] = [25, 50];
+const QUIESCENCE_POLL_INTERVAL_CAP_MS: u64 = 50;
+
+/// In-page probe: installs a document-wide MutationObserver once per window
+/// and reports `readyState|generation` (`generation = -1` when the observer
+/// cannot run, signalling the caller to use the DOM-hash fallback).
+const STABILITY_PROBE_SCRIPT: &str = r#"(() => {
+  const w = window;
+  if (w.__tempoMutObs === undefined) {
+    w.__tempoMutGen = 0;
+    try {
+      const target = document.documentElement || document;
+      const obs = new MutationObserver(() => { w.__tempoMutGen += 1; });
+      obs.observe(target, { subtree: true, childList: true, attributes: true, characterData: true });
+      w.__tempoMutObs = obs;
+    } catch (e) {
+      w.__tempoMutObs = null;
+    }
+  }
+  const gen = w.__tempoMutObs ? w.__tempoMutGen : -1;
+  return `${document.readyState}|${gen}`;
+})()"#;
 
 fn is_policy_proxy_arg(arg: &str) -> bool {
     let name = arg
@@ -944,6 +1130,7 @@ impl DriverTrait for CdpTempoDriver {
             url_policy: self.url_policy.clone(),
             blocked_request_url,
             request_policy_tracker,
+            probe_context: Mutex::new(None),
         }))
     }
 
@@ -2079,7 +2266,10 @@ fn extract_interactive_elements(html: &str) -> Vec<InteractiveElement> {
         selector_path: String,
     }
 
-    let mut elements = Vec::new();
+    // Pre-size from a cheap density estimate (~1 interactive element per 400
+    // bytes of HTML, capped) so a big page doesn't pay repeated grow-copies of
+    // the element vector while streaming.
+    let mut elements = Vec::with_capacity((html.len() / 400).clamp(8, 1024));
     let mut search_from = 0;
     // Sentinel document-root frame; its empty tag never matches a real close tag.
     let mut stack: Vec<Frame> = vec![Frame {
@@ -2512,6 +2702,54 @@ mod tests {
             ready: true,
             dom_hash: hash_b,
         }));
+    }
+
+    #[test]
+    fn stability_probe_parses_ready_state_and_generation() {
+        assert_eq!(
+            parse_stability_probe("complete|42"),
+            Some(PageStabilitySample {
+                ready: true,
+                dom_hash: 42,
+            })
+        );
+        assert_eq!(
+            parse_stability_probe("loading|7"),
+            Some(PageStabilitySample {
+                ready: false,
+                dom_hash: 7,
+            })
+        );
+        assert_eq!(
+            parse_stability_probe("interactive|0"),
+            Some(PageStabilitySample {
+                ready: true,
+                dom_hash: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn stability_probe_rejects_unavailable_or_malformed_probes() {
+        // Observer unavailable: route to the DOM-hash fallback.
+        assert_eq!(parse_stability_probe("complete|-1"), None);
+        // Malformed shapes a broken page could produce.
+        assert_eq!(parse_stability_probe("complete"), None);
+        assert_eq!(parse_stability_probe("complete|"), None);
+        assert_eq!(parse_stability_probe("complete|abc"), None);
+        assert_eq!(parse_stability_probe(""), None);
+        assert_eq!(parse_stability_probe("|"), None);
+    }
+
+    #[test]
+    fn quiescence_poll_ramp_is_bounded_by_legacy_cap() {
+        for interval in QUIESCENCE_POLL_INTERVALS_MS {
+            assert!(interval <= QUIESCENCE_POLL_INTERVAL_CAP_MS);
+        }
+        // Three stable samples must span at least 75ms of quiet evidence so
+        // late-starting JS keeps close to the legacy 100ms observation window.
+        let evidence_span: u64 = QUIESCENCE_POLL_INTERVALS_MS.iter().sum();
+        assert!(evidence_span >= 75);
     }
 
     #[test]
