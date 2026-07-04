@@ -27,6 +27,7 @@ use chromiumoxide::cdp::browser_protocol::target::{
 };
 use chromiumoxide::cdp::js_protocol::runtime::{EvaluateParams, ExecutionContextId};
 use chromiumoxide::error::CdpError;
+use chromiumoxide::handler::HandlerConfig;
 use chromiumoxide::page::{Page, ScreenshotParams};
 use futures::{future::join_all, StreamExt};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -74,6 +75,7 @@ const CDP_POLICY_PROXY_ARGS: [&str; 6] = [
     "--proxy-pac-url",
     "--proxy-server",
 ];
+const CDP_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Explicit opt-out for Chromium sandboxing in constrained CI/container setups.
 pub const TEMPO_CDP_NO_SANDBOX_ENV: &str = "TEMPO_CDP_NO_SANDBOX";
@@ -128,6 +130,7 @@ impl CdpConfig {
         let mut builder = BrowserConfig::builder()
             .headless_mode(HeadlessMode::New)
             .launch_timeout(self.launch_timeout)
+            .request_timeout(CDP_REQUEST_TIMEOUT)
             .user_data_dir(user_data_dir)
             .incognito()
             .enable_request_intercept()
@@ -1058,22 +1061,33 @@ impl DriverTrait for CdpTempoDriver {
         &mut self,
         _options: BrowsingContextCreateOptions,
     ) -> Result<Box<dyn DriverTrait>, Unsupported> {
-        let browser_ws = self.browser.websocket_address().clone();
-        let (browser, mut handler) = Browser::connect(browser_ws)
-            .await
-            .map_err(|_error| Unsupported("fresh CDP browsing context"))?;
-        let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
-        let browser_context_id = browser
+        let browser_context_id = self
+            .browser
             .create_browser_context(
                 CreateBrowserContextParams::builder()
                     .dispose_on_detach(true)
                     .build(),
             )
             .await
-            .map_err(|_error| {
-                handler_task.abort();
-                Unsupported("fresh CDP browsing context")
-            })?;
+            .map_err(|_error| Unsupported("fresh CDP browsing context"))?;
+        let browser_ws = self.browser.websocket_address().clone();
+        let handler_config = HandlerConfig {
+            context_ids: vec![browser_context_id.clone()],
+            request_timeout: CDP_REQUEST_TIMEOUT,
+            ..HandlerConfig::default()
+        };
+        let (browser, mut handler) =
+            match Browser::connect_with_config(browser_ws, handler_config).await {
+                Ok(pair) => pair,
+                Err(_error) => {
+                    let _ = self
+                        .browser
+                        .dispose_browser_context(browser_context_id.clone())
+                        .await;
+                    return Err(Unsupported("fresh CDP browsing context"));
+                }
+            };
+        let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
         let page_params = match CreateTargetParams::builder()
             .url("about:blank")
             .browser_context_id(browser_context_id.clone())
