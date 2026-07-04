@@ -758,6 +758,8 @@ struct ReplaySummary {
     planned_actions: usize,
     applied_steps: usize,
     step_errors: usize,
+    /// Count of CAPTCHA / auth-wall hard-pauses awaiting human takeover (#244).
+    human_takeovers: usize,
     transport_errors: usize,
     cassettes: usize,
     step_triples: Vec<StepTriple>,
@@ -780,6 +782,7 @@ impl ReplaySummary {
             planned_actions: 0,
             applied_steps: 0,
             step_errors: 0,
+            human_takeovers: 0,
             transport_errors: 0,
             cassettes: 0,
             step_triples,
@@ -797,6 +800,7 @@ impl ReplaySummary {
                 JournalEvent::ActionPlanned { .. } => summary.planned_actions += 1,
                 JournalEvent::StepApplied { .. } => summary.applied_steps += 1,
                 JournalEvent::StepError { .. } => summary.step_errors += 1,
+                JournalEvent::HumanTakeoverRequired { .. } => summary.human_takeovers += 1,
                 JournalEvent::TransportError { .. } => summary.transport_errors += 1,
                 JournalEvent::CassetteRecorded { .. } => summary.cassettes += 1,
                 JournalEvent::SessionClosed => summary.session_closed = true,
@@ -874,6 +878,7 @@ fn replay_steps_from_entries(entries: &[JournalEntry]) -> Result<Vec<ReplayStep>
             | JournalEvent::StructuredFastPathSelected { .. }
             | JournalEvent::Observation { .. }
             | JournalEvent::ModelDecision { .. }
+            | JournalEvent::HumanTakeoverRequired { .. }
             | JournalEvent::TransportError { .. }
             | JournalEvent::CassetteRecorded { .. }
             | JournalEvent::SessionClosed => {}

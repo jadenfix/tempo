@@ -102,6 +102,48 @@ pub enum SideEffect {
     Delete,
 }
 
+/// Why a run must stop and hand control to a human (final.md §7 session handoff, #244).
+///
+/// tempo NEVER integrates a CAPTCHA-solving service or any automated
+/// challenge-answering: the only correct response to one of these states is to
+/// pause and let a person take the wheel. This enum names *what* was detected so
+/// a takeover UI can explain the pause; it is deliberately coarse.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TakeoverKind {
+    /// A CAPTCHA / bot challenge widget (reCAPTCHA, hCaptcha, Cloudflare
+    /// Turnstile, "I'm not a robot", interstitial "verify you are human").
+    Captcha,
+    /// An access wall: the page reports the request is unauthorized / forbidden
+    /// / the session expired, so no further automated action can proceed.
+    AuthWall,
+    /// A credential or one-time-code form the human must fill (login / OTP / 2FA).
+    LoginRequired,
+}
+
+impl TakeoverKind {
+    /// Stable, human-facing label for logs and takeover UI.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Captcha => "captcha",
+            Self::AuthWall => "auth_wall",
+            Self::LoginRequired => "login_required",
+        }
+    }
+}
+
+/// A detected human-takeover requirement: the typed hard-pause signal produced by
+/// the challenge/auth-wall classifier (`tempo_act::detect`) and journaled so a
+/// resumed run never auto-continues past it (#244).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HumanTakeover {
+    pub kind: TakeoverKind,
+    /// Short, human-readable explanation of the detection (which cue fired).
+    pub reason: String,
+    /// URL of the page the human is being asked to take over.
+    pub url: String,
+}
+
 /// The semantic action space (C2). Actions target stable `NodeId`s, not coordinates.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]

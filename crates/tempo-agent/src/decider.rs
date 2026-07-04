@@ -25,10 +25,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::time::Duration;
-use tempo_act::{execute_action, ExecutionStatus};
+use tempo_act::{detect_human_takeover, execute_action, ExecutionStatus};
 use tempo_driver::{DriverTrait, TransportError};
 use tempo_policy::Origin;
-use tempo_schema::{Action, CompiledObservation};
+use tempo_schema::{Action, CompiledObservation, HumanTakeover};
 use tempo_session::{read_journal_entries, JournalEntry, JournalEvent, SessionJournal};
 use thiserror::Error;
 
@@ -609,6 +609,14 @@ pub enum DecidedRunStatus {
         /// Journaled denial reason.
         reason: String,
     },
+    /// A CAPTCHA / auth-wall / login state was detected: the run hard-paused and
+    /// is waiting for a human to take over (#244). This is a terminal stop for
+    /// the automated loop — never a retry, never a solve. The seam where a
+    /// windowed-shell takeover UI (#247) will adopt the session attaches here.
+    HumanTakeoverRequired {
+        /// The typed detection signal (kind, reason, URL).
+        takeover: HumanTakeover,
+    },
     /// A prior run journaled intent for an action but not its outcome; resume
     /// refused to re-execute it (#99).
     Interrupted {
@@ -673,6 +681,9 @@ struct DecidedResume {
     completed: Vec<ResumedRound>,
     pending: Option<ResumedRound>,
     last_step_error: Option<String>,
+    /// A journaled human-takeover pause (#244). When set, resume surfaces the
+    /// hard-pause terminal status instead of re-observing and continuing.
+    human_takeover: Option<HumanTakeover>,
 }
 
 impl AgentRunner {
@@ -731,6 +742,13 @@ impl AgentRunner {
         if resume.closed {
             return Ok(self.decided_report(state, DecidedRunStatus::AlreadyComplete));
         }
+        // A journaled human-takeover pause is a hard stop: never re-observe or
+        // continue past it on resume — a human must still take over (#244).
+        if let Some(takeover) = resume.human_takeover {
+            return Ok(
+                self.decided_report(state, DecidedRunStatus::HumanTakeoverRequired { takeover })
+            );
+        }
         if let Some(reason) = resume.last_step_error {
             let status = terminal_status_for_step_error(reason);
             return Ok(self.decided_report(state, status));
@@ -759,6 +777,12 @@ impl AgentRunner {
             })?;
             self.record_decided_observation(&mut state, observation, "decided initial observation")?
         };
+
+        // A challenge may be present the moment we land (or on the resumed page):
+        // pause before asking the decider to act on it (#244).
+        if let Some(status) = self.detect_takeover(&mut state, &observation)? {
+            return Ok(self.decided_report(state, status));
+        }
 
         let mut total_decisions = resume.completed.len() + usize::from(resume.pending.is_some());
 
@@ -953,11 +977,40 @@ impl AgentRunner {
             *observation =
                 self.record_decided_observation(state, next, "decided post-action observation")?;
 
+            // Hard-pause on a CAPTCHA / auth-wall / login state before running
+            // any further queued action (#244). Takes precedence over a plain
+            // step error: the challenge is the actionable reason to stop.
+            if let Some(status) = self.detect_takeover(state, observation)? {
+                return Ok(Some(status));
+            }
+
             if let Some(reason) = step_error {
                 return Ok(Some(DecidedRunStatus::StepError { reason }));
             }
         }
         Ok(None)
+    }
+
+    /// Hard-pause if the observation is a CAPTCHA / auth-wall / login state
+    /// (#244). This is pure detection over the compiled observation — tempo
+    /// never solves the challenge or answers it automatically. On a hit it
+    /// journals the typed [`JournalEvent::HumanTakeoverRequired`] (so a resumed
+    /// run stops here too) and returns the terminal
+    /// [`DecidedRunStatus::HumanTakeoverRequired`], which stops the loop before
+    /// any further queued action runs and before the decider is asked to act on
+    /// the challenge page (so no blind click on a checkbox).
+    fn detect_takeover(
+        &self,
+        state: &mut DecidedRunState,
+        observation: &CompiledObservation,
+    ) -> Result<Option<DecidedRunStatus>, AgentError> {
+        let Some(takeover) = detect_human_takeover(observation) else {
+            return Ok(None);
+        };
+        state.journal.append(JournalEvent::HumanTakeoverRequired {
+            takeover: takeover.clone(),
+        })?;
+        Ok(Some(DecidedRunStatus::HumanTakeoverRequired { takeover }))
     }
 
     /// Validate the observation budget, journal the observation, and update
@@ -1034,6 +1087,7 @@ fn decided_resume_from_entries(entries: &[JournalEntry]) -> Result<DecidedResume
         completed: Vec::new(),
         pending: None,
         last_step_error: None,
+        human_takeover: None,
     };
 
     for entry in entries {
@@ -1104,6 +1158,9 @@ fn decided_resume_from_entries(entries: &[JournalEntry]) -> Result<DecidedResume
                 if complete && let Some(done) = resume.pending.take() {
                     resume.completed.push(done);
                 }
+            }
+            JournalEvent::HumanTakeoverRequired { takeover } => {
+                resume.human_takeover = Some(takeover.clone());
             }
             JournalEvent::Observation { .. }
             | JournalEvent::StructuredFastPathSelected { .. }
@@ -1307,6 +1364,195 @@ mod tests {
             entries.last().map(|entry| &entry.event),
             Some(JournalEvent::SessionClosed)
         ));
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    /// A driver that serves a benign page until the first action runs, then
+    /// exposes a reCAPTCHA widget on every subsequent observation — modelling a
+    /// challenge that appears mid-task (#244).
+    struct ChallengeAfterActionDriver {
+        seq: u64,
+        challenged: bool,
+    }
+
+    impl ChallengeAfterActionDriver {
+        fn new() -> Self {
+            Self {
+                seq: 0,
+                challenged: false,
+            }
+        }
+
+        fn snapshot(&self) -> CompiledObservation {
+            let elements = if self.challenged {
+                vec![
+                    button("submit"),
+                    tempo_schema::InteractiveElement {
+                        node_id: NodeId("captcha".into()),
+                        role: "iframe".into(),
+                        name: vec![tempo_schema::TaintSpan {
+                            provenance: tempo_schema::Provenance::Page,
+                            text: "reCAPTCHA".into(),
+                        }],
+                        value: Vec::new(),
+                        bounds: None,
+                        rank: 1.0,
+                    },
+                ]
+            } else {
+                vec![button("submit")]
+            };
+            CompiledObservation {
+                schema_version: tempo_schema::SCHEMA_VERSION.into(),
+                url: "https://example.com/".into(),
+                seq: self.seq,
+                elements,
+                marks: vec![],
+            }
+        }
+
+        fn grounded_diff(&self, since_seq: u64) -> tempo_schema::ObservationDiff {
+            tempo_schema::ObservationDiff {
+                since_seq,
+                seq: self.seq,
+                added: Vec::new(),
+                removed: Vec::new(),
+                changed: vec![button("submit")],
+            }
+        }
+    }
+
+    #[async_trait]
+    impl DriverTrait for ChallengeAfterActionDriver {
+        fn engine(&self) -> tempo_driver::Engine {
+            tempo_driver::Engine::Test
+        }
+
+        async fn goto(&mut self, _url: &str) -> Result<CompiledObservation, TransportError> {
+            self.seq += 1;
+            Ok(self.snapshot())
+        }
+
+        async fn observe(&mut self) -> Result<CompiledObservation, TransportError> {
+            Ok(self.snapshot())
+        }
+
+        async fn observe_diff(
+            &mut self,
+            since_seq: u64,
+        ) -> Result<tempo_schema::ObservationDiff, TransportError> {
+            Ok(self.grounded_diff(since_seq))
+        }
+
+        async fn act(
+            &mut self,
+            _action: &Action,
+        ) -> Result<tempo_driver::StepOutcome, TransportError> {
+            self.seq += 1;
+            // The challenge appears as a result of this action.
+            self.challenged = true;
+            Ok(tempo_driver::StepOutcome::Applied {
+                diff: self.grounded_diff(self.seq - 1),
+            })
+        }
+
+        async fn act_batch(
+            &mut self,
+            batch: &tempo_schema::ActionBatch,
+        ) -> Result<tempo_driver::StepOutcome, TransportError> {
+            let mut last = tempo_driver::StepOutcome::Applied {
+                diff: self.grounded_diff(self.seq),
+            };
+            for action in &batch.actions {
+                last = self.act(action).await?;
+            }
+            Ok(last)
+        }
+
+        async fn fork(&mut self) -> Result<Box<dyn DriverTrait>, tempo_driver::Unsupported> {
+            Err(tempo_driver::Unsupported("challenge driver does not fork"))
+        }
+
+        async fn extract(&mut self, _node: &NodeId) -> Result<serde_json::Value, TransportError> {
+            Ok(serde_json::Value::Null)
+        }
+
+        async fn evaluate_script(
+            &mut self,
+            _expression: &str,
+            _await_promise: bool,
+        ) -> Result<serde_json::Value, TransportError> {
+            Ok(serde_json::Value::Null)
+        }
+
+        async fn screenshot(&mut self) -> Result<Vec<u8>, TransportError> {
+            Ok(Vec::new())
+        }
+
+        async fn close(&mut self) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn decided_run_hard_pauses_on_detected_captcha_without_running_further_actions(
+    ) -> TestResult {
+        let (root, journal_path) = journal_root("decided-captcha-pause")?;
+        let mut driver = ChallengeAfterActionDriver::new();
+        let runner = AgentRunner::new(
+            &journal_path,
+            AgentRunIds::new("run-captcha", "session-captcha"),
+        );
+        // Two actions queued in one batch. The CAPTCHA appears after the first,
+        // so the second must NEVER execute.
+        let mut decider = ScriptedDecider::new(vec![vec![click("submit"), click("submit")]]);
+        let spec = DecidedTaskSpec::new("https://example.com", "click submit twice");
+
+        let report = runner
+            .run_decided_task(&mut driver, &mut decider, &spec)
+            .await?;
+
+        // The typed hard-pause outcome, not a StepError, not a retry.
+        let DecidedRunStatus::HumanTakeoverRequired { takeover } = &report.status else {
+            return Err(format!("expected HumanTakeoverRequired, got {:?}", report.status).into());
+        };
+        assert_eq!(takeover.kind, tempo_schema::TakeoverKind::Captcha);
+        assert_eq!(takeover.url, "https://example.com/");
+        // Exactly one action ran; the second queued action was not executed.
+        assert_eq!(report.actions_completed, 1);
+
+        let entries = read_journal_entries(&journal_path)?;
+        let planned = entries
+            .iter()
+            .filter(|entry| matches!(entry.event, JournalEvent::ActionPlanned { .. }))
+            .count();
+        assert_eq!(planned, 1, "second action must not be planned or run");
+        let takeovers = entries
+            .iter()
+            .filter(|entry| matches!(entry.event, JournalEvent::HumanTakeoverRequired { .. }))
+            .count();
+        assert_eq!(takeovers, 1);
+        // The pause is journaled and the session is NOT closed (a human owes work).
+        assert!(!matches!(
+            entries.last().map(|entry| &entry.event),
+            Some(JournalEvent::SessionClosed)
+        ));
+
+        // Resume must re-surface the hard pause and never auto-continue — even
+        // with a driver whose page is now benign.
+        let mut resumed_driver = TestDriver::new().with_elements(vec![button("submit")]);
+        let mut resumed_decider = ScriptedDecider::new(vec![vec![click("submit")]]);
+        let resumed = runner
+            .run_decided_task(&mut resumed_driver, &mut resumed_decider, &spec)
+            .await?;
+        assert!(matches!(
+            resumed.status,
+            DecidedRunStatus::HumanTakeoverRequired { .. }
+        ));
+        // The resume ran no new actions.
+        assert_eq!(resumed.actions_completed, 0);
+
         remove_dir_if_exists(&root)?;
         Ok(())
     }

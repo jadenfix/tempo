@@ -365,6 +365,7 @@ impl ResumeCursor {
                 | JournalEvent::StructuredFastPathSelected { .. }
                 | JournalEvent::Observation { .. }
                 | JournalEvent::ModelDecision { .. }
+                | JournalEvent::HumanTakeoverRequired { .. }
                 | JournalEvent::TransportError { .. }
                 | JournalEvent::CassetteRecorded { .. } => {}
             }
@@ -1706,6 +1707,7 @@ pub fn step_triples_from_journal_with_retention_policy(
             | JournalEvent::Observation { .. }
             | JournalEvent::ModelDecision { .. }
             | JournalEvent::ActionPlanned { .. }
+            | JournalEvent::HumanTakeoverRequired { .. }
             | JournalEvent::TransportError { .. }
             | JournalEvent::CassetteRecorded { .. }
             | JournalEvent::SessionClosed => {}
@@ -1739,6 +1741,7 @@ pub fn step_triples_from_journal_entries(
             | JournalEvent::Observation { .. }
             | JournalEvent::ModelDecision { .. }
             | JournalEvent::ActionPlanned { .. }
+            | JournalEvent::HumanTakeoverRequired { .. }
             | JournalEvent::TransportError { .. }
             | JournalEvent::CassetteRecorded { .. }
             | JournalEvent::SessionClosed => {}

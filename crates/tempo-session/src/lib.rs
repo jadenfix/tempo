@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tempo_driver::{StepOutcome, TransportError};
-use tempo_schema::{Action, CompiledObservation, ObservationDiff};
+use tempo_schema::{Action, CompiledObservation, HumanTakeover, ObservationDiff};
 use thiserror::Error;
 
 pub const TEMPO_STEALTH_MODE_ENV: &str = "TEMPO_STEALTH_MODE";
@@ -128,6 +128,13 @@ pub enum JournalEvent {
     StepError {
         action: Action,
         reason: String,
+    },
+    /// A CAPTCHA / auth-wall / login state was detected on the post-action page
+    /// and the run hard-paused for a human to take over (#244). This is NOT a
+    /// step error and NOT retryable: a resumed run replays this event and stops
+    /// again rather than auto-continuing. tempo never solves the challenge.
+    HumanTakeoverRequired {
+        takeover: HumanTakeover,
     },
     TransportError {
         context: String,
