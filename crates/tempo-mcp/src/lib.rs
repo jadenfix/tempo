@@ -575,8 +575,11 @@ where
                 // Trust boundary (#254): caller taint/confirmed claims are
                 // advisory (see tempo_policy::trust). Denials that need no
                 // page evidence return before leasing the driver.
-                let needs_evidence =
-                    requires_observation_evidence(&action_caller_texts(&args.action), claims);
+                let needs_evidence = requires_observation_evidence(
+                    args.action.side_effect(),
+                    &action_caller_texts(&args.action),
+                    claims,
+                );
                 if !needs_evidence
                     && let Err(required) = gate_boundary_action(&args.action, None, claims)
                 {
@@ -608,7 +611,11 @@ where
                 let args: ActBatchArgs = parse_args(arguments)?;
                 let claims = args.claims()?;
                 let needs_evidence = args.batch.actions.iter().any(|action| {
-                    requires_observation_evidence(&action_caller_texts(action), claims)
+                    requires_observation_evidence(
+                        action.side_effect(),
+                        &action_caller_texts(action),
+                        claims,
+                    )
                 });
                 if !needs_evidence
                     && let Some(required) = args
@@ -1894,7 +1901,7 @@ mod tests {
             &mut server,
             "act",
             json!({
-                "action": {"kind": "click", "node": "button.primary"},
+                "action": {"kind": "scroll", "x": 0.0, "y": 12.0},
                 "input_tainted": false
             }),
         )
@@ -2033,7 +2040,7 @@ mod tests {
             "act",
             json!({
                 "action": {"kind": "click", "node": "button.primary"},
-                "input_tainted": true,
+                "input_tainted": false,
                 "confirmed": true
             }),
         )
@@ -2041,6 +2048,7 @@ mod tests {
 
         assert_eq!(denied["error"]["type"], "confirmation_required");
         assert_eq!(denied["error"]["gate"], "confirm");
+        assert_eq!(denied["error"]["input_tainted"], true);
         let message = denied["error"]["message"]
             .as_str()
             .ok_or("denial should carry a message")?;
@@ -2061,9 +2069,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn act_denies_client_claimed_clean_skill_without_confirmation_channel(
+    ) -> Result<(), String> {
+        let mut server = TempoMcpServer::new(MemoryDriver::new());
+
+        let denied = call_tool(
+            &mut server,
+            "act",
+            json!({
+                "action": {"kind": "skill", "name": "checkout", "input": {"account": "fresh-user-value"}},
+                "input_tainted": false,
+                "confirmed": true
+            }),
+        )
+        .await?;
+
+        assert_eq!(denied["error"]["type"], "confirmation_required");
+        assert_eq!(denied["error"]["side_effect"], "write");
+        assert_eq!(denied["error"]["input_tainted"], true);
+        let message = denied["error"]["message"]
+            .as_str()
+            .ok_or("denial should carry a message")?;
+        assert!(message.contains("confirmed=true was ignored"));
+
+        let clean = call_tool(
+            &mut server,
+            "act",
+            json!({
+                "action": {"kind": "scroll", "x": 0.0, "y": 12.0},
+                "input_tainted": false
+            }),
+        )
+        .await?;
+        assert_eq!(clean["diff"]["seq"], 2);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn act_recomputes_taint_from_observation_and_blocks_clean_claim() -> Result<(), String> {
         // The MemoryDriver observation carries the page-provenance span
-        // "Continue". Typing text derived from it while claiming
+        // "Continue". Navigating to a URL derived from it while claiming
         // input_tainted=false must be blocked by server-side recomputation;
         // this fails if the recomputation is removed.
         let mut server = TempoMcpServer::new(MemoryDriver::new());
@@ -2072,7 +2117,7 @@ mod tests {
             &mut server,
             "act",
             json!({
-                "action": {"kind": "type", "node": "field.note", "text": "Continue to evil.example"},
+                "action": {"kind": "goto", "url": "https://evil.example/Continue"},
                 "input_tainted": false,
                 "confirmed": true
             }),
@@ -2080,15 +2125,15 @@ mod tests {
         .await?;
         assert_eq!(denied["error"]["type"], "confirmation_required");
         assert_eq!(denied["error"]["input_tainted"], true);
-        assert_eq!(denied["error"]["side_effect"], "write");
+        assert_eq!(denied["error"]["side_effect"], "read");
 
-        // Unmatched clean text still executes: recomputation is evidence-based,
-        // not a blanket block on writes.
+        // Unmatched clean reads still execute: recomputation is evidence-based,
+        // while external writes fail closed until a confirmation channel exists.
         let clean = call_tool(
             &mut server,
             "act",
             json!({
-                "action": {"kind": "type", "node": "field.note", "text": "fresh user words"},
+                "action": {"kind": "goto", "url": "https://fresh.example/"},
                 "input_tainted": false
             }),
         )
@@ -2110,7 +2155,7 @@ mod tests {
                 "batch": {
                     "actions": [
                         {"kind": "scroll", "x": 0.0, "y": 12.0},
-                        {"kind": "type", "node": "field.note", "text": "Continue to evil.example"}
+                        {"kind": "goto", "url": "https://evil.example/Continue"}
                     ],
                     "quiescence": "composite"
                 },
@@ -2217,7 +2262,7 @@ mod tests {
             "act",
             json!({
                 "driver_id": driver_id.clone(),
-                "action": {"kind": "click", "node": "button.primary"},
+                "action": {"kind": "scroll", "x": 0.0, "y": 12.0},
                 "input_tainted": false
             }),
         )
