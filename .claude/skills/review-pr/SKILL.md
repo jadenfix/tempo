@@ -45,6 +45,7 @@ Correctness & honesty of the contract:
 - [ ] Handles/IDs the caller reuses across calls are stable, or their churn is handled rather than silently breaking multi-step callers.
 - [ ] Docs, comments, and declared schemas/types match what the code actually does — no present-tense claims for a stub, no `{"type":"object"}` standing in for a real schema.
 - [ ] Runtime-visible contract changes update every public description in the same slice: OpenAPI paths/statuses/schemas, agent cards, SDK-facing docs, and compatibility fixtures. A route or response field that exists at runtime but is absent from the contract is a blocker for SDK workflows.
+- [ ] Public Rust schema struct changes update source callers too: `serde(default)` preserves old JSON compatibility, but it does not make existing struct literals compile. Scan/update workspace literals and downstream crates.
 
 Resource, lifecycle & availability:
 - [ ] Everything that can grow is bounded: input/response sizes, queues, maps, caches, retries, spawned tasks, and session/connection counts. Unbounded growth on remote-driven input is a blocker.
