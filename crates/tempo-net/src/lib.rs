@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 use std::fmt::Write as _;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -262,6 +262,114 @@ impl fmt::Display for UrlBlocked {
 }
 
 impl Error for UrlBlocked {}
+
+/// DNS result that has passed Tempo's URL and resolved-socket policy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedUrlTarget {
+    host: String,
+    sockets: Vec<SocketAddr>,
+}
+
+impl ResolvedUrlTarget {
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    pub fn sockets(&self) -> &[SocketAddr] {
+        &self.sockets
+    }
+}
+
+/// Failure while resolving a URL into policy-checked sockets.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ResolveUrlTargetError {
+    MissingHost,
+    MissingPort {
+        host: String,
+    },
+    ResolveFailed {
+        host: String,
+        port: u16,
+        reason: String,
+    },
+    EmptyResolution {
+        host: String,
+        port: u16,
+    },
+    UrlBlocked(UrlBlocked),
+}
+
+impl fmt::Display for ResolveUrlTargetError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingHost => write!(f, "URL has no host to resolve"),
+            Self::MissingPort { host } => write!(f, "URL host {host} has no known port"),
+            Self::ResolveFailed { host, port, reason } => {
+                write!(f, "failed to resolve {host}:{port}: {reason}")
+            }
+            Self::EmptyResolution { host, port } => {
+                write!(f, "host {host}:{port} resolved to no socket addresses")
+            }
+            Self::UrlBlocked(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl Error for ResolveUrlTargetError {}
+
+/// Resolve a URL and reject the result unless every selected socket is allowed.
+///
+/// Callers pass the returned sockets to their HTTP client with `resolve_to_addrs`.
+/// That pins the request to the same DNS answers that were checked here, closing
+/// the gap where a public hostname can resolve to loopback, RFC 1918, or metadata
+/// infrastructure after a hostname-only policy check has passed.
+pub fn resolve_url_target(
+    url: &url::Url,
+    policy: &UrlPolicy,
+) -> Result<ResolvedUrlTarget, ResolveUrlTargetError> {
+    policy
+        .enforce(url.as_str())
+        .map_err(ResolveUrlTargetError::UrlBlocked)?;
+    let host = url
+        .host_str()
+        .ok_or(ResolveUrlTargetError::MissingHost)?
+        .to_string();
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| ResolveUrlTargetError::MissingPort { host: host.clone() })?;
+    let sockets = (host.as_str(), port).to_socket_addrs().map_err(|error| {
+        ResolveUrlTargetError::ResolveFailed {
+            host: host.clone(),
+            port,
+            reason: error.to_string(),
+        }
+    })?;
+    checked_url_target_from_sockets(url, host, port, sockets, policy)
+}
+
+/// Build a policy-checked target from a caller-supplied DNS result.
+pub fn checked_url_target_from_sockets(
+    url: &url::Url,
+    host: impl Into<String>,
+    port: u16,
+    sockets: impl IntoIterator<Item = SocketAddr>,
+    policy: &UrlPolicy,
+) -> Result<ResolvedUrlTarget, ResolveUrlTargetError> {
+    policy
+        .enforce(url.as_str())
+        .map_err(ResolveUrlTargetError::UrlBlocked)?;
+    let host = host.into();
+    let sockets: Vec<_> = sockets.into_iter().collect();
+    if sockets.is_empty() {
+        return Err(ResolveUrlTargetError::EmptyResolution { host, port });
+    }
+    for socket in &sockets {
+        policy
+            .enforce_resolved_socket(url.as_str(), *socket)
+            .map_err(ResolveUrlTargetError::UrlBlocked)?;
+    }
+    Ok(ResolvedUrlTarget { host, sockets })
+}
 
 /// A component covered by an RFC 9421 HTTP Message Signature.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2415,6 +2523,45 @@ mod tests {
             "https://public.example/agent",
             SocketAddr::from(([93, 184, 216, 34], 443)),
         )?;
+        Ok(())
+    }
+
+    #[test]
+    fn checked_url_target_rejects_private_dns_answers_before_client_pin(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let policy = UrlPolicy::block_private();
+        let url = url::Url::parse("https://public.example/agent")?;
+        let result = checked_url_target_from_sockets(
+            &url,
+            "public.example",
+            443,
+            [SocketAddr::from(([169, 254, 169, 254], 443))],
+            &policy,
+        );
+
+        assert!(
+            matches!(
+                &result,
+                Err(ResolveUrlTargetError::UrlBlocked(error))
+                    if error.reason.code == BlockCode::BlockedIp
+                        && error.reason.detail.contains("resolved IP")
+            ),
+            "private DNS answer should be blocked: {result:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn checked_url_target_returns_public_sockets_for_pinned_client(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let policy = UrlPolicy::block_private();
+        let url = url::Url::parse("https://public.example/agent")?;
+        let socket = SocketAddr::from(([93, 184, 216, 34], 443));
+        let target =
+            checked_url_target_from_sockets(&url, "public.example", 443, [socket], &policy)?;
+
+        assert_eq!(target.host(), "public.example");
+        assert_eq!(target.sockets(), &[socket]);
         Ok(())
     }
 

@@ -12,6 +12,7 @@ use tempo_act::{execute_action, execute_batch, ExecutionStatus};
 use tempo_driver::{DriverTrait, Engine, StepOutcome, TransportError};
 use tempo_handshake::{probe_http_origin, LaneDecision, ProbeHit};
 pub use tempo_handshake::{HttpProbeConfig, Lane as StructuredLane, StructuredSignal};
+use tempo_net::resolve_url_target;
 use tempo_policy::{
     ConfirmationGate, InputTaint, Origin, OriginError, OriginPolicy, OriginRuleMode,
 };
@@ -1259,15 +1260,14 @@ impl AgentRunner {
         let endpoint = decision
             .mcp_endpoint_url()
             .map_err(|error| error.to_string())?;
-        self.structured_fast_path
-            .config
-            .url_policy
-            .enforce(endpoint.as_str())
-            .map_err(|error| error.to_string())?;
+        let resolved_endpoint =
+            resolve_url_target(&endpoint, &self.structured_fast_path.config.url_policy)
+                .map_err(|error| error.to_string())?;
         let max_body_bytes = self.structured_fast_path.config.max_body_bytes;
         let client = reqwest::Client::builder()
             .timeout(self.structured_fast_path.config.timeout)
             .redirect(reqwest::redirect::Policy::none())
+            .resolve_to_addrs(resolved_endpoint.host(), resolved_endpoint.sockets())
             .build()
             .map_err(|error| error.to_string())?;
 
