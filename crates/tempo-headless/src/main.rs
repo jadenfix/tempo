@@ -109,7 +109,7 @@ impl TempodOptions {
                         .ok_or_else(|| "--engine-socket requires a path".to_string())?;
                     overrides.engine_socket = Some(value.clone());
                 }
-                "--allow-remote" => {}
+                "--allow-remote" | "--allow-private-network" => {}
                 "--auth-token" => {
                     args.next()
                         .ok_or_else(|| "--auth-token requires a bearer token".to_string())?;
@@ -350,6 +350,7 @@ mod tests {
             "servo".to_string(),
             "--engine-socket".to_string(),
             "/tmp/flag-engine.sock".to_string(),
+            "--allow-private-network".to_string(),
             "--auth-token".to_string(),
             "secret-token".to_string(),
         ])?;
