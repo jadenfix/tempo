@@ -1,0 +1,12 @@
+[package]
+name = "tempo-crawl"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+tempo-net = { path = "../tempo-net" }
+
+[lints]
+workspace = true
