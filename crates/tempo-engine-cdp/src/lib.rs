@@ -40,7 +40,7 @@ use tempo_driver::{
     MAX_SCREENSHOT_BYTES, MAX_SCREENSHOT_HEIGHT, MAX_SCREENSHOT_WIDTH,
 };
 use tempo_net::UrlPolicy;
-use tempo_observe::{finalize_observation, CompileOptions, RawElement, StableIdMapper};
+use tempo_observe::{RawElement, StableIdMapper};
 use tempo_schema::{
     Action, ActionBatch, CompiledObservation, InteractiveElement, NodeId, ObservationDiff,
     Provenance, QuiescencePolicy, TaintSpan,
@@ -457,17 +457,6 @@ impl CdpTempoDriver {
             compile_observation(&mut self.stable_id_mapper, url, dom_html, self.seq);
         self.selectors_by_node = selectors_by_node;
         self.enrich_observation_from_ax_tree(&mut compiled).await?;
-        // Finish the live observation the same way the fixture compiler does:
-        // rank-sort, apply the byte/token budget, and populate set-of-marks labels.
-        // Run after enrichment so the budget accounts for enriched AX names/values.
-        // Without this the CDP lane shipped the full, unranked, unbudgeted
-        // document-order element dump with no marks (#477).
-        let compiled = finalize_observation(
-            compiled.url,
-            compiled.seq,
-            compiled.elements,
-            CompileOptions::default(),
-        );
         self.history.insert(compiled.seq, compiled.clone());
         prune_observation_history(&mut self.history, compiled.seq);
         Ok(compiled)
