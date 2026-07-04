@@ -2126,6 +2126,7 @@ fn compile_observation(
             url,
             seq,
             elements,
+            omitted: 0,
             marks: Vec::new(),
         },
         selectors_by_node,
@@ -2809,6 +2810,7 @@ mod tests {
             elements: extract_interactive_elements(
                 r#"<button id="save">Save</button><a href="/a">A</a>"#,
             ),
+            omitted: 0,
             marks: Vec::new(),
         };
         let after = CompiledObservation {
@@ -2818,6 +2820,7 @@ mod tests {
             elements: extract_interactive_elements(
                 r#"<button id="save">Saved</button><input name="q" value="">"#,
             ),
+            omitted: 0,
             marks: Vec::new(),
         };
 

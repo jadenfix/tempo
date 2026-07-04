@@ -1221,6 +1221,7 @@ fn reconstruct_observation(
         url: base.url.clone(),
         seq: diff.seq,
         elements,
+        omitted: base.omitted,
         marks: base.marks.clone(),
     })
 }
@@ -1401,6 +1402,7 @@ mod tests {
             url: url.into(),
             seq,
             elements: vec![button("submit")],
+            omitted: 0,
             marks: vec![],
         }
     }
@@ -1593,6 +1595,7 @@ mod tests {
                 url: "https://example.com/".into(),
                 seq: self.seq,
                 elements,
+                omitted: 0,
                 marks: vec![],
             }
         }
@@ -2445,6 +2448,7 @@ mod tests {
                 url: self.url.clone(),
                 seq: self.seq,
                 elements: self.ordered_elements(),
+                omitted: 0,
                 marks: vec![],
             };
             self.history
@@ -2460,6 +2464,7 @@ mod tests {
                 url: self.url.clone(),
                 seq: self.seq,
                 elements: self.elements.clone(),
+                omitted: 0,
                 marks: vec![],
             };
             let base =
@@ -2471,6 +2476,7 @@ mod tests {
                         url: self.url.clone(),
                         seq: since_seq,
                         elements: Vec::new(),
+                        omitted: 0,
                         marks: vec![],
                     });
             let before: HashSet<&str> =
@@ -2869,6 +2875,7 @@ mod tests {
             url: "https://example.com/".into(),
             seq: 4,
             elements: vec![el("a", 0.9), el("b", 0.5), el("c", 0.3)],
+            omitted: 0,
             marks: vec![],
         };
         // Change "a" in place, remove "b" — no additions, so order is preserved.
@@ -2901,6 +2908,7 @@ mod tests {
             url: "https://example.com/".into(),
             seq: 4,
             elements: vec![el("a", 0.9)],
+            omitted: 0,
             marks: vec![],
         };
         let ok = ObservationDiff {

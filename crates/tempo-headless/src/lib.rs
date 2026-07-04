@@ -10708,6 +10708,7 @@ mod tests {
             url: url.into(),
             seq,
             elements: Vec::new(),
+            omitted: 0,
             marks: Vec::new(),
         }
     }

@@ -74,6 +74,10 @@ pub struct CompiledObservation {
     /// Monotonic observation sequence; `ObservationDiff` is expressed relative to one.
     pub seq: u64,
     pub elements: Vec<InteractiveElement>,
+    /// Ranked elements omitted by the observation budgeter. Zero means the
+    /// compiled observation contains every candidate the compiler considered.
+    #[serde(default)]
+    pub omitted: u32,
     /// Optional set-of-marks overlay: NodeId -> mark label drawn over the screenshot.
     #[serde(default)]
     pub marks: Vec<(NodeId, u32)>,
@@ -390,6 +394,7 @@ impl From<beater_browser::Observation> for CompiledObservation {
             url: observation.url,
             seq: 0,
             elements,
+            omitted: 0,
             marks: vec![],
         }
     }
@@ -656,7 +661,8 @@ pub fn compiled_observation_json_schema() -> Value {
         // `CompiledObservation` does not use `#[serde(deny_unknown_fields)]`, so
         // unknown keys are ignored on deserialization — mirror that here.
         "additionalProperties": true,
-        // `marks` carries `#[serde(default)]`, so it is optional on the wire.
+        // `omitted`/`marks` carry `#[serde(default)]`, so they are optional on
+        // the wire for older artifacts.
         "required": ["schema_version", "url", "seq", "elements"],
         "properties": {
             "schema_version": { "type": "string", "const": SCHEMA_VERSION },
@@ -666,6 +672,7 @@ pub fn compiled_observation_json_schema() -> Value {
                 "type": "array",
                 "items": { "$ref": "#/$defs/InteractiveElement" }
             },
+            "omitted": { "type": "integer", "minimum": 0, "maximum": u32::MAX },
             "marks": {
                 "type": "array",
                 "items": {
@@ -994,6 +1001,7 @@ mod tests {
                 bounds: Some([0.0, 0.0, 10.0, 10.0]),
                 rank: 0.9,
             }],
+            omitted: 0,
             marks: vec![],
         };
         let s = serde_json::to_string(&obs)?;
@@ -1173,6 +1181,7 @@ mod tests {
         let observation: CompiledObservation = serde_json::from_str(&format!(
             r#"{{"schema_version":"{SCHEMA_VERSION}","url":"u","seq":1,"elements":[],"extra":42}}"#
         ))?;
+        assert_eq!(observation.omitted, 0);
         assert!(observation.marks.is_empty());
         Ok(())
     }
@@ -1438,6 +1447,7 @@ mod tests {
                 url: "https://example.com".into(),
                 seq: 3,
                 elements: vec![],
+                omitted: 0,
                 marks: vec![],
             },
             diff: Some(ObservationDiff {

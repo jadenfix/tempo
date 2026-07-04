@@ -191,6 +191,7 @@ impl TestDriver {
             url: self.url.clone(),
             seq: self.seq,
             elements: self.elements.clone(),
+            omitted: 0,
             marks: vec![],
         }
     }

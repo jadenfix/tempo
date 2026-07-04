@@ -3325,6 +3325,7 @@ mod tests {
                     url: "https://example.com".into(),
                     seq: 0,
                     elements: vec![],
+                    omitted: 0,
                     marks: vec![],
                 },
             },

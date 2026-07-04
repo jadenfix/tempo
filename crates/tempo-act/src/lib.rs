@@ -707,6 +707,7 @@ mod tests {
                 url: "https://example.test".into(),
                 seq: self.seq,
                 elements: vec![button_element(self.seq)],
+                omitted: 0,
                 marks: vec![],
             }
         }

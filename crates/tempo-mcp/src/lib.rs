@@ -3170,6 +3170,7 @@ mod tests {
                         bounds: Some([0.0, 0.0, 120.0, 32.0]),
                         rank: 1.0,
                     }],
+                    omitted: 0,
                     marks: vec![(NodeId("button.primary".into()), 1)],
                 },
             }

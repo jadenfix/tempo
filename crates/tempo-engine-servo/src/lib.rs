@@ -1809,6 +1809,7 @@ mod tests {
                 url: "https://servo.test".into(),
                 seq: 1,
                 elements: Vec::new(),
+                omitted: 0,
                 marks: Vec::new(),
             };
             connection

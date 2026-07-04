@@ -2175,6 +2175,7 @@ mod tests {
                 bounds: None,
                 rank: 1.0,
             }],
+            omitted: 0,
             marks: Vec::new(),
         }
     }
@@ -2195,6 +2196,7 @@ mod tests {
                 bounds: None,
                 rank: 1.0,
             }],
+            omitted: 0,
             marks: Vec::new(),
         }
     }
