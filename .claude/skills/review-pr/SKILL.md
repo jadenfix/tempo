@@ -34,6 +34,7 @@ The checklist further down is a memory aid. These techniques are what actually s
 - **Follow the seams the diff hides:** the callers of every changed signature, the callees it now leans on, and any invariant elsewhere that assumed the old behavior.
 - **Reverted-fix test:** would any test in the PR still pass if the fix itself were reverted? If yes, the test proves nothing — that's a blocker for a bugfix PR.
 - **Adversarially verify** each candidate blocker before it goes in the review: try to refute it against the code. Survives refutation → blocker. Can't build a concrete trace → nit.
+- **Preserve durable lessons.** If a review uncovers a persistent, non-overfit invariant that would catch future unrelated bugs, record it as general guidance in this file and in `AGENTS.md` or `CLAUDE.md`. Do not add issue numbers, branch names, or frozen file:line examples unless they are explicitly marked as temporary examples.
 
 ## What to look for (general bug classes — check every one that the diff touches)
 
