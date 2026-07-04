@@ -361,6 +361,22 @@ impl CdpTempoDriver {
         }
     }
 
+    async fn recover_timed_out_navigation_since(
+        &self,
+        cursor: u64,
+        requested_url: &str,
+    ) -> Result<(), TransportError> {
+        self.enforce_no_blocked_request_soon_since(cursor).await?;
+        let current_url = self.current_url().await?;
+        self.enforce_current_url_policy_value(&current_url)?;
+        self.enforce_no_blocked_request_since(cursor)?;
+        if navigation_urls_match(requested_url, &current_url) {
+            Ok(())
+        } else {
+            Err(TransportError::NavTimeout)
+        }
+    }
+
     fn page(&self) -> Result<&Page, TransportError> {
         self.page
             .as_ref()
@@ -976,8 +992,16 @@ impl DriverTrait for CdpTempoDriver {
         self.enforce_url_policy(url)?;
         self.clear_blocked_request()?;
         let cursor = self.request_policy_cursor();
-        let goto_result = self.page()?.goto(url).await;
-        self.map_cdp_result_since(cursor, goto_result).await?;
+        match self.page()?.goto(url).await {
+            Ok(_page) => {}
+            Err(CdpError::Timeout) => {
+                self.recover_timed_out_navigation_since(cursor, url).await?;
+            }
+            Err(error) => {
+                self.enforce_no_blocked_request_soon_since(cursor).await?;
+                return Err(map_cdp_error(error));
+            }
+        }
         self.enforce_no_blocked_request_soon_since(cursor).await?;
         if self.take_blocked_request()?.is_some() {
             return Err(TransportError::UrlBlocked);
@@ -1780,6 +1804,16 @@ fn validate_screenshot_bytes(bytes: Vec<u8>) -> Result<Vec<u8>, TransportError> 
 
 fn map_cdp_error(error: CdpError) -> TransportError {
     TransportError::Other(error.to_string())
+}
+
+fn navigation_urls_match(requested_url: &str, current_url: &str) -> bool {
+    if requested_url == current_url {
+        return true;
+    }
+    match (url::Url::parse(requested_url), url::Url::parse(current_url)) {
+        (Ok(requested), Ok(current)) => requested == current,
+        _ => false,
+    }
 }
 
 fn env_flag_enabled(name: &str) -> bool {
@@ -2623,6 +2657,26 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpListener, TcpStream as StdTcpStream};
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn navigation_url_match_accepts_chromium_normalization_only() {
+        assert!(navigation_urls_match(
+            "http://example.test",
+            "http://example.test/"
+        ));
+        assert!(navigation_urls_match(
+            "https://example.test/path?q=1",
+            "https://example.test/path?q=1"
+        ));
+        assert!(!navigation_urls_match(
+            "https://example.test/path?q=1",
+            "https://example.test/path?q=2"
+        ));
+        assert!(!navigation_urls_match(
+            "https://example.test/path",
+            "https://other.test/path"
+        ));
+    }
 
     #[test]
     fn extracts_selector_backed_interactive_elements_from_real_dom_html() {
