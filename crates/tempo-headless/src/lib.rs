@@ -16,7 +16,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
 use std::time::Duration;
 use tempo_agent::{StepTriple, StepTripleOutcome};
@@ -33,7 +33,7 @@ use tempo_driver::{
 };
 use tempo_engine_host::{
     DriverCommand as HostDriverCommand, DriverResponse, DriverWireError, EngineHost,
-    EngineHostConfig, EngineHostError, EngineIpcClient,
+    EngineHostConfig, EngineHostError, EngineIpcClient, SharedEngineIpcClient,
 };
 use tempo_policy::{decide_action, decide_effect, InputTaint, PolicyDecision};
 use tempo_schema::{Action, ActionBatch, CompiledObservation, NodeId, ObservationDiff, SideEffect};
@@ -68,26 +68,20 @@ const ENGINE_IPC_TIMEOUT: Duration = Duration::from_secs(30);
 const ENGINE_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(test)]
 const ENGINE_TEARDOWN_TIMEOUT: Duration = Duration::from_millis(200);
-/// Upper bound on how long `create()` waits for the attached engine to create a
-/// session browsing context AND navigate it to the session URL before giving up.
-/// Both are blocking engine-IPC round-trips run on the create path while the
-/// caller holds the global pool `Mutex` (`handle_stream`), so a slow/unresponsive
-/// navigation target would otherwise stall every request -- including
-/// `GET /health` and `POST /drain` -- for up to 2x`ENGINE_IPC_TIMEOUT`, or
-/// *forever* if the engine connection carries no read timeout (#213). The
-/// create+goto (and the failure-path `Close`) run on a detached worker thread and
-/// we await it with one `recv_timeout`; on timeout the worker owns and abandons
-/// the wedged work while `create()` returns a `TempodError`, so the pool lock is
-/// released and the daemon stays available. The bound is set to 2x
-/// `ENGINE_IPC_TIMEOUT` plus a small margin so a genuinely slow-but-valid
-/// navigation the engine still answers within its own per-round-trip IPC budget
-/// is never cut off; only the pathological never-answers case is capped.
+/// Upper bound on how long a session create waits for the attached engine to
+/// create a session browsing context AND navigate it to the session URL before
+/// giving up. The create+goto (and the failure-path `Close`) run on a detached
+/// worker thread awaited with one `recv_timeout`; on timeout the worker owns
+/// and abandons the wedged work while create returns a `TempodError`, so the
+/// daemon stays available (#213/#217). The bound is 2x `ENGINE_IPC_TIMEOUT`
+/// plus a small margin so a genuinely slow-but-valid navigation the engine
+/// still answers within its own per-round-trip IPC budget is never cut off;
+/// only the pathological never-answers case is capped.
 ///
-/// RESIDUAL (#213): the pool lock is still held for up to this window -- a strict
-/// improvement over an indefinite/forever stall, but not zero. Fully releasing
-/// the lock across the create+goto IPC (take the root driver handle out, drop the
-/// `MutexGuard`, do the IPC off-lock, re-acquire to insert) is a larger,
-/// higher-risk refactor of the routing/locking path left as a follow-up.
+/// Since issue #230 the HTTP create path (`create_session_shared`) runs this
+/// whole window with the pool lock RELEASED — the #213 residual (lock held for
+/// up to the bound) is gone — and only re-locks briefly to publish the session.
+/// The bound still matters: it is what caps a single create attempt end to end.
 #[cfg(not(test))]
 const SESSION_CREATE_TIMEOUT: Duration = Duration::from_secs(65);
 #[cfg(test)]
@@ -237,29 +231,100 @@ pub enum TempodSessionEventKind {
     StepTriple { triple: StepTriple },
 }
 
+/// Per-driver (per browsing context / fork / root) operation gate.
+///
+/// Serializes engine round-trips issued through clones of the SAME driver
+/// handle so per-session ordering is preserved, while distinct drivers —
+/// distinct sessions/contexts — proceed fully in parallel over the shared,
+/// multiplexed engine connection (issue #230). Acquisition is bounded: a
+/// waiter gives up after the timeout instead of queueing indefinitely, and
+/// every hold is itself bounded by the engine IPC timeout, so waits always
+/// terminate.
+#[derive(Default)]
+struct OpGate {
+    busy: Mutex<bool>,
+    released: Condvar,
+}
+
+impl OpGate {
+    fn acquire(self: &Arc<Self>, timeout: Duration) -> Option<OpGateGuard> {
+        let deadline = std::time::Instant::now().checked_add(timeout);
+        // Poisoning is recovered (`into_inner`): the guarded state is one bool
+        // whose invariant cannot be broken mid-panic, and treating poison as
+        // fatal would wedge every later operation on this driver behind a
+        // one-off panic (#305 review nit).
+        let mut busy = self
+            .busy
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        loop {
+            if !*busy {
+                *busy = true;
+                return Some(OpGateGuard {
+                    gate: Arc::clone(self),
+                });
+            }
+            let remaining = deadline
+                .and_then(|deadline| deadline.checked_duration_since(std::time::Instant::now()))?;
+            busy = match self.released.wait_timeout(busy, remaining) {
+                Ok((guard, _)) => guard,
+                Err(poisoned) => poisoned.into_inner().0,
+            };
+        }
+    }
+}
+
+struct OpGateGuard {
+    gate: Arc<OpGate>,
+}
+
+impl Drop for OpGateGuard {
+    fn drop(&mut self) {
+        *self
+            .gate
+            .busy
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = false;
+        self.gate.released.notify_one();
+    }
+}
+
 /// Driver handle attached to tempod through the engine-host UDS protocol.
+///
+/// Clones share the multiplexed engine connection AND the per-driver [`OpGate`]:
+/// round-trips through clones of one handle stay ordered, while handles for
+/// different engine-side drivers (`driver_id`s) run concurrently (issue #230).
 #[derive(Clone)]
 pub struct AttachedEngineDriver {
     engine: Engine,
-    client: Arc<Mutex<EngineIpcClient>>,
+    client: SharedEngineIpcClient,
     driver_id: Option<String>,
+    gate: Arc<OpGate>,
 }
 
 impl AttachedEngineDriver {
-    pub fn new(engine: Engine, client: EngineIpcClient) -> Self {
-        Self {
+    pub fn new(engine: Engine, client: EngineIpcClient) -> Result<Self, TempodError> {
+        let client = SharedEngineIpcClient::from_client(client)
+            .map_err(|error| TempodError::Driver(format!("engine IPC setup failed: {error}")))?;
+        Ok(Self {
             engine,
-            client: Arc::new(Mutex::new(client)),
+            client,
             driver_id: None,
-        }
+            gate: Arc::new(OpGate::default()),
+        })
     }
 
     fn request(&self, command: HostDriverCommand) -> Result<DriverResponse, DriverClientError> {
-        let mut client = self
+        // Same-driver ordering: hold this driver's gate for the round-trip.
+        // The gate wait and the round-trip itself are both bounded, and no
+        // other lock (pool, MCP, or another session's gate) is held here.
+        let _gate = self
+            .gate
+            .acquire(ENGINE_IPC_TIMEOUT)
+            .ok_or(DriverClientError::Busy)?;
+        Ok(self
             .client
-            .lock()
-            .map_err(|_| DriverClientError::LockFailed)?;
-        Ok(client.request_for(self.driver_id.as_deref(), command)?)
+            .request_for(self.driver_id.as_deref(), command, ENGINE_IPC_TIMEOUT)?)
     }
 
     fn request_observation(
@@ -352,13 +417,21 @@ impl AttachedEngineDriver {
         }
     }
 
+    /// New handle for a newly-created engine-side driver: shares the
+    /// connection, but gets its OWN operation gate so it never serializes
+    /// against its parent or siblings.
+    fn derived(&self, driver_id: String) -> Self {
+        Self {
+            engine: self.engine,
+            client: self.client.clone(),
+            driver_id: Some(driver_id),
+            gate: Arc::new(OpGate::default()),
+        }
+    }
+
     async fn fork_attached(&mut self) -> Result<Self, Unsupported> {
         match self.request(HostDriverCommand::Fork) {
-            Ok(DriverResponse::Forked { driver_id }) => Ok(Self {
-                engine: self.engine,
-                client: Arc::clone(&self.client),
-                driver_id: Some(driver_id),
-            }),
+            Ok(DriverResponse::Forked { driver_id }) => Ok(self.derived(driver_id)),
             Ok(DriverResponse::Error { error }) => Err(driver_wire_unsupported(error)),
             Ok(_) => Err(Unsupported("unexpected engine IPC fork response")),
             Err(_) => Err(Unsupported("engine IPC fork failed")),
@@ -370,11 +443,7 @@ impl AttachedEngineDriver {
         options: BrowsingContextCreateOptions,
     ) -> Result<Self, Unsupported> {
         match self.request(HostDriverCommand::CreateBrowsingContext { options }) {
-            Ok(DriverResponse::BrowsingContextCreated { driver_id }) => Ok(Self {
-                engine: self.engine,
-                client: Arc::clone(&self.client),
-                driver_id: Some(driver_id),
-            }),
+            Ok(DriverResponse::BrowsingContextCreated { driver_id }) => Ok(self.derived(driver_id)),
             Ok(DriverResponse::Error { error }) => Err(driver_wire_unsupported(error)),
             Ok(_) => Err(Unsupported("unexpected engine IPC create context response")),
             Err(_) => Err(Unsupported("engine IPC create context failed")),
@@ -468,8 +537,10 @@ impl DriverTrait for AttachedEngineDriver {
 
 #[derive(Debug, Error)]
 enum DriverClientError {
-    #[error("attached engine driver lock failed")]
-    LockFailed,
+    #[error(
+        "engine driver is busy: another operation on this session/context did not finish in time"
+    )]
+    Busy,
     #[error("engine host failed: {0}")]
     Host(#[from] EngineHostError),
 }
@@ -483,7 +554,11 @@ pub struct SessionPool {
     otlp_exporter: Option<OtlpJsonExporter>,
     bidi: BidiRouter,
     driver: Option<AttachedEngineDriver>,
-    mcp: Option<Arc<Mutex<tempo_mcp::TempoMcpServer<AttachedEngineDriver>>>>,
+    /// One MCP server for the attached engine. No outer `Mutex`: the server
+    /// itself runs concurrent tool calls on distinct drivers and serializes
+    /// same-driver calls internally (issue #230), so tool calls on different
+    /// sessions no longer queue behind a process-wide MCP lock.
+    mcp: Option<Arc<tempo_mcp::TempoMcpServer<AttachedEngineDriver>>>,
     bidi_contexts: BTreeMap<BrowsingContextId, AttachedEngineDriver>,
     next_bidi_context_id: u64,
     next_id: u64,
@@ -534,12 +609,27 @@ impl SessionPool {
         self.otlp_exporter.as_ref()
     }
 
+    /// Create a session while exclusively holding the pool. The HTTP path uses
+    /// [`create_session_shared`] instead, which runs the engine round-trips
+    /// WITHOUT the pool lock so other sessions and metadata routes stay live
+    /// (issue #230); this method serves already-locked callers (tests, and
+    /// driverless metadata-only pools).
     pub fn create(&mut self, url: impl Into<String>) -> Result<TempodSession, TempodError> {
         if self.draining {
             return Err(TempodError::Draining);
         }
         let url = url.into();
         let session_driver = self.create_session_engine_context(&url)?;
+        Ok(self.finish_create(url, session_driver))
+    }
+
+    /// Insert the session record (and its engine context driver, when present)
+    /// and emit the created event. Callers have already checked `draining`.
+    fn finish_create(
+        &mut self,
+        url: String,
+        session_driver: Option<AttachedEngineDriver>,
+    ) -> TempodSession {
         let id = TempodSessionId(format!("session-{}", self.next_id));
         self.next_id = self.next_id.saturating_add(1);
         let session = TempodSession {
@@ -558,7 +648,7 @@ impl SessionPool {
                 url: session.url.clone(),
             },
         );
-        Ok(session)
+        session
     }
 
     pub fn list(&self) -> Vec<TempodSession> {
@@ -615,17 +705,20 @@ impl SessionPool {
         self.draining
     }
 
-    pub fn attach_engine_driver(&mut self, engine: Engine, client: EngineIpcClient) {
+    pub fn attach_engine_driver(
+        &mut self,
+        engine: Engine,
+        client: EngineIpcClient,
+    ) -> Result<(), TempodError> {
         self.close_engine_resources(true);
-        let driver = AttachedEngineDriver::new(engine, client);
-        self.mcp = Some(Arc::new(Mutex::new(tempo_mcp::TempoMcpServer::new(
-            driver.clone(),
-        ))));
+        let driver = AttachedEngineDriver::new(engine, client)?;
+        self.mcp = Some(Arc::new(tempo_mcp::TempoMcpServer::new(driver.clone())));
         self.bidi_contexts.clear();
         self.next_bidi_context_id = 1;
         self.bidi_contexts
             .insert(default_context_id(), driver.clone());
         self.driver = Some(driver);
+        Ok(())
     }
 
     pub fn detach_engine_driver(&mut self) {
@@ -671,8 +764,9 @@ impl SessionPool {
     /// its fork / MCP closes are still bounded through the same worker.
     ///
     /// `AttachedEngineDriver` and `TempoMcpServer<AttachedEngineDriver>` are
-    /// `Send + 'static` (`Arc<Mutex<..>>` + `Copy` `Engine`; forks are
-    /// `Box<dyn DriverTrait>`, which is `Send`), so they move to the worker thread.
+    /// `Send + 'static` (shared multiplexed IPC client + `Copy` `Engine`; forks
+    /// are `Box<dyn DriverTrait>`, which is `Send`), so they move to the worker
+    /// thread.
     fn bounded_engine_teardown(&mut self, close_root: bool, timeout: Duration) {
         // Collect everything to close and clean up `self` up front.
         let forks: Vec<AttachedEngineDriver> = std::mem::take(&mut self.bidi_contexts)
@@ -707,15 +801,8 @@ impl SessionPool {
             }
             // Then MCP forks.
             if let Some(server) = mcp {
-                match server.lock() {
-                    Ok(mut server) => {
-                        for error in futures::executor::block_on(server.close_all_forks()) {
-                            eprintln!("tempod: error closing MCP fork at teardown: {error}");
-                        }
-                    }
-                    Err(_) => eprintln!(
-                        "tempod: MCP server lock poisoned during fork teardown; skipping fork close"
-                    ),
+                for error in futures::executor::block_on(server.close_all_forks()) {
+                    eprintln!("tempod: error closing MCP fork at teardown: {error}");
                 }
             }
             // Then session-owned engine contexts.
@@ -756,68 +843,15 @@ impl SessionPool {
         let Some(root_driver) = self.driver.as_ref() else {
             return Ok(None);
         };
-        // The create-context + goto round-trips block on engine IPC while the
-        // caller holds the global pool `Mutex`. A slow/unresponsive navigation
-        // target must not wedge the daemon (and every `GET /health` / `POST
-        // /drain` blocked on that lock), so we run them on a detached worker
-        // bounded by `SESSION_CREATE_TIMEOUT`, mirroring the #200/#205
-        // bounded-teardown pattern (#213). The root driver's engine handle is an
-        // `Arc<Mutex<EngineIpcClient>>`, so cloning it shares the same engine
-        // connection with the worker. The failure-path `Close` runs on the same
-        // worker so it is bounded by the same window and never re-blocks us.
-        let mut worker_driver = root_driver.clone();
-        let url = url.to_string();
-        let outcome = run_create_bounded(
-            SESSION_CREATE_TIMEOUT,
-            move || -> Result<AttachedEngineDriver, TempodError> {
-                let options = BrowsingContextCreateOptions {
-                    kind: BrowsingContextKind::Tab,
-                    background: true,
-                };
-                let mut session_driver = futures::executor::block_on(
-                    worker_driver.create_browsing_context_attached(options),
-                )
-                .map_err(|error| {
-                    TempodError::Driver(format!(
-                        "attached engine failed to create session context: {error}"
-                    ))
-                })?;
-                if let Err(error) = futures::executor::block_on(session_driver.goto(&url)) {
-                    let _ = futures::executor::block_on(session_driver.close());
-                    return Err(TempodError::Driver(format!(
-                        "attached engine failed to navigate session context: {error}"
-                    )));
-                }
-                Ok(session_driver)
-            },
-            // If the create+goto succeeds AFTER the caller has already timed out
-            // (receiver gone), close the freshly-created session context here on
-            // the worker thread instead of dropping it. The engine has been
-            // invalidated on the timeout path, so nothing else owns this context;
-            // dropping it silently would leak the browsing context engine-side
-            // (#213 review). `Err(_)` values carry no engine resource to release.
-            |orphaned: Result<AttachedEngineDriver, TempodError>| {
-                if let Ok(mut orphaned_driver) = orphaned {
-                    let _ = futures::executor::block_on(orphaned_driver.close());
-                }
-            },
-        );
-        match outcome {
+        match run_session_context_create(root_driver.clone(), url) {
             Some(result) => result.map(Some),
             None => {
-                // The detached create worker may still be blocked in
-                // `AttachedEngineDriver::request` holding the shared
-                // `Arc<Mutex<EngineIpcClient>>`. The root driver and existing
-                // session drivers share that same wedged client, so a LATER
-                // engine-backed request would block FOREVER on the mutex while
-                // holding the pool lock -- reintroducing the exact `/health` /
-                // `/drain` stall this bound is meant to prevent (#213). Detach
-                // the shared engine state (identically to the bounded-teardown
-                // timeout path) so any subsequent engine-backed request fails
-                // fast instead of waiting on the wedged IPC handle. The wedged
-                // client is NOT closed here (that would re-block); the abandoned
-                // worker still owns it and drops it once the engine answers or
-                // disconnects.
+                // The engine failed to answer the bounded create+goto window at
+                // all — treat it as unresponsive and detach the shared engine
+                // state so later engine-backed requests fail fast instead of
+                // each waiting out its own IPC timeout against a wedged child
+                // (#213). The abandoned worker still owns the in-flight work
+                // and releases it once the engine answers or disconnects.
                 self.abandon_attached_engine_after_teardown_timeout(
                     "session-create engine navigation",
                 );
@@ -1133,6 +1167,52 @@ where
             None
         }
     }
+}
+
+/// Run the session create-context + goto engine round-trips on a detached
+/// worker bounded by [`SESSION_CREATE_TIMEOUT`] (#213/#217). Returns `None` on
+/// timeout — the worker then owns the wedged work and closes any late-created
+/// context via the orphan hook instead of leaking it. The failure-path `Close`
+/// runs on the same worker so it is bounded by the same window.
+fn run_session_context_create(
+    mut worker_driver: AttachedEngineDriver,
+    url: &str,
+) -> Option<Result<AttachedEngineDriver, TempodError>> {
+    let url = url.to_string();
+    run_create_bounded(
+        SESSION_CREATE_TIMEOUT,
+        move || -> Result<AttachedEngineDriver, TempodError> {
+            let options = BrowsingContextCreateOptions {
+                kind: BrowsingContextKind::Tab,
+                background: true,
+            };
+            let mut session_driver = futures::executor::block_on(
+                worker_driver.create_browsing_context_attached(options),
+            )
+            .map_err(|error| {
+                TempodError::Driver(format!(
+                    "attached engine failed to create session context: {error}"
+                ))
+            })?;
+            if let Err(error) = futures::executor::block_on(session_driver.goto(&url)) {
+                let _ = futures::executor::block_on(session_driver.close());
+                return Err(TempodError::Driver(format!(
+                    "attached engine failed to navigate session context: {error}"
+                )));
+            }
+            Ok(session_driver)
+        },
+        // If the create+goto succeeds AFTER the caller has already timed out
+        // (receiver gone), close the freshly-created session context here on
+        // the worker thread instead of dropping it. Nothing else owns this
+        // context, so dropping it silently would leak the browsing context
+        // engine-side (#213 review). `Err(_)` values carry no engine resource.
+        |orphaned: Result<AttachedEngineDriver, TempodError>| {
+            if let Ok(mut orphaned_driver) = orphaned {
+                let _ = futures::executor::block_on(orphaned_driver.close());
+            }
+        },
+    )
 }
 
 fn driver_client_transport_error(error: DriverClientError) -> TransportError {
@@ -1472,15 +1552,16 @@ pub fn run_tempod_with_attached_driver_config(
     config.validate_bind_addr(addr)?;
     let listener = TcpListener::bind(addr)?;
     let mut pool = SessionPool::from_env();
-    pool.attach_engine_driver(engine, connect_engine_ipc(socket_path)?);
+    pool.attach_engine_driver(engine, connect_engine_ipc(socket_path)?)?;
     serve_forever_with_config(listener, Arc::new(Mutex::new(pool)), config)
 }
 
-/// Connect to the engine host UDS and apply an IPC read/write timeout so a
-/// stalled engine cannot wedge the daemon indefinitely.
+/// Connect to the engine host UDS with a bounded write timeout. Read bounding
+/// is per-request: the multiplexed client (`SharedEngineIpcClient`) awaits each
+/// response with its own `ENGINE_IPC_TIMEOUT` and clears the socket read
+/// timeout so its idle reader thread never mis-times a frame (issue #230).
 fn connect_engine_ipc(socket_path: impl AsRef<Path>) -> Result<EngineIpcClient, TempodError> {
     let stream = std::os::unix::net::UnixStream::connect(socket_path)?;
-    stream.set_read_timeout(Some(ENGINE_IPC_TIMEOUT))?;
     stream.set_write_timeout(Some(ENGINE_IPC_TIMEOUT))?;
     Ok(EngineIpcClient::from_stream(stream))
 }
@@ -1762,10 +1843,7 @@ fn handle_stream(
             return Ok(());
         }
     }
-    let response = {
-        let mut pool = pool.lock().map_err(|_| TempodError::PoolLock)?;
-        handle_http_request_with_auth(&mut pool, request, auth)
-    };
+    let response = handle_http_request_with_auth(pool, request, auth);
     stream.write_all(response.to_bytes().as_slice())?;
     stream.flush()?;
     Ok(())
@@ -1780,13 +1858,20 @@ fn tempod_error_response(err: &TempodError) -> HttpResponse {
     )
 }
 
+/// Lock the pool for a SHORT, engine-IPC-free critical section. Routes must
+/// never hold this guard across an engine round-trip (issue #230): engine work
+/// happens on cloned per-session driver handles after the guard is dropped.
+fn lock_pool(pool: &Arc<Mutex<SessionPool>>) -> Result<MutexGuard<'_, SessionPool>, TempodError> {
+    pool.lock().map_err(|_| TempodError::PoolLock)
+}
+
 #[cfg(test)]
-fn handle_http_request(pool: &mut SessionPool, request: HttpRequest) -> HttpResponse {
+fn handle_http_request(pool: &Arc<Mutex<SessionPool>>, request: HttpRequest) -> HttpResponse {
     handle_http_request_with_auth(pool, request, &TempodAuth::disabled())
 }
 
 fn handle_http_request_with_auth(
-    pool: &mut SessionPool,
+    pool: &Arc<Mutex<SessionPool>>,
     request: HttpRequest,
     auth: &TempodAuth,
 ) -> HttpResponse {
@@ -1796,16 +1881,25 @@ fn handle_http_request_with_auth(
     }
 }
 
+/// Route one HTTP request. Locking discipline (issue #230): metadata routes
+/// (`/health`, list/adopt/kill/drain/events) take the pool lock only for their
+/// in-memory work (kill/drain additionally run the pre-existing BOUNDED
+/// engine-context closes from #200/#205 under it), while the engine-op routes
+/// (`POST /sessions`, `POST /mcp`, `POST /bidi`) split into lock -> clone the
+/// needed per-session handle -> unlock -> engine round-trip -> re-lock to
+/// publish results. No engine round-trip ever runs while the pool lock is
+/// held, so operations on different sessions execute concurrently and
+/// `/health`/`/drain` never queue behind an in-flight browser operation.
 #[cfg(test)]
 fn route_http_request(
-    pool: &mut SessionPool,
+    pool: &Arc<Mutex<SessionPool>>,
     request: HttpRequest,
 ) -> Result<HttpResponse, TempodError> {
     route_http_request_with_auth(pool, request, &TempodAuth::disabled())
 }
 
 fn route_http_request_with_auth(
-    pool: &mut SessionPool,
+    pool: &Arc<Mutex<SessionPool>>,
     request: HttpRequest,
     auth: &TempodAuth,
 ) -> Result<HttpResponse, TempodError> {
@@ -1823,6 +1917,8 @@ fn route_http_request_with_auth(
         return Err(TempodError::Forbidden("origin not allowed".into()));
     }
     match (request.method.as_str(), request.path.as_str()) {
+        // Health never touches the pool at all: it must answer even while
+        // metadata routes are briefly holding the lock.
         ("GET", "/health") => Ok(HttpResponse::json(200, json!({"ok": true}))),
         ("GET", tempo_mcp::A2A_AGENT_CARD_PATH) | ("GET", tempo_mcp::A2A_AGENT_JSON_PATH) => Ok(
             HttpResponse::from_mcp(tempo_mcp::agent_card_response(&request.base_url())),
@@ -1835,15 +1931,19 @@ fn route_http_request_with_auth(
             }
             Ok(route_bidi(pool, request.body))
         }
-        ("GET", "/sessions") => Ok(HttpResponse::json(200, pool.list())),
+        ("GET", "/sessions") => Ok(HttpResponse::json(200, lock_pool(pool)?.list())),
         ("POST", "/sessions") => {
             let body: CreateSessionRequest = serde_json::from_slice(&request.body)?;
             if body.url.trim().is_empty() {
                 return Err(TempodError::BadRequest("session url is required".into()));
             }
-            Ok(HttpResponse::json(201, pool.create(body.url)?))
+            Ok(HttpResponse::json(
+                201,
+                create_session_shared(pool, body.url)?,
+            ))
         }
         ("POST", "/drain") => {
+            let mut pool = lock_pool(pool)?;
             pool.drain();
             Ok(HttpResponse::json(
                 200,
@@ -1857,15 +1957,18 @@ fn route_http_request_with_auth(
             if request.method == "GET"
                 && let Some((id, after_seq)) = session_events_from_path(&request.path)?
             {
-                return Ok(HttpResponse::json(200, pool.events(&id, after_seq)?));
+                return Ok(HttpResponse::json(
+                    200,
+                    lock_pool(pool)?.events(&id, after_seq)?,
+                ));
             }
             if request.method == "POST" && request.path.ends_with("/adopt") {
                 let id = session_id_from_action_path(&request.path, "adopt")?;
-                return Ok(HttpResponse::json(200, pool.adopt(&id)?));
+                return Ok(HttpResponse::json(200, lock_pool(pool)?.adopt(&id)?));
             }
             if request.method == "DELETE" {
                 let id = session_id_from_path(&request.path)?;
-                return Ok(HttpResponse::json(200, pool.kill(&id)?));
+                return Ok(HttpResponse::json(200, lock_pool(pool)?.kill(&id)?));
             }
             Err(TempodError::BadRequest(format!(
                 "unsupported route: {} {}",
@@ -1873,6 +1976,66 @@ fn route_http_request_with_auth(
             )))
         }
     }
+}
+
+/// `POST /sessions` with the engine round-trips OFF the pool lock (issue #230;
+/// completes the follow-up documented on [`SESSION_CREATE_TIMEOUT`]):
+///
+/// 1. lock — admission (drain check) and root-driver handle clone;
+/// 2. unlock — bounded create-context + goto on a detached worker
+///    (`SESSION_CREATE_TIMEOUT`, unchanged from #217), so concurrent creates
+///    and every other route proceed meanwhile;
+/// 3. lock — re-check drain (closing the fresh context if drain won the race)
+///    and publish the session record + driver.
+fn create_session_shared(
+    pool: &Arc<Mutex<SessionPool>>,
+    url: String,
+) -> Result<TempodSession, TempodError> {
+    let root_driver = {
+        let pool = lock_pool(pool)?;
+        if pool.draining {
+            return Err(TempodError::Draining);
+        }
+        pool.driver.clone()
+    };
+
+    let session_driver = match root_driver {
+        None => None,
+        Some(root_driver) => match run_session_context_create(root_driver, &url) {
+            Some(result) => Some(result?),
+            None => {
+                // Same circuit breaker as the locked path: an engine that
+                // cannot answer within the whole create window is treated as
+                // unresponsive and detached so later requests fail fast (#213).
+                lock_pool(pool)?.abandon_attached_engine_after_teardown_timeout(
+                    "session-create engine navigation",
+                );
+                return Err(TempodError::Driver(
+                    "attached engine timed out creating/navigating session context".into(),
+                ));
+            }
+        },
+    };
+
+    let mut pool = lock_pool(pool)?;
+    if pool.draining {
+        // Drain raced the off-lock engine work: the pool must stay empty, so
+        // release the freshly-created context (bounded) instead of leaking it.
+        if let Some(mut driver) = session_driver
+            && run_teardown_bounded(
+                "session context Close after drain race",
+                ENGINE_TEARDOWN_TIMEOUT,
+                move || futures::executor::block_on(driver.close()),
+            )
+            .is_none()
+        {
+            eprintln!(
+                "tempod: session context created during drain was abandoned to a detached worker"
+            );
+        }
+        return Err(TempodError::Draining);
+    }
+    Ok(pool.finish_create(url, session_driver))
 }
 
 fn session_events_from_path(
@@ -2085,10 +2248,10 @@ fn serve_bidi_websocket(
         };
         match frame.opcode {
             WS_OPCODE_TEXT | WS_OPCODE_BINARY => {
-                let messages = {
-                    let mut pool = pool.lock().map_err(|_| TempodError::PoolLock)?;
-                    route_bidi_websocket(&mut pool, frame.payload)
-                };
+                // Commands are dispatched without holding the pool lock across
+                // engine round-trips (issue #230); this connection still
+                // processes its own frames strictly in order.
+                let messages = route_bidi_websocket(pool, frame.payload);
                 for message in messages {
                     let payload = bidi_message_payload(&message)?;
                     write_websocket_frame(&mut stream, WS_OPCODE_TEXT, &payload)?;
@@ -2188,11 +2351,11 @@ fn write_websocket_frame(
     Ok(())
 }
 
-fn route_bidi(pool: &mut SessionPool, body: Vec<u8>) -> HttpResponse {
+fn route_bidi(pool: &Arc<Mutex<SessionPool>>, body: Vec<u8>) -> HttpResponse {
     route_bidi_dispatch(pool, body).response
 }
 
-fn route_bidi_websocket(pool: &mut SessionPool, body: Vec<u8>) -> Vec<BidiMessage> {
+fn route_bidi_websocket(pool: &Arc<Mutex<SessionPool>>, body: Vec<u8>) -> Vec<BidiMessage> {
     let dispatch = route_bidi_dispatch(pool, body);
     let mut messages = Vec::with_capacity(1 + dispatch.events.len());
     messages.push(dispatch.message);
@@ -2200,49 +2363,77 @@ fn route_bidi_websocket(pool: &mut SessionPool, body: Vec<u8>) -> Vec<BidiMessag
     messages
 }
 
-fn route_bidi_dispatch(pool: &mut SessionPool, body: Vec<u8>) -> BidiDispatchResult {
-    match pool.bidi.route_json(&body) {
-        Ok(RoutedCommand::Immediate(message)) => BidiDispatchResult::new(200, message),
-        Ok(RoutedCommand::SessionStarted(message)) => {
-            pool.start_bidi_session();
-            BidiDispatchResult::new(200, message)
-        }
-        Ok(RoutedCommand::SessionEnded(message)) => {
-            pool.end_bidi_session();
-            BidiDispatchResult::new(200, message)
-        }
-        Ok(RoutedCommand::Driver { id, command }) => {
-            if pool.draining {
-                return BidiDispatchResult::new(
-                    503,
-                    BidiMessage::error(
-                        Some(id),
-                        BidiErrorCode::UnknownError,
-                        "tempod is draining; BiDi driver commands are not accepted",
-                    ),
-                );
+fn pool_lock_bidi_error(id: Option<tempo_bidi::CommandId>) -> BidiDispatchResult {
+    BidiDispatchResult::new(
+        500,
+        BidiMessage::error(id, BidiErrorCode::UnknownError, "session pool lock failed"),
+    )
+}
+
+/// Route one BiDi command. Router bookkeeping and drain/driver admission run
+/// under a brief pool lock; driver commands then execute on a cloned
+/// per-context handle with the lock released (issue #230), so commands on
+/// different browsing contexts run concurrently while the per-context
+/// [`OpGate`] keeps same-context commands ordered.
+fn route_bidi_dispatch(pool: &Arc<Mutex<SessionPool>>, body: Vec<u8>) -> BidiDispatchResult {
+    let (id, command) = {
+        let Ok(mut pool) = pool.lock() else {
+            return pool_lock_bidi_error(None);
+        };
+        match pool.bidi.route_json(&body) {
+            Ok(RoutedCommand::Immediate(message)) => return BidiDispatchResult::new(200, message),
+            Ok(RoutedCommand::SessionStarted(message)) => {
+                pool.start_bidi_session();
+                return BidiDispatchResult::new(200, message);
             }
-            if pool.driver.is_none() {
-                return BidiDispatchResult::new(
-                    503,
-                    BidiMessage::error(
-                        Some(id),
-                        BidiErrorCode::UnknownError,
-                        "driver command requires an attached engine driver",
-                    ),
-                );
+            Ok(RoutedCommand::SessionEnded(message)) => {
+                pool.end_bidi_session();
+                return BidiDispatchResult::new(200, message);
             }
-            route_bidi_driver(pool, id, command)
+            Ok(RoutedCommand::Driver { id, command }) => {
+                if pool.draining {
+                    return BidiDispatchResult::new(
+                        503,
+                        BidiMessage::error(
+                            Some(id),
+                            BidiErrorCode::UnknownError,
+                            "tempod is draining; BiDi driver commands are not accepted",
+                        ),
+                    );
+                }
+                if pool.driver.is_none() {
+                    return BidiDispatchResult::new(
+                        503,
+                        BidiMessage::error(
+                            Some(id),
+                            BidiErrorCode::UnknownError,
+                            "driver command requires an attached engine driver",
+                        ),
+                    );
+                }
+                (id, command)
+            }
+            Err(error) => {
+                return BidiDispatchResult::new(
+                    400,
+                    BidiMessage::error(None, BidiErrorCode::InvalidArgument, error.to_string()),
+                )
+            }
         }
-        Err(error) => BidiDispatchResult::new(
-            400,
-            BidiMessage::error(None, BidiErrorCode::InvalidArgument, error.to_string()),
-        ),
-    }
+    };
+    route_bidi_driver(pool, id, command)
+}
+
+/// Clone the driver handle for a BiDi context under a brief pool lock.
+fn bidi_driver_handle(
+    pool: &Arc<Mutex<SessionPool>>,
+    context: &BrowsingContextId,
+) -> Result<Option<AttachedEngineDriver>, TempodError> {
+    Ok(lock_pool(pool)?.bidi_driver_for(context))
 }
 
 fn route_bidi_driver(
-    pool: &mut SessionPool,
+    pool: &Arc<Mutex<SessionPool>>,
     id: tempo_bidi::CommandId,
     command: BidiDriverCommand,
 ) -> BidiDispatchResult {
@@ -2257,13 +2448,21 @@ fn route_bidi_driver(
                 return denied;
             }
             let context = command.context.clone();
-            let Some(mut driver) = pool.bidi_driver_for(&context) else {
+            let Ok(handle) = bidi_driver_handle(pool, &context) else {
+                return pool_lock_bidi_error(Some(id));
+            };
+            let Some(mut driver) = handle else {
                 return unknown_browsing_context_result(id);
             };
             let url = command.url.clone();
+            // Engine round-trip runs with NO pool lock held (issue #230);
+            // `driver` is a clone sharing the context's connection + op gate.
             match futures::executor::block_on(driver.goto(&url)) {
                 Ok(_) => {
-                    pool.bidi_contexts.insert(context.clone(), driver);
+                    let events = match lock_pool(pool) {
+                        Ok(pool) => browsing_context_navigation_events(&pool, id, &context, &url),
+                        Err(_) => Vec::new(),
+                    };
                     BidiDispatchResult::with_events(
                         200,
                         bidi_success_or_error(
@@ -2273,7 +2472,7 @@ fn route_bidi_driver(
                                 url: url.clone(),
                             },
                         ),
-                        browsing_context_navigation_events(pool, id, &context, &url),
+                        events,
                     )
                 }
                 Err(error) => BidiDispatchResult::new(
@@ -2284,26 +2483,26 @@ fn route_bidi_driver(
         }
         BidiDriverCommand::GetTree(command) => {
             let root = command.root.unwrap_or_else(default_context_id);
-            let Some(mut driver) = pool.bidi_driver_for(&root) else {
+            let Ok(handle) = bidi_driver_handle(pool, &root) else {
+                return pool_lock_bidi_error(Some(id));
+            };
+            let Some(mut driver) = handle else {
                 return unknown_browsing_context_result(id);
             };
             match futures::executor::block_on(driver.observe()) {
-                Ok(observation) => {
-                    pool.bidi_contexts.insert(root.clone(), driver);
-                    BidiDispatchResult::new(
-                        200,
-                        bidi_success_or_error(
-                            id,
-                            GetTreeResult {
-                                contexts: vec![BrowsingContextInfo {
-                                    context: root,
-                                    url: observation.url,
-                                    children: Vec::new(),
-                                }],
-                            },
-                        ),
-                    )
-                }
+                Ok(observation) => BidiDispatchResult::new(
+                    200,
+                    bidi_success_or_error(
+                        id,
+                        GetTreeResult {
+                            contexts: vec![BrowsingContextInfo {
+                                context: root,
+                                url: observation.url,
+                                children: Vec::new(),
+                            }],
+                        },
+                    ),
+                ),
                 Err(error) => BidiDispatchResult::new(
                     200,
                     BidiMessage::error(Some(id), BidiErrorCode::UnknownError, error.to_string()),
@@ -2312,24 +2511,24 @@ fn route_bidi_driver(
         }
         BidiDriverCommand::CaptureScreenshot(_) => {
             let context = screenshot_context(&command);
-            let Some(mut driver) = pool.bidi_driver_for(&context) else {
+            let Ok(handle) = bidi_driver_handle(pool, &context) else {
+                return pool_lock_bidi_error(Some(id));
+            };
+            let Some(mut driver) = handle else {
                 return unknown_browsing_context_result(id);
             };
             match futures::executor::block_on(driver.screenshot()) {
                 Ok(bytes) => {
                     if bytes.len() > MAX_SCREENSHOT_BYTES {
-                        let bytes_len = bytes.len();
-                        pool.bidi_contexts.insert(context, driver);
                         return BidiDispatchResult::new(
                             200,
                             BidiMessage::error(
                                 Some(id),
                                 BidiErrorCode::UnknownError,
-                                output_cap_message("screenshot", bytes_len, MAX_SCREENSHOT_BYTES),
+                                output_cap_message("screenshot", bytes.len(), MAX_SCREENSHOT_BYTES),
                             ),
                         );
                     }
-                    pool.bidi_contexts.insert(context, driver);
                     BidiDispatchResult::new(
                         200,
                         bidi_success_or_error(
@@ -2347,19 +2546,26 @@ fn route_bidi_driver(
             }
         }
         BidiDriverCommand::CreateContext(command) => {
-            if pool.bidi_contexts.len() >= MAX_BIDI_CONTEXTS {
-                return BidiDispatchResult::new(
-                    200,
-                    BidiMessage::error(
-                        Some(id),
-                        BidiErrorCode::UnknownError,
-                        "browsing context limit reached",
-                    ),
-                );
-            }
             let reference = command.reference_context.unwrap_or_else(default_context_id);
-            let Some(mut driver) = pool.bidi_driver_for(&reference) else {
-                return unknown_browsing_context_result(id);
+            // Phase 1: cap check + reference handle under a brief lock.
+            let driver = {
+                let Ok(pool) = pool.lock() else {
+                    return pool_lock_bidi_error(Some(id));
+                };
+                if pool.bidi_contexts.len() >= MAX_BIDI_CONTEXTS {
+                    return BidiDispatchResult::new(
+                        200,
+                        BidiMessage::error(
+                            Some(id),
+                            BidiErrorCode::UnknownError,
+                            "browsing context limit reached",
+                        ),
+                    );
+                }
+                match pool.bidi_driver_for(&reference) {
+                    Some(driver) => driver,
+                    None => return unknown_browsing_context_result(id),
+                }
             };
             let options = BrowsingContextCreateOptions {
                 kind: match command.context_type {
@@ -2368,9 +2574,30 @@ fn route_bidi_driver(
                 },
                 background: command.background,
             };
+            let mut driver = driver;
             match futures::executor::block_on(driver.create_browsing_context_attached(options)) {
                 Ok(created_driver) => {
-                    pool.bidi_contexts.insert(reference, driver);
+                    // Phase 3: register under the lock, re-checking the state
+                    // that may have changed during the off-lock round-trip.
+                    let Ok(mut pool) = pool.lock() else {
+                        return pool_lock_bidi_error(Some(id));
+                    };
+                    if pool.draining
+                        || pool.driver.is_none()
+                        || pool.bidi_contexts.len() >= MAX_BIDI_CONTEXTS
+                    {
+                        // Release the fresh context (bounded) instead of
+                        // registering into a pool that can no longer track it.
+                        pool.close_removed_bidi_context(created_driver);
+                        return BidiDispatchResult::new(
+                            200,
+                            BidiMessage::error(
+                                Some(id),
+                                BidiErrorCode::UnknownError,
+                                "browsing context could not be registered (limit reached or tempod is draining)",
+                            ),
+                        );
+                    }
                     let context = pool.register_bidi_context(created_driver);
                     BidiDispatchResult::new(
                         200,
@@ -2395,9 +2622,14 @@ fn route_bidi_driver(
                     ),
                 );
             }
+            let Ok(mut pool) = pool.lock() else {
+                return pool_lock_bidi_error(Some(id));
+            };
             match pool.bidi_contexts.remove(&context) {
                 Some(driver) => {
-                    // Release the forked engine-side driver so it is not leaked.
+                    // Release the forked engine-side driver so it is not
+                    // leaked; this close is BOUNDED (#200/#205), so holding the
+                    // lock across it keeps the established teardown pattern.
                     pool.close_removed_bidi_context(driver);
                     BidiDispatchResult::new(200, bidi_success_or_error(id, json!({})))
                 }
@@ -2421,26 +2653,26 @@ fn route_bidi_driver(
                 return denied;
             }
             let context = command.target.context.clone();
-            let Some(mut driver) = pool.bidi_driver_for(&context) else {
+            let Ok(handle) = bidi_driver_handle(pool, &context) else {
+                return pool_lock_bidi_error(Some(id));
+            };
+            let Some(mut driver) = handle else {
                 return unknown_browsing_context_result(id);
             };
             let expression = command.expression.clone();
             match futures::executor::block_on(
                 driver.evaluate_script(&expression, command.await_promise),
             ) {
-                Ok(value) => {
-                    pool.bidi_contexts.insert(context.clone(), driver);
-                    BidiDispatchResult::new(
-                        200,
-                        bidi_success_or_error(
-                            id,
-                            ScriptEvaluateResult {
-                                result: value,
-                                realm: Some(context.0),
-                            },
-                        ),
-                    )
-                }
+                Ok(value) => BidiDispatchResult::new(
+                    200,
+                    bidi_success_or_error(
+                        id,
+                        ScriptEvaluateResult {
+                            result: value,
+                            realm: Some(context.0),
+                        },
+                    ),
+                ),
                 Err(error) => BidiDispatchResult::new(
                     200,
                     BidiMessage::error(Some(id), BidiErrorCode::UnknownError, error.to_string()),
@@ -2685,28 +2917,35 @@ fn bidi_response_unchecked(status: u16, message: BidiMessage) -> HttpResponse {
     }
 }
 
-fn route_mcp(pool: &mut SessionPool, request: &HttpRequest) -> HttpResponse {
-    if pool.draining {
-        return HttpResponse::json(
-            503,
-            json!({
-                "error": "tempod is draining; MCP tool calls are not accepted",
-            }),
-        );
-    }
-    if let Some(server) = &pool.mcp {
-        let Ok(mut server) = server.lock() else {
+fn route_mcp(pool: &Arc<Mutex<SessionPool>>, request: &HttpRequest) -> HttpResponse {
+    // Phase 1 (pool lock, brief): drain admission + MCP server handle clone.
+    let server = {
+        let Ok(pool) = pool.lock() else {
             return HttpResponse::json(
                 500,
                 json!({
-                    "error": "MCP server lock failed",
+                    "error": "session pool lock failed",
                 }),
             );
         };
+        if pool.draining {
+            return HttpResponse::json(
+                503,
+                json!({
+                    "error": "tempod is draining; MCP tool calls are not accepted",
+                }),
+            );
+        }
+        pool.mcp.clone()
+    };
+    // Phase 2 (NO pool lock): the tool call. The server itself runs calls on
+    // distinct drivers concurrently and serializes same-driver calls, so no
+    // process-wide lock stands between two sessions' tool calls (issue #230).
+    if let Some(server) = server {
         return HttpResponse::from_mcp(futures::executor::block_on(
             server.handle_post(request.origin.as_deref(), &request.body),
         ));
-    };
+    }
     HttpResponse::from_mcp(tempo_mcp::handle_post_driverless(
         request.origin.as_deref(),
         &request.body,
@@ -2995,6 +3234,60 @@ mod tests {
 
     type TestResult = Result<(), Box<dyn Error>>;
 
+    /// Test shims (issue #230): production routing takes
+    /// `&Arc<Mutex<SessionPool>>` so engine round-trips can run off-lock. These
+    /// wrappers keep the many tests written against a bare `&mut SessionPool`
+    /// exercising the real routing code: the pool is temporarily moved into a
+    /// shared handle for the call and moved back afterwards. (Local fns shadow
+    /// the glob-imported production versions.)
+    fn with_shared_pool<T>(
+        pool: &mut SessionPool,
+        run: impl FnOnce(&Arc<Mutex<SessionPool>>) -> T,
+    ) -> T {
+        let shared = Arc::new(Mutex::new(std::mem::take(pool)));
+        let result = run(&shared);
+        if let Ok(mutex) = Arc::try_unwrap(shared) {
+            match mutex.into_inner() {
+                Ok(inner) => *pool = inner,
+                Err(poisoned) => *pool = poisoned.into_inner(),
+            }
+        }
+        result
+    }
+
+    fn route_http_request(
+        pool: &mut SessionPool,
+        request: HttpRequest,
+    ) -> Result<HttpResponse, TempodError> {
+        with_shared_pool(pool, |shared| super::route_http_request(shared, request))
+    }
+
+    fn handle_http_request(pool: &mut SessionPool, request: HttpRequest) -> HttpResponse {
+        with_shared_pool(pool, |shared| super::handle_http_request(shared, request))
+    }
+
+    fn handle_http_request_with_auth(
+        pool: &mut SessionPool,
+        request: HttpRequest,
+        auth: &TempodAuth,
+    ) -> HttpResponse {
+        with_shared_pool(pool, |shared| {
+            super::handle_http_request_with_auth(shared, request, auth)
+        })
+    }
+
+    fn route_bidi_dispatch(pool: &mut SessionPool, body: Vec<u8>) -> BidiDispatchResult {
+        with_shared_pool(pool, |shared| super::route_bidi_dispatch(shared, body))
+    }
+
+    fn route_bidi_driver(
+        pool: &mut SessionPool,
+        id: tempo_bidi::CommandId,
+        command: BidiDriverCommand,
+    ) -> BidiDispatchResult {
+        with_shared_pool(pool, |shared| super::route_bidi_driver(shared, id, command))
+    }
+
     #[test]
     fn session_pool_create_list_adopt_kill_and_drain() -> TestResult {
         let mut pool = SessionPool::default();
@@ -3057,7 +3350,7 @@ mod tests {
         });
 
         let mut pool = SessionPool::default();
-        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream))?;
 
         let create = route_http_request(
             &mut pool,
@@ -3137,7 +3430,7 @@ mod tests {
         });
 
         let mut pool = SessionPool::default();
-        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream))?;
         let create = route_http_request(
             &mut pool,
             HttpRequest {
@@ -3236,7 +3529,7 @@ mod tests {
         });
 
         let mut pool = SessionPool::default();
-        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream))?;
 
         let create = handle_http_request(
             &mut pool,
@@ -3291,7 +3584,7 @@ mod tests {
         });
 
         let mut pool = SessionPool::default();
-        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream))?;
 
         let started = std::time::Instant::now();
         let response = handle_http_request(
@@ -3353,7 +3646,7 @@ mod tests {
         });
 
         let mut pool = SessionPool::default();
-        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream))?;
         let pool = Arc::new(Mutex::new(pool));
 
         // Thread A holds the pool lock across the wedged create. It signals once it
@@ -3452,7 +3745,7 @@ mod tests {
         });
 
         let mut pool = SessionPool::default();
-        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream))?;
 
         // First create times out; it must invalidate the shared engine.
         let first = handle_http_request(
@@ -3577,26 +3870,26 @@ mod tests {
                 },
             )?;
 
-            // The orphaned late-success context must be closed, not leaked. The
-            // root driver can also be closed during invalidation, and close order
-            // is not deterministic, so acknowledge every `Close` and signal only
-            // when the late session context is observed.
+            // The orphaned late-success context must be closed, not leaked.
+            // Since #230 the abandon path's root `Close` is written on the
+            // multiplexed connection as soon as the create times out (it no
+            // longer queues behind the in-flight goto), so the engine may see
+            // it interleaved before/after the context close. Answer everything
+            // and require only that the orphaned CONTEXT receives its Close.
             loop {
-                let close = match connection.read_driver_request() {
-                    Ok(close) => close,
-                    Err(_) => break,
-                };
+                let close = connection.read_driver_request()?;
                 assert_eq!(close.command, HostDriverCommand::Close);
-                if close.driver_id.as_deref() == Some("session-context-late") {
-                    let _ = close_tx.send(());
-                }
+                let context_close = close.driver_id.as_deref() == Some("session-context-late");
                 connection.write_driver_response(close.id, DriverResponse::Closed)?;
+                if context_close {
+                    let _ = close_tx.send(());
+                    return Ok(());
+                }
             }
-            Ok(())
         });
 
         let mut pool = SessionPool::default();
-        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream))?;
 
         let started = std::time::Instant::now();
         let response = handle_http_request(
@@ -3729,7 +4022,7 @@ mod tests {
         });
 
         let mut pool = SessionPool::default();
-        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream))?;
 
         // Create the pre-existing, live session context.
         let pre = handle_http_request(
@@ -3782,6 +4075,558 @@ mod tests {
 
         drop(pool);
         join_driver_handler(engine)?;
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Issue #230: end-to-end concurrency tests. All of them drive the daemon
+    // over real TCP against a fake engine that answers each driver request on
+    // its own worker thread (delayed, wedged, or out of order), because the
+    // whole point is that the DAEMON must no longer serialize independent
+    // browser operations.
+    // ------------------------------------------------------------------
+
+    enum FakeEngineReply {
+        Respond(DriverResponse),
+        RespondAfter(Duration, DriverResponse),
+        /// Never answer this request (the wedged-engine case).
+        Wedge,
+    }
+
+    /// Serve driver requests concurrently: one reader thread, one detached
+    /// worker per request, writes serialized by a mutex. Returns after wiring
+    /// the threads; they exit when the daemon side closes the connection.
+    fn spawn_concurrent_fake_engine<H>(server_stream: UnixStream, handler: H) -> TestResult
+    where
+        H: Fn(&DriverRequest) -> FakeEngineReply + Send + Sync + 'static,
+    {
+        let writer = Arc::new(Mutex::new(EngineIpcConnection::from_stream(
+            server_stream.try_clone()?,
+        )));
+        let mut reader = EngineIpcConnection::from_stream(server_stream);
+        let handler = Arc::new(handler);
+        thread::spawn(move || loop {
+            let request = match reader.read_driver_request() {
+                Ok(request) => request,
+                Err(_) => return,
+            };
+            let writer = Arc::clone(&writer);
+            let handler = Arc::clone(&handler);
+            thread::spawn(move || {
+                let (delay, response) = match handler(&request) {
+                    FakeEngineReply::Respond(response) => (Duration::ZERO, response),
+                    FakeEngineReply::RespondAfter(delay, response) => (delay, response),
+                    FakeEngineReply::Wedge => return,
+                };
+                if !delay.is_zero() {
+                    thread::sleep(delay);
+                }
+                if let Ok(mut writer) = writer.lock() {
+                    let _ = writer.write_driver_response(request.id, response);
+                }
+            });
+        });
+        Ok(())
+    }
+
+    /// Pool with an attached concurrent fake engine, shared for TCP serving.
+    fn shared_pool_with_fake_engine<H>(
+        handler: H,
+    ) -> Result<Arc<Mutex<SessionPool>>, Box<dyn Error>>
+    where
+        H: Fn(&DriverRequest) -> FakeEngineReply + Send + Sync + 'static,
+    {
+        let (client_stream, server_stream) = UnixStream::pair()?;
+        spawn_concurrent_fake_engine(server_stream, handler)?;
+        let mut pool = SessionPool::default();
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream))?;
+        Ok(Arc::new(Mutex::new(pool)))
+    }
+
+    type ServerHandles = Vec<thread::JoinHandle<Result<(), TempodError>>>;
+
+    /// Spawn `count` single-request server threads accepting on one listener.
+    fn spawn_servers(
+        listener: &TcpListener,
+        pool: &Arc<Mutex<SessionPool>>,
+        count: usize,
+    ) -> Result<ServerHandles, Box<dyn Error>> {
+        let mut handles = Vec::with_capacity(count);
+        for _ in 0..count {
+            let listener = listener.try_clone()?;
+            let pool = Arc::clone(pool);
+            handles.push(thread::spawn(move || serve_one(listener, pool)));
+        }
+        Ok(handles)
+    }
+
+    fn http_post(
+        addr: std::net::SocketAddr,
+        path: &str,
+        body: &str,
+    ) -> Result<String, std::io::Error> {
+        send_http(
+            addr,
+            &format!(
+                "POST {path} HTTP/1.1\r\ncontent-length: {}\r\n\r\n{body}",
+                body.len()
+            ),
+        )
+    }
+
+    fn bidi_navigate_body(id: u64, context: &str, url: &str) -> String {
+        format!(
+            r#"{{"id":{id},"method":"browsingContext.navigate","params":{{"context":"{context}","url":"{url}","inputTainted":false}}}}"#
+        )
+    }
+
+    /// (a-1) Two POST /sessions whose navigations each take ~120ms (inside the
+    /// 200ms cfg(test) create bound) must overlap. Overlap is proven by the
+    /// engine-side arrival times: the second create's goto reaches the engine
+    /// while the first goto is still pending. Reverted to pre-#230 locking
+    /// (pool lock held across the create round-trips), the second create's
+    /// frames cannot arrive until the first create finished (>=120ms gap) and
+    /// this fails.
+    #[test]
+    fn concurrent_session_creates_overlap_across_sessions() -> TestResult {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let context_ids = AtomicUsize::new(1);
+        let goto_arrivals: Arc<Mutex<Vec<std::time::Instant>>> = Arc::new(Mutex::new(Vec::new()));
+        let arrivals = Arc::clone(&goto_arrivals);
+        let pool = shared_pool_with_fake_engine(move |request| match &request.command {
+            HostDriverCommand::CreateBrowsingContext { .. } => {
+                let n = context_ids.fetch_add(1, Ordering::SeqCst);
+                FakeEngineReply::Respond(DriverResponse::BrowsingContextCreated {
+                    driver_id: format!("session-context-{n}"),
+                })
+            }
+            HostDriverCommand::Goto { url } => {
+                if let Ok(mut arrivals) = arrivals.lock() {
+                    arrivals.push(std::time::Instant::now());
+                }
+                FakeEngineReply::RespondAfter(
+                    Duration::from_millis(120),
+                    DriverResponse::Observation {
+                        observation: observation(url, 1),
+                    },
+                )
+            }
+            _ => FakeEngineReply::Respond(DriverResponse::Closed),
+        })?;
+
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let servers = spawn_servers(&listener, &pool, 2)?;
+
+        let started = std::time::Instant::now();
+        let first =
+            thread::spawn(move || http_post(addr, "/sessions", r#"{"url":"https://one.test"}"#));
+        let second =
+            thread::spawn(move || http_post(addr, "/sessions", r#"{"url":"https://two.test"}"#));
+        let first = first.join().map_err(|_| "first create panicked")??;
+        let second = second.join().map_err(|_| "second create panicked")??;
+        let elapsed = started.elapsed();
+
+        assert!(first.starts_with("HTTP/1.1 201"), "{first}");
+        assert!(second.starts_with("HTTP/1.1 201"), "{second}");
+        // Loose wall-clock sanity (serial would be >=240ms plus overhead).
+        assert!(
+            elapsed < Duration::from_millis(2000),
+            "session creates took unexpectedly long: {elapsed:?}"
+        );
+        let arrivals = goto_arrivals
+            .lock()
+            .map_err(|_| "arrival log poisoned")?
+            .clone();
+        assert_eq!(arrivals.len(), 2);
+        let gap = arrivals[1].duration_since(arrivals[0]);
+        assert!(
+            gap < Duration::from_millis(60),
+            "second session's navigation reached the engine {gap:?} after the first: \
+             creates were serialized (>=120ms gap) instead of overlapping"
+        );
+        for server in servers {
+            server.join().map_err(|_| "server thread panicked")??;
+        }
+        Ok(())
+    }
+
+    /// (a-2) The literal #230 acceptance shape: two ~300ms browser operations
+    /// on two different browsing contexts complete in <500ms total. Reverted
+    /// to one-op-at-a-time dispatch they serialize to >=600ms and this fails.
+    #[test]
+    fn two_slow_ops_on_different_contexts_complete_in_parallel() -> TestResult {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let context_ids = AtomicUsize::new(1);
+        let pool = shared_pool_with_fake_engine(move |request| match &request.command {
+            HostDriverCommand::CreateBrowsingContext { .. } => {
+                let n = context_ids.fetch_add(1, Ordering::SeqCst);
+                FakeEngineReply::Respond(DriverResponse::BrowsingContextCreated {
+                    driver_id: format!("context-{n}"),
+                })
+            }
+            HostDriverCommand::Goto { url } => FakeEngineReply::RespondAfter(
+                Duration::from_millis(300),
+                DriverResponse::Observation {
+                    observation: observation(url, 1),
+                },
+            ),
+            _ => FakeEngineReply::Respond(DriverResponse::Closed),
+        })?;
+
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let servers = spawn_servers(&listener, &pool, 3)?;
+
+        let created = http_post(
+            addr,
+            "/bidi",
+            r#"{"id":1,"method":"browsingContext.create","params":{"type":"tab"}}"#,
+        )?;
+        assert!(created.contains(r#""type":"success""#), "{created}");
+
+        let started = std::time::Instant::now();
+        let first = thread::spawn(move || {
+            http_post(
+                addr,
+                "/bidi",
+                &bidi_navigate_body(2, "tempo-root", "https://one.test"),
+            )
+        });
+        let second = thread::spawn(move || {
+            http_post(
+                addr,
+                "/bidi",
+                &bidi_navigate_body(3, "tempo-bidi-1", "https://two.test"),
+            )
+        });
+        let first = first.join().map_err(|_| "first navigate panicked")??;
+        let second = second.join().map_err(|_| "second navigate panicked")??;
+        let elapsed = started.elapsed();
+
+        assert!(first.contains(r#""type":"success""#), "{first}");
+        assert!(second.contains(r#""type":"success""#), "{second}");
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "two ~300ms ops on different contexts did not run concurrently: {elapsed:?} \
+             (serial would be >=600ms)"
+        );
+        for server in servers {
+            server.join().map_err(|_| "server thread panicked")??;
+        }
+        Ok(())
+    }
+
+    /// (b) Two navigations on the SAME context must stay ordered: the second
+    /// must not reach the engine until the first one's response returned.
+    /// Reverted to a daemon without the per-context gate, both gotos arrive
+    /// within milliseconds of each other and this fails.
+    #[test]
+    fn same_context_navigations_stay_serialized() -> TestResult {
+        let goto_arrivals: Arc<Mutex<Vec<std::time::Instant>>> = Arc::new(Mutex::new(Vec::new()));
+        let arrivals = Arc::clone(&goto_arrivals);
+        let pool = shared_pool_with_fake_engine(move |request| match &request.command {
+            HostDriverCommand::Goto { url } => {
+                if let Ok(mut arrivals) = arrivals.lock() {
+                    arrivals.push(std::time::Instant::now());
+                }
+                FakeEngineReply::RespondAfter(
+                    Duration::from_millis(250),
+                    DriverResponse::Observation {
+                        observation: observation(url, 1),
+                    },
+                )
+            }
+            _ => FakeEngineReply::Respond(DriverResponse::Closed),
+        })?;
+
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let servers = spawn_servers(&listener, &pool, 2)?;
+
+        let first = thread::spawn(move || {
+            http_post(
+                addr,
+                "/bidi",
+                &bidi_navigate_body(1, "tempo-root", "https://first.test"),
+            )
+        });
+        thread::sleep(Duration::from_millis(60));
+        let second = thread::spawn(move || {
+            http_post(
+                addr,
+                "/bidi",
+                &bidi_navigate_body(2, "tempo-root", "https://second.test"),
+            )
+        });
+        let first = first.join().map_err(|_| "first navigate panicked")??;
+        let second = second.join().map_err(|_| "second navigate panicked")??;
+        assert!(first.contains(r#""type":"success""#), "{first}");
+        assert!(second.contains(r#""type":"success""#), "{second}");
+
+        let arrivals = goto_arrivals
+            .lock()
+            .map_err(|_| "arrival log poisoned")?
+            .clone();
+        assert_eq!(arrivals.len(), 2);
+        let gap = arrivals[1].duration_since(arrivals[0]);
+        assert!(
+            gap >= Duration::from_millis(150),
+            "second same-context goto reached the engine {gap:?} after the first; \
+             it must wait for the first response (~250ms): per-session ordering was lost"
+        );
+        for server in servers {
+            server.join().map_err(|_| "server thread panicked")??;
+        }
+        Ok(())
+    }
+
+    /// (c) /health and /drain must answer while an engine operation is in
+    /// flight (the #200/#213 availability family, now for the op hot path).
+    /// Reverted to pool-lock-across-round-trip routing, the health probe waits
+    /// out the 800ms navigation and this fails.
+    #[test]
+    fn health_and_drain_respond_while_engine_op_is_in_flight() -> TestResult {
+        let pool = shared_pool_with_fake_engine(|request| match &request.command {
+            HostDriverCommand::Goto { url } => FakeEngineReply::RespondAfter(
+                Duration::from_millis(800),
+                DriverResponse::Observation {
+                    observation: observation(url, 1),
+                },
+            ),
+            _ => FakeEngineReply::Respond(DriverResponse::Closed),
+        })?;
+
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let servers = spawn_servers(&listener, &pool, 3)?;
+
+        let navigate = thread::spawn(move || {
+            http_post(
+                addr,
+                "/bidi",
+                &bidi_navigate_body(1, "tempo-root", "https://slow.test"),
+            )
+        });
+        thread::sleep(Duration::from_millis(150));
+
+        let started = std::time::Instant::now();
+        let health = send_http(addr, "GET /health HTTP/1.1\r\n\r\n")?;
+        let health_latency = started.elapsed();
+        assert!(health.starts_with("HTTP/1.1 200"), "{health}");
+        assert!(
+            health_latency < Duration::from_millis(300),
+            "GET /health queued behind an in-flight engine op: {health_latency:?}"
+        );
+
+        let started = std::time::Instant::now();
+        let drain = http_post(addr, "/drain", "")?;
+        let drain_latency = started.elapsed();
+        assert!(drain.starts_with("HTTP/1.1 200"), "{drain}");
+        assert!(drain.contains(r#""draining":true"#), "{drain}");
+        assert!(
+            drain_latency < Duration::from_secs(3),
+            "POST /drain queued behind an in-flight engine op: {drain_latency:?}"
+        );
+
+        let _ = navigate.join().map_err(|_| "navigate thread panicked")?;
+        for server in servers {
+            server.join().map_err(|_| "server thread panicked")??;
+        }
+        Ok(())
+    }
+
+    /// (d) Drain while two operations are mid-flight on different contexts:
+    /// drain must complete promptly and the daemon must stay consistent.
+    #[test]
+    fn drain_completes_cleanly_during_concurrent_ops() -> TestResult {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let context_ids = AtomicUsize::new(1);
+        let pool = shared_pool_with_fake_engine(move |request| match &request.command {
+            HostDriverCommand::CreateBrowsingContext { .. } => {
+                let n = context_ids.fetch_add(1, Ordering::SeqCst);
+                FakeEngineReply::Respond(DriverResponse::BrowsingContextCreated {
+                    driver_id: format!("context-{n}"),
+                })
+            }
+            HostDriverCommand::Goto { url } => FakeEngineReply::RespondAfter(
+                Duration::from_millis(300),
+                DriverResponse::Observation {
+                    observation: observation(url, 1),
+                },
+            ),
+            _ => FakeEngineReply::Respond(DriverResponse::Closed),
+        })?;
+
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        // Exactly four requests: create-context, two navigations, drain.
+        let servers = spawn_servers(&listener, &pool, 4)?;
+
+        // A second context so the two in-flight ops target different sessions.
+        let created = http_post(
+            addr,
+            "/bidi",
+            r#"{"id":1,"method":"browsingContext.create","params":{"type":"tab"}}"#,
+        )?;
+        assert!(created.contains(r#""type":"success""#), "{created}");
+
+        let nav_root = thread::spawn(move || {
+            http_post(
+                addr,
+                "/bidi",
+                &bidi_navigate_body(2, "tempo-root", "https://root.test"),
+            )
+        });
+        let nav_fork = thread::spawn(move || {
+            http_post(
+                addr,
+                "/bidi",
+                &bidi_navigate_body(3, "tempo-bidi-1", "https://fork.test"),
+            )
+        });
+        thread::sleep(Duration::from_millis(100));
+
+        let started = std::time::Instant::now();
+        let drain = http_post(addr, "/drain", "")?;
+        assert!(drain.starts_with("HTTP/1.1 200"), "{drain}");
+        assert!(drain.contains(r#""draining":true"#), "{drain}");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "drain stalled behind concurrent in-flight ops"
+        );
+
+        // The in-flight ops must resolve (success or error, but never hang).
+        let _ = nav_root.join().map_err(|_| "root navigate panicked")?;
+        let _ = nav_fork.join().map_err(|_| "fork navigate panicked")?;
+        for server in servers {
+            server.join().map_err(|_| "server thread panicked")??;
+        }
+        Ok(())
+    }
+
+    /// (#305 review blocker) An MCP `fork` in flight when `/drain` fires must
+    /// not leak the forked browsing context: the fork's engine round-trip can
+    /// complete AFTER drain's `close_all_forks` snapshot, so the retired MCP
+    /// fork registry refuses the late registration and the tool call closes
+    /// its own fork. Reverted, the engine never receives a Close for the late
+    /// fork and the recv below times out.
+    #[test]
+    fn mcp_fork_in_flight_across_drain_is_closed_not_leaked() -> TestResult {
+        let (fork_closed_tx, fork_closed_rx) = std::sync::mpsc::channel();
+        let pool = shared_pool_with_fake_engine(move |request| match &request.command {
+            HostDriverCommand::Fork => FakeEngineReply::RespondAfter(
+                Duration::from_millis(300),
+                DriverResponse::Forked {
+                    driver_id: "fork-1".into(),
+                },
+            ),
+            HostDriverCommand::Close if request.driver_id.as_deref() == Some("fork-1") => {
+                let _ = fork_closed_tx.send(());
+                FakeEngineReply::Respond(DriverResponse::Closed)
+            }
+            _ => FakeEngineReply::Respond(DriverResponse::Closed),
+        })?;
+
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let servers = spawn_servers(&listener, &pool, 2)?;
+
+        let fork_call = thread::spawn(move || {
+            http_post(
+                addr,
+                "/mcp",
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"fork","arguments":{}}}"#,
+            )
+        });
+        // Drain while the fork's engine round-trip is still in flight.
+        thread::sleep(Duration::from_millis(100));
+        let drain = http_post(addr, "/drain", "")?;
+        assert!(drain.starts_with("HTTP/1.1 200"), "{drain}");
+
+        // The late fork must be closed engine-side, not leaked.
+        fork_closed_rx
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(|_| {
+                "fork completing after the drain snapshot was never closed: \
+             the forked browsing context leaked engine-side"
+            })?;
+        let fork_response = fork_call.join().map_err(|_| "fork call panicked")??;
+        assert!(
+            fork_response.contains("shut down"),
+            "late fork must be refused after drain: {fork_response}"
+        );
+        for server in servers {
+            server.join().map_err(|_| "server thread panicked")??;
+        }
+        Ok(())
+    }
+
+    /// (e) A wedged operation on context A (engine never answers) must not
+    /// block operations on context B. Reverted to shared-client/pool-lock
+    /// serialization, B queues behind A's 30s IPC timeout and this fails.
+    #[test]
+    fn wedged_op_on_one_context_does_not_block_another() -> TestResult {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let context_ids = AtomicUsize::new(1);
+        let pool = shared_pool_with_fake_engine(move |request| match &request.command {
+            HostDriverCommand::CreateBrowsingContext { .. } => {
+                let n = context_ids.fetch_add(1, Ordering::SeqCst);
+                FakeEngineReply::Respond(DriverResponse::BrowsingContextCreated {
+                    driver_id: format!("context-{n}"),
+                })
+            }
+            HostDriverCommand::Goto { url } if url.contains("wedged") => FakeEngineReply::Wedge,
+            HostDriverCommand::Goto { url } => FakeEngineReply::RespondAfter(
+                Duration::from_millis(50),
+                DriverResponse::Observation {
+                    observation: observation(url, 1),
+                },
+            ),
+            _ => FakeEngineReply::Respond(DriverResponse::Closed),
+        })?;
+
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let servers = spawn_servers(&listener, &pool, 2)?;
+
+        let created = http_post(
+            addr,
+            "/bidi",
+            r#"{"id":1,"method":"browsingContext.create","params":{"type":"tab"}}"#,
+        )?;
+        assert!(created.contains(r#""type":"success""#), "{created}");
+
+        // Context A wedges forever (its request thread stays parked on the
+        // bounded IPC wait; never joined).
+        let wedged_listener = listener.try_clone()?;
+        let wedged_pool = Arc::clone(&pool);
+        thread::spawn(move || serve_one(wedged_listener, wedged_pool));
+        thread::spawn(move || {
+            let _ = http_post(
+                addr,
+                "/bidi",
+                &bidi_navigate_body(2, "tempo-root", "https://wedged.test"),
+            );
+        });
+        thread::sleep(Duration::from_millis(150));
+
+        // Context B must complete promptly regardless.
+        let started = std::time::Instant::now();
+        let fast = http_post(
+            addr,
+            "/bidi",
+            &bidi_navigate_body(3, "tempo-bidi-1", "https://fast.test"),
+        )?;
+        let latency = started.elapsed();
+        assert!(fast.contains(r#""type":"success""#), "{fast}");
+        assert!(
+            latency < Duration::from_secs(2),
+            "op on context B queued behind wedged context A: {latency:?}"
+        );
+        for server in servers {
+            server.join().map_err(|_| "server thread panicked")??;
+        }
         Ok(())
     }
 
@@ -4302,7 +5147,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let addr = listener.local_addr()?;
         let mut pool = SessionPool::default();
-        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream))?;
         let pool = Arc::new(Mutex::new(pool));
         let handle = thread::spawn({
             let pool = Arc::clone(&pool);
@@ -4371,7 +5216,7 @@ mod tests {
             futures::executor::block_on(serve_driver_connection(&mut connection, &mut driver))
         });
         let mut pool = SessionPool::default();
-        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream))?;
 
         let subscribed = route_bidi_dispatch(
             &mut pool,
@@ -4515,7 +5360,7 @@ mod tests {
         let (client_stream, mut server_stream) = UnixStream::pair()?;
         server_stream.set_nonblocking(true)?;
         let mut pool = SessionPool::default();
-        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream))?;
 
         let response = route_http_request(
             &mut pool,
@@ -4583,7 +5428,7 @@ mod tests {
         let (client_stream, mut server_stream) = UnixStream::pair()?;
         server_stream.set_nonblocking(true)?;
         let mut pool = SessionPool::default();
-        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream))?;
 
         let response = route_http_request(
             &mut pool,
@@ -4710,7 +5555,7 @@ mod tests {
         let (client_stream, mut server_stream) = UnixStream::pair()?;
         server_stream.set_nonblocking(true)?;
         let mut pool = SessionPool::default();
-        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream))?;
 
         let response = route_http_request(
             &mut pool,
@@ -4779,7 +5624,7 @@ mod tests {
         let (client_stream, mut server_stream) = UnixStream::pair()?;
         server_stream.set_nonblocking(true)?;
         let mut pool = SessionPool::default();
-        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream))?;
 
         let response = route_http_request(
             &mut pool,
@@ -4816,7 +5661,7 @@ mod tests {
             futures::executor::block_on(serve_driver_connection(&mut connection, &mut driver))
         });
         let mut pool = SessionPool::default();
-        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream))?;
 
         let root_nav = route_http_request(
             &mut pool,
@@ -5128,7 +5973,7 @@ mod tests {
         let (client_stream, mut server_stream) = UnixStream::pair()?;
         server_stream.set_nonblocking(true)?;
         let mut pool = SessionPool::default();
-        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream))?;
 
         let response = route_http_request(
             &mut pool,
@@ -5166,7 +6011,7 @@ mod tests {
             futures::executor::block_on(serve_driver_connection(&mut connection, &mut driver))
         });
         let mut pool = SessionPool::default();
-        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream))?;
 
         let fork_response = route_http_request(&mut pool, mcp_tool_request(1, "fork", json!({}))?)?;
         let fork: Value = serde_json::from_slice(&fork_response.body)?;
@@ -5324,7 +6169,7 @@ mod tests {
         });
 
         let mut pool = SessionPool::default();
-        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream))?;
 
         // Open three live forks through the MCP endpoint.
         for id in 0..3 {
@@ -5367,7 +6212,7 @@ mod tests {
         });
 
         let mut pool = SessionPool::default();
-        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream))?;
         for id in 0..3 {
             let response = route_http_request(&mut pool, mcp_tool_request(id, "fork", json!({}))?)?;
             let fork: Value = serde_json::from_slice(&response.body)?;
@@ -5400,7 +6245,7 @@ mod tests {
         });
 
         let mut pool = SessionPool::default();
-        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream))?;
         let mcp_fork = route_http_request(&mut pool, mcp_tool_request(1, "fork", json!({}))?)?;
         let mcp_fork: Value = serde_json::from_slice(&mcp_fork.body)?;
         assert!(mcp_fork["result"]["structuredContent"]["driver_id"].is_string());
@@ -5487,7 +6332,7 @@ mod tests {
         });
 
         let mut pool = SessionPool::default();
-        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream))?;
         assert!(pool.driver.is_some());
 
         let started = std::time::Instant::now();
@@ -5520,15 +6365,11 @@ mod tests {
         });
 
         let mut pool = SessionPool::default();
-        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream))?;
         let driver = pool.driver.as_ref().ok_or("attached root driver missing")?;
         pool.bidi_contexts.insert(
             BrowsingContextId("wedged-bidi-fork".into()),
-            AttachedEngineDriver {
-                engine: Engine::Cdp,
-                client: Arc::clone(&driver.client),
-                driver_id: Some("fork-1".into()),
-            },
+            driver.derived("fork-1".into()),
         );
 
         let started = std::time::Instant::now();
@@ -5576,7 +6417,7 @@ mod tests {
         });
 
         let mut pool = SessionPool::default();
-        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream))?;
 
         let fork_response = route_http_request(&mut pool, mcp_tool_request(1, "fork", json!({}))?)?;
         let fork: Value = serde_json::from_slice(&fork_response.body)?;
@@ -5642,7 +6483,7 @@ mod tests {
         });
 
         let mut pool = SessionPool::default();
-        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream))?;
         let create = route_http_request(
             &mut pool,
             HttpRequest {
@@ -5689,11 +6530,8 @@ mod tests {
         let mut pool = SessionPool::default();
         pool.bidi_contexts.insert(
             BrowsingContextId("tempo-bidi-wedged".to_string()),
-            AttachedEngineDriver {
-                engine: Engine::Cdp,
-                client: Arc::new(Mutex::new(EngineIpcClient::from_stream(client_stream))),
-                driver_id: Some("context-wedged".to_string()),
-            },
+            AttachedEngineDriver::new(Engine::Cdp, EngineIpcClient::from_stream(client_stream))?
+                .derived("context-wedged".to_string()),
         );
         pool.next_bidi_context_id = 2;
 
@@ -5722,7 +6560,7 @@ mod tests {
             futures::executor::block_on(serve_driver_connection(&mut connection, &mut driver))
         });
         let mut root_driver =
-            AttachedEngineDriver::new(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+            AttachedEngineDriver::new(Engine::Cdp, EngineIpcClient::from_stream(client_stream))?;
 
         let (root_observation, fork_observation) = futures::executor::block_on(async {
             root_driver.goto("https://root.test").await?;
@@ -6563,7 +7401,7 @@ mod tests {
             futures::executor::block_on(serve_driver_connection(&mut connection, &mut driver))
         });
         let mut pool = SessionPool::default();
-        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream))?;
 
         // Repeatedly create contexts; once the cap is reached, further creates
         // must be rejected instead of growing the map without bound.
@@ -6600,7 +7438,7 @@ mod tests {
             futures::executor::block_on(serve_driver_connection(&mut connection, &mut driver))
         });
         let mut pool = SessionPool::default();
-        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream))?;
 
         let created = route_http_request(
             &mut pool,
@@ -6657,7 +7495,7 @@ mod tests {
         });
 
         let mut pool = SessionPool::default();
-        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream))?;
         let started = route_http_request(
             &mut pool,
             HttpRequest {
@@ -6674,14 +7512,8 @@ mod tests {
 
         let driver = pool.driver.as_ref().ok_or("attached root driver missing")?;
         let context = BrowsingContextId("wedged-bidi-close-fork".into());
-        pool.bidi_contexts.insert(
-            context.clone(),
-            AttachedEngineDriver {
-                engine: Engine::Cdp,
-                client: Arc::clone(&driver.client),
-                driver_id: Some("fork-1".into()),
-            },
-        );
+        pool.bidi_contexts
+            .insert(context.clone(), driver.derived("fork-1".into()));
 
         let started = std::time::Instant::now();
         let closed = route_http_request(
@@ -6749,7 +7581,7 @@ mod tests {
             futures::executor::block_on(serve_driver_connection(&mut connection, &mut driver))
         });
         let mut pool = SessionPool::default();
-        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream))?;
 
         let created = route_http_request(
             &mut pool,
@@ -6838,7 +7670,7 @@ mod tests {
         });
 
         let mut pool = SessionPool::default();
-        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream))?;
         let started = route_http_request(
             &mut pool,
             HttpRequest {
@@ -6856,11 +7688,7 @@ mod tests {
         let driver = pool.driver.as_ref().ok_or("attached root driver missing")?;
         pool.bidi_contexts.insert(
             BrowsingContextId("wedged-bidi-session-fork".into()),
-            AttachedEngineDriver {
-                engine: Engine::Cdp,
-                client: Arc::clone(&driver.client),
-                driver_id: Some("fork-1".into()),
-            },
+            driver.derived("fork-1".into()),
         );
 
         let started = std::time::Instant::now();
@@ -7085,12 +7913,12 @@ mod tests {
     fn attach_driver_handler<F>(
         pool: &mut SessionPool,
         handler: F,
-    ) -> Result<thread::JoinHandle<Result<(), EngineHostError>>, std::io::Error>
+    ) -> Result<thread::JoinHandle<Result<(), EngineHostError>>, Box<dyn Error>>
     where
         F: FnOnce(DriverRequest) -> DriverResponse + Send + 'static,
     {
         let (client_stream, server_stream) = UnixStream::pair()?;
-        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream))?;
         Ok(thread::spawn(move || {
             let mut connection = EngineIpcConnection::from_stream(server_stream);
             let request = connection.read_driver_request()?;
@@ -7122,7 +7950,7 @@ mod tests {
         let (client_stream, mut server_stream) = UnixStream::pair()?;
         server_stream.set_nonblocking(true)?;
         let mut pool = SessionPool::default();
-        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream))?;
 
         let response = route_http_request(
             &mut pool,

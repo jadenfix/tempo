@@ -6,6 +6,8 @@
 
 use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::sync::{Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use serde::Deserialize;
@@ -31,10 +33,23 @@ pub const A2A_AGENT_JSON_PATH: &str = "/.well-known/agent.json";
 pub const A2A_AGENT_CARD_CONTENT_TYPE: &str = "application/a2a+json";
 const DRIVER_REQUIRED_ERROR_CODE: i64 = -32002;
 const RESPONSE_TOO_LARGE_ERROR_CODE: i64 = -32003;
+/// The targeted driver (root or fork) is owned by another in-flight tool call
+/// and was not returned within [`DRIVER_LEASE_TIMEOUT`].
+const DRIVER_BUSY_ERROR_CODE: i64 = -32004;
 /// Upper bound on concurrently live forked drivers per session. Forks each hold a
 /// live browser context/target for real engines, so refuse to accumulate beyond
 /// this cap and require the client to `close_fork` before creating more.
 const MAX_LIVE_FORKS: usize = 32;
+/// Bound on how long a tool call waits for another in-flight call on the SAME
+/// driver (root or fork) before failing (issue #230). Tool calls on different
+/// drivers never wait on each other; this bound only serializes same-driver
+/// calls, and each in-flight call is itself bounded by the engine IPC timeout,
+/// so the wait always terminates. The production value covers one full
+/// worst-case engine round-trip plus margin.
+#[cfg(not(test))]
+const DRIVER_LEASE_TIMEOUT: Duration = Duration::from_secs(35);
+#[cfg(test)]
+const DRIVER_LEASE_TIMEOUT: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct McpHttpResponse {
@@ -81,10 +96,18 @@ pub struct ToolDescriptor {
 }
 
 /// tempo's MCP session router over one driver instance.
+///
+/// Concurrency contract (issue #230): `handle_post` takes `&self`, so one
+/// server instance can execute many tool calls at once. Tool calls that target
+/// DIFFERENT drivers (the root driver or distinct forks) run concurrently; a
+/// tool call that targets a driver already mid-call waits — bounded by
+/// [`DRIVER_LEASE_TIMEOUT`] — for the in-flight call to finish, preserving
+/// per-driver ordering. This is a plain lease (take the driver out under a
+/// short-held lock, run the ops while owning it, put it back): no lock is held
+/// across an engine round-trip and no queue/actor machinery is involved.
 pub struct TempoMcpServer<D> {
-    driver: D,
-    forks: BTreeMap<String, Box<dyn DriverTrait>>,
-    next_fork_id: u64,
+    root: DriverSlot<D>,
+    forks: ForkSlots,
     handshake_report: ProbeReport,
     handshake_probe_config: HttpProbeConfig,
 }
@@ -92,9 +115,8 @@ pub struct TempoMcpServer<D> {
 impl<D> TempoMcpServer<D> {
     pub fn new(driver: D) -> Self {
         Self {
-            driver,
-            forks: BTreeMap::new(),
-            next_fork_id: 1,
+            root: DriverSlot::new(driver),
+            forks: ForkSlots::default(),
             handshake_report: ProbeReport::new(),
             handshake_probe_config: HttpProbeConfig::default(),
         }
@@ -109,30 +131,276 @@ impl<D> TempoMcpServer<D> {
         self.handshake_probe_config = config;
         self
     }
+}
 
-    pub fn driver(&self) -> &D {
-        &self.driver
+/// Why a driver could not be leased for a tool call.
+enum LeaseError {
+    /// No driver is registered under the requested id.
+    Unknown,
+    /// The driver exists but another call held it for the whole bounded wait.
+    Busy,
+    /// A lease lock was poisoned by a panicking holder.
+    Poisoned,
+}
+
+/// Exclusive lease slot for the root driver: `Some` when idle, `None` while a
+/// tool call owns the driver. Waiters block on the condvar, bounded by the
+/// caller-supplied timeout, so a same-driver burst serializes without any lock
+/// being held across the leased engine round-trips.
+struct DriverSlot<D> {
+    slot: Mutex<Option<D>>,
+    returned: Condvar,
+}
+
+impl<D> DriverSlot<D> {
+    fn new(driver: D) -> Self {
+        Self {
+            slot: Mutex::new(Some(driver)),
+            returned: Condvar::new(),
+        }
     }
 
-    pub fn driver_mut(&mut self) -> &mut D {
-        &mut self.driver
+    fn take(&self, timeout: Duration) -> Result<D, LeaseError> {
+        let deadline = Instant::now().checked_add(timeout);
+        let mut slot = self.slot.lock().map_err(|_| LeaseError::Poisoned)?;
+        loop {
+            if let Some(driver) = slot.take() {
+                return Ok(driver);
+            }
+            let Some(remaining) =
+                deadline.and_then(|deadline| deadline.checked_duration_since(Instant::now()))
+            else {
+                return Err(LeaseError::Busy);
+            };
+            let (guard, _) = self
+                .returned
+                .wait_timeout(slot, remaining)
+                .map_err(|_| LeaseError::Poisoned)?;
+            slot = guard;
+        }
     }
 
-    pub fn handshake_report_mut(&mut self) -> &mut ProbeReport {
-        &mut self.handshake_report
+    fn put(&self, driver: D) {
+        if let Ok(mut slot) = self.slot.lock() {
+            *slot = Some(driver);
+        }
+        self.returned.notify_one();
     }
+}
 
-    fn register_fork(&mut self, forked: Box<dyn DriverTrait>) -> Result<String, JsonRpcError> {
-        let fork_id = self.next_fork_id;
-        let Some(next_id) = self.next_fork_id.checked_add(1) else {
-            return Err(JsonRpcError::invalid_request(
-                "MCP fork driver id counter exhausted",
-            ));
+/// A registered fork: idle (leasable) or currently owned by a tool call.
+enum ForkEntry {
+    Idle(Box<dyn DriverTrait>),
+    Leased,
+}
+
+struct ForkMap {
+    entries: BTreeMap<String, ForkEntry>,
+    next_fork_id: u64,
+    /// Set permanently by [`ForkSlots::retire`] when the server's forks are
+    /// being torn down (drain/detach). A `fork` tool call whose engine
+    /// round-trip completes AFTER the teardown snapshot must not register into
+    /// a registry nobody will close again — registration is refused and the
+    /// caller closes the fresh fork instead (#230 review blocker: the
+    /// lock-split made this race reachable; pre-#230 the global locks made it
+    /// impossible). Mirrors the BiDi CreateContext re-check-after-unlock.
+    retired: bool,
+}
+
+impl Default for ForkMap {
+    fn default() -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            next_fork_id: 1,
+            retired: false,
+        }
+    }
+}
+
+/// Fork registry with per-fork leasing. The registry lock is only held for map
+/// bookkeeping (register/lease/restore/remove); leased drivers are owned by the
+/// calling task, so calls on distinct forks proceed fully in parallel.
+#[derive(Default)]
+struct ForkSlots {
+    inner: Mutex<ForkMap>,
+    returned: Condvar,
+}
+
+/// A fork that could not be registered, handed back so the caller can close it
+/// instead of leaking the engine-side context.
+struct ForkRegisterRejection {
+    forked: Box<dyn DriverTrait>,
+    reason: String,
+}
+
+impl ForkSlots {
+    fn register(&self, forked: Box<dyn DriverTrait>) -> Result<String, ForkRegisterRejection> {
+        let Ok(mut map) = self.inner.lock() else {
+            return Err(ForkRegisterRejection {
+                forked,
+                reason: "MCP fork registry lock poisoned".into(),
+            });
         };
-        self.next_fork_id = next_id;
+        // Retirement, cap check, and registration are all atomic under the
+        // registry lock: a fork either registers before the teardown snapshot
+        // (and is closed by it) or is refused here (and closed by its caller).
+        if map.retired {
+            return Err(ForkRegisterRejection {
+                forked,
+                reason: "MCP forks are shut down (drain/detach); the new fork was closed".into(),
+            });
+        }
+        if map.entries.len() >= MAX_LIVE_FORKS {
+            return Err(ForkRegisterRejection {
+                forked,
+                reason: format!(
+                    "fork limit reached ({MAX_LIVE_FORKS} live forks); close_fork before creating another"
+                ),
+            });
+        }
+        let fork_id = map.next_fork_id;
+        let Some(next_id) = fork_id.checked_add(1) else {
+            return Err(ForkRegisterRejection {
+                forked,
+                reason: "MCP fork driver id counter exhausted".into(),
+            });
+        };
+        map.next_fork_id = next_id;
         let driver_id = format!("fork-{fork_id}");
-        self.forks.insert(driver_id.clone(), forked);
+        map.entries
+            .insert(driver_id.clone(), ForkEntry::Idle(forked));
         Ok(driver_id)
+    }
+
+    fn lease(
+        &self,
+        driver_id: &str,
+        timeout: Duration,
+    ) -> Result<Box<dyn DriverTrait>, LeaseError> {
+        let deadline = Instant::now().checked_add(timeout);
+        let mut map = self.inner.lock().map_err(|_| LeaseError::Poisoned)?;
+        loop {
+            match map.entries.get_mut(driver_id) {
+                None => return Err(LeaseError::Unknown),
+                Some(entry @ ForkEntry::Idle(_)) => {
+                    let ForkEntry::Idle(driver) = std::mem::replace(entry, ForkEntry::Leased)
+                    else {
+                        return Err(LeaseError::Poisoned);
+                    };
+                    return Ok(driver);
+                }
+                Some(ForkEntry::Leased) => {}
+            }
+            let Some(remaining) =
+                deadline.and_then(|deadline| deadline.checked_duration_since(Instant::now()))
+            else {
+                return Err(LeaseError::Busy);
+            };
+            let (guard, _) = self
+                .returned
+                .wait_timeout(map, remaining)
+                .map_err(|_| LeaseError::Poisoned)?;
+            map = guard;
+        }
+    }
+
+    fn restore(&self, driver_id: &str, driver: Box<dyn DriverTrait>) {
+        if let Ok(mut map) = self.inner.lock()
+            && let Some(entry) = map.entries.get_mut(driver_id)
+        {
+            // `remove` waits for idle entries, so a leased entry is still
+            // present until it is restored here; a missing entry means the
+            // registry was poisoned, in which case the driver is dropped.
+            *entry = ForkEntry::Idle(driver);
+        }
+        self.returned.notify_all();
+    }
+
+    /// Wait (bounded) for the fork to be idle, then take it out of the registry.
+    fn remove(
+        &self,
+        driver_id: &str,
+        timeout: Duration,
+    ) -> Result<Box<dyn DriverTrait>, LeaseError> {
+        let deadline = Instant::now().checked_add(timeout);
+        let mut map = self.inner.lock().map_err(|_| LeaseError::Poisoned)?;
+        loop {
+            match map.entries.get(driver_id) {
+                None => return Err(LeaseError::Unknown),
+                Some(ForkEntry::Idle(_)) => {
+                    let Some(ForkEntry::Idle(driver)) = map.entries.remove(driver_id) else {
+                        return Err(LeaseError::Poisoned);
+                    };
+                    return Ok(driver);
+                }
+                Some(ForkEntry::Leased) => {}
+            }
+            let Some(remaining) =
+                deadline.and_then(|deadline| deadline.checked_duration_since(Instant::now()))
+            else {
+                return Err(LeaseError::Busy);
+            };
+            let (guard, _) = self
+                .returned
+                .wait_timeout(map, remaining)
+                .map_err(|_| LeaseError::Poisoned)?;
+            map = guard;
+        }
+    }
+
+    /// Permanently refuse new registrations and return the ids live at the
+    /// moment of retirement. Setting the flag and taking the snapshot under
+    /// ONE lock acquisition closes the in-flight-`fork`-across-drain race:
+    /// every fork is either in this snapshot (closed by the caller of
+    /// [`TempoMcpServer::close_all_forks`]) or refused at registration
+    /// (closed by the `fork` tool call itself).
+    fn retire(&self) -> Vec<String> {
+        match self.inner.lock() {
+            Ok(mut map) => {
+                map.retired = true;
+                map.entries.keys().cloned().collect()
+            }
+            Err(_) => Vec::new(),
+        }
+    }
+}
+
+/// Exclusive, self-returning lease on the root driver or a fork. The leased
+/// driver is owned by the tool call for its whole duration (including
+/// multi-round-trip tools such as `screenshot` with set-of-marks), and is put
+/// back on drop so an early return can never strand a driver as busy.
+enum LeasedDriver<'a, D: DriverTrait> {
+    Root(&'a DriverSlot<D>, Option<D>),
+    Fork(&'a ForkSlots, String, Option<Box<dyn DriverTrait>>),
+}
+
+impl<D: DriverTrait> LeasedDriver<'_, D> {
+    fn driver_mut(&mut self) -> Option<&mut (dyn DriverTrait + '_)> {
+        match self {
+            Self::Root(_, driver) => driver
+                .as_mut()
+                .map(|driver| driver as &mut (dyn DriverTrait + '_)),
+            Self::Fork(_, _, driver) => driver
+                .as_mut()
+                .map(|driver| &mut **driver as &mut (dyn DriverTrait + '_)),
+        }
+    }
+}
+
+impl<D: DriverTrait> Drop for LeasedDriver<'_, D> {
+    fn drop(&mut self) {
+        match self {
+            Self::Root(slot, driver) => {
+                if let Some(driver) = driver.take() {
+                    slot.put(driver);
+                }
+            }
+            Self::Fork(slots, driver_id, driver) => {
+                if let Some(driver) = driver.take() {
+                    slots.restore(driver_id, driver);
+                }
+            }
+        }
     }
 }
 
@@ -140,21 +408,28 @@ impl<D> TempoMcpServer<D>
 where
     D: DriverTrait,
 {
-    /// Close and forget a single forked driver, releasing its engine resources.
-    async fn close_fork(&mut self, driver_id: &str) -> Result<(), String> {
-        let Some(mut forked) = self.forks.remove(driver_id) else {
-            return Err(format!("unknown driver_id: {driver_id}"));
-        };
-        forked.close().await.map_err(|error| error.to_string())
-    }
-
-    /// Close and drop every live fork. Call when a session ends so forked engine
-    /// contexts do not leak for the process lifetime. Returns per-fork close errors.
-    pub async fn close_all_forks(&mut self) -> Vec<String> {
+    /// Close and drop every live fork, and permanently retire the fork
+    /// registry so a `fork` tool call still in flight cannot register (and
+    /// leak) a context after this snapshot — it is refused at registration and
+    /// closes its own fork instead. Call when a session ends so forked engine
+    /// contexts do not leak for the process lifetime. Returns per-fork close
+    /// errors. Waits (bounded) for any fork still owned by an in-flight call.
+    pub async fn close_all_forks(&self) -> Vec<String> {
         let mut errors = Vec::new();
-        for (driver_id, mut forked) in std::mem::take(&mut self.forks) {
-            if let Err(error) = forked.close().await {
-                errors.push(format!("{driver_id}: {error}"));
+        for driver_id in self.forks.retire() {
+            match self.forks.remove(&driver_id, DRIVER_LEASE_TIMEOUT) {
+                Ok(mut forked) => {
+                    if let Err(error) = forked.close().await {
+                        errors.push(format!("{driver_id}: {error}"));
+                    }
+                }
+                // Removed by a concurrent close_fork; nothing left to release.
+                Err(LeaseError::Unknown) => {}
+                Err(LeaseError::Busy | LeaseError::Poisoned) => {
+                    errors.push(format!(
+                        "{driver_id}: fork was not returned by its in-flight call within {DRIVER_LEASE_TIMEOUT:?}"
+                    ));
+                }
             }
         }
         errors
@@ -165,23 +440,32 @@ impl<D> TempoMcpServer<D>
 where
     D: DriverTrait,
 {
-    fn driver_for_mut(
-        &mut self,
-        driver_id: Option<&str>,
-    ) -> Result<&mut (dyn DriverTrait + '_), JsonRpcError> {
-        let Some(driver_id) = driver_id else {
-            return Ok(&mut self.driver);
-        };
-        match self.forks.get_mut(driver_id) {
-            Some(driver) => Ok(driver.as_mut()),
-            None => Err(JsonRpcError::invalid_params(format!(
-                "unknown driver_id: {driver_id}"
-            ))),
+    fn lease_driver(&self, driver_id: Option<&str>) -> Result<LeasedDriver<'_, D>, JsonRpcError> {
+        match driver_id {
+            None => match self.root.take(DRIVER_LEASE_TIMEOUT) {
+                Ok(driver) => Ok(LeasedDriver::Root(&self.root, Some(driver))),
+                Err(_) => Err(JsonRpcError::driver_busy(
+                    "the root driver is busy with another tool call; retry shortly",
+                )),
+            },
+            Some(driver_id) => match self.forks.lease(driver_id, DRIVER_LEASE_TIMEOUT) {
+                Ok(driver) => Ok(LeasedDriver::Fork(
+                    &self.forks,
+                    driver_id.to_string(),
+                    Some(driver),
+                )),
+                Err(LeaseError::Unknown) => Err(JsonRpcError::invalid_params(format!(
+                    "unknown driver_id: {driver_id}"
+                ))),
+                Err(LeaseError::Busy | LeaseError::Poisoned) => Err(JsonRpcError::driver_busy(
+                    format!("driver {driver_id} is busy with another tool call; retry shortly"),
+                )),
+            },
         }
     }
 
     /// Handle one MCP POST body. `origin` is the HTTP Origin header when present.
-    pub async fn handle_post(&mut self, origin: Option<&str>, body: &[u8]) -> McpHttpResponse {
+    pub async fn handle_post(&self, origin: Option<&str>, body: &[u8]) -> McpHttpResponse {
         if !origin_allowed(origin) {
             return McpHttpResponse::json(
                 403,
@@ -210,7 +494,7 @@ where
         }
     }
 
-    async fn handle_message(&mut self, message: &Value) -> Result<Value, JsonRpcError> {
+    async fn handle_message(&self, message: &Value) -> Result<Value, JsonRpcError> {
         if !message.is_object() {
             return Err(JsonRpcError::invalid_request(
                 "JSON-RPC message must be an object",
@@ -238,7 +522,7 @@ where
         }
     }
 
-    async fn tools_call(&mut self, params: &Value) -> Result<Value, JsonRpcError> {
+    async fn tools_call(&self, params: &Value) -> Result<Value, JsonRpcError> {
         let name = params
             .get("name")
             .and_then(Value::as_str)
@@ -257,11 +541,14 @@ where
         tool_call_json(call)
     }
 
-    async fn call_tool(&mut self, name: &str, arguments: Value) -> Result<ToolCall, JsonRpcError> {
+    async fn call_tool(&self, name: &str, arguments: Value) -> Result<ToolCall, JsonRpcError> {
         match name {
             "observe" => {
                 let args: DriverTargetArgs = parse_args(arguments)?;
-                let driver = self.driver_for_mut(args.driver_id.as_deref())?;
+                let mut lease = self.lease_driver(args.driver_id.as_deref())?;
+                let Some(driver) = lease.driver_mut() else {
+                    return Err(JsonRpcError::invalid_request("driver lease was empty"));
+                };
                 match driver.observe().await {
                     Ok(observation) => Ok(ToolCall::success(json!(observation))),
                     Err(error) => Ok(ToolCall::error(error.to_string())),
@@ -269,7 +556,10 @@ where
             }
             "observe_diff" => {
                 let args: ObserveDiffArgs = parse_args(arguments)?;
-                let driver = self.driver_for_mut(args.driver_id.as_deref())?;
+                let mut lease = self.lease_driver(args.driver_id.as_deref())?;
+                let Some(driver) = lease.driver_mut() else {
+                    return Err(JsonRpcError::invalid_request("driver lease was empty"));
+                };
                 match driver.observe_diff(args.since_seq).await {
                     Ok(diff) => Ok(ToolCall::success(json!(diff))),
                     Err(error) => Ok(ToolCall::error(error.to_string())),
@@ -282,7 +572,10 @@ where
                 {
                     return Ok(denial);
                 }
-                let driver = self.driver_for_mut(args.driver_id.as_deref())?;
+                let mut lease = self.lease_driver(args.driver_id.as_deref())?;
+                let Some(driver) = lease.driver_mut() else {
+                    return Err(JsonRpcError::invalid_request("driver lease was empty"));
+                };
                 match driver.act(&args.action).await {
                     Ok(outcome) => Ok(ToolCall::success(step_outcome_json(outcome))),
                     Err(error) => Ok(ToolCall::error(error.to_string())),
@@ -296,7 +589,10 @@ where
                 }) {
                     return Ok(denial);
                 }
-                let driver = self.driver_for_mut(args.driver_id.as_deref())?;
+                let mut lease = self.lease_driver(args.driver_id.as_deref())?;
+                let Some(driver) = lease.driver_mut() else {
+                    return Err(JsonRpcError::invalid_request("driver lease was empty"));
+                };
                 match driver.act_batch(&args.batch).await {
                     Ok(outcome) => Ok(ToolCall::success(step_outcome_json(outcome))),
                     Err(error) => Ok(ToolCall::error(error.to_string())),
@@ -305,30 +601,35 @@ where
             "fork" => {
                 let args: ForkArgs = parse_args(arguments)?;
                 let forked = {
-                    let driver = self.driver_for_mut(args.driver_id.as_deref())?;
+                    let mut lease = self.lease_driver(args.driver_id.as_deref())?;
+                    let Some(driver) = lease.driver_mut() else {
+                        return Err(JsonRpcError::invalid_request("driver lease was empty"));
+                    };
+                    // The parent lease is dropped (returned) before registration,
+                    // so a slow fork does not hold the parent hostage afterwards.
                     driver.fork().await
                 };
                 match forked {
-                    Ok(mut forked) => {
-                        if self.forks.len() >= MAX_LIVE_FORKS {
-                            // Refuse to accumulate: close the fork we just created so it
-                            // does not leak, and ask the client to reclaim one first.
-                            let mut reason = format!(
-                                "fork limit reached ({MAX_LIVE_FORKS} live forks); close_fork before creating another"
-                            );
-                            if let Err(error) = forked.close().await {
-                                reason
-                                    .push_str(&format!("; also failed to close new fork: {error}"));
-                            }
-                            return Ok(ToolCall::error(reason));
-                        }
+                    Ok(forked) => {
                         let engine = engine_name(forked.engine());
-                        let driver_id = self.register_fork(forked)?;
-                        Ok(ToolCall::success(json!({
-                            "supported": true,
-                            "driver_id": driver_id,
-                            "engine": engine,
-                        })))
+                        match self.forks.register(forked) {
+                            Ok(driver_id) => Ok(ToolCall::success(json!({
+                                "supported": true,
+                                "driver_id": driver_id,
+                                "engine": engine,
+                            }))),
+                            Err(ForkRegisterRejection { mut forked, reason }) => {
+                                // Refuse to accumulate: close the fork we just
+                                // created so it does not leak.
+                                let mut reason = reason;
+                                if let Err(error) = forked.close().await {
+                                    reason.push_str(&format!(
+                                        "; also failed to close new fork: {error}"
+                                    ));
+                                }
+                                Ok(ToolCall::error(reason))
+                            }
+                        }
                     }
                     Err(error) => Ok(ToolCall::success(json!({
                         "supported": false,
@@ -338,19 +639,32 @@ where
             }
             "close_fork" => {
                 let args: CloseForkArgs = parse_args(arguments)?;
-                match self.close_fork(&args.driver_id).await {
-                    Ok(()) => Ok(ToolCall::success(json!({
-                        "closed": true,
-                        "driver_id": args.driver_id,
-                    }))),
-                    Err(error) => Ok(ToolCall::error(error)),
+                match self.forks.remove(&args.driver_id, DRIVER_LEASE_TIMEOUT) {
+                    Ok(mut forked) => match forked.close().await {
+                        Ok(()) => Ok(ToolCall::success(json!({
+                            "closed": true,
+                            "driver_id": args.driver_id,
+                        }))),
+                        Err(error) => Ok(ToolCall::error(error.to_string())),
+                    },
+                    Err(LeaseError::Unknown) => Ok(ToolCall::error(format!(
+                        "unknown driver_id: {}",
+                        args.driver_id
+                    ))),
+                    Err(LeaseError::Busy | LeaseError::Poisoned) => Ok(ToolCall::error(format!(
+                        "driver {} is busy with another tool call; retry shortly",
+                        args.driver_id
+                    ))),
                 }
             }
             "extract" => {
                 let args: NodeArgs = parse_args(arguments)?;
                 let driver_id = args.driver_id.clone();
                 let node = args.node_id()?;
-                let driver = self.driver_for_mut(driver_id.as_deref())?;
+                let mut lease = self.lease_driver(driver_id.as_deref())?;
+                let Some(driver) = lease.driver_mut() else {
+                    return Err(JsonRpcError::invalid_request("driver lease was empty"));
+                };
                 match driver.extract(&node).await {
                     Ok(value) => Ok(ToolCall::success_json_bounded(
                         "extract_json",
@@ -362,7 +676,10 @@ where
             }
             "screenshot" => {
                 let args: ScreenshotArgs = parse_args(arguments)?;
-                let driver = self.driver_for_mut(args.driver_id.as_deref())?;
+                let mut lease = self.lease_driver(args.driver_id.as_deref())?;
+                let Some(driver) = lease.driver_mut() else {
+                    return Err(JsonRpcError::invalid_request("driver lease was empty"));
+                };
                 let observation = if args.set_of_marks {
                     match driver.observe().await {
                         Ok(observation) => Some(observation),
@@ -413,7 +730,10 @@ where
                 let args: HandshakeArgs = parse_args(arguments)?;
                 let probe = run_handshake_probe(&args, &self.handshake_probe_config).await;
                 let web_mcp = {
-                    let driver = self.driver_for_mut(args.driver_id.as_deref())?;
+                    let mut lease = self.lease_driver(args.driver_id.as_deref())?;
+                    let Some(driver) = lease.driver_mut() else {
+                        return Err(JsonRpcError::invalid_request("driver lease was empty"));
+                    };
                     Some(run_origin_bound_web_mcp_detection(&args, driver).await)
                 };
                 Ok(ToolCall::success(handshake_result_json(
@@ -665,6 +985,13 @@ impl JsonRpcError {
     fn response_too_large(message: impl Into<String>) -> Self {
         Self {
             code: RESPONSE_TOO_LARGE_ERROR_CODE,
+            message: message.into(),
+        }
+    }
+
+    fn driver_busy(message: impl Into<String>) -> Self {
+        Self {
+            code: DRIVER_BUSY_ERROR_CODE,
             message: message.into(),
         }
     }
@@ -1430,7 +1757,7 @@ mod tests {
 
     #[tokio::test]
     async fn initialize_and_tool_list_follow_mcp_shape() -> Result<(), String> {
-        let mut server = TempoMcpServer::new(MemoryDriver::new());
+        let server = TempoMcpServer::new(MemoryDriver::new());
         let initialize = server
             .handle_post(None, br#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#)
             .await
@@ -1759,7 +2086,9 @@ mod tests {
 
     #[tokio::test]
     async fn close_fork_closes_and_removes_forked_driver() -> Result<(), String> {
-        let mut server = TempoMcpServer::new(MemoryDriver::new());
+        let driver = MemoryDriver::new();
+        let closed_counter = Arc::clone(&driver.closed);
+        let mut server = TempoMcpServer::new(driver);
 
         let fork = call_tool(&mut server, "fork", json!({})).await?;
         let driver_id = fork["driver_id"]
@@ -1775,7 +2104,7 @@ mod tests {
         .await?;
         assert_eq!(closed["closed"], true);
         // The forked driver's close() ran (fork shares the counter handle).
-        assert_eq!(server.driver().closed.load(Ordering::SeqCst), 1);
+        assert_eq!(closed_counter.load(Ordering::SeqCst), 1);
 
         // The fork is gone: targeting it now errors, and a repeat close reports it missing.
         let reuse = call_tool(
@@ -1796,7 +2125,9 @@ mod tests {
 
     #[tokio::test]
     async fn fork_limit_is_enforced_and_rejected_fork_is_closed() -> Result<(), String> {
-        let mut server = TempoMcpServer::new(MemoryDriver::new());
+        let driver = MemoryDriver::new();
+        let closed_counter = Arc::clone(&driver.closed);
+        let mut server = TempoMcpServer::new(driver);
         for _ in 0..MAX_LIVE_FORKS {
             let fork = call_tool(&mut server, "fork", json!({})).await?;
             assert_eq!(fork["supported"], true);
@@ -1808,20 +2139,22 @@ mod tests {
             .ok_or("fork past the limit must return an error")?;
         assert!(reason.contains("fork limit reached"), "{reason}");
         // The rejected fork was closed instead of leaking.
-        assert_eq!(server.driver().closed.load(Ordering::SeqCst), 1);
+        assert_eq!(closed_counter.load(Ordering::SeqCst), 1);
         Ok(())
     }
 
     #[tokio::test]
     async fn close_all_forks_closes_every_live_fork() -> Result<(), String> {
-        let mut server = TempoMcpServer::new(MemoryDriver::new());
+        let driver = MemoryDriver::new();
+        let closed_counter = Arc::clone(&driver.closed);
+        let mut server = TempoMcpServer::new(driver);
         for _ in 0..3 {
             call_tool(&mut server, "fork", json!({})).await?;
         }
 
         let errors = server.close_all_forks().await;
         assert!(errors.is_empty(), "{errors:?}");
-        assert_eq!(server.driver().closed.load(Ordering::SeqCst), 3);
+        assert_eq!(closed_counter.load(Ordering::SeqCst), 3);
 
         // Every fork was dropped from the session map.
         let missing = call_tool(&mut server, "close_fork", json!({"driver_id": "fork-1"})).await?;
@@ -2082,7 +2415,7 @@ mod tests {
         );
 
         let (origin, fixture) = serve_handshake_fixture().map_err(|error| error.to_string())?;
-        let mut server = TempoMcpServer::new(MemoryDriver::new()).with_handshake_probe_config(
+        let server = TempoMcpServer::new(MemoryDriver::new()).with_handshake_probe_config(
             HttpProbeConfig::default().with_url_policy(UrlPolicy::allow_all()),
         );
         let body = json!({
@@ -2170,7 +2503,7 @@ mod tests {
 
     #[tokio::test]
     async fn protocol_errors_and_notifications_have_http_semantics() -> Result<(), String> {
-        let mut server = TempoMcpServer::new(MemoryDriver::new());
+        let server = TempoMcpServer::new(MemoryDriver::new());
         let malformed = server.handle_post(None, b"{not-json").await;
         assert_eq!(malformed.status, 400);
         assert_eq!(
@@ -2209,6 +2542,154 @@ mod tests {
         ] {
             assert!(!origin_allowed(Some(origin)), "{origin}");
         }
+    }
+
+    fn tool_call_body(id: u64, name: &str, arguments: Value) -> Vec<u8> {
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": {"name": name, "arguments": arguments}
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    fn blocking_tool_call(
+        server: &Arc<TempoMcpServer<MemoryDriver>>,
+        id: u64,
+        name: &str,
+        arguments: Value,
+    ) -> Result<Value, String> {
+        let response = futures::executor::block_on(
+            server.handle_post(None, &tool_call_body(id, name, arguments)),
+        );
+        response.json_value().map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn tool_calls_on_distinct_drivers_run_concurrently() -> Result<(), String> {
+        // Root + fork each take ~200ms to observe. If the server still
+        // serialized all tool calls behind one lock (pre-#230), the pair would
+        // take >=400ms; concurrent dispatch finishes in ~200ms.
+        let driver = MemoryDriver::new().with_observe_delay(Duration::from_millis(200));
+        let server = Arc::new(TempoMcpServer::new(driver));
+
+        let fork = blocking_tool_call(&server, 1, "fork", json!({}))?;
+        let fork_id = fork["result"]["structuredContent"]["driver_id"]
+            .as_str()
+            .ok_or("fork must return a driver_id")?
+            .to_string();
+
+        let started = Instant::now();
+        let root_server = Arc::clone(&server);
+        let root_call =
+            std::thread::spawn(move || blocking_tool_call(&root_server, 2, "observe", json!({})));
+        let fork_server = Arc::clone(&server);
+        let fork_call = std::thread::spawn(move || {
+            blocking_tool_call(&fork_server, 3, "observe", json!({"driver_id": fork_id}))
+        });
+        let root_result = root_call.join().map_err(|_| "root call panicked")??;
+        let fork_result = fork_call.join().map_err(|_| "fork call panicked")??;
+        let elapsed = started.elapsed();
+
+        assert!(root_result.get("error").is_none(), "{root_result}");
+        assert!(fork_result.get("error").is_none(), "{fork_result}");
+        assert!(
+            elapsed < Duration::from_millis(350),
+            "tool calls on distinct drivers did not overlap: {elapsed:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn same_driver_tool_calls_stay_serialized() -> Result<(), String> {
+        // Two concurrent observes on the ROOT driver must not interleave: the
+        // per-driver lease keeps same-driver ordering while releasing
+        // unrelated drivers (issue #230).
+        let driver = MemoryDriver::new().with_observe_delay(Duration::from_millis(150));
+        let spans = Arc::clone(&driver.observe_spans);
+        let server = Arc::new(TempoMcpServer::new(driver));
+
+        let first_server = Arc::clone(&server);
+        let first =
+            std::thread::spawn(move || blocking_tool_call(&first_server, 1, "observe", json!({})));
+        let second_server = Arc::clone(&server);
+        let second =
+            std::thread::spawn(move || blocking_tool_call(&second_server, 2, "observe", json!({})));
+        let first_result = first.join().map_err(|_| "first call panicked")??;
+        let second_result = second.join().map_err(|_| "second call panicked")??;
+        assert!(first_result.get("error").is_none(), "{first_result}");
+        assert!(second_result.get("error").is_none(), "{second_result}");
+
+        let mut spans = spans.lock().map_err(|_| "span log poisoned")?.clone();
+        spans.sort_by_key(|(start, _)| *start);
+        assert_eq!(spans.len(), 2);
+        assert!(
+            spans[1].0 >= spans[0].1,
+            "same-driver observes overlapped: {spans:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn same_driver_call_beyond_lease_bound_fails_driver_busy() -> Result<(), String> {
+        // An op that outlives DRIVER_LEASE_TIMEOUT makes a queued same-driver
+        // call fail with the bounded driver-busy error instead of waiting
+        // forever.
+        let driver = MemoryDriver::new()
+            .with_observe_delay(DRIVER_LEASE_TIMEOUT + Duration::from_millis(300));
+        let server = Arc::new(TempoMcpServer::new(driver));
+
+        let long_server = Arc::clone(&server);
+        let long_call =
+            std::thread::spawn(move || blocking_tool_call(&long_server, 1, "observe", json!({})));
+        // Lose the race deterministically.
+        std::thread::sleep(Duration::from_millis(100));
+        let started = Instant::now();
+        let busy = blocking_tool_call(&server, 2, "observe", json!({}))?;
+        let waited = started.elapsed();
+
+        assert_eq!(busy["error"]["code"], DRIVER_BUSY_ERROR_CODE, "{busy}");
+        assert!(
+            waited < DRIVER_LEASE_TIMEOUT + Duration::from_millis(400),
+            "driver-busy wait was not bounded: {waited:?}"
+        );
+        let long_result = long_call.join().map_err(|_| "long call panicked")??;
+        assert!(long_result.get("error").is_none(), "{long_result}");
+        Ok(())
+    }
+
+    #[test]
+    fn fork_in_flight_across_close_all_forks_is_closed_not_leaked() -> Result<(), String> {
+        // #230 review blocker: a `fork` whose engine round-trip completes
+        // AFTER close_all_forks took its teardown snapshot must not register
+        // into a registry nobody will close again. The retired registry
+        // refuses the late registration and the tool call closes its own
+        // fork. Reverted (no retirement), the late fork registers
+        // successfully and is never closed — both assertions below fail.
+        let driver = MemoryDriver::new().with_fork_delay(Duration::from_millis(300));
+        let closed_counter = Arc::clone(&driver.closed);
+        let server = Arc::new(TempoMcpServer::new(driver));
+
+        let fork_server = Arc::clone(&server);
+        let in_flight =
+            std::thread::spawn(move || blocking_tool_call(&fork_server, 1, "fork", json!({})));
+        // Let the fork reach its engine round-trip, then tear down (drain).
+        std::thread::sleep(Duration::from_millis(100));
+        let errors = futures::executor::block_on(server.close_all_forks());
+        assert!(errors.is_empty(), "{errors:?}");
+
+        let fork_result = in_flight.join().map_err(|_| "fork call panicked")??;
+        let error_text = fork_result["result"]["structuredContent"]["error"]
+            .as_str()
+            .ok_or_else(|| {
+                format!("late fork must be refused after close_all_forks: {fork_result}")
+            })?;
+        assert!(error_text.contains("shut down"), "{error_text}");
+        // The refused fork was closed, not leaked.
+        assert_eq!(closed_counter.load(Ordering::SeqCst), 1);
+        Ok(())
     }
 
     async fn call_tool(
@@ -2337,12 +2818,23 @@ mod tests {
         // Shared across forks (fork() clones this handle) so tests can assert that
         // close() actually ran on a forked driver rather than it merely being dropped.
         closed: Arc<AtomicUsize>,
+        /// When set, `observe` blocks this long — used by the issue #230
+        /// concurrency tests to prove overlap/serialization.
+        observe_delay: Option<Duration>,
+        /// When set, `fork` blocks this long — used to race an in-flight fork
+        /// against `close_all_forks` (#230 review blocker).
+        fork_delay: Option<Duration>,
+        /// Start/end instants of every delayed `observe`, shared across forks.
+        observe_spans: Arc<Mutex<Vec<(Instant, Instant)>>>,
     }
 
     impl MemoryDriver {
         fn new() -> Self {
             Self {
                 closed: Arc::new(AtomicUsize::new(0)),
+                observe_delay: None,
+                fork_delay: None,
+                observe_spans: Arc::new(Mutex::new(Vec::new())),
                 web_mcp_available: false,
                 web_mcp_has_tools: false,
                 web_mcp_method_only: false,
@@ -2401,6 +2893,16 @@ mod tests {
             self.screenshot_bytes = Some(bytes);
             self
         }
+
+        fn with_observe_delay(mut self, delay: Duration) -> Self {
+            self.observe_delay = Some(delay);
+            self
+        }
+
+        fn with_fork_delay(mut self, delay: Duration) -> Self {
+            self.fork_delay = Some(delay);
+            self
+        }
     }
 
     #[async_trait]
@@ -2416,6 +2918,13 @@ mod tests {
         }
 
         async fn observe(&mut self) -> Result<CompiledObservation, TransportError> {
+            if let Some(delay) = self.observe_delay {
+                let start = Instant::now();
+                std::thread::sleep(delay);
+                if let Ok(mut spans) = self.observe_spans.lock() {
+                    spans.push((start, Instant::now()));
+                }
+            }
             Ok(self.observation.clone())
         }
 
@@ -2453,6 +2962,9 @@ mod tests {
         }
 
         async fn fork(&mut self) -> Result<Box<dyn DriverTrait>, Unsupported> {
+            if let Some(delay) = self.fork_delay {
+                std::thread::sleep(delay);
+            }
             Ok(Box::new(self.clone()))
         }
 
