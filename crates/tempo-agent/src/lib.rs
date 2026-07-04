@@ -3567,7 +3567,7 @@ mod tests {
         );
         let mut driver = FailingDriver::new(TransportFailurePoint::PostActionObserve)
             .with_elements(vec![button("submit")]);
-        let runner = AgentRunner::new(
+        let runner = AgentRunner::new_plaintext_unsafe(
             &journal_path,
             AgentRunIds::new(
                 "run-action-budget-preexecute",
@@ -3614,7 +3614,7 @@ mod tests {
             StructuredSignal::McpCatalog,
             "/mcp/catalog.json",
         );
-        let runner = AgentRunner::new(
+        let runner = AgentRunner::new_plaintext_unsafe(
             &journal_path,
             AgentRunIds::new(
                 "run-structured-budget-preexecute",

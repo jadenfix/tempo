@@ -174,11 +174,6 @@ mod tests {
         assert_eq!(options.auth_token.as_deref(), Some("env-token"));
         Ok(())
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
 
     #[test]
     fn explicit_engine_requires_engine_socket() {
