@@ -21,13 +21,13 @@
 
 pub use tempo_net::{
     AuditRecord, BlockCode, BlockReason, CheckedCrawlConnection, CheckedCrawlDispatch,
-    CrawlCheckedBatch, CrawlDecision, CrawlDispatchError, CrawlDispatchGuard, CrawlDispatchSigner,
-    CrawlError, CrawlFrontierSnapshot, CrawlPolicy, CrawlScheduler, DomainRule, EgressDenied,
-    EgressPolicy, EgressRecord, IdentityMode, NetworkRequest, NetworkResponseRecord,
-    OriginCrawlSnapshot, ProfileId, ProxyRoute, RejectedCrawlDispatch, RequestId, RobotsRules,
-    SignatureError, SignatureHeaders, UrlBlocked, UrlPolicy, WebBotAuthSigningKey,
-    DEFAULT_CRAWL_MAX_CONCURRENT_PER_ORIGIN, DEFAULT_CRAWL_MAX_GLOBAL_INFLIGHT,
-    DEFAULT_CRAWL_MIN_DELAY_TICKS,
+    CrawlCheckedBatch, CrawlConnectionTarget, CrawlDecision, CrawlDispatchError,
+    CrawlDispatchGuard, CrawlDispatchSigner, CrawlError, CrawlFrontierSnapshot, CrawlPolicy,
+    CrawlScheduler, DomainRule, EgressDenied, EgressPolicy, EgressRecord, IdentityMode,
+    NetworkRequest, NetworkResponseRecord, OriginCrawlSnapshot, ProfileId, ProxyRoute,
+    RejectedCrawlDispatch, RequestId, RobotsRules, SignatureError, SignatureHeaders, UrlBlocked,
+    UrlPolicy, WebBotAuthSigningKey, DEFAULT_CRAWL_MAX_CONCURRENT_PER_ORIGIN,
+    DEFAULT_CRAWL_MAX_GLOBAL_INFLIGHT, DEFAULT_CRAWL_MIN_DELAY_TICKS,
 };
 
 #[deprecated(
@@ -87,7 +87,7 @@ impl CrawlFrontier {
         resolve_socket: F,
     ) -> Result<CrawlCheckedBatch, CrawlError>
     where
-        F: FnMut(&tempo_net::CrawlDispatch) -> Result<std::net::SocketAddr, CrawlDispatchError>,
+        F: FnMut(CrawlConnectionTarget<'_>) -> Result<std::net::SocketAddr, CrawlDispatchError>,
     {
         self.inner
             .dispatch_checked_ready(tick, max_requests, guard, resolve_socket)
@@ -260,7 +260,11 @@ mod tests {
         let url_policy = UrlPolicy::block_private();
         let egress_policy = EgressPolicy::allow_all();
         let guard = checked_dispatch_guard(&url_policy, &egress_policy);
-        let batch: CrawlCheckedBatch = frontier.dispatch_checked_ready(1, 1, guard, |_| {
+        let batch: CrawlCheckedBatch = frontier.dispatch_checked_ready(1, 1, guard, |target| {
+            assert!(!target.is_proxied());
+            assert_eq!(target.destination_domain(), "example.com");
+            assert_eq!(target.destination_port(), 443);
+            assert_eq!(target.resolution_endpoint(), "https://example.com/page");
             Ok(std::net::SocketAddr::from(([93, 184, 216, 34], 443)))
         })?;
 

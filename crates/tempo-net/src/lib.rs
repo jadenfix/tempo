@@ -2229,6 +2229,83 @@ impl CrawlDispatch {
     }
 }
 
+/// Resolver input for checked crawl dispatch.
+///
+/// Direct targets must resolve the request URL host. Proxied targets must
+/// resolve the selected proxy endpoint, not the request URL host.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CrawlConnectionTarget<'a> {
+    Direct {
+        request: &'a NetworkRequest,
+        domain: &'a str,
+        port: u16,
+    },
+    Proxied {
+        request: &'a NetworkRequest,
+        domain: &'a str,
+        port: u16,
+        proxy: &'a ProxyRoute,
+    },
+}
+
+impl<'a> CrawlConnectionTarget<'a> {
+    fn new(dispatch: &'a CrawlDispatch, egress_decision: &'a EgressDecision) -> Self {
+        match egress_decision {
+            EgressDecision::Direct { domain, port } => Self::Direct {
+                request: &dispatch.request,
+                domain,
+                port: *port,
+            },
+            EgressDecision::Proxied {
+                domain,
+                port,
+                proxy,
+            } => Self::Proxied {
+                request: &dispatch.request,
+                domain,
+                port: *port,
+                proxy,
+            },
+        }
+    }
+
+    pub fn request(&self) -> &'a NetworkRequest {
+        match self {
+            Self::Direct { request, .. } | Self::Proxied { request, .. } => request,
+        }
+    }
+
+    pub fn destination_domain(&self) -> &'a str {
+        match self {
+            Self::Direct { domain, .. } | Self::Proxied { domain, .. } => domain,
+        }
+    }
+
+    pub fn destination_port(&self) -> u16 {
+        match self {
+            Self::Direct { port, .. } | Self::Proxied { port, .. } => *port,
+        }
+    }
+
+    pub fn proxy(&self) -> Option<&'a ProxyRoute> {
+        match self {
+            Self::Direct { .. } => None,
+            Self::Proxied { proxy, .. } => Some(proxy),
+        }
+    }
+
+    pub fn resolution_endpoint(&self) -> &'a str {
+        match self {
+            Self::Direct { request, .. } => &request.url,
+            Self::Proxied { proxy, .. } => &proxy.endpoint,
+        }
+    }
+
+    pub const fn is_proxied(&self) -> bool {
+        matches!(self, Self::Proxied { .. })
+    }
+}
+
 /// Checked capability for opening a crawl network connection.
 ///
 /// Executors must connect to [`Self::resolved_socket`] and use
@@ -2547,10 +2624,9 @@ impl CrawlFrontier {
     ///
     /// Unlike [`dispatch_ready`](Self::dispatch_ready), this method does not mark a
     /// request active until the caller-provided socket and the shared Tempo URL,
-    /// egress, audit, and optional Web Bot Auth checks have passed. For direct
-    /// egress, `resolve_socket` must return the target URL socket. For proxied
-    /// egress, it must return the selected proxy endpoint socket; Tempo validates
-    /// that socket against the proxy endpoint without resolving the target host.
+    /// egress, audit, and optional Web Bot Auth checks have passed. The resolver
+    /// receives the selected [`CrawlConnectionTarget`]: direct egress targets the
+    /// request URL, while proxied egress targets the selected proxy endpoint.
     pub fn dispatch_checked_ready<F>(
         &mut self,
         tick: u64,
@@ -2559,7 +2635,7 @@ impl CrawlFrontier {
         mut resolve_socket: F,
     ) -> Result<CrawlCheckedBatch, CrawlError>
     where
-        F: FnMut(&CrawlDispatch) -> Result<SocketAddr, CrawlDispatchError>,
+        F: FnMut(CrawlConnectionTarget<'_>) -> Result<SocketAddr, CrawlDispatchError>,
     {
         let mut batch = CrawlCheckedBatch::default();
         if max_requests == 0 {
@@ -2598,7 +2674,8 @@ impl CrawlFrontier {
                             continue;
                         }
                     };
-                    let checked = match resolve_socket(&dispatch) {
+                    let connection_target = CrawlConnectionTarget::new(&dispatch, &egress_decision);
+                    let checked = match resolve_socket(connection_target) {
                         Ok(resolved_socket) => guard.check_with_egress_decision(
                             &dispatch,
                             resolved_socket,
@@ -6211,8 +6288,13 @@ Disallow: /private
         let egress_policy = EgressPolicy::allow_all();
         let guard = CrawlDispatchGuard::new(&url_policy, &egress_policy);
         let mut resolve_calls = 0usize;
-        let batch = frontier.dispatch_checked_ready(1, 1, guard, |_| {
+        let batch = frontier.dispatch_checked_ready(1, 1, guard, |target| {
             resolve_calls += 1;
+            assert!(!target.is_proxied());
+            assert_eq!(target.request().url, "https://a.example/page");
+            assert_eq!(target.destination_domain(), "a.example");
+            assert_eq!(target.destination_port(), 443);
+            assert_eq!(target.resolution_endpoint(), "https://a.example/page");
             Ok(SocketAddr::from(([10, 0, 0, 5], 443)))
         })?;
 
@@ -6270,9 +6352,23 @@ Disallow: /private
         );
         let guard = CrawlDispatchGuard::new(&url_policy, &egress_policy);
         let mut resolve_calls = 0usize;
-        let batch = frontier.dispatch_checked_ready(1, 1, guard, |dispatch| {
+        let batch = frontier.dispatch_checked_ready(1, 1, guard, |target| {
             resolve_calls += 1;
-            assert_eq!(dispatch.request.url, "https://proxied.example/page");
+            let CrawlConnectionTarget::Proxied {
+                request,
+                domain,
+                port,
+                proxy,
+            } = target
+            else {
+                panic!("expected selected proxy target");
+            };
+            assert_eq!(request.url, "https://proxied.example/page");
+            assert_eq!(domain, "proxied.example");
+            assert_eq!(port, 443);
+            assert_eq!(proxy.id.as_str(), "proxy-a");
+            assert_eq!(proxy.endpoint.as_str(), "socks5://proxy.example:1080");
+            assert_eq!(target.resolution_endpoint(), "socks5://proxy.example:1080");
             Ok(SocketAddr::from(([93, 184, 216, 34], 1080)))
         })?;
 
