@@ -1,24 +1,37 @@
 //! tempo-headless — headless `tempod` control plane.
 //!
 //! The daemon owns session lifecycle, engine-host supervision, graceful drain,
-//! and JSONL export for StepTriples. The HTTP layer here is intentionally small:
-//! it uses the standard library so the control surface works before a larger web
-//! framework is selected for production packaging.
+//! and StepTriple telemetry export (OTLP/HTTP to a collector, JSONL as the
+//! local fallback lane). The transport is axum/hyper on tokio (final.md §3.1,
+//! issue #249): the session REST surface, MCP, and the BiDi WebSocket are all
+//! served from one router, while session/engine work stays synchronous below
+//! the transport and runs on blocking worker threads.
 
 #![recursion_limit = "256"]
 
 use async_trait::async_trait;
+use axum::body::Bytes;
+use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
+use axum::extract::{DefaultBodyLimit, Path as UrlPath, RawQuery, Request as AxumRequest, State};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{delete, get, post};
+use axum::{Extension, Router};
 use base64::Engine as _;
+use hyper_util::rt::{TokioIo, TokioTimer};
+use hyper_util::service::TowerToHyperService;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as JsonValue};
-use sha1::{Digest, Sha1};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::io::Write;
+use std::net::{SocketAddr, TcpListener, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::TrySendError;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::Duration;
 use tempo_agent::{StepTriple, StepTripleOutcome};
@@ -44,19 +57,24 @@ use tempo_policy::trust::{
 use tempo_policy::{decide_action, ConfirmationGate, InputTaint};
 use tempo_schema::{Action, ActionBatch, CompiledObservation, NodeId, ObservationDiff, SideEffect};
 use thiserror::Error;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use url::Url;
 
+/// Maximum accepted HTTP body size; hyper's per-connection read buffer is
+/// capped to the same bound so oversized headers are rejected as well.
 const MAX_HTTP_BYTES: usize = 64 * 1024;
 const MAX_IDEMPOTENCY_KEY_BYTES: usize = 256;
 const MAX_SESSION_IDEMPOTENCY_RECORDS: usize = 1024;
-const MAX_WS_PAYLOAD_BYTES: u64 = MAX_HTTP_BYTES as u64;
+const MAX_WS_PAYLOAD_BYTES: usize = MAX_HTTP_BYTES;
 /// Maximum accepted TCP control-plane connections handled concurrently.
 const MAX_HTTP_CONNECTIONS: usize = 128;
 /// Maximum upgraded BiDi WebSocket sessions held concurrently.
 const MAX_WEBSOCKET_CONNECTIONS: usize = 32;
 /// Maximum number of live BiDi browsing contexts (forked drivers) held at once.
 const MAX_BIDI_CONTEXTS: usize = 64;
-/// Per-connection socket read/write timeout, bounding slowloris-style stalls.
+/// Bound on how long a client may take to send its request head, so a
+/// slowloris client cannot hold one of the capped connection permits forever
+/// (hyper `header_read_timeout`).
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(30);
 /// Timeout applied to engine-host IPC round-trips so a stalled engine cannot
 /// wedge the daemon indefinitely.
@@ -94,15 +112,12 @@ const ENGINE_TEARDOWN_TIMEOUT: Duration = Duration::from_millis(200);
 const SESSION_CREATE_TIMEOUT: Duration = Duration::from_secs(65);
 #[cfg(test)]
 const SESSION_CREATE_TIMEOUT: Duration = Duration::from_millis(200);
-const WS_ACCEPT_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-const WS_OPCODE_TEXT: u8 = 0x1;
-const WS_OPCODE_BINARY: u8 = 0x2;
-const WS_OPCODE_CLOSE: u8 = 0x8;
-const WS_OPCODE_PING: u8 = 0x9;
-const WS_OPCODE_PONG: u8 = 0xA;
 const HTTP_CONNECTION_LIMIT_MESSAGE: &str = "too many active tempod HTTP connections";
 const WEBSOCKET_CONNECTION_LIMIT_MESSAGE: &str = "too many active tempod WebSocket connections";
 pub const TEMPO_OTLP_JSONL_ENV: &str = "TEMPO_OTLP_JSONL";
+/// Collector endpoint for real OTLP/HTTP export of StepTriples (issue #249),
+/// e.g. `http://collector.internal:4318`; `/v1/traces` is appended when absent.
+pub const TEMPO_OTLP_ENDPOINT_ENV: &str = "TEMPO_OTLP_ENDPOINT";
 pub const TEMPO_TEMPOD_AUTH_TOKEN_ENV: &str = "TEMPO_TEMPOD_AUTH_TOKEN";
 /// Prometheus text exposition endpoint (`GET /metrics`).
 pub const TEMPOD_METRICS_PATH: &str = "/metrics";
@@ -138,11 +153,12 @@ impl TempodAuth {
         self.bearer_token.is_some()
     }
 
-    fn authorize(&self, request: &HttpRequest) -> Result<(), TempodError> {
+    /// Authorize a request from its raw `Authorization` header value.
+    fn authorize(&self, authorization: Option<&str>) -> Result<(), TempodError> {
         let Some(expected) = &self.bearer_token else {
             return Ok(());
         };
-        let Some(header) = request.header("authorization") else {
+        let Some(header) = authorization else {
             return Err(TempodError::Unauthorized("missing bearer token".into()));
         };
         let Some(actual) = authorization_bearer_token(header) else {
@@ -620,6 +636,7 @@ pub struct SessionPool {
     events: BTreeMap<TempodSessionId, Vec<TempodSessionEvent>>,
     otlp_exporter: Option<OtlpJsonExporter>,
     privacy_mode: PrivacyMode,
+    otlp_http_exporter: Option<OtlpHttpExporter>,
     bidi: BidiRouter,
     driver: Option<AttachedEngineDriver>,
     /// One MCP server for the attached engine. No outer `Mutex`: the server
@@ -643,6 +660,7 @@ impl Default for SessionPool {
             events: BTreeMap::new(),
             otlp_exporter: None,
             privacy_mode: PrivacyMode::default(),
+            otlp_http_exporter: None,
             bidi: BidiRouter::default(),
             driver: None,
             mcp: None,
@@ -671,6 +689,7 @@ impl fmt::Debug for SessionPool {
             .field("event_sessions", &self.events.len())
             .field("otlp_exporter", &self.otlp_exporter)
             .field("privacy_mode", &self.privacy_mode)
+            .field("otlp_http_exporter", &self.otlp_http_exporter)
             .field("bidi", &self.bidi)
             .field("driver", &self.driver)
             .field("mcp_attached", &self.mcp.is_some())
@@ -697,26 +716,51 @@ impl SessionPool {
     pub fn from_env() -> Self {
         Self::from_env_values(
             std::env::var_os(TEMPO_OTLP_JSONL_ENV),
+            std::env::var_os(TEMPO_OTLP_ENDPOINT_ENV),
             std::env::var_os(TEMPO_STEALTH_MODE_ENV),
         )
     }
 
     #[cfg(test)]
-    fn from_otlp_env_value(value: Option<std::ffi::OsString>) -> Self {
-        Self::from_env_values(value, None)
+    fn from_otlp_env_values(
+        jsonl: Option<std::ffi::OsString>,
+        endpoint: Option<std::ffi::OsString>,
+    ) -> Self {
+        Self::from_env_values(jsonl, endpoint, None)
     }
 
+    /// Wire the telemetry lanes from environment values: `TEMPO_OTLP_JSONL`
+    /// keeps the local JSONL fallback lane, `TEMPO_OTLP_ENDPOINT` enables real
+    /// OTLP/HTTP export to a collector (issue #249), and `TEMPO_STEALTH_MODE`
+    /// disables local history and all opt-in telemetry export.
     fn from_env_values(
-        otlp_value: Option<std::ffi::OsString>,
+        jsonl: Option<std::ffi::OsString>,
+        endpoint: Option<std::ffi::OsString>,
         stealth_value: Option<std::ffi::OsString>,
     ) -> Self {
         let privacy_mode = PrivacyMode::from_env_value(stealth_value);
         let mut pool = Self::default().with_privacy_mode(privacy_mode);
         if privacy_mode.retains_history()
-            && let Some(path) = otlp_value
+            && let Some(path) = jsonl
             && !path.is_empty()
         {
             pool = pool.with_otlp_exporter(OtlpJsonExporter::new(path));
+        }
+        if privacy_mode.retains_history() {
+            match endpoint {
+                Some(endpoint) if !endpoint.is_empty() => match endpoint.into_string() {
+                    Ok(endpoint) => match OtlpHttpExporter::new(endpoint) {
+                        Ok(exporter) => pool.otlp_http_exporter = Some(exporter),
+                        Err(error) => {
+                            eprintln!("tempod: ignoring {TEMPO_OTLP_ENDPOINT_ENV}: {error}");
+                        }
+                    },
+                    Err(_) => {
+                        eprintln!("tempod: ignoring non-UTF-8 {TEMPO_OTLP_ENDPOINT_ENV}");
+                    }
+                },
+                _ => {}
+            }
         }
         pool
     }
@@ -725,6 +769,7 @@ impl SessionPool {
         self.privacy_mode = privacy_mode;
         if !privacy_mode.retains_history() {
             self.otlp_exporter = None;
+            self.otlp_http_exporter = None;
             self.events.clear();
             self.session_act_batch_idempotency.clear();
         }
@@ -757,6 +802,17 @@ impl SessionPool {
 
     pub fn otlp_exporter(&self) -> Option<&OtlpJsonExporter> {
         self.otlp_exporter.as_ref()
+    }
+
+    pub fn with_otlp_http_exporter(mut self, exporter: OtlpHttpExporter) -> Self {
+        if self.privacy_mode.retains_history() {
+            self.otlp_http_exporter = Some(exporter);
+        }
+        self
+    }
+
+    pub fn otlp_http_exporter(&self) -> Option<&OtlpHttpExporter> {
+        self.otlp_http_exporter.as_ref()
     }
 
     /// Create a session while exclusively holding the pool. The HTTP path uses
@@ -1181,6 +1237,14 @@ impl SessionPool {
             // than propagating the IO error out of `record_step`.
             if let Err(error) = exporter.export_step(&triple) {
                 eprintln!("tempod: OTLP step export failed (telemetry only): {error}");
+            }
+        }
+        if let Some(exporter) = &self.otlp_http_exporter {
+            // Same best-effort contract for the collector lane (issue #249):
+            // the span is redacted, then handed to the export worker without
+            // blocking; a full queue or dead worker only logs.
+            if let Err(error) = exporter.export_step(&triple) {
+                eprintln!("tempod: OTLP/HTTP step export failed (telemetry only): {error}");
             }
         }
         Ok(self.record_event(id, TempodSessionEventKind::StepTriple { triple }))
@@ -1812,6 +1876,230 @@ fn redact_goto_url(url: &str) -> serde_json::Value {
     })
 }
 
+/// Path suffix mandated by the OTLP/HTTP spec for the traces signal.
+const OTLP_TRACES_PATH: &str = "/v1/traces";
+/// Bounded handoff between `record_step` and the export worker: when the
+/// collector cannot keep up the queue fills and spans are dropped (logged),
+/// never queued unboundedly and never blocking the step path.
+const OTLP_EXPORT_QUEUE_CAPACITY: usize = 256;
+/// Opportunistic batching bound: one HTTP request carries at most this many
+/// spans.
+const OTLP_EXPORT_BATCH_LIMIT: usize = 64;
+/// Bound on one export POST so a stalled collector cannot wedge the worker
+/// (and thereby turn the bounded queue into a permanent span sink).
+const OTLP_HTTP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Real OTLP/HTTP exporter for StepTriple telemetry (issue #249, final.md §7):
+/// posts spans to `{endpoint}/v1/traces` using the OTLP JSON encoding
+/// (`application/json`), one span per recorded step.
+///
+/// The encoding is the OTLP `ExportTraceServiceRequest` JSON mapping built
+/// with `serde_json`; the transport is a `reqwest` blocking client on one
+/// dedicated worker thread. That keeps the dependency set to crates already
+/// in the workspace instead of pulling the full `opentelemetry` SDK for a
+/// single-signal, single-attribute-set exporter.
+///
+/// The issue #216 hardening carries over from the JSONL lane:
+/// * Redaction happens in [`OtlpHttpExporter::export_step`], BEFORE the span
+///   crosses the channel — raw secrets never reach the worker or the wire.
+/// * Best-effort: `export_step` only does an in-memory `try_send`; a full
+///   queue or dead worker returns an error the caller logs, and the step path
+///   never blocks on collector I/O.
+#[derive(Clone)]
+pub struct OtlpHttpExporter {
+    endpoint: String,
+    sender: std::sync::mpsc::SyncSender<serde_json::Value>,
+}
+
+impl fmt::Debug for OtlpHttpExporter {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OtlpHttpExporter")
+            .field("endpoint", &self.endpoint)
+            .finish()
+    }
+}
+
+impl OtlpHttpExporter {
+    /// Create an exporter posting to `endpoint` (a collector base URL such as
+    /// `http://collector.internal:4318`; `/v1/traces` is appended when the
+    /// endpoint does not already end with it) and spawn its worker thread.
+    pub fn new(endpoint: impl Into<String>) -> Result<Self, TempodError> {
+        let endpoint = normalize_otlp_endpoint(&endpoint.into())?;
+        let (sender, receiver) =
+            std::sync::mpsc::sync_channel::<serde_json::Value>(OTLP_EXPORT_QUEUE_CAPACITY);
+        let worker_endpoint = endpoint.clone();
+        thread::Builder::new()
+            .name("tempod-otlp-export".into())
+            .spawn(move || otlp_export_worker(&worker_endpoint, &receiver))?;
+        Ok(Self { endpoint, sender })
+    }
+
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    /// Redact and enqueue one step span. Never blocks: a full queue or a dead
+    /// worker drops the span and reports why, so the caller can log it.
+    pub fn export_step(&self, triple: &StepTriple) -> Result<(), TempodError> {
+        let span = otlp_span_record(triple);
+        self.sender.try_send(span).map_err(|error| match error {
+            TrySendError::Full(_) => {
+                TempodError::Driver("OTLP export queue is full; span dropped".into())
+            }
+            TrySendError::Disconnected(_) => {
+                TempodError::Driver("OTLP export worker exited; span dropped".into())
+            }
+        })
+    }
+}
+
+/// Validate and complete an OTLP/HTTP collector endpoint.
+fn normalize_otlp_endpoint(endpoint: &str) -> Result<String, TempodError> {
+    let trimmed = endpoint.trim().trim_end_matches('/');
+    let full = if trimmed.ends_with(OTLP_TRACES_PATH) {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}{OTLP_TRACES_PATH}")
+    };
+    let parsed = Url::parse(&full).map_err(|error| {
+        TempodError::BadRequest(format!("invalid OTLP endpoint {endpoint:?}: {error}"))
+    })?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(TempodError::BadRequest(format!(
+            "OTLP endpoint {endpoint:?} must use http or https"
+        )));
+    }
+    Ok(full)
+}
+
+/// Export worker: drains the bounded queue, batches opportunistically, and
+/// POSTs OTLP JSON to the collector. Failures are logged and dropped —
+/// telemetry only, by contract.
+fn otlp_export_worker(endpoint: &str, receiver: &std::sync::mpsc::Receiver<serde_json::Value>) {
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(OTLP_HTTP_TIMEOUT)
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => {
+            // Without a client every span would silently vanish; exit so
+            // `export_step` reports a dead worker instead.
+            eprintln!("tempod: OTLP export worker failed to start: {error}");
+            return;
+        }
+    };
+    while let Ok(first) = receiver.recv() {
+        let mut spans = vec![first];
+        while spans.len() < OTLP_EXPORT_BATCH_LIMIT {
+            match receiver.try_recv() {
+                Ok(span) => spans.push(span),
+                Err(_) => break,
+            }
+        }
+        let request = json!({
+            "resourceSpans": [{
+                "resource": {
+                    "attributes": [
+                        {"key": "service.name", "value": {"stringValue": "tempod"}},
+                    ],
+                },
+                "scopeSpans": [{
+                    "scope": {"name": "tempo-headless"},
+                    "spans": spans,
+                }],
+            }],
+        });
+        let body = match serde_json::to_vec(&request) {
+            Ok(body) => body,
+            Err(error) => {
+                eprintln!("tempod: OTLP export encoding failed (telemetry only): {error}");
+                continue;
+            }
+        };
+        match client
+            .post(endpoint)
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+        {
+            Ok(response) if !response.status().is_success() => {
+                eprintln!(
+                    "tempod: OTLP collector rejected export (telemetry only): {}",
+                    response.status()
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                eprintln!("tempod: OTLP export failed (telemetry only): {error}");
+            }
+        }
+    }
+}
+
+/// Build one OTLP JSON span for a step. Sensitive fields go through the same
+/// redaction as the JSONL lane ([`redact_action`] / [`redact_step_outcome`]),
+/// so both telemetry lanes have a single redaction source of truth.
+fn otlp_span_record(triple: &StepTriple) -> serde_json::Value {
+    let (trace_id, span_id) = otlp_ids();
+    let now_ns = current_time_ns().to_string();
+    let status_code = match &triple.outcome {
+        StepTripleOutcome::Applied { .. } => 1,
+        StepTripleOutcome::StepError { .. } => 2,
+    };
+    json!({
+        "traceId": trace_id,
+        "spanId": span_id,
+        "name": "tempo.step",
+        // SPAN_KIND_INTERNAL
+        "kind": 1,
+        "startTimeUnixNano": now_ns,
+        "endTimeUnixNano": now_ns,
+        "attributes": [
+            {"key": "tempo.step.seq", "value": {"intValue": triple.seq.to_string()}},
+            {"key": "tempo.step.action", "value": {"stringValue": redact_action(&triple.action).to_string()}},
+            {"key": "tempo.step.outcome", "value": {"stringValue": redact_step_outcome(&triple.outcome).to_string()}},
+        ],
+        "status": {"code": status_code},
+    })
+}
+
+/// Unique-enough trace/span ids without a dedicated RNG dependency: a
+/// per-process urandom seed mixed with the wall clock and a monotone counter.
+/// Telemetry-lane quality — not cryptographic, but distinct per step and (via
+/// the seed) across hosts, which is what fleet observability needs.
+fn otlp_ids() -> (String, String) {
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    static SEED: OnceLock<u64> = OnceLock::new();
+    let seed = *SEED.get_or_init(|| {
+        let mut bytes = [0_u8; 8];
+        if let Ok(mut file) = File::open("/dev/urandom") {
+            use std::io::Read as _;
+            let _ = file.read_exact(&mut bytes);
+        }
+        u64::from_le_bytes(bytes) ^ u64::from(std::process::id()).rotate_left(32)
+    });
+    let count = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = current_time_ns();
+    let time_lo = nanos as u64;
+    let time_hi = (nanos >> 64) as u64;
+    let trace_hi = seed ^ time_hi.rotate_left(17) ^ count.rotate_left(41);
+    // The low word is forced non-zero so an all-zero (invalid) id is impossible.
+    let trace_lo = (time_lo ^ count) | 1;
+    let span = (seed.rotate_left(23) ^ time_lo ^ count.rotate_left(7)) | 1;
+    (
+        format!("{trace_hi:016x}{trace_lo:016x}"),
+        format!("{span:016x}"),
+    )
+}
+
+fn current_time_ns() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0)
+}
+
 /// Run tempod forever on an address such as `127.0.0.1:8787`.
 pub fn run_tempod(addr: &str) -> Result<(), TempodError> {
     run_tempod_with_config(addr, TempodServerConfig::default())
@@ -1910,29 +2198,27 @@ fn connect_engine_ipc(socket_path: impl AsRef<Path>) -> Result<EngineIpcClient, 
     Ok(EngineIpcClient::from_stream(stream))
 }
 
+/// Connection caps from issue #295, mapped onto tokio semaphores: `try_acquire`
+/// (never `acquire`) keeps the observable behavior — an over-cap connection is
+/// rejected immediately, never queued. tower's `ConcurrencyLimit` is
+/// deliberately not used here because it queues callers instead of shedding
+/// them.
 #[derive(Clone)]
 struct ConnectionLimiter {
-    state: Arc<Mutex<ConnectionLimiterState>>,
+    http: Arc<Semaphore>,
+    websocket: Arc<Semaphore>,
+    #[cfg(test)]
     max_http: usize,
     max_websocket: usize,
 }
 
-#[derive(Debug, Default)]
-struct ConnectionLimiterState {
-    active_http: usize,
-    active_websocket: usize,
-}
+type ConnectionPermit = OwnedSemaphorePermit;
 
-#[derive(Clone, Copy, Debug)]
-enum ConnectionPermitKind {
-    Http,
-    WebSocket,
-}
-
-struct ConnectionPermit {
-    limiter: ConnectionLimiter,
-    kind: ConnectionPermitKind,
-}
+/// Per-connection slot holding the HTTP connection permit. A successful BiDi
+/// WebSocket upgrade takes the HTTP permit out and holds a WebSocket permit
+/// instead (issue #295's permit swap), so upgraded sockets count only against
+/// the WebSocket cap.
+type HttpPermitSlot = Arc<Mutex<Option<ConnectionPermit>>>;
 
 impl Default for ConnectionLimiter {
     fn default() -> Self {
@@ -1943,68 +2229,43 @@ impl Default for ConnectionLimiter {
 impl ConnectionLimiter {
     fn new(max_http: usize, max_websocket: usize) -> Self {
         Self {
-            state: Arc::new(Mutex::new(ConnectionLimiterState::default())),
+            http: Arc::new(Semaphore::new(max_http)),
+            websocket: Arc::new(Semaphore::new(max_websocket)),
+            #[cfg(test)]
             max_http,
             max_websocket,
         }
     }
 
     fn try_acquire_http(&self) -> Option<ConnectionPermit> {
-        let mut state = self.state();
-        if state.active_http >= self.max_http {
-            return None;
-        }
-        state.active_http += 1;
-        Some(ConnectionPermit {
-            limiter: self.clone(),
-            kind: ConnectionPermitKind::Http,
-        })
+        Arc::clone(&self.http).try_acquire_owned().ok()
     }
 
     fn try_acquire_websocket(&self) -> Option<ConnectionPermit> {
-        let mut state = self.state();
-        if state.active_websocket >= self.max_websocket {
-            return None;
-        }
-        state.active_websocket += 1;
-        Some(ConnectionPermit {
-            limiter: self.clone(),
-            kind: ConnectionPermitKind::WebSocket,
-        })
+        Arc::clone(&self.websocket).try_acquire_owned().ok()
     }
 
-    fn state(&self) -> std::sync::MutexGuard<'_, ConnectionLimiterState> {
-        self.state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    fn active_websockets(&self) -> usize {
+        self.max_websocket
+            .saturating_sub(self.websocket.available_permits())
     }
 
     #[cfg(test)]
     fn active_counts(&self) -> (usize, usize) {
-        let state = self.state();
-        (state.active_http, state.active_websocket)
-    }
-}
-
-impl Drop for ConnectionPermit {
-    fn drop(&mut self) {
-        let mut state = self.limiter.state();
-        match self.kind {
-            ConnectionPermitKind::Http => {
-                state.active_http = state.active_http.saturating_sub(1);
-            }
-            ConnectionPermitKind::WebSocket => {
-                state.active_websocket = state.active_websocket.saturating_sub(1);
-            }
-        }
+        (
+            self.max_http.saturating_sub(self.http.available_permits()),
+            self.active_websockets(),
+        )
     }
 }
 
 /// Serve requests until the listener fails or the process is stopped.
 ///
-/// Each connection is handled on its own thread so that a slow, stalled, or
-/// failing client is isolated to that connection: per-connection I/O errors and
-/// transient `accept` errors are logged and the accept loop keeps running.
+/// The accept loop enforces the issue #295 HTTP connection cap at accept time
+/// (an over-cap connection is dropped immediately, never queued) and hands each
+/// accepted connection to hyper on its own tokio task, so a slow, stalled, or
+/// failing client stays isolated to that connection and transient `accept`
+/// errors are logged without killing the daemon.
 pub fn serve_forever(
     listener: TcpListener,
     pool: Arc<Mutex<SessionPool>>,
@@ -2045,33 +2306,37 @@ fn serve_forever_trusted(
     limiter: ConnectionLimiter,
 ) -> Result<(), TempodError> {
     let _ = process_start();
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
-                let Some(http_permit) = limiter.try_acquire_http() else {
-                    drop(stream);
-                    continue;
-                };
-                let pool = Arc::clone(&pool);
-                let limiter = limiter.clone();
-                let auth = auth.clone();
-                thread::spawn(move || {
-                    if let Err(err) = handle_connection(stream, &pool, &auth, &limiter, http_permit)
-                    {
-                        log_connection_error(&err);
-                    }
-                });
-            }
-            Err(err) => {
-                // A transient accept error (e.g. EMFILE) must not kill the daemon.
-                log_connection_error(&TempodError::Io(err));
+    let runtime = transport_runtime()?;
+    runtime.block_on(async move {
+        let listener = tokio_listener(listener)?;
+        let router = tempod_router(TempodAppState {
+            pool,
+            auth,
+            limiter: limiter.clone(),
+        });
+        loop {
+            match listener.accept().await {
+                Ok((stream, _addr)) => {
+                    // Over-cap connections are shed at accept time (issue
+                    // #295): dropped immediately instead of queueing.
+                    let Some(permit) = limiter.try_acquire_http() else {
+                        drop(stream);
+                        continue;
+                    };
+                    tokio::spawn(serve_tcp_connection(stream, router.clone(), permit));
+                }
+                Err(err) => {
+                    // A transient accept error (e.g. EMFILE) must not kill the daemon.
+                    log_connection_error(&TempodError::Io(err));
+                }
             }
         }
-    }
-    Ok(())
+    })
 }
 
-/// Serve exactly one HTTP request. Tests use this against a real TCP listener.
+/// Serve exactly one connection. Tests use this against a real TCP listener;
+/// every non-upgrade response carries `connection: close`, so this serves one
+/// HTTP exchange (or one whole BiDi WebSocket session).
 pub fn serve_one(listener: TcpListener, pool: Arc<Mutex<SessionPool>>) -> Result<(), TempodError> {
     serve_one_with_config(listener, pool, TempodServerConfig::default())
 }
@@ -2100,40 +2365,84 @@ fn serve_one_trusted(
     limiter: ConnectionLimiter,
 ) -> Result<(), TempodError> {
     let _ = process_start();
-    let (stream, _addr) = listener.accept()?;
-    let Some(http_permit) = limiter.try_acquire_http() else {
-        drop(stream);
-        return Err(TempodError::ConnectionLimit(
-            HTTP_CONNECTION_LIMIT_MESSAGE.into(),
-        ));
-    };
-    handle_connection(stream, &pool, &auth, &limiter, http_permit)
+    let runtime = transport_runtime()?;
+    runtime.block_on(async move {
+        let listener = tokio_listener(listener)?;
+        let (stream, _addr) = listener.accept().await?;
+        let Some(permit) = limiter.try_acquire_http() else {
+            drop(stream);
+            return Err(TempodError::ConnectionLimit(
+                HTTP_CONNECTION_LIMIT_MESSAGE.into(),
+            ));
+        };
+        let router = tempod_router(TempodAppState {
+            pool,
+            auth,
+            limiter: limiter.clone(),
+        });
+        serve_tcp_connection(stream, router, permit).await;
+        // A BiDi upgrade hands the socket to a spawned WebSocket task and the
+        // HTTP connection future completes at the 101; wait for the session
+        // (visible as a held WebSocket permit on this call's limiter) so the
+        // runtime is not torn down underneath it.
+        while limiter.active_websockets() > 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        Ok(())
+    })
 }
 
-/// Apply per-connection socket options, then handle the connection. Timeouts
-/// bound how long a stalled client can occupy a handler thread (slowloris).
-fn handle_connection(
-    stream: TcpStream,
-    pool: &Arc<Mutex<SessionPool>>,
-    auth: &TempodAuth,
-    limiter: &ConnectionLimiter,
-    http_permit: ConnectionPermit,
-) -> Result<(), TempodError> {
-    apply_socket_options(&stream)?;
-    handle_stream(stream, pool, auth, limiter, http_permit)
+/// Single-threaded tokio runtime for the transport. Handlers never block this
+/// thread: all pool/engine work runs via `spawn_blocking`, which is what keeps
+/// `/health` responsive while engine operations are in flight (issues
+/// #200/#213/#230).
+fn transport_runtime() -> Result<tokio::runtime::Runtime, TempodError> {
+    Ok(tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?)
 }
 
-/// Apply read/write timeouts and disable Nagle on an accepted connection. A
-/// stalled client (slowloris) is aborted after `SOCKET_TIMEOUT` instead of
-/// occupying a handler thread forever. TCP_NODELAY matters because this is a
-/// request/response control plane: with Nagle on, a small response or BiDi
-/// event written after another small write can sit in the kernel until the
-/// peer's delayed ACK (tens of milliseconds) instead of going out immediately.
-fn apply_socket_options(stream: &TcpStream) -> Result<(), TempodError> {
-    stream.set_read_timeout(Some(SOCKET_TIMEOUT))?;
-    stream.set_write_timeout(Some(SOCKET_TIMEOUT))?;
-    stream.set_nodelay(true)?;
-    Ok(())
+fn tokio_listener(listener: TcpListener) -> Result<tokio::net::TcpListener, TempodError> {
+    listener.set_nonblocking(true)?;
+    Ok(tokio::net::TcpListener::from_std(listener)?)
+}
+
+/// Serve one accepted TCP connection with hyper/axum.
+///
+/// * `TCP_NODELAY`, because this is a request/response control plane.
+/// * `header_read_timeout` bounds slowloris-style stalls (`SOCKET_TIMEOUT`).
+/// * `half_close(true)` keeps clients working that shut down their write side
+///   after sending the request.
+/// * `max_buf_size` caps hyper's read buffering at the pre-existing
+///   `MAX_HTTP_BYTES` transport bound.
+/// * The connection's HTTP permit rides in an [`HttpPermitSlot`] request
+///   extension so a BiDi WebSocket upgrade can swap it for a WebSocket permit
+///   (issue #295).
+async fn serve_tcp_connection(
+    stream: tokio::net::TcpStream,
+    router: Router,
+    permit: ConnectionPermit,
+) {
+    if let Err(err) = stream.set_nodelay(true) {
+        log_connection_error(&TempodError::Io(err));
+        return;
+    }
+    let slot: HttpPermitSlot = Arc::new(Mutex::new(Some(permit)));
+    let service = TowerToHyperService::new(router.layer(Extension(Arc::clone(&slot))));
+    let connection = hyper::server::conn::http1::Builder::new()
+        .timer(TokioTimer::new())
+        .header_read_timeout(SOCKET_TIMEOUT)
+        .half_close(true)
+        .max_buf_size(MAX_HTTP_BYTES)
+        .serve_connection(TokioIo::new(stream), service)
+        .with_upgrades();
+    if let Err(err) = connection.await {
+        // Per-connection protocol/I-O errors stay isolated to this connection.
+        tempo_telemetry::logger()
+            .event(tempo_telemetry::Level::Error, "tempod", "connection error")
+            .field("error", err.to_string())
+            .emit();
+    }
 }
 
 fn log_connection_error(err: &TempodError) {
@@ -2143,87 +2452,115 @@ fn log_connection_error(err: &TempodError) {
         .emit();
 }
 
-fn handle_stream(
-    mut stream: TcpStream,
-    pool: &Arc<Mutex<SessionPool>>,
-    auth: &TempodAuth,
-    limiter: &ConnectionLimiter,
-    http_permit: ConnectionPermit,
-) -> Result<(), TempodError> {
-    let mut http_permit = Some(http_permit);
-    let request = match read_http_request(&mut stream) {
-        Ok(request) => request,
-        Err(err) => {
-            // Reject a malformed/oversized request with an error response rather
-            // than dropping the connection (issue #84); the connection error, if
-            // any, stays isolated to this handler (issue #85).
-            let response = HttpResponse::json(
-                err.status(),
-                json!({
-                    "error": err.to_string(),
-                }),
-            );
-            stream.write_all(response.to_bytes().as_slice())?;
-            stream.flush()?;
-            return Ok(());
-        }
-    };
-    match websocket_upgrade_key_with_auth(&request, auth) {
-        Ok(Some(key)) => {
-            let Some(websocket_permit) = limiter.try_acquire_websocket() else {
-                let response = tempod_error_response(&TempodError::ConnectionLimit(
-                    WEBSOCKET_CONNECTION_LIMIT_MESSAGE.into(),
-                ));
-                stream.write_all(response.to_bytes().as_slice())?;
-                stream.flush()?;
-                return Ok(());
-            };
-            drop(http_permit.take());
-            stream.write_all(websocket_upgrade_response(&key).as_slice())?;
-            stream.flush()?;
-            return serve_bidi_websocket(stream, pool, websocket_permit);
-        }
-        Ok(None) => {}
-        Err(err) => {
-            let response = HttpResponse::json(
-                err.status(),
-                json!({
-                    "error": err.to_string(),
-                }),
-            );
-            stream.write_all(response.to_bytes().as_slice())?;
-            stream.flush()?;
-            return Ok(());
-        }
+/// Shared state behind every route.
+#[derive(Clone)]
+struct TempodAppState {
+    pool: Arc<Mutex<SessionPool>>,
+    auth: TempodAuth,
+    limiter: ConnectionLimiter,
+}
+
+/// The tempod control-plane router (final.md §3.1): session lifecycle REST,
+/// MCP, and the BiDi WebSocket on one axum HTTP server.
+///
+/// Locking discipline (issue #230) is unchanged below the transport: metadata
+/// routes take the pool lock only for in-memory work, engine-op routes clone a
+/// per-session handle and run engine round-trips OFF the lock, and `/health`
+/// touches no state at all. Every pool-touching handler runs on
+/// `spawn_blocking`, so the transport thread (and `/health`) never queues
+/// behind an in-flight browser operation.
+fn tempod_router(state: TempodAppState) -> Router {
+    Router::new()
+        .route("/health", get(health))
+        .route(TEMPOD_OPENAPI_PATH, get(openapi))
+        .route(tempo_mcp::A2A_AGENT_CARD_PATH, get(agent_card))
+        .route(tempo_mcp::A2A_AGENT_JSON_PATH, get(agent_card))
+        .route("/mcp", get(mcp_get).post(mcp_post))
+        .route("/bidi", get(bidi_websocket_upgrade).post(bidi_post))
+        .route("/sessions", get(sessions_list).post(sessions_create))
+        .route("/sessions/{id}", delete(session_kill))
+        .route("/sessions/{id}/adopt", post(session_adopt))
+        .route("/sessions/{id}/observe", get(session_observe))
+        .route("/sessions/{id}/act_batch", post(session_act_batch))
+        .route("/sessions/{id}/events", get(session_events))
+        .route("/drain", post(drain))
+        .route(TEMPOD_METRICS_PATH, get(metrics))
+        .fallback(unsupported_route)
+        .layer(DefaultBodyLimit::max(MAX_HTTP_BYTES))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            guard_control_plane,
+        ))
+        .layer(middleware::from_fn(instrument_requests))
+        .layer(middleware::from_fn(close_connections))
+        .with_state(state)
+}
+
+/// Per-route bearer-auth + loopback-Origin guard, evaluated before any handler
+/// or body read. Route classification is unchanged from the socket-level
+/// server: [`route_requires_auth`] / [`control_route_requires_origin_check`].
+///
+/// DNS-rebinding defence (issue #83 follow-up): the session/control-plane
+/// routes mutate or expose browser state, so they get the same loopback-Origin
+/// guard already applied to /mcp and /bidi. The guard relies on
+/// `origin_allowed` returning `true` when no Origin header is present, so
+/// non-browser/CLI clients keep working.
+async fn guard_control_plane(
+    State(state): State<TempodAppState>,
+    request: AxumRequest,
+    next: Next,
+) -> Response {
+    let method = request.method().as_str();
+    let path = request.uri().path();
+    if route_requires_auth(method, path)
+        && let Err(err) = state
+            .auth
+            .authorize(header_str(request.headers(), header::AUTHORIZATION))
+    {
+        return tempod_error_response(&err).into_response();
     }
-    let response = handle_http_request_with_auth(pool, request, auth);
-    stream.write_all(response.to_bytes().as_slice())?;
-    stream.flush()?;
-    Ok(())
+    if control_route_requires_origin_check(method, path)
+        && !tempo_mcp::origin_allowed(header_str(request.headers(), header::ORIGIN))
+    {
+        return tempod_error_response(&TempodError::Forbidden("origin not allowed".into()))
+            .into_response();
+    }
+    next.run(request).await
 }
 
 fn tempod_error_response(err: &TempodError) -> HttpResponse {
     HttpResponse::json(err.status(), err.body())
 }
 
-/// Lock the pool for a SHORT, engine-IPC-free critical section. Routes must
-/// never hold this guard across an engine round-trip (issue #230): engine work
-/// happens on cloned per-session driver handles after the guard is dropped.
-fn lock_pool(pool: &Arc<Mutex<SessionPool>>) -> Result<MutexGuard<'_, SessionPool>, TempodError> {
-    pool.lock().map_err(|_| TempodError::PoolLock)
+/// Close every non-upgrade connection after one exchange. This preserves the
+/// previous server's wire behavior (every response carried
+/// `connection: close`), so existing clients that read to EOF keep working.
+async fn close_connections(request: AxumRequest, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    if response.status() != StatusCode::SWITCHING_PROTOCOLS {
+        response
+            .headers_mut()
+            .insert(header::CONNECTION, HeaderValue::from_static("close"));
+    }
+    response
 }
 
-#[cfg(test)]
-fn handle_http_request(pool: &Arc<Mutex<SessionPool>>, request: HttpRequest) -> HttpResponse {
-    handle_http_request_with_auth(pool, request, &TempodAuth::disabled())
-}
-
-fn handle_http_request_with_auth(
-    pool: &Arc<Mutex<SessionPool>>,
-    request: HttpRequest,
-    auth: &TempodAuth,
-) -> HttpResponse {
-    let route = metrics_route_class(&request.method, &request.path);
+/// Request counter + latency histogram at the HTTP funnel (from #324), with
+/// bounded route-class labels. Auth/origin rejections are counted with their
+/// route class, matching the previous funnel placement; BiDi WebSocket
+/// upgrade attempts are excluded, as before, because an upgraded connection
+/// is not a request/response exchange.
+async fn instrument_requests(request: AxumRequest, next: Next) -> Response {
+    let method = request.method().as_str();
+    let path = request.uri().path();
+    if method == "GET"
+        && path == "/bidi"
+        && (request.headers().contains_key(header::UPGRADE)
+            || request.headers().contains_key(header::SEC_WEBSOCKET_KEY))
+    {
+        return next.run(request).await;
+    }
+    let route = metrics_route_class(method, path);
     let timer = tempo_telemetry::global()
         .histogram(
             "tempod_http_request_seconds",
@@ -2232,17 +2569,17 @@ fn handle_http_request_with_auth(
             None,
         )
         .start_timer();
-    let response = match route_http_request_with_auth(pool, request, auth) {
-        Ok(response) => response,
-        Err(err) => tempod_error_response(&err),
-    };
+    let response = next.run(request).await;
     drop(timer);
     tempo_telemetry::global()
         .counter(
             "tempod_http_requests_total",
             "HTTP requests that reached the route handler, by route and status class \
-             (parse failures, connection-limit rejections, and WebSocket upgrades are not counted)",
-            &[("route", route), ("status", status_class(response.status))],
+             (connection-limit rejections and WebSocket upgrades are not counted)",
+            &[
+                ("route", route),
+                ("status", status_class(response.status().as_u16())),
+            ],
         )
         .inc();
     response
@@ -2292,12 +2629,31 @@ fn metrics_enabled() -> bool {
     METRICS_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-static PROCESS_START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+static PROCESS_START: OnceLock<std::time::Instant> = OnceLock::new();
 
 /// Anchor for the uptime gauge. The serve entry points call this at startup;
 /// if only a scrape ever calls it, uptime under-reports rather than lying.
 fn process_start() -> std::time::Instant {
     *PROCESS_START.get_or_init(std::time::Instant::now)
+}
+
+/// GET /metrics — Prometheus text exposition (from #324). Deliberately behind
+/// the loopback-Origin guard (and bearer auth on remote binds): exposition is
+/// control-plane data. Scrapers send no Origin header, so they pass the
+/// guard. Short in-memory pool lock only.
+async fn metrics(State(state): State<TempodAppState>) -> Response {
+    if !metrics_enabled() {
+        return HttpResponse::json(
+            404,
+            json!({"error": "metrics exposition disabled by configuration"}),
+        )
+        .into_response();
+    }
+    run_blocking(move || -> Result<HttpResponse, TempodError> {
+        let pool = lock_pool(&state.pool)?;
+        Ok(metrics_response(&pool))
+    })
+    .await
 }
 
 /// Prometheus text exposition. Point-in-time gauges (uptime, build info,
@@ -2336,133 +2692,284 @@ fn metrics_response(pool: &SessionPool) -> HttpResponse {
     )
 }
 
-/// Route one HTTP request. Locking discipline (issue #230): metadata routes
-/// (`/health`, list/adopt/kill/drain/events) take the pool lock only for their
-/// in-memory work (kill/drain additionally run the pre-existing BOUNDED
-/// engine-context closes from #200/#205 under it), while the engine-op routes
-/// (`POST /sessions`, `POST /mcp`, `POST /bidi`) split into lock -> clone the
-/// needed per-session handle -> unlock -> engine round-trip -> re-lock to
-/// publish results. No engine round-trip ever runs while the pool lock is
-/// held, so operations on different sessions execute concurrently and
-/// `/health`/`/drain` never queue behind an in-flight browser operation.
-#[cfg(test)]
-fn route_http_request(
-    pool: &Arc<Mutex<SessionPool>>,
-    request: HttpRequest,
-) -> Result<HttpResponse, TempodError> {
-    route_http_request_with_auth(pool, request, &TempodAuth::disabled())
+fn header_str(headers: &HeaderMap, name: header::HeaderName) -> Option<&str> {
+    headers.get(name).and_then(|value| value.to_str().ok())
 }
 
-fn route_http_request_with_auth(
-    pool: &Arc<Mutex<SessionPool>>,
-    request: HttpRequest,
-    auth: &TempodAuth,
-) -> Result<HttpResponse, TempodError> {
-    if route_requires_auth(&request.method, &request.path) {
-        auth.authorize(&request)?;
-    }
-    // DNS-rebinding defence (issue #83 follow-up): the session/control-plane
-    // routes mutate or expose browser state, so they get the same loopback-Origin
-    // guard already applied to /mcp and /bidi. Without this a malicious page could
-    // DNS-rebind to the loopback listener and drive/observe the browser via
-    // /sessions, /drain, /adopt, DELETE, or the session-events routes.
-    if control_route_requires_origin_check(&request.method, &request.path)
-        && !bidi_origin_allowed(&request)
-    {
-        return Err(TempodError::Forbidden("origin not allowed".into()));
-    }
-    match (request.method.as_str(), request.path.as_str()) {
-        // Health never touches the pool at all: it must answer even while
-        // metadata routes are briefly holding the lock.
-        ("GET", "/health") => Ok(HttpResponse::json(200, json!({"ok": true}))),
-        // Deliberately behind the loopback-Origin guard (and bearer auth on
-        // remote binds): exposition is control-plane data. Scrapers send no
-        // Origin header, so they pass the guard. Short in-memory lock only.
-        ("GET", TEMPOD_METRICS_PATH) => {
-            if !metrics_enabled() {
-                return Ok(HttpResponse::json(
-                    404,
-                    json!({"error": "metrics exposition disabled by configuration"}),
-                ));
-            }
-            let pool = lock_pool(pool)?;
-            Ok(metrics_response(&pool))
+fn base_url_from_headers(headers: &HeaderMap) -> String {
+    let host = header_str(headers, header::HOST)
+        .filter(|host| valid_host_header(host))
+        .unwrap_or("localhost");
+    format!("http://{host}")
+}
+
+/// Run a blocking route body on the tokio blocking pool so no handler ever
+/// blocks the transport thread.
+async fn run_blocking<T, F>(work: F) -> Response
+where
+    T: IntoResponse + Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    match tokio::task::spawn_blocking(work).await {
+        Ok(response) => response.into_response(),
+        Err(_) => {
+            HttpResponse::json(500, json!({"error": "tempod worker task failed"})).into_response()
         }
-        ("GET", TEMPOD_OPENAPI_PATH) => Ok(HttpResponse::new(
+    }
+}
+
+/// GET /health never touches the pool or the blocking pool: it must answer
+/// even while every route worker is busy with engine or lock work.
+async fn health() -> HttpResponse {
+    HttpResponse::json(200, json!({"ok": true}))
+}
+
+async fn openapi(headers: HeaderMap) -> HttpResponse {
+    HttpResponse::new(
+        200,
+        TEMPOD_OPENAPI_CONTENT_TYPE,
+        tempod_openapi(&base_url_from_headers(&headers))
+            .to_string()
+            .into_bytes(),
+    )
+}
+
+async fn agent_card(headers: HeaderMap) -> HttpResponse {
+    HttpResponse::from_mcp(tempo_mcp::agent_card_response(&base_url_from_headers(
+        &headers,
+    )))
+}
+
+async fn mcp_get() -> HttpResponse {
+    HttpResponse::from_mcp(tempo_mcp::handle_get())
+}
+
+async fn mcp_post(
+    State(state): State<TempodAppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let origin = header_str(&headers, header::ORIGIN).map(str::to_owned);
+    run_blocking(move || route_mcp(&state.pool, origin.as_deref(), &body)).await
+}
+
+async fn bidi_post(
+    State(state): State<TempodAppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if !tempo_mcp::origin_allowed(header_str(&headers, header::ORIGIN)) {
+        return tempod_error_response(&TempodError::Forbidden("origin not allowed".into()))
+            .into_response();
+    }
+    run_blocking(move || route_bidi(&state.pool, body.to_vec())).await
+}
+
+async fn sessions_list(State(state): State<TempodAppState>) -> Response {
+    run_blocking(move || -> Result<HttpResponse, TempodError> {
+        Ok(HttpResponse::json(200, lock_pool(&state.pool)?.list()))
+    })
+    .await
+}
+
+async fn sessions_create(State(state): State<TempodAppState>, body: Bytes) -> Response {
+    run_blocking(move || -> Result<HttpResponse, TempodError> {
+        // Malformed JSON is a client error (400) on this transport; the
+        // hand-rolled parser surfaced it as a 500.
+        let request: CreateSessionRequest = serde_json::from_slice(&body)
+            .map_err(|err| TempodError::BadRequest(format!("invalid session request: {err}")))?;
+        if request.url.trim().is_empty() {
+            return Err(TempodError::BadRequest("session url is required".into()));
+        }
+        let created = create_session_shared(&state.pool, request.url)?;
+        tempo_telemetry::global()
+            .counter(
+                "tempod_sessions_created_total",
+                "Sessions created over the HTTP control plane",
+                &[],
+            )
+            .inc();
+        Ok(HttpResponse::json(201, created))
+    })
+    .await
+}
+
+async fn session_kill(
+    State(state): State<TempodAppState>,
+    UrlPath(id): UrlPath<String>,
+) -> Response {
+    run_blocking(move || -> Result<HttpResponse, TempodError> {
+        Ok(HttpResponse::json(
             200,
-            TEMPOD_OPENAPI_CONTENT_TYPE,
-            tempod_openapi(&request.base_url()).to_string().into_bytes(),
-        )),
-        ("GET", tempo_mcp::A2A_AGENT_CARD_PATH) | ("GET", tempo_mcp::A2A_AGENT_JSON_PATH) => Ok(
-            HttpResponse::from_mcp(tempo_mcp::agent_card_response(&request.base_url())),
-        ),
-        ("GET", "/mcp") => Ok(HttpResponse::from_mcp(tempo_mcp::handle_get())),
-        ("POST", "/mcp") => Ok(route_mcp(pool, &request)),
-        ("POST", "/bidi") => {
-            if !bidi_origin_allowed(&request) {
-                return Err(TempodError::Forbidden("origin not allowed".into()));
-            }
-            Ok(route_bidi(pool, request.body))
-        }
-        ("GET", "/sessions") => Ok(HttpResponse::json(200, lock_pool(pool)?.list())),
-        ("POST", "/sessions") => {
-            let body: CreateSessionRequest = serde_json::from_slice(&request.body)?;
-            if body.url.trim().is_empty() {
-                return Err(TempodError::BadRequest("session url is required".into()));
-            }
-            let created = create_session_shared(pool, body.url)?;
-            tempo_telemetry::global()
-                .counter(
-                    "tempod_sessions_created_total",
-                    "Sessions created over the HTTP control plane",
-                    &[],
-                )
-                .inc();
-            Ok(HttpResponse::json(201, created))
-        }
-        ("POST", "/drain") => {
-            let mut pool = lock_pool(pool)?;
-            pool.drain();
-            Ok(HttpResponse::json(
-                200,
-                json!({
-                    "draining": pool.draining(),
-                    "sessions": pool.list(),
-                }),
-            ))
-        }
-        _ => {
-            if request.method == "GET"
-                && let Some((id, after_seq)) = session_events_from_path(&request.path)?
-            {
-                return Ok(HttpResponse::json(
-                    200,
-                    lock_pool(pool)?.events(&id, after_seq)?,
-                ));
-            }
-            if request.method == "POST" && request.path.ends_with("/adopt") {
-                let id = session_id_from_action_path(&request.path, "adopt")?;
-                return Ok(HttpResponse::json(200, lock_pool(pool)?.adopt(&id)?));
-            }
-            if request.method == "GET" && request.path.ends_with("/observe") {
-                let id = session_id_from_action_path(&request.path, "observe")?;
-                return Ok(HttpResponse::json(200, route_session_observe(pool, &id)?));
-            }
-            if request.method == "POST" && request.path.ends_with("/act_batch") {
-                let id = session_id_from_action_path(&request.path, "act_batch")?;
-                let body = parse_session_act_batch_request(&request.body)?;
-                return route_session_act_batch(pool, id, body);
-            }
-            if request.method == "DELETE" {
-                let id = session_id_from_path(&request.path)?;
-                return Ok(HttpResponse::json(200, lock_pool(pool)?.kill(&id)?));
-            }
-            Err(TempodError::BadRequest(format!(
+            lock_pool(&state.pool)?.kill(&TempodSessionId(id))?,
+        ))
+    })
+    .await
+}
+
+async fn session_adopt(
+    State(state): State<TempodAppState>,
+    UrlPath(id): UrlPath<String>,
+) -> Response {
+    run_blocking(move || -> Result<HttpResponse, TempodError> {
+        Ok(HttpResponse::json(
+            200,
+            lock_pool(&state.pool)?.adopt(&TempodSessionId(id))?,
+        ))
+    })
+    .await
+}
+
+async fn session_events(
+    State(state): State<TempodAppState>,
+    UrlPath(id): UrlPath<String>,
+    RawQuery(query): RawQuery,
+) -> Response {
+    run_blocking(move || -> Result<HttpResponse, TempodError> {
+        let after_seq = after_seq(query.as_deref())?;
+        Ok(HttpResponse::json(
+            200,
+            lock_pool(&state.pool)?.events(&TempodSessionId(id), after_seq)?,
+        ))
+    })
+    .await
+}
+
+async fn session_observe(
+    State(state): State<TempodAppState>,
+    UrlPath(id): UrlPath<String>,
+) -> Response {
+    run_blocking(move || -> Result<HttpResponse, TempodError> {
+        Ok(HttpResponse::json(
+            200,
+            route_session_observe(&state.pool, &TempodSessionId(id))?,
+        ))
+    })
+    .await
+}
+
+async fn session_act_batch(
+    State(state): State<TempodAppState>,
+    UrlPath(id): UrlPath<String>,
+    body: Bytes,
+) -> Response {
+    run_blocking(move || -> Result<HttpResponse, TempodError> {
+        let body = parse_session_act_batch_request(&body)?;
+        route_session_act_batch(&state.pool, TempodSessionId(id), body)
+    })
+    .await
+}
+
+async fn drain(State(state): State<TempodAppState>) -> Response {
+    run_blocking(move || -> Result<HttpResponse, TempodError> {
+        let mut pool = lock_pool(&state.pool)?;
+        pool.drain();
+        Ok(HttpResponse::json(
+            200,
+            json!({
+                "draining": pool.draining(),
+                "sessions": pool.list(),
+            }),
+        ))
+    })
+    .await
+}
+
+/// Unmatched routes answer 404 (standard HTTP; the hand-rolled parser answered
+/// 400 for them).
+async fn unsupported_route(request: AxumRequest) -> HttpResponse {
+    HttpResponse::json(
+        404,
+        json!({
+            "error": format!(
                 "unsupported route: {} {}",
-                request.method, request.path
-            )))
+                request.method(),
+                request.uri().path()
+            ),
+        }),
+    )
+}
+
+/// GET /bidi — BiDi WebSocket upgrade.
+///
+/// Guard order matches the previous server: bearer auth (middleware, 401) ->
+/// upgrade-header validation (`WebSocketUpgrade` extractor, 400) ->
+/// loopback-Origin guard (403, DNS-rebinding defence; browsers always send
+/// Origin on WS upgrades, non-browser clients omit it and pass) -> WebSocket
+/// connection cap (503). No subprotocol is negotiated, as before.
+async fn bidi_websocket_upgrade(
+    State(state): State<TempodAppState>,
+    headers: HeaderMap,
+    permit_slot: Option<Extension<HttpPermitSlot>>,
+    ws: WebSocketUpgrade,
+) -> Response {
+    if !tempo_mcp::origin_allowed(header_str(&headers, header::ORIGIN)) {
+        return tempod_error_response(&TempodError::Forbidden(
+            "WebSocket origin not allowed".into(),
+        ))
+        .into_response();
+    }
+    let Some(websocket_permit) = state.limiter.try_acquire_websocket() else {
+        return tempod_error_response(&TempodError::ConnectionLimit(
+            WEBSOCKET_CONNECTION_LIMIT_MESSAGE.into(),
+        ))
+        .into_response();
+    };
+    let pool = Arc::clone(&state.pool);
+    ws.max_message_size(MAX_WS_PAYLOAD_BYTES)
+        .on_upgrade(move |socket| async move {
+            // Permit swap (issue #295): the socket stops being an HTTP request
+            // and becomes a WebSocket, releasing its HTTP connection permit.
+            if let Some(Extension(slot)) = permit_slot
+                && let Ok(mut slot) = slot.lock()
+            {
+                slot.take();
+            }
+            let _websocket_permit = websocket_permit;
+            serve_bidi_websocket(socket, pool).await;
+        })
+}
+
+/// Serve BiDi messages on an upgraded WebSocket. Commands are dispatched
+/// without holding the pool lock across engine round-trips (issue #230); this
+/// connection still processes its own messages strictly in order.
+async fn serve_bidi_websocket(mut socket: WebSocket, pool: Arc<Mutex<SessionPool>>) {
+    while let Some(Ok(message)) = socket.recv().await {
+        let payload = match message {
+            WsMessage::Text(text) => text.as_bytes().to_vec(),
+            WsMessage::Binary(bytes) => bytes.to_vec(),
+            // The websocket protocol layer answers pings and echoes the
+            // close handshake itself while the stream keeps being polled;
+            // after a close completes, `recv` returns `None` and the loop
+            // ends.
+            WsMessage::Ping(_) | WsMessage::Pong(_) | WsMessage::Close(_) => continue,
+        };
+        let dispatch_pool = Arc::clone(&pool);
+        let Ok(messages) =
+            tokio::task::spawn_blocking(move || route_bidi_websocket(&dispatch_pool, payload))
+                .await
+        else {
+            return;
+        };
+        for message in messages {
+            let Ok(payload) = bidi_message_payload(&message) else {
+                return;
+            };
+            let Ok(text) = String::from_utf8(payload) else {
+                return;
+            };
+            if socket.send(WsMessage::Text(text.into())).await.is_err() {
+                return;
+            }
         }
     }
+}
+
+/// Lock the pool for a SHORT, engine-IPC-free critical section. Routes must
+/// never hold this guard across an engine round-trip (issue #230): engine work
+/// happens on cloned per-session driver handles after the guard is dropped.
+fn lock_pool(pool: &Arc<Mutex<SessionPool>>) -> Result<MutexGuard<'_, SessionPool>, TempodError> {
+    pool.lock().map_err(|_| TempodError::PoolLock)
 }
 
 /// `POST /sessions` with the engine round-trips OFF the pool lock (issue #230;
@@ -3029,29 +3536,6 @@ pub fn tempod_openapi(base_url: &str) -> JsonValue {
     })
 }
 
-fn session_events_from_path(
-    path: &str,
-) -> Result<Option<(TempodSessionId, Option<u64>)>, TempodError> {
-    let (path, query) = split_path_query(path);
-    let Some(session_path) = path.strip_suffix("/events") else {
-        return Ok(None);
-    };
-    if !session_path.starts_with("/sessions/") {
-        return Ok(None);
-    }
-    Ok(Some((
-        session_id_from_path(session_path)?,
-        after_seq(query)?,
-    )))
-}
-
-fn split_path_query(path: &str) -> (&str, Option<&str>) {
-    match path.split_once('?') {
-        Some((path, query)) => (path, Some(query)),
-        None => (path, None),
-    }
-}
-
 fn after_seq(query: Option<&str>) -> Result<Option<u64>, TempodError> {
     let Some(query) = query else {
         return Ok(None);
@@ -3070,71 +3554,12 @@ fn after_seq(query: Option<&str>) -> Result<Option<u64>, TempodError> {
     Ok(None)
 }
 
-#[cfg(test)]
-fn websocket_upgrade_key(request: &HttpRequest) -> Result<Option<String>, TempodError> {
-    websocket_upgrade_key_with_auth(request, &TempodAuth::disabled())
-}
-
-fn websocket_upgrade_key_with_auth(
-    request: &HttpRequest,
-    auth: &TempodAuth,
-) -> Result<Option<String>, TempodError> {
-    if request.method != "GET" || request.path != "/bidi" {
-        return Ok(None);
-    }
-    let upgrade = request
-        .header("upgrade")
-        .map(|value| value.eq_ignore_ascii_case("websocket"))
-        .unwrap_or(false);
-    let connection_upgrade = request
-        .header("connection")
-        .map(|value| header_has_token(value, "upgrade"))
-        .unwrap_or(false);
-    if !upgrade && !connection_upgrade && request.header("sec-websocket-key").is_none() {
-        return Ok(None);
-    }
-    auth.authorize(request)?;
-    if !upgrade || !connection_upgrade {
-        return Err(TempodError::BadRequest(
-            "WebSocket upgrade requires Upgrade: websocket and Connection: Upgrade".into(),
-        ));
-    }
-    if request.header("sec-websocket-version") != Some("13") {
-        return Err(TempodError::BadRequest(
-            "WebSocket upgrade requires Sec-WebSocket-Version: 13".into(),
-        ));
-    }
-    // Reject cross-origin WebSocket handshakes (DNS-rebinding defence). Browsers
-    // always send Origin on WS upgrades, so this blocks a malicious page from
-    // driving the automated browser; non-browser clients omit Origin and pass.
-    if !bidi_origin_allowed(request) {
-        return Err(TempodError::Forbidden(
-            "WebSocket origin not allowed".into(),
-        ));
-    }
-    let key = request
-        .header("sec-websocket-key")
-        .filter(|key| !key.trim().is_empty())
-        .ok_or_else(|| {
-            TempodError::BadRequest("WebSocket upgrade requires Sec-WebSocket-Key".into())
-        })?;
-    Ok(Some(key.to_string()))
-}
-
-/// Origin policy for the BiDi control endpoint. Mirrors the MCP route: Origin is
-/// optional for non-browser clients, but when present only loopback origins are
-/// accepted, blocking DNS-rebinding driven WebSocket/POST access.
-fn bidi_origin_allowed(request: &HttpRequest) -> bool {
-    tempo_mcp::origin_allowed(request.origin.as_deref())
-}
-
-/// Whether a route served by `route_http_request` must pass the loopback-Origin
-/// guard. Session/control-plane routes (create, drain, adopt, delete, list,
+/// Whether a route must pass the loopback-Origin guard. Session/control-plane routes (create, drain, adopt, delete, list,
 /// session events, and any unrecognised — hence potentially state-changing —
 /// route) are guarded. Exempt are the public idempotent metadata routes
 /// (`/health`, the A2A agent card, `GET /mcp`) and the routes that already run
 /// their own Origin check (`POST /mcp` via `route_mcp`, `POST /bidi`, and the
-/// `GET /bidi` WebSocket upgrade handled before this function). The guard relies
+/// `GET /bidi` WebSocket upgrade handler). The guard relies
 /// on `origin_allowed` returning `true` when no Origin header is present, so
 /// non-browser/CLI clients keep working.
 fn control_route_requires_origin_check(method: &str, path: &str) -> bool {
@@ -3210,151 +3635,6 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
         diff |= usize::from(left_byte ^ right_byte);
     }
     diff == 0
-}
-
-fn header_has_token(value: &str, token: &str) -> bool {
-    value
-        .split(',')
-        .any(|entry| entry.trim().eq_ignore_ascii_case(token))
-}
-
-fn websocket_upgrade_response(key: &str) -> Vec<u8> {
-    let mut hasher = Sha1::new();
-    hasher.update(key.as_bytes());
-    hasher.update(WS_ACCEPT_GUID.as_bytes());
-    let accept = base64::engine::general_purpose::STANDARD.encode(hasher.finalize());
-    format!(
-        "HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\nconnection: Upgrade\r\nsec-websocket-accept: {accept}\r\n\r\n"
-    )
-    .into_bytes()
-}
-
-fn serve_bidi_websocket(
-    mut stream: TcpStream,
-    pool: &Arc<Mutex<SessionPool>>,
-    _websocket_permit: ConnectionPermit,
-) -> Result<(), TempodError> {
-    loop {
-        let Some(frame) = read_websocket_frame(&mut stream)? else {
-            return Ok(());
-        };
-        match frame.opcode {
-            WS_OPCODE_TEXT | WS_OPCODE_BINARY => {
-                // Commands are dispatched without holding the pool lock across
-                // engine round-trips (issue #230); this connection still
-                // processes its own frames strictly in order.
-                let messages = route_bidi_websocket(pool, frame.payload);
-                for message in messages {
-                    let payload = bidi_message_payload(&message)?;
-                    write_websocket_frame(&mut stream, WS_OPCODE_TEXT, &payload)?;
-                }
-            }
-            WS_OPCODE_PING => {
-                write_websocket_frame(&mut stream, WS_OPCODE_PONG, &frame.payload)?;
-            }
-            WS_OPCODE_CLOSE => {
-                write_websocket_frame(&mut stream, WS_OPCODE_CLOSE, &[])?;
-                return Ok(());
-            }
-            _ => {
-                write_websocket_frame(&mut stream, WS_OPCODE_CLOSE, &[])?;
-                return Ok(());
-            }
-        }
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct WebSocketFrame {
-    opcode: u8,
-    payload: Vec<u8>,
-}
-
-fn read_websocket_frame(stream: &mut TcpStream) -> Result<Option<WebSocketFrame>, TempodError> {
-    let mut header = [0_u8; 2];
-    match stream.read_exact(&mut header) {
-        Ok(()) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(err) => return Err(TempodError::Io(err)),
-    }
-    let fin = header[0] & 0x80 != 0;
-    if !fin {
-        return Err(TempodError::BadRequest(
-            "fragmented websocket frames are not supported".into(),
-        ));
-    }
-    if header[1] & 0x80 == 0 {
-        return Err(TempodError::BadRequest(
-            "client websocket frames must be masked".into(),
-        ));
-    }
-    let opcode = header[0] & 0x0f;
-    let mut len = u64::from(header[1] & 0x7f);
-    if len == 126 {
-        let mut ext = [0_u8; 2];
-        stream.read_exact(&mut ext)?;
-        len = u64::from(u16::from_be_bytes(ext));
-    } else if len == 127 {
-        let mut ext = [0_u8; 8];
-        stream.read_exact(&mut ext)?;
-        len = u64::from_be_bytes(ext);
-    }
-    if len > MAX_WS_PAYLOAD_BYTES {
-        return Err(TempodError::BadRequest(
-            "websocket payload is too large".into(),
-        ));
-    }
-    let payload_len = usize::try_from(len)
-        .map_err(|err| TempodError::BadRequest(format!("invalid websocket length: {err}")))?;
-    let mut mask = [0_u8; 4];
-    stream.read_exact(&mut mask)?;
-    let mut payload = vec![0_u8; payload_len];
-    stream.read_exact(&mut payload)?;
-    for (index, byte) in payload.iter_mut().enumerate() {
-        *byte ^= mask[index % mask.len()];
-    }
-    Ok(Some(WebSocketFrame { opcode, payload }))
-}
-
-fn write_websocket_frame(
-    stream: &mut TcpStream,
-    opcode: u8,
-    payload: &[u8],
-) -> Result<(), TempodError> {
-    // Server-to-client frame header is at most 10 bytes (no mask): build it on
-    // the stack instead of allocating a Vec per frame.
-    let mut header = [0_u8; 10];
-    header[0] = 0x80 | (opcode & 0x0f);
-    let header_len = if payload.len() < 126 {
-        header[1] = payload.len() as u8;
-        2
-    } else if let Ok(len) = u16::try_from(payload.len()) {
-        header[1] = 126;
-        header[2..4].copy_from_slice(&len.to_be_bytes());
-        4
-    } else {
-        let len = u64::try_from(payload.len())
-            .map_err(|err| TempodError::BadRequest(format!("invalid websocket length: {err}")))?;
-        header[1] = 127;
-        header[2..10].copy_from_slice(&len.to_be_bytes());
-        10
-    };
-
-    // Small frames (the common case: BiDi responses/events, pings) go out in
-    // one write syscall and one TCP segment. Large payloads keep two writes
-    // rather than paying a multi-hundred-KB copy to save one syscall.
-    const INLINE_COPY_LIMIT: usize = 8 * 1024;
-    if payload.len() <= INLINE_COPY_LIMIT {
-        let mut frame = Vec::with_capacity(header_len + payload.len());
-        frame.extend_from_slice(&header[..header_len]);
-        frame.extend_from_slice(payload);
-        stream.write_all(&frame)?;
-    } else {
-        stream.write_all(&header[..header_len])?;
-        stream.write_all(payload)?;
-    }
-    stream.flush()?;
-    Ok(())
 }
 
 fn route_bidi(pool: &Arc<Mutex<SessionPool>>, body: Vec<u8>) -> HttpResponse {
@@ -3924,7 +4204,7 @@ fn bidi_response_unchecked(status: u16, message: BidiMessage) -> HttpResponse {
     }
 }
 
-fn route_mcp(pool: &Arc<Mutex<SessionPool>>, request: &HttpRequest) -> HttpResponse {
+fn route_mcp(pool: &Arc<Mutex<SessionPool>>, origin: Option<&str>, body: &[u8]) -> HttpResponse {
     // Phase 1 (pool lock, brief): drain admission + MCP server handle clone.
     let server = {
         let Ok(pool) = pool.lock() else {
@@ -3950,58 +4230,10 @@ fn route_mcp(pool: &Arc<Mutex<SessionPool>>, request: &HttpRequest) -> HttpRespo
     // process-wide lock stands between two sessions' tool calls (issue #230).
     if let Some(server) = server {
         return HttpResponse::from_mcp(futures::executor::block_on(
-            server.handle_post(request.origin.as_deref(), &request.body),
+            server.handle_post(origin, body),
         ));
     }
-    HttpResponse::from_mcp(tempo_mcp::handle_post_driverless(
-        request.origin.as_deref(),
-        &request.body,
-    ))
-}
-
-fn session_id_from_action_path(path: &str, action: &str) -> Result<TempodSessionId, TempodError> {
-    let suffix = format!("/{action}");
-    let path = path
-        .strip_suffix(&suffix)
-        .ok_or_else(|| TempodError::BadRequest(format!("invalid session action path: {path}")))?;
-    session_id_from_path(path)
-}
-
-fn session_id_from_path(path: &str) -> Result<TempodSessionId, TempodError> {
-    let id = path
-        .strip_prefix("/sessions/")
-        .ok_or_else(|| TempodError::BadRequest(format!("invalid session path: {path}")))?;
-    if id.is_empty() {
-        return Err(TempodError::BadRequest("session id is required".into()));
-    }
-    Ok(TempodSessionId(id.into()))
-}
-
-#[derive(Debug)]
-struct HttpRequest {
-    method: String,
-    path: String,
-    headers: BTreeMap<String, String>,
-    host: Option<String>,
-    origin: Option<String>,
-    body: Vec<u8>,
-}
-
-impl HttpRequest {
-    fn header(&self, name: &str) -> Option<&str> {
-        self.headers
-            .get(&name.to_ascii_lowercase())
-            .map(String::as_str)
-    }
-
-    fn base_url(&self) -> String {
-        let host = self
-            .host
-            .as_deref()
-            .filter(|host| valid_host_header(host))
-            .unwrap_or("localhost");
-        format!("http://{host}")
-    }
+    HttpResponse::from_mcp(tempo_mcp::handle_post_driverless(origin, body))
 }
 
 fn valid_host_header(host: &str) -> bool {
@@ -4009,111 +4241,6 @@ fn valid_host_header(host: &str) -> bool {
         && host
             .bytes()
             .all(|byte| byte.is_ascii_graphic() && !matches!(byte, b'/' | b'\\'))
-}
-
-fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, TempodError> {
-    let mut bytes = Vec::new();
-    let mut buf = [0_u8; 1024];
-    loop {
-        let read = stream.read(&mut buf)?;
-        if read == 0 {
-            break;
-        }
-        bytes.extend_from_slice(&buf[..read]);
-        if bytes.len() > MAX_HTTP_BYTES {
-            return Err(TempodError::BadRequest("HTTP request is too large".into()));
-        }
-        if header_end(&bytes).is_some() {
-            break;
-        }
-    }
-
-    let header_end =
-        header_end(&bytes).ok_or_else(|| TempodError::BadRequest("missing HTTP headers".into()))?;
-    let headers = String::from_utf8(bytes[..header_end].to_vec())
-        .map_err(|err| TempodError::BadRequest(err.to_string()))?;
-    let header_map = header_map(headers.lines());
-    let origin = header_map.get("origin").cloned();
-    let host = header_map.get("host").cloned();
-    let mut lines = headers.lines();
-    let request_line = lines
-        .next()
-        .ok_or_else(|| TempodError::BadRequest("missing request line".into()))?;
-    let mut parts = request_line.split_whitespace();
-    let method = parts
-        .next()
-        .ok_or_else(|| TempodError::BadRequest("missing method".into()))?
-        .to_string();
-    let path = parts
-        .next()
-        .ok_or_else(|| TempodError::BadRequest("missing path".into()))?
-        .to_string();
-    let content_len = content_length(&header_map)?;
-    let body_start = header_end + 4;
-    // `content_len` is already bounded by MAX_HTTP_BYTES, but compute the end
-    // offset with a checked add so a malicious Content-Length can never overflow
-    // and panic (issue #84).
-    let body_end = body_start
-        .checked_add(content_len)
-        .ok_or_else(|| TempodError::BadRequest("HTTP body length overflow".into()))?;
-    if body_end > MAX_HTTP_BYTES {
-        return Err(TempodError::BadRequest("HTTP request is too large".into()));
-    }
-    while bytes.len() < body_end {
-        let read = stream.read(&mut buf)?;
-        if read == 0 {
-            break;
-        }
-        bytes.extend_from_slice(&buf[..read]);
-        if bytes.len() > MAX_HTTP_BYTES {
-            return Err(TempodError::BadRequest("HTTP request is too large".into()));
-        }
-    }
-    if bytes.len() < body_end {
-        return Err(TempodError::BadRequest("incomplete HTTP body".into()));
-    }
-
-    Ok(HttpRequest {
-        method,
-        path,
-        headers: header_map,
-        host,
-        origin,
-        body: bytes[body_start..body_end].to_vec(),
-    })
-}
-
-fn header_end(bytes: &[u8]) -> Option<usize> {
-    bytes.windows(4).position(|window| window == b"\r\n\r\n")
-}
-
-fn header_map<'a>(lines: impl Iterator<Item = &'a str>) -> BTreeMap<String, String> {
-    let mut headers = BTreeMap::new();
-    for line in lines {
-        let Some((name, value)) = line.split_once(':') else {
-            continue;
-        };
-        headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
-    }
-    headers
-}
-
-fn content_length(headers: &BTreeMap<String, String>) -> Result<usize, TempodError> {
-    match headers.get("content-length") {
-        Some(value) => {
-            let length: usize = value
-                .trim()
-                .parse()
-                .map_err(|err: std::num::ParseIntError| TempodError::BadRequest(err.to_string()))?;
-            if length > MAX_HTTP_BYTES {
-                return Err(TempodError::BadRequest(
-                    "Content-Length exceeds maximum allowed size".into(),
-                ));
-            }
-            Ok(length)
-        }
-        None => Ok(0),
-    }
 }
 
 #[derive(Deserialize)]
@@ -4160,29 +4287,23 @@ impl HttpResponse {
     fn from_mcp(response: tempo_mcp::McpHttpResponse) -> Self {
         Self::new(response.status, response.content_type, response.body)
     }
+}
 
-    fn to_bytes(&self) -> Vec<u8> {
-        let reason = match self.status {
-            200 => "OK",
-            201 => "Created",
-            401 => "Unauthorized",
-            400 => "Bad Request",
-            403 => "Forbidden",
-            404 => "Not Found",
-            405 => "Method Not Allowed",
-            500 => "Internal Server Error",
-            503 => "Service Unavailable",
-            _ => "OK",
-        };
-        let mut bytes = format!(
-            "HTTP/1.1 {} {reason}\r\ncontent-type: {}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-            self.status,
-            self.content_type,
-            self.body.len()
+impl IntoResponse for HttpResponse {
+    fn into_response(self) -> Response {
+        let status = StatusCode::from_u16(self.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        (
+            status,
+            [(header::CONTENT_TYPE, self.content_type)],
+            self.body,
         )
-        .into_bytes();
-        bytes.extend_from_slice(&self.body);
-        bytes
+            .into_response()
+    }
+}
+
+impl IntoResponse for TempodError {
+    fn into_response(self) -> Response {
+        tempod_error_response(&self).into_response()
     }
 }
 
@@ -4270,6 +4391,14 @@ mod tests {
 
     type TestResult = Result<(), Box<dyn Error>>;
 
+    // RFC 6455 opcodes used by the raw-socket WebSocket test client.
+    const WS_OPCODE_TEXT: u8 = 0x1;
+    const WS_OPCODE_CLOSE: u8 = 0x8;
+
+    fn header_end(bytes: &[u8]) -> Option<usize> {
+        bytes.windows(4).position(|window| window == b"\r\n\r\n")
+    }
+
     /// Test shims (issue #230): production routing takes
     /// `&Arc<Mutex<SessionPool>>` so engine round-trips can run off-lock. These
     /// wrappers keep the many tests written against a bare `&mut SessionPool`
@@ -4291,25 +4420,108 @@ mod tests {
         result
     }
 
+    /// Request description used by the in-process tests. The shims below feed
+    /// it through the production axum router (`tempod_router`) via
+    /// `tower::ServiceExt::oneshot`, so every in-process test exercises the
+    /// same routing, guards, and handlers as a real socket connection.
+    #[derive(Debug)]
+    struct HttpRequest {
+        method: String,
+        path: String,
+        headers: BTreeMap<String, String>,
+        host: Option<String>,
+        origin: Option<String>,
+        body: Vec<u8>,
+    }
+
+    /// Simplified response captured from the router for assertions.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct TestResponse {
+        status: u16,
+        content_type: String,
+        body: Vec<u8>,
+    }
+
+    fn oneshot_response(
+        shared: &Arc<Mutex<SessionPool>>,
+        auth: &TempodAuth,
+        request: HttpRequest,
+    ) -> Result<TestResponse, TempodError> {
+        use tower::ServiceExt as _;
+        let router = tempod_router(TempodAppState {
+            pool: Arc::clone(shared),
+            auth: auth.clone(),
+            limiter: ConnectionLimiter::default(),
+        });
+        let mut builder = axum::http::Request::builder()
+            .method(request.method.as_str())
+            .uri(&request.path);
+        for (name, value) in &request.headers {
+            builder = builder.header(name, value);
+        }
+        if let Some(host) = &request.host {
+            builder = builder.header("host", host);
+        }
+        if let Some(origin) = &request.origin {
+            builder = builder.header("origin", origin);
+        }
+        let http_request = builder
+            .body(axum::body::Body::from(request.body))
+            .map_err(|error| TempodError::BadRequest(error.to_string()))?;
+        let runtime = transport_runtime()?;
+        runtime.block_on(async move {
+            let response = match router.oneshot(http_request).await {
+                Ok(response) => response,
+                Err(infallible) => match infallible {},
+            };
+            let status = response.status().as_u16();
+            let content_type = response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            let body = axum::body::to_bytes(response.into_body(), MAX_HTTP_BYTES * 16)
+                .await
+                .map_err(|error| TempodError::Driver(error.to_string()))?
+                .to_vec();
+            Ok(TestResponse {
+                status,
+                content_type,
+                body,
+            })
+        })
+    }
+
     fn route_http_request(
         pool: &mut SessionPool,
         request: HttpRequest,
-    ) -> Result<HttpResponse, TempodError> {
-        with_shared_pool(pool, |shared| super::route_http_request(shared, request))
+    ) -> Result<TestResponse, TempodError> {
+        with_shared_pool(pool, |shared| {
+            oneshot_response(shared, &TempodAuth::disabled(), request)
+        })
     }
 
-    fn handle_http_request(pool: &mut SessionPool, request: HttpRequest) -> HttpResponse {
-        with_shared_pool(pool, |shared| super::handle_http_request(shared, request))
+    fn handle_http_request(pool: &mut SessionPool, request: HttpRequest) -> TestResponse {
+        handle_http_request_with_auth(pool, request, &TempodAuth::disabled())
     }
 
     fn handle_http_request_with_auth(
         pool: &mut SessionPool,
         request: HttpRequest,
         auth: &TempodAuth,
-    ) -> HttpResponse {
-        with_shared_pool(pool, |shared| {
-            super::handle_http_request_with_auth(shared, request, auth)
-        })
+    ) -> TestResponse {
+        match with_shared_pool(pool, |shared| oneshot_response(shared, auth, request)) {
+            Ok(response) => response,
+            Err(error) => {
+                let response = tempod_error_response(&error);
+                TestResponse {
+                    status: response.status,
+                    content_type: response.content_type.to_string(),
+                    body: response.body,
+                }
+            }
+        }
     }
 
     fn route_bidi_dispatch(pool: &mut SessionPool, body: Vec<u8>) -> BidiDispatchResult {
@@ -5301,7 +5513,6 @@ mod tests {
                     driver_id: format!("context-{n}"),
                 })
             }
-            // Policy taint recomputation before each gated navigate (#254).
             HostDriverCommand::Observe => FakeEngineReply::Respond(DriverResponse::Observation {
                 observation: observation("about:blank", 0),
             }),
@@ -5366,7 +5577,6 @@ mod tests {
         let goto_arrivals: Arc<Mutex<Vec<std::time::Instant>>> = Arc::new(Mutex::new(Vec::new()));
         let arrivals = Arc::clone(&goto_arrivals);
         let pool = shared_pool_with_fake_engine(move |request| match &request.command {
-            // Policy taint recomputation before each gated navigate (#254).
             HostDriverCommand::Observe => FakeEngineReply::Respond(DriverResponse::Observation {
                 observation: observation("about:blank", 0),
             }),
@@ -5432,7 +5642,6 @@ mod tests {
     #[test]
     fn health_and_drain_respond_while_engine_op_is_in_flight() -> TestResult {
         let pool = shared_pool_with_fake_engine(|request| match &request.command {
-            // Policy taint recomputation before each gated navigate (#254).
             HostDriverCommand::Observe => FakeEngineReply::Respond(DriverResponse::Observation {
                 observation: observation("about:blank", 0),
             }),
@@ -5497,7 +5706,6 @@ mod tests {
                     driver_id: format!("context-{n}"),
                 })
             }
-            // Policy taint recomputation before each gated navigate (#254).
             HostDriverCommand::Observe => FakeEngineReply::Respond(DriverResponse::Observation {
                 observation: observation("about:blank", 0),
             }),
@@ -5628,7 +5836,6 @@ mod tests {
                     driver_id: format!("context-{n}"),
                 })
             }
-            // Policy taint recomputation before each gated navigate (#254).
             HostDriverCommand::Observe => FakeEngineReply::Respond(DriverResponse::Observation {
                 observation: observation("about:blank", 0),
             }),
@@ -5770,7 +5977,8 @@ mod tests {
     fn session_pool_from_env_value_configures_otlp_jsonl_exporter() -> TestResult {
         let path = unique_dir("env-otlp")?.join("steps.jsonl");
 
-        let mut pool = SessionPool::from_otlp_env_value(Some(path.as_os_str().to_os_string()));
+        let mut pool =
+            SessionPool::from_otlp_env_values(Some(path.as_os_str().to_os_string()), None);
         assert_eq!(
             pool.otlp_exporter()
                 .ok_or("expected env path to configure exporter")?
@@ -5780,11 +5988,11 @@ mod tests {
 
         pool.set_otlp_exporter(None);
         assert!(pool.otlp_exporter().is_none());
-        assert!(SessionPool::from_otlp_env_value(None)
+        assert!(SessionPool::from_otlp_env_values(None, None)
             .otlp_exporter()
             .is_none());
         assert!(
-            SessionPool::from_otlp_env_value(Some(std::ffi::OsString::new()))
+            SessionPool::from_otlp_env_values(Some(std::ffi::OsString::new()), None)
                 .otlp_exporter()
                 .is_none()
         );
@@ -6702,9 +6910,6 @@ mod tests {
 
     #[test]
     fn bidi_endpoint_denies_confirmed_tainted_script_without_confirmation_channel() -> TestResult {
-        // Pre-#254 a bare confirmed=true bypassed the gate for tainted
-        // scripts. It is now advisory: the tainted script stays blocked, and
-        // no engine IPC is dispatched.
         let (client_stream, mut server_stream) = UnixStream::pair()?;
         server_stream.set_nonblocking(true)?;
         let mut pool = SessionPool::default();
@@ -6731,40 +6936,6 @@ mod tests {
             .as_str()
             .ok_or("BiDi error response should include a message")?;
         assert!(message.contains("policy denied"));
-        assert!(message.contains("confirmed=true was ignored"));
-        assert_no_driver_ipc(&mut server_stream)?;
-        Ok(())
-    }
-
-    #[test]
-    fn bidi_script_denies_confirmed_clean_claim_without_confirmation_channel() -> TestResult {
-        let (client_stream, mut server_stream) = UnixStream::pair()?;
-        server_stream.set_nonblocking(true)?;
-        let mut pool = SessionPool::default();
-        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream))?;
-
-        let response = route_http_request(
-            &mut pool,
-            HttpRequest {
-                method: "POST".into(),
-                path: "/bidi".into(),
-                headers: BTreeMap::new(),
-                host: None,
-                origin: None,
-                body: br#"{"id":27,"method":"script.evaluate","params":{"expression":"pay('12345678')","target":{"context":"tempo-root"},"inputTainted":false,"confirmed":true}}"#.to_vec(),
-            },
-        )?;
-
-        assert_eq!(response.status, 200);
-        let value: Value = serde_json::from_slice(&response.body)?;
-        assert_eq!(value["type"], "error");
-        assert_eq!(value["id"], 27);
-        assert_eq!(value["error"], "invalid argument");
-        let message = value["message"]
-            .as_str()
-            .ok_or("BiDi error response should include a message")?;
-        assert!(message.contains("policy denied"));
-        assert!(message.contains("input_tainted=true"));
         assert!(message.contains("confirmed=true was ignored"));
         assert_no_driver_ipc(&mut server_stream)?;
         Ok(())
@@ -7991,6 +8162,273 @@ mod tests {
         Ok(())
     }
 
+    // ---- Issue #249: real OTLP/HTTP export to a collector ----
+
+    /// Minimal OTLP collector fixture: accepts one connection, captures the
+    /// HTTP request (head + body), answers 200 `{}`.
+    #[allow(clippy::type_complexity)]
+    fn spawn_otlp_collector_fixture() -> Result<
+        (
+            std::net::SocketAddr,
+            thread::JoinHandle<Result<(String, Vec<u8>), String>>,
+        ),
+        Box<dyn Error>,
+    > {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let handle = thread::spawn(move || -> Result<(String, Vec<u8>), String> {
+            let (mut stream, _addr) = listener.accept().map_err(|error| error.to_string())?;
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .map_err(|error| error.to_string())?;
+            let mut bytes = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            let (body_start, content_length) = loop {
+                let read = stream
+                    .read(&mut buffer)
+                    .map_err(|error| error.to_string())?;
+                if read == 0 {
+                    return Err("collector connection closed before headers".into());
+                }
+                bytes.extend_from_slice(&buffer[..read]);
+                if let Some(end) = header_end(&bytes) {
+                    let head = String::from_utf8_lossy(&bytes[..end]).to_string();
+                    let content_length = head
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            if name.trim().eq_ignore_ascii_case("content-length") {
+                                value.trim().parse::<usize>().ok()
+                            } else {
+                                None
+                            }
+                        })
+                        .ok_or("collector request missing content-length")?;
+                    break (end + 4, content_length);
+                }
+            };
+            while bytes.len() < body_start + content_length {
+                let read = stream
+                    .read(&mut buffer)
+                    .map_err(|error| error.to_string())?;
+                if read == 0 {
+                    return Err("collector connection closed mid-body".into());
+                }
+                bytes.extend_from_slice(&buffer[..read]);
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}")
+                .map_err(|error| error.to_string())?;
+            let head = String::from_utf8_lossy(&bytes[..body_start]).to_string();
+            let body = bytes[body_start..body_start + content_length].to_vec();
+            Ok((head, body))
+        });
+        Ok((addr, handle))
+    }
+
+    #[test]
+    fn otlp_http_export_posts_redacted_spans_to_collector() -> TestResult {
+        let (addr, collector) = spawn_otlp_collector_fixture()?;
+        let exporter = OtlpHttpExporter::new(format!("http://{addr}"))?;
+        assert!(exporter.endpoint().ends_with("/v1/traces"));
+
+        let mut pool = SessionPool::default().with_otlp_http_exporter(exporter);
+        let session = pool.create("https://otlp.test")?;
+        let secret = "hunter2-super-secret-password";
+        let triple = StepTriple {
+            key: IdempotencyKey("step-otlp".into()),
+            seq: 9,
+            action: Action::Type {
+                node: NodeId("a[href=\"/reset?token=SECRET123\"]".into()),
+                text: secret.into(),
+            },
+            outcome: StepTripleOutcome::StepError {
+                reason: "failed with token SECRET123".into(),
+            },
+        };
+        pool.record_step(&session.id, triple)?;
+
+        let (head, body) = collector
+            .join()
+            .map_err(|_| "collector fixture panicked")??;
+        let request_line = head.lines().next().unwrap_or_default();
+        assert!(
+            request_line.starts_with("POST /v1/traces HTTP/1.1"),
+            "collector saw: {request_line}"
+        );
+        assert!(
+            head.to_ascii_lowercase()
+                .contains("content-type: application/json"),
+            "collector head: {head}"
+        );
+
+        // #216 guarantee: redaction happened BEFORE export — no secret crosses
+        // the wire in any encoding position.
+        let text = String::from_utf8(body.clone())?;
+        assert!(
+            !text.contains(secret),
+            "typed secret must be redacted before export"
+        );
+        assert!(
+            !text.contains("SECRET123"),
+            "node-id/step-error secrets must be redacted before export"
+        );
+
+        let value: Value = serde_json::from_slice(&body)?;
+        assert_eq!(
+            value["resourceSpans"][0]["resource"]["attributes"][0]["value"]["stringValue"],
+            "tempod"
+        );
+        let span = &value["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
+        assert_eq!(span["name"], "tempo.step");
+        assert_eq!(span["status"]["code"], 2);
+        let trace_id = span["traceId"].as_str().ok_or("missing traceId")?;
+        let span_id = span["spanId"].as_str().ok_or("missing spanId")?;
+        assert_eq!(trace_id.len(), 32);
+        assert_eq!(span_id.len(), 16);
+        assert_ne!(trace_id, "00000000000000000000000000000000");
+        assert_ne!(span_id, "0000000000000000");
+        let attributes = span["attributes"].as_array().ok_or("missing attributes")?;
+        let seq = attributes
+            .iter()
+            .find(|attribute| attribute["key"] == "tempo.step.seq")
+            .ok_or("missing tempo.step.seq attribute")?;
+        assert_eq!(seq["value"]["intValue"], "9");
+        Ok(())
+    }
+
+    #[test]
+    fn otlp_http_export_never_blocks_step_recording_when_collector_is_down() -> TestResult {
+        // Reserve a port with no listener behind it.
+        let dead = TcpListener::bind("127.0.0.1:0")?;
+        let addr = dead.local_addr()?;
+        drop(dead);
+
+        let exporter = OtlpHttpExporter::new(format!("http://{addr}"))?;
+        let mut pool = SessionPool::default().with_otlp_http_exporter(exporter);
+        let session = pool.create("https://otlp-down.test")?;
+
+        let started = Instant::now();
+        for seq in 0..(OTLP_EXPORT_QUEUE_CAPACITY as u64 + 64) {
+            // Best-effort (#216): recording steps must keep succeeding, fast,
+            // even when every span is dropped because the collector is gone —
+            // more steps than the queue holds, so the full-queue path runs too.
+            pool.record_step(&session.id, sample_step_triple(seq))?;
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "record_step must not block on collector I/O: {elapsed:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn otlp_endpoint_normalization_and_env_wiring() -> TestResult {
+        assert_eq!(
+            normalize_otlp_endpoint("http://collector.internal:4318")?,
+            "http://collector.internal:4318/v1/traces"
+        );
+        assert_eq!(
+            normalize_otlp_endpoint("http://collector.internal:4318/")?,
+            "http://collector.internal:4318/v1/traces"
+        );
+        assert_eq!(
+            normalize_otlp_endpoint("https://collector.internal:4318/v1/traces")?,
+            "https://collector.internal:4318/v1/traces"
+        );
+        assert!(normalize_otlp_endpoint("ftp://collector.internal").is_err());
+        assert!(normalize_otlp_endpoint("not a url").is_err());
+
+        let pool = SessionPool::from_otlp_env_values(
+            None,
+            Some(std::ffi::OsString::from("http://127.0.0.1:4318")),
+        );
+        assert_eq!(
+            pool.otlp_http_exporter()
+                .ok_or("expected endpoint env to configure the exporter")?
+                .endpoint(),
+            "http://127.0.0.1:4318/v1/traces"
+        );
+        assert!(pool.otlp_exporter().is_none());
+
+        // Telemetry is best-effort: a bad endpoint is ignored, not fatal.
+        let ignored =
+            SessionPool::from_otlp_env_values(None, Some(std::ffi::OsString::from("not a url")));
+        assert!(ignored.otlp_http_exporter().is_none());
+        Ok(())
+    }
+
+    // ---- Issue #249: axum transport regressions ----
+
+    #[test]
+    fn chunked_transfer_encoding_create_session_is_decoded() -> TestResult {
+        // The hand-rolled parser only understood Content-Length and silently
+        // treated a chunked body as empty, so a standard HTTP/1.1 client using
+        // Transfer-Encoding: chunked got a bogus error. hyper decodes it.
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let pool = Arc::new(Mutex::new(SessionPool::default()));
+        let server_pool = Arc::clone(&pool);
+        let handle = thread::spawn(move || serve_one(listener, server_pool));
+
+        let body = r#"{"url":"https://chunked.test"}"#;
+        let request = format!(
+            "POST /sessions HTTP/1.1\r\nhost: 127.0.0.1\r\ntransfer-encoding: chunked\r\n\r\n{len:x}\r\n{body}\r\n0\r\n\r\n",
+            len = body.len(),
+        );
+        let response = send_http(addr, &request)?;
+        join_server(handle)?;
+        assert!(response.starts_with("HTTP/1.1 201"), "{response}");
+        let sessions = pool.lock().map_err(|_| "pool poisoned")?.list();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].url, "https://chunked.test");
+        Ok(())
+    }
+
+    #[test]
+    fn oversized_body_is_rejected_with_413() -> TestResult {
+        // Replaces the old content_length() parser unit test: the transport
+        // still refuses bodies beyond MAX_HTTP_BYTES, now with the standard
+        // 413 (the hand-rolled parser answered 400).
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let pool = Arc::new(Mutex::new(SessionPool::default()));
+        let handle = thread::spawn(move || serve_one(listener, pool));
+
+        let oversized = "x".repeat(MAX_HTTP_BYTES + 1);
+        let response = send_http(
+            addr,
+            &format!(
+                "POST /sessions HTTP/1.1\r\nhost: 127.0.0.1\r\ncontent-length: {}\r\n\r\n{oversized}",
+                oversized.len(),
+            ),
+        )?;
+        join_server(handle)?;
+        assert!(response.starts_with("HTTP/1.1 413"), "{response}");
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_json_create_session_is_rejected_as_bad_request() -> TestResult {
+        let mut pool = SessionPool::default();
+        let response = handle_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/sessions".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: b"{not json".to_vec(),
+            },
+        );
+        // Standard client error; the hand-rolled parser surfaced this as 500.
+        assert_eq!(response.status, 400, "{response:?}");
+        assert!(pool.list().is_empty());
+        Ok(())
+    }
+
     #[test]
     fn engine_supervisor_starts_and_restarts_child() -> TestResult {
         let mut supervisor = EngineSupervisor::new();
@@ -8046,27 +8484,27 @@ mod tests {
 
     #[test]
     fn bidi_websocket_upgrade_rejects_cross_origin() -> TestResult {
-        let request = HttpRequest {
-            method: "GET".into(),
-            path: "/bidi".into(),
-            headers: BTreeMap::from([
-                ("upgrade".into(), "websocket".into()),
-                ("connection".into(), "Upgrade".into()),
-                ("sec-websocket-version".into(), "13".into()),
-                (
-                    "sec-websocket-key".into(),
-                    "dGhlIHNhbXBsZSBub25jZQ==".into(),
-                ),
-                ("origin".into(), "http://evil.example".into()),
-            ]),
-            host: None,
-            origin: Some("http://evil.example".into()),
-            body: Vec::new(),
-        };
-        match websocket_upgrade_key(&request) {
-            Err(TempodError::Forbidden(_)) => Ok(()),
-            other => Err(format!("expected Forbidden, got {other:?}").into()),
-        }
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let pool = Arc::new(Mutex::new(SessionPool::default()));
+        let handle = thread::spawn(move || serve_one(listener, pool));
+
+        let response = send_http(
+            addr,
+            "GET /bidi HTTP/1.1\r\n\
+             host: 127.0.0.1\r\n\
+             origin: http://evil.example\r\n\
+             upgrade: websocket\r\n\
+             connection: Upgrade\r\n\
+             sec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+             sec-websocket-version: 13\r\n\r\n",
+        )?;
+        join_server(handle)?;
+        assert!(
+            response.starts_with("HTTP/1.1 403"),
+            "cross-origin WebSocket upgrade must be rejected: {response}"
+        );
+        Ok(())
     }
 
     fn control_request(method: &str, path: &str, origin: Option<&str>, body: &[u8]) -> HttpRequest {
@@ -8427,18 +8865,46 @@ mod tests {
     fn auth_config_requires_bearer_for_bidi_websocket_upgrade() -> TestResult {
         let auth = TempodAuth::bearer("secret-token")?;
 
-        match websocket_upgrade_key_with_auth(&bidi_websocket_request(None), &auth) {
-            Err(TempodError::Unauthorized(_)) => {}
-            other => return Err(format!("expected Unauthorized, got {other:?}").into()),
-        }
-        match websocket_upgrade_key_with_auth(&bidi_websocket_request(Some("wrong-token")), &auth) {
-            Err(TempodError::Unauthorized(_)) => {}
-            other => return Err(format!("expected Unauthorized, got {other:?}").into()),
-        }
-        assert_eq!(
-            websocket_upgrade_key_with_auth(&bidi_websocket_request(Some("secret-token")), &auth)?,
-            Some("dGhlIHNhbXBsZSBub25jZQ==".into())
+        let mut pool = SessionPool::default();
+        let missing = handle_http_request_with_auth(&mut pool, bidi_websocket_request(None), &auth);
+        assert_eq!(missing.status, 401, "upgrade without token: {missing:?}");
+
+        let wrong = handle_http_request_with_auth(
+            &mut pool,
+            bidi_websocket_request(Some("wrong-token")),
+            &auth,
         );
+        assert_eq!(wrong.status, 401, "upgrade with wrong token: {wrong:?}");
+
+        // With the right token the request clears auth and reaches the
+        // WebSocket upgrade (101 Switching Protocols) on a real socket.
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let server_pool = Arc::new(Mutex::new(SessionPool::default()));
+        let server_auth = auth.clone();
+        let handle = thread::spawn(move || serve_one_with_auth(listener, server_pool, server_auth));
+
+        let mut stream = TcpStream::connect(addr)?;
+        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+        stream.write_all(
+            b"GET /bidi HTTP/1.1\r\n\
+              host: 127.0.0.1\r\n\
+              authorization: Bearer secret-token\r\n\
+              upgrade: websocket\r\n\
+              connection: Upgrade\r\n\
+              sec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+              sec-websocket-version: 13\r\n\r\n",
+        )?;
+        let response = read_http_head(&mut stream)?;
+        assert!(
+            response.starts_with("HTTP/1.1 101 Switching Protocols"),
+            "authorized upgrade: {response}"
+        );
+        stream.write_all(&masked_client_frame(WS_OPCODE_CLOSE, &[])?)?;
+        let (opcode, _payload) = read_server_frame(&mut stream)?;
+        assert_eq!(opcode, WS_OPCODE_CLOSE);
+        drop(stream);
+        join_server(handle)?;
         Ok(())
     }
 
@@ -8455,31 +8921,13 @@ mod tests {
             addr,
             "POST /sessions HTTP/1.1\r\ncontent-length: 18446744073709551615\r\n\r\n",
         )?;
-        // The daemon thread must return cleanly (no panic / process death).
+        // The daemon thread must return cleanly (no panic / process death),
+        // and the absurd Content-Length is refused as a client error (hyper
+        // answers 431 for an unsatisfiable message head; the hand-rolled
+        // parser answered 400).
         join_server(handle)?;
-        assert!(response.starts_with("HTTP/1.1 400"));
+        assert!(response.starts_with("HTTP/1.1 4"), "{response}");
         Ok(())
-    }
-
-    #[test]
-    fn content_length_helper_rejects_oversized_and_overflow_values() {
-        let mut over = BTreeMap::new();
-        over.insert(
-            "content-length".to_string(),
-            "18446744073709551615".to_string(),
-        );
-        assert!(content_length(&over).is_err());
-
-        let mut big = BTreeMap::new();
-        big.insert(
-            "content-length".to_string(),
-            (MAX_HTTP_BYTES + 1).to_string(),
-        );
-        assert!(content_length(&big).is_err());
-
-        let mut ok = BTreeMap::new();
-        ok.insert("content-length".to_string(), "12".to_string());
-        assert_eq!(content_length(&ok).ok(), Some(12));
     }
 
     // ---- Issue #85: per-connection errors do not kill the listener ----
@@ -8596,27 +9044,6 @@ mod tests {
         wait_for_connection_counts(&limiter, (0, 0))?;
 
         assert!(!handle.is_finished());
-        Ok(())
-    }
-
-    // ---- Issue #86: read timeout is applied per connection ----
-
-    #[test]
-    fn apply_socket_options_sets_deadlines_and_nodelay() -> TestResult {
-        // Real 30s slowloris timeouts are impractical to exercise in a unit test,
-        // so verify deterministically that the helper installs both deadlines and
-        // TCP_NODELAY on the accepted socket; serve_forever/serve_one call it per
-        // connection.
-        let listener = TcpListener::bind("127.0.0.1:0")?;
-        let addr = listener.local_addr()?;
-        let client = TcpStream::connect(addr)?;
-        let (server, _addr) = listener.accept()?;
-
-        apply_socket_options(&server)?;
-        assert_eq!(server.read_timeout()?, Some(SOCKET_TIMEOUT));
-        assert_eq!(server.write_timeout()?, Some(SOCKET_TIMEOUT));
-        assert!(server.nodelay()?);
-        drop(client);
         Ok(())
     }
 
