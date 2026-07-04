@@ -12,6 +12,7 @@ use tempo_act::{execute_action, execute_batch, ExecutionStatus};
 use tempo_driver::{DriverTrait, Engine, StepOutcome, TransportError};
 use tempo_handshake::{probe_http_origin, LaneDecision, ProbeHit};
 pub use tempo_handshake::{HttpProbeConfig, Lane as StructuredLane, StructuredSignal};
+use tempo_net::resolve_url_target;
 use tempo_policy::{
     ConfirmationGate, InputTaint, Origin, OriginError, OriginPolicy, OriginRuleMode,
 };
@@ -291,6 +292,17 @@ impl TokenBudget {
     pub fn remaining(&self) -> u64 {
         self.max_tokens.saturating_sub(self.used_tokens)
     }
+
+    pub fn ensure_available(&self, tokens: u64) -> Result<(), AgentError> {
+        let attempted = self.used_tokens.saturating_add(tokens);
+        if attempted > self.max_tokens {
+            return Err(AgentError::TokenBudgetExceeded {
+                attempted,
+                max: self.max_tokens,
+            });
+        }
+        Ok(())
+    }
 }
 
 /// Resume cursor derived from existing journal entries.
@@ -488,6 +500,11 @@ impl AgentLoop {
             Some(step) => self.cursor.pending_planned.as_ref() == Some(&step.key),
             None => false,
         }
+    }
+
+    pub fn ensure_next_step_budget(&self) -> Result<(), AgentError> {
+        let step = self.next_step().ok_or(AgentError::PlanComplete)?;
+        self.budget.ensure_available(step.estimated_tokens)
     }
 
     pub fn record_next_outcome(&mut self, outcome: StepOutcome) -> Result<StepTriple, AgentError> {
@@ -957,6 +974,8 @@ impl AgentRunner {
                 return Ok(report);
             }
 
+            agent.ensure_next_step_budget()?;
+
             // Journal intent before the side effect runs (#99) so an interrupted
             // execution is detected — rather than silently repeated — on resume.
             agent.plan_next_step()?;
@@ -1172,6 +1191,8 @@ impl AgentRunner {
                 return Ok(report);
             }
 
+            agent.ensure_next_step_budget()?;
+
             agent.plan_next_step()?;
             let outcome = match &planned.action {
                 Action::Skill { name, input } => {
@@ -1239,15 +1260,14 @@ impl AgentRunner {
         let endpoint = decision
             .mcp_endpoint_url()
             .map_err(|error| error.to_string())?;
-        self.structured_fast_path
-            .config
-            .url_policy
-            .enforce(endpoint.as_str())
-            .map_err(|error| error.to_string())?;
+        let resolved_endpoint =
+            resolve_url_target(&endpoint, &self.structured_fast_path.config.url_policy)
+                .map_err(|error| error.to_string())?;
         let max_body_bytes = self.structured_fast_path.config.max_body_bytes;
         let client = reqwest::Client::builder()
             .timeout(self.structured_fast_path.config.timeout)
             .redirect(reqwest::redirect::Policy::none())
+            .resolve_to_addrs(resolved_endpoint.host(), resolved_endpoint.sockets())
             .build()
             .map_err(|error| error.to_string())?;
 
@@ -3533,6 +3553,95 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn runner_budget_exhaustion_preempts_driver_action_execution() -> TestResult {
+        let root = unique_dir("runner-action-budget-preexecute")?;
+        remove_dir_if_exists(&root)?;
+        fs::create_dir_all(&root)?;
+        let journal_path = root.join("session.jsonl");
+        let task = DriverTask::new(
+            "https://example.com",
+            vec![Action::Click {
+                node: NodeId("submit".into()),
+            }],
+        );
+        let mut driver = FailingDriver::new(TransportFailurePoint::PostActionObserve)
+            .with_elements(vec![button("submit")]);
+        let runner = AgentRunner::new_plaintext_unsafe(
+            &journal_path,
+            AgentRunIds::new(
+                "run-action-budget-preexecute",
+                "session-action-budget-preexecute",
+            ),
+        )
+        .with_confirmation_mode(ConfirmationMode::AutoConfirmAll)
+        .with_token_budget(TokenBudget::new(0));
+
+        let error = runner.run_driver_task(&mut driver, &task).await.err();
+
+        assert!(matches!(
+            error,
+            Some(AgentError::TokenBudgetExceeded { max: 0, .. })
+        ));
+        assert_eq!(driver.goto_calls, 1);
+        assert_eq!(driver.act_calls, 0);
+        let entries = read_journal_entries(&journal_path)?;
+        assert!(!entries
+            .iter()
+            .any(|entry| matches!(entry.event, JournalEvent::ActionPlanned { .. })));
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn structured_budget_exhaustion_preempts_mcp_tool_call() -> TestResult {
+        let root = unique_dir("structured-budget-preempts-mcp")?;
+        remove_dir_if_exists(&root)?;
+        fs::create_dir_all(&root)?;
+        let journal_path = root.join("session.jsonl");
+        let origin = "http://127.0.0.1:9";
+        let task = DriverTask::new(
+            format!("{origin}/app"),
+            vec![Action::Skill {
+                name: "search".into(),
+                input: serde_json::json!({"q": "tempo"}),
+            }],
+        );
+        let decision = StructuredFastPathDecision::new(
+            origin,
+            StructuredLane::Mcp,
+            StructuredSignal::McpCatalog,
+            "/mcp/catalog.json",
+        );
+        let runner = AgentRunner::new_plaintext_unsafe(
+            &journal_path,
+            AgentRunIds::new(
+                "run-structured-budget-preexecute",
+                "session-structured-budget-preexecute",
+            ),
+        )
+        .with_confirmation_mode(ConfirmationMode::AutoConfirmAll)
+        .with_token_budget(TokenBudget::new(0));
+
+        let error = runner.run_structured_task(&task, decision).await.err();
+
+        assert!(matches!(
+            error,
+            Some(AgentError::TokenBudgetExceeded { max: 0, .. })
+        ));
+        let entries = read_journal_entries(&journal_path)?;
+        assert!(entries
+            .iter()
+            .any(|entry| matches!(entry.event, JournalEvent::StructuredFastPathSelected { .. })));
+        assert!(!entries
+            .iter()
+            .any(|entry| matches!(entry.event, JournalEvent::ActionPlanned { .. })));
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn live_cdp_runner_completes_scripted_task_and_journals_it() -> TestResult {
         let Some(chrome) = std::env::var("TEMPO_CDP_CHROME").ok() else {
@@ -4548,6 +4657,7 @@ mod tests {
         failure: TransportFailurePoint,
         goto_calls: usize,
         observe_calls: usize,
+        act_calls: usize,
     }
 
     impl FailingDriver {
@@ -4557,6 +4667,7 @@ mod tests {
                 failure,
                 goto_calls: 0,
                 observe_calls: 0,
+                act_calls: 0,
             }
         }
 
@@ -4596,6 +4707,7 @@ mod tests {
         }
 
         async fn act(&mut self, action: &Action) -> Result<StepOutcome, TransportError> {
+            self.act_calls += 1;
             if self.failure == TransportFailurePoint::Act {
                 return Err(TransportError::Other("act failed".into()));
             }
@@ -4603,6 +4715,7 @@ mod tests {
         }
 
         async fn act_batch(&mut self, batch: &ActionBatch) -> Result<StepOutcome, TransportError> {
+            self.act_calls += batch.actions.len();
             if self.failure == TransportFailurePoint::Act {
                 return Err(TransportError::Other("act failed".into()));
             }
