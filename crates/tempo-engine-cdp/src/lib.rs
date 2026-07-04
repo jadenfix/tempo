@@ -16,7 +16,7 @@ use chromiumoxide::cdp::browser_protocol::dom::{
 };
 use chromiumoxide::cdp::browser_protocol::fetch::{
     ContinueRequestParams, EnableParams as FetchEnableParams, EventRequestPaused,
-    FailRequestParams, RequestPattern,
+    FailRequestParams, RequestPattern, RequestStage,
 };
 use chromiumoxide::cdp::browser_protocol::network::ErrorReason;
 use chromiumoxide::cdp::browser_protocol::page::{CaptureScreenshotFormat, Viewport};
@@ -373,11 +373,6 @@ impl CdpTempoDriver {
         Ok(url)
     }
 
-    async fn snapshot(&self) -> Result<(String, String), TransportError> {
-        let cursor = self.request_policy_cursor();
-        self.snapshot_since(cursor).await
-    }
-
     async fn snapshot_since(&self, cursor: u64) -> Result<(String, String), TransportError> {
         let url = self.current_url().await?;
         self.enforce_current_url_policy_value(&url)?;
@@ -407,9 +402,20 @@ impl CdpTempoDriver {
         Ok(compiled)
     }
 
+    async fn record_snapshot_since(
+        &mut self,
+        cursor: u64,
+        url: String,
+        dom_html: String,
+    ) -> Result<CompiledObservation, TransportError> {
+        let compiled = self.record_snapshot(url, dom_html).await?;
+        self.enforce_no_blocked_request_soon_since(cursor).await?;
+        Ok(compiled)
+    }
+
     async fn record_current_observation(&mut self) -> Result<CompiledObservation, TransportError> {
-        let (url, dom_html) = self.snapshot().await?;
-        self.record_snapshot(url, dom_html).await
+        let cursor = self.request_policy_cursor();
+        self.record_current_observation_since(cursor).await
     }
 
     async fn record_current_observation_since(
@@ -417,7 +423,7 @@ impl CdpTempoDriver {
         cursor: u64,
     ) -> Result<CompiledObservation, TransportError> {
         let (url, dom_html) = self.snapshot_since(cursor).await?;
-        self.record_snapshot(url, dom_html).await
+        self.record_snapshot_since(cursor, url, dom_html).await
     }
 
     async fn enrich_observation_from_ax_tree(
@@ -795,7 +801,8 @@ impl DriverTrait for CdpTempoDriver {
             return Err(TransportError::UrlBlocked);
         }
         let (final_url, dom_html) = self.snapshot_since(cursor).await?;
-        self.record_snapshot(final_url, dom_html).await
+        self.record_snapshot_since(cursor, final_url, dom_html)
+            .await
     }
 
     async fn observe(&mut self) -> Result<CompiledObservation, TransportError> {
@@ -1159,7 +1166,12 @@ async fn install_request_policy(
         .map_err(map_cdp_error)?;
     page.execute(
         FetchEnableParams::builder()
-            .pattern(RequestPattern::builder().url_pattern("*").build())
+            .pattern(
+                RequestPattern::builder()
+                    .url_pattern("*")
+                    .request_stage(RequestStage::Request)
+                    .build(),
+            )
             .build(),
     )
     .await
@@ -3062,6 +3074,49 @@ mod tests {
             !fixture.private_requested.load(Ordering::SeqCst),
             "page-triggered loopback navigation reached the fixture"
         );
+        driver.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_cdp_click_prevent_default_does_not_preblock_private_href(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(chrome) = std::env::var_os("TEMPO_CDP_CHROME") else {
+            eprintln!("skipping live CDP preventDefault policy test; TEMPO_CDP_CHROME is unset");
+            return Ok(());
+        };
+        let config = CdpConfig::default()
+            .with_executable(chrome.to_string_lossy())
+            .with_no_sandbox_env_opt_in();
+        let mut driver = CdpTempoDriver::launch_with(config).await?;
+        driver
+            .evaluate_script(
+                r#"(() => {
+                    document.body.innerHTML = '<a id="go" href="http://127.0.0.1:1/private">Stay</a>';
+                    document.getElementById('go').addEventListener('click', (event) => {
+                        event.preventDefault();
+                        document.body.dataset.clicked = 'yes';
+                    });
+                    return true;
+                })()"#,
+                true,
+            )
+            .await?;
+        let observation = driver.observe().await?;
+        let go_node = observation
+            .elements
+            .iter()
+            .find(|element| element.name.first().map(|span| span.text.as_str()) == Some("Stay"))
+            .map(|element| element.node_id.clone())
+            .ok_or_else(|| std::io::Error::other("missing prevented private link"))?;
+
+        let outcome = driver.act(&Action::Click { node: go_node }).await?;
+
+        assert!(matches!(outcome, StepOutcome::Applied { .. }));
+        let clicked = driver
+            .evaluate_script("Promise.resolve(document.body.dataset.clicked)", true)
+            .await?;
+        assert_eq!(clicked, serde_json::json!("yes"));
         driver.close().await?;
         Ok(())
     }
