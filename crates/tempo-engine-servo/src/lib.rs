@@ -788,8 +788,6 @@ impl ServoNetworkAdapter {
             let proxy_sockets = resolve_proxy(&proxy_target)?;
             if proxy_sockets.is_empty() {
                 return Err(ServoNetworkError::ResolveProxy {
-                    host: proxy_target.host,
-                    port: proxy_target.port,
                     reason: "host resolved to no socket addresses".into(),
                 });
             }
@@ -999,16 +997,12 @@ fn resolve_proxy_endpoint(
 ) -> Result<Vec<SocketAddr>, ServoNetworkError> {
     let sockets = (target.host.as_str(), target.port)
         .to_socket_addrs()
-        .map_err(|error| ServoNetworkError::ResolveProxy {
-            host: target.host.clone(),
-            port: target.port,
-            reason: error.to_string(),
+        .map_err(|_| ServoNetworkError::ResolveProxy {
+            reason: "DNS lookup failed".into(),
         })?
         .collect::<Vec<_>>();
     if sockets.is_empty() {
         return Err(ServoNetworkError::ResolveProxy {
-            host: target.host.clone(),
-            port: target.port,
             reason: "host resolved to no socket addresses".into(),
         });
     }
@@ -1112,12 +1106,8 @@ pub enum ServoNetworkError {
     ClientBuild(String),
     #[error("failed to configure proxy: {0}")]
     Proxy(String),
-    #[error("failed to resolve proxy endpoint {host}:{port}: {reason}")]
-    ResolveProxy {
-        host: String,
-        port: u16,
-        reason: String,
-    },
+    #[error("failed to resolve proxy endpoint: {reason}")]
+    ResolveProxy { reason: String },
     #[error("failed to resolve request target {url}: {reason}")]
     ResolveTarget { url: String, reason: String },
     #[error("invalid redirect from {url}: {reason}")]
@@ -1190,7 +1180,7 @@ mod tests {
     use std::os::unix::net::UnixStream;
     use std::sync::mpsc;
     use std::thread;
-    use std::time::Duration as StdDuration;
+    use std::time::{Duration as StdDuration, Instant};
     use tempo_driver::{DriverTrait, Engine, TestDriver};
     use tempo_engine_host::{serve_driver_connection, EngineIpcConnection};
     use tempo_net::{DomainRule, ProxyRoute};
@@ -1199,6 +1189,15 @@ mod tests {
     type TestResult = Result<(), Box<dyn Error>>;
     type HttpFixture = (
         String,
+        mpsc::Receiver<String>,
+        thread::JoinHandle<Result<(), io::Error>>,
+    );
+    type HttpFixtureParts = (
+        mpsc::Receiver<String>,
+        thread::JoinHandle<Result<(), io::Error>>,
+    );
+    type SocketHttpFixture = (
+        SocketAddr,
         mpsc::Receiver<String>,
         thread::JoinHandle<Result<(), io::Error>>,
     );
@@ -1719,6 +1718,47 @@ mod tests {
     }
 
     #[test]
+    fn servo_network_adapter_redacts_proxy_resolution_errors() -> TestResult {
+        let egress_policy = EgressPolicy::block_by_default()
+            .allow_insecure_local_proxy_endpoints()
+            .proxy_domain(
+                DomainRule::exact("target.example"),
+                ProxyRoute::new("local-proxy", "http://private-endpoint.localhost:8080"),
+            );
+        let adapter = ServoNetworkAdapter::new("profile-a", IdentityMode::AgentDeclared)
+            .with_url_policy(UrlPolicy::allow_all())
+            .with_egress_policy(egress_policy.clone());
+        let request = NetworkRequest::new(
+            "req-1",
+            "GET",
+            "http://target.example/page",
+            "profile-a",
+            IdentityMode::AgentDeclared,
+        );
+        let decision = egress_policy
+            .decide(&request)
+            .map_err(|error| io::Error::other(format!("{error:?}")))?;
+        let resolved_target = ResolvedTarget {
+            host: "target.example".into(),
+            socket: SocketAddr::from(([93, 184, 216, 34], 80)),
+        };
+
+        let error = adapter
+            .client_for_with_proxy_resolver(&decision, &resolved_target, |_| Ok(Vec::new()))
+            .err()
+            .ok_or_else(|| io::Error::other("expected proxy resolution failure"))?;
+        let rendered = format!("{error}\n{error:?}");
+
+        for private in ["private-endpoint", "8080"] {
+            assert!(
+                !rendered.contains(private),
+                "proxy resolution error leaked {private}: {rendered}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn servo_network_adapter_allows_explicit_cleartext_loopback_proxy_socket() -> TestResult {
         let egress_policy = EgressPolicy::block_by_default()
             .allow_insecure_local_proxy_endpoints()
@@ -1747,6 +1787,72 @@ mod tests {
         adapter.client_for_with_proxy_resolver(&decision, &resolved_target, |_| {
             Ok(vec![SocketAddr::from(([127, 0, 0, 1], 8080))])
         })?;
+        Ok(())
+    }
+
+    #[test]
+    fn servo_network_adapter_pins_proxy_dns_to_validated_socket() -> TestResult {
+        let localhost_first = ("localhost", 80)
+            .to_socket_addrs()?
+            .next()
+            .ok_or_else(|| io::Error::other("localhost resolved to no sockets"))?
+            .ip();
+        let proxy_ip = if localhost_first.is_ipv4() {
+            std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+        } else {
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+        };
+        let wrong_ip = if proxy_ip.is_ipv4() {
+            std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+        } else {
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+        };
+        let (proxy_addr, captured_request, server) =
+            serve_http_once_on(proxy_ip, 0, b"via proxy".to_vec())?;
+        let (wrong_addr, _wrong_request, wrong_server) =
+            serve_http_once_on(wrong_ip, proxy_addr.port(), b"wrong proxy".to_vec())?;
+        assert_eq!(wrong_addr.port(), proxy_addr.port());
+        let proxy_host = "localhost";
+        let egress_policy = EgressPolicy::block_by_default()
+            .allow_insecure_local_proxy_endpoints()
+            .proxy_domain(
+                DomainRule::exact("target.example"),
+                ProxyRoute::new(
+                    "local-proxy",
+                    format!("http://{proxy_host}:{}", proxy_addr.port()),
+                ),
+            );
+        let adapter = ServoNetworkAdapter::new("profile-a", IdentityMode::AgentDeclared)
+            .with_url_policy(UrlPolicy::allow_all())
+            .with_egress_policy(egress_policy.clone());
+        let request = ServoNetworkRequest::new("req-1", "GET", "http://target.example/page");
+        let network_request =
+            request.to_network_request(&adapter.profile_id, adapter.identity_mode)?;
+        let decision = egress_policy
+            .decide(&network_request)
+            .map_err(|error| io::Error::other(format!("{error:?}")))?;
+        let resolved_target = ResolvedTarget {
+            host: "target.example".into(),
+            socket: SocketAddr::from(([93, 184, 216, 34], 80)),
+        };
+        let client =
+            adapter.client_for_with_proxy_resolver(&decision, &resolved_target, |target| {
+                assert_eq!(target.host, proxy_host);
+                assert_eq!(target.port, proxy_addr.port());
+                Ok(vec![proxy_addr])
+            })?;
+
+        let response = adapter.send_request(&client, &request, &decision, &[])?;
+        join_server(server)?;
+        let captured = captured_request.recv_timeout(StdDuration::from_secs(1))?;
+
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, b"via proxy");
+        assert!(
+            captured.starts_with("GET http://target.example/page HTTP/1.1"),
+            "{captured}"
+        );
+        join_server(wrong_server)?;
         Ok(())
     }
 
@@ -1799,12 +1905,56 @@ mod tests {
     fn serve_http_once(body: Vec<u8>) -> Result<HttpFixture, io::Error> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let addr = listener.local_addr()?;
+        let (request_rx, handle) = serve_http_once_listener(listener, body, true)?;
+        Ok((format!("http://{addr}"), request_rx, handle))
+    }
+
+    fn serve_http_once_on(
+        ip: std::net::IpAddr,
+        port: u16,
+        body: Vec<u8>,
+    ) -> Result<SocketHttpFixture, io::Error> {
+        let listener = TcpListener::bind(SocketAddr::new(ip, port))?;
+        let addr = listener.local_addr()?;
+        let (request_rx, handle) = serve_http_once_listener(listener, body, false)?;
+        Ok((addr, request_rx, handle))
+    }
+
+    fn serve_http_once_listener(
+        listener: TcpListener,
+        body: Vec<u8>,
+        require_request: bool,
+    ) -> Result<HttpFixtureParts, io::Error> {
+        listener.set_nonblocking(true)?;
         let (request_tx, request_rx) = mpsc::channel();
         let handle = thread::spawn(move || -> Result<(), io::Error> {
-            let (stream, _addr) = listener.accept()?;
-            handle_http_stream(stream, body, request_tx)
+            let timeout = if require_request {
+                StdDuration::from_secs(5)
+            } else {
+                StdDuration::from_secs(1)
+            };
+            let deadline = Instant::now() + timeout;
+            loop {
+                match listener.accept() {
+                    Ok((stream, _addr)) => return handle_http_stream(stream, body, request_tx),
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            return if require_request {
+                                Err(io::Error::new(
+                                    io::ErrorKind::TimedOut,
+                                    "HTTP fixture did not receive a request",
+                                ))
+                            } else {
+                                Ok(())
+                            };
+                        }
+                        thread::sleep(StdDuration::from_millis(10));
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
         });
-        Ok((format!("http://{addr}"), request_rx, handle))
+        Ok((request_rx, handle))
     }
 
     fn handle_http_stream(
