@@ -3273,6 +3273,7 @@ mod tests {
                 diff: ObservationDiff {
                     since_seq: self.observation.seq - 1,
                     seq: self.observation.seq,
+                    omitted: 0,
                     added: Vec::new(),
                     removed: Vec::new(),
                     changed: self.observation.elements.clone(),

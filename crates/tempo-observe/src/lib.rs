@@ -641,6 +641,7 @@ pub fn diff_observations(
     ObservationDiff {
         since_seq: previous.seq,
         seq: current.seq,
+        omitted: current.omitted,
         added,
         removed,
         changed,
@@ -986,8 +987,13 @@ struct ObservationPrefixProbe<'a> {
     url: &'a str,
     seq: u64,
     elements: &'a [InteractiveElement],
+    #[serde(skip_serializing_if = "usize_is_zero")]
     omitted: usize,
     marks: &'a [(NodeId, u32)],
+}
+
+fn usize_is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 /// `io::Write` sink that only counts bytes: budget probing needs the
@@ -1732,7 +1738,7 @@ mod tests {
     fn diff_reports_only_added_removed_and_changed_elements() {
         let mut compiler = ObservationCompiler::new();
         let previous = compiler.compile(checkout_fixture());
-        let current = compiler.compile(ObservationInput::new(
+        let mut current = compiler.compile(ObservationInput::new(
             "https://shop.example/checkout",
             vec![
                 RawElement::new("button", "Pay now")
@@ -1750,16 +1756,42 @@ mod tests {
                     .bounds([120.0, 240.0, 140.0, 38.0]),
             ],
         ));
+        current.omitted = 2;
 
         let diff = diff_observations(&previous, &current);
 
         assert_eq!(diff.since_seq, previous.seq);
         assert_eq!(diff.seq, current.seq);
+        assert_eq!(diff.omitted, 2);
         assert_eq!(diff.added.len(), 1);
         assert_eq!(diff.added[0].name[0].text, "Apply coupon");
         assert_eq!(diff.removed.len(), 1);
         assert_eq!(diff.changed.len(), 1);
         assert_eq!(diff.changed[0].name[0].text, "Email address");
+    }
+
+    #[test]
+    fn budget_probe_matches_zero_omitted_wire_shape() {
+        let url = "https://budget.test";
+        let elements = vec![test_element("node:submit", "button", 1.0)];
+        let marks = Vec::new();
+        let full = assemble_observation(url.into(), 1, elements.clone(), 0, marks.clone());
+        let max_bytes = serialized_len(&full);
+        let serialized = serde_json::to_string(&full).expect("observation serializes");
+        assert!(
+            !serialized.contains("\"omitted\""),
+            "zero omitted count must not change the wire budget: {serialized}"
+        );
+        let options = CompileOptions {
+            max_bytes,
+            max_tokens: 0,
+            max_marks: 0,
+        };
+
+        assert!(prefix_within_budget(url, 1, &elements, 0, &marks, &options));
+        let budgeted = apply_budget(url.into(), 1, elements, options);
+        assert_eq!(budgeted.elements.len(), 1);
+        assert_eq!(budgeted.omitted, 0);
     }
 
     #[test]
@@ -1932,6 +1964,7 @@ mod tests {
         let lossy_diff = ObservationDiff {
             since_seq: previous.seq,
             seq: current.seq,
+            omitted: 0,
             added: Vec::new(),
             removed: Vec::new(),
             changed: Vec::new(),

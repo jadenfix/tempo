@@ -2318,6 +2318,7 @@ fn diff_from_base(
         return ObservationDiff {
             since_seq,
             seq: current.seq,
+            omitted: current.omitted,
             added: current.elements.clone(),
             removed: Vec::new(),
             changed: Vec::new(),
@@ -2358,6 +2359,7 @@ fn diff_from_base(
     ObservationDiff {
         since_seq,
         seq: current.seq,
+        omitted: current.omitted,
         added,
         removed,
         changed,

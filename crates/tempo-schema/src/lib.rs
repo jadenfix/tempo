@@ -92,6 +92,11 @@ fn u32_is_zero(value: &u32) -> bool {
 pub struct ObservationDiff {
     pub since_seq: u64,
     pub seq: u64,
+    /// Ranked elements omitted from the current observation after applying the
+    /// diff. Zero means the current observation contains every candidate the
+    /// compiler considered.
+    #[serde(default, skip_serializing_if = "u32_is_zero")]
+    pub omitted: u32,
     pub added: Vec<InteractiveElement>,
     pub removed: Vec<NodeId>,
     pub changed: Vec<InteractiveElement>,
@@ -705,6 +710,7 @@ pub fn observation_diff_json_schema() -> Value {
         "properties": {
             "since_seq": { "type": "integer", "minimum": 0 },
             "seq": { "type": "integer", "minimum": 0 },
+            "omitted": { "type": "integer", "minimum": 0, "maximum": u32::MAX },
             "added": {
                 "type": "array",
                 "items": { "$ref": "#/$defs/InteractiveElement" }
@@ -1098,6 +1104,15 @@ mod tests {
             .collect();
         assert!(!observation_required.contains(&"marks"));
 
+        let diff = observation_diff_json_schema();
+        let diff_required: Vec<&str> = diff["required"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(!diff_required.contains(&"omitted"));
+
         let grounding = grounding_json_schema();
         let grounding_required: Vec<&str> = grounding["required"]
             .as_array()
@@ -1470,6 +1485,7 @@ mod tests {
             diff: Some(ObservationDiff {
                 since_seq: 2,
                 seq: 3,
+                omitted: 0,
                 added: vec![],
                 removed: vec![],
                 changed: vec![],

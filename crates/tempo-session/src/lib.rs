@@ -1693,6 +1693,7 @@ mod tests {
                 diff: ObservationDiff {
                     since_seq: 0,
                     seq: 1,
+                    omitted: 0,
                     added: vec![],
                     removed: vec![],
                     changed: vec![],
@@ -3341,6 +3342,7 @@ mod tests {
                 diff: ObservationDiff {
                     since_seq: 0,
                     seq: 1,
+                    omitted: 0,
                     added: vec![],
                     removed: vec![],
                     changed: vec![],

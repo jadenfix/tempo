@@ -737,6 +737,7 @@ mod tests {
                 return Ok(ObservationDiff {
                     since_seq,
                     seq: self.seq,
+                    omitted: 0,
                     added: Vec::new(),
                     removed: Vec::new(),
                     changed: Vec::new(),
@@ -745,6 +746,7 @@ mod tests {
             Ok(ObservationDiff {
                 since_seq,
                 seq: self.seq,
+                omitted: 0,
                 added: Vec::new(),
                 removed: Vec::new(),
                 changed: vec![button_element(self.seq)],
@@ -762,6 +764,7 @@ mod tests {
                 diff: ObservationDiff {
                     since_seq: self.seq - 1,
                     seq: self.seq,
+                    omitted: 0,
                     added: Vec::new(),
                     removed: Vec::new(),
                     changed: vec![button_element(self.seq)],
@@ -778,6 +781,7 @@ mod tests {
                 diff: ObservationDiff {
                     since_seq: self.seq,
                     seq: self.seq,
+                    omitted: 0,
                     added: Vec::new(),
                     removed: Vec::new(),
                     changed: Vec::new(),

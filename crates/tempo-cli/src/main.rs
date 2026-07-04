@@ -2146,6 +2146,7 @@ mod tests {
             diff: ObservationDiff {
                 since_seq: 0,
                 seq: 1,
+                omitted: 0,
                 added: Vec::new(),
                 removed: Vec::new(),
                 changed: Vec::new(),

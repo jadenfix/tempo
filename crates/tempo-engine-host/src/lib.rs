@@ -2195,6 +2195,7 @@ mod tests {
         let diff = ObservationDiff {
             since_seq: 41,
             seq: 42,
+            omitted: 0,
             added: vec![],
             removed: vec![],
             changed: vec![],

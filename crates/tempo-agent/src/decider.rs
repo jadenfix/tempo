@@ -1221,7 +1221,7 @@ fn reconstruct_observation(
         url: base.url.clone(),
         seq: diff.seq,
         elements,
-        omitted: base.omitted,
+        omitted: diff.omitted,
         marks: base.marks.clone(),
     })
 }
@@ -1604,6 +1604,7 @@ mod tests {
             tempo_schema::ObservationDiff {
                 since_seq,
                 seq: self.seq,
+                omitted: 0,
                 added: Vec::new(),
                 removed: Vec::new(),
                 changed: vec![button("submit")],
@@ -2511,6 +2512,7 @@ mod tests {
             ObservationDiff {
                 since_seq,
                 seq: self.seq,
+                omitted: current.omitted,
                 added,
                 removed,
                 changed,
@@ -2553,6 +2555,7 @@ mod tests {
                 return Ok(ObservationDiff {
                     since_seq,
                     seq: self.seq,
+                    omitted: 0,
                     added: self.elements.clone(),
                     removed: Vec::new(),
                     changed: Vec::new(),
@@ -2577,6 +2580,7 @@ mod tests {
                 diff: ObservationDiff {
                     since_seq: self.seq - 1,
                     seq: self.seq,
+                    omitted: 0,
                     added: Vec::new(),
                     removed: Vec::new(),
                     changed: Vec::new(),
@@ -2882,6 +2886,7 @@ mod tests {
         let diff = ObservationDiff {
             since_seq: 4,
             seq: 5,
+            omitted: 2,
             added: vec![],
             removed: vec![NodeId("b".into())],
             changed: vec![el("a", 0.2)],
@@ -2899,6 +2904,7 @@ mod tests {
         // Survivors keep their original order; "a" stays first with new content.
         assert_eq!(ids, vec!["a", "c"]);
         assert_eq!(rebuilt.elements[0].rank, 0.2, "changed content not applied");
+        assert_eq!(rebuilt.omitted, 2);
     }
 
     #[test]
@@ -2914,6 +2920,7 @@ mod tests {
         let ok = ObservationDiff {
             since_seq: 4,
             seq: 5,
+            omitted: 0,
             added: vec![],
             removed: vec![],
             changed: vec![],
