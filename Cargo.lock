@@ -8719,8 +8719,10 @@ dependencies = [
 name = "tempo-shell"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "eframe",
  "futures",
+ "png 0.17.16",
  "serde",
  "serde_json",
  "tempo-driver",

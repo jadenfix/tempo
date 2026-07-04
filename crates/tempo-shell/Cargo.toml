@@ -20,7 +20,10 @@ required-features = ["window"]
 # First GUI stack in this crate: `eframe` bundles winit + egui + a glow (GL)
 # backend. OFF by default so headless CI never compiles it (no display / GL
 # system libs on the `check` runner). Build the window with `--features window`.
-window = ["dep:eframe"]
+# `png`/`base64` are pulled in only here: the page-state pane decodes the base64
+# PNG the `screenshot` MCP tool returns into pixels for display. The pure model
+# only ever holds the base64 string, so headless builds need neither.
+window = ["dep:eframe", "dep:png", "dep:base64"]
 
 [dependencies]
 serde = { workspace = true }
@@ -38,6 +41,10 @@ eframe = { version = "0.35", optional = true, default-features = false, features
     "wayland",
     "x11",
 ] }
+# Screenshot-pane decode path (window feature only). `png` matches the version
+# tempo-observe already uses; `base64` matches the sibling shell/net crates.
+png = { version = "0.17", optional = true }
+base64 = { version = "0.22", optional = true }
 
 [dev-dependencies]
 futures = "0.3"

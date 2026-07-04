@@ -16,6 +16,7 @@ use eframe::egui;
 use tempo_headless::TEMPO_TEMPOD_AUTH_TOKEN_ENV;
 use thiserror::Error;
 
+use crate::tab::ScreenshotImage;
 use crate::ui::{ShellUiModel, UiAction};
 use crate::{validate_auth_token, ShellClient, ShellError, DEFAULT_TEMPOD_ADDR};
 
@@ -132,6 +133,11 @@ struct ShellApp {
     auth_token: Option<String>,
     poll_interval: Duration,
     last_poll: Option<Instant>,
+    /// Decoded texture for the active tab's latest snapshot, plus the
+    /// `(session_id, screenshot_seq)` it was decoded from so we only re-decode
+    /// when a fresh snapshot arrives (not every repaint).
+    screenshot_texture: Option<egui::TextureHandle>,
+    rendered_snapshot: Option<(String, u64)>,
 }
 
 impl ShellApp {
@@ -141,6 +147,8 @@ impl ShellApp {
             auth_token: config.auth_token,
             poll_interval: config.poll_interval,
             last_poll: None,
+            screenshot_texture: None,
+            rendered_snapshot: None,
         }
     }
 
@@ -161,6 +169,121 @@ impl ShellApp {
             Some(at) => at.elapsed() >= self.poll_interval,
         }
     }
+
+    /// Render the active tab's page-state image: the latest single-shot
+    /// screenshot, decoded to a texture. Deliberately not interactive — no input
+    /// is forwarded into the image (the live viewport is deferred to #349/#246).
+    /// Decode failures surface as a label; nothing here panics.
+    fn show_page_state(&mut self, ui: &mut egui::Ui) {
+        let snapshot = self.model.active_tab().and_then(|tab| {
+            tab.screenshot
+                .as_ref()
+                .map(|image| (tab.session_id.clone(), tab.screenshot_seq, image.clone()))
+        });
+        let Some((session_id, seq, image)) = snapshot else {
+            ui.label("(no page snapshot yet — press \"Refresh page\")");
+            return;
+        };
+
+        let key = (session_id, seq);
+        if self.rendered_snapshot.as_ref() != Some(&key) {
+            match decode_screenshot(ui.ctx(), &image) {
+                Ok(texture) => {
+                    self.screenshot_texture = Some(texture);
+                    self.rendered_snapshot = Some(key);
+                }
+                Err(err) => {
+                    ui.label(format!("page snapshot decode failed: {err}"));
+                    return;
+                }
+            }
+        }
+
+        if let Some(texture) = &self.screenshot_texture {
+            ui.label("page state (periodic snapshot — not a live viewport):");
+            let sized = egui::load::SizedTexture::from_handle(texture);
+            ui.add(egui::Image::new(sized).max_width(ui.available_width()));
+        }
+    }
+}
+
+/// Decode a [`ScreenshotImage`] (base64 PNG) into an egui texture. Window-only:
+/// the pure model never touches pixels.
+fn decode_screenshot(
+    ctx: &egui::Context,
+    image: &ScreenshotImage,
+) -> Result<egui::TextureHandle, String> {
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(image.data.as_bytes())
+        .map_err(|err| err.to_string())?;
+    let color_image = decode_png_to_color_image(&bytes)?;
+    Ok(ctx.load_texture(
+        "tab-page-state",
+        color_image,
+        egui::TextureOptions::default(),
+    ))
+}
+
+/// Decode 8-bit PNG bytes into an RGBA [`egui::ColorImage`]. Mirrors the
+/// expand/strip transforms tempo-observe uses so grayscale/indexed/16-bit
+/// screenshots still render.
+fn decode_png_to_color_image(png_bytes: &[u8]) -> Result<egui::ColorImage, String> {
+    let mut decoder = png::Decoder::new(png_bytes);
+    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    let mut reader = decoder.read_info().map_err(|err| err.to_string())?;
+    let mut buffer = vec![0; reader.output_buffer_size()];
+    let info = reader
+        .next_frame(&mut buffer)
+        .map_err(|err| err.to_string())?;
+    if info.bit_depth != png::BitDepth::Eight {
+        return Err(format!("unsupported PNG bit depth: {:?}", info.bit_depth));
+    }
+
+    let pixels = &buffer[..info.buffer_size()];
+    let width = info.width as usize;
+    let height = info.height as usize;
+    let expected = width
+        .checked_mul(height)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| "PNG dimensions overflow".to_string())?;
+
+    let rgba = match info.color_type {
+        png::ColorType::Rgba => pixels.to_vec(),
+        png::ColorType::Rgb => {
+            let mut out = Vec::with_capacity(expected);
+            for chunk in pixels.chunks_exact(3) {
+                out.extend_from_slice(&[chunk[0], chunk[1], chunk[2], 255]);
+            }
+            out
+        }
+        png::ColorType::Grayscale => {
+            let mut out = Vec::with_capacity(expected);
+            for gray in pixels {
+                out.extend_from_slice(&[*gray, *gray, *gray, 255]);
+            }
+            out
+        }
+        png::ColorType::GrayscaleAlpha => {
+            let mut out = Vec::with_capacity(expected);
+            for chunk in pixels.chunks_exact(2) {
+                out.extend_from_slice(&[chunk[0], chunk[0], chunk[0], chunk[1]]);
+            }
+            out
+        }
+        other => return Err(format!("unsupported PNG color type: {other:?}")),
+    };
+
+    if rgba.len() != expected {
+        return Err(format!(
+            "PNG frame size mismatch: got {}, expected {expected}",
+            rgba.len()
+        ));
+    }
+    Ok(egui::ColorImage::from_rgba_unmultiplied(
+        [width, height],
+        &rgba,
+    ))
 }
 
 impl eframe::App for ShellApp {
@@ -169,6 +292,12 @@ impl eframe::App for ShellApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         if self.due_for_poll() {
             self.dispatch(UiAction::Refresh);
+            // Keep the active tab's page-state snapshot fresh on the same cadence
+            // (the DoD's "refreshed on an interval"; the button below is the
+            // manual path). Cheap no-op when there is no active tab.
+            if self.model.active_tab().is_some() {
+                self.dispatch(UiAction::RefreshScreenshot);
+            }
             self.last_poll = Some(Instant::now());
         }
 
@@ -182,38 +311,69 @@ impl eframe::App for ShellApp {
                 if ui.button("Refresh").clicked() {
                     pending = Some(UiAction::Refresh);
                 }
+                let health = match model.healthy {
+                    Some(true) => "health: ok",
+                    Some(false) => "health: DOWN",
+                    None => "health: unknown",
+                };
+                ui.label(health);
             });
             ui.horizontal(|ui| {
-                ui.label("open URL:");
+                ui.label("new tab URL:");
                 ui.text_edit_singleline(&mut model.open_url);
-                if ui.button("Open").clicked() {
-                    pending = Some(UiAction::Open);
+                if ui.button("New Tab").clicked() {
+                    pending = Some(UiAction::NewTab);
                 }
             });
+
             ui.separator();
-            let health = match model.healthy {
-                Some(true) => "health: ok",
-                Some(false) => "health: DOWN",
-                None => "health: unknown",
-            };
-            ui.label(health);
-            if model.sessions.is_empty() {
-                ui.label("(no live sessions)");
-            } else {
-                for row in &model.sessions {
-                    ui.horizontal(|ui| {
-                        ui.monospace(&row.id);
-                        ui.label(&row.state);
-                        ui.label(&row.url);
-                        if ui.button("Adopt").clicked() {
-                            pending = Some(UiAction::Adopt(row.id.clone()));
-                        }
-                        if ui.button("Close").clicked() {
-                            pending = Some(UiAction::Close(row.id.clone()));
-                        }
-                    });
+
+            // Tab strip: one selectable per tempod session, with a close button.
+            ui.horizontal_wrapped(|ui| {
+                if model.tabs.is_empty() {
+                    ui.label("(no tabs — open one above)");
                 }
+                for (index, tab) in model.tabs.iter().enumerate() {
+                    let is_active = model.active_tab == Some(index);
+                    let title = tab.current_url().unwrap_or(&tab.session_id);
+                    if ui.selectable_label(is_active, title).clicked() {
+                        pending = Some(UiAction::SelectTab(index));
+                    }
+                    if ui.small_button("x").clicked() {
+                        pending = Some(UiAction::CloseTab(index));
+                    }
+                }
+            });
+
+            // Active-tab chrome: omnibox + back/forward + refresh, then the
+            // periodically-refreshed page-state image (NOT a live viewport).
+            if let Some(active) = model.active_tab
+                && let Some(tab) = model.tabs.get_mut(active)
+            {
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(tab.history.can_back(), egui::Button::new("←"))
+                        .clicked()
+                    {
+                        pending = Some(UiAction::Back);
+                    }
+                    if ui
+                        .add_enabled(tab.history.can_forward(), egui::Button::new("→"))
+                        .clicked()
+                    {
+                        pending = Some(UiAction::Forward);
+                    }
+                    ui.text_edit_singleline(&mut tab.omnibox);
+                    if ui.button("Go").clicked() {
+                        pending = Some(UiAction::Navigate);
+                    }
+                    if ui.button("Refresh page").clicked() {
+                        pending = Some(UiAction::RefreshScreenshot);
+                    }
+                });
+                ui.label(&tab.status);
             }
+
             ui.separator();
             ui.label(&model.status);
         }
@@ -221,6 +381,8 @@ impl eframe::App for ShellApp {
         if let Some(action) = pending {
             self.dispatch(action);
         }
+
+        self.show_page_state(ui);
 
         // Keep the poll cadence alive even when the user is idle.
         ui.ctx().request_repaint_after(self.poll_interval);
@@ -257,5 +419,34 @@ mod tests {
         assert_eq!(app.model.base_url, DEFAULT_TEMPOD_ADDR);
         assert!(app.last_poll.is_none());
         assert!(app.due_for_poll());
+        assert!(app.screenshot_texture.is_none());
+    }
+
+    /// The screenshot-pane decode path is pure (no display) and expands RGB to
+    /// RGBA, so it can be unit tested without opening a window.
+    #[test]
+    fn decodes_rgb_png_to_rgba_color_image() -> Result<(), String> {
+        let mut png_bytes = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut png_bytes, 2, 1);
+            encoder.set_color(png::ColorType::Rgb);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().map_err(|err| err.to_string())?;
+            writer
+                .write_image_data(&[10, 20, 30, 40, 50, 60])
+                .map_err(|err| err.to_string())?;
+        }
+
+        let color = decode_png_to_color_image(&png_bytes)?;
+        assert_eq!(color.size, [2, 1]);
+        assert_eq!(
+            color.pixels[0],
+            egui::Color32::from_rgba_unmultiplied(10, 20, 30, 255)
+        );
+        assert_eq!(
+            color.pixels[1],
+            egui::Color32::from_rgba_unmultiplied(40, 50, 60, 255)
+        );
+        Ok(())
     }
 }
