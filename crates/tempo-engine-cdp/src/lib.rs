@@ -2640,9 +2640,38 @@ fn element_text(html: &str, from: usize, tag: &str) -> Option<String> {
     if matches!(tag, "input" | "select") {
         return None;
     }
-    let close = format!("</{tag}");
-    let end_offset = html[from..].to_ascii_lowercase().find(&close)?;
-    Some(strip_tags(&html[from..from + end_offset]))
+    // Find the "</tag" close marker with a single, allocation-free, ASCII-case-
+    // insensitive scan of the remaining bytes. The previous form
+    // `html[from..].to_ascii_lowercase().find(...)` allocated and byte-copied the
+    // entire document tail *for every interactive element*, i.e. O(elements ×
+    // html_len) per observe — tens of MB of transient allocation on a large page.
+    // `tag` is already lowercased by the caller; we compare case-insensitively for
+    // robustness. Behavior (including a prefix match like `</a` inside `</abbr`) is
+    // identical to the old `str::find`.
+    let rest = &html[from..];
+    let end_offset = find_close_tag(rest.as_bytes(), tag.as_bytes())?;
+    Some(strip_tags(&rest[..end_offset]))
+}
+
+/// Byte offset of the next `</tag` (ASCII-case-insensitive) in `haystack`, or `None`.
+///
+/// Single linear pass: the scan advances strictly past each `<` it inspects, so every
+/// byte is examined at most once — O(haystack.len()), not O(len) per candidate. `<` is
+/// ASCII, so every returned offset is a UTF-8 char boundary (safe to slice at).
+fn find_close_tag(haystack: &[u8], tag: &[u8]) -> Option<usize> {
+    let mut i = 0;
+    while let Some(rel) = haystack[i..].iter().position(|&b| b == b'<') {
+        let open = i + rel;
+        let name = open + 2; // skip past "</"
+        if haystack.get(open + 1) == Some(&b'/')
+            && name + tag.len() <= haystack.len()
+            && haystack[name..name + tag.len()].eq_ignore_ascii_case(tag)
+        {
+            return Some(open);
+        }
+        i = open + 1;
+    }
+    None
 }
 
 fn strip_tags(input: &str) -> String {
@@ -2767,6 +2796,33 @@ mod tests {
         assert_eq!(elements[0].name[0].text, "Save");
         assert_eq!(elements[1].value[0].text, "me@example.com");
         assert_eq!(elements[3].role, "button");
+    }
+
+    #[test]
+    fn find_close_tag_matches_case_insensitively_in_one_pass() {
+        // Case-insensitive, returns the byte offset of the '<' of "</tag".
+        assert_eq!(find_close_tag(b"hi</A>", b"a"), Some(2));
+        assert_eq!(find_close_tag(b"x<span>y</SPAN>z", b"span"), Some(8));
+        // First matching close wins; earlier non-matching '<' are skipped.
+        assert_eq!(find_close_tag(b"<b>bold</i></b>", b"b"), Some(11));
+        // No close tag present.
+        assert_eq!(find_close_tag(b"<b>unterminated", b"b"), None);
+        // Prefix-match quirk preserved from the old str::find form: "</a" matches
+        // inside "</abbr" (harmless — identical to prior behavior).
+        assert_eq!(find_close_tag(b"x</abbr>", b"a"), Some(1));
+    }
+
+    #[test]
+    fn element_text_reads_inner_text_without_allocating_the_tail() {
+        // `from` points just past the element's open tag; text runs to "</tag".
+        let html = "<p>lead</p><button>Click <b>me</b></button>tail";
+        let open = "<p>lead</p><button>".len();
+        assert_eq!(
+            element_text(html, open, "button").as_deref(),
+            Some("Click me")
+        );
+        // input/select never carry inner text.
+        assert_eq!(element_text("<input>", 7, "input"), None);
     }
 
     #[test]
