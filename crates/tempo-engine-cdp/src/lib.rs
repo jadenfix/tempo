@@ -320,9 +320,14 @@ impl CdpTempoDriver {
             .unwrap_or_default())
     }
 
-    async fn snapshot(&self) -> Result<(String, String), TransportError> {
+    async fn enforce_current_url_policy(&self) -> Result<String, TransportError> {
         let url = self.current_url().await?;
         self.enforce_url_policy(&url)?;
+        Ok(url)
+    }
+
+    async fn snapshot(&self) -> Result<(String, String), TransportError> {
+        let url = self.enforce_current_url_policy().await?;
         let dom_html = self.page()?.content().await.map_err(map_cdp_error)?;
         Ok((url, dom_html))
     }
@@ -384,6 +389,7 @@ impl CdpTempoDriver {
         root: DomNodeId,
         selector: &str,
     ) -> Result<Option<AxSummary>, TransportError> {
+        self.enforce_current_url_policy().await?;
         let page = self.page()?;
         let queried = match page.execute(QuerySelectorParams::new(root, selector)).await {
             Ok(response) => response.result,
@@ -447,6 +453,7 @@ impl CdpTempoDriver {
         F: FnOnce(chromiumoxide::Element) -> Fut,
         Fut: std::future::Future<Output = Result<(), TransportError>>,
     {
+        self.enforce_current_url_policy().await?;
         match self.page()?.find_element(selector).await {
             Ok(element) => match op(element).await {
                 Ok(()) => Ok(true),
@@ -522,6 +529,7 @@ impl CdpTempoDriver {
         &self,
         selector: &str,
     ) -> Result<serde_json::Value, TransportError> {
+        self.enforce_current_url_policy().await?;
         self.page()?
             .evaluate(extraction_script(selector)?)
             .await
@@ -605,6 +613,7 @@ impl CdpTempoDriver {
                     .await
             }
             Action::Scroll { x, y } => {
+                self.enforce_current_url_policy().await?;
                 self.page()?
                     .evaluate(format!("window.scrollTo({}, {});", *x as i64, *y as i64))
                     .await
@@ -639,6 +648,7 @@ impl CdpTempoDriver {
         let mut tracker = CompositeQuiescenceTracker::new(3);
 
         loop {
+            self.enforce_current_url_policy().await?;
             let ready_state = self
                 .page()?
                 .evaluate("document.readyState")
@@ -646,6 +656,7 @@ impl CdpTempoDriver {
                 .map_err(map_cdp_error)?
                 .into_value::<String>()
                 .map_err(|error| TransportError::Other(error.to_string()))?;
+            self.enforce_current_url_policy().await?;
             let dom_html = self.page()?.content().await.map_err(map_cdp_error)?;
             let sample = PageStabilitySample {
                 ready: ready_state != "loading",
@@ -874,6 +885,7 @@ impl DriverTrait for CdpTempoDriver {
             .await_promise(await_promise)
             .build()
             .map_err(TransportError::Other)?;
+        self.enforce_current_url_policy().await?;
         self.page()?
             .evaluate(params)
             .await
@@ -888,6 +900,7 @@ impl DriverTrait for CdpTempoDriver {
             .clip(screenshot_viewport_clip()?)
             .capture_beyond_viewport(false)
             .build();
+        self.enforce_current_url_policy().await?;
         let bytes = self
             .page()?
             .screenshot(params)
