@@ -1115,9 +1115,8 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     diff == 0
 }
 
-/// Verify the connecting peer's uid matches the server's own uid via
-/// `SO_PEERCRED` before serving it. On non-Linux targets (where `SO_PEERCRED`
-/// is unavailable through the safe `nix` wrapper) this is a no-op.
+/// Verify the connecting peer's uid matches the server's own uid before serving
+/// it. Linux uses `SO_PEERCRED`; macOS and BSD use `getpeereid`.
 #[cfg(target_os = "linux")]
 fn authorize_peer(stream: &UnixStream) -> Result<(), EngineHostError> {
     let creds = nix::sys::socket::getsockopt(stream, nix::sys::socket::sockopt::PeerCredentials)
@@ -1125,14 +1124,42 @@ fn authorize_peer(stream: &UnixStream) -> Result<(), EngineHostError> {
     authorize_peer_uid(creds.uid(), nix::unistd::geteuid().as_raw())
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+fn authorize_peer(stream: &UnixStream) -> Result<(), EngineHostError> {
+    let (peer_uid, _peer_gid) = nix::unistd::getpeereid(stream)
+        .map_err(|errno| EngineHostError::PeerCredentials(errno.to_string()))?;
+    authorize_peer_uid(peer_uid.as_raw(), nix::unistd::geteuid().as_raw())
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+)))]
 fn authorize_peer(_stream: &UnixStream) -> Result<(), EngineHostError> {
     Ok(())
 }
 
 /// Pure uid comparison extracted for testing: the peer is authorized only when
 /// its uid matches the server's uid.
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+    test
+))]
 fn authorize_peer_uid(peer_uid: u32, server_uid: u32) -> Result<(), EngineHostError> {
     if peer_uid == server_uid {
         Ok(())
@@ -1880,7 +1907,14 @@ mod tests {
         ));
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    ))]
     #[test]
     fn accept_authorizes_same_uid_peer_and_restricts_socket_permissions() -> TestResult {
         let root = unique_dir("peercred")?;
@@ -1983,7 +2017,14 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    ))]
     fn join_connect(
         handle: thread::JoinHandle<Result<EngineIpcClient, EngineHostError>>,
     ) -> Result<EngineIpcClient, Box<dyn Error>> {
