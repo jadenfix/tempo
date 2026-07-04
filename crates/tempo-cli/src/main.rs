@@ -30,7 +30,9 @@ use tempo_observe::{
     observation_corpus_report, CompileOptions, ObservationCorpusReport, ObservationInput,
 };
 use tempo_schema::Action;
-use tempo_session::{read_journal_entries, JournalEntry, JournalError, JournalEvent};
+use tempo_session::{
+    read_journal_entries, DurableRetentionPolicy, JournalEntry, JournalError, JournalEvent,
+};
 use tempo_taint::{run_taint_gate, TaintRedTeamCase};
 use thiserror::Error;
 
@@ -283,6 +285,7 @@ impl Command {
                     chrome,
                     allow_private_network,
                     confirmation_mode,
+                    retention_policy: None,
                 })?;
                 write_json(&output, &report, stdout)
             }
@@ -850,6 +853,7 @@ struct RunCdpTaskConfig {
     chrome: Option<String>,
     allow_private_network: bool,
     confirmation_mode: ConfirmationMode,
+    retention_policy: Option<DurableRetentionPolicy>,
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize)]
@@ -950,6 +954,7 @@ fn run_cdp_task(config: RunCdpTaskConfig) -> Result<RunCdpTaskReport, CliError> 
         )
         .with_confirmation_mode(config.confirmation_mode)
         .with_structured_fast_path(structured_fast_path);
+        let runner = with_retention_policy(runner, config.retention_policy.clone());
         let report = runtime.block_on(runner.run_structured_task(&task, decision))?;
         return Ok(RunCdpTaskReport::from_agent_report(report));
     }
@@ -970,6 +975,7 @@ fn run_cdp_task(config: RunCdpTaskConfig) -> Result<RunCdpTaskReport, CliError> 
         )
         .with_confirmation_mode(config.confirmation_mode)
         .with_structured_fast_path(StructuredFastPath::disabled());
+        let runner = with_retention_policy(runner, config.retention_policy);
 
         let run_result = runner.run_driver_task(&mut driver, &task).await;
         let close_result = driver.close().await;
@@ -977,6 +983,16 @@ fn run_cdp_task(config: RunCdpTaskConfig) -> Result<RunCdpTaskReport, CliError> 
         close_result?;
         Ok(RunCdpTaskReport::from_agent_report(report))
     })
+}
+
+fn with_retention_policy(
+    runner: AgentRunner,
+    retention_policy: Option<DurableRetentionPolicy>,
+) -> AgentRunner {
+    match retention_policy {
+        Some(retention_policy) => runner.with_retention_policy(retention_policy),
+        None => runner,
+    }
 }
 
 fn run_status(status: &AgentRunStatus) -> RunCdpTaskStatus {
@@ -1745,6 +1761,9 @@ mod tests {
         remove_dir(&dir)?;
         fs::create_dir_all(&dir)?;
         let (origin, server) = serve_mcp_catalog_probe_fixture()?;
+        let retention_policy = DurableRetentionPolicy::encrypted(
+            tempo_session::DurableEncryptionKey::from_bytes([23; 32]),
+        );
 
         let report = run_cdp_task(RunCdpTaskConfig {
             start_url: format!("{origin}/app"),
@@ -1755,6 +1774,7 @@ mod tests {
             chrome: Some("/definitely/not/a/chrome/binary".into()),
             allow_private_network: true,
             confirmation_mode: ConfirmationMode::DenyHumanRequired,
+            retention_policy: Some(retention_policy.clone()),
         })?;
         server
             .join()
@@ -1766,7 +1786,10 @@ mod tests {
         assert_eq!(report.status.signal, Some("mcp_catalog"));
         assert_eq!(report.observations, 0);
         assert!(report.steps.is_empty());
-        let entries = tempo_session::read_journal_entries(dir.join("session.jsonl"))?;
+        let entries = tempo_session::read_journal_entries_with_retention_policy(
+            dir.join("session.jsonl"),
+            &retention_policy,
+        )?;
         assert!(entries
             .iter()
             .any(|entry| matches!(entry.event, JournalEvent::StructuredFastPathSelected { .. })));
