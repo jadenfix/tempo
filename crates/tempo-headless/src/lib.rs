@@ -319,6 +319,34 @@ impl PrivacyMode {
     }
 }
 
+/// Current process privacy mode from `TEMPO_STEALTH_MODE`.
+pub fn privacy_mode_from_env() -> PrivacyMode {
+    PrivacyMode::from_env_value(std::env::var_os(TEMPO_STEALTH_MODE_ENV))
+}
+
+/// Apply privacy-mode retention rules to process-level telemetry.
+///
+/// Stealth mode disables local log output/ring retention and the `/metrics`
+/// exposition endpoint even when telemetry was otherwise enabled by config.
+pub fn configure_process_telemetry_for_privacy(
+    privacy_mode: PrivacyMode,
+    configured_metrics_enabled: bool,
+) -> bool {
+    let retain_local_telemetry = privacy_mode.retains_history();
+    tempo_telemetry::logger().set_local_output_enabled(retain_local_telemetry);
+    let effective_metrics_enabled =
+        metrics_enabled_for_privacy(privacy_mode, configured_metrics_enabled);
+    set_metrics_enabled(effective_metrics_enabled);
+    effective_metrics_enabled
+}
+
+const fn metrics_enabled_for_privacy(
+    privacy_mode: PrivacyMode,
+    configured_metrics_enabled: bool,
+) -> bool {
+    configured_metrics_enabled && privacy_mode.retains_history()
+}
+
 /// Per-driver (per browsing context / fork / root) operation gate.
 ///
 /// Serializes engine round-trips issued through clones of the SAME driver
@@ -6402,6 +6430,14 @@ mod tests {
             Err(TempodError::SessionNotFound(_))
         ));
         Ok(())
+    }
+
+    #[test]
+    fn stealth_mode_disables_metrics_exposition_even_when_config_enabled() {
+        assert!(metrics_enabled_for_privacy(PrivacyMode::Audit, true));
+        assert!(!metrics_enabled_for_privacy(PrivacyMode::Audit, false));
+        assert!(!metrics_enabled_for_privacy(PrivacyMode::Stealth, true));
+        assert!(!metrics_enabled_for_privacy(PrivacyMode::Stealth, false));
     }
 
     #[test]

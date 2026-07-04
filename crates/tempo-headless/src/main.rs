@@ -41,17 +41,22 @@ fn main() {
         }
     };
 
+    let privacy_mode = tempo_headless::privacy_mode_from_env();
+    let effective_metrics_enabled = tempo_headless::configure_process_telemetry_for_privacy(
+        privacy_mode,
+        layered.telemetry.metrics_enabled,
+    );
     if let Some(level) = tempo_telemetry::Level::parse(&layered.telemetry.log_level) {
         tempo_telemetry::logger().set_min_level(level);
     }
-    tempo_headless::set_metrics_enabled(layered.telemetry.metrics_enabled);
     let navigation_url_policy = options.navigation_url_policy();
     tempo_telemetry::logger()
         .event(tempo_telemetry::Level::Info, "tempod", "starting")
         .field("addr", options.addr.clone())
         .field("engine", format!("{:?}", options.engine))
         .field("attached_engine", options.engine_socket.is_some())
-        .field("metrics_enabled", layered.telemetry.metrics_enabled)
+        .field("metrics_enabled", effective_metrics_enabled)
+        .field("privacy_mode", format!("{privacy_mode:?}"))
         .field("allow_private_network", options.allow_private_network)
         .emit();
 
