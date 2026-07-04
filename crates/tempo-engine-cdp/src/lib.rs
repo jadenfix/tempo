@@ -629,10 +629,6 @@ impl DriverTrait for CdpTempoDriver {
             .goto(url)
             .await
             .map_err(|error| self.map_navigation_error(error))?;
-        self.page()?
-            .wait_for_navigation()
-            .await
-            .map_err(|error| self.map_navigation_error(error))?;
         if self.take_blocked_request()?.is_some() {
             return Err(TransportError::UrlBlocked);
         }
