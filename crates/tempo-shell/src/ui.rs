@@ -11,6 +11,7 @@
 //! transport a single implementation (no reimplementation) and lets tests inject
 //! a mock without a network.
 
+use crate::tab::{ScreenshotImage, Tab};
 use crate::{HealthResponse, ShellClient, ShellError};
 use tempo_headless::{TempodSession, TempodSessionState};
 
@@ -51,6 +52,10 @@ pub trait SessionService {
     fn open(&self, url: &str) -> Result<TempodSession, ShellError>;
     fn adopt(&self, session_id: &str) -> Result<TempodSession, ShellError>;
     fn close(&self, session_id: &str) -> Result<TempodSession, ShellError>;
+    /// Navigate a tab's driver to `url` (omnibox / back / forward).
+    fn goto(&self, driver_id: Option<&str>, url: &str) -> Result<(), ShellError>;
+    /// Fetch a single-shot page snapshot for a tab's driver.
+    fn screenshot(&self, driver_id: Option<&str>) -> Result<ScreenshotImage, ShellError>;
 }
 
 impl SessionService for ShellClient {
@@ -73,6 +78,14 @@ impl SessionService for ShellClient {
     fn close(&self, session_id: &str) -> Result<TempodSession, ShellError> {
         ShellClient::close(self, session_id)
     }
+
+    fn goto(&self, driver_id: Option<&str>, url: &str) -> Result<(), ShellError> {
+        ShellClient::goto(self, driver_id, url)
+    }
+
+    fn screenshot(&self, driver_id: Option<&str>) -> Result<ScreenshotImage, ShellError> {
+        ShellClient::screenshot(self, driver_id)
+    }
 }
 
 /// A user intent produced by the window chrome and consumed by the reducer.
@@ -87,6 +100,44 @@ pub enum UiAction {
     Adopt(String),
     /// Close the given session id.
     Close(String),
+    /// Open the URL in [`ShellUiModel::open_url`] as a new tab (opens a tempod
+    /// session and makes it active).
+    NewTab,
+    /// Make the tab at the given index active.
+    SelectTab(usize),
+    /// Close the tab at the given index (and its tempod session).
+    CloseTab(usize),
+    /// Navigate the active tab to its omnibox URL (pushes history).
+    Navigate,
+    /// Move the active tab back one history entry (re-issues goto).
+    Back,
+    /// Move the active tab forward one history entry (re-issues goto).
+    Forward,
+    /// Refresh the active tab's page-state screenshot.
+    RefreshScreenshot,
+}
+
+/// Which way [`ShellUiModel::step_history`] walks the active tab's stack.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HistoryStep {
+    Back,
+    Forward,
+}
+
+impl HistoryStep {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Back => "back",
+            Self::Forward => "forward",
+        }
+    }
+
+    fn label_capitalized(self) -> &'static str {
+        match self {
+            Self::Back => "Back",
+            Self::Forward => "Forward",
+        }
+    }
 }
 
 /// The observable UI state: the base-url/open-url fields, the session list, the
@@ -99,6 +150,10 @@ pub struct ShellUiModel {
     pub sessions: Vec<SessionRow>,
     pub status: String,
     pub healthy: Option<bool>,
+    /// One tab per tempod session, each with its own history/omnibox/snapshot.
+    pub tabs: Vec<Tab>,
+    /// Index into [`Self::tabs`] of the tab whose chrome is shown, if any.
+    pub active_tab: Option<usize>,
 }
 
 impl Default for ShellUiModel {
@@ -109,6 +164,8 @@ impl Default for ShellUiModel {
             sessions: Vec::new(),
             status: "Idle — press Refresh to list sessions.".to_string(),
             healthy: None,
+            tabs: Vec::new(),
+            active_tab: None,
         }
     }
 }
@@ -131,6 +188,172 @@ impl ShellUiModel {
             UiAction::Open => self.open(service),
             UiAction::Adopt(session_id) => self.adopt(service, &session_id),
             UiAction::Close(session_id) => self.close(service, &session_id),
+            UiAction::NewTab => self.new_tab(service),
+            UiAction::SelectTab(index) => self.select_tab(index),
+            UiAction::CloseTab(index) => self.close_tab(service, index),
+            UiAction::Navigate => self.navigate(service),
+            UiAction::Back => self.step_history(service, HistoryStep::Back),
+            UiAction::Forward => self.step_history(service, HistoryStep::Forward),
+            UiAction::RefreshScreenshot => self.refresh_screenshot(service),
+        }
+    }
+
+    /// The active tab, if any.
+    pub fn active_tab(&self) -> Option<&Tab> {
+        self.active_tab.and_then(|index| self.tabs.get(index))
+    }
+
+    fn new_tab(&mut self, service: &dyn SessionService) {
+        let url = self.open_url.trim().to_string();
+        if url.is_empty() {
+            self.status = "Enter a URL for the new tab.".to_string();
+            return;
+        }
+        match service.open(&url) {
+            Ok(session) => {
+                let row = SessionRow::from(&session);
+                // A new tab targets the default attached driver (`None`);
+                // per-tab drivers are the shared-session work deferred to #246.
+                let tab = Tab::new(row.id.clone(), None, session.url.clone());
+                self.status = format!("Opened tab {} → {}", row.id, row.url);
+                self.upsert(row);
+                self.tabs.push(tab);
+                self.active_tab = Some(self.tabs.len() - 1);
+                self.open_url.clear();
+            }
+            Err(err) => self.set_error("new tab", &err),
+        }
+    }
+
+    fn select_tab(&mut self, index: usize) {
+        if let Some(tab) = self.tabs.get(index) {
+            self.status = format!("Switched to tab {}", tab.session_id);
+            self.active_tab = Some(index);
+        } else {
+            self.status = format!("No tab at index {index}");
+        }
+    }
+
+    fn close_tab(&mut self, service: &dyn SessionService, index: usize) {
+        let Some(session_id) = self.tabs.get(index).map(|tab| tab.session_id.clone()) else {
+            self.status = format!("No tab at index {index}");
+            return;
+        };
+        match service.close(&session_id) {
+            Ok(session) => {
+                self.upsert(SessionRow::from(&session));
+                self.tabs.remove(index);
+                self.active_tab = match self.active_tab {
+                    _ if self.tabs.is_empty() => None,
+                    Some(active) if active > index => Some(active - 1),
+                    Some(active) => Some(active.min(self.tabs.len() - 1)),
+                    None => None,
+                };
+                self.status = format!("Closed tab {session_id}");
+            }
+            Err(err) => self.set_error("close tab", &err),
+        }
+    }
+
+    fn navigate(&mut self, service: &dyn SessionService) {
+        let Some(active) = self.active_tab else {
+            self.status = "No active tab to navigate.".to_string();
+            return;
+        };
+        let outcome = {
+            let Some(tab) = self.tabs.get_mut(active) else {
+                self.status = "No active tab to navigate.".to_string();
+                return;
+            };
+            let url = tab.omnibox.trim().to_string();
+            if url.is_empty() {
+                tab.status = "Enter a URL.".to_string();
+                self.status = "Enter a URL.".to_string();
+                return;
+            }
+            let session_id = tab.session_id.clone();
+            match service.goto(tab.driver_id.as_deref(), &url) {
+                Ok(()) => {
+                    tab.history.push(url.clone());
+                    tab.status = format!("Navigated to {url}");
+                    Ok((session_id, url))
+                }
+                Err(err) => {
+                    tab.status = format!("goto failed: {err}");
+                    Err(err)
+                }
+            }
+        };
+        match outcome {
+            Ok((session_id, url)) => self.status = format!("Tab {session_id} → {url}"),
+            Err(err) => self.set_error("goto", &err),
+        }
+    }
+
+    fn step_history(&mut self, service: &dyn SessionService, step: HistoryStep) {
+        let Some(active) = self.active_tab else {
+            self.status = "No active tab.".to_string();
+            return;
+        };
+        let target = self.tabs.get_mut(active).and_then(|tab| match step {
+            HistoryStep::Back => tab.history.back().map(str::to_string),
+            HistoryStep::Forward => tab.history.forward().map(str::to_string),
+        });
+        let Some(url) = target else {
+            self.status = format!("Nothing to go {}.", step.label());
+            return;
+        };
+        let outcome = {
+            let Some(tab) = self.tabs.get_mut(active) else {
+                return;
+            };
+            let session_id = tab.session_id.clone();
+            tab.omnibox = url.clone();
+            match service.goto(tab.driver_id.as_deref(), &url) {
+                Ok(()) => {
+                    tab.status = format!("{} to {url}", step.label_capitalized());
+                    Ok(session_id)
+                }
+                Err(err) => {
+                    tab.status = format!("goto failed: {err}");
+                    Err(err)
+                }
+            }
+        };
+        match outcome {
+            Ok(session_id) => {
+                self.status = format!("{}: tab {session_id} → {url}", step.label_capitalized());
+            }
+            Err(err) => self.set_error("goto", &err),
+        }
+    }
+
+    fn refresh_screenshot(&mut self, service: &dyn SessionService) {
+        let Some(active) = self.active_tab else {
+            self.status = "No active tab to snapshot.".to_string();
+            return;
+        };
+        let outcome = {
+            let Some(tab) = self.tabs.get_mut(active) else {
+                return;
+            };
+            let session_id = tab.session_id.clone();
+            match service.screenshot(tab.driver_id.as_deref()) {
+                Ok(image) => {
+                    tab.screenshot = Some(image);
+                    tab.screenshot_seq += 1;
+                    tab.status = "Screenshot refreshed.".to_string();
+                    Ok(session_id)
+                }
+                Err(err) => {
+                    tab.status = format!("screenshot failed: {err}");
+                    Err(err)
+                }
+            }
+        };
+        match outcome {
+            Ok(session_id) => self.status = format!("Screenshot refreshed for tab {session_id}"),
+            Err(err) => self.set_error("screenshot", &err),
         }
     }
 
@@ -299,6 +522,22 @@ mod tests {
                 TempodSessionState::Killed,
             ))
         }
+
+        fn goto(&self, driver_id: Option<&str>, url: &str) -> Result<(), ShellError> {
+            self.record(format!("goto:{}:{url}", driver_id.unwrap_or("-")));
+            self.maybe_fail("goto")?;
+            Ok(())
+        }
+
+        fn screenshot(&self, driver_id: Option<&str>) -> Result<ScreenshotImage, ShellError> {
+            self.record(format!("screenshot:{}", driver_id.unwrap_or("-")));
+            self.maybe_fail("screenshot")?;
+            Ok(ScreenshotImage {
+                mime_type: "image/png".to_string(),
+                encoding: "base64".to_string(),
+                data: "QUJD".to_string(),
+            })
+        }
     }
 
     #[test]
@@ -421,6 +660,208 @@ mod tests {
             "status was {:?}",
             model.status
         );
+    }
+
+    #[test]
+    fn new_tab_opens_session_and_becomes_active() {
+        let service = MockService::default();
+        let mut model = ShellUiModel {
+            open_url: "https://tab.test".into(),
+            ..ShellUiModel::default()
+        };
+
+        model.dispatch(UiAction::NewTab, &service);
+
+        assert_eq!(service.calls(), vec!["open:https://tab.test"]);
+        assert_eq!(model.tabs.len(), 1);
+        assert_eq!(model.active_tab, Some(0));
+        assert_eq!(model.tabs[0].session_id, "session-new");
+        assert_eq!(model.tabs[0].current_url(), Some("https://tab.test"));
+        // Opening a tab also mirrors into the session list.
+        assert_eq!(model.sessions.len(), 1);
+        assert!(model.open_url.is_empty());
+    }
+
+    #[test]
+    fn new_tab_without_url_does_not_call_service() {
+        let service = MockService::default();
+        let mut model = ShellUiModel::default();
+
+        model.dispatch(UiAction::NewTab, &service);
+
+        assert!(service.calls().is_empty());
+        assert!(model.tabs.is_empty());
+        assert_eq!(model.active_tab, None);
+    }
+
+    #[test]
+    fn select_tab_updates_active() {
+        let service = MockService::default();
+        let mut model = ShellUiModel {
+            tabs: vec![
+                Tab::new("session-0", None, "https://a.test"),
+                Tab::new("session-1", None, "https://b.test"),
+            ],
+            active_tab: Some(0),
+            ..ShellUiModel::default()
+        };
+
+        model.dispatch(UiAction::SelectTab(1), &service);
+        assert_eq!(model.active_tab, Some(1));
+
+        // Out-of-range selection is a no-op on the active index.
+        model.dispatch(UiAction::SelectTab(5), &service);
+        assert_eq!(model.active_tab, Some(1));
+    }
+
+    #[test]
+    fn close_tab_closes_session_and_reindexes_active() {
+        let service = MockService::default();
+        let mut model = ShellUiModel {
+            tabs: vec![
+                Tab::new("session-0", None, "https://a.test"),
+                Tab::new("session-1", None, "https://b.test"),
+                Tab::new("session-2", None, "https://c.test"),
+            ],
+            active_tab: Some(2),
+            ..ShellUiModel::default()
+        };
+
+        model.dispatch(UiAction::CloseTab(0), &service);
+
+        assert_eq!(service.calls(), vec!["close:session-0"]);
+        assert_eq!(model.tabs.len(), 2);
+        assert_eq!(model.tabs[0].session_id, "session-1");
+        // Active shifts down with the removed lower-indexed tab.
+        assert_eq!(model.active_tab, Some(1));
+    }
+
+    #[test]
+    fn navigate_dispatches_goto_to_active_tab_and_pushes_history() {
+        let service = MockService::default();
+        let mut tab = Tab::new("session-0", None, "https://a.test");
+        tab.omnibox = "https://b.test".into();
+        let mut model = ShellUiModel {
+            tabs: vec![tab],
+            active_tab: Some(0),
+            ..ShellUiModel::default()
+        };
+
+        model.dispatch(UiAction::Navigate, &service);
+
+        assert_eq!(service.calls(), vec!["goto:-:https://b.test"]);
+        assert_eq!(model.tabs[0].current_url(), Some("https://b.test"));
+        assert!(model.tabs[0].history.can_back());
+        assert!(model.status.contains("session-0"));
+    }
+
+    #[test]
+    fn navigate_targets_each_tabs_own_driver() {
+        let service = MockService::default();
+        let mut tab = Tab::new("session-1", Some("fork-7".into()), "https://a.test");
+        tab.omnibox = "https://c.test".into();
+        let mut model = ShellUiModel {
+            tabs: vec![tab],
+            active_tab: Some(0),
+            ..ShellUiModel::default()
+        };
+
+        model.dispatch(UiAction::Navigate, &service);
+
+        // The tab's driver_id is forwarded, so goto hits the right session.
+        assert_eq!(service.calls(), vec!["goto:fork-7:https://c.test"]);
+    }
+
+    #[test]
+    fn back_and_forward_reissue_goto_for_active_tab() {
+        let service = MockService::default();
+        let mut model = ShellUiModel {
+            tabs: vec![Tab::new("session-0", None, "https://a.test")],
+            active_tab: Some(0),
+            ..ShellUiModel::default()
+        };
+        // Navigate forward twice to build a stack: a -> b -> c.
+        model.tabs[0].omnibox = "https://b.test".into();
+        model.dispatch(UiAction::Navigate, &service);
+        model.tabs[0].omnibox = "https://c.test".into();
+        model.dispatch(UiAction::Navigate, &service);
+
+        model.dispatch(UiAction::Back, &service);
+        assert_eq!(model.tabs[0].current_url(), Some("https://b.test"));
+        assert_eq!(model.tabs[0].omnibox, "https://b.test");
+
+        model.dispatch(UiAction::Forward, &service);
+        assert_eq!(model.tabs[0].current_url(), Some("https://c.test"));
+
+        assert_eq!(
+            service.calls(),
+            vec![
+                "goto:-:https://b.test", // navigate to b
+                "goto:-:https://c.test", // navigate to c
+                "goto:-:https://b.test", // back to b
+                "goto:-:https://c.test", // forward to c
+            ]
+        );
+    }
+
+    #[test]
+    fn back_at_oldest_entry_is_a_no_op() {
+        let service = MockService::default();
+        let mut model = ShellUiModel {
+            tabs: vec![Tab::new("session-0", None, "https://a.test")],
+            active_tab: Some(0),
+            ..ShellUiModel::default()
+        };
+
+        model.dispatch(UiAction::Back, &service);
+
+        assert!(
+            service.calls().is_empty(),
+            "no goto when nothing to go back to"
+        );
+        assert!(model.status.contains("Nothing to go back"));
+    }
+
+    #[test]
+    fn refresh_screenshot_requests_active_tabs_driver_and_stores_image() {
+        let service = MockService::default();
+        let mut model = ShellUiModel {
+            tabs: vec![Tab::new(
+                "session-9",
+                Some("fork-2".into()),
+                "https://a.test",
+            )],
+            active_tab: Some(0),
+            ..ShellUiModel::default()
+        };
+
+        model.dispatch(UiAction::RefreshScreenshot, &service);
+
+        assert_eq!(service.calls(), vec!["screenshot:fork-2"]);
+        let shot = model.tabs[0].screenshot.as_ref();
+        assert_eq!(
+            shot.map(|image| image.mime_type.as_str()),
+            Some("image/png")
+        );
+        assert_eq!(model.tabs[0].screenshot_seq, 1);
+    }
+
+    #[test]
+    fn screenshot_error_surfaces_to_status_and_leaves_no_image() {
+        let service = MockService {
+            fail: Some("screenshot"),
+            ..MockService::default()
+        };
+        let mut model = ShellUiModel {
+            tabs: vec![Tab::new("session-0", None, "https://a.test")],
+            active_tab: Some(0),
+            ..ShellUiModel::default()
+        };
+
+        model.dispatch(UiAction::RefreshScreenshot, &service);
+
+        assert!(model.tabs[0].screenshot.is_none());
+        assert!(model.status.contains("screenshot failed"));
     }
 
     /// The reducer drives a real tempod over the existing ShellClient transport,

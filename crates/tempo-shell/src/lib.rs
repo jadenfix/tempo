@@ -12,6 +12,7 @@ use std::time::Duration;
 use tempo_headless::{TempodSession, TempodSessionEvent, TempodSessionId};
 use thiserror::Error;
 
+pub mod tab;
 pub mod ui;
 #[cfg(feature = "window")]
 pub mod window;
@@ -280,6 +281,34 @@ impl ShellClient {
             return Err(ShellError::Usage("handshake ORIGIN is required".into()));
         }
         self.mcp_tool("handshake", json!({ "origin": origin }))
+    }
+
+    /// Navigate `driver_id` (or the default attached driver) to `url` via the
+    /// `act` MCP tool with an [`Action::Goto`]. This is the omnibox/back/forward
+    /// primitive: there is no native history in `DriverTrait`, so the shell
+    /// re-issues a `goto` for every navigation.
+    pub fn goto(&self, driver_id: Option<&str>, url: &str) -> Result<(), ShellError> {
+        let action = serde_json::to_value(tempo_schema::Action::Goto {
+            url: url.to_string(),
+        })?;
+        let mut arguments = json!({ "action": action });
+        if let Some(driver_id) = driver_id {
+            arguments["driver_id"] = json!(driver_id);
+        }
+        self.mcp_tool("act", arguments)?;
+        Ok(())
+    }
+
+    /// Fetch a single-shot page snapshot from `driver_id` (or the default
+    /// attached driver) via the `screenshot` MCP tool. Not a live frame — the
+    /// caller refreshes it on an interval or a button.
+    pub fn screenshot(&self, driver_id: Option<&str>) -> Result<tab::ScreenshotImage, ShellError> {
+        let mut arguments = json!({});
+        if let Some(driver_id) = driver_id {
+            arguments["driver_id"] = json!(driver_id);
+        }
+        let structured = self.mcp_tool("screenshot", arguments)?;
+        tab::ScreenshotImage::from_structured(&structured)
     }
 
     pub fn mcp_tool(&self, name: &str, arguments: Value) -> Result<Value, ShellError> {
