@@ -845,8 +845,13 @@ fn open_journal_connection(path: &Path, mode: JournalOpenMode) -> Result<Connect
     if let JournalOpenMode::ReadWriteCreate = &mode {
         ensure_private_path_permissions(path)?;
     }
-    configure_journal_connection(&conn, &mode)?;
+    conn.busy_timeout(JOURNAL_BUSY_TIMEOUT)?;
+    // The version gate must run before `configure_journal_connection`: the WAL
+    // conversion there is a persistent, file-mutating pragma, and a journal rejected
+    // as incompatible must be left byte-identical on disk (no mode flip, no orphaned
+    // -wal/-shm sidecars) for the newer tempo that owns it.
     check_journal_version(&conn, path)?;
+    configure_journal_connection(&conn, &mode)?;
     if let JournalOpenMode::ReadWriteCreate = mode {
         initialize_journal_schema(&conn)?;
         stamp_journal_version(&conn)?;
@@ -950,11 +955,13 @@ fn stamp_journal_version(conn: &Connection) -> Result<(), JournalError> {
     Ok(())
 }
 
+/// Apply the write-path pragmas. Only called after [`check_journal_version`] has
+/// accepted the file, because `journal_mode=WAL` is a persistent mutation and a
+/// rejected journal must be left untouched.
 fn configure_journal_connection(
     conn: &Connection,
     mode: &JournalOpenMode,
 ) -> Result<(), JournalError> {
-    conn.busy_timeout(JOURNAL_BUSY_TIMEOUT)?;
     // A read-only connection cannot (and must not) write these pragmas; doing so would
     // require a write lock and defeat the lock-free read/resume contract. WAL is a
     // persistent database property, so read-only connections inherit it from the file.
@@ -2816,6 +2823,51 @@ mod tests {
             SessionJournal::open(&path, run_id, session_id),
             Err(JournalError::IncompatibleVersion { .. })
         ));
+
+        remove_if_exists(&path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn rejected_incompatible_version_open_leaves_file_byte_identical() -> TestResult {
+        // The IncompatibleVersion gate must run before the persistent WAL pragma:
+        // a journal owned by a newer tempo is rejected, so this version must not
+        // flip its journal mode, restamp its header, or leave -wal/-shm sidecars.
+        let path = unique_path("newer-version-untouched")?;
+        remove_if_exists(&path)?;
+        let run_id = RunId("run-ver-untouched".into());
+        let session_id = SessionId("session-ver-untouched".into());
+
+        {
+            let mut journal = SessionJournal::open(&path, run_id.clone(), session_id.clone())?;
+            journal.append(JournalEvent::SessionStarted {
+                url: "https://example.com".into(),
+            })?;
+        }
+        {
+            let conn = Connection::open(&path)?;
+            conn.execute_batch(&format!(
+                "PRAGMA user_version={};",
+                SUPPORTED_JOURNAL_VERSION + 1
+            ))?;
+        }
+        // Clear any stale sidecars left by builds that persist them past close, so
+        // the assertions below observe only what the rejected open itself creates.
+        remove_one_if_exists(&sqlite_sidecar_path(&path, "-wal"))?;
+        remove_one_if_exists(&sqlite_sidecar_path(&path, "-shm"))?;
+        let before = fs::read(&path)?;
+
+        assert!(matches!(
+            SessionJournal::open(&path, run_id, session_id),
+            Err(JournalError::IncompatibleVersion { .. })
+        ));
+
+        assert!(
+            fs::read(&path)? == before,
+            "rejected incompatible-version open mutated the journal file"
+        );
+        assert!(!sqlite_sidecar_path(&path, "-wal").exists());
+        assert!(!sqlite_sidecar_path(&path, "-shm").exists());
 
         remove_if_exists(&path)?;
         Ok(())
