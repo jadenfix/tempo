@@ -48,10 +48,12 @@ Resource, lifecycle & availability:
 - [ ] Every engine/remote/subprocess round-trip has a timeout **and** a recovery path — a crash or hang is detected and healed (restart/reconnect, with backoff), not permanently terminal.
 - [ ] Health/readiness signals reflect real state (draining, dependency-down, at-capacity); cleanup and teardown run on every exit path including error and cancel.
 - [ ] Locks are narrow, consistently ordered, released on panic (poison recovered, not fatal), and never held across `.await`, navigation, or subprocess I/O — the pool lock especially, so `/health` and `/drain` stay responsive.
+- [ ] Durable/journal writes use a batched single-writer path (e.g. WAL + a dedicated writer), not per-write open + full fsync; a crash or kill mid-write must be recoverable on restart with no torn or lost committed state.
 
 Trust boundaries & security:
 - [ ] Caller-supplied trust/policy/side-effect classifications (`taint`, `confirmed`, …) are recomputed server-side, never trusted.
 - [ ] Untrusted data is size-checked, provenance-tracked, and cannot cause side effects or leak secret headers; a policy (URL, egress, redaction) is enforced across the whole path — redirects, retries, interception — not just the entrypoint.
+- [ ] Untrusted descriptors and attestations (OpenAPI/WebMCP catalogs, handshake evidence) are origin-bound and cannot themselves drive side effects or inject secret headers.
 - [ ] A detector or guard runs on data that actually reaches it: check that upstream filtering/compilation didn't strip the very signal the check needs.
 
 Performance on hot paths (a regression here is a correctness bug for this project):
