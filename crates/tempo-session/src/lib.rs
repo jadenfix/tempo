@@ -703,9 +703,7 @@ fn durable_retention_policy_from_env_values(
         .filter(|value| !value.is_empty());
 
     match retention.as_deref() {
-        Some("plaintext-unsafe" | "plaintext" | "plain") => {
-            Ok(DurableRetentionPolicy::PlaintextUnsafe)
-        }
+        Some("plaintext-unsafe") => Ok(DurableRetentionPolicy::PlaintextUnsafe),
         Some("encrypted" | "encrypt") | None => {
             let Some(key_hex) = key_hex_value
                 .as_ref()
@@ -2148,6 +2146,12 @@ mod tests {
             durable_retention_policy_from_env_values(Some(OsString::from("forever")), None),
             Err(JournalError::InvalidDurableRetentionPolicy { value }) if value == "forever"
         ));
+        for alias in ["plaintext", "plain"] {
+            assert!(matches!(
+                durable_retention_policy_from_env_values(Some(OsString::from(alias)), None),
+                Err(JournalError::InvalidDurableRetentionPolicy { value }) if value == alias
+            ));
+        }
         Ok(())
     }
 
