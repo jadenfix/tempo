@@ -12,7 +12,7 @@ use chromiumoxide::cdp::browser_protocol::accessibility::{
 };
 use chromiumoxide::cdp::browser_protocol::browser::BrowserContextId;
 use chromiumoxide::cdp::browser_protocol::dom::{
-    DescribeNodeParams, GetDocumentParams, NodeId as DomNodeId, QuerySelectorParams,
+    GetDocumentParams, NodeId as DomNodeId, QuerySelectorParams,
 };
 use chromiumoxide::cdp::browser_protocol::fetch::{
     ContinueRequestParams, EnableParams as FetchEnableParams, EventRequestPaused,
@@ -490,29 +490,18 @@ impl CdpTempoDriver {
             return Ok(None);
         }
 
-        let described = match page
-            .execute(
-                DescribeNodeParams::builder()
-                    .node_id(queried.node_id)
-                    .build(),
-            )
-            .await
-        {
-            Ok(response) => response.result,
-            Err(error)
-                if matches!(error, CdpError::NotFound)
-                    || is_node_not_found_msg(&error.to_string()) =>
-            {
-                return Ok(None);
-            }
-            Err(error) => return Err(map_cdp_error(error)),
-        };
-
-        let backend_node_id = described.node.backend_node_id;
+        // `Accessibility.getPartialAXTree` accepts a DOM node id directly, so the
+        // querySelector result feeds straight into it. The previous pipeline also
+        // issued a `DOM.describeNode` between the two purely to translate the DOM
+        // node id into a backend node id; that hop is redundant and is dropped
+        // here, cutting one dependent CDP round-trip per enriched element on the
+        // observation hot path (#299). `fetch_relatives(false)` scopes the reply
+        // to the queried node alone — no ancestors, siblings, or children — so
+        // the response describes exactly that element's own AX node.
         let ax_nodes = match page
             .execute(
                 GetPartialAxTreeParams::builder()
-                    .backend_node_id(backend_node_id)
+                    .node_id(queried.node_id)
                     .fetch_relatives(false)
                     .build(),
             )
@@ -528,9 +517,8 @@ impl CdpTempoDriver {
             }
             Err(error) => return Err(map_cdp_error(error)),
         };
-        let summaries = ax_summaries_by_backend_id(&ax_nodes);
 
-        Ok(summaries.get(backend_node_id.inner()).cloned())
+        Ok(sole_ax_summary(&ax_nodes))
     }
 
     async fn with_element<F, Fut>(&self, selector: &str, op: F) -> Result<bool, TransportError>
@@ -2095,6 +2083,20 @@ struct AxSummary {
     value: Option<String>,
 }
 
+/// The AX summary of the single node described by a `GetPartialAXTree` reply
+/// fetched with `fetch_relatives = false`.
+///
+/// With relatives disabled the reply carries only the queried element's own AX
+/// node (ancestors/siblings/children are not fetched), so
+/// `ax_summaries_by_backend_id` — which already skips ignored nodes and those
+/// with no role/name/value — yields at most one entry: that element's summary.
+/// Taking it is therefore exactly equivalent to the previous
+/// `backend_node_id`-keyed lookup, which selected that same node, while no
+/// longer needing the backend node id from a separate `DOM.describeNode` call.
+fn sole_ax_summary(nodes: &[AxNode]) -> Option<AxSummary> {
+    ax_summaries_by_backend_id(nodes).into_values().next()
+}
+
 fn ax_summaries_by_backend_id(nodes: &[AxNode]) -> BTreeMap<i64, AxSummary> {
     let mut summaries = BTreeMap::new();
     for node in nodes {
@@ -2933,6 +2935,70 @@ mod tests {
         Ok(())
     }
 
+    /// `sole_ax_summary` must return exactly what the old
+    /// `ax_summaries_by_backend_id(..).get(backend_id)` lookup returned. Dropping
+    /// the `DOM.describeNode` round-trip (#299) means the backend node id is no
+    /// longer known ahead of time, so enrichment now takes the single node a
+    /// `fetch_relatives = false` reply describes instead of keying by backend id.
+    /// This asserts the two selections agree on a reply shaped like the real
+    /// getPartialAXTree(fetch_relatives=false) output: the queried element plus
+    /// the ignored/uninteresting nodes that carry no summary.
+    #[test]
+    fn sole_ax_summary_matches_backend_id_keyed_selection() {
+        let target_backend_id = 42_i64;
+
+        // The queried element's own AX node — the only summarizable node in a
+        // fetch_relatives=false reply.
+        let mut target = AxNode::new(AxNodeId::new("target"), false);
+        target.backend_dom_node_id = Some(BackendNodeId::new(target_backend_id));
+        target.role = Some(test_ax_value(
+            AxValueType::Role,
+            serde_json::json!("button"),
+        ));
+        target.name = Some(test_ax_value(
+            AxValueType::ComputedString,
+            serde_json::json!("Submit"),
+        ));
+
+        // An ignored node (e.g. a wrapper) that carries a backend id but no
+        // summary — present in real replies, filtered by the summary builder.
+        let mut ignored = AxNode::new(AxNodeId::new("ignored"), true);
+        ignored.backend_dom_node_id = Some(BackendNodeId::new(7));
+        ignored.role = Some(test_ax_value(AxValueType::Role, serde_json::json!("none")));
+
+        // A non-ignored node with no role/name/value — also filtered out.
+        let empty = AxNode::new(AxNodeId::new("empty"), false);
+
+        let nodes = vec![ignored, target, empty];
+
+        // Old selection: build the map, key by the target's backend id.
+        let old = ax_summaries_by_backend_id(&nodes)
+            .get(&target_backend_id)
+            .cloned();
+        // New selection: take the single summarizable node.
+        let new = sole_ax_summary(&nodes);
+
+        assert!(old.is_some(), "the queried element must have a summary");
+        assert_eq!(new, old, "sole_ax_summary must equal the backend-id lookup");
+    }
+
+    /// When the queried element itself is not in the accessibility tree (ignored
+    /// or summary-less), both the old backend-id lookup and `sole_ax_summary`
+    /// yield `None` — no enrichment is applied, matching prior behavior.
+    #[test]
+    fn sole_ax_summary_is_none_when_no_summarizable_node() {
+        let mut ignored = AxNode::new(AxNodeId::new("ignored"), true);
+        ignored.backend_dom_node_id = Some(BackendNodeId::new(9));
+        ignored.name = Some(test_ax_value(
+            AxValueType::ComputedString,
+            serde_json::json!("hidden"),
+        ));
+
+        let nodes = vec![ignored];
+        assert_eq!(sole_ax_summary(&nodes), None);
+        assert!(ax_summaries_by_backend_id(&nodes).is_empty());
+    }
+
     #[test]
     fn blocks_private_navigation_by_default() {
         let policy = UrlPolicy::block_private();
@@ -3402,6 +3468,75 @@ mod tests {
             .evaluate_script("Promise.resolve(document.body.dataset.clicked)", true)
             .await?;
         assert_eq!(clicked, serde_json::json!("yes"));
+        driver.close().await?;
+        Ok(())
+    }
+
+    /// End-to-end guard for the #299 round-trip cut: after dropping the
+    /// `DOM.describeNode` hop and feeding the querySelector DOM node id straight
+    /// into `GetPartialAXTree`, the observation must still carry the real
+    /// accessibility-tree overlay. The fixture names its controls only through
+    /// `aria-labelledby`, which the raw DOM extractor does not resolve (it reads
+    /// `aria-label`/`title`/`value`/text) — so the asserted names can *only* come
+    /// from the accessibility tree, proving the batched path produces output
+    /// identical to the sequential one.
+    #[tokio::test]
+    async fn live_cdp_ax_enrichment_survives_describe_node_drop(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(chrome) = std::env::var_os("TEMPO_CDP_CHROME") else {
+            eprintln!("skipping live CDP AX enrichment test; TEMPO_CDP_CHROME is unset");
+            return Ok(());
+        };
+        let config = CdpConfig::default()
+            .with_executable(chrome.to_string_lossy())
+            .with_no_sandbox_env_opt_in();
+        let mut driver = CdpTempoDriver::launch_with(config).await?;
+        driver
+            .evaluate_script(
+                r#"(() => {
+                    document.body.innerHTML =
+                        '<span id="save-label">Save document</span>' +
+                        '<button id="save" aria-labelledby="save-label"></button>' +
+                        '<span id="email-label">Email address</span>' +
+                        '<input id="email" type="text" aria-labelledby="email-label" value="me@example.com">';
+                    return true;
+                })()"#,
+                true,
+            )
+            .await?;
+
+        let observation = driver.observe().await?;
+
+        let save = observation
+            .elements
+            .iter()
+            .find(|element| element.role == "button")
+            .ok_or_else(|| std::io::Error::other("missing save button"))?;
+        // Raw extraction would leave this name empty (no aria-label/title/value/
+        // text); "Save document" is resolved from aria-labelledby by the AX tree.
+        assert_eq!(
+            save.name.first().map(|span| span.text.as_str()),
+            Some("Save document"),
+            "AX-tree accessible name must survive the describeNode drop"
+        );
+
+        let email = observation
+            .elements
+            .iter()
+            .find(|element| element.role == "textbox")
+            .ok_or_else(|| std::io::Error::other("missing email input"))?;
+        // Raw extraction would name this element after its value; the AX tree
+        // overrides it with the aria-labelledby target.
+        assert_eq!(
+            email.name.first().map(|span| span.text.as_str()),
+            Some("Email address"),
+            "AX-tree accessible name must override the raw value-derived name"
+        );
+        assert_eq!(
+            email.value.first().map(|span| span.text.as_str()),
+            Some("me@example.com"),
+        );
+
         driver.close().await?;
         Ok(())
     }
