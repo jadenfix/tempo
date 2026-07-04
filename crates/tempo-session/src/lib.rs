@@ -359,8 +359,21 @@ impl CassetteKey {
         update_length_prefixed(&mut hasher, method.as_bytes());
         update_length_prefixed(&mut hasher, url.as_bytes());
         update_length_prefixed(&mut hasher, body);
-        let digest = hasher.finalize();
+        Self::from_hasher(hasher)
+    }
 
+    fn legacy_v1_from_request(method: &str, url: &str, body: &[u8]) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(method.as_bytes());
+        hasher.update([0]);
+        hasher.update(url.as_bytes());
+        hasher.update([0]);
+        hasher.update(body);
+        Self::from_hasher(hasher)
+    }
+
+    fn from_hasher(hasher: Sha256) -> Self {
+        let digest = hasher.finalize();
         let mut key = String::with_capacity(digest.len() * 2);
         for byte in digest {
             // Writing formatted hex into a String is infallible.
@@ -512,6 +525,37 @@ impl CassetteStore {
             }
         }
         Ok(None)
+    }
+
+    /// Replay a request using the current key format, migrating pre-v2 cassette
+    /// records when a legacy key is the only match.
+    pub fn replay_request(
+        &self,
+        method: &str,
+        url: &str,
+        request_body: impl AsRef<[u8]>,
+    ) -> Result<Option<ResponseCassette>, JournalError> {
+        let request_body = request_body.as_ref();
+        let key = CassetteKey::from_request(method, url, request_body);
+        if let Some(cassette) = self.replay(&key)? {
+            return Ok(Some(cassette));
+        }
+
+        let legacy_key = CassetteKey::legacy_v1_from_request(method, url, request_body);
+        if legacy_key == key {
+            return Ok(None);
+        }
+
+        let Some(legacy_cassette) = self.replay(&legacy_key)? else {
+            return Ok(None);
+        };
+
+        let migrated_cassette = ResponseCassette {
+            key,
+            ..legacy_cassette
+        };
+        self.record(&migrated_cassette)?;
+        Ok(Some(migrated_cassette))
     }
 
     pub fn all(&self) -> Result<Vec<ResponseCassette>, JournalError> {
@@ -1667,6 +1711,92 @@ mod tests {
             Err(JournalError::CassetteConflict { key }) if key == first.key
         ));
         assert_eq!(store.all()?, vec![first]);
+
+        remove_if_exists(&path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn cassette_replay_request_migrates_legacy_key() -> TestResult {
+        let path = unique_path("cassette-legacy-key")?;
+        remove_if_exists(&path)?;
+        let method = "POST";
+        let url = "https://example.com/api";
+        let request_body = b"left\0right";
+        let current_key = CassetteKey::from_request(method, url, request_body);
+        let legacy_key = CassetteKey::legacy_v1_from_request(method, url, request_body);
+        assert_ne!(current_key, legacy_key);
+
+        let legacy = ResponseCassette {
+            key: legacy_key,
+            method: method.into(),
+            url: url.into(),
+            status: 200,
+            headers: vec![("content-type".into(), "application/json".into())],
+            body: br#"{"ok":true}"#.to_vec(),
+        };
+        let expected = ResponseCassette {
+            key: current_key.clone(),
+            ..legacy.clone()
+        };
+
+        let store = CassetteStore::open(&path)?;
+        store.record(&legacy)?;
+        assert_eq!(store.replay(&current_key)?, None);
+
+        assert_eq!(
+            store.replay_request(method, url, request_body)?,
+            Some(expected.clone())
+        );
+        assert_eq!(store.replay(&current_key)?, Some(expected.clone()));
+        assert_eq!(store.all()?, vec![legacy, expected.clone()]);
+
+        assert_eq!(
+            store.replay_request(method, url, request_body)?,
+            Some(expected)
+        );
+        assert_eq!(store.all()?.len(), 2);
+
+        remove_if_exists(&path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn cassette_replay_request_prefers_current_key() -> TestResult {
+        let path = unique_path("cassette-current-key")?;
+        remove_if_exists(&path)?;
+        let method = "GET";
+        let url = "https://example.com/api";
+        let request_body = b"";
+        let current_key = CassetteKey::from_request(method, url, request_body);
+        let legacy_key = CassetteKey::legacy_v1_from_request(method, url, request_body);
+
+        let legacy = ResponseCassette {
+            key: legacy_key,
+            method: method.into(),
+            url: url.into(),
+            status: 200,
+            headers: Vec::new(),
+            body: b"legacy".to_vec(),
+        };
+        let current = ResponseCassette {
+            key: current_key,
+            method: method.into(),
+            url: url.into(),
+            status: 202,
+            headers: Vec::new(),
+            body: b"current".to_vec(),
+        };
+
+        let store = CassetteStore::open(&path)?;
+        store.record(&legacy)?;
+        store.record(&current)?;
+
+        assert_eq!(
+            store.replay_request(method, url, request_body)?,
+            Some(current.clone())
+        );
+        assert_eq!(store.all()?, vec![legacy, current]);
 
         remove_if_exists(&path)?;
         Ok(())
