@@ -1,8 +1,19 @@
 use std::path::PathBuf;
+use tempo_config::TempodConfig;
 use tempo_driver::Engine;
 
 fn main() {
-    let options = match TempodOptions::parse(std::env::args().skip(1)) {
+    // Layered configuration: built-in defaults < JSON file named by
+    // TEMPO_CONFIG < TEMPO_* environment variables. The CLI flags parsed
+    // below are the top layer and override whatever the layers produced.
+    let layered = match TempodConfig::load_from_process_env() {
+        Ok(config) => config,
+        Err(err) => {
+            eprintln!("tempod configuration error: {err}");
+            std::process::exit(2);
+        }
+    };
+    let options = match TempodOptions::parse(std::env::args().skip(1), &layered) {
         Ok(options) => options,
         Err(err) => {
             eprintln!("{err}");
@@ -16,6 +27,19 @@ fn main() {
             std::process::exit(2);
         }
     };
+
+    if let Some(level) = tempo_telemetry::Level::parse(&layered.telemetry.log_level) {
+        tempo_telemetry::logger().set_min_level(level);
+    }
+    tempo_headless::set_metrics_enabled(layered.telemetry.metrics_enabled);
+    tempo_telemetry::logger()
+        .event(tempo_telemetry::Level::Info, "tempod", "starting")
+        .field("addr", options.addr.clone())
+        .field("engine", format!("{:?}", options.engine))
+        .field("attached_engine", options.engine_socket.is_some())
+        .field("metrics_enabled", layered.telemetry.metrics_enabled)
+        .field("stealth_mode", layered.stealth_mode)
+        .emit();
 
     let result = match options.engine_socket {
         Some(socket_path) => tempo_headless::run_tempod_with_attached_driver_config(
@@ -42,21 +66,26 @@ struct TempodOptions {
 }
 
 impl TempodOptions {
-    fn parse(args: impl IntoIterator<Item = String>) -> Result<Self, String> {
+    fn parse(
+        args: impl IntoIterator<Item = String>,
+        defaults: &TempodConfig,
+    ) -> Result<Self, String> {
         Self::parse_with_env(
             args,
             std::env::var(tempo_headless::TEMPO_TEMPOD_AUTH_TOKEN_ENV).ok(),
+            defaults,
         )
     }
 
     fn parse_with_env(
         args: impl IntoIterator<Item = String>,
         env_auth_token: Option<String>,
+        defaults: &TempodConfig,
     ) -> Result<Self, String> {
         let mut addr = None;
-        let mut engine = Engine::Cdp;
+        let mut engine = engine_from_config(defaults.engine);
         let mut engine_was_set = false;
-        let mut engine_socket = None;
+        let mut engine_socket = defaults.engine_socket.clone().map(PathBuf::from);
         let mut allow_remote = false;
         let mut auth_token = env_auth_token.filter(|token| !token.is_empty());
         let mut args = args.into_iter();
@@ -105,7 +134,7 @@ impl TempodOptions {
         }
 
         Ok(Self {
-            addr: addr.unwrap_or_else(|| "127.0.0.1:8787".into()),
+            addr: addr.unwrap_or_else(|| defaults.bind_addr.clone()),
             engine,
             engine_socket,
             allow_remote,
@@ -128,6 +157,13 @@ impl TempodOptions {
     }
 }
 
+fn engine_from_config(engine: tempo_config::EngineKind) -> Engine {
+    match engine {
+        tempo_config::EngineKind::Cdp => Engine::Cdp,
+        tempo_config::EngineKind::Servo => Engine::Servo,
+    }
+}
+
 fn parse_engine(value: &str) -> Result<Engine, String> {
     match value {
         "cdp" => Ok(Engine::Cdp),
@@ -140,7 +176,9 @@ fn usage() -> String {
     format!(
         "usage: tempod [ADDR] [--engine cdp|servo] [--engine-socket PATH] [--allow-remote] [--auth-token TOKEN]\n\
          \n\
+         layered config: defaults < JSON file named by {config_env} < TEMPO_* env < flags\n\
          non-loopback binds require --allow-remote plus --auth-token TOKEN or {env}",
+        config_env = tempo_config::ENV_CONFIG_PATH,
         env = tempo_headless::TEMPO_TEMPOD_AUTH_TOKEN_ENV,
     )
 }
@@ -159,6 +197,7 @@ mod tests {
                 "secret-token".to_string(),
             ],
             None,
+            &TempodConfig::default(),
         )?;
 
         assert_eq!(options.addr, "0.0.0.0:8787");
@@ -169,15 +208,62 @@ mod tests {
 
     #[test]
     fn auth_token_defaults_from_env() -> Result<(), String> {
-        let options = TempodOptions::parse_with_env(std::iter::empty(), Some("env-token".into()))?;
+        let options = TempodOptions::parse_with_env(
+            std::iter::empty(),
+            Some("env-token".into()),
+            &TempodConfig::default(),
+        )?;
 
         assert_eq!(options.auth_token.as_deref(), Some("env-token"));
         Ok(())
     }
 
     #[test]
+    fn layered_config_supplies_defaults_and_flags_override() -> Result<(), String> {
+        let defaults = TempodConfig {
+            bind_addr: "127.0.0.1:9999".to_string(),
+            engine: tempo_config::EngineKind::Servo,
+            engine_socket: Some("/tmp/config-engine.sock".to_string()),
+            ..TempodConfig::default()
+        };
+
+        // No args: config supplies addr, engine, and socket.
+        let options = TempodOptions::parse_with_env(std::iter::empty(), None, &defaults)?;
+        assert_eq!(options.addr, "127.0.0.1:9999");
+        assert_eq!(options.engine, Engine::Servo);
+        assert_eq!(
+            options.engine_socket,
+            Some(PathBuf::from("/tmp/config-engine.sock"))
+        );
+
+        // Flags override the config layer.
+        let options = TempodOptions::parse_with_env(
+            [
+                "127.0.0.1:1234".to_string(),
+                "--engine".to_string(),
+                "cdp".to_string(),
+                "--engine-socket".to_string(),
+                "/tmp/flag-engine.sock".to_string(),
+            ],
+            None,
+            &defaults,
+        )?;
+        assert_eq!(options.addr, "127.0.0.1:1234");
+        assert_eq!(options.engine, Engine::Cdp);
+        assert_eq!(
+            options.engine_socket,
+            Some(PathBuf::from("/tmp/flag-engine.sock"))
+        );
+        Ok(())
+    }
+
+    #[test]
     fn explicit_engine_requires_engine_socket() {
-        let error = match TempodOptions::parse(["--engine".to_string(), "servo".to_string()]) {
+        let error = match TempodOptions::parse_with_env(
+            ["--engine".to_string(), "servo".to_string()],
+            None,
+            &TempodConfig::default(),
+        ) {
             Ok(_) => panic!("--engine without --engine-socket should be rejected"),
             Err(error) => error,
         };
@@ -187,12 +273,16 @@ mod tests {
 
     #[test]
     fn explicit_engine_with_socket_is_accepted() {
-        let options = match TempodOptions::parse([
-            "--engine".to_string(),
-            "servo".to_string(),
-            "--engine-socket".to_string(),
-            "/tmp/tempo-engine.sock".to_string(),
-        ]) {
+        let options = match TempodOptions::parse_with_env(
+            [
+                "--engine".to_string(),
+                "servo".to_string(),
+                "--engine-socket".to_string(),
+                "/tmp/tempo-engine.sock".to_string(),
+            ],
+            None,
+            &TempodConfig::default(),
+        ) {
             Ok(options) => options,
             Err(error) => panic!("--engine with --engine-socket should parse: {error}"),
         };

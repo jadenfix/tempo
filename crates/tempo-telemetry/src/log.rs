@@ -83,7 +83,10 @@ impl Logger {
     pub fn new(ring_capacity: usize, write_stderr: bool) -> Self {
         Self {
             min_level: AtomicU8::new(Level::Info as u8),
-            ring: Mutex::new(VecDeque::with_capacity(ring_capacity.min(4096))),
+            // Pre-allocation is bounded independently of the logical capacity
+            // so a huge capacity doesn't reserve memory up front; the ring
+            // still grows to (and is evicted at) `ring_capacity`.
+            ring: Mutex::new(VecDeque::with_capacity(ring_capacity.clamp(1, 1024))),
             ring_capacity: ring_capacity.max(1),
             write_stderr,
         }

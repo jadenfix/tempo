@@ -19,13 +19,18 @@
 //! ```
 //! use tempo_config::TempodConfig;
 //!
+//! # fn main() -> Result<(), tempo_config::ConfigError> {
 //! let env = |key: &str| match key {
 //!     "TEMPO_MAX_SESSIONS" => Some("8".to_string()),
 //!     _ => None,
 //! };
-//! let config = TempodConfig::load_with(None, &env).unwrap_or_default();
+//! // Propagate errors — a misconfiguration should stop startup, not be
+//! // silently replaced with defaults.
+//! let config = TempodConfig::load_with(None, &env)?;
 //! assert_eq!(config.limits.max_sessions, 8);
 //! assert_eq!(config.bind_addr, "127.0.0.1:8787");
+//! # Ok(())
+//! # }
 //! ```
 
 use std::collections::BTreeSet;
@@ -217,7 +222,7 @@ impl TempodConfig {
             self.otlp_jsonl_path = Some(value);
         }
         if let Some(value) = env(ENV_STEALTH_MODE) {
-            self.stealth_mode = parse_bool(ENV_STEALTH_MODE, &value)?;
+            self.stealth_mode = parse_stealth_bool(&value)?;
         }
         if let Some(value) = env(ENV_MAX_SESSIONS) {
             self.limits.max_sessions = parse_number(ENV_MAX_SESSIONS, &value)?;
@@ -233,20 +238,21 @@ impl TempodConfig {
             self.telemetry.metrics_enabled = parse_bool(ENV_METRICS_ENABLED, &value)?;
         }
         if let Some(value) = env(ENV_LOG_LEVEL) {
-            self.telemetry.log_level = value.trim().to_ascii_lowercase();
+            let level = value.trim().to_ascii_lowercase();
+            // The logger itself accepts "warning" as an alias; normalize so
+            // validation and the logger agree.
+            self.telemetry.log_level = if level == "warning" {
+                "warn".to_string()
+            } else {
+                level
+            };
         }
         Ok(())
     }
 
     /// Structural validation with actionable messages; run after layering.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        SocketAddr::from_str(&self.bind_addr).map_err(|_| ConfigError::InvalidField {
-            field: "bind_addr",
-            reason: format!(
-                "`{}` is not a socket address (expected host:port, e.g. 127.0.0.1:8787)",
-                self.bind_addr
-            ),
-        })?;
+        self.bind_socket_addr()?;
         if self.limits.max_sessions == 0 {
             return Err(ConfigError::InvalidField {
                 field: "limits.max_sessions",
@@ -285,12 +291,25 @@ impl TempodConfig {
         Ok(())
     }
 
-    /// The parsed bind address; call after [`validate`](Self::validate).
+    /// The parsed bind address. Accepts a literal socket address first and
+    /// falls back to `host:port` resolution so `localhost:8787` — which
+    /// `TcpListener::bind` accepts today — keeps working when wired.
     pub fn bind_socket_addr(&self) -> Result<SocketAddr, ConfigError> {
-        SocketAddr::from_str(&self.bind_addr).map_err(|_| ConfigError::InvalidField {
-            field: "bind_addr",
-            reason: format!("`{}` is not a socket address", self.bind_addr),
-        })
+        if let Ok(addr) = SocketAddr::from_str(&self.bind_addr) {
+            return Ok(addr);
+        }
+        use std::net::ToSocketAddrs;
+        self.bind_addr
+            .to_socket_addrs()
+            .ok()
+            .and_then(|mut addrs| addrs.next())
+            .ok_or_else(|| ConfigError::InvalidField {
+                field: "bind_addr",
+                reason: format!(
+                    "`{}` is not a socket address (expected host:port, e.g. 127.0.0.1:8787)",
+                    self.bind_addr
+                ),
+            })
     }
 
     /// Pretty JSON of the effective config — startup logging / `--print-config`.
@@ -326,6 +345,17 @@ fn parse_bool(var: &'static str, value: &str) -> Result<bool, ConfigError> {
             expected: "1|true|yes|on or 0|false|no|off",
         }),
     }
+}
+
+/// `TEMPO_STEALTH_MODE` matches the daemon's truthy set, which additionally
+/// accepts the literal `stealth` (see `tempo-session`). Unlike the daemon —
+/// which silently treats unrecognized values as false — an unrecognized value
+/// here is a startup error, so a typo cannot silently disable stealth.
+fn parse_stealth_bool(value: &str) -> Result<bool, ConfigError> {
+    if value.trim().eq_ignore_ascii_case("stealth") {
+        return Ok(true);
+    }
+    parse_bool(ENV_STEALTH_MODE, value)
 }
 
 fn parse_number<T: FromStr>(var: &'static str, value: &str) -> Result<T, ConfigError> {
@@ -507,6 +537,36 @@ mod tests {
         ] {
             assert_eq!(parse_bool(ENV_STEALTH_MODE, spelling)?, expected);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn stealth_parsing_matches_daemon_truthy_set() -> Result<(), ConfigError> {
+        // The daemon (tempo-session) additionally accepts the literal
+        // "stealth"; the config layer must agree.
+        assert!(parse_stealth_bool("stealth")?);
+        assert!(parse_stealth_bool("STEALTH")?);
+        assert!(parse_stealth_bool("1")?);
+        assert!(!parse_stealth_bool("off")?);
+        assert!(parse_stealth_bool("maybe").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn log_level_warning_alias_normalizes_to_warn() -> Result<(), ConfigError> {
+        let env = env_of(&[(ENV_LOG_LEVEL, "WARNING")]);
+        let config = TempodConfig::load_with(None, &env)?;
+        assert_eq!(config.telemetry.log_level, "warn");
+        Ok(())
+    }
+
+    #[test]
+    fn bind_addr_accepts_resolvable_host_port() -> Result<(), ConfigError> {
+        // TcpListener::bind accepts `localhost:port` today; the config layer
+        // must not regress that when wired into tempod.
+        let env = env_of(&[(ENV_BIND_ADDR, "localhost:8787")]);
+        let config = TempodConfig::load_with(None, &env)?;
+        assert!(config.bind_socket_addr()?.ip().is_loopback());
         Ok(())
     }
 

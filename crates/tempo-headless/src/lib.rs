@@ -1948,6 +1948,19 @@ fn status_class(status: u16) -> &'static str {
     }
 }
 
+static METRICS_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Enable/disable `GET /metrics` (wired from `tempo-config`'s
+/// `telemetry.metrics_enabled`). Disabled means 404, not an absent route, so
+/// operators can tell "off by config" from "wrong tempod version".
+pub fn set_metrics_enabled(enabled: bool) {
+    METRICS_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn metrics_enabled() -> bool {
+    METRICS_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 static PROCESS_START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 
 /// Anchor for the uptime gauge. The serve entry points call this at startup;
@@ -2034,7 +2047,16 @@ fn route_http_request_with_auth(
         // Deliberately behind the loopback-Origin guard (and bearer auth on
         // remote binds): exposition is control-plane data. Scrapers send no
         // Origin header, so they pass the guard. Short in-memory lock only.
-        ("GET", TEMPOD_METRICS_PATH) => Ok(metrics_response(&lock_pool(pool)?)),
+        ("GET", TEMPOD_METRICS_PATH) => {
+            if !metrics_enabled() {
+                return Ok(HttpResponse::json(
+                    404,
+                    json!({"error": "metrics exposition disabled by configuration"}),
+                ));
+            }
+            let pool = lock_pool(pool)?;
+            Ok(metrics_response(&pool))
+        }
         ("GET", tempo_mcp::A2A_AGENT_CARD_PATH) | ("GET", tempo_mcp::A2A_AGENT_JSON_PATH) => Ok(
             HttpResponse::from_mcp(tempo_mcp::agent_card_response(&request.base_url())),
         ),
@@ -7217,11 +7239,23 @@ mod tests {
         let text = String::from_utf8(metrics.body.clone())?;
         assert!(text.contains("tempod_http_requests_total{route=\"health\",status=\"2xx\"}"));
         assert!(text.contains("tempod_sessions_created_total"));
-        assert!(text.contains("tempod_sessions_active 1"));
+        // Presence only: the registry is process-global, so exact gauge
+        // values would race any concurrently-running test that scrapes.
+        assert!(text.contains("tempod_sessions_active"));
         assert!(text.contains("tempod_build_info{version="));
         assert!(text.contains("tempod_uptime_seconds"));
         assert!(text.contains("tempod_http_request_seconds_bucket"));
-        assert!(text.contains("tempod_draining 0"));
+        assert!(text.contains("tempod_draining"));
+
+        // Config toggle: disabled means 404 (route present, exposition off).
+        // Same test so the global flag never races the scrape above.
+        set_metrics_enabled(false);
+        let disabled = handle_http_request(
+            &mut pool,
+            control_request("GET", TEMPOD_METRICS_PATH, None, b""),
+        );
+        set_metrics_enabled(true);
+        assert_eq!(disabled.status, 404);
         Ok(())
     }
 

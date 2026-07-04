@@ -9,8 +9,8 @@
 //!   verification can read the exposition directly instead of re-deriving
 //!   percentiles.
 //! - **Structured logs** ([`Logger`], [`LogEvent`]): JSON-lines events on
-//!   stderr plus a bounded in-memory ring for post-mortem retrieval, replacing
-//!   bare `eprintln!` call sites across the daemon.
+//!   stderr plus a bounded in-memory ring for post-mortem retrieval — the
+//!   structured replacement for bare `eprintln!` call sites.
 //!
 //! Both planes are lock-light (atomics on the hot path, a registry mutex only
 //! on first registration and render) and poison-tolerant: a panicked holder

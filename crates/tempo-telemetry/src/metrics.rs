@@ -199,24 +199,27 @@ impl Histogram {
         self.core.sum.load()
     }
 
-    /// Estimated quantile (`0.0..=1.0`) by linear interpolation inside the
-    /// covering bucket; values landing in the +Inf overflow bucket report the
+    /// Estimated quantile (`0.0..=1.0`), PromQL-style: uniform interpolation
+    /// within the covering bucket at the unceiled rank `q * count`, so a
+    /// single 0.5s observation in a `[0, 1]` bucket reports p50 = 0.5, not
+    /// the bucket edge. Values landing in the +Inf overflow bucket report the
     /// largest finite bound. `None` until at least one observation exists.
+    /// The total is derived from the bucket counts themselves so the estimate
+    /// is internally consistent under concurrent `observe` calls.
     pub fn quantile(&self, q: f64) -> Option<f64> {
-        let total = self.count();
+        let counts = self.bucket_counts();
+        let total: u64 = counts.iter().sum();
         if total == 0 {
             return None;
         }
-        let q = q.clamp(0.0, 1.0);
-        let rank = (q * total as f64).ceil().max(1.0) as u64;
+        let rank = q.clamp(0.0, 1.0) * total as f64;
         let mut cumulative = 0u64;
-        for (idx, bucket) in self.core.buckets.iter().enumerate() {
-            let in_bucket = bucket.load(Ordering::Relaxed);
+        for (idx, in_bucket) in counts.iter().copied().enumerate() {
             if in_bucket == 0 {
-                cumulative += in_bucket;
                 continue;
             }
-            if cumulative + in_bucket >= rank {
+            let upper_cumulative = cumulative + in_bucket;
+            if upper_cumulative as f64 >= rank {
                 let upper = match self.core.bounds.get(idx) {
                     Some(bound) => *bound,
                     // Overflow bucket: no finite upper edge to interpolate to.
@@ -227,10 +230,10 @@ impl Histogram {
                 } else {
                     self.core.bounds.get(idx - 1).copied().unwrap_or(0.0)
                 };
-                let into_bucket = (rank - cumulative) as f64 / in_bucket as f64;
-                return Some(lower + (upper - lower) * into_bucket);
+                let frac = ((rank - cumulative as f64) / in_bucket as f64).clamp(0.0, 1.0);
+                return Some(lower + (upper - lower) * frac);
             }
-            cumulative += in_bucket;
+            cumulative = upper_cumulative;
         }
         self.core.bounds.last().copied().or(Some(f64::INFINITY))
     }
@@ -304,6 +307,8 @@ impl Registry {
         Self::default()
     }
 
+    /// First registration wins for the help text; later calls with the same
+    /// name and labels return the existing series.
     pub fn counter(&self, name: &str, help: &str, labels: &[(&str, &str)]) -> Counter {
         match self.series(name, help, MetricKind::Counter, labels, || {
             Series::Counter(Counter::new())
@@ -328,7 +333,9 @@ impl Registry {
         }
     }
 
-    /// `bounds: None` uses [`DEFAULT_LATENCY_BOUNDS_SECS`].
+    /// `bounds: None` uses [`DEFAULT_LATENCY_BOUNDS_SECS`]. First registration
+    /// wins for help text *and* bucket bounds; later calls with the same name
+    /// and labels return the existing series regardless of the bounds passed.
     pub fn histogram(
         &self,
         name: &str,
@@ -417,10 +424,13 @@ impl Registry {
                             render_labels(labels, None),
                             format_f64(histogram.sum())
                         ));
+                        // _count is derived from the same bucket reads as the
+                        // +Inf line: `le="+Inf" == _count` must hold even when
+                        // a scrape races a concurrent observe, or PromQL
+                        // histogram_quantile/rate consumers break.
                         out.push_str(&format!(
-                            "{name}_count{} {}\n",
-                            render_labels(labels, None),
-                            histogram.count()
+                            "{name}_count{} {cumulative}\n",
+                            render_labels(labels, None)
                         ));
                     }
                 }
@@ -451,7 +461,8 @@ impl Registry {
                     Series::Counter(counter) => json!(counter.get()),
                     Series::Gauge(gauge) => json!(gauge.get()),
                     Series::Histogram(histogram) => json!({
-                        "count": histogram.count(),
+                        // Bucket-derived, matching the exposition invariant.
+                        "count": histogram.bucket_counts().iter().sum::<u64>(),
                         "sum": histogram.sum(),
                         "p50": histogram.quantile(0.50),
                         "p95": histogram.quantile(0.95),
@@ -476,7 +487,16 @@ impl Registry {
 fn normalize_labels(labels: &[(&str, &str)]) -> Vec<(String, String)> {
     let mut normalized: Vec<(String, String)> = labels
         .iter()
-        .map(|(k, v)| (sanitize_label_name(k), (*v).to_string()))
+        .map(|(k, v)| {
+            let mut key = sanitize_label_name(k);
+            // `le` is reserved for histogram bucket lines; a user label named
+            // `le` would render duplicate label names, which is malformed
+            // exposition.
+            if key == "le" {
+                key.push('_');
+            }
+            (key, (*v).to_string())
+        })
         .collect();
     normalized.sort();
     normalized.dedup_by(|a, b| a.0 == b.0);
@@ -611,6 +631,37 @@ mod tests {
                 .count(),
             6
         );
+    }
+
+    #[test]
+    fn quantile_interpolates_promql_style_at_small_counts() {
+        let registry = Registry::new();
+        let histogram = registry.histogram("single_seconds", "single", &[], Some(&[1.0]));
+        histogram.observe(0.5);
+        // One observation in [0, 1.0]: PromQL reports q*upper, not the edge.
+        let p50 = histogram.quantile(0.5).unwrap_or(f64::NAN);
+        assert!((p50 - 0.5).abs() < 1e-9, "p50 was {p50}");
+        let p0 = histogram.quantile(0.0).unwrap_or(f64::NAN);
+        assert!((p0 - 0.0).abs() < 1e-9, "p0 was {p0}");
+    }
+
+    #[test]
+    fn reserved_le_label_is_renamed_not_duplicated() {
+        let registry = Registry::new();
+        let histogram = registry.histogram(
+            "le_labeled_seconds",
+            "le label",
+            &[("le", "user-value")],
+            Some(&[1.0]),
+        );
+        histogram.observe(0.5);
+        let text = registry.render_prometheus();
+        assert!(text.contains("le_labeled_seconds_bucket{le_=\"user-value\",le=\"1\"} 1"));
+        // Exactly one `le=` (the bucket edge) per bucket line.
+        let Some(line) = text.lines().find(|l| l.contains("_bucket")) else {
+            panic!("expected a bucket line");
+        };
+        assert_eq!(line.matches("le=\"").count(), 1, "line: {line}");
     }
 
     #[test]
