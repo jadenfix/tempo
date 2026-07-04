@@ -13,7 +13,7 @@ Examples:
 
 Environment:
   TEMPO_WORKTREE_ROOT       Parent directory for new worktrees.
-  TEMPO_WORKTREE_NO_FETCH   Set to 1 to skip fetching origin/main.
+  TEMPO_WORKTREE_NO_FETCH   Set to 1 to skip fetching the base ref.
 USAGE
 }
 
@@ -47,8 +47,18 @@ fi
 branch="codex/$slug"
 path="$worktree_root/$repo_name-$slug"
 
+if ! git check-ref-format --branch "$branch" >/dev/null 2>&1; then
+  echo "tempo: generated branch is not valid: $branch" >&2
+  exit 2
+fi
+
 if git show-ref --verify --quiet "refs/heads/$branch"; then
   echo "tempo: branch already exists: $branch" >&2
+  exit 1
+fi
+
+if git show-ref --verify --quiet "refs/remotes/origin/$branch"; then
+  echo "tempo: remote branch already exists: origin/$branch" >&2
   exit 1
 fi
 
@@ -58,7 +68,19 @@ if [[ -e "$path" ]]; then
 fi
 
 if [[ "${TEMPO_WORKTREE_NO_FETCH:-}" != "1" ]]; then
-  git fetch origin main
+  case "$base_ref" in
+    origin/*)
+      base_branch="${base_ref#origin/}"
+      git fetch origin "+refs/heads/$base_branch:refs/remotes/origin/$base_branch"
+      ;;
+    refs/remotes/origin/*)
+      base_branch="${base_ref#refs/remotes/origin/}"
+      git fetch origin "+refs/heads/$base_branch:refs/remotes/origin/$base_branch"
+      ;;
+    *)
+      git fetch origin "$base_ref"
+      ;;
+  esac
 fi
 
 git worktree add -b "$branch" "$path" "$base_ref"

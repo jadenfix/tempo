@@ -29,3 +29,17 @@ git add <paths>
 
 Do not work directly in another agent's dirty checkout. If a change depends on
 another PR, either stack from that branch explicitly or wait until it lands.
+
+After a branch has merged, clean up the worktree and local branch from another
+checkout:
+
+```sh
+git worktree remove ../tempo-crawl-frontier
+git branch -d codex/crawl-frontier
+```
+
+If the remote branch was deleted after merge, prune the stale tracking ref:
+
+```sh
+git remote prune origin
+```
