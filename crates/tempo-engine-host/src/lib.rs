@@ -20,7 +20,10 @@ use tempo_driver::{
     BrowsingContextCreateOptions, DriverTrait, StepOutcome, TransportError, Unsupported,
 };
 use tempo_schema::{Action, ActionBatch, CompiledObservation, NodeId, ObservationDiff};
-use tempo_session::{JournalError, ResumeState, RunId, SessionId, SessionJournal};
+use tempo_session::{
+    durable_retention_policy_from_env, DurableRetentionPolicy, JournalError, ResumeState, RunId,
+    SessionId, SessionJournal,
+};
 use thiserror::Error;
 
 pub const MAX_FRAME_BYTES: u32 = 1024 * 1024;
@@ -188,12 +191,39 @@ impl EngineHost {
         run_id: RunId,
         session_id: SessionId,
     ) -> Result<ResumeState, EngineHostError> {
+        let retention_policy = durable_retention_policy_from_env()?;
+        self.resume_session_with_retention_policy(run_id, session_id, retention_policy)
+    }
+
+    pub fn resume_session_plaintext_unsafe(
+        &self,
+        run_id: RunId,
+        session_id: SessionId,
+    ) -> Result<ResumeState, EngineHostError> {
+        self.resume_session_with_retention_policy(
+            run_id,
+            session_id,
+            DurableRetentionPolicy::PlaintextUnsafe,
+        )
+    }
+
+    pub fn resume_session_with_retention_policy(
+        &self,
+        run_id: RunId,
+        session_id: SessionId,
+        retention_policy: DurableRetentionPolicy,
+    ) -> Result<ResumeState, EngineHostError> {
         let path = self
             .config
             .session_journal
             .as_ref()
             .ok_or(EngineHostError::MissingJournalPath)?;
-        Ok(SessionJournal::resume(path, run_id, session_id)?)
+        Ok(SessionJournal::resume_with_retention_policy(
+            path,
+            run_id,
+            session_id,
+            retention_policy,
+        )?)
     }
 
     /// Bind the configured UDS control socket before launching the child.
@@ -846,7 +876,40 @@ pub fn resume_session_from_journal(
     run_id: RunId,
     session_id: SessionId,
 ) -> Result<ResumeState, EngineHostError> {
-    Ok(SessionJournal::resume(journal_path, run_id, session_id)?)
+    let retention_policy = durable_retention_policy_from_env()?;
+    resume_session_from_journal_with_retention_policy(
+        journal_path,
+        run_id,
+        session_id,
+        retention_policy,
+    )
+}
+
+pub fn resume_session_from_journal_plaintext_unsafe(
+    journal_path: impl AsRef<Path>,
+    run_id: RunId,
+    session_id: SessionId,
+) -> Result<ResumeState, EngineHostError> {
+    resume_session_from_journal_with_retention_policy(
+        journal_path,
+        run_id,
+        session_id,
+        DurableRetentionPolicy::PlaintextUnsafe,
+    )
+}
+
+pub fn resume_session_from_journal_with_retention_policy(
+    journal_path: impl AsRef<Path>,
+    run_id: RunId,
+    session_id: SessionId,
+    retention_policy: DurableRetentionPolicy,
+) -> Result<ResumeState, EngineHostError> {
+    Ok(SessionJournal::resume_with_retention_policy(
+        journal_path,
+        run_id,
+        session_id,
+        retention_policy,
+    )?)
 }
 
 /// Human-readable crate summary.
@@ -1562,7 +1625,7 @@ mod tests {
         journal.append(JournalEvent::SessionClosed)?;
 
         let host = EngineHost::spawn(shell_config("exit 0").session_journal(journal_path.clone()))?;
-        let resumed = host.resume_session(run_id, session_id)?;
+        let resumed = host.resume_session_plaintext_unsafe(run_id, session_id)?;
 
         assert_eq!(resumed.path, journal_path);
         assert_eq!(resumed.entries.len(), 2);

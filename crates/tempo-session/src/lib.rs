@@ -4,10 +4,12 @@
 //! durable: every step is committed to a SQLite journal, and every replayable
 //! response is stored in a deterministic cassette format that can move between hosts.
 
+use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use rusqlite::{params, Connection, OpenFlags};
-use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io::Write;
@@ -16,6 +18,68 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tempo_driver::{StepOutcome, TransportError};
 use tempo_schema::{Action, CompiledObservation, ObservationDiff};
 use thiserror::Error;
+
+pub const TEMPO_STEALTH_MODE_ENV: &str = "TEMPO_STEALTH_MODE";
+pub const TEMPO_DURABLE_RETENTION_ENV: &str = "TEMPO_DURABLE_RETENTION";
+pub const TEMPO_DURABLE_ENCRYPTION_KEY_HEX_ENV: &str = "TEMPO_DURABLE_ENCRYPTION_KEY_HEX";
+pub const DURABLE_ENCRYPTION_KEY_BYTES: usize = 32;
+const ENCRYPTED_RECORD_VERSION: u8 = 1;
+const ENCRYPTED_RECORD_ALGORITHM: &str = "XChaCha20-Poly1305";
+
+/// Explicit durable-state retention policy for journals and replay cassettes.
+///
+/// `PlaintextUnsafe` is retained for compatibility and local audit fixtures, but it
+/// writes URLs, actions, headers, and bodies as readable local artifacts. Production
+/// audit/replay paths should use `Encrypted` with a key owned by the caller's OS
+/// keychain, fleet KMS, or an ephemeral per-session secret.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DurableRetentionPolicy {
+    PlaintextUnsafe,
+    Encrypted { key: DurableEncryptionKey },
+}
+
+impl DurableRetentionPolicy {
+    pub fn encrypted(key: DurableEncryptionKey) -> Self {
+        Self::Encrypted { key }
+    }
+
+    pub fn from_env() -> Result<Self, JournalError> {
+        durable_retention_policy_from_env()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct DurableEncryptionKey([u8; DURABLE_ENCRYPTION_KEY_BYTES]);
+
+impl DurableEncryptionKey {
+    pub fn from_bytes(bytes: [u8; DURABLE_ENCRYPTION_KEY_BYTES]) -> Self {
+        Self(bytes)
+    }
+
+    pub fn from_slice(bytes: &[u8]) -> Result<Self, JournalError> {
+        let key = <[u8; DURABLE_ENCRYPTION_KEY_BYTES]>::try_from(bytes).map_err(|_| {
+            JournalError::InvalidEncryptionKeyLength {
+                expected: DURABLE_ENCRYPTION_KEY_BYTES,
+                actual: bytes.len(),
+            }
+        })?;
+        Ok(Self(key))
+    }
+
+    pub fn from_hex(hex: &str) -> Result<Self, JournalError> {
+        Self::from_slice(&hex_decode(hex)?)
+    }
+
+    fn as_bytes(&self) -> &[u8; DURABLE_ENCRYPTION_KEY_BYTES] {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for DurableEncryptionKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DurableEncryptionKey(<redacted>)")
+    }
+}
 
 /// Stable session identifier recorded in every journal entry.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,6 +176,7 @@ pub struct SessionJournal {
     /// Held for the journal's lifetime. Dropping the handle releases the advisory lock.
     _lock: File,
     conn: Connection,
+    retention_policy: DurableRetentionPolicy,
     run_id: RunId,
     session_id: SessionId,
     next_seq: u64,
@@ -128,11 +193,42 @@ impl SessionJournal {
         run_id: RunId,
         session_id: SessionId,
     ) -> Result<Self, JournalError> {
+        Self::open_with_retention_policy(
+            path,
+            run_id,
+            session_id,
+            DurableRetentionPolicy::PlaintextUnsafe,
+        )
+    }
+
+    pub fn open_with_retention_policy(
+        path: impl AsRef<Path>,
+        run_id: RunId,
+        session_id: SessionId,
+        retention_policy: DurableRetentionPolicy,
+    ) -> Result<Self, JournalError> {
+        Self::open_with_stealth_value(
+            path,
+            run_id,
+            session_id,
+            std::env::var_os(TEMPO_STEALTH_MODE_ENV),
+            retention_policy,
+        )
+    }
+
+    fn open_with_stealth_value(
+        path: impl AsRef<Path>,
+        run_id: RunId,
+        session_id: SessionId,
+        stealth_value: Option<OsString>,
+        retention_policy: DurableRetentionPolicy,
+    ) -> Result<Self, JournalError> {
+        reject_durable_state_in_stealth_mode_value(stealth_value)?;
         let path = path.as_ref().to_path_buf();
         let lock = lock_journal_writer(&path)?;
         let conn = open_journal_connection(&path, JournalOpenMode::ReadWriteCreate)?;
 
-        let entries = read_journal_entries_from_connection(&conn)?;
+        let entries = read_journal_entries_from_connection(&conn, &retention_policy)?;
         validate_journal_entries(&entries, &run_id, &session_id)?;
         let next_seq = entries
             .iter()
@@ -145,6 +241,7 @@ impl SessionJournal {
             path,
             _lock: lock,
             conn,
+            retention_policy,
             run_id,
             session_id,
             next_seq,
@@ -160,12 +257,43 @@ impl SessionJournal {
         run_id: RunId,
         session_id: SessionId,
     ) -> Result<ResumeState, JournalError> {
+        Self::resume_with_retention_policy(
+            path,
+            run_id,
+            session_id,
+            DurableRetentionPolicy::PlaintextUnsafe,
+        )
+    }
+
+    pub fn resume_with_retention_policy(
+        path: impl AsRef<Path>,
+        run_id: RunId,
+        session_id: SessionId,
+        retention_policy: DurableRetentionPolicy,
+    ) -> Result<ResumeState, JournalError> {
+        Self::resume_with_stealth_value(
+            path,
+            run_id,
+            session_id,
+            std::env::var_os(TEMPO_STEALTH_MODE_ENV),
+            retention_policy,
+        )
+    }
+
+    fn resume_with_stealth_value(
+        path: impl AsRef<Path>,
+        run_id: RunId,
+        session_id: SessionId,
+        stealth_value: Option<OsString>,
+        retention_policy: DurableRetentionPolicy,
+    ) -> Result<ResumeState, JournalError> {
+        reject_durable_state_in_stealth_mode_value(stealth_value)?;
         let path = path.as_ref().to_path_buf();
         // Read-only snapshot: no writer lock, no schema init, no pragma writes, and it
         // never creates the database. A journal that does not exist yet resumes as an
         // empty session rather than being materialized on disk.
         let entries = match open_readonly_connection(&path)? {
-            Some(conn) => read_journal_entries_from_connection(&conn)?,
+            Some(conn) => read_journal_entries_from_connection(&conn, &retention_policy)?,
             None => Vec::new(),
         };
         validate_journal_entries(&entries, &run_id, &session_id)?;
@@ -187,6 +315,7 @@ impl SessionJournal {
 
     /// Append one event in a committed SQLite transaction before returning.
     pub fn append(&mut self, event: JournalEvent) -> Result<JournalEntry, JournalError> {
+        reject_durable_state_in_stealth_mode()?;
         let entry = JournalEntry {
             schema_version: tempo_schema::SCHEMA_VERSION.into(),
             run_id: self.run_id.clone(),
@@ -196,7 +325,7 @@ impl SessionJournal {
             event,
         };
 
-        insert_journal_entry(&mut self.conn, &entry)?;
+        insert_journal_entry(&mut self.conn, &entry, &self.retention_policy)?;
 
         self.next_seq += 1;
         Ok(entry)
@@ -222,16 +351,29 @@ impl CassetteKey {
     /// former FNV-1a-64) let an attacker craft two distinct requests sharing one key
     /// and thereby substitute a chosen recorded response during replay. SHA-256 is
     /// collision-resistant and its 256-bit output removes birthday collisions on
-    /// large corpora. Fields are length-unambiguously separated by NUL bytes.
+    /// large corpora. Fields are versioned and length-prefixed so page-controlled
+    /// NUL bytes cannot move data across component boundaries.
     pub fn from_request(method: &str, url: &str, body: &[u8]) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(b"tempo-session:cassette-key:v2\0");
+        update_length_prefixed(&mut hasher, method.as_bytes());
+        update_length_prefixed(&mut hasher, url.as_bytes());
+        update_length_prefixed(&mut hasher, body);
+        Self::from_hasher(hasher)
+    }
+
+    fn legacy_v1_from_request(method: &str, url: &str, body: &[u8]) -> Self {
         let mut hasher = Sha256::new();
         hasher.update(method.as_bytes());
         hasher.update([0]);
         hasher.update(url.as_bytes());
         hasher.update([0]);
         hasher.update(body);
-        let digest = hasher.finalize();
+        Self::from_hasher(hasher)
+    }
 
+    fn from_hasher(hasher: Sha256) -> Self {
+        let digest = hasher.finalize();
         let mut key = String::with_capacity(digest.len() * 2);
         for byte in digest {
             // Writing formatted hex into a String is infallible.
@@ -239,6 +381,11 @@ impl CassetteKey {
         }
         Self(key)
     }
+}
+
+fn update_length_prefixed(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update((value.len() as u64).to_be_bytes());
+    hasher.update(value);
 }
 
 /// Byte-stable replay record. No host-local paths or timestamps are stored.
@@ -288,24 +435,53 @@ impl ResponseCassette {
 /// Append-only cassette store used by replay-fork and deterministic re-execution.
 pub struct CassetteStore {
     path: PathBuf,
+    retention_policy: DurableRetentionPolicy,
 }
 
 impl CassetteStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, JournalError> {
+        Self::open_with_retention_policy(path, DurableRetentionPolicy::PlaintextUnsafe)
+    }
+
+    pub fn open_with_retention_policy(
+        path: impl AsRef<Path>,
+        retention_policy: DurableRetentionPolicy,
+    ) -> Result<Self, JournalError> {
+        Self::open_with_stealth_value(
+            path,
+            std::env::var_os(TEMPO_STEALTH_MODE_ENV),
+            retention_policy,
+        )
+    }
+
+    fn open_with_stealth_value(
+        path: impl AsRef<Path>,
+        stealth_value: Option<OsString>,
+        retention_policy: DurableRetentionPolicy,
+    ) -> Result<Self, JournalError> {
+        reject_durable_state_in_stealth_mode_value(stealth_value)?;
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        OpenOptions::new().create(true).append(true).open(&path)?;
-        Ok(Self { path })
+        let mut options = OpenOptions::new();
+        options.create(true).append(true);
+        apply_private_file_mode(&mut options);
+        let file = options.open(&path)?;
+        ensure_private_file_permissions(&file)?;
+        Ok(Self {
+            path,
+            retention_policy,
+        })
     }
 
     pub fn record(&self, cassette: &ResponseCassette) -> Result<(), JournalError> {
-        let mut file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(&self.path)?;
+        reject_durable_state_in_stealth_mode()?;
+        let mut options = OpenOptions::new();
+        options.create(true).read(true).append(true);
+        apply_private_file_mode(&mut options);
+        let mut file = options.open(&self.path)?;
+        ensure_private_file_permissions(&file)?;
         match file.try_lock() {
             Ok(()) => {}
             Err(TryLockError::WouldBlock) => {
@@ -316,9 +492,9 @@ impl CassetteStore {
             Err(TryLockError::Error(source)) => return Err(JournalError::Io(source)),
         }
 
-        truncate_torn_tail(&self.path, &file)?;
+        let append_boundary = repair_cassette_tail_before_append(&self.path, &file)?;
 
-        for existing in read_cassettes(&self.path)? {
+        for existing in read_cassettes_with_retention_policy(&self.path, &self.retention_policy)? {
             if existing.key == cassette.key {
                 if existing == *cassette {
                     return Ok(());
@@ -329,7 +505,13 @@ impl CassetteStore {
             }
         }
 
-        serde_json::to_writer(&mut file, cassette)?;
+        let cassette_json = serde_json::to_vec(cassette)?;
+        let record =
+            encode_durable_record_bytes(&cassette_json, &self.retention_policy, cassette_aad())?;
+        if let CassetteAppendBoundary::NeedsNewline = append_boundary {
+            file.write_all(b"\n")?;
+        }
+        file.write_all(&record)?;
         file.write_all(b"\n")?;
         file.flush()?;
         file.sync_data()?;
@@ -337,7 +519,7 @@ impl CassetteStore {
     }
 
     pub fn replay(&self, key: &CassetteKey) -> Result<Option<ResponseCassette>, JournalError> {
-        for cassette in read_cassettes(&self.path)? {
+        for cassette in read_cassettes_with_retention_policy(&self.path, &self.retention_policy)? {
             if &cassette.key == key {
                 return Ok(Some(cassette));
             }
@@ -345,8 +527,39 @@ impl CassetteStore {
         Ok(None)
     }
 
+    /// Replay a request using the current key format, migrating pre-v2 cassette
+    /// records when a legacy key is the only match.
+    pub fn replay_request(
+        &self,
+        method: &str,
+        url: &str,
+        request_body: impl AsRef<[u8]>,
+    ) -> Result<Option<ResponseCassette>, JournalError> {
+        let request_body = request_body.as_ref();
+        let key = CassetteKey::from_request(method, url, request_body);
+        if let Some(cassette) = self.replay(&key)? {
+            return Ok(Some(cassette));
+        }
+
+        let legacy_key = CassetteKey::legacy_v1_from_request(method, url, request_body);
+        if legacy_key == key {
+            return Ok(None);
+        }
+
+        let Some(legacy_cassette) = self.replay(&legacy_key)? else {
+            return Ok(None);
+        };
+
+        let migrated_cassette = ResponseCassette {
+            key,
+            ..legacy_cassette
+        };
+        self.record(&migrated_cassette)?;
+        Ok(Some(migrated_cassette))
+    }
+
     pub fn all(&self) -> Result<Vec<ResponseCassette>, JournalError> {
-        read_cassettes(&self.path)
+        read_cassettes_with_retention_policy(&self.path, &self.retention_policy)
     }
 
     pub fn path(&self) -> &Path {
@@ -358,6 +571,10 @@ impl CassetteStore {
 pub enum JournalError {
     #[error("journal io failed: {0}")]
     Io(#[from] std::io::Error),
+    #[error(
+        "TEMPO_STEALTH_MODE is enabled; durable journals and cassettes are disabled to avoid plaintext local artifacts"
+    )]
+    StealthModeUnsupported,
     #[error("journal is already locked by another session: {path:?}")]
     Locked { path: PathBuf },
     #[error("journal sqlite operation failed: {0}")]
@@ -387,6 +604,32 @@ pub enum JournalError {
     },
     #[error("journal field {field} is out of range or malformed: {value}")]
     InvalidField { field: &'static str, value: String },
+    #[error("durable encryption key must be {expected} bytes, got {actual}")]
+    InvalidEncryptionKeyLength { expected: usize, actual: usize },
+    #[error(
+        "durable retention requires TEMPO_DURABLE_ENCRYPTION_KEY_HEX unless TEMPO_DURABLE_RETENTION=plaintext-unsafe is explicitly set"
+    )]
+    SecureRetentionPolicyRequired,
+    #[error(
+        "invalid TEMPO_DURABLE_RETENTION value {value:?}; expected encrypted or plaintext-unsafe"
+    )]
+    InvalidDurableRetentionPolicy { value: String },
+    #[error("secure randomness failed while preparing encrypted durable state: {reason}")]
+    Random { reason: String },
+    #[error("encrypted durable record is malformed: {reason}")]
+    EncryptedRecordMalformed { reason: String },
+    #[error(
+        "encrypted durable record version {found} is newer than supported version {supported}"
+    )]
+    EncryptedRecordVersion { found: u8, supported: u8 },
+    #[error("encrypted durable record requires an encrypted retention policy")]
+    EncryptedRecordRequiresKey,
+    #[error("plaintext durable record rejected because encrypted retention policy was requested")]
+    PlaintextRecordRejected,
+    #[error("durable record encryption failed")]
+    EncryptionFailed,
+    #[error("durable record decryption failed")]
+    DecryptionFailed,
     #[error("cassette key conflict for {key:?}")]
     CassetteConflict { key: CassetteKey },
     #[error("system clock is before unix epoch")]
@@ -406,7 +649,79 @@ pub fn describe() -> &'static str {
     "session lifecycle, SQLite journal, portable cassettes, and deterministic replay primitives"
 }
 
+fn reject_durable_state_in_stealth_mode() -> Result<(), JournalError> {
+    reject_durable_state_in_stealth_mode_value(std::env::var_os(TEMPO_STEALTH_MODE_ENV))
+}
+
+fn reject_durable_state_in_stealth_mode_value(value: Option<OsString>) -> Result<(), JournalError> {
+    if stealth_mode_enabled_from_env_value(value) {
+        return Err(JournalError::StealthModeUnsupported);
+    }
+    Ok(())
+}
+
+fn stealth_mode_enabled_from_env_value(value: Option<OsString>) -> bool {
+    let Some(value) = value else {
+        return false;
+    };
+    matches!(
+        value.to_string_lossy().trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on" | "stealth"
+    )
+}
+
+/// Resolve the production durable retention policy from environment.
+///
+/// By default production callers fail closed unless `TEMPO_DURABLE_ENCRYPTION_KEY_HEX`
+/// contains a 32-byte hex key. Plaintext durable artifacts remain available only via
+/// `TEMPO_DURABLE_RETENTION=plaintext-unsafe` or explicit low-level compatibility APIs.
+pub fn durable_retention_policy_from_env() -> Result<DurableRetentionPolicy, JournalError> {
+    durable_retention_policy_from_env_values(
+        std::env::var_os(TEMPO_DURABLE_RETENTION_ENV),
+        std::env::var_os(TEMPO_DURABLE_ENCRYPTION_KEY_HEX_ENV),
+    )
+}
+
+fn durable_retention_policy_from_env_values(
+    retention_value: Option<OsString>,
+    key_hex_value: Option<OsString>,
+) -> Result<DurableRetentionPolicy, JournalError> {
+    let retention = retention_value
+        .as_ref()
+        .map(|value| value.to_string_lossy().trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty());
+
+    match retention.as_deref() {
+        Some("plaintext-unsafe" | "plaintext" | "plain") => {
+            Ok(DurableRetentionPolicy::PlaintextUnsafe)
+        }
+        Some("encrypted" | "encrypt") | None => {
+            let Some(key_hex) = key_hex_value
+                .as_ref()
+                .map(|value| value.to_string_lossy().trim().to_string())
+                .filter(|value| !value.is_empty())
+            else {
+                return Err(JournalError::SecureRetentionPolicyRequired);
+            };
+            Ok(DurableRetentionPolicy::encrypted(
+                DurableEncryptionKey::from_hex(&key_hex)?,
+            ))
+        }
+        Some(value) => Err(JournalError::InvalidDurableRetentionPolicy {
+            value: value.to_string(),
+        }),
+    }
+}
+
 pub fn read_journal_entries(path: impl AsRef<Path>) -> Result<Vec<JournalEntry>, JournalError> {
+    read_journal_entries_with_retention_policy(path, &DurableRetentionPolicy::PlaintextUnsafe)
+}
+
+pub fn read_journal_entries_with_retention_policy(
+    path: impl AsRef<Path>,
+    retention_policy: &DurableRetentionPolicy,
+) -> Result<Vec<JournalEntry>, JournalError> {
+    reject_durable_state_in_stealth_mode()?;
     let path = path.as_ref();
     // Preserve the "missing journal is not silently created" contract: surface a
     // NotFound IO error rather than fabricating an empty database.
@@ -414,13 +729,21 @@ pub fn read_journal_entries(path: impl AsRef<Path>) -> Result<Vec<JournalEntry>,
     // Read-only: never runs schema init or pragma writes, so a concurrent writer's
     // commit window cannot make this fail with SQLITE_BUSY.
     match open_readonly_connection(path)? {
-        Some(conn) => read_journal_entries_from_connection(&conn),
+        Some(conn) => read_journal_entries_from_connection(&conn, retention_policy),
         None => Ok(Vec::new()),
     }
 }
 
 pub fn read_cassettes(path: impl AsRef<Path>) -> Result<Vec<ResponseCassette>, JournalError> {
-    read_jsonl(path)
+    read_cassettes_with_retention_policy(path, &DurableRetentionPolicy::PlaintextUnsafe)
+}
+
+pub fn read_cassettes_with_retention_policy(
+    path: impl AsRef<Path>,
+    retention_policy: &DurableRetentionPolicy,
+) -> Result<Vec<ResponseCassette>, JournalError> {
+    reject_durable_state_in_stealth_mode()?;
+    read_cassette_jsonl(path, retention_policy)
 }
 
 /// Current on-disk journal schema version. Stamped into `PRAGMA user_version` on the
@@ -447,10 +770,11 @@ enum JournalOpenMode {
 }
 
 fn open_journal_connection(path: &Path, mode: JournalOpenMode) -> Result<Connection, JournalError> {
-    if let JournalOpenMode::ReadWriteCreate = mode
-        && let Some(parent) = path.parent()
-    {
-        std::fs::create_dir_all(parent)?;
+    if let JournalOpenMode::ReadWriteCreate = mode {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        create_private_file_if_missing(path)?;
     }
 
     // Reject a legacy/foreign file (e.g. a pre-#193 JSONL journal) up front so the
@@ -465,6 +789,9 @@ fn open_journal_connection(path: &Path, mode: JournalOpenMode) -> Result<Connect
         JournalOpenMode::ReadOnly => OpenFlags::SQLITE_OPEN_READ_ONLY,
     };
     let conn = Connection::open_with_flags(path, flags).map_err(|err| map_db_error(err, path))?;
+    if let JournalOpenMode::ReadWriteCreate = &mode {
+        ensure_private_path_permissions(path)?;
+    }
     configure_journal_connection(&conn, &mode)?;
     check_journal_version(&conn, path)?;
     if let JournalOpenMode::ReadWriteCreate = mode {
@@ -488,6 +815,17 @@ fn open_readonly_connection(path: &Path) -> Result<Option<Connection>, JournalEr
         path,
         JournalOpenMode::ReadOnly,
     )?))
+}
+
+fn create_private_file_if_missing(path: &Path) -> Result<(), JournalError> {
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    apply_private_file_mode(&mut options);
+    match options.open(path) {
+        Ok(file) => ensure_private_file_permissions(&file),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(err) => Err(err.into()),
+    }
 }
 
 /// Map a raw SQLite failure to an actionable [`JournalError::LegacyFormat`] when it
@@ -598,11 +936,11 @@ fn lock_journal_writer(path: &Path) -> Result<File, JournalError> {
         std::fs::create_dir_all(parent)?;
     }
     let lock_path = journal_lock_path(path);
-    let file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(&lock_path)?;
+    let mut options = OpenOptions::new();
+    options.create(true).write(true).truncate(false);
+    apply_private_file_mode(&mut options);
+    let file = options.open(&lock_path)?;
+    ensure_private_file_permissions(&file)?;
     match file.try_lock() {
         Ok(()) => Ok(file),
         Err(TryLockError::WouldBlock) => Err(JournalError::Locked {
@@ -618,12 +956,61 @@ fn journal_lock_path(path: &Path) -> PathBuf {
     PathBuf::from(raw)
 }
 
-fn insert_journal_entry(conn: &mut Connection, entry: &JournalEntry) -> Result<(), JournalError> {
+#[cfg(unix)]
+fn apply_private_file_mode(options: &mut OpenOptions) {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    options.mode(0o600);
+}
+
+#[cfg(not(unix))]
+fn apply_private_file_mode(_options: &mut OpenOptions) {}
+
+#[cfg(unix)]
+fn ensure_private_file_permissions(file: &File) -> Result<(), JournalError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_private_file_permissions(_file: &File) -> Result<(), JournalError> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn ensure_private_path_permissions(path: &Path) -> Result<(), JournalError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_private_path_permissions(_path: &Path) -> Result<(), JournalError> {
+    Ok(())
+}
+
+fn insert_journal_entry(
+    conn: &mut Connection,
+    entry: &JournalEntry,
+    retention_policy: &DurableRetentionPolicy,
+) -> Result<(), JournalError> {
     let seq = i64::try_from(entry.seq).map_err(|_| JournalError::InvalidField {
         field: "seq",
         value: entry.seq.to_string(),
     })?;
     let event_json = serde_json::to_string(&entry.event)?;
+    let timestamp_ms = entry.timestamp_ms.to_string();
+    let aad = journal_event_aad(
+        entry.schema_version.as_str(),
+        entry.run_id.0.as_str(),
+        entry.session_id.0.as_str(),
+        seq.to_string().as_str(),
+        timestamp_ms.as_str(),
+    );
+    let event_record = encode_durable_record_string(event_json.as_bytes(), retention_policy, &aad)?;
     let tx = conn.transaction()?;
     tx.execute(
         "INSERT INTO journal_entries(
@@ -634,8 +1021,8 @@ fn insert_journal_entry(conn: &mut Connection, entry: &JournalEntry) -> Result<(
             entry.session_id.0.as_str(),
             seq,
             entry.schema_version.as_str(),
-            entry.timestamp_ms.to_string(),
-            event_json,
+            timestamp_ms,
+            event_record,
         ],
     )?;
     tx.commit()?;
@@ -644,21 +1031,25 @@ fn insert_journal_entry(conn: &mut Connection, entry: &JournalEntry) -> Result<(
 
 fn read_journal_entries_from_connection(
     conn: &Connection,
+    retention_policy: &DurableRetentionPolicy,
 ) -> Result<Vec<JournalEntry>, JournalError> {
     let mut stmt = conn.prepare(
         "SELECT schema_version, run_id, session_id, seq, timestamp_ms, event_json
          FROM journal_entries
          ORDER BY seq ASC",
     )?;
-    let rows = stmt.query_map([], journal_entry_from_row)?;
+    let mut rows = stmt.query([])?;
     let mut entries = Vec::new();
-    for row in rows {
-        entries.push(row?);
+    while let Some(row) = rows.next()? {
+        entries.push(journal_entry_from_row(row, retention_policy)?);
     }
     Ok(entries)
 }
 
-fn journal_entry_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JournalEntry> {
+fn journal_entry_from_row(
+    row: &rusqlite::Row<'_>,
+    retention_policy: &DurableRetentionPolicy,
+) -> Result<JournalEntry, JournalError> {
     let schema_version: String = row.get(0)?;
     let run_id: String = row.get(1)?;
     let session_id: String = row.get(2)?;
@@ -666,15 +1057,25 @@ fn journal_entry_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JournalEn
     let timestamp_ms: String = row.get(4)?;
     let event_json: String = row.get(5)?;
 
-    let seq = u64::try_from(seq).map_err(|err| {
-        rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Integer, Box::new(err))
+    let seq = u64::try_from(seq).map_err(|_| JournalError::InvalidField {
+        field: "seq",
+        value: seq.to_string(),
     })?;
-    let timestamp_ms = timestamp_ms.parse::<u128>().map_err(|err| {
-        rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(err))
-    })?;
-    let event = serde_json::from_str::<JournalEvent>(&event_json).map_err(|err| {
-        rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(err))
-    })?;
+    let timestamp_ms = timestamp_ms
+        .parse::<u128>()
+        .map_err(|_| JournalError::InvalidField {
+            field: "timestamp_ms",
+            value: timestamp_ms.clone(),
+        })?;
+    let aad = journal_event_aad(
+        schema_version.as_str(),
+        run_id.as_str(),
+        session_id.as_str(),
+        seq.to_string().as_str(),
+        timestamp_ms.to_string().as_str(),
+    );
+    let event_json = decode_durable_record_string(event_json.as_bytes(), retention_policy, &aad)?;
+    let event = serde_json::from_str::<JournalEvent>(&event_json)?;
 
     Ok(JournalEntry {
         schema_version,
@@ -686,17 +1087,231 @@ fn journal_entry_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JournalEn
     })
 }
 
-/// Parse an append-only JSONL file into records.
-///
-/// A crash between the JSON write and the trailing newline+sync leaves a torn final
-/// line. To keep such a session resumable, a single unparsable trailing record is
-/// tolerated (dropped) **only** when the file does not end in a newline — i.e. it was
-/// never fully committed. A completed line (one followed by `\n`) that fails to parse
-/// is treated as genuine mid-file corruption and reported with its line number.
-fn read_jsonl<T: DeserializeOwned>(path: impl AsRef<Path>) -> Result<Vec<T>, JournalError> {
+#[derive(Debug, Serialize, Deserialize)]
+struct EncryptedRecordDocument {
+    tempo_session_envelope: EncryptedRecordEnvelope,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct EncryptedRecordEnvelope {
+    version: u8,
+    algorithm: String,
+    nonce_hex: String,
+    ciphertext_hex: String,
+}
+
+fn encode_durable_record_string(
+    plaintext: &[u8],
+    retention_policy: &DurableRetentionPolicy,
+    aad: &[u8],
+) -> Result<String, JournalError> {
+    match retention_policy {
+        DurableRetentionPolicy::PlaintextUnsafe => {
+            String::from_utf8(plaintext.to_vec()).map_err(|err| JournalError::InvalidField {
+                field: "durable_record",
+                value: err.to_string(),
+            })
+        }
+        DurableRetentionPolicy::Encrypted { key } => {
+            let mut nonce = [0_u8; 24];
+            getrandom::fill(&mut nonce).map_err(|error| JournalError::Random {
+                reason: error.to_string(),
+            })?;
+            let cipher = XChaCha20Poly1305::new_from_slice(key.as_bytes())
+                .map_err(|_| JournalError::EncryptionFailed)?;
+            let ciphertext = cipher
+                .encrypt(
+                    XNonce::from_slice(&nonce),
+                    Payload {
+                        msg: plaintext,
+                        aad,
+                    },
+                )
+                .map_err(|_| JournalError::EncryptionFailed)?;
+            serde_json::to_string(&EncryptedRecordDocument {
+                tempo_session_envelope: EncryptedRecordEnvelope {
+                    version: ENCRYPTED_RECORD_VERSION,
+                    algorithm: ENCRYPTED_RECORD_ALGORITHM.into(),
+                    nonce_hex: hex_encode(&nonce),
+                    ciphertext_hex: hex_encode(&ciphertext),
+                },
+            })
+            .map_err(JournalError::Serde)
+        }
+    }
+}
+
+fn encode_durable_record_bytes(
+    plaintext: &[u8],
+    retention_policy: &DurableRetentionPolicy,
+    aad: &[u8],
+) -> Result<Vec<u8>, JournalError> {
+    Ok(encode_durable_record_string(plaintext, retention_policy, aad)?.into_bytes())
+}
+
+fn decode_durable_record_string(
+    record: &[u8],
+    retention_policy: &DurableRetentionPolicy,
+    aad: &[u8],
+) -> Result<String, JournalError> {
+    let bytes = decode_durable_record_bytes(record, retention_policy, aad)?;
+    String::from_utf8(bytes).map_err(|err| JournalError::InvalidField {
+        field: "durable_record",
+        value: err.to_string(),
+    })
+}
+
+fn decode_durable_record_bytes(
+    record: &[u8],
+    retention_policy: &DurableRetentionPolicy,
+    aad: &[u8],
+) -> Result<Vec<u8>, JournalError> {
+    let record_text = std::str::from_utf8(record).ok();
+    let encrypted = match record_text {
+        Some(text) => parse_encrypted_record_document(text)?,
+        None => None,
+    };
+
+    match (retention_policy, encrypted) {
+        (DurableRetentionPolicy::PlaintextUnsafe, Some(_)) => {
+            Err(JournalError::EncryptedRecordRequiresKey)
+        }
+        (DurableRetentionPolicy::PlaintextUnsafe, None) => Ok(record.to_vec()),
+        (DurableRetentionPolicy::Encrypted { key: _ }, None) => {
+            Err(JournalError::PlaintextRecordRejected)
+        }
+        (DurableRetentionPolicy::Encrypted { key }, Some(document)) => {
+            let envelope = document.tempo_session_envelope;
+            if envelope.version > ENCRYPTED_RECORD_VERSION {
+                return Err(JournalError::EncryptedRecordVersion {
+                    found: envelope.version,
+                    supported: ENCRYPTED_RECORD_VERSION,
+                });
+            }
+            if envelope.version != ENCRYPTED_RECORD_VERSION {
+                return Err(JournalError::EncryptedRecordMalformed {
+                    reason: format!("unsupported envelope version {}", envelope.version),
+                });
+            }
+            if envelope.algorithm != ENCRYPTED_RECORD_ALGORITHM {
+                return Err(JournalError::EncryptedRecordMalformed {
+                    reason: format!("unsupported algorithm {}", envelope.algorithm),
+                });
+            }
+            let nonce = hex_decode_exact::<24>(&envelope.nonce_hex)?;
+            let ciphertext = hex_decode(&envelope.ciphertext_hex)?;
+            let cipher = XChaCha20Poly1305::new_from_slice(key.as_bytes())
+                .map_err(|_| JournalError::DecryptionFailed)?;
+            cipher
+                .decrypt(
+                    XNonce::from_slice(&nonce),
+                    Payload {
+                        msg: ciphertext.as_slice(),
+                        aad,
+                    },
+                )
+                .map_err(|_| JournalError::DecryptionFailed)
+        }
+    }
+}
+
+fn parse_encrypted_record_document(
+    record_text: &str,
+) -> Result<Option<EncryptedRecordDocument>, JournalError> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(record_text) else {
+        return Ok(None);
+    };
+    if value.get("tempo_session_envelope").is_none() {
+        return Ok(None);
+    }
+    serde_json::from_value(value).map(Some).map_err(|source| {
+        JournalError::EncryptedRecordMalformed {
+            reason: source.to_string(),
+        }
+    })
+}
+
+fn journal_event_aad(
+    schema_version: &str,
+    run_id: &str,
+    session_id: &str,
+    seq: &str,
+    timestamp_ms: &str,
+) -> Vec<u8> {
+    aad_fields(&[
+        "tempo-session",
+        "journal-event",
+        "v1",
+        schema_version,
+        run_id,
+        session_id,
+        seq,
+        timestamp_ms,
+    ])
+}
+
+fn cassette_aad() -> &'static [u8] {
+    b"tempo-session\0cassette\0v1"
+}
+
+fn aad_fields(fields: &[&str]) -> Vec<u8> {
+    let mut aad = Vec::new();
+    aad.extend_from_slice(&(fields.len() as u64).to_be_bytes());
+    for field in fields {
+        let bytes = field.as_bytes();
+        aad.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+        aad.extend_from_slice(bytes);
+    }
+    aad
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    encoded
+}
+
+fn hex_decode_exact<const N: usize>(hex: &str) -> Result<[u8; N], JournalError> {
+    let bytes = hex_decode(hex)?;
+    <[u8; N]>::try_from(bytes.as_slice()).map_err(|_| JournalError::EncryptedRecordMalformed {
+        reason: format!("expected {N} decoded bytes, got {}", bytes.len()),
+    })
+}
+
+fn hex_decode(hex: &str) -> Result<Vec<u8>, JournalError> {
+    let raw = hex.as_bytes();
+    if !raw.len().is_multiple_of(2) {
+        return Err(JournalError::EncryptedRecordMalformed {
+            reason: "hex string has odd length".into(),
+        });
+    }
+    let mut bytes = Vec::with_capacity(raw.len() / 2);
+    for pair in raw.chunks_exact(2) {
+        let high = hex_nibble(pair[0])?;
+        let low = hex_nibble(pair[1])?;
+        bytes.push((high << 4) | low);
+    }
+    Ok(bytes)
+}
+
+fn hex_nibble(byte: u8) -> Result<u8, JournalError> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err(JournalError::EncryptedRecordMalformed {
+            reason: format!("invalid hex byte 0x{byte:02x}"),
+        }),
+    }
+}
+
+fn read_cassette_jsonl(
+    path: impl AsRef<Path>,
+    retention_policy: &DurableRetentionPolicy,
+) -> Result<Vec<ResponseCassette>, JournalError> {
     let bytes = std::fs::read(path.as_ref())?;
-    // A fully-committed record always ends in a newline. If the file does not, its
-    // last segment is a partially-written (torn) record that may be dropped.
     let torn_tail_possible = bytes.last() != Some(&b'\n');
     let lines: Vec<&[u8]> = bytes.split(|byte| *byte == b'\n').collect();
     let last_index = lines.len().saturating_sub(1);
@@ -706,12 +1321,19 @@ fn read_jsonl<T: DeserializeOwned>(path: impl AsRef<Path>) -> Result<Vec<T>, Jou
         if raw.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-        // Parse from bytes so an invalid-UTF-8 torn tail is tolerated rather than
-        // surfacing as a hard IO error.
-        match serde_json::from_slice::<T>(raw) {
+        let decoded = match decode_durable_record_bytes(raw, retention_policy, cassette_aad()) {
+            Ok(decoded) => decoded,
+            Err(source) => {
+                if torn_tail_possible && index == last_index && is_incomplete_json_record(raw) {
+                    break;
+                }
+                return Err(source);
+            }
+        };
+        match serde_json::from_slice::<ResponseCassette>(&decoded) {
             Ok(record) => records.push(record),
             Err(source) => {
-                if torn_tail_possible && index == last_index {
+                if torn_tail_possible && index == last_index && is_incomplete_json_record(raw) {
                     break;
                 }
                 return Err(JournalError::Corrupt {
@@ -725,25 +1347,36 @@ fn read_jsonl<T: DeserializeOwned>(path: impl AsRef<Path>) -> Result<Vec<T>, Jou
     Ok(records)
 }
 
-/// Truncate a torn trailing record (bytes after the last committed newline) so the
-/// journal file contains only fully-synced records before the next append.
-///
-/// Every committed append ends in `\n`, so any bytes past the final newline are an
-/// incomplete write from a crash and are safe to discard. A file that already ends in
-/// a newline (or is empty) is left untouched.
-fn truncate_torn_tail(path: &Path, file: &File) -> Result<(), JournalError> {
+fn is_incomplete_json_record(raw: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(raw).is_err()
+}
+
+enum CassetteAppendBoundary {
+    Ready,
+    NeedsNewline,
+}
+
+/// Repair a trailing incomplete JSON record before append without deleting a complete
+/// record that still needs authentication/decode by the caller.
+fn repair_cassette_tail_before_append(
+    path: &Path,
+    file: &File,
+) -> Result<CassetteAppendBoundary, JournalError> {
     let bytes = std::fs::read(path)?;
     if bytes.is_empty() || bytes.last() == Some(&b'\n') {
-        return Ok(());
+        return Ok(CassetteAppendBoundary::Ready);
     }
     let keep = bytes
         .iter()
         .rposition(|byte| *byte == b'\n')
         .map(|idx| idx as u64 + 1)
         .unwrap_or(0);
-    file.set_len(keep)?;
-    file.sync_all()?;
-    Ok(())
+    if is_incomplete_json_record(&bytes[keep as usize..]) {
+        file.set_len(keep)?;
+        file.sync_all()?;
+        return Ok(CassetteAppendBoundary::Ready);
+    }
+    Ok(CassetteAppendBoundary::NeedsNewline)
 }
 
 fn validate_journal_entries(
@@ -1084,6 +1717,92 @@ mod tests {
     }
 
     #[test]
+    fn cassette_replay_request_migrates_legacy_key() -> TestResult {
+        let path = unique_path("cassette-legacy-key")?;
+        remove_if_exists(&path)?;
+        let method = "POST";
+        let url = "https://example.com/api";
+        let request_body = b"left\0right";
+        let current_key = CassetteKey::from_request(method, url, request_body);
+        let legacy_key = CassetteKey::legacy_v1_from_request(method, url, request_body);
+        assert_ne!(current_key, legacy_key);
+
+        let legacy = ResponseCassette {
+            key: legacy_key,
+            method: method.into(),
+            url: url.into(),
+            status: 200,
+            headers: vec![("content-type".into(), "application/json".into())],
+            body: br#"{"ok":true}"#.to_vec(),
+        };
+        let expected = ResponseCassette {
+            key: current_key.clone(),
+            ..legacy.clone()
+        };
+
+        let store = CassetteStore::open(&path)?;
+        store.record(&legacy)?;
+        assert_eq!(store.replay(&current_key)?, None);
+
+        assert_eq!(
+            store.replay_request(method, url, request_body)?,
+            Some(expected.clone())
+        );
+        assert_eq!(store.replay(&current_key)?, Some(expected.clone()));
+        assert_eq!(store.all()?, vec![legacy, expected.clone()]);
+
+        assert_eq!(
+            store.replay_request(method, url, request_body)?,
+            Some(expected)
+        );
+        assert_eq!(store.all()?.len(), 2);
+
+        remove_if_exists(&path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn cassette_replay_request_prefers_current_key() -> TestResult {
+        let path = unique_path("cassette-current-key")?;
+        remove_if_exists(&path)?;
+        let method = "GET";
+        let url = "https://example.com/api";
+        let request_body = b"";
+        let current_key = CassetteKey::from_request(method, url, request_body);
+        let legacy_key = CassetteKey::legacy_v1_from_request(method, url, request_body);
+
+        let legacy = ResponseCassette {
+            key: legacy_key,
+            method: method.into(),
+            url: url.into(),
+            status: 200,
+            headers: Vec::new(),
+            body: b"legacy".to_vec(),
+        };
+        let current = ResponseCassette {
+            key: current_key,
+            method: method.into(),
+            url: url.into(),
+            status: 202,
+            headers: Vec::new(),
+            body: b"current".to_vec(),
+        };
+
+        let store = CassetteStore::open(&path)?;
+        store.record(&legacy)?;
+        store.record(&current)?;
+
+        assert_eq!(
+            store.replay_request(method, url, request_body)?,
+            Some(current.clone())
+        );
+        assert_eq!(store.all()?, vec![legacy, current]);
+
+        remove_if_exists(&path)?;
+        Ok(())
+    }
+
+    #[test]
     fn cassette_record_repairs_torn_tail_before_append() -> TestResult {
         let path = unique_path("cassette-torn-tail")?;
         remove_if_exists(&path)?;
@@ -1199,7 +1918,7 @@ mod tests {
             [],
         )?;
         let err = read_journal_entries(&path).err();
-        assert!(matches!(err, Some(JournalError::Sqlite(_))));
+        assert!(matches!(err, Some(JournalError::Serde(_))));
 
         remove_if_exists(&path)?;
         Ok(())
@@ -1253,10 +1972,13 @@ mod tests {
             .chars()
             .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
 
-        // Known SHA-256 of "GET\0https://example.com/api\0payload".
+        // Known SHA-256 of the v2 versioned, length-prefixed request tuple.
         let expected = {
             let mut hasher = Sha256::new();
-            hasher.update(b"GET\0https://example.com/api\0payload");
+            hasher.update(b"tempo-session:cassette-key:v2\0");
+            update_length_prefixed(&mut hasher, b"GET");
+            update_length_prefixed(&mut hasher, b"https://example.com/api");
+            update_length_prefixed(&mut hasher, b"payload");
             let digest = hasher.finalize();
             let mut key = String::with_capacity(digest.len() * 2);
             for byte in digest {
@@ -1271,6 +1993,10 @@ mod tests {
         let split = CassetteKey::from_request("GET", "x", b"");
         let joined = CassetteKey::from_request("GETx", "", b"");
         assert_ne!(split, joined);
+
+        let nul_in_url = CassetteKey::from_request("GET", "x\0", b"y");
+        let nul_in_body = CassetteKey::from_request("GET", "x", b"\0y");
+        assert_ne!(nul_in_url, nul_in_body);
 
         let other_method = CassetteKey::from_request("POST", "https://example.com/api", b"payload");
         assert_ne!(a, other_method);
@@ -1322,6 +2048,489 @@ mod tests {
         assert!(!path.exists());
         assert!(!journal_lock_path(&path).exists());
 
+        Ok(())
+    }
+
+    #[test]
+    fn durable_session_state_fails_closed_when_stealth_mode_is_requested() -> TestResult {
+        for value in ["1", "true", "yes", "on", "stealth", " TRUE "] {
+            assert!(matches!(
+                reject_durable_state_in_stealth_mode_value(Some(OsString::from(value))),
+                Err(JournalError::StealthModeUnsupported)
+            ));
+        }
+
+        for value in [
+            None,
+            Some(OsString::from("")),
+            Some(OsString::from("0")),
+            Some(OsString::from("false")),
+        ] {
+            assert!(reject_durable_state_in_stealth_mode_value(value).is_ok());
+        }
+
+        let journal_path = unique_path("stealth-journal-blocked")?;
+        let cassette_path = unique_path("stealth-cassette-blocked")?;
+        remove_if_exists(&journal_path)?;
+        remove_if_exists(&cassette_path)?;
+        assert!(matches!(
+            SessionJournal::open_with_stealth_value(
+                &journal_path,
+                RunId("run-stealth".into()),
+                SessionId("session-stealth".into()),
+                Some(OsString::from("true")),
+                DurableRetentionPolicy::PlaintextUnsafe,
+            ),
+            Err(JournalError::StealthModeUnsupported)
+        ));
+        assert!(!journal_path.exists());
+        assert!(!journal_lock_path(&journal_path).exists());
+        assert!(matches!(
+            SessionJournal::resume_with_stealth_value(
+                &journal_path,
+                RunId("run-stealth".into()),
+                SessionId("session-stealth".into()),
+                Some(OsString::from("true")),
+                DurableRetentionPolicy::PlaintextUnsafe,
+            ),
+            Err(JournalError::StealthModeUnsupported)
+        ));
+        assert!(!journal_path.exists());
+        assert!(!journal_lock_path(&journal_path).exists());
+        assert!(matches!(
+            CassetteStore::open_with_stealth_value(
+                &cassette_path,
+                Some(OsString::from("stealth")),
+                DurableRetentionPolicy::PlaintextUnsafe,
+            ),
+            Err(JournalError::StealthModeUnsupported)
+        ));
+        assert!(!cassette_path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn durable_retention_policy_env_requires_key_or_plaintext_opt_in() -> TestResult {
+        assert!(matches!(
+            durable_retention_policy_from_env_values(None, None),
+            Err(JournalError::SecureRetentionPolicyRequired)
+        ));
+        assert!(matches!(
+            durable_retention_policy_from_env_values(Some(OsString::from("encrypted")), None),
+            Err(JournalError::SecureRetentionPolicyRequired)
+        ));
+        assert_eq!(
+            durable_retention_policy_from_env_values(
+                Some(OsString::from("plaintext-unsafe")),
+                None,
+            )?,
+            DurableRetentionPolicy::PlaintextUnsafe
+        );
+
+        let key_hex = "2a".repeat(DURABLE_ENCRYPTION_KEY_BYTES);
+        assert!(matches!(
+            durable_retention_policy_from_env_values(None, Some(OsString::from(key_hex))),
+            Ok(DurableRetentionPolicy::Encrypted { key })
+                if key == DurableEncryptionKey::from_bytes([0x2a; DURABLE_ENCRYPTION_KEY_BYTES])
+        ));
+        assert!(matches!(
+            durable_retention_policy_from_env_values(Some(OsString::from("forever")), None),
+            Err(JournalError::InvalidDurableRetentionPolicy { value }) if value == "forever"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn encrypted_journal_hides_event_bytes_and_requires_key() -> TestResult {
+        let path = unique_path("encrypted-journal")?;
+        remove_if_exists(&path)?;
+        let run_id = RunId("run-encrypted".into());
+        let session_id = SessionId("session-encrypted".into());
+        let policy = encrypted_test_policy(7);
+        let wrong_policy = encrypted_test_policy(8);
+
+        let mut journal = SessionJournal::open_with_retention_policy(
+            &path,
+            run_id.clone(),
+            session_id.clone(),
+            policy.clone(),
+        )?;
+        journal.append(JournalEvent::SessionStarted {
+            url: "https://example.com/search?q=journal-secret".into(),
+        })?;
+        journal.append(JournalEvent::ActionPlanned {
+            action: Action::Type {
+                node: NodeId("login-field".into()),
+                text: "typed-secret".into(),
+            },
+        })?;
+        drop(journal);
+
+        let bytes = fs::read(&path)?;
+        assert!(contains_bytes(&bytes, b"tempo_session_envelope"));
+        assert!(!contains_bytes(&bytes, b"journal-secret"));
+        assert!(!contains_bytes(&bytes, b"typed-secret"));
+
+        let resumed = SessionJournal::resume_with_retention_policy(
+            &path,
+            run_id.clone(),
+            session_id.clone(),
+            policy,
+        )?;
+        assert_eq!(resumed.entries.len(), 2);
+        assert!(matches!(
+            read_journal_entries(&path),
+            Err(JournalError::EncryptedRecordRequiresKey)
+        ));
+        assert!(matches!(
+            SessionJournal::resume_with_retention_policy(&path, run_id, session_id, wrong_policy),
+            Err(JournalError::DecryptionFailed)
+        ));
+
+        remove_if_exists(&path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn encrypted_cassettes_hide_payload_bytes_and_require_key() -> TestResult {
+        let path = unique_path("encrypted-cassette")?;
+        remove_if_exists(&path)?;
+        let policy = encrypted_test_policy(9);
+        let wrong_policy = encrypted_test_policy(10);
+        let cassette = ResponseCassette::for_request(
+            "POST",
+            "https://example.com/api?token=cassette-url-secret",
+            b"request-body-secret",
+            200,
+            vec![("x-secret".into(), "header-secret".into())],
+            b"response-body-secret".to_vec(),
+        );
+
+        let store = CassetteStore::open_with_retention_policy(&path, policy.clone())?;
+        store.record(&cassette)?;
+
+        let bytes = fs::read(&path)?;
+        assert!(contains_bytes(&bytes, b"tempo_session_envelope"));
+        assert!(!contains_bytes(&bytes, b"cassette-url-secret"));
+        assert!(!contains_bytes(&bytes, b"request-body-secret"));
+        assert!(!contains_bytes(&bytes, b"header-secret"));
+        assert!(!contains_bytes(&bytes, b"response-body-secret"));
+        assert_eq!(store.replay(&cassette.key)?, Some(cassette.clone()));
+        assert!(matches!(
+            read_cassettes(&path),
+            Err(JournalError::EncryptedRecordRequiresKey)
+        ));
+
+        let wrong_store = CassetteStore::open_with_retention_policy(&path, wrong_policy)?;
+        assert!(matches!(
+            wrong_store.all(),
+            Err(JournalError::DecryptionFailed)
+        ));
+
+        remove_if_exists(&path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn encrypted_record_future_version_is_forward_detectable() -> TestResult {
+        let future = serde_json::to_vec(&EncryptedRecordDocument {
+            tempo_session_envelope: EncryptedRecordEnvelope {
+                version: ENCRYPTED_RECORD_VERSION + 1,
+                algorithm: ENCRYPTED_RECORD_ALGORITHM.into(),
+                nonce_hex: hex_encode(&[0_u8; 24]),
+                ciphertext_hex: hex_encode(b"not-a-real-ciphertext"),
+            },
+        })?;
+
+        assert!(matches!(
+            decode_durable_record_bytes(&future, &encrypted_test_policy(11), b"test-aad"),
+            Err(JournalError::EncryptedRecordVersion {
+                found,
+                supported
+            }) if found == ENCRYPTED_RECORD_VERSION + 1 && supported == ENCRYPTED_RECORD_VERSION
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_non_ascii_hex_is_rejected_without_panicking() -> TestResult {
+        assert!(matches!(
+            DurableEncryptionKey::from_hex("éé"),
+            Err(JournalError::EncryptedRecordMalformed { .. })
+        ));
+
+        let malformed = serde_json::to_vec(&EncryptedRecordDocument {
+            tempo_session_envelope: EncryptedRecordEnvelope {
+                version: ENCRYPTED_RECORD_VERSION,
+                algorithm: ENCRYPTED_RECORD_ALGORITHM.into(),
+                nonce_hex: "éé".into(),
+                ciphertext_hex: hex_encode(b"not-a-real-ciphertext"),
+            },
+        })?;
+        assert!(matches!(
+            decode_durable_record_bytes(&malformed, &encrypted_test_policy(12), b"test-aad"),
+            Err(JournalError::EncryptedRecordMalformed { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn encrypted_retention_rejects_existing_plaintext_records() -> TestResult {
+        let journal_path = unique_path("encrypted-rejects-plaintext-journal")?;
+        let cassette_path = unique_path("encrypted-rejects-plaintext-cassette")?;
+        remove_if_exists(&journal_path)?;
+        remove_if_exists(&cassette_path)?;
+        let run_id = RunId("run-plaintext".into());
+        let session_id = SessionId("session-plaintext".into());
+
+        {
+            let mut journal =
+                SessionJournal::open(&journal_path, run_id.clone(), session_id.clone())?;
+            journal.append(JournalEvent::SessionStarted {
+                url: "https://plaintext.example".into(),
+            })?;
+        }
+        assert!(matches!(
+            SessionJournal::resume_with_retention_policy(
+                &journal_path,
+                run_id,
+                session_id,
+                encrypted_test_policy(13),
+            ),
+            Err(JournalError::PlaintextRecordRejected)
+        ));
+
+        let cassette = ResponseCassette::new(
+            "GET",
+            "https://plaintext.example/api",
+            200,
+            vec![("x-mode".into(), "plaintext".into())],
+            b"plaintext-body".to_vec(),
+        );
+        let store = CassetteStore::open(&cassette_path)?;
+        store.record(&cassette)?;
+        let encrypted_store =
+            CassetteStore::open_with_retention_policy(&cassette_path, encrypted_test_policy(14))?;
+        assert!(matches!(
+            encrypted_store.all(),
+            Err(JournalError::PlaintextRecordRejected)
+        ));
+
+        remove_if_exists(&journal_path)?;
+        remove_if_exists(&cassette_path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn encrypted_journal_aad_separates_nul_containing_identities() -> TestResult {
+        let path = unique_path("encrypted-aad-collision")?;
+        remove_if_exists(&path)?;
+        let policy = encrypted_test_policy(15);
+        let source_run = RunId("a".into());
+        let source_session = SessionId("b\0c".into());
+        let target_run = RunId("a\0b".into());
+        let target_session = SessionId("c".into());
+
+        {
+            let mut journal = SessionJournal::open_with_retention_policy(
+                &path,
+                source_run,
+                source_session,
+                policy.clone(),
+            )?;
+            journal.append(JournalEvent::SessionStarted {
+                url: "https://aad.example".into(),
+            })?;
+        }
+        {
+            let conn = Connection::open(&path)?;
+            conn.execute(
+                "UPDATE journal_entries SET run_id = ?1, session_id = ?2 WHERE seq = 0",
+                rusqlite::params![target_run.0.as_str(), target_session.0.as_str()],
+            )?;
+        }
+
+        assert!(matches!(
+            SessionJournal::resume_with_retention_policy(&path, target_run, target_session, policy,),
+            Err(JournalError::DecryptionFailed)
+        ));
+
+        remove_if_exists(&path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn encrypted_cassette_complete_tampered_tail_fails_closed() -> TestResult {
+        let path = unique_path("encrypted-complete-tail-tamper")?;
+        remove_if_exists(&path)?;
+        let policy = encrypted_test_policy(16);
+        let store = CassetteStore::open_with_retention_policy(&path, policy.clone())?;
+        store.record(&ResponseCassette::new(
+            "GET",
+            "https://tail.example/api",
+            200,
+            Vec::new(),
+            b"tail-body".to_vec(),
+        ))?;
+
+        let mut bytes = fs::read(&path)?;
+        if bytes.last() == Some(&b'\n') {
+            bytes.pop();
+        }
+        let mut document: EncryptedRecordDocument = serde_json::from_slice(&bytes)?;
+        let replacement = if document
+            .tempo_session_envelope
+            .ciphertext_hex
+            .starts_with("00")
+        {
+            "ff"
+        } else {
+            "00"
+        };
+        document
+            .tempo_session_envelope
+            .ciphertext_hex
+            .replace_range(0..2, replacement);
+        std::fs::write(&path, serde_json::to_vec(&document)?)?;
+
+        let store = CassetteStore::open_with_retention_policy(&path, policy)?;
+        assert!(matches!(store.all(), Err(JournalError::DecryptionFailed)));
+        let before_record = fs::read(&path)?;
+        assert!(matches!(
+            store.record(&ResponseCassette::new(
+                "GET",
+                "https://tail.example/next",
+                200,
+                Vec::new(),
+                b"next-body".to_vec(),
+            )),
+            Err(JournalError::DecryptionFailed)
+        ));
+        assert_eq!(fs::read(&path)?, before_record);
+
+        remove_if_exists(&path)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_session_files_are_owner_only_on_unix() -> TestResult {
+        let journal_path = unique_path("private-journal")?;
+        let cassette_path = unique_path("private-cassette")?;
+        remove_if_exists(&journal_path)?;
+        remove_if_exists(&cassette_path)?;
+
+        let mut journal = SessionJournal::open(
+            &journal_path,
+            RunId("run-private".into()),
+            SessionId("session-private".into()),
+        )?;
+        journal.append(JournalEvent::SessionStarted {
+            url: "https://example.com".into(),
+        })?;
+        drop(journal);
+
+        assert_eq!(file_mode(&journal_path)?, 0o600);
+        assert_eq!(file_mode(&journal_lock_path(&journal_path))?, 0o600);
+
+        let cassette = ResponseCassette::new(
+            "GET",
+            "https://example.com/api",
+            200,
+            Vec::new(),
+            b"ok".to_vec(),
+        );
+        let store = CassetteStore::open(&cassette_path)?;
+        store.record(&cassette)?;
+        assert_eq!(file_mode(&cassette_path)?, 0o600);
+
+        remove_if_exists(&journal_path)?;
+        remove_if_exists(&cassette_path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn encrypted_journal_hides_plaintext_and_requires_key() -> TestResult {
+        let path = unique_path("encrypted-journal")?;
+        remove_if_exists(&path)?;
+        let run_id = RunId("run-encrypted".into());
+        let session_id = SessionId("session-encrypted".into());
+        let policy = DurableRetentionPolicy::encrypted(test_key(7));
+        let secret_url = "https://secret.example/path?token=top-secret";
+
+        {
+            let mut journal = SessionJournal::open_with_retention_policy(
+                &path,
+                run_id.clone(),
+                session_id.clone(),
+                policy.clone(),
+            )?;
+            journal.append(JournalEvent::SessionStarted {
+                url: secret_url.into(),
+            })?;
+        }
+
+        let bytes = fs::read(&path)?;
+        assert!(!contains_bytes(&bytes, b"top-secret"));
+        assert!(!contains_bytes(&bytes, secret_url.as_bytes()));
+
+        let resumed = SessionJournal::resume_with_retention_policy(
+            &path,
+            run_id.clone(),
+            session_id.clone(),
+            policy,
+        )?;
+        assert_eq!(resumed.entries.len(), 1);
+        assert_eq!(
+            resumed.entries[0].event,
+            JournalEvent::SessionStarted {
+                url: secret_url.into()
+            }
+        );
+        assert!(matches!(
+            SessionJournal::resume(&path, run_id.clone(), session_id.clone()),
+            Err(JournalError::EncryptedRecordRequiresKey)
+        ));
+        assert!(matches!(
+            SessionJournal::resume_with_retention_policy(
+                &path,
+                run_id,
+                session_id,
+                DurableRetentionPolicy::encrypted(test_key(8)),
+            ),
+            Err(JournalError::DecryptionFailed)
+        ));
+
+        remove_if_exists(&path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn encrypted_cassettes_hide_plaintext_and_require_key() -> TestResult {
+        let path = unique_path("encrypted-cassette")?;
+        remove_if_exists(&path)?;
+        let policy = DurableRetentionPolicy::encrypted(test_key(9));
+        let cassette = ResponseCassette::new(
+            "GET",
+            "https://api.example/private?token=top-secret",
+            200,
+            vec![("set-cookie".into(), "session=top-secret".into())],
+            b"top-secret body".to_vec(),
+        );
+
+        let store = CassetteStore::open_with_retention_policy(&path, policy.clone())?;
+        store.record(&cassette)?;
+
+        let bytes = fs::read(&path)?;
+        assert!(!contains_bytes(&bytes, b"top-secret"));
+        assert!(!contains_bytes(&bytes, b"set-cookie"));
+        assert_eq!(store.replay(&cassette.key)?, Some(cassette));
+        assert!(matches!(
+            read_cassettes(&path),
+            Err(JournalError::EncryptedRecordRequiresKey)
+        ));
+
+        remove_if_exists(&path)?;
         Ok(())
     }
 
@@ -1430,11 +2639,26 @@ mod tests {
         }
     }
 
+    fn encrypted_test_policy(seed: u8) -> DurableRetentionPolicy {
+        DurableRetentionPolicy::encrypted(DurableEncryptionKey::from_bytes([seed; 32]))
+    }
+
+    #[cfg(unix)]
+    fn file_mode(path: &Path) -> Result<u32, std::io::Error> {
+        use std::os::unix::fs::PermissionsExt;
+
+        Ok(fs::metadata(path)?.permissions().mode() & 0o777)
+    }
+
     fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
         !needle.is_empty()
             && haystack
                 .windows(needle.len())
                 .any(|window| window == needle)
+    }
+
+    fn test_key(seed: u8) -> DurableEncryptionKey {
+        DurableEncryptionKey::from_bytes([seed; DURABLE_ENCRYPTION_KEY_BYTES])
     }
 
     fn crash_matrix_events() -> Vec<JournalEvent> {
@@ -1477,6 +2701,6 @@ mod tests {
 
     fn write_entry(path: &Path, entry: JournalEntry) -> Result<(), JournalError> {
         let mut conn = open_journal_connection(path, JournalOpenMode::ReadWriteCreate)?;
-        insert_journal_entry(&mut conn, &entry)
+        insert_journal_entry(&mut conn, &entry, &DurableRetentionPolicy::PlaintextUnsafe)
     }
 }
