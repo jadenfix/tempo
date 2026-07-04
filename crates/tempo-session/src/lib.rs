@@ -2084,6 +2084,132 @@ mod tests {
     }
 
     #[test]
+    fn cassette_index_replay_matches_all_across_tail_repair() -> TestResult {
+        let path = unique_path("cassette-index-tail-repair")?;
+        remove_if_exists(&path)?;
+        let store = CassetteStore::open(&path)?;
+        let first = test_cassette(1);
+        let second = test_cassette(2);
+        let complete_unterminated = test_cassette(3);
+        let after_boundary_repair = test_cassette(4);
+        let after_torn_tail = test_cassette(5);
+
+        store.record(&first)?;
+        assert_cassette_store_contents(&store, std::slice::from_ref(&first))?;
+
+        store.record(&second)?;
+        assert_cassette_store_contents(&store, &[first.clone(), second.clone()])?;
+
+        append_cassette_without_newline(&path, &complete_unterminated)?;
+        assert_cassette_store_contents(
+            &store,
+            &[first.clone(), second.clone(), complete_unterminated.clone()],
+        )?;
+
+        store.record(&after_boundary_repair)?;
+        assert_cassette_store_contents(
+            &store,
+            &[
+                first.clone(),
+                second.clone(),
+                complete_unterminated.clone(),
+                after_boundary_repair.clone(),
+            ],
+        )?;
+
+        append_raw_cassette_tail(&path, br#"{"key":{"#)?;
+        assert_cassette_store_contents(
+            &store,
+            &[
+                first.clone(),
+                second.clone(),
+                complete_unterminated.clone(),
+                after_boundary_repair.clone(),
+            ],
+        )?;
+
+        store.record(&after_torn_tail)?;
+        assert_cassette_store_contents(
+            &store,
+            &[
+                first,
+                second,
+                complete_unterminated,
+                after_boundary_repair,
+                after_torn_tail,
+            ],
+        )?;
+
+        remove_if_exists(&path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn cassette_index_catches_up_across_instances_and_rebuilds_after_shrink() -> TestResult {
+        let path = unique_path("cassette-index-multi-instance")?;
+        remove_if_exists(&path)?;
+        let writer = CassetteStore::open(&path)?;
+        let reader = CassetteStore::open(&path)?;
+        let first = test_cassette(10);
+        let second = test_cassette(11);
+        let third = test_cassette(12);
+
+        writer.record(&first)?;
+        let first_len = fs::metadata(&path)?.len();
+        assert_eq!(reader.replay(&first.key)?, Some(first.clone()));
+
+        writer.record(&second)?;
+        assert_eq!(reader.replay(&second.key)?, Some(second.clone()));
+        assert_cassette_store_contents(&reader, &[first.clone(), second.clone()])?;
+
+        {
+            let file = OpenOptions::new().write(true).open(&path)?;
+            file.set_len(first_len)?;
+            file.sync_all()?;
+        }
+        assert_eq!(reader.replay(&second.key)?, None);
+        assert_cassette_store_contents(&reader, std::slice::from_ref(&first))?;
+
+        writer.record(&third)?;
+        assert_cassette_store_contents(&reader, &[first, third])?;
+
+        remove_if_exists(&path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn cassette_index_poison_resets_before_replay() -> TestResult {
+        let path = unique_path("cassette-index-poison")?;
+        remove_if_exists(&path)?;
+        let store = CassetteStore::open(&path)?;
+        let cassette = test_cassette(20);
+        store.record(&cassette)?;
+
+        let poison_result = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let mut guard = match store.index.lock() {
+                        Ok(guard) => guard,
+                        Err(_) => panic!("index should not be poisoned before this test"),
+                    };
+                    guard.by_key.clear();
+                    if let Ok(metadata) = fs::metadata(&path) {
+                        guard.indexed_bytes = metadata.len();
+                    }
+                    panic!("poison cassette index with an inconsistent watermark");
+                })
+                .join()
+        });
+        assert!(poison_result.is_err());
+
+        assert_eq!(store.replay(&cassette.key)?, Some(cassette.clone()));
+        assert_cassette_store_contents(&store, std::slice::from_ref(&cassette))?;
+
+        remove_if_exists(&path)?;
+        Ok(())
+    }
+
+    #[test]
     fn journal_records_are_host_portable() -> TestResult {
         let path = unique_path("portable")?;
         remove_if_exists(&path)?;
@@ -3136,6 +3262,49 @@ mod tests {
 
     fn test_key(seed: u8) -> DurableEncryptionKey {
         DurableEncryptionKey::from_bytes([seed; DURABLE_ENCRYPTION_KEY_BYTES])
+    }
+
+    fn test_cassette(index: usize) -> ResponseCassette {
+        ResponseCassette::new(
+            if index.is_multiple_of(2) {
+                "POST"
+            } else {
+                "GET"
+            },
+            format!("https://example.com/cassette/{index}"),
+            200 + (index % 10) as u16,
+            vec![("x-tempo-index".into(), index.to_string())],
+            format!("body-{index}").into_bytes(),
+        )
+    }
+
+    fn assert_cassette_store_contents(
+        store: &CassetteStore,
+        expected: &[ResponseCassette],
+    ) -> TestResult {
+        assert_eq!(store.all()?, expected);
+        for cassette in expected {
+            assert_eq!(store.replay(&cassette.key)?, Some(cassette.clone()));
+        }
+        assert_eq!(store.replay(&CassetteKey("missing".into()))?, None);
+        Ok(())
+    }
+
+    fn append_cassette_without_newline(path: &Path, cassette: &ResponseCassette) -> TestResult {
+        let cassette_json = serde_json::to_vec(cassette)?;
+        let record = encode_durable_record_bytes(
+            &cassette_json,
+            &DurableRetentionPolicy::PlaintextUnsafe,
+            cassette_aad(),
+        )?;
+        append_raw_cassette_tail(path, &record)
+    }
+
+    fn append_raw_cassette_tail(path: &Path, bytes: &[u8]) -> TestResult {
+        let mut file = OpenOptions::new().append(true).open(path)?;
+        file.write_all(bytes)?;
+        file.flush()?;
+        Ok(())
     }
 
     fn crash_matrix_events() -> Vec<JournalEvent> {
