@@ -2371,13 +2371,20 @@ fn route_http_request_with_auth(
     {
         return Err(TempodError::Forbidden("origin not allowed".into()));
     }
+    if request.method == "GET"
+        && request.path == TEMPOD_METRICS_PATH
+        && !loopback_host_allowed(request.host.as_deref())
+    {
+        return Err(TempodError::Forbidden("host not allowed".into()));
+    }
     match (request.method.as_str(), request.path.as_str()) {
         // Health never touches the pool at all: it must answer even while
         // metadata routes are briefly holding the lock.
         ("GET", "/health") => Ok(HttpResponse::json(200, json!({"ok": true}))),
         // Deliberately behind the loopback-Origin guard (and bearer auth on
         // remote binds): exposition is control-plane data. Scrapers send no
-        // Origin header, so they pass the guard. Short in-memory lock only.
+        // Origin header, but still need a loopback Host authority. Short
+        // in-memory lock only.
         ("GET", TEMPOD_METRICS_PATH) => {
             if !metrics_enabled() {
                 return Ok(HttpResponse::json(
@@ -2484,6 +2491,9 @@ fn create_session_shared(
             return Err(TempodError::Draining);
         }
         enforce_tempod_navigation_url(&pool.url_policy, &url)?;
+        if pool.driver.is_some() {
+            enforce_tempod_resolved_navigation_url(&pool.url_policy, &url)?;
+        }
         pool.driver.clone()
     };
 
@@ -2543,6 +2553,7 @@ fn route_session_act_batch(
     let (mut driver, request_fingerprint, idempotency_key, policy) = {
         let mut pool = lock_pool(pool)?;
         let policy = enforce_session_batch_policy(&pool.url_policy, pool.privacy_mode, &body)?;
+        enforce_batch_resolved_navigation_url_policy(&pool.url_policy, &body.batch)?;
         let request_fingerprint = session_act_batch_idempotency_fingerprint(&body);
         if let Some(key) = body.idempotency_key.as_deref()
             && let Some(response) =
@@ -2800,6 +2811,16 @@ fn enforce_tempod_navigation_url(policy: &UrlPolicy, url: &str) -> Result<(), Te
     Ok(())
 }
 
+fn enforce_tempod_resolved_navigation_url(
+    policy: &UrlPolicy,
+    url: &str,
+) -> Result<(), TempodError> {
+    if let Some(message) = tempod_resolved_navigation_url_policy_denial(policy, url) {
+        return Err(TempodError::Forbidden(message));
+    }
+    Ok(())
+}
+
 fn enforce_batch_navigation_url_policy(
     policy: &UrlPolicy,
     batch: &ActionBatch,
@@ -2811,6 +2832,23 @@ fn enforce_batch_navigation_url_policy(
             return Err(TempodError::Forbidden(format!(
                 "action {index} goto {message}"
             )));
+        }
+    }
+    Ok(())
+}
+
+fn enforce_batch_resolved_navigation_url_policy(
+    policy: &UrlPolicy,
+    batch: &ActionBatch,
+) -> Result<(), TempodError> {
+    for (index, action) in batch.actions.iter().enumerate() {
+        if let Action::Goto { url } = action {
+            enforce_tempod_resolved_navigation_url(policy, url).map_err(|error| match error {
+                TempodError::Forbidden(message) => {
+                    TempodError::Forbidden(format!("action {index} goto {message}"))
+                }
+                other => other,
+            })?;
         }
     }
     Ok(())
@@ -4020,7 +4058,7 @@ impl HttpRequest {
         let host = self
             .host
             .as_deref()
-            .filter(|host| valid_host_header(host))
+            .filter(|host| loopback_host_allowed(Some(host)))
             .unwrap_or("localhost");
         format!("http://{host}")
     }
@@ -4031,6 +4069,29 @@ fn valid_host_header(host: &str) -> bool {
         && host
             .bytes()
             .all(|byte| byte.is_ascii_graphic() && !matches!(byte, b'/' | b'\\'))
+}
+
+fn loopback_host_allowed(host: Option<&str>) -> bool {
+    let Some(host) = host.map(str::trim).filter(|host| valid_host_header(host)) else {
+        return false;
+    };
+    let Ok(url) = Url::parse(&format!("http://{host}/")) else {
+        return false;
+    };
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return false;
+    }
+    match url.host() {
+        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(addr)) => addr.is_loopback(),
+        Some(url::Host::Ipv6(addr)) => addr.is_loopback(),
+        None => false,
+    }
 }
 
 fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, TempodError> {
@@ -5301,6 +5362,101 @@ mod tests {
         Ok(Arc::new(Mutex::new(pool)))
     }
 
+    #[test]
+    fn session_create_blocks_private_url_before_engine_context() -> TestResult {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let create_calls = Arc::new(AtomicUsize::new(0));
+        let create_calls_for_engine = Arc::clone(&create_calls);
+        let pool = shared_pool_with_fake_engine(move |request| match &request.command {
+            HostDriverCommand::CreateBrowsingContext { .. } => {
+                create_calls_for_engine.fetch_add(1, Ordering::SeqCst);
+                FakeEngineReply::Respond(DriverResponse::BrowsingContextCreated {
+                    driver_id: "session-context-1".into(),
+                })
+            }
+            HostDriverCommand::Goto { url } => {
+                FakeEngineReply::Respond(DriverResponse::Observation {
+                    observation: observation(url, 1),
+                })
+            }
+            _ => FakeEngineReply::Respond(DriverResponse::Closed),
+        })?;
+        pool.lock().map_err(|_| "pool lock poisoned")?.url_policy = UrlPolicy::block_private();
+
+        let response = super::handle_http_request(
+            &pool,
+            control_request("POST", "/sessions", None, br#"{"url":"http://127.0.0.1/"}"#),
+        );
+
+        assert_eq!(response.status, 403);
+        assert_eq!(create_calls.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn session_act_batch_blocks_private_goto_before_engine_dispatch() -> TestResult {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let act_calls = Arc::new(AtomicUsize::new(0));
+        let act_calls_for_engine = Arc::clone(&act_calls);
+        let pool = shared_pool_with_fake_engine(move |request| match &request.command {
+            HostDriverCommand::CreateBrowsingContext { .. } => {
+                FakeEngineReply::Respond(DriverResponse::BrowsingContextCreated {
+                    driver_id: "session-context-1".into(),
+                })
+            }
+            HostDriverCommand::Goto { url } => {
+                FakeEngineReply::Respond(DriverResponse::Observation {
+                    observation: observation(url, 1),
+                })
+            }
+            HostDriverCommand::ActBatch { .. } => {
+                act_calls_for_engine.fetch_add(1, Ordering::SeqCst);
+                FakeEngineReply::Respond(DriverResponse::Step {
+                    outcome: StepOutcome::Applied {
+                        diff: ObservationDiff {
+                            since_seq: 1,
+                            seq: 2,
+                            added: Vec::new(),
+                            removed: Vec::new(),
+                            changed: Vec::new(),
+                        },
+                    }
+                    .into(),
+                })
+            }
+            _ => FakeEngineReply::Respond(DriverResponse::Closed),
+        })?;
+        let created = super::handle_http_request(
+            &pool,
+            control_request(
+                "POST",
+                "/sessions",
+                None,
+                br#"{"url":"https://example.com"}"#,
+            ),
+        );
+        assert_eq!(created.status, 201);
+        let created: TempodSession = serde_json::from_slice(&created.body)?;
+        let path = format!("/sessions/{}/act_batch", created.id.0);
+        pool.lock().map_err(|_| "pool lock poisoned")?.url_policy = UrlPolicy::block_private();
+
+        let blocked = super::handle_http_request(
+            &pool,
+            control_request(
+                "POST",
+                &path,
+                None,
+                br#"{"batch":{"actions":[{"kind":"goto","url":"http://127.0.0.1/"}],"quiescence":"composite"},"input_tainted":false}"#,
+            ),
+        );
+
+        assert_eq!(blocked.status, 403);
+        assert_eq!(act_calls.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
     type ServerHandles = Vec<thread::JoinHandle<Result<(), TempodError>>>;
 
     /// Spawn `count` single-request server threads accepting on one listener.
@@ -6203,7 +6359,7 @@ mod tests {
 
         let response = send_http(
             addr,
-            "GET /.well-known/agent-card.json HTTP/1.1\r\nhost: tempod.test:7777\r\n\r\n",
+            "GET /.well-known/agent-card.json HTTP/1.1\r\nhost: localhost:7777\r\n\r\n",
         )?;
         join_server(handle)?;
 
@@ -6215,7 +6371,7 @@ mod tests {
             .ok_or("missing HTTP response body")?;
         let card: Value = serde_json::from_str(body)?;
         assert_eq!(card["name"], "tempo");
-        assert_eq!(card["url"], "http://tempod.test:7777/mcp");
+        assert_eq!(card["url"], "http://localhost:7777/mcp");
         assert_eq!(card["preferredTransport"], "MCP");
         assert!(card["skills"]
             .as_array()
@@ -6260,6 +6416,27 @@ mod tests {
                 path: tempo_mcp::A2A_AGENT_CARD_PATH.into(),
                 headers: BTreeMap::new(),
                 host: Some("localhost/path".into()),
+                origin: None,
+                body: Vec::new(),
+            },
+        )?;
+
+        assert_eq!(response.status, 200);
+        let card: Value = serde_json::from_slice(&response.body)?;
+        assert_eq!(card["url"], "http://localhost/mcp");
+        Ok(())
+    }
+
+    #[test]
+    fn agent_card_falls_back_when_host_header_is_not_loopback() -> TestResult {
+        let mut pool = SessionPool::default();
+        let response = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "GET".into(),
+                path: tempo_mcp::A2A_AGENT_CARD_PATH.into(),
+                headers: BTreeMap::new(),
+                host: Some("tempod.test:7777".into()),
                 origin: None,
                 body: Vec::new(),
             },
@@ -8202,6 +8379,12 @@ mod tests {
         }
     }
 
+    fn with_host(mut request: HttpRequest, host: &str) -> HttpRequest {
+        request.host = Some(host.into());
+        request.headers.insert("host".into(), host.into());
+        request
+    }
+
     fn with_bearer(mut request: HttpRequest, token: &str) -> HttpRequest {
         request
             .headers
@@ -8251,7 +8434,10 @@ mod tests {
 
         let metrics = handle_http_request(
             &mut pool,
-            control_request("GET", TEMPOD_METRICS_PATH, None, b""),
+            with_host(
+                control_request("GET", TEMPOD_METRICS_PATH, None, b""),
+                "localhost:8787",
+            ),
         );
         assert_eq!(metrics.status, 200);
         assert_eq!(
@@ -8274,7 +8460,10 @@ mod tests {
         set_metrics_enabled(false);
         let disabled = handle_http_request(
             &mut pool,
-            control_request("GET", TEMPOD_METRICS_PATH, None, b""),
+            with_host(
+                control_request("GET", TEMPOD_METRICS_PATH, None, b""),
+                "127.0.0.1",
+            ),
         );
         set_metrics_enabled(true);
         assert_eq!(disabled.status, 404);
@@ -8284,14 +8473,46 @@ mod tests {
     #[test]
     fn metrics_endpoint_is_origin_guarded() -> TestResult {
         // The exposition is control-plane data: a DNS-rebinding page must not
-        // be able to read operational state cross-origin. Scrapers and CLI
-        // clients send no Origin header, so they pass the guard.
+        // be able to read operational state cross-origin even if the Host
+        // authority is loopback.
         let mut pool = SessionPool::default();
         let blocked = handle_http_request(
             &mut pool,
-            control_request("GET", TEMPOD_METRICS_PATH, Some("http://evil.example"), b""),
+            with_host(
+                control_request("GET", TEMPOD_METRICS_PATH, Some("http://evil.example"), b""),
+                "localhost:8787",
+            ),
         );
         assert_eq!(blocked.status, 403);
+        Ok(())
+    }
+
+    #[test]
+    fn metrics_endpoint_requires_loopback_host() -> TestResult {
+        let mut pool = SessionPool::default();
+        let missing = handle_http_request(
+            &mut pool,
+            control_request("GET", TEMPOD_METRICS_PATH, None, b""),
+        );
+        assert_eq!(missing.status, 403);
+
+        let external = handle_http_request(
+            &mut pool,
+            with_host(
+                control_request("GET", TEMPOD_METRICS_PATH, None, b""),
+                "tempod.evil.test",
+            ),
+        );
+        assert_eq!(external.status, 403);
+
+        let ipv6_loopback = handle_http_request(
+            &mut pool,
+            with_host(
+                control_request("GET", TEMPOD_METRICS_PATH, None, b""),
+                "[::1]:8787",
+            ),
+        );
+        assert_eq!(ipv6_loopback.status, 200);
         Ok(())
     }
 
