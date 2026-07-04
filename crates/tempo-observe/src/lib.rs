@@ -182,13 +182,6 @@ impl RawElement {
         normalize_spans_into(&mut value, &self.value);
         opaque_identity_key("fp", &[role.as_str(), name.as_str(), value.as_str()])
     }
-
-    fn allocation_key(&self) -> String {
-        if self.stable_hint.is_some() {
-            return self.fingerprint_key();
-        }
-        self.source_key().unwrap_or_else(|| self.fingerprint_key())
-    }
 }
 
 /// Raw observation input for one page snapshot.
@@ -450,10 +443,17 @@ impl StableIdMapper {
     pub fn node_id_for(&mut self, raw: &RawElement) -> NodeId {
         let seq = self.seq;
 
+        // Hash once per element. The previous flow recomputed these SHA-256
+        // digests up to four times per element — `source_key()` in both the
+        // hit and insert paths, plus an allocation-key helper re-deriving
+        // whichever key it chose — which dominated compile cost on large
+        // snapshots.
+        let source_key = raw.source_key();
+        let base_fingerprint = raw.fingerprint_key();
+
         // Disambiguate elements that share a fingerprint within this snapshot: the
         // Nth occurrence gets its own lookup key so two genuinely distinct
         // elements never resolve to the same NodeId (issue #105).
-        let base_fingerprint = raw.fingerprint_key();
         // get_mut-then-insert instead of entry(clone): the common case (first
         // occurrence within a snapshot) pays one clone, repeats pay none.
         let occurrence = match self.occurrences.get_mut(&base_fingerprint) {
@@ -467,16 +467,14 @@ impl StableIdMapper {
                 0
             }
         };
-        // Extend the owned base key in place rather than format!-ing a fresh
-        // String per element.
-        let mut fingerprint = base_fingerprint;
+        let mut fingerprint = String::with_capacity(base_fingerprint.len() + 4);
         {
             use std::fmt::Write as _;
-            let _ = write!(fingerprint, "#{occurrence}");
+            let _ = write!(fingerprint, "{base_fingerprint}#{occurrence}");
         }
 
-        if let Some(source_key) = raw.source_key()
-            && let Some(entry) = self.by_source.get_mut(&source_key)
+        if let Some(source_key) = &source_key
+            && let Some(entry) = self.by_source.get_mut(source_key)
         {
             entry.last_seen = seq;
             let node_id = entry.node_id.clone();
@@ -489,7 +487,7 @@ impl StableIdMapper {
         if let Some(entry) = self.by_fingerprint.get_mut(&fingerprint) {
             entry.last_seen = seq;
             let node_id = entry.node_id.clone();
-            if let Some(source_key) = raw.source_key() {
+            if let Some(source_key) = source_key {
                 self.by_source.insert(
                     source_key,
                     MappedId {
@@ -501,8 +499,16 @@ impl StableIdMapper {
             return node_id;
         }
 
-        let node_id = self.allocate(&raw.allocation_key());
-        if let Some(source_key) = raw.source_key() {
+        // Allocation-key rule over the digests already computed above: a
+        // stable hint (or a missing source id) allocates from the
+        // fingerprint, otherwise from the source identity.
+        let allocation_key = if raw.stable_hint.is_some() {
+            base_fingerprint.as_str()
+        } else {
+            source_key.as_deref().unwrap_or(base_fingerprint.as_str())
+        };
+        let node_id = self.allocate(allocation_key);
+        if let Some(source_key) = source_key {
             self.by_source.insert(
                 source_key,
                 MappedId {
@@ -664,8 +670,12 @@ pub fn observation_corpus_report(
 
     for input in inputs.iter().cloned() {
         let snapshot = compiler.compile_with_identities(input);
-        bytes.push(serialized_len(&snapshot.observation));
-        tokens.push(estimated_tokens(&snapshot.observation));
+        // Serialize once per snapshot: the token estimate is a pure function
+        // of the serialized byte length, so a second full serialization for
+        // `estimated_tokens` would double the dominant cost of this loop.
+        let byte_len = serialized_len(&snapshot.observation);
+        bytes.push(byte_len);
+        tokens.push(tokens_for_serialized_len(byte_len));
         let current_identities = unique_identity_map(snapshot.identities);
 
         for (key, node_id) in &current_identities {
@@ -841,10 +851,16 @@ pub fn composite_set_of_marks_png(
     screenshot_png: &[u8],
     observation: &CompiledObservation,
 ) -> Result<Vec<u8>, MarkCompositorError> {
-    let decoded = decode_png_to_rgba(screenshot_png)?;
-    let composited =
-        composite_set_of_marks_rgba(&decoded.rgba, decoded.width, decoded.height, observation)?;
-    encode_rgba_png(&composited, decoded.width, decoded.height)
+    // The decode already produced an owned RGBA buffer; composite into it
+    // directly instead of cloning the full frame a second time.
+    let mut decoded = decode_png_to_rgba(screenshot_png)?;
+    composite_set_of_marks_rgba_in_place(
+        &mut decoded.rgba,
+        decoded.width,
+        decoded.height,
+        observation,
+    )?;
+    encode_rgba_png(&decoded.rgba, decoded.width, decoded.height)
 }
 
 /// Composite set-of-marks labels and bounds onto a raw RGBA screenshot.
@@ -858,6 +874,21 @@ pub fn composite_set_of_marks_rgba(
     height: u32,
     observation: &CompiledObservation,
 ) -> Result<Vec<u8>, MarkCompositorError> {
+    let mut output = screenshot_rgba.to_vec();
+    composite_set_of_marks_rgba_in_place(&mut output, width, height, observation)?;
+    Ok(output)
+}
+
+/// In-place variant of [`composite_set_of_marks_rgba`] for callers that own
+/// their RGBA buffer: marks touch only a handful of small rectangles, so
+/// drawing in place avoids copying the full frame (a 1280×800 screenshot is
+/// ~4MB) per composite.
+pub fn composite_set_of_marks_rgba_in_place(
+    screenshot_rgba: &mut [u8],
+    width: u32,
+    height: u32,
+    observation: &CompiledObservation,
+) -> Result<(), MarkCompositorError> {
     let expected = rgba_len(width, height)?;
     if screenshot_rgba.len() != expected {
         return Err(MarkCompositorError::InvalidBufferLength {
@@ -866,9 +897,8 @@ pub fn composite_set_of_marks_rgba(
         });
     }
 
-    let mut output = screenshot_rgba.to_vec();
     let mut canvas = RgbaCanvas {
-        pixels: &mut output,
+        pixels: screenshot_rgba,
         width,
         height,
     };
@@ -888,7 +918,7 @@ pub fn composite_set_of_marks_rgba(
         };
         draw_mark(&mut canvas, bounds, *label);
     }
-    Ok(output)
+    Ok(())
 }
 
 /// Serialized JSON byte length for a compiled observation.
@@ -901,7 +931,13 @@ pub fn serialized_len(observation: &CompiledObservation) -> usize {
 
 /// Coarse token estimate used for the budget gate.
 pub fn estimated_tokens(observation: &CompiledObservation) -> usize {
-    serialized_len(observation).div_ceil(4)
+    tokens_for_serialized_len(serialized_len(observation))
+}
+
+/// Token estimate from an already-computed serialized byte length, so callers
+/// that need both figures serialize once.
+fn tokens_for_serialized_len(byte_len: usize) -> usize {
+    byte_len.div_ceil(4)
 }
 
 /// Percentile over pre-sorted values: callers sort once and probe many times.
