@@ -23,7 +23,7 @@ use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::service::TowerToHyperService;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as JsonValue};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -185,6 +185,7 @@ impl TempodAuth {
 pub struct TempodServerConfig {
     allow_remote_binds: bool,
     auth: TempodAuth,
+    allowed_hosts: BTreeSet<String>,
 }
 
 impl TempodServerConfig {
@@ -199,6 +200,13 @@ impl TempodServerConfig {
 
     pub fn with_auth(mut self, auth: TempodAuth) -> Self {
         self.auth = auth;
+        self
+    }
+
+    fn with_bind_addr_host(mut self, addr: &str) -> Self {
+        if let Some(host) = normalized_host_header_name(addr) {
+            self.allowed_hosts.insert(host);
+        }
         self
     }
 
@@ -2198,6 +2206,7 @@ pub fn run_tempod_with_config_and_navigation_url_policy(
     config: TempodServerConfig,
     url_policy: UrlPolicy,
 ) -> Result<(), TempodError> {
+    let config = config.with_bind_addr_host(addr);
     config.validate_bind_addr(addr)?;
     let listener = TcpListener::bind(addr)?;
     let pool = Arc::new(Mutex::new(
@@ -2253,6 +2262,7 @@ pub fn run_tempod_with_attached_driver_config_and_navigation_url_policy(
     socket_path: impl AsRef<Path>,
     url_policy: UrlPolicy,
 ) -> Result<(), TempodError> {
+    let config = config.with_bind_addr_host(addr);
     config.validate_bind_addr(addr)?;
     let listener = TcpListener::bind(addr)?;
     let mut pool = SessionPool::from_env().with_navigation_url_policy(url_policy);
@@ -2359,7 +2369,14 @@ pub fn serve_forever_with_config(
     config: TempodServerConfig,
 ) -> Result<(), TempodError> {
     config.validate_listener(&listener)?;
-    serve_forever_trusted(listener, pool, config.auth, ConnectionLimiter::default())
+    let host_guard = TempodHostGuard::from_listener(&listener, &config.allowed_hosts)?;
+    serve_forever_trusted(
+        listener,
+        pool,
+        config.auth,
+        host_guard,
+        ConnectionLimiter::default(),
+    )
 }
 
 #[cfg(test)]
@@ -2368,13 +2385,15 @@ fn serve_forever_with_limits(
     pool: Arc<Mutex<SessionPool>>,
     limiter: ConnectionLimiter,
 ) -> Result<(), TempodError> {
-    serve_forever_trusted(listener, pool, TempodAuth::disabled(), limiter)
+    let host_guard = TempodHostGuard::from_listener(&listener, &BTreeSet::new())?;
+    serve_forever_trusted(listener, pool, TempodAuth::disabled(), host_guard, limiter)
 }
 
 fn serve_forever_trusted(
     listener: TcpListener,
     pool: Arc<Mutex<SessionPool>>,
     auth: TempodAuth,
+    host_guard: TempodHostGuard,
     limiter: ConnectionLimiter,
 ) -> Result<(), TempodError> {
     let _ = process_start();
@@ -2384,6 +2403,7 @@ fn serve_forever_trusted(
         let router = tempod_router(TempodAppState {
             pool,
             auth,
+            host_guard,
             limiter: limiter.clone(),
         });
         loop {
@@ -2427,13 +2447,21 @@ pub fn serve_one_with_config(
     config: TempodServerConfig,
 ) -> Result<(), TempodError> {
     config.validate_listener(&listener)?;
-    serve_one_trusted(listener, pool, config.auth, ConnectionLimiter::default())
+    let host_guard = TempodHostGuard::from_listener(&listener, &config.allowed_hosts)?;
+    serve_one_trusted(
+        listener,
+        pool,
+        config.auth,
+        host_guard,
+        ConnectionLimiter::default(),
+    )
 }
 
 fn serve_one_trusted(
     listener: TcpListener,
     pool: Arc<Mutex<SessionPool>>,
     auth: TempodAuth,
+    host_guard: TempodHostGuard,
     limiter: ConnectionLimiter,
 ) -> Result<(), TempodError> {
     let _ = process_start();
@@ -2450,6 +2478,7 @@ fn serve_one_trusted(
         let router = tempod_router(TempodAppState {
             pool,
             auth,
+            host_guard,
             limiter: limiter.clone(),
         });
         serve_tcp_connection(stream, router, permit).await;
@@ -2529,7 +2558,53 @@ fn log_connection_error(err: &TempodError) {
 struct TempodAppState {
     pool: Arc<Mutex<SessionPool>>,
     auth: TempodAuth,
+    host_guard: TempodHostGuard,
     limiter: ConnectionLimiter,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TempodHostGuard {
+    allowed_hosts: BTreeSet<String>,
+    allow_any_valid_host: bool,
+}
+
+impl TempodHostGuard {
+    fn from_listener(
+        listener: &TcpListener,
+        configured_hosts: &BTreeSet<String>,
+    ) -> Result<Self, TempodError> {
+        let mut allowed_hosts = configured_hosts.clone();
+        let addr = listener.local_addr()?;
+        allowed_hosts.insert(canonical_ip_host(addr.ip()));
+        if addr.ip().is_loopback() {
+            allowed_hosts.insert("localhost".to_string());
+            allowed_hosts.insert("127.0.0.1".to_string());
+            allowed_hosts.insert("[::1]".to_string());
+        }
+        Ok(Self {
+            allowed_hosts,
+            allow_any_valid_host: addr.ip().is_unspecified(),
+        })
+    }
+
+    #[cfg(test)]
+    fn loopback() -> Self {
+        Self {
+            allowed_hosts: BTreeSet::from([
+                "localhost".to_string(),
+                "127.0.0.1".to_string(),
+                "[::1]".to_string(),
+            ]),
+            allow_any_valid_host: false,
+        }
+    }
+
+    fn allows(&self, host: Option<&str>) -> bool {
+        let Some(host) = host.and_then(normalized_host_header_name) else {
+            return false;
+        };
+        self.allow_any_valid_host || self.allowed_hosts.contains(&host)
+    }
 }
 
 /// The tempod control-plane router (final.md §3.1): session lifecycle REST,
@@ -2568,15 +2643,16 @@ fn tempod_router(state: TempodAppState) -> Router {
         .with_state(state)
 }
 
-/// Per-route bearer-auth + loopback-Origin guard, evaluated before any handler
-/// or body read. Route classification is unchanged from the socket-level
-/// server: [`route_requires_auth`] / [`control_route_requires_origin_check`].
+/// Per-route bearer-auth + loopback Host/Origin guard, evaluated before any
+/// handler or body read. Route classification is unchanged from the
+/// socket-level server: [`route_requires_auth`] /
+/// [`control_route_requires_origin_check`].
 ///
 /// DNS-rebinding defence (issue #83 follow-up): the session/control-plane
-/// routes mutate or expose browser state, so they get the same loopback-Origin
-/// guard already applied to /mcp and /bidi. The guard relies on
-/// `origin_allowed` returning `true` when no Origin header is present, so
-/// non-browser/CLI clients keep working.
+/// routes mutate or expose browser state, so they require both an expected
+/// Host and the same loopback-Origin guard already applied to /mcp and /bidi.
+/// The Origin side still accepts missing Origin for non-browser/CLI clients,
+/// but those requests must now carry an expected Host.
 async fn guard_control_plane(
     State(state): State<TempodAppState>,
     request: AxumRequest,
@@ -2584,6 +2660,14 @@ async fn guard_control_plane(
 ) -> Response {
     let method = request.method().as_str();
     let path = request.uri().path();
+    if route_requires_host_check(method, path)
+        && !state
+            .host_guard
+            .allows(header_str(request.headers(), header::HOST))
+    {
+        return tempod_error_response(&TempodError::Forbidden("host not allowed".into()))
+            .into_response();
+    }
     if route_requires_auth(method, path)
         && let Err(err) = state
             .auth
@@ -3735,6 +3819,10 @@ fn route_requires_auth(method: &str, path: &str) -> bool {
     ) || control_route_requires_origin_check(method, path)
 }
 
+fn route_requires_host_check(method: &str, path: &str) -> bool {
+    route_requires_auth(method, path)
+}
+
 fn bind_addr_is_loopback(addr: &str) -> Result<bool, TempodError> {
     let addrs = addr.to_socket_addrs()?;
     let mut saw_addr = false;
@@ -4418,6 +4506,49 @@ fn loopback_host_allowed(host: Option<&str>) -> bool {
     }
 }
 
+fn normalized_host_header_name(host: &str) -> Option<String> {
+    if !valid_host_header(host) {
+        return None;
+    }
+    if host.starts_with('[') {
+        let end = host.find(']')?;
+        let literal = &host[..=end];
+        let suffix = &host[end + 1..];
+        if !suffix.is_empty() && !valid_port_suffix(suffix) {
+            return None;
+        }
+        return Some(literal.to_ascii_lowercase());
+    }
+    if host.contains(['[', ']']) {
+        return None;
+    }
+    let host = match host.rsplit_once(':') {
+        Some((name, port)) if valid_port(port) => name,
+        Some(_) => return None,
+        None => host,
+    }
+    .trim_end_matches('.');
+    if host.is_empty() || host.contains(':') {
+        return None;
+    }
+    Some(host.to_ascii_lowercase())
+}
+
+fn valid_port_suffix(suffix: &str) -> bool {
+    suffix.strip_prefix(':').is_some_and(valid_port)
+}
+
+fn valid_port(port: &str) -> bool {
+    !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn canonical_ip_host(ip: std::net::IpAddr) -> String {
+    match ip {
+        std::net::IpAddr::V4(ip) => ip.to_string(),
+        std::net::IpAddr::V6(ip) => format!("[{ip}]"),
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CreateSessionRequest {
@@ -4626,6 +4757,7 @@ mod tests {
         let router = tempod_router(TempodAppState {
             pool: Arc::clone(shared),
             auth: auth.clone(),
+            host_guard: TempodHostGuard::loopback(),
             limiter: ConnectionLimiter::default(),
         });
         let mut builder = axum::http::Request::builder()
@@ -4634,9 +4766,7 @@ mod tests {
         for (name, value) in &request.headers {
             builder = builder.header(name, value);
         }
-        if let Some(host) = &request.host {
-            builder = builder.header("host", host);
-        }
+        builder = builder.header("host", request.host.as_deref().unwrap_or("127.0.0.1:8787"));
         if let Some(origin) = &request.origin {
             builder = builder.header("origin", origin);
         }
@@ -9069,6 +9199,11 @@ mod tests {
         }
     }
 
+    fn with_host(mut request: HttpRequest, host: &str) -> HttpRequest {
+        request.host = Some(host.to_string());
+        request
+    }
+
     fn with_bearer(mut request: HttpRequest, token: &str) -> HttpRequest {
         request
             .headers
@@ -9258,6 +9393,78 @@ mod tests {
         );
         assert_eq!(loopback.status, 201);
         Ok(())
+    }
+
+    #[test]
+    fn control_routes_reject_untrusted_host_without_origin() -> TestResult {
+        // #375: after DNS rebinding, browser fetches can be same-origin and
+        // omit Origin, but the Host header remains attacker-controlled.
+        let create_body = br#"{"url":"https://example.test"}"#;
+        let mut pool = SessionPool::default();
+        let blocked = handle_http_request(
+            &mut pool,
+            with_host(
+                control_request("POST", "/sessions", None, create_body),
+                "evil.example",
+            ),
+        );
+        assert_eq!(blocked.status, 403);
+        assert!(
+            pool.list().is_empty(),
+            "untrusted Host request must not create a session"
+        );
+
+        let blocked_metrics = handle_http_request(
+            &mut pool,
+            with_host(
+                control_request("GET", TEMPOD_METRICS_PATH, None, b""),
+                "evil.example",
+            ),
+        );
+        assert_eq!(blocked_metrics.status, 403);
+
+        let allowed_localhost = handle_http_request(
+            &mut pool,
+            with_host(
+                control_request("POST", "/sessions", None, create_body),
+                "localhost:8787",
+            ),
+        );
+        assert_eq!(allowed_localhost.status, 201);
+
+        let allowed_ipv6_loopback = handle_http_request(
+            &mut pool,
+            with_host(
+                control_request("POST", "/sessions", None, create_body),
+                "[::1]:8787",
+            ),
+        );
+        assert_eq!(allowed_ipv6_loopback.status, 201);
+        Ok(())
+    }
+
+    #[test]
+    fn host_header_normalization_rejects_rebinding_authorities() {
+        assert_eq!(
+            normalized_host_header_name("LOCALHOST:8787").as_deref(),
+            Some("localhost")
+        );
+        assert_eq!(
+            normalized_host_header_name("127.0.0.1:8787").as_deref(),
+            Some("127.0.0.1")
+        );
+        assert_eq!(
+            normalized_host_header_name("[::1]:8787").as_deref(),
+            Some("[::1]")
+        );
+        assert_eq!(
+            normalized_host_header_name("localhost.").as_deref(),
+            Some("localhost")
+        );
+        assert!(normalized_host_header_name("evil.example").is_some());
+        assert!(normalized_host_header_name("localhost/path").is_none());
+        assert!(normalized_host_header_name("localhost:bad").is_none());
+        assert!(normalized_host_header_name("[::1").is_none());
     }
 
     // ---- Issue #256: capability auth for non-loopback tempod binds ----
@@ -10015,9 +10222,25 @@ mod tests {
     fn send_http(addr: std::net::SocketAddr, request: &str) -> Result<String, std::io::Error> {
         let mut stream = TcpStream::connect(addr)?;
         stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+        let request = request_with_default_host(addr, request);
         stream.write_all(request.as_bytes())?;
         stream.shutdown(std::net::Shutdown::Write)?;
         read_http_response(&mut stream)
+    }
+
+    fn request_with_default_host(addr: std::net::SocketAddr, request: &str) -> String {
+        if request.to_ascii_lowercase().contains("\r\nhost:") {
+            return request.to_string();
+        }
+        let Some(head_end) = request.find("\r\n") else {
+            return request.to_string();
+        };
+        let mut with_host =
+            String::with_capacity(request.len() + "host: 127.0.0.1:65535\r\n".len());
+        with_host.push_str(&request[..head_end + 2]);
+        with_host.push_str(&format!("host: 127.0.0.1:{}\r\n", addr.port()));
+        with_host.push_str(&request[head_end + 2..]);
+        with_host
     }
 
     fn read_http_response(stream: &mut TcpStream) -> Result<String, std::io::Error> {
