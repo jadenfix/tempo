@@ -77,6 +77,10 @@ const MAX_SESSION_IDEMPOTENCY_RECORDS: usize = 1024;
 const MAX_WS_PAYLOAD_BYTES: usize = MAX_HTTP_BYTES;
 /// Maximum accepted TCP control-plane connections handled concurrently.
 const MAX_HTTP_CONNECTIONS: usize = 128;
+/// Maximum retained tempod sessions. Killed sessions stay in the in-memory
+/// session map until the reaper lands (#412), so cap the retained map, not just
+/// currently-running sessions.
+const MAX_TEMPOD_SESSIONS: usize = 1024;
 /// Maximum upgraded BiDi WebSocket sessions held concurrently.
 const MAX_WEBSOCKET_CONNECTIONS: usize = 32;
 /// Maximum number of live BiDi browsing contexts (forked drivers) held at once.
@@ -706,6 +710,7 @@ pub struct SessionPool {
     url_policy: UrlPolicy,
     next_bidi_context_id: u64,
     next_id: u64,
+    max_sessions: usize,
     draining: bool,
 }
 
@@ -729,6 +734,7 @@ impl Default for SessionPool {
             url_policy: UrlPolicy::allow_all(),
             next_bidi_context_id: 0,
             next_id: 0,
+            max_sessions: MAX_TEMPOD_SESSIONS,
             draining: false,
         }
     }
@@ -753,6 +759,7 @@ impl fmt::Debug for SessionPool {
             .field("mcp_attached", &self.mcp.is_some())
             .field("url_policy", &self.url_policy)
             .field("next_id", &self.next_id)
+            .field("max_sessions", &self.max_sessions)
             .field("draining", &self.draining)
             .finish()
     }
@@ -841,6 +848,12 @@ impl SessionPool {
         self
     }
 
+    #[cfg(test)]
+    fn with_max_sessions(mut self, max_sessions: usize) -> Self {
+        self.max_sessions = max_sessions;
+        self
+    }
+
     pub fn privacy_mode(&self) -> PrivacyMode {
         self.privacy_mode
     }
@@ -881,9 +894,7 @@ impl SessionPool {
     /// (issue #230); this method serves already-locked callers (tests, and
     /// driverless metadata-only pools).
     pub fn create(&mut self, url: impl Into<String>) -> Result<TempodSession, TempodError> {
-        if self.draining {
-            return Err(TempodError::Draining);
-        }
+        self.ensure_accepting_session()?;
         let url = url.into();
         enforce_tempod_navigation_url(&self.url_policy, &url)?;
         let session_driver = self.create_session_engine_context(&url)?;
@@ -924,6 +935,26 @@ impl SessionPool {
 
     pub fn active_session_count(&self) -> usize {
         self.sessions.len()
+    }
+
+    fn session_limit_reached(&self) -> bool {
+        self.sessions.len() >= self.max_sessions
+    }
+
+    fn ensure_accepting_session(&self) -> Result<(), TempodError> {
+        if self.draining {
+            return Err(TempodError::Draining);
+        }
+        if self.session_limit_reached() {
+            return Err(TempodError::SessionLimit {
+                max: self.max_sessions,
+            });
+        }
+        Ok(())
+    }
+
+    fn engine_attached(&self) -> bool {
+        self.driver.is_some()
     }
 
     pub fn adopt(&mut self, id: &TempodSessionId) -> Result<TempodSession, TempodError> {
@@ -2648,6 +2679,7 @@ impl TempodHostGuard {
 fn tempod_router(state: TempodAppState) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/ready", get(ready))
         .route(TEMPOD_OPENAPI_PATH, get(openapi))
         .route(tempo_mcp::A2A_AGENT_CARD_PATH, get(agent_card))
         .route(tempo_mcp::A2A_AGENT_JSON_PATH, get(agent_card))
@@ -2782,6 +2814,7 @@ async fn instrument_requests(request: AxumRequest, next: Next) -> Response {
 fn metrics_route_class(method: &str, path: &str) -> &'static str {
     match (method, path) {
         ("GET", "/health") => "health",
+        ("GET", "/ready") => "ready",
         ("GET", TEMPOD_METRICS_PATH) => "metrics",
         (_, "/mcp") => "mcp",
         (_, "/bidi") => "bidi",
@@ -2922,6 +2955,40 @@ where
 /// even while every route worker is busy with engine or lock work.
 async fn health() -> HttpResponse {
     HttpResponse::json(200, json!({"ok": true}))
+}
+
+async fn ready(State(state): State<TempodAppState>) -> Response {
+    run_blocking(move || -> Result<HttpResponse, TempodError> {
+        let pool = lock_pool(&state.pool)?;
+        Ok(readiness_response(&pool))
+    })
+    .await
+}
+
+fn readiness_response(pool: &SessionPool) -> HttpResponse {
+    let mut reasons = Vec::new();
+    if pool.draining() {
+        reasons.push("draining");
+    }
+    if !pool.engine_attached() {
+        reasons.push("engine_detached");
+    }
+    if pool.session_limit_reached() {
+        reasons.push("session_limit_reached");
+    }
+    let ready = reasons.is_empty();
+    HttpResponse::json(
+        if ready { 200 } else { 503 },
+        json!({
+            "ok": ready,
+            "ready": ready,
+            "draining": pool.draining(),
+            "engine_attached": pool.engine_attached(),
+            "sessions": pool.active_session_count(),
+            "max_sessions": pool.max_sessions,
+            "reasons": reasons,
+        }),
+    )
 }
 
 async fn openapi(headers: HeaderMap) -> HttpResponse {
@@ -3187,9 +3254,7 @@ fn create_session_shared(
 ) -> Result<TempodSession, TempodError> {
     let root_driver = {
         let pool = lock_pool(pool)?;
-        if pool.draining {
-            return Err(TempodError::Draining);
-        }
+        pool.ensure_accepting_session()?;
         enforce_tempod_navigation_url(&pool.url_policy, &url)?;
         pool.driver.clone()
     };
@@ -3216,19 +3281,32 @@ fn create_session_shared(
     if pool.draining {
         // Drain raced the off-lock engine work: the pool must stay empty, so
         // release the freshly-created context (bounded) instead of leaking it.
-        if let Some(mut driver) = session_driver
-            && run_teardown_bounded(
-                "session context Close after drain race",
-                ENGINE_TEARDOWN_TIMEOUT,
-                move || futures::executor::block_on(driver.close()),
-            )
-            .is_none()
-        {
-            log_tempod_warn("session context created during drain was abandoned").emit();
-        }
+        abandon_created_session_driver(session_driver, "session context Close after drain race");
         return Err(TempodError::Draining);
     }
+    if pool.session_limit_reached() {
+        let max = pool.max_sessions;
+        abandon_created_session_driver(
+            session_driver,
+            "session context Close after session-limit race",
+        );
+        return Err(TempodError::SessionLimit { max });
+    }
     Ok(pool.finish_create(url, session_driver))
+}
+
+fn abandon_created_session_driver(
+    session_driver: Option<AttachedEngineDriver>,
+    operation: &'static str,
+) {
+    if let Some(mut driver) = session_driver
+        && run_teardown_bounded(operation, ENGINE_TEARDOWN_TIMEOUT, move || {
+            futures::executor::block_on(driver.close())
+        })
+        .is_none()
+    {
+        log_tempod_warn("session context created during rejected create was abandoned").emit();
+    }
 }
 
 fn route_session_observe(
@@ -3820,7 +3898,7 @@ fn after_seq(query: Option<&str>) -> Result<Option<u64>, TempodError> {
 /// Whether a route must pass the loopback-Origin guard. Session/control-plane routes (create, drain, adopt, delete, list,
 /// session events, and any unrecognised — hence potentially state-changing —
 /// route) are guarded. Exempt are the public idempotent metadata routes
-/// (`/health`, the A2A agent card, `GET /mcp`) and the routes that already run
+/// (`/health`, `/ready`, the A2A agent card, `GET /mcp`) and the routes that already run
 /// their own Origin check (`POST /mcp` via `route_mcp`, `POST /bidi`, and the
 /// `GET /bidi` WebSocket upgrade handler). The guard relies
 /// on `origin_allowed` returning `true` when no Origin header is present, so
@@ -3829,6 +3907,7 @@ fn control_route_requires_origin_check(method: &str, path: &str) -> bool {
     !matches!(
         (method, path),
         ("GET", "/health")
+            | ("GET", "/ready")
             | ("GET", tempo_mcp::A2A_AGENT_CARD_PATH)
             | ("GET", tempo_mcp::A2A_AGENT_JSON_PATH)
             | ("GET", TEMPOD_OPENAPI_PATH)
@@ -4658,6 +4737,8 @@ pub enum TempodError {
     PolicyDenied(Box<PolicyDeniedError>),
     #[error("connection limit reached: {0}")]
     ConnectionLimit(String),
+    #[error("session limit reached: max {max} retained sessions")]
+    SessionLimit { max: usize },
     #[error("session not found: {0:?}")]
     SessionNotFound(TempodSessionId),
     #[error("engine not found: {0}")]
@@ -4682,6 +4763,7 @@ impl TempodError {
             Self::Conflict(_) => 409,
             Self::Forbidden(_) => 403,
             Self::PolicyDenied(_) => 403,
+            Self::SessionLimit { .. } => 429,
             Self::SessionNotFound(_) | Self::EngineNotFound(_) => 404,
             Self::Draining | Self::ConnectionLimit(_) | Self::DriverUnavailable(_) => 503,
             Self::Io(_) | Self::Json(_) | Self::PoolLock | Self::Driver(_) | Self::Engine(_) => 500,
@@ -4854,6 +4936,12 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn json_array_contains(value: &Value, expected: &str) -> bool {
+        value
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| item == expected))
     }
 
     fn route_bidi_dispatch(pool: &mut SessionPool, body: Vec<u8>) -> BidiDispatchResult {
@@ -6965,6 +7053,116 @@ mod tests {
             value["error"],
             "tempod is draining; new sessions are not accepted"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn health_stays_live_while_ready_reports_detached_and_draining() -> TestResult {
+        let mut pool = SessionPool::default();
+
+        let health = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "GET".into(),
+                path: "/health".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: Vec::new(),
+            },
+        )?;
+        assert_eq!(health.status, 200);
+
+        let ready = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "GET".into(),
+                path: "/ready".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: Vec::new(),
+            },
+        )?;
+        assert_eq!(ready.status, 503);
+        let value: Value = serde_json::from_slice(&ready.body)?;
+        assert_eq!(value["ready"], false);
+        assert_eq!(value["engine_attached"], false);
+        assert!(json_array_contains(&value["reasons"], "engine_detached"));
+
+        pool.drain();
+        let draining_ready = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "GET".into(),
+                path: "/ready".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: Vec::new(),
+            },
+        )?;
+        assert_eq!(draining_ready.status, 503);
+        let value: Value = serde_json::from_slice(&draining_ready.body)?;
+        assert_eq!(value["draining"], true);
+        assert!(json_array_contains(&value["reasons"], "draining"));
+        Ok(())
+    }
+
+    #[test]
+    fn http_create_session_returns_429_at_session_cap() -> TestResult {
+        let mut pool = SessionPool::default().with_max_sessions(1);
+
+        let created = handle_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/sessions".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: br#"{"url":"https://first.test"}"#.to_vec(),
+            },
+        );
+        assert_eq!(created.status, 201);
+
+        let rejected = handle_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/sessions".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: br#"{"url":"https://second.test"}"#.to_vec(),
+            },
+        );
+        assert_eq!(rejected.status, 429);
+        let value: Value = serde_json::from_slice(&rejected.body)?;
+        assert_eq!(
+            value["error"],
+            "session limit reached: max 1 retained sessions"
+        );
+
+        let ready = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "GET".into(),
+                path: "/ready".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: Vec::new(),
+            },
+        )?;
+        assert_eq!(ready.status, 503);
+        let value: Value = serde_json::from_slice(&ready.body)?;
+        assert_eq!(value["sessions"], 1);
+        assert_eq!(value["max_sessions"], 1);
+        assert!(json_array_contains(
+            &value["reasons"],
+            "session_limit_reached"
+        ));
         Ok(())
     }
 
@@ -9350,6 +9548,7 @@ mod tests {
     #[test]
     fn metrics_route_class_bounds_label_cardinality() {
         assert_eq!(metrics_route_class("GET", "/health"), "health");
+        assert_eq!(metrics_route_class("GET", "/ready"), "ready");
         assert_eq!(metrics_route_class("GET", "/metrics"), "metrics");
         assert_eq!(metrics_route_class("POST", "/sessions"), "sessions");
         assert_eq!(
