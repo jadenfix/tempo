@@ -1771,13 +1771,13 @@ mod tests {
     }
 
     #[test]
-    fn budget_probe_matches_zero_omitted_wire_shape() {
+    fn budget_probe_matches_zero_omitted_wire_shape() -> Result<(), serde_json::Error> {
         let url = "https://budget.test";
         let elements = vec![test_element("node:submit", "button", 1.0)];
         let marks = Vec::new();
         let full = assemble_observation(url.into(), 1, elements.clone(), 0, marks.clone());
         let max_bytes = serialized_len(&full);
-        let serialized = serde_json::to_string(&full).expect("observation serializes");
+        let serialized = serde_json::to_string(&full)?;
         assert!(
             !serialized.contains("\"omitted\""),
             "zero omitted count must not change the wire budget: {serialized}"
@@ -1792,6 +1792,7 @@ mod tests {
         let budgeted = apply_budget(url.into(), 1, elements, options);
         assert_eq!(budgeted.elements.len(), 1);
         assert_eq!(budgeted.omitted, 0);
+        Ok(())
     }
 
     #[test]
