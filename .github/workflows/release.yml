@@ -25,8 +25,8 @@ jobs:
         run: cargo build --release --locked -p tempo-headless -p tempo-cli
       - name: Smoke-test binaries
         run: |
-          target/release/tempod --help >/dev/null 2>&1 || true
-          target/release/tempo-cli --help >/dev/null 2>&1 || true
+          target/release/tempod --help >/dev/null 2>&1
+          target/release/tempo-cli --help >/dev/null 2>&1
       - name: Package
         shell: bash
         run: |
