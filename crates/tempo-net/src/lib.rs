@@ -1590,6 +1590,13 @@ impl ProxyRoute {
     }
 }
 
+/// Host/port that must be resolved and pinned before using a proxy endpoint.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProxyEndpointTarget {
+    pub host: String,
+    pub port: u16,
+}
+
 /// Default egress behavior when no domain rule matches.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EgressDefault {
@@ -1650,6 +1657,27 @@ impl EgressPolicy {
     pub fn allow_insecure_local_proxy_endpoints(mut self) -> Self {
         self.allow_insecure_local_proxy_endpoints = true;
         self
+    }
+
+    /// Return the proxy host/port a transport adapter must resolve and pin.
+    pub fn proxy_endpoint_target(
+        &self,
+        proxy: &ProxyRoute,
+    ) -> Result<ProxyEndpointTarget, UrlBlocked> {
+        proxy_endpoint_target(&proxy.endpoint, self.allow_insecure_local_proxy_endpoints)
+    }
+
+    /// Validate a proxy endpoint socket after adapter-side DNS resolution.
+    pub fn enforce_proxy_endpoint_resolved_socket(
+        &self,
+        proxy: &ProxyRoute,
+        resolved_socket: SocketAddr,
+    ) -> Result<(), UrlBlocked> {
+        enforce_proxy_endpoint_resolved_socket(
+            &proxy.endpoint,
+            resolved_socket,
+            self.allow_insecure_local_proxy_endpoints,
+        )
     }
 
     pub fn decide(&self, request: &NetworkRequest) -> Result<EgressDecision, EgressDenied> {
@@ -2916,10 +2944,21 @@ fn enforce_proxy_endpoint_preflight(
     endpoint: &str,
     allow_insecure_local_proxy_endpoints: bool,
 ) -> Result<(), UrlBlocked> {
+    let _ = proxy_endpoint_target(endpoint, allow_insecure_local_proxy_endpoints)?;
+    Ok(())
+}
+
+fn proxy_endpoint_target(
+    endpoint: &str,
+    allow_insecure_local_proxy_endpoints: bool,
+) -> Result<ProxyEndpointTarget, UrlBlocked> {
     let parts = UrlParts::parse(endpoint).map_err(|reason| UrlBlocked { reason })?;
     enforce_proxy_endpoint_parts_policy(&parts, allow_insecure_local_proxy_endpoints)?;
-    let _ = proxy_endpoint_port(&parts)?;
-    Ok(())
+    let port = proxy_endpoint_port(&parts)?;
+    Ok(ProxyEndpointTarget {
+        host: parts.host,
+        port,
+    })
 }
 
 fn enforce_proxy_endpoint_parts_policy(
