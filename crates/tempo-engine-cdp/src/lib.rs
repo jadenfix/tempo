@@ -359,6 +359,7 @@ impl CdpTempoDriver {
             return Ok(());
         }
 
+        self.enforce_current_url_policy().await?;
         let page = self.page()?;
         let root = page
             .execute(GetDocumentParams::default())
