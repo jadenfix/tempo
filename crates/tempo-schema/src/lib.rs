@@ -1056,6 +1056,7 @@ mod tests {
                 bounds: None,
                 rank: 0.9,
             }],
+            omitted: 0,
             marks: vec![],
         };
 
