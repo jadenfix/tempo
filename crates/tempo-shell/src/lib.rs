@@ -13,6 +13,16 @@ use tempo_headless::{TempodSession, TempodSessionEvent, TempodSessionId};
 use thiserror::Error;
 
 pub const DEFAULT_TEMPOD_ADDR: &str = "127.0.0.1:8787";
+pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+// Mirrors tempo-engine-host::MAX_SCREENSHOT_BYTES without depending on that crate
+// from production shell code. MCP screenshot results base64-encode that raw
+// screenshot and wrap it in JSON, so the response cap must allow the encoded
+// 64 MiB engine-host screenshot ceiling plus envelope/header overhead.
+const ENGINE_HOST_MAX_SCREENSHOT_BYTES: usize = 64 * 1024 * 1024;
+const MCP_SCREENSHOT_RESPONSE_OVERHEAD_BYTES: usize = 1024 * 1024;
+pub const DEFAULT_MAX_MCP_RESPONSE_BYTES: usize =
+    ENGINE_HOST_MAX_SCREENSHOT_BYTES.div_ceil(3) * 4 + MCP_SCREENSHOT_RESPONSE_OVERHEAD_BYTES;
+const MAX_RESPONSE_HEADER_BYTES: usize = 64 * 1024;
 
 const USAGE: &str = "\
 tempo-shell
@@ -146,6 +156,8 @@ where
 pub struct ShellClient {
     tempod_addr: String,
     timeout: Duration,
+    max_response_bytes: usize,
+    max_mcp_response_bytes: usize,
 }
 
 impl ShellClient {
@@ -153,11 +165,24 @@ impl ShellClient {
         Self {
             tempod_addr: tempod_addr.into(),
             timeout: Duration::from_secs(5),
+            max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
+            max_mcp_response_bytes: DEFAULT_MAX_MCP_RESPONSE_BYTES,
         }
     }
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    pub fn with_max_response_bytes(mut self, max_response_bytes: usize) -> Self {
+        self.max_response_bytes = max_response_bytes;
+        self.max_mcp_response_bytes = max_response_bytes;
+        self
+    }
+
+    pub fn with_max_mcp_response_bytes(mut self, max_mcp_response_bytes: usize) -> Self {
+        self.max_mcp_response_bytes = max_mcp_response_bytes;
         self
     }
 
@@ -216,7 +241,7 @@ impl ShellClient {
     }
 
     pub fn mcp_tool(&self, name: &str, arguments: Value) -> Result<Value, ShellError> {
-        let envelope: Value = self.request_json(
+        let envelope: Value = self.request_json_with_max_response_bytes(
             "POST",
             "/mcp",
             Some(json!({
@@ -228,6 +253,7 @@ impl ShellClient {
                     "arguments": arguments,
                 },
             })),
+            self.max_mcp_response_bytes,
         )?;
         if let Some(error) = envelope.get("error") {
             return Err(ShellError::Mcp(error.to_string()));
@@ -243,11 +269,25 @@ impl ShellClient {
         T: for<'de> Deserialize<'de>,
         B: Serialize,
     {
+        self.request_json_with_max_response_bytes(method, path, body, self.max_response_bytes)
+    }
+
+    fn request_json_with_max_response_bytes<T, B>(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<B>,
+        max_response_bytes: usize,
+    ) -> Result<T, ShellError>
+    where
+        T: for<'de> Deserialize<'de>,
+        B: Serialize,
+    {
         let body = match body {
             Some(body) => serde_json::to_vec(&body)?,
             None => Vec::new(),
         };
-        let response = self.request(method, path, &body)?;
+        let response = self.request(method, path, &body, max_response_bytes)?;
         if !(200..300).contains(&response.status) {
             return Err(ShellError::Http {
                 status: response.status,
@@ -257,7 +297,13 @@ impl ShellClient {
         Ok(serde_json::from_slice(&response.body)?)
     }
 
-    fn request(&self, method: &str, path: &str, body: &[u8]) -> Result<HttpResponse, ShellError> {
+    fn request(
+        &self,
+        method: &str,
+        path: &str,
+        body: &[u8],
+        max_response_bytes: usize,
+    ) -> Result<HttpResponse, ShellError> {
         let mut stream = TcpStream::connect(&self.tempod_addr)?;
         stream.set_read_timeout(Some(self.timeout))?;
         stream.set_write_timeout(Some(self.timeout))?;
@@ -270,9 +316,7 @@ impl ShellClient {
         stream.write_all(body)?;
         stream.shutdown(std::net::Shutdown::Write)?;
 
-        let mut bytes = Vec::new();
-        stream.read_to_end(&mut bytes)?;
-        parse_http_response(&bytes)
+        read_http_response(&mut stream, max_response_bytes)
     }
 }
 
@@ -291,6 +335,12 @@ pub struct DrainResponse {
 struct HttpResponse {
     status: u16,
     body: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HttpResponseHead {
+    status: u16,
+    content_length: Option<usize>,
 }
 
 fn parse_command(args: &[String]) -> Result<ShellCommand, ShellError> {
@@ -380,22 +430,195 @@ where
 }
 
 fn parse_http_response(bytes: &[u8]) -> Result<HttpResponse, ShellError> {
-    let header_end = bytes
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
+    let header_end = response_header_end(bytes)
         .ok_or_else(|| ShellError::Protocol("missing HTTP response headers".into()))?;
-    let headers = String::from_utf8(bytes[..header_end].to_vec())
-        .map_err(|err| ShellError::Protocol(err.to_string()))?;
-    let status = headers
-        .lines()
+    let head = parse_http_response_head(&bytes[..header_end])?;
+
+    let body = &bytes[header_end + 4..];
+    let body = if let Some(length) = head.content_length {
+        match body.len().cmp(&length) {
+            std::cmp::Ordering::Less => {
+                return Err(ShellError::Protocol("truncated HTTP response body".into()));
+            }
+            std::cmp::Ordering::Greater => {
+                return Err(ShellError::Protocol(
+                    "HTTP response body exceeds content-length".into(),
+                ));
+            }
+            std::cmp::Ordering::Equal => body.to_vec(),
+        }
+    } else {
+        body.to_vec()
+    };
+
+    Ok(HttpResponse {
+        status: head.status,
+        body,
+    })
+}
+
+fn read_http_response(
+    stream: &mut TcpStream,
+    max_response_bytes: usize,
+) -> Result<HttpResponse, ShellError> {
+    let mut bytes = Vec::new();
+    let header_end = read_response_headers(stream, &mut bytes)?;
+    let head = parse_http_response_head(&bytes[..header_end])?;
+
+    if let Some(content_length) = head.content_length {
+        let response_len = (header_end + 4)
+            .checked_add(content_length)
+            .ok_or_else(|| ShellError::Protocol("HTTP response length overflow".into()))?;
+        if response_len > max_response_bytes {
+            return Err(ShellError::ResponseTooLarge {
+                max_bytes: max_response_bytes,
+            });
+        }
+        read_exact_response_len(stream, &mut bytes, response_len)?;
+    } else {
+        read_close_delimited_response(stream, &mut bytes, max_response_bytes)?;
+    }
+
+    parse_http_response(&bytes)
+}
+
+fn read_response_headers(stream: &mut TcpStream, bytes: &mut Vec<u8>) -> Result<usize, ShellError> {
+    let mut buf = [0_u8; 1024];
+    loop {
+        if let Some(header_end) = response_header_end(bytes) {
+            if header_end > MAX_RESPONSE_HEADER_BYTES {
+                return Err(ShellError::Protocol(
+                    "HTTP response headers too large".into(),
+                ));
+            }
+            return Ok(header_end);
+        }
+        if bytes.len() > MAX_RESPONSE_HEADER_BYTES {
+            return Err(ShellError::Protocol(
+                "HTTP response headers too large".into(),
+            ));
+        }
+
+        let read = stream.read(&mut buf)?;
+        if read == 0 {
+            return Err(ShellError::Protocol("missing HTTP response headers".into()));
+        }
+        bytes.extend_from_slice(&buf[..read]);
+    }
+}
+
+fn read_exact_response_len(
+    stream: &mut TcpStream,
+    bytes: &mut Vec<u8>,
+    response_len: usize,
+) -> Result<(), ShellError> {
+    let mut buf = [0_u8; 1024];
+    while bytes.len() < response_len {
+        let remaining = response_len - bytes.len();
+        let read_len = remaining.min(buf.len());
+        let read = stream.read(&mut buf[..read_len])?;
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&buf[..read]);
+    }
+    Ok(())
+}
+
+fn read_close_delimited_response(
+    stream: &mut TcpStream,
+    bytes: &mut Vec<u8>,
+    max_response_bytes: usize,
+) -> Result<(), ShellError> {
+    let mut buf = [0_u8; 1024];
+    loop {
+        if bytes.len() > max_response_bytes {
+            return Err(ShellError::ResponseTooLarge {
+                max_bytes: max_response_bytes,
+            });
+        }
+        let remaining = max_response_bytes
+            .saturating_sub(bytes.len())
+            .saturating_add(1);
+        let read_len = remaining.min(buf.len());
+        let read = stream.read(&mut buf[..read_len])?;
+        if read == 0 {
+            return Ok(());
+        }
+        bytes.extend_from_slice(&buf[..read]);
+        if bytes.len() > max_response_bytes {
+            return Err(ShellError::ResponseTooLarge {
+                max_bytes: max_response_bytes,
+            });
+        }
+    }
+}
+
+fn response_header_end(bytes: &[u8]) -> Option<usize> {
+    bytes.windows(4).position(|window| window == b"\r\n\r\n")
+}
+
+fn parse_http_response_head(bytes: &[u8]) -> Result<HttpResponseHead, ShellError> {
+    let headers =
+        String::from_utf8(bytes.to_vec()).map_err(|err| ShellError::Protocol(err.to_string()))?;
+    let mut lines = headers.lines();
+    let status_line = lines
         .next()
-        .and_then(|line| line.split_whitespace().nth(1))
+        .ok_or_else(|| ShellError::Protocol("missing HTTP status".into()))?;
+    let mut status_parts = status_line.split_ascii_whitespace();
+    let version = status_parts
+        .next()
+        .ok_or_else(|| ShellError::Protocol("missing HTTP version".into()))?;
+    if !matches!(version, "HTTP/1.0" | "HTTP/1.1") {
+        return Err(ShellError::Protocol(format!(
+            "unsupported HTTP version: {version}"
+        )));
+    }
+    let status = status_parts
+        .next()
         .ok_or_else(|| ShellError::Protocol("missing HTTP status".into()))?
         .parse()
         .map_err(|err: std::num::ParseIntError| ShellError::Protocol(err.to_string()))?;
-    Ok(HttpResponse {
+    if !(100..=599).contains(&status) {
+        return Err(ShellError::Protocol(format!(
+            "invalid HTTP status: {status}"
+        )));
+    }
+
+    let mut content_length = None;
+    for line in lines {
+        let (name, value) = line
+            .split_once(':')
+            .ok_or_else(|| ShellError::Protocol(format!("malformed HTTP header: {line}")))?;
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(ShellError::Protocol("empty HTTP header name".into()));
+        }
+        let value = value.trim();
+        if name.eq_ignore_ascii_case("content-length") {
+            let length = value
+                .parse::<usize>()
+                .map_err(|err| ShellError::Protocol(format!("invalid content-length: {err}")))?;
+            if content_length.is_some_and(|existing| existing != length) {
+                return Err(ShellError::Protocol(
+                    "conflicting content-length headers".into(),
+                ));
+            }
+            content_length = Some(length);
+        } else if name.eq_ignore_ascii_case("transfer-encoding")
+            && !value
+                .split(',')
+                .all(|coding| coding.trim().eq_ignore_ascii_case("identity"))
+        {
+            return Err(ShellError::Protocol(format!(
+                "unsupported transfer-encoding: {value}"
+            )));
+        }
+    }
+
+    Ok(HttpResponseHead {
         status,
-        body: bytes[header_end + 4..].to_vec(),
+        content_length,
     })
 }
 
@@ -431,6 +654,8 @@ pub enum ShellError {
     Http { status: u16, body: String },
     #[error("tempod MCP failed: {0}")]
     Mcp(String),
+    #[error("tempod response exceeded {max_bytes} bytes")]
+    ResponseTooLarge { max_bytes: usize },
     #[error("invalid tempod HTTP response: {0}")]
     Protocol(String),
 }
@@ -439,7 +664,12 @@ impl ShellError {
     pub fn exit_code(&self) -> u8 {
         match self {
             Self::Usage(_) => 2,
-            Self::Io(_) | Self::Json(_) | Self::Http { .. } | Self::Mcp(_) | Self::Protocol(_) => 1,
+            Self::Io(_)
+            | Self::Json(_)
+            | Self::Http { .. }
+            | Self::Mcp(_)
+            | Self::ResponseTooLarge { .. }
+            | Self::Protocol(_) => 1,
         }
     }
 }
@@ -528,6 +758,54 @@ mod tests {
                 name: "screenshot".into(),
                 arguments: json!({"set_of_marks": true}),
             }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parse_http_response_respects_content_length() -> TestResult {
+        let response = parse_http_response(b"HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\nhello")?;
+
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, b"hello");
+        Ok(())
+    }
+
+    #[test]
+    fn parse_http_response_rejects_incomplete_content_length_body() -> TestResult {
+        let err = match parse_http_response(b"HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\nhell") {
+            Ok(_) => return Err("truncated body should be rejected".into()),
+            Err(err) => err,
+        };
+
+        assert!(matches!(err, ShellError::Protocol(message) if message.contains("truncated")));
+        Ok(())
+    }
+
+    #[test]
+    fn parse_http_response_rejects_extra_content_length_body() -> TestResult {
+        let err = match parse_http_response(b"HTTP/1.1 200 OK\r\ncontent-length: 4\r\n\r\nhello") {
+            Ok(_) => return Err("extra body bytes should be rejected".into()),
+            Err(err) => err,
+        };
+
+        assert!(
+            matches!(err, ShellError::Protocol(message) if message.contains("exceeds content-length"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parse_http_response_rejects_unsupported_transfer_encoding() -> TestResult {
+        let err = match parse_http_response(
+            b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+        ) {
+            Ok(_) => return Err("chunked response should be rejected".into()),
+            Err(err) => err,
+        };
+
+        assert!(
+            matches!(err, ShellError::Protocol(message) if message.contains("transfer-encoding"))
         );
         Ok(())
     }
@@ -670,6 +948,177 @@ mod tests {
 
         assert_eq!(String::from_utf8(output)?, "[]\n");
         Ok(())
+    }
+
+    #[test]
+    fn client_rejects_oversized_tempod_response() -> TestResult {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let handle = thread::spawn(move || -> Result<(), std::io::Error> {
+            let (mut stream, _) = listener.accept()?;
+            let mut response =
+                b"HTTP/1.1 200 OK\r\ncontent-length: 32\r\nconnection: close\r\n\r\n".to_vec();
+            response.extend([b'x'; 32]);
+            match stream.write_all(&response) {
+                Ok(()) => Ok(()),
+                Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+                Err(err) => Err(err),
+            }
+        });
+
+        let err = match ShellClient::new(addr.to_string())
+            .with_max_response_bytes(64)
+            .health()
+        {
+            Ok(_) => return Err("oversized response should be rejected before JSON parse".into()),
+            Err(err) => err,
+        };
+
+        assert!(matches!(
+            err,
+            ShellError::ResponseTooLarge { max_bytes: 64 }
+        ));
+        match handle.join() {
+            Ok(result) => result?,
+            Err(_) => return Err("server thread failed".into()),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn client_rejects_oversized_content_length_before_body_read() -> TestResult {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let handle = thread::spawn(move || -> Result<(), Box<dyn Error + Send + Sync>> {
+            let (mut stream, _) = listener.accept()?;
+            stream.write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-length: 1024\r\nconnection: close\r\n\r\n",
+            )?;
+            let _ = done_rx.recv_timeout(Duration::from_secs(1));
+            Ok(())
+        });
+
+        let err = match ShellClient::new(addr.to_string())
+            .with_timeout(Duration::from_millis(200))
+            .with_max_response_bytes(64)
+            .health()
+        {
+            Ok(_) => return Err("advertised oversized response should be rejected".into()),
+            Err(err) => err,
+        };
+        let _ = done_tx.send(());
+
+        assert!(matches!(
+            err,
+            ShellError::ResponseTooLarge { max_bytes: 64 }
+        ));
+        match handle.join() {
+            Ok(result) => result.map_err(|err| err.to_string())?,
+            Err(_) => return Err("server thread failed".into()),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn client_accepts_full_engine_host_sized_mcp_base64_screenshot_payload() -> TestResult {
+        let raw_screenshot_len = ENGINE_HOST_MAX_SCREENSHOT_BYTES;
+        let base64_len = raw_screenshot_len.div_ceil(3) * 4;
+        let encoded = "A".repeat(base64_len);
+        let body = serde_json::to_vec(&json!({
+            "jsonrpc": "2.0",
+            "id": "tempo-shell",
+            "result": {
+                "structuredContent": {
+                    "mime_type": "image/png",
+                    "encoding": "base64",
+                    "set_of_marks": false,
+                    "data": encoded,
+                }
+            }
+        }))?;
+        assert!(body.len() > DEFAULT_MAX_RESPONSE_BYTES);
+        assert!(body.len() <= DEFAULT_MAX_MCP_RESPONSE_BYTES);
+
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let expected_len = base64_len;
+        let handle = thread::spawn(move || -> Result<(), std::io::Error> {
+            let (mut stream, _) = listener.accept()?;
+            let mut request = Vec::new();
+            stream.read_to_end(&mut request)?;
+            let header = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            write_fixture_response(&mut stream, header.as_bytes())?;
+            write_fixture_response(&mut stream, &body)
+        });
+
+        let result = ShellClient::new(addr.to_string()).mcp_tool("screenshot", json!({}))?;
+
+        assert_eq!(result["encoding"], "base64");
+        assert_eq!(result["data"].as_str().map(str::len), Some(expected_len));
+        match handle.join() {
+            Ok(result) => result?,
+            Err(_) => return Err("server thread failed".into()),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn mcp_client_rejects_oversized_content_length_before_body_read() -> TestResult {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let handle = thread::spawn(move || -> Result<(), Box<dyn Error + Send + Sync>> {
+            let (mut stream, _) = listener.accept()?;
+            let content_length = DEFAULT_MAX_MCP_RESPONSE_BYTES + 1;
+            let header = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {content_length}\r\nconnection: close\r\n\r\n"
+            );
+            stream.write_all(header.as_bytes())?;
+            let _ = done_rx.recv_timeout(Duration::from_secs(1));
+            Ok(())
+        });
+
+        let err = match ShellClient::new(addr.to_string())
+            .with_timeout(Duration::from_millis(200))
+            .mcp_tool("screenshot", json!({}))
+        {
+            Ok(_) => return Err("advertised oversized MCP response should be rejected".into()),
+            Err(err) => err,
+        };
+        let _ = done_tx.send(());
+
+        assert!(matches!(
+            err,
+            ShellError::ResponseTooLarge {
+                max_bytes: DEFAULT_MAX_MCP_RESPONSE_BYTES
+            }
+        ));
+        match handle.join() {
+            Ok(result) => result.map_err(|err| err.to_string())?,
+            Err(_) => return Err("server thread failed".into()),
+        }
+        Ok(())
+    }
+
+    fn write_fixture_response(stream: &mut TcpStream, bytes: &[u8]) -> Result<(), std::io::Error> {
+        match stream.write_all(bytes) {
+            Ok(()) => Ok(()),
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                ) =>
+            {
+                Ok(())
+            }
+            Err(err) => Err(err),
+        }
     }
 
     #[test]
