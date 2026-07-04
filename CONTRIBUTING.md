@@ -71,5 +71,6 @@ sane:
 
 Tags matching `v*` trigger `.github/workflows/release.yml`, which builds
 optimized `tempod` and `tempo-cli` binaries for macOS and Linux with the
-workspace release profile (thin LTO, codegen-units=1, stripped symbols) and
-attaches them, with SHA-256 checksums, to a GitHub release.
+workspace release profile (thin LTO, codegen-units=1, stripped debuginfo while
+keeping symbol names for field backtraces) and attaches them, with SHA-256
+checksums, to a GitHub release.
