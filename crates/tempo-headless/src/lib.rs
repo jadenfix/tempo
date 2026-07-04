@@ -693,9 +693,27 @@ impl SessionPool {
         );
         match outcome {
             Some(result) => result.map(Some),
-            None => Err(TempodError::Driver(
-                "attached engine timed out creating/navigating session context".into(),
-            )),
+            None => {
+                // The detached create worker may still be blocked in
+                // `AttachedEngineDriver::request` holding the shared
+                // `Arc<Mutex<EngineIpcClient>>`. The root driver and existing
+                // session drivers share that same wedged client, so a LATER
+                // engine-backed request would block FOREVER on the mutex while
+                // holding the pool lock -- reintroducing the exact `/health` /
+                // `/drain` stall this bound is meant to prevent (#213). Detach
+                // the shared engine state (identically to the bounded-teardown
+                // timeout path) so any subsequent engine-backed request fails
+                // fast instead of waiting on the wedged IPC handle. The wedged
+                // client is NOT closed here (that would re-block); the abandoned
+                // worker still owns it and drops it once the engine answers or
+                // disconnects.
+                self.abandon_attached_engine_after_teardown_timeout(
+                    "session-create engine navigation",
+                );
+                Err(TempodError::Driver(
+                    "attached engine timed out creating/navigating session context".into(),
+                ))
+            }
         }
     }
 
@@ -2705,6 +2723,122 @@ mod tests {
             Err(_) => return Err("create thread panicked".into()),
         };
         assert_eq!(create_status, 500);
+
+        wedged_engine.thread().unpark();
+        join_driver_handler(wedged_engine)?;
+        Ok(())
+    }
+
+    #[test]
+    fn wedged_create_invalidates_engine_so_followup_request_does_not_deadlock() -> TestResult {
+        // A create that times out on a wedged navigation target leaves the
+        // detached create worker blocked in `AttachedEngineDriver::request` while
+        // holding the shared `Arc<Mutex<EngineIpcClient>>`. If the pool kept the
+        // engine attached, a FOLLOW-UP engine-backed request would clone that same
+        // wedged client and block FOREVER on the mutex -- reintroducing the exact
+        // `/health` / `/drain` stall #213 prevents. The fix detaches the engine on
+        // create timeout, so the follow-up returns promptly instead of deadlocking.
+        let (client_stream, server_stream) = UnixStream::pair()?;
+        let wedged_engine = thread::spawn(move || -> Result<(), EngineHostError> {
+            let mut connection = EngineIpcConnection::from_stream(server_stream);
+
+            let create = connection.read_driver_request()?;
+            assert!(matches!(
+                create.command,
+                HostDriverCommand::CreateBrowsingContext { .. }
+            ));
+            connection.write_driver_response(
+                create.id,
+                DriverResponse::BrowsingContextCreated {
+                    driver_id: "session-context-wedged".into(),
+                },
+            )?;
+
+            let goto = connection.read_driver_request()?;
+            assert!(matches!(goto.command, HostDriverCommand::Goto { .. }));
+            // Never answer the goto: the create worker stays blocked holding the
+            // shared engine mutex.
+            thread::park_timeout(Duration::from_secs(60));
+            Ok(())
+        });
+
+        let mut pool = SessionPool::default();
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+
+        // First create times out; it must invalidate the shared engine.
+        let first = handle_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/sessions".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: br#"{"url":"https://wedged-nav.test"}"#.to_vec(),
+            },
+        );
+        assert_eq!(first.status, 500);
+
+        // A follow-up engine-backed request must NOT block on the wedged mutex. We
+        // use a `POST /mcp` `observe` -- an UNBOUNDED engine round-trip made under
+        // the pool lock via the shared `pool.mcp` driver (unlike create, it is NOT
+        // wrapped in `run_create_bounded`). The create worker from the timed-out
+        // request is still parked in `AttachedEngineDriver::request` holding the
+        // shared engine mutex, so if the engine were still attached this observe
+        // would lock the same client and deadlock forever, stalling the pool lock --
+        // the exact hazard #213 addresses. Run it on a worker and bound the wait so
+        // the regression surfaces here as a timeout failure instead of hanging the
+        // whole suite. Against the pre-fix code this `recv_timeout` expires; with the
+        // fix the engine (and its MCP fork) is detached, so the request falls through
+        // to the driverless MCP path and returns promptly.
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let followup = thread::spawn(move || -> (u16, Vec<u8>, SessionPool) {
+            let response = route_http_request(
+                &mut pool,
+                HttpRequest {
+                    method: "POST".into(),
+                    path: "/mcp".into(),
+                    headers: BTreeMap::new(),
+                    host: None,
+                    origin: Some("http://127.0.0.1".into()),
+                    body: br#"{"jsonrpc":"2.0","id":42,"method":"tools/call","params":{"name":"observe","arguments":{}}}"#.to_vec(),
+                },
+            );
+            let (status, body) = match response {
+                Ok(response) => (response.status, response.body),
+                Err(error) => (0, error.to_string().into_bytes()),
+            };
+            let _ = done_tx.send(status);
+            (status, body, pool)
+        });
+
+        let status = done_rx.recv_timeout(Duration::from_secs(5)).map_err(|_| {
+            "follow-up engine-backed request blocked on the wedged engine mutex after \
+             a create timeout: the shared engine was not invalidated"
+        })?;
+        // Engine detached on timeout, so the observe is served by the driverless MCP
+        // path (HTTP 200 with a JSON-RPC \"no driver\" error) instead of deadlocking.
+        assert_eq!(status, 200);
+
+        let (joined_status, body, pool) = match followup.join() {
+            Ok(joined) => joined,
+            Err(_) => return Err("follow-up thread panicked".into()),
+        };
+        assert_eq!(joined_status, 200);
+        // Confirm we truly went driverless (engine invalidated), not to the engine.
+        let value: Value = serde_json::from_slice(&body)?;
+        assert_eq!(value["id"], 42);
+        assert_eq!(value["error"]["code"], -32002);
+        // The attached engine was invalidated, not merely bypassed: no root driver,
+        // no MCP fork, and no leaked session drivers remain to wait on the wedged
+        // IPC handle.
+        assert!(
+            pool.driver.is_none(),
+            "attached engine was not invalidated after a create timeout"
+        );
+        assert!(pool.mcp.is_none());
+        assert!(pool.session_drivers.is_empty());
+        drop(pool);
 
         wedged_engine.thread().unpark();
         join_driver_handler(wedged_engine)?;
