@@ -811,6 +811,8 @@ mod tests {
         let addr = listener.local_addr()?;
         let handle = thread::spawn(move || -> Result<(), std::io::Error> {
             let (mut stream, _) = listener.accept()?;
+            let mut request = [0_u8; 512];
+            let _ = stream.read(&mut request)?;
             let mut response =
                 b"HTTP/1.1 200 OK\r\ncontent-length: 32\r\nconnection: close\r\n\r\n".to_vec();
             response.extend([b'x'; 32]);
