@@ -319,8 +319,14 @@ impl CdpTempoDriver {
             .unwrap_or_default())
     }
 
-    async fn snapshot(&self) -> Result<(String, String), TransportError> {
+    async fn enforce_current_url_policy(&self) -> Result<String, TransportError> {
         let url = self.current_url().await?;
+        self.enforce_url_policy(&url)?;
+        Ok(url)
+    }
+
+    async fn snapshot(&self) -> Result<(String, String), TransportError> {
+        let url = self.enforce_current_url_policy().await?;
         let dom_html = self.page()?.content().await.map_err(map_cdp_error)?;
         Ok((url, dom_html))
     }
@@ -352,6 +358,7 @@ impl CdpTempoDriver {
             return Ok(());
         }
 
+        self.enforce_current_url_policy().await?;
         let page = self.page()?;
         let root = page
             .execute(GetDocumentParams::default())
@@ -382,6 +389,7 @@ impl CdpTempoDriver {
         root: DomNodeId,
         selector: &str,
     ) -> Result<Option<AxSummary>, TransportError> {
+        self.enforce_current_url_policy().await?;
         let page = self.page()?;
         let queried = match page.execute(QuerySelectorParams::new(root, selector)).await {
             Ok(response) => response.result,
@@ -445,20 +453,23 @@ impl CdpTempoDriver {
         F: FnOnce(chromiumoxide::Element) -> Fut,
         Fut: std::future::Future<Output = Result<(), TransportError>>,
     {
+        self.enforce_current_url_policy().await?;
         match self.page()?.find_element(selector).await {
             Ok(element) => match op(element).await {
                 Ok(()) => Ok(true),
-                Err(TransportError::Other(message)) if is_node_not_found_msg(&message) => Ok(false),
+                Err(TransportError::Other(message)) if is_selector_grounding_miss_msg(&message) => {
+                    Ok(false)
+                }
                 Err(other) => Err(other),
             },
             Err(CdpError::NotFound) => Ok(false),
-            Err(error) if is_node_not_found_msg(&error.to_string()) => Ok(false),
+            Err(error) if is_selector_grounding_miss_msg(&error.to_string()) => Ok(false),
             Err(error) => Err(map_cdp_error(error)),
         }
     }
 
     fn selector_for_node(&self, node: &NodeId) -> Option<String> {
-        grounded_selector(&self.selectors_by_node, node)
+        selector_or_legacy_fallback(&self.selectors_by_node, node)
     }
 
     async fn refresh_selector_for_node(
@@ -520,6 +531,7 @@ impl CdpTempoDriver {
         &self,
         selector: &str,
     ) -> Result<serde_json::Value, TransportError> {
+        self.enforce_current_url_policy().await?;
         self.page()?
             .evaluate(extraction_script(selector)?)
             .await
@@ -603,6 +615,7 @@ impl CdpTempoDriver {
                     .await
             }
             Action::Scroll { x, y } => {
+                self.enforce_current_url_policy().await?;
                 self.page()?
                     .evaluate(format!("window.scrollTo({}, {});", *x as i64, *y as i64))
                     .await
@@ -637,6 +650,7 @@ impl CdpTempoDriver {
         let mut tracker = CompositeQuiescenceTracker::new(3);
 
         loop {
+            self.enforce_current_url_policy().await?;
             let ready_state = self
                 .page()?
                 .evaluate("document.readyState")
@@ -644,6 +658,7 @@ impl CdpTempoDriver {
                 .map_err(map_cdp_error)?
                 .into_value::<String>()
                 .map_err(|error| TransportError::Other(error.to_string()))?;
+            self.enforce_current_url_policy().await?;
             let dom_html = self.page()?.content().await.map_err(map_cdp_error)?;
             let sample = PageStabilitySample {
                 ready: ready_state != "loading",
@@ -695,7 +710,6 @@ impl DriverTrait for CdpTempoDriver {
             return Err(TransportError::UrlBlocked);
         }
         let (final_url, dom_html) = self.snapshot().await?;
-        self.enforce_url_policy(&final_url)?;
         self.record_snapshot(final_url, dom_html).await
     }
 
@@ -869,6 +883,7 @@ impl DriverTrait for CdpTempoDriver {
             .await_promise(await_promise)
             .build()
             .map_err(TransportError::Other)?;
+        self.enforce_current_url_policy().await?;
         self.page()?
             .evaluate(params)
             .await
@@ -883,6 +898,7 @@ impl DriverTrait for CdpTempoDriver {
             .clip(screenshot_viewport_clip()?)
             .capture_beyond_viewport(false)
             .build();
+        self.enforce_current_url_policy().await?;
         let bytes = self
             .page()?
             .screenshot(params)
@@ -1322,6 +1338,14 @@ fn is_node_not_found_msg(message: &str) -> bool {
     lowered.contains("could not find node") || lowered.contains("no node with given id")
 }
 
+fn is_selector_grounding_miss_msg(message: &str) -> bool {
+    let lowered = message.to_lowercase();
+    is_node_not_found_msg(&lowered)
+        || lowered.contains("invalid selector")
+        || lowered.contains("not a valid selector")
+        || lowered.contains("dom error while querying")
+}
+
 fn is_uninteresting_ax_node_msg(message: &str) -> bool {
     message.to_lowercase().contains("uninteresting")
 }
@@ -1337,6 +1361,19 @@ fn grounded_selector(
     node: &NodeId,
 ) -> Option<String> {
     selectors_by_node.get(node).cloned()
+}
+
+fn selector_or_legacy_fallback(
+    selectors_by_node: &BTreeMap<NodeId, String>,
+    node: &NodeId,
+) -> Option<String> {
+    grounded_selector(selectors_by_node, node).or_else(|| {
+        if node.0.starts_with("node:") {
+            None
+        } else {
+            Some(node.0.clone())
+        }
+    })
 }
 
 fn extraction_found(value: &serde_json::Value) -> bool {
@@ -2255,10 +2292,18 @@ mod tests {
     }
 
     #[test]
-    fn selector_shaped_node_id_without_grounding_is_not_a_selector() {
+    fn selector_shaped_node_id_without_grounding_falls_back_for_legacy_actions() {
         let selectors = BTreeMap::new();
         assert_eq!(
             grounded_selector(&selectors, &NodeId("[id=\"save\"]".into())),
+            None
+        );
+        assert_eq!(
+            selector_or_legacy_fallback(&selectors, &NodeId("[id=\"save\"]".into())),
+            Some("[id=\"save\"]".into())
+        );
+        assert_eq!(
+            selector_or_legacy_fallback(&selectors, &NodeId("node:abc123".into())),
             None
         );
     }
@@ -2747,6 +2792,60 @@ mod tests {
         assert_eq!(clicked, serde_json::json!("yes"));
         driver.close().await?;
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_cdp_invalid_legacy_node_ids_are_step_errors(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(chrome) = std::env::var_os("TEMPO_CDP_CHROME") else {
+            eprintln!("skipping live CDP invalid legacy NodeId test; TEMPO_CDP_CHROME is unset");
+            return Ok(());
+        };
+        let url = serve_fixture()?;
+        let config = CdpConfig::default()
+            .with_executable(chrome.to_string_lossy())
+            .with_no_sandbox_env_opt_in();
+        let mut driver = CdpTempoDriver::launch_with(config)
+            .await?
+            .allow_private_network_access();
+
+        driver.goto(&url).await?;
+        let bad_node = NodeId("button:message".into());
+
+        assert_step_error(
+            driver
+                .act(&Action::Click {
+                    node: bad_node.clone(),
+                })
+                .await?,
+        );
+        assert_step_error(
+            driver
+                .act(&Action::Type {
+                    node: bad_node.clone(),
+                    text: "secret".into(),
+                })
+                .await?,
+        );
+        assert_step_error(
+            driver
+                .act(&Action::Select {
+                    node: bad_node.clone(),
+                    value: "option".into(),
+                })
+                .await?,
+        );
+        assert_step_error(driver.act(&Action::Extract { node: bad_node }).await?);
+
+        driver.close().await?;
+        Ok(())
+    }
+
+    fn assert_step_error(outcome: StepOutcome) {
+        assert!(
+            matches!(outcome, StepOutcome::StepError { .. }),
+            "expected recoverable StepError for malformed legacy NodeId, got {outcome:?}"
+        );
     }
 
     #[tokio::test]
