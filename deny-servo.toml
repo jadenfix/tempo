@@ -1,41 +1,44 @@
 # cargo-deny configuration for the optional Servo engine lane.
-#
-# This is intentionally separate from deny.toml. The default audit remains the
-# shipping/default-feature gate; this config is only for the scheduled/manual
-# Servo audit that enables the optional servo-vanilla/servo-tempo dependency
-# graph and reports upstream Servo advisories without blocking ordinary PRs.
+# The default shipping graph stays gated by deny.toml. This file audits the
+# Servo feature graph separately so known upstream Servo advisories are tracked
+# explicitly and new advisories still fail the scheduled/manual Servo audit.
 
 [graph]
 all-features = false
+no-default-features = true
+features = ["servo-tempo"]
 
 [advisories]
 version = 2
 yanked = "deny"
+ignore = [
+    { id = "RUSTSEC-2023-0071", reason = "Tracked by #376 for the optional Servo lane; reassess when updating the pinned Servo crate." },
+    { id = "RUSTSEC-2024-0436", reason = "Tracked by #376 for the optional Servo lane; reassess when updating the pinned Servo crate." },
+    { id = "RUSTSEC-2025-0075", reason = "Tracked by #376 for the optional Servo lane; reassess when updating the pinned Servo crate." },
+    { id = "RUSTSEC-2025-0080", reason = "Tracked by #376 for the optional Servo lane; reassess when updating the pinned Servo crate." },
+    { id = "RUSTSEC-2025-0081", reason = "Tracked by #376 for the optional Servo lane; reassess when updating the pinned Servo crate." },
+    { id = "RUSTSEC-2025-0098", reason = "Tracked by #376 for the optional Servo lane; reassess when updating the pinned Servo crate." },
+    { id = "RUSTSEC-2025-0100", reason = "Tracked by #376 for the optional Servo lane; reassess when updating the pinned Servo crate." },
+    { id = "RUSTSEC-2025-0141", reason = "Tracked by #376 for the optional Servo lane; reassess when updating the pinned Servo crate." },
+    { id = "RUSTSEC-2025-0144", reason = "Tracked by #376 for the optional Servo lane; reassess when updating the pinned Servo crate." },
+    { id = "RUSTSEC-2026-0192", reason = "Tracked by #376 for the optional Servo lane; reassess when updating the pinned Servo crate." },
+]
 
 [licenses]
 version = 2
-# Base project allowlist plus the additional licenses currently present in the
-# pinned Servo 0.3.0 dependency graph. Keep this Servo-lane-only; do not copy it
-# to deny.toml without a separate redistribution review.
 allow = [
-    "0BSD",
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
-    "BSD-1-Clause",
+    "MIT",
     "BSD-2-Clause",
     "BSD-3-Clause",
-    "BSL-1.0",
-    "CC0-1.0",
-    "CDLA-Permissive-2.0",
     "ISC",
-    "LGPL-2.1-or-later",
-    "MIT",
-    "MIT-0",
+    "Zlib",
+    "CC0-1.0",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
     "MPL-2.0",
     "NCSA",
-    "Unicode-3.0",
-    "Unlicense",
-    "Zlib",
 ]
 confidence-threshold = 0.8
 
