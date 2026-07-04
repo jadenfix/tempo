@@ -28,7 +28,7 @@ use chromiumoxide::cdp::browser_protocol::target::{
 use chromiumoxide::cdp::js_protocol::runtime::{EvaluateParams, ExecutionContextId};
 use chromiumoxide::error::CdpError;
 use chromiumoxide::page::{Page, ScreenshotParams};
-use futures::StreamExt;
+use futures::{future::join_all, StreamExt};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::Path;
@@ -2167,12 +2167,27 @@ where
     F: FnMut(NodeId) -> Fut,
     Fut: std::future::Future<Output = Result<Option<AxSummary>, TransportError>>,
 {
+    let mut jobs = Vec::new();
     for index in top_ranked_indices(elements, max_enriched) {
-        let Some(element) = elements.get_mut(index) else {
+        let Some(element) = elements.get(index) else {
             continue;
         };
         let node_id = element.node_id.clone();
-        if let Some(summary) = lookup(node_id).await? {
+        jobs.push((index, lookup(node_id)));
+    }
+
+    // The selected set is capped at `max_enriched`, so running these lookups
+    // together bounds concurrency while avoiding serial CDP round-trip waits.
+    let results = join_all(
+        jobs.into_iter()
+            .map(|(index, lookup)| async move { (index, lookup.await) }),
+    )
+    .await;
+    for (index, summary) in results {
+        if let Some(summary) = summary? {
+            let Some(element) = elements.get_mut(index) else {
+                continue;
+            };
             apply_ax_summary(element, &summary);
         }
     }
@@ -3953,6 +3968,44 @@ mod tests {
 
         // Under the cap, every element is enriched exactly once.
         assert_eq!(calls, element_count);
+        assert!(elements
+            .iter()
+            .all(|element| element.name[0].text == "enriched"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn enrichment_lookups_run_concurrently_within_the_cap() -> Result<(), TransportError> {
+        let mut elements = vec![
+            sample_element("#a", 0.5),
+            sample_element("#b", 0.9),
+            sample_element("#c", 0.8),
+            sample_element("#d", 1.0),
+        ];
+        let in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        enrich_elements(&mut elements, MAX_AX_ENRICHED_ELEMENTS, {
+            let in_flight = in_flight.clone();
+            let max_in_flight = max_in_flight.clone();
+            move |_node_id: NodeId| {
+                let in_flight = in_flight.clone();
+                let max_in_flight = max_in_flight.clone();
+                async move {
+                    let current = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_in_flight.fetch_max(current, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                    Ok::<_, TransportError>(Some(enriched_summary()))
+                }
+            }
+        })
+        .await?;
+
+        assert!(
+            max_in_flight.load(Ordering::SeqCst) > 1,
+            "AX enrichment lookups were still serialized"
+        );
         assert!(elements
             .iter()
             .all(|element| element.name[0].text == "enriched"));
