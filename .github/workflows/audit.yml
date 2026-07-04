@@ -47,9 +47,9 @@ jobs:
           # Scheduled/manual only: make the optional Servo dependency graph
           # visible without blocking day-to-day PRs on upstream Servo advisories.
           arguments: >
-            --manifest-path crates/tempo-engine-servo/Cargo.toml
             --all-features
             --locked
+          manifest-path: crates/tempo-engine-servo/Cargo.toml
           command: >
             check
             --config deny-servo.toml
