@@ -442,7 +442,13 @@ impl fmt::Debug for SessionPool {
 #[derive(Clone, Debug, PartialEq)]
 struct SessionActBatchIdempotencyEntry {
     request_fingerprint: JsonValue,
-    response: JsonValue,
+    response: CachedSessionActBatchResponse,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct CachedSessionActBatchResponse {
+    status: u16,
+    body: JsonValue,
 }
 
 struct ReservedSessionCreate {
@@ -795,7 +801,7 @@ impl SessionPool {
         id: &TempodSessionId,
         key: &str,
         request_fingerprint: &JsonValue,
-    ) -> Result<Option<JsonValue>, TempodError> {
+    ) -> Result<Option<CachedSessionActBatchResponse>, TempodError> {
         if !self.sessions.contains_key(id) {
             return Err(TempodError::SessionNotFound(id.clone()));
         }
@@ -838,7 +844,8 @@ impl SessionPool {
         id: &TempodSessionId,
         key: &str,
         request_fingerprint: JsonValue,
-        response: JsonValue,
+        status: u16,
+        body: JsonValue,
     ) -> Result<(), TempodError> {
         if !self.sessions.contains_key(id) {
             return Err(TempodError::SessionNotFound(id.clone()));
@@ -848,10 +855,15 @@ impl SessionPool {
             (id.clone(), key.to_owned()),
             SessionActBatchIdempotencyEntry {
                 request_fingerprint,
-                response,
+                response: CachedSessionActBatchResponse { status, body },
             },
         );
         Ok(())
+    }
+
+    fn forget_session_act_batch_response(&mut self, id: &TempodSessionId, key: &str) {
+        self.session_act_batch_idempotency
+            .remove(&(id.clone(), key.to_owned()));
     }
 
     fn session_idempotency_record_count(&self, id: &TempodSessionId) -> usize {
@@ -1754,23 +1766,47 @@ fn route_http_request(
                     && let Some(response) =
                         pool.cached_session_act_batch_response(&id, key, &request_fingerprint)?
                 {
-                    return Ok(HttpResponse::json(200, response));
-                }
-                if let Some(key) = body.idempotency_key.as_deref() {
-                    pool.ensure_session_idempotency_capacity(&id, key)?;
+                    return Ok(HttpResponse::json(response.status, response.body));
                 }
                 let idempotency_key = body.idempotency_key.clone();
-                let outcome = pool.act_batch_session(&id, &body.batch)?;
-                let response = step_outcome_response(outcome, policy);
+                if let Some(key) = idempotency_key.as_deref() {
+                    pool.remember_session_act_batch_response(
+                        &id,
+                        key,
+                        request_fingerprint.clone(),
+                        409,
+                        session_act_batch_unknown_outcome_response(&policy),
+                    )?;
+                }
+                let response = match pool.act_batch_session(&id, &body.batch) {
+                    Ok(outcome) => CachedSessionActBatchResponse {
+                        status: 200,
+                        body: step_outcome_response(outcome, policy),
+                    },
+                    Err(
+                        error @ (TempodError::SessionNotFound(_)
+                        | TempodError::DriverUnavailable(_)),
+                    ) => {
+                        if let Some(key) = idempotency_key.as_deref() {
+                            pool.forget_session_act_batch_response(&id, key);
+                        }
+                        return Err(error);
+                    }
+                    Err(error) => CachedSessionActBatchResponse {
+                        status: error.status(),
+                        body: error.body(),
+                    },
+                };
                 if let Some(key) = idempotency_key {
                     pool.remember_session_act_batch_response(
                         &id,
                         &key,
                         request_fingerprint,
-                        response.clone(),
+                        response.status,
+                        response.body.clone(),
                     )?;
                 }
-                return Ok(HttpResponse::json(200, response));
+                return Ok(HttpResponse::json(response.status, response.body));
             }
             if request.method == "POST" && request.path.ends_with("/adopt") {
                 let id = session_id_from_action_path(&request.path, "adopt")?;
@@ -1975,6 +2011,16 @@ fn step_outcome_response(
     }
 }
 
+fn session_act_batch_unknown_outcome_response(
+    policy: &SessionBatchPolicyReport,
+) -> serde_json::Value {
+    json!({
+        "status": "unknown_outcome",
+        "reason": "act_batch execution is already in progress for this idempotency_key; retry with the same request to replay the terminal result",
+        "policy": session_batch_policy_json(policy),
+    })
+}
+
 fn policy_denied_error_json(error: &PolicyDeniedError) -> serde_json::Value {
     json!({
         "error": error.to_string(),
@@ -2014,6 +2060,7 @@ fn confirmation_gate_name(gate: ConfirmationGate) -> &'static str {
 /// languages should consume the live contract that the daemon actually serves.
 pub fn tempod_openapi(base_url: &str) -> serde_json::Value {
     let base_url = base_url.trim_end_matches('/');
+    let tempo_schema_bundle = tempo_schema::schema_bundle_json_schema();
     json!({
         "openapi": "3.1.0",
         "info": {
@@ -2810,20 +2857,20 @@ pub fn tempod_openapi(base_url: &str) -> serde_json::Value {
                         "idempotency_key_provided": {"type": "boolean"}
                     }
                 },
-                "NodeId": tempo_schema_component("NodeId"),
-                "Provenance": tempo_schema_component("Provenance"),
-                "TaintSpan": tempo_schema_component("TaintSpan"),
-                "InteractiveElement": tempo_schema_component("InteractiveElement"),
-                "CompiledObservation": tempo_schema_component("CompiledObservation"),
-                "ObservationDiff": tempo_schema_component("ObservationDiff"),
-                "SideEffect": tempo_schema_component("SideEffect"),
-                "Action": tempo_schema_component("Action"),
-                "QuiescencePolicy": tempo_schema_component("QuiescencePolicy"),
-                "ActionBatch": tempo_schema_component("ActionBatch"),
-                "StepStatus": tempo_schema_component("StepStatus"),
-                "Grounding": tempo_schema_component("Grounding"),
-                "ActionOutcome": tempo_schema_component("ActionOutcome"),
-                "StepTriple": tempo_schema_component("StepTriple"),
+                "NodeId": tempo_schema_component(&tempo_schema_bundle, "NodeId"),
+                "Provenance": tempo_schema_component(&tempo_schema_bundle, "Provenance"),
+                "TaintSpan": tempo_schema_component(&tempo_schema_bundle, "TaintSpan"),
+                "InteractiveElement": tempo_schema_component(&tempo_schema_bundle, "InteractiveElement"),
+                "CompiledObservation": tempo_schema_component(&tempo_schema_bundle, "CompiledObservation"),
+                "ObservationDiff": tempo_schema_component(&tempo_schema_bundle, "ObservationDiff"),
+                "SideEffect": tempo_schema_component(&tempo_schema_bundle, "SideEffect"),
+                "Action": tempo_schema_component(&tempo_schema_bundle, "Action"),
+                "QuiescencePolicy": tempo_schema_component(&tempo_schema_bundle, "QuiescencePolicy"),
+                "ActionBatch": tempo_schema_component(&tempo_schema_bundle, "ActionBatch"),
+                "StepStatus": tempo_schema_component(&tempo_schema_bundle, "StepStatus"),
+                "Grounding": tempo_schema_component(&tempo_schema_bundle, "Grounding"),
+                "ActionOutcome": tempo_schema_component(&tempo_schema_bundle, "ActionOutcome"),
+                "StepTriple": tempo_schema_component(&tempo_schema_bundle, "StepTriple"),
                 "ErrorResponse": {
                     "type": "object",
                     "additionalProperties": false,
@@ -2852,8 +2899,7 @@ pub fn tempod_openapi(base_url: &str) -> serde_json::Value {
     })
 }
 
-fn tempo_schema_component(name: &str) -> serde_json::Value {
-    let bundle = tempo_schema::schema_bundle_json_schema();
+fn tempo_schema_component(bundle: &serde_json::Value, name: &str) -> serde_json::Value {
     let mut schema = bundle
         .get("$defs")
         .and_then(serde_json::Value::as_object)
@@ -5668,6 +5714,130 @@ mod tests {
     }
 
     #[test]
+    fn session_act_batch_replays_idempotent_driver_error_without_reexecution() -> TestResult {
+        let (client_stream, server_stream) = UnixStream::pair()?;
+        let server = thread::spawn(move || -> Result<(), EngineHostError> {
+            let mut connection = EngineIpcConnection::from_stream(server_stream);
+
+            let create = connection.read_driver_request()?;
+            assert!(matches!(
+                create.command,
+                HostDriverCommand::CreateBrowsingContext { .. }
+            ));
+            connection.write_driver_response(
+                create.id,
+                DriverResponse::BrowsingContextCreated {
+                    driver_id: "session-idempotent-error".into(),
+                },
+            )?;
+
+            let goto = connection.read_driver_request()?;
+            assert_eq!(goto.driver_id.as_deref(), Some("session-idempotent-error"));
+            assert!(matches!(goto.command, HostDriverCommand::Goto { .. }));
+            connection.write_driver_response(
+                goto.id,
+                DriverResponse::Observation {
+                    observation: observation("https://idempotent-error.test", 1),
+                },
+            )?;
+
+            let act_batch = connection.read_driver_request()?;
+            assert_eq!(
+                act_batch.driver_id.as_deref(),
+                Some("session-idempotent-error")
+            );
+            assert!(matches!(
+                act_batch.command,
+                HostDriverCommand::ActBatch { .. }
+            ));
+            connection.write_driver_response(
+                act_batch.id,
+                DriverResponse::Error {
+                    error: DriverWireError::transport(&TransportError::Other(
+                        "ambiguous click failure".into(),
+                    )),
+                },
+            )?;
+
+            let close = connection.read_driver_request()?;
+            assert_eq!(close.driver_id.as_deref(), Some("session-idempotent-error"));
+            assert_eq!(close.command, HostDriverCommand::Close);
+            connection.write_driver_response(close.id, DriverResponse::Closed)
+        });
+
+        let mut pool = SessionPool::default();
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+        let create = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/sessions".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: br#"{"url":"https://idempotent-error.test"}"#.to_vec(),
+            },
+        )?;
+        assert_eq!(create.status, 201);
+
+        let request_body = serde_json::to_vec(&json!({
+            "batch": {
+                "actions": [{"kind": "click", "node": "buy"}],
+                "quiescence": "composite"
+            },
+            "input_tainted": false,
+            "confirmed": true,
+            "idempotency_key": "click-buy-error-1"
+        }))?;
+        let first = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/sessions/session-0/act_batch".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: Some("http://127.0.0.1".into()),
+                body: request_body.clone(),
+            },
+        )?;
+        assert_eq!(first.status, 500);
+        let first_body: Value = serde_json::from_slice(&first.body)?;
+        assert!(first_body["error"]
+            .as_str()
+            .ok_or("missing cached driver error")?
+            .contains("ambiguous click failure"));
+
+        let replay = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/sessions/session-0/act_batch".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: Some("http://127.0.0.1".into()),
+                body: request_body,
+            },
+        )?;
+        assert_eq!(replay.status, first.status);
+        assert_eq!(replay.body, first.body);
+
+        let kill = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "DELETE".into(),
+                path: "/sessions/session-0".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: Some("http://127.0.0.1".into()),
+                body: Vec::new(),
+            },
+        )?;
+        assert_eq!(kill.status, 200);
+        join_driver_handler(server)?;
+        Ok(())
+    }
+
+    #[test]
     fn session_act_batch_rejects_new_idempotency_key_when_cache_is_full() -> TestResult {
         let mut pool = SessionPool::default();
         let session = pool.create("https://idempotency-cap.test")?;
@@ -5676,6 +5846,7 @@ mod tests {
                 &session.id,
                 &format!("key-{index}"),
                 json!({"index": index}),
+                200,
                 json!({"status": "applied", "index": index}),
             )?;
         }
