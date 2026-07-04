@@ -1816,6 +1816,11 @@ fn grounded_selector(
     selectors_by_node.get(node).cloned()
 }
 
+/// Beater compatibility boundary: tempo-schema's
+/// `From<beater_browser::BrowserAction>` still emits raw CSS selectors as
+/// NodeIds that never passed through StableIdMapper. Those legacy selectors may
+/// be tried as querySelector inputs, but tempo-owned `node:*` IDs are opaque
+/// capabilities and must never fall through to raw selector lookup.
 fn selector_or_legacy_fallback(
     selectors_by_node: &BTreeMap<NodeId, String>,
     node: &NodeId,
@@ -3424,6 +3429,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn live_cdp_current_url_guard_rejects_redirected_private_url_before_snapshot(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(chrome) = std::env::var_os("TEMPO_CDP_CHROME") else {
+            eprintln!(
+                "skipping live CDP redirected current URL guard test; TEMPO_CDP_CHROME is unset"
+            );
+            return Ok(());
+        };
+        let fixture = serve_policy_fixture()?;
+        let config = CdpConfig::default()
+            .with_executable(chrome.to_string_lossy())
+            .with_no_sandbox_env_opt_in();
+        let mut driver = CdpTempoDriver::launch_with(config)
+            .await?
+            .allow_private_network_access();
+
+        driver
+            .goto(&fixture.allowed_url("/redirect-private"))
+            .await?;
+        assert!(
+            fixture.private_requested.load(Ordering::SeqCst),
+            "redirect fixture did not land on the private target"
+        );
+        driver = driver.with_url_policy(UrlPolicy::block_private());
+
+        let observe_result = driver.observe().await;
+        assert!(
+            matches!(observe_result, Err(TransportError::UrlBlocked)),
+            "expected snapshot path to reject the private current URL before reading DOM, got {observe_result:?}"
+        );
+
+        let wait_result = driver
+            .act_batch(&ActionBatch {
+                actions: Vec::new(),
+                quiescence: QuiescencePolicy::Composite,
+            })
+            .await;
+
+        assert!(
+            matches!(wait_result, Err(TransportError::UrlBlocked)),
+            "expected composite quiescence to reject the private current URL before reading DOM, got {wait_result:?}"
+        );
+        driver.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn live_cdp_driver_navigates_observes_acts_and_screenshots(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let Some(chrome) = std::env::var_os("TEMPO_CDP_CHROME") else {
@@ -3726,6 +3778,11 @@ mod tests {
                             r#"<!doctype html><html><body><a id="go" href="{thread_private_url}">Go</a></body></html>"#
                         );
                         http_response("200 OK", "text/html", &body)
+                    }
+                    "/redirect-private" => {
+                        format!(
+                            "HTTP/1.1 302 Found\r\nLocation: {thread_private_url}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        )
                     }
                     "/private" => {
                         requested.store(true, Ordering::SeqCst);
