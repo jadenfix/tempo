@@ -5,61 +5,77 @@ description: High-recall, high-precision independent review of a tempo PR. Use w
 
 # tempo PR review
 
-You are an independent, non-author reviewer for `jadenfix/tempo`. The argument is a PR number: `$ARGUMENTS`. Several agents work this repo concurrently — assume nothing about freshness, and never rubber-stamp.
+You are an independent, non-author reviewer for `jadenfix/tempo`. The argument is a PR number: `$ARGUMENTS`. Several agents work this repo concurrently — assume nothing about freshness, and never rubber-stamp. This rubric teaches you *how* to find bugs on any PR; it is deliberately not a list of past bugs to grep for.
 
 ## Ground rules
 
 - **Non-author only.** Check `gh pr view <N> -R jadenfix/tempo --json commits -q '.commits[].messageHeadline'` — if you recognize any commit as your own work from this session, stop and hand the review to another agent.
 - Read-only: do not modify the main clone, do not run `cargo` in a directory another agent may be building in. CI already builds per-PR; review by reading.
-- Precision rule: every **blocker** must include a concrete traced failure scenario (specific input/state → specific wrong behavior, with `file:line`). If you cannot trace one, it is a nit, not a blocker.
-- Recall rule: read the ENTIRE diff (page through `gh pr diff`), the referenced issues, and the surrounding code of every touched file at current `main` — bugs live at the seams the diff doesn't show.
+- Precision: every **blocker** carries a concrete traced failure scenario (specific input/state → specific wrong behavior, with `file:line`). If you cannot trace one, it is a nit.
+- Recall: read the ENTIRE diff, the referenced issues, and the surrounding code of every touched file at current `main`. Bugs live at the seams the diff doesn't show.
 
 ## Procedure
 
 1. `gh pr view <N> -R jadenfix/tempo --json title,body,author,files,mergeStateStatus,statusCheckRollup`
 2. `gh pr diff <N> -R jadenfix/tempo` — all of it.
-3. `gh issue view <issue> -R jadenfix/tempo` for every referenced issue; the issue defines the intended scope.
-4. **Supersession check:** `git log origin/main --oneline -30` plus targeted `git log -p` on touched files. Concurrent agents mean main may already contain an equivalent fix. If so: verdict REJECT (superseded).
+3. `gh issue view <issue> -R jadenfix/tempo` for every referenced issue; the issue defines the intended scope (did the PR do more or less than it needs?).
+4. **Supersession check:** `git log origin/main --oneline -30` plus targeted `git log -p` on touched files. Concurrent agents mean main may already contain an equivalent fix → REJECT (superseded).
 5. **Overlap check:** `gh pr list -R jadenfix/tempo --state open` — flag open PRs touching the same paths and whether merge order matters.
-6. Work the checklist below against diff + surrounding code.
+6. Hunt for bugs using the method below.
 7. Post the review (format at the bottom) and return a structured verdict.
 
-## tempo critical checklist (high recall — check every item that applies)
+## How to find bugs (do this — don't just tick boxes)
 
-Resource bounds & availability:
-- [ ] Every read of remote/untrusted data is size-capped (response bodies honor `max_body_bytes`-style config; WebSocket frames, screenshots, extracts, tool responses bounded end-to-end). Unbounded `read_to_end`/`Vec` growth on network input is a blocker.
-- [ ] Every engine/remote round-trip has a timeout; a wedged target must not hang tempod, drain, or close paths.
-- [ ] No lock held across `.await`, navigation, or subprocess I/O — especially the tempod pool lock (`/health` and `/drain` must stay responsive).
-- [ ] Connection/session concurrency is bounded; no unbounded task spawning per connection.
+The checklist further down is a memory aid. These techniques are what actually surface bugs; apply them to the code this PR touches.
+
+- **Trace one path end to end.** Pick the main value or state the PR changes and follow it through the code — into the error and edge branches, not just the happy path. Most blockers live on the path the tests don't take.
+- **Review from three seats.** tempo serves a **human**, an **LLM agent**, and a **fleet operator**, and each fails differently: the agent cannot see through a result envelope that lies (it keys on the flag, not the prose); the operator cannot rescue a node that has silently wedged or grows without bound; the human notices a frozen UI or a control that does nothing. For the code in the diff, ask how it hurts each of the three.
+- **Enumerate failure modes** for every new input, call, or state transition: empty · malformed · oversized · slow/hung · repeated/retried · concurrent · out-of-order · partial failure · adversarial/untrusted. A new path that silently mishandles one of these is a candidate blocker.
+- **Follow the seams the diff hides:** the callers of every changed signature, the callees it now leans on, and any invariant elsewhere that assumed the old behavior.
+- **Reverted-fix test:** would any test in the PR still pass if the fix itself were reverted? If yes, the test proves nothing — that's a blocker for a bugfix PR.
+- **Adversarially verify** each candidate blocker before it goes in the review: try to refute it against the code. Survives refutation → blocker. Can't build a concrete trace → nit.
+
+## What to look for (general bug classes — check every one that the diff touches)
+
+Correctness & honesty of the contract:
+- [ ] Return values, status flags, and result/tool envelopes tell the caller the truth — a failure or a no-op is never reported as success. (Highest stakes where the caller is the agent, which acts on the flag.)
+- [ ] Output that drops, truncates, samples, or rate-limits data says so, so the consumer can distinguish "absent" from "omitted."
+- [ ] Handles/IDs the caller reuses across calls are stable, or their churn is handled rather than silently breaking multi-step callers.
+- [ ] Docs, comments, and declared schemas/types match what the code actually does — no present-tense claims for a stub, no `{"type":"object"}` standing in for a real schema.
+
+Resource, lifecycle & availability:
+- [ ] Everything that can grow is bounded: input/response sizes, queues, maps, caches, retries, spawned tasks, and session/connection counts. Unbounded growth on remote-driven input is a blocker.
+- [ ] Every engine/remote/subprocess round-trip has a timeout **and** a recovery path — a crash or hang is detected and healed (restart/reconnect, with backoff), not permanently terminal.
+- [ ] Health/readiness signals reflect real state (draining, dependency-down, at-capacity); cleanup and teardown run on every exit path including error and cancel.
+- [ ] Locks are narrow, consistently ordered, released on panic (poison recovered, not fatal), and never held across `.await`, navigation, or subprocess I/O — the pool lock especially, so `/health` and `/drain` stay responsive.
 
 Trust boundaries & security:
-- [ ] Caller-supplied `taint`, `confirmed`, policy, or side-effect classifications are NEVER trusted — recompute server-side (mcp/bidi/policy seam).
-- [ ] URL policy is enforced across redirects and request interception, not just the initial navigation (engine-cdp).
-- [ ] Binding beyond loopback requires capability auth; loopback-only defaults preserved.
-- [ ] Untrusted descriptors (OpenAPI, WebMCP catalogs, handshake evidence) cannot cause side effects or leak secret headers; handshake evidence is origin-bound.
-- [ ] Secrets/PII redacted in journals, cassettes, OTLP/JSONL exports, logs; durable files created 0600; export failures fail closed or degrade without blocking the step path.
-- [ ] Engine-host IPC has peer authentication (no unauthenticated UDS/pipe trust); proxy endpoints must be secure schemes or explicit insecure opt-in.
+- [ ] Caller-supplied trust/policy/side-effect classifications (`taint`, `confirmed`, …) are recomputed server-side, never trusted.
+- [ ] Untrusted data is size-checked, provenance-tracked, and cannot cause side effects or leak secret headers; a policy (URL, egress, redaction) is enforced across the whole path — redirects, retries, interception — not just the entrypoint.
+- [ ] A detector or guard runs on data that actually reaches it: check that upstream filtering/compilation didn't strip the very signal the check needs.
 
-Hot-path performance (the #229–#235 wave — perf regressions are correctness here):
-- [ ] Reused, not re-created: `reqwest::Client`, MCP sessions, DB connections. A fresh client or full re-handshake per call on a hot path is a blocker.
-- [ ] No redundant serialization/copies on the observation path (serialize once, no base64 round-trips of large payloads, no full re-observe where a diff suffices).
-- [ ] No new serialization points: work that can overlap (settle wait vs. next-step prep, per-node AX enrichment) isn't made strictly sequential; no new global single-op bottleneck.
-- [ ] SQLite/journal writes use the established WAL + dedicated-writer pattern, not per-write open/sync-FULL.
+Performance on hot paths (a regression here is a correctness bug for this project):
+- [ ] Reused, not recreated: clients, sessions, connections, buffers, metric handles — no per-call handshake, allocation, or registration where it can be cached.
+- [ ] No redundant serialization, copies, or round-trips on the per-action path; work that can overlap isn't forced sequential; no new global single-op bottleneck.
 
-Identity & politeness invariants (net/crawl):
-- [ ] Never change identity (UA/JA4/profile) after a block; no residential proxies; robots/AIPREF respected where the code touches fetching.
+Fit & simplicity (more code is not better):
+- [ ] The change does exactly what its issue needs — no speculative abstraction, dead branch, unused config knob, second way to do an existing thing, or new crate/feature with no caller.
+- [ ] It fits `final.md`: crate-layer direction is respected (a lower-layer contract crate must not depend upward on a higher-layer one), the driver contract stays engine-agnostic, observe/policy/taint stay pure, and public contracts stay versioned to evolve independently.
 
-Rust discipline (workspace-enforced, but check the diff doesn't fight it):
-- [ ] No `unwrap`/`expect` (clippy denies), no `unsafe` (forbidden), errors are typed, no panics reachable from untrusted input.
-- [ ] Doc comments do not overstate status (no "this is real/done" claims for shims).
+Tests:
+- [ ] A test exercises the actual failure mode (survives the reverted-fix question above); new caps/timeouts/limits are tested at the boundary — at, below, above.
 
-Scope & simplicity (blockers, not style points — more code != better):
-- [ ] Change does exactly what the referenced issue needs. Speculative abstractions, unused config knobs, dead branches, duplicated logic, or a second way to do an existing thing are BLOCKERS.
-- [ ] Architecture fit: consistent with `final.md` (crate boundaries, engine-agnostic driver contract, pure-crate discipline for observe/policy/taint).
+## tempo hard rules (standing invariants — treat a violation as a blocker)
 
-Test depth:
-- [ ] Tests exercise the actual failure mode, not just the happy path. Ask: would every test still pass if the fix were reverted? If yes, that's a blocker.
-- [ ] New timeouts/caps/limits have a test at the boundary (at, below, above).
+These are the project's non-negotiable rules, not suggestions:
+- No `unwrap`/`expect` (clippy denies) and no `unsafe` (forbidden); errors are typed; no panic reachable from untrusted input.
+- Loopback-only bind by default; binding beyond loopback requires capability auth, and the boundary must not be bypassable (e.g. a component linking the pool in-process).
+- Engine-host IPC is peer-authenticated; proxy endpoints are secure schemes or an explicit insecure opt-in.
+- Identity (UA/JA4/profile) never changes after a block; no residential proxies; robots/AIPREF respected where the code fetches.
+- Secrets/PII redacted in journals, cassettes, and OTLP/JSONL exports; durable files are `0600`; export failure degrades without blocking the step path.
+- Raw accessibility/DOM data is compiled engine-side; only compiled observations/diffs cross into `tempod`.
+
+For concrete, current instances of these bug classes, skim the tracker's `sev:high`/`sev:critical` issues — but review the code in front of you, not a checklist of past bugs.
 
 ## Verdict & posting
 
