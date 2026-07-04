@@ -363,6 +363,7 @@ fn eval_record_from_journal_entries(
                 last_observe_start_ms = Some(entry.timestamp_ms);
             }
             JournalEvent::TransportError { .. }
+            | JournalEvent::ModelDecision { .. }
             | JournalEvent::StructuredFastPathSelected { .. }
             | JournalEvent::CassetteRecorded { .. }
             | JournalEvent::SessionClosed => {}

@@ -105,6 +105,17 @@ pub enum JournalEvent {
     Observation {
         observation: CompiledObservation,
     },
+    /// One model-decided action batch, journaled before any of its actions run
+    /// (journal-before-effect, #248). Provider token usage is recorded per
+    /// decision so cache-hit rate stays observable (`cache_read_input_tokens`,
+    /// #218).
+    ModelDecision {
+        actions: Vec<Action>,
+        rationale: Option<String>,
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_read_input_tokens: u64,
+    },
     ActionPlanned {
         action: Action,
     },

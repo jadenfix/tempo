@@ -24,6 +24,8 @@ use tempo_session::{
 use tempo_skills::{SkillError, SkillStore};
 use thiserror::Error;
 
+pub mod decider;
+
 /// Default p95 observation budget from `final.md` §10.
 pub const DEFAULT_MAX_OBSERVATION_BYTES: usize = 8 * 1024;
 
@@ -350,6 +352,7 @@ impl ResumeCursor {
                 JournalEvent::SessionStarted { .. }
                 | JournalEvent::StructuredFastPathSelected { .. }
                 | JournalEvent::Observation { .. }
+                | JournalEvent::ModelDecision { .. }
                 | JournalEvent::TransportError { .. }
                 | JournalEvent::CassetteRecorded { .. } => {}
             }
@@ -1681,6 +1684,7 @@ pub fn step_triples_from_journal_with_retention_policy(
             JournalEvent::SessionStarted { .. }
             | JournalEvent::StructuredFastPathSelected { .. }
             | JournalEvent::Observation { .. }
+            | JournalEvent::ModelDecision { .. }
             | JournalEvent::ActionPlanned { .. }
             | JournalEvent::TransportError { .. }
             | JournalEvent::CassetteRecorded { .. }
@@ -1713,6 +1717,7 @@ pub fn step_triples_from_journal_entries(
             JournalEvent::SessionStarted { .. }
             | JournalEvent::StructuredFastPathSelected { .. }
             | JournalEvent::Observation { .. }
+            | JournalEvent::ModelDecision { .. }
             | JournalEvent::ActionPlanned { .. }
             | JournalEvent::TransportError { .. }
             | JournalEvent::CassetteRecorded { .. }
@@ -1859,28 +1864,61 @@ async fn post_mcp_json(
     })
 }
 
-/// Reads an MCP HTTP response body into a `String` while enforcing a hard byte
-/// cap, so an attacker-controlled endpoint cannot exhaust memory by streaming an
-/// unbounded body (see issue #212). Mirrors the probe path's `take`-style bound
-/// in `tempo-handshake`, but for the async client: rejects early when the
-/// advertised `Content-Length` already exceeds the cap, then accumulates chunks
-/// and errors as soon as the received bytes would cross the cap.
+/// MCP-flavored wrapper over [`read_body_capped`]: collapses the typed cap
+/// errors onto this client's string-error plumbing.
 async fn read_mcp_body_capped(
     response: reqwest::Response,
     max_body_bytes: usize,
 ) -> Result<String, String> {
+    read_body_capped(response, max_body_bytes)
+        .await
+        .map_err(|error| match error {
+            CappedBodyError::TooLarge { max_bytes } => {
+                format!("MCP response body exceeded {max_bytes} bytes")
+            }
+            CappedBodyError::Transport(reason) => reason,
+        })
+}
+
+/// Typed failure from [`read_body_capped`], so callers can distinguish a
+/// retryable transport fault from a fatal size-cap breach.
+pub(crate) enum CappedBodyError {
+    TooLarge { max_bytes: usize },
+    Transport(String),
+}
+
+/// Reads an HTTP response body into a `String` while enforcing a hard byte
+/// cap, so an attacker-controlled endpoint cannot exhaust memory by streaming
+/// an unbounded body (see issue #212). Mirrors the probe path's `take`-style
+/// bound in `tempo-handshake`, but for the async client: rejects early when
+/// the advertised `Content-Length` already exceeds the cap, then accumulates
+/// chunks and errors as soon as the received bytes would cross the cap.
+/// Shared by the MCP client above and the Anthropic decider (#248); each
+/// caller maps [`CappedBodyError`] onto its own error type.
+pub(crate) async fn read_body_capped(
+    response: reqwest::Response,
+    max_body_bytes: usize,
+) -> Result<String, CappedBodyError> {
     let cap = max_body_bytes as u64;
     if let Some(content_length) = response.content_length()
         && content_length > cap
     {
-        return Err(format!("MCP response body exceeded {max_body_bytes} bytes"));
+        return Err(CappedBodyError::TooLarge {
+            max_bytes: max_body_bytes,
+        });
     }
 
     let mut response = response;
     let mut body: Vec<u8> = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|error| error.to_string())? {
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| CappedBodyError::Transport(error.to_string()))?
+    {
         if body.len() as u64 + chunk.len() as u64 > cap {
-            return Err(format!("MCP response body exceeded {max_body_bytes} bytes"));
+            return Err(CappedBodyError::TooLarge {
+                max_bytes: max_body_bytes,
+            });
         }
         body.extend_from_slice(&chunk);
     }
@@ -2218,6 +2256,8 @@ pub enum AgentError {
     },
     #[error("token budget exceeded: attempted {attempted}, max {max}")]
     TokenBudgetExceeded { attempted: u64, max: u64 },
+    #[error("model decider failed: {0}")]
+    Decider(#[from] decider::DeciderError),
     #[error(
         "observation budget exceeded: {bytes} bytes/{estimated_tokens} tokens, max {max_bytes} bytes/{max_tokens} tokens"
     )]
@@ -4011,6 +4051,10 @@ mod tests {
                 match listener.accept() {
                     Ok((mut stream, _peer)) => {
                         handled += 1;
+                        // Accepted sockets can inherit the listener's
+                        // nonblocking flag (macOS), flaking reads with
+                        // WouldBlock; force blocking mode explicitly.
+                        stream.set_nonblocking(false)?;
                         stream.set_read_timeout(Some(std::time::Duration::from_secs(1)))?;
                         let request = read_http_request(&mut stream)?;
                         let response = if request.starts_with("GET /mcp/catalog.json ") {
@@ -4131,6 +4175,10 @@ mod tests {
             while std::time::Instant::now() < deadline {
                 match listener.accept() {
                     Ok((mut stream, _peer)) => {
+                        // Accepted sockets can inherit the listener's
+                        // nonblocking flag (macOS), flaking reads with
+                        // WouldBlock; force blocking mode explicitly.
+                        stream.set_nonblocking(false)?;
                         stream.set_read_timeout(Some(std::time::Duration::from_secs(1)))?;
                         let _request = read_http_request(&mut stream)?;
                         let response =
@@ -4169,6 +4217,10 @@ mod tests {
             while std::time::Instant::now() < deadline {
                 match listener.accept() {
                     Ok((mut stream, _peer)) => {
+                        // Accepted sockets can inherit the listener's
+                        // nonblocking flag (macOS), flaking reads with
+                        // WouldBlock; force blocking mode explicitly.
+                        stream.set_nonblocking(false)?;
                         stream.set_read_timeout(Some(std::time::Duration::from_secs(1)))?;
                         let _request = read_http_request(&mut stream)?;
                         // Status + headers WITHOUT Content-Length; `Connection: close`
@@ -4310,7 +4362,7 @@ mod tests {
         Ok(())
     }
 
-    struct HttpFixtureResponse {
+    pub(crate) struct HttpFixtureResponse {
         status: &'static str,
         content_type: &'static str,
         body: String,
@@ -4328,7 +4380,7 @@ mod tests {
             self
         }
 
-        fn to_http(&self) -> String {
+        pub(crate) fn to_http(&self) -> String {
             let mut response = format!(
                 "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n",
                 self.status,
@@ -4347,7 +4399,7 @@ mod tests {
         }
     }
 
-    fn http_fixture_response(
+    pub(crate) fn http_fixture_response(
         status: &'static str,
         content_type: &'static str,
         body: impl Into<String>,
@@ -4360,7 +4412,7 @@ mod tests {
         }
     }
 
-    fn read_http_request(stream: &mut std::net::TcpStream) -> std::io::Result<String> {
+    pub(crate) fn read_http_request(stream: &mut std::net::TcpStream) -> std::io::Result<String> {
         let mut bytes = Vec::new();
         let mut chunk = [0_u8; 1024];
         loop {
@@ -4590,7 +4642,7 @@ mod tests {
         }
     }
 
-    fn button(id: &str) -> InteractiveElement {
+    pub(crate) fn button(id: &str) -> InteractiveElement {
         InteractiveElement {
             node_id: NodeId(id.into()),
             role: "button".into(),
@@ -4633,7 +4685,7 @@ mod tests {
         }
     }
 
-    fn unique_dir(label: &str) -> Result<PathBuf, std::time::SystemTimeError> {
+    pub(crate) fn unique_dir(label: &str) -> Result<PathBuf, std::time::SystemTimeError> {
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         let mut path = std::env::temp_dir();
         path.push(format!(
@@ -4643,7 +4695,7 @@ mod tests {
         Ok(path)
     }
 
-    fn remove_dir_if_exists(path: &Path) -> Result<(), std::io::Error> {
+    pub(crate) fn remove_dir_if_exists(path: &Path) -> Result<(), std::io::Error> {
         match fs::remove_dir_all(path) {
             Ok(()) => Ok(()),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
