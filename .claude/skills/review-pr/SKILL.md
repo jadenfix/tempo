@@ -9,7 +9,7 @@ You are an independent, non-author reviewer for `jadenfix/tempo`. The argument i
 
 ## Ground rules
 
-- **Non-author only.** If you authored any commit on this branch, stop and hand the review to another agent.
+- **Non-author only.** Check `gh pr view <N> -R jadenfix/tempo --json commits -q '.commits[].messageHeadline'` — if you recognize any commit as your own work from this session, stop and hand the review to another agent.
 - Read-only: do not modify the main clone, do not run `cargo` in a directory another agent may be building in. CI already builds per-PR; review by reading.
 - Precision rule: every **blocker** must include a concrete traced failure scenario (specific input/state → specific wrong behavior, with `file:line`). If you cannot trace one, it is a nit, not a blocker.
 - Recall rule: read the ENTIRE diff (page through `gh pr diff`), the referenced issues, and the surrounding code of every touched file at current `main` — bugs live at the seams the diff doesn't show.
@@ -18,7 +18,7 @@ You are an independent, non-author reviewer for `jadenfix/tempo`. The argument i
 
 1. `gh pr view <N> -R jadenfix/tempo --json title,body,author,files,mergeStateStatus,statusCheckRollup`
 2. `gh pr diff <N> -R jadenfix/tempo` — all of it.
-3. `gh issue view` every referenced issue; the issue defines the intended scope.
+3. `gh issue view <issue> -R jadenfix/tempo` for every referenced issue; the issue defines the intended scope.
 4. **Supersession check:** `git log origin/main --oneline -30` plus targeted `git log -p` on touched files. Concurrent agents mean main may already contain an equivalent fix. If so: verdict REJECT (superseded).
 5. **Overlap check:** `gh pr list -R jadenfix/tempo --state open` — flag open PRs touching the same paths and whether merge order matters.
 6. Work the checklist below against diff + surrounding code.
@@ -38,6 +38,13 @@ Trust boundaries & security:
 - [ ] Binding beyond loopback requires capability auth; loopback-only defaults preserved.
 - [ ] Untrusted descriptors (OpenAPI, WebMCP catalogs, handshake evidence) cannot cause side effects or leak secret headers; handshake evidence is origin-bound.
 - [ ] Secrets/PII redacted in journals, cassettes, OTLP/JSONL exports, logs; durable files created 0600; export failures fail closed or degrade without blocking the step path.
+- [ ] Engine-host IPC has peer authentication (no unauthenticated UDS/pipe trust); proxy endpoints must be secure schemes or explicit insecure opt-in.
+
+Hot-path performance (the #229–#235 wave — perf regressions are correctness here):
+- [ ] Reused, not re-created: `reqwest::Client`, MCP sessions, DB connections. A fresh client or full re-handshake per call on a hot path is a blocker.
+- [ ] No redundant serialization/copies on the observation path (serialize once, no base64 round-trips of large payloads, no full re-observe where a diff suffices).
+- [ ] No new serialization points: work that can overlap (settle wait vs. next-step prep, per-node AX enrichment) isn't made strictly sequential; no new global single-op bottleneck.
+- [ ] SQLite/journal writes use the established WAL + dedicated-writer pattern, not per-write open/sync-FULL.
 
 Identity & politeness invariants (net/crawl):
 - [ ] Never change identity (UA/JA4/profile) after a block; no residential proxies; robots/AIPREF respected where the code touches fetching.
