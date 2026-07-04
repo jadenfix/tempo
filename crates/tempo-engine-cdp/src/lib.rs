@@ -2,8 +2,8 @@
 //!
 //! This crate is the real CDP fallback lane. It launches a headless
 //! Chromium-family browser through `chromiumoxide` and adapts it to tempo's C3
-//! driver contract. NodeIds in this lane are stable CSS selectors compiled from
-//! the live page DOM.
+//! driver contract. NodeIds in this lane are stable observation IDs mapped to
+//! live CSS selectors inside the adapter.
 
 use async_trait::async_trait;
 use chromiumoxide::browser::{Browser, BrowserConfig, HeadlessMode};
@@ -19,11 +19,13 @@ use chromiumoxide::error::CdpError;
 use chromiumoxide::page::{Page, ScreenshotParams};
 use futures::StreamExt;
 use std::collections::{BTreeMap, HashMap};
+use std::path::Path;
 use std::time::{Duration, Instant};
 use tempo_driver::{
     BrowsingContextCreateOptions, DriverTrait, Engine, StepOutcome, TransportError, Unsupported,
 };
 use tempo_net::UrlPolicy;
+use tempo_observe::{RawElement, StableIdMapper};
 use tempo_schema::{
     Action, ActionBatch, CompiledObservation, InteractiveElement, NodeId, ObservationDiff,
     Provenance, QuiescencePolicy, TaintSpan,
@@ -44,13 +46,18 @@ use tokio::task::JoinHandle;
 /// enriched, while the long tail stays present but without an AX overlay.
 const MAX_AX_ENRICHED_ELEMENTS: usize = 16;
 
+/// Explicit opt-out for Chromium sandboxing in constrained CI/container setups.
+pub const TEMPO_CDP_NO_SANDBOX_ENV: &str = "TEMPO_CDP_NO_SANDBOX";
+
 /// Launch configuration for the CDP fallback lane.
 #[derive(Clone, Debug)]
 pub struct CdpConfig {
     /// Explicit path to a Chrome/Chromium binary. When unset, chromiumoxide
     /// tries its platform auto-detection.
     pub executable: Option<String>,
-    /// Run Chrome with `--no-sandbox`, which is required in many CI containers.
+    /// Run Chrome with `--no-sandbox`. This is less secure and should only be
+    /// used for constrained CI/container fixtures that cannot run Chromium's
+    /// sandbox.
     pub no_sandbox: bool,
     /// How long to wait for the browser process to expose DevTools.
     pub launch_timeout: Duration,
@@ -62,10 +69,31 @@ impl CdpConfig {
         self
     }
 
-    fn browser_config(&self) -> Result<BrowserConfig, TransportError> {
+    pub fn with_no_sandbox_for_ci(mut self) -> Self {
+        self.no_sandbox = true;
+        self
+    }
+
+    /// Honor the explicit no-sandbox opt-in environment variable.
+    ///
+    /// This keeps production/default launches sandboxed while allowing live CI
+    /// fixtures to run on hosted Linux runners that cannot provide Chromium's
+    /// sandbox.
+    pub fn with_no_sandbox_env_opt_in(self) -> Self {
+        if env_flag_enabled(TEMPO_CDP_NO_SANDBOX_ENV) {
+            self.with_no_sandbox_for_ci()
+        } else {
+            self
+        }
+    }
+
+    fn browser_config(&self, user_data_dir: &Path) -> Result<BrowserConfig, TransportError> {
         let mut builder = BrowserConfig::builder()
             .headless_mode(HeadlessMode::New)
-            .launch_timeout(self.launch_timeout);
+            .launch_timeout(self.launch_timeout)
+            .user_data_dir(user_data_dir)
+            .incognito()
+            .disable_cache();
         if self.no_sandbox {
             builder = builder.no_sandbox();
         }
@@ -80,7 +108,7 @@ impl Default for CdpConfig {
     fn default() -> Self {
         Self {
             executable: None,
-            no_sandbox: true,
+            no_sandbox: false,
             launch_timeout: Duration::from_secs(20),
         }
     }
@@ -91,9 +119,12 @@ pub struct CdpTempoDriver {
     browser: Browser,
     page: Option<Page>,
     handler_task: JoinHandle<()>,
+    profile_dir: Option<tempfile::TempDir>,
     owns_browser: bool,
     seq: u64,
     history: BTreeMap<u64, CompiledObservation>,
+    stable_id_mapper: StableIdMapper,
+    selectors_by_node: BTreeMap<NodeId, String>,
     url_policy: UrlPolicy,
 }
 
@@ -105,7 +136,13 @@ impl CdpTempoDriver {
 
     /// Launch a real browser with an explicit CDP configuration.
     pub async fn launch_with(config: CdpConfig) -> Result<Self, TransportError> {
-        let browser_config = config.browser_config()?;
+        let profile_dir = tempfile::Builder::new()
+            .prefix("tempo-cdp-profile-")
+            .tempdir()
+            .map_err(|error| {
+                TransportError::Other(format!("failed to create private CDP profile: {error}"))
+            })?;
+        let browser_config = config.browser_config(profile_dir.path())?;
         let (browser, mut handler) = Browser::launch(browser_config)
             .await
             .map_err(map_cdp_error)?;
@@ -119,9 +156,12 @@ impl CdpTempoDriver {
             browser,
             page: Some(page),
             handler_task,
+            profile_dir: Some(profile_dir),
             owns_browser: true,
             seq: 0,
             history: BTreeMap::new(),
+            stable_id_mapper: StableIdMapper::new(),
+            selectors_by_node: BTreeMap::new(),
             url_policy: UrlPolicy::block_private(),
         })
     }
@@ -169,7 +209,9 @@ impl CdpTempoDriver {
         dom_html: String,
     ) -> Result<CompiledObservation, TransportError> {
         self.seq += 1;
-        let mut compiled = compile_observation(url, dom_html, self.seq);
+        let (mut compiled, selectors_by_node) =
+            compile_observation(&mut self.stable_id_mapper, url, dom_html, self.seq);
+        self.selectors_by_node = selectors_by_node;
         self.enrich_observation_from_ax_tree(&mut compiled).await?;
         self.history.insert(compiled.seq, compiled.clone());
         Ok(compiled)
@@ -203,7 +245,12 @@ impl CdpTempoDriver {
         enrich_elements(
             &mut observation.elements,
             MAX_AX_ENRICHED_ELEMENTS,
-            |selector| async move { self.ax_summary_for_selector(root, &selector).await },
+            |node_id| async move {
+                let Some(selector) = self.selectors_by_node.get(&node_id).cloned() else {
+                    return Ok(None);
+                };
+                self.ax_summary_for_selector(root, &selector).await
+            },
         )
         .await
     }
@@ -288,10 +335,81 @@ impl CdpTempoDriver {
         }
     }
 
-    async fn selector_outcome(
+    fn selector_for_node(&self, node: &NodeId) -> Option<String> {
+        grounded_selector(&self.selectors_by_node, node)
+    }
+
+    async fn refresh_selector_for_node(
+        &mut self,
+        node: &NodeId,
+    ) -> Result<Option<String>, TransportError> {
+        let _ = self.record_current_observation().await?;
+        Ok(self.selectors_by_node.get(node).cloned())
+    }
+
+    async fn with_node_element<F, Fut>(
+        &mut self,
+        node: &NodeId,
+        mut op: F,
+    ) -> Result<NodeGrounding, TransportError>
+    where
+        F: FnMut(chromiumoxide::Element) -> Fut,
+        Fut: std::future::Future<Output = Result<(), TransportError>>,
+    {
+        if let Some(selector) = self.selector_for_node(node) {
+            if self.with_element(&selector, &mut op).await? {
+                return Ok(NodeGrounding {
+                    target: selector,
+                    grounded: true,
+                });
+            }
+
+            if let Some(refreshed) = self.refresh_selector_for_node(node).await?
+                && refreshed != selector
+            {
+                let grounded = self.with_element(&refreshed, &mut op).await?;
+                return Ok(NodeGrounding {
+                    target: refreshed,
+                    grounded,
+                });
+            }
+
+            return Ok(NodeGrounding {
+                target: selector,
+                grounded: false,
+            });
+        }
+
+        let refreshed = self.refresh_selector_for_node(node).await?;
+        let Some(selector) = refreshed else {
+            return Ok(NodeGrounding {
+                target: node.0.clone(),
+                grounded: false,
+            });
+        };
+        let grounded = self.with_element(&selector, op).await?;
+        Ok(NodeGrounding {
+            target: selector,
+            grounded,
+        })
+    }
+
+    async fn extract_with_selector(
+        &self,
+        selector: &str,
+    ) -> Result<serde_json::Value, TransportError> {
+        self.page()?
+            .evaluate(extraction_script(selector)?)
+            .await
+            .map_err(map_cdp_error)?
+            .into_value::<serde_json::Value>()
+            .map_err(|error| TransportError::Other(error.to_string()))
+    }
+
+    async fn node_outcome(
         &mut self,
         previous_seq: u64,
-        selector: &str,
+        target: &str,
         grounded: bool,
     ) -> Result<StepOutcome, TransportError> {
         let compiled = self.record_current_observation().await?;
@@ -301,7 +419,7 @@ impl CdpTempoDriver {
             })
         } else {
             Ok(StepOutcome::StepError {
-                reason: format!("selector not found: {selector}"),
+                reason: format!("node not found: {target}"),
             })
         }
     }
@@ -316,47 +434,50 @@ impl CdpTempoDriver {
                 })
             }
             Action::Click { node } => {
-                let selector = node.0.clone();
-                let grounded = self
-                    .with_element(&selector, |element| async move {
+                let grounding = self
+                    .with_node_element(node, |element| async move {
                         element.click().await.map_err(map_cdp_error)?;
                         Ok(())
                     })
                     .await?;
-                self.selector_outcome(previous_seq, &selector, grounded)
+                self.node_outcome(previous_seq, &grounding.target, grounding.grounded)
                     .await
             }
             Action::Type { node, text } => {
-                let selector = node.0.clone();
                 let text = text.clone();
-                let grounded = self
-                    .with_element(&selector, |element| async move {
-                        element.focus().await.map_err(map_cdp_error)?;
-                        element.type_str(&text).await.map_err(map_cdp_error)?;
-                        Ok(())
+                let grounding = self
+                    .with_node_element(node, |element| {
+                        let text = text.clone();
+                        async move {
+                            element.focus().await.map_err(map_cdp_error)?;
+                            element.type_str(&text).await.map_err(map_cdp_error)?;
+                            Ok(())
+                        }
                     })
                     .await?;
-                self.selector_outcome(previous_seq, &selector, grounded)
+                self.node_outcome(previous_seq, &grounding.target, grounding.grounded)
                     .await
             }
             Action::Select { node, value } => {
-                let selector = node.0.clone();
                 let encoded = serde_json::to_string(value)
                     .map_err(|error| TransportError::Other(error.to_string()))?;
-                let grounded = self
-                    .with_element(&selector, |element| async move {
-                        let function = format!(
-                            "function() {{ this.value = {encoded}; \
+                let grounding = self
+                    .with_node_element(node, |element| {
+                        let encoded = encoded.clone();
+                        async move {
+                            let function = format!(
+                                "function() {{ this.value = {encoded}; \
                              this.dispatchEvent(new Event('change', {{ bubbles: true }})); }}"
-                        );
-                        element
-                            .call_js_fn(function, false)
-                            .await
-                            .map_err(map_cdp_error)?;
-                        Ok(())
+                            );
+                            element
+                                .call_js_fn(function, false)
+                                .await
+                                .map_err(map_cdp_error)?;
+                            Ok(())
+                        }
                     })
                     .await?;
-                self.selector_outcome(previous_seq, &selector, grounded)
+                self.node_outcome(previous_seq, &grounding.target, grounding.grounded)
                     .await
             }
             Action::Scroll { x, y } => {
@@ -377,11 +498,10 @@ impl CdpTempoDriver {
                 })
             }
             Action::Extract { node } => {
-                let selector = node.0.clone();
-                let grounded = self
-                    .with_element(&selector, |_element| async move { Ok(()) })
+                let grounding = self
+                    .with_node_element(node, |_element| async move { Ok(()) })
                     .await?;
-                self.selector_outcome(previous_seq, &selector, grounded)
+                self.node_outcome(previous_seq, &grounding.target, grounding.grounded)
                     .await
             }
             Action::Skill { name, .. } => Ok(StepOutcome::StepError {
@@ -440,8 +560,9 @@ impl DriverTrait for CdpTempoDriver {
             .wait_for_navigation()
             .await
             .map_err(|error| TransportError::Other(error.to_string()))?;
-        let (_, dom_html) = self.snapshot().await?;
-        self.record_snapshot(url.to_string(), dom_html).await
+        let (final_url, dom_html) = self.snapshot().await?;
+        self.enforce_url_policy(&final_url)?;
+        self.record_snapshot(final_url, dom_html).await
     }
 
     async fn observe(&mut self) -> Result<CompiledObservation, TransportError> {
@@ -518,20 +639,36 @@ impl DriverTrait for CdpTempoDriver {
             browser,
             page: Some(page),
             handler_task,
+            profile_dir: None,
             owns_browser: false,
             seq: 0,
             history: BTreeMap::new(),
+            stable_id_mapper: StableIdMapper::new(),
+            selectors_by_node: BTreeMap::new(),
             url_policy: self.url_policy.clone(),
         }))
     }
 
     async fn extract(&mut self, node: &NodeId) -> Result<serde_json::Value, TransportError> {
-        self.page()?
-            .evaluate(extraction_script(&node.0)?)
-            .await
-            .map_err(map_cdp_error)?
-            .into_value::<serde_json::Value>()
-            .map_err(|error| TransportError::Other(error.to_string()))
+        let Some(selector) = self.selector_for_node(node) else {
+            let Some(refreshed) = self.refresh_selector_for_node(node).await? else {
+                return Ok(node_not_found_extraction(node));
+            };
+            return self.extract_with_selector(&refreshed).await;
+        };
+
+        let extracted = self.extract_with_selector(&selector).await?;
+        if extraction_found(&extracted) {
+            return Ok(extracted);
+        }
+
+        if let Some(refreshed) = self.refresh_selector_for_node(node).await?
+            && refreshed != selector
+        {
+            return self.extract_with_selector(&refreshed).await;
+        }
+
+        Ok(extracted)
     }
 
     async fn evaluate_script(
@@ -568,12 +705,24 @@ impl DriverTrait for CdpTempoDriver {
             page.close().await.map_err(map_cdp_error)?;
         }
         self.handler_task.abort();
+        self.profile_dir.take();
         Ok(())
     }
 }
 
 fn map_cdp_error(error: CdpError) -> TransportError {
     TransportError::Other(error.to_string())
+}
+
+fn env_flag_enabled(name: &str) -> bool {
+    std::env::var(name)
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
 }
 
 fn is_node_not_found_msg(message: &str) -> bool {
@@ -583,6 +732,34 @@ fn is_node_not_found_msg(message: &str) -> bool {
 
 fn is_uninteresting_ax_node_msg(message: &str) -> bool {
     message.to_lowercase().contains("uninteresting")
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct NodeGrounding {
+    target: String,
+    grounded: bool,
+}
+
+fn grounded_selector(
+    selectors_by_node: &BTreeMap<NodeId, String>,
+    node: &NodeId,
+) -> Option<String> {
+    selectors_by_node.get(node).cloned()
+}
+
+fn extraction_found(value: &serde_json::Value) -> bool {
+    value
+        .get("found")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn node_not_found_extraction(node: &NodeId) -> serde_json::Value {
+    serde_json::json!({
+        "selector": node.0,
+        "found": false,
+        "error": "node id not found",
+    })
 }
 
 fn enforce_url_policy(url: &str, policy: &UrlPolicy) -> Result<(), TransportError> {
@@ -763,14 +940,46 @@ fn extraction_script(selector: &str) -> Result<String, TransportError> {
     ))
 }
 
-fn compile_observation(url: String, dom_html: String, seq: u64) -> CompiledObservation {
-    CompiledObservation {
-        schema_version: tempo_schema::SCHEMA_VERSION.into(),
-        url,
-        seq,
-        elements: extract_interactive_elements(&dom_html),
-        marks: Vec::new(),
+fn compile_observation(
+    mapper: &mut StableIdMapper,
+    url: String,
+    dom_html: String,
+    seq: u64,
+) -> (CompiledObservation, BTreeMap<NodeId, String>) {
+    let mut elements = extract_interactive_elements(&dom_html);
+    let raw_elements: Vec<_> = elements
+        .iter()
+        .map(raw_element_from_selector_element)
+        .collect();
+    let node_ids = mapper.map_snapshot(seq, &raw_elements);
+    let mut selectors_by_node = BTreeMap::new();
+    for (element, node_id) in elements.iter_mut().zip(node_ids) {
+        let selector = element.node_id.0.clone();
+        element.node_id = node_id.clone();
+        selectors_by_node.insert(node_id, selector);
     }
+
+    (
+        CompiledObservation {
+            schema_version: tempo_schema::SCHEMA_VERSION.into(),
+            url,
+            seq,
+            elements,
+            marks: Vec::new(),
+        },
+        selectors_by_node,
+    )
+}
+
+fn raw_element_from_selector_element(element: &InteractiveElement) -> RawElement {
+    let mut raw = RawElement::new(element.role.clone(), "")
+        .source_id(element.node_id.0.clone())
+        .name_spans(element.name.clone())
+        .value_spans(element.value.clone());
+    if let Some(bounds) = element.bounds {
+        raw = raw.bounds(bounds);
+    }
+    raw
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -863,15 +1072,15 @@ async fn enrich_elements<F, Fut>(
     mut lookup: F,
 ) -> Result<(), TransportError>
 where
-    F: FnMut(String) -> Fut,
+    F: FnMut(NodeId) -> Fut,
     Fut: std::future::Future<Output = Result<Option<AxSummary>, TransportError>>,
 {
     for index in top_ranked_indices(elements, max_enriched) {
         let Some(element) = elements.get_mut(index) else {
             continue;
         };
-        let selector = element.node_id.0.clone();
-        if let Some(summary) = lookup(selector).await? {
+        let node_id = element.node_id.clone();
+        if let Some(summary) = lookup(node_id).await? {
             apply_ax_summary(element, &summary);
         }
     }
@@ -1422,6 +1631,46 @@ mod tests {
     }
 
     #[test]
+    fn compiled_observation_uses_stable_ids_with_private_selector_lookup() {
+        let mut mapper = StableIdMapper::new();
+        let (first, first_lookup) = compile_observation(
+            &mut mapper,
+            "https://example.test".into(),
+            r#"<button id="save">Save</button>"#.into(),
+            1,
+        );
+        let save_id = first.elements[0].node_id.clone();
+
+        assert!(save_id.0.starts_with("node:"));
+        assert_eq!(
+            first_lookup.get(&save_id).map(String::as_str),
+            Some("[id=\"save\"]")
+        );
+
+        let (second, second_lookup) = compile_observation(
+            &mut mapper,
+            "https://example.test".into(),
+            r#"<button id="renamed">Save</button>"#.into(),
+            2,
+        );
+
+        assert_eq!(second.elements[0].node_id, save_id);
+        assert_eq!(
+            second_lookup.get(&save_id).map(String::as_str),
+            Some("[id=\"renamed\"]")
+        );
+    }
+
+    #[test]
+    fn selector_shaped_node_id_without_grounding_is_not_a_selector() {
+        let selectors = BTreeMap::new();
+        assert_eq!(
+            grounded_selector(&selectors, &NodeId("[id=\"save\"]".into())),
+            None
+        );
+    }
+
+    #[test]
     fn ax_summary_overlays_dom_fallback_name_role_and_value(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let html = r#"
@@ -1577,21 +1826,29 @@ mod tests {
             return Ok(());
         };
         let url = serve_fixture()?;
-        let config = CdpConfig::default().with_executable(chrome.to_string_lossy());
+        let config = CdpConfig::default()
+            .with_executable(chrome.to_string_lossy())
+            .with_no_sandbox_env_opt_in();
         let mut driver = CdpTempoDriver::launch_with(config)
             .await?
             .allow_private_network_access();
 
         let observation = driver.goto(&url).await?;
         assert_eq!(observation.schema_version, tempo_schema::SCHEMA_VERSION);
-        assert!(observation
+        let save = observation
             .elements
             .iter()
-            .any(|element| element.node_id == NodeId("[id=\"save\"]".into())));
+            .find(|element| {
+                element.role == "button"
+                    && element.name.first().map(|span| span.text.as_str()) == Some("Save")
+            })
+            .ok_or_else(|| std::io::Error::other("missing save button"))?;
+        let save_node = save.node_id.clone();
+        assert!(save_node.0.starts_with("node:"));
         let email = observation
             .elements
             .iter()
-            .find(|element| element.node_id == NodeId("[id=\"email\"]".into()))
+            .find(|element| element.role == "textbox")
             .ok_or_else(|| std::io::Error::other("missing email input"))?;
         let email_name = email
             .name
@@ -1605,7 +1862,7 @@ mod tests {
         assert_eq!(email_name.text, "Email Address");
         assert_eq!(email_value.text, "me@example.com");
 
-        let extracted = driver.extract(&NodeId("[id=\"save\"]".into())).await?;
+        let extracted = driver.extract(&save_node).await?;
         assert_eq!(extracted["selector"], "[id=\"save\"]");
         assert_eq!(extracted["found"], true);
         assert_eq!(extracted["node"]["tag"], "button");
@@ -1613,11 +1870,7 @@ mod tests {
         assert_eq!(extracted["node"]["name"], "Save");
         assert_eq!(extracted["node"]["attributes"]["id"], "save");
 
-        let outcome = driver
-            .act(&Action::Click {
-                node: NodeId("[id=\"save\"]".into()),
-            })
-            .await?;
+        let outcome = driver.act(&Action::Click { node: save_node }).await?;
         assert!(matches!(outcome, StepOutcome::Applied { .. }));
 
         let evaluated = driver
@@ -1633,13 +1886,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn live_cdp_stable_node_id_survives_selector_mutation(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(chrome) = std::env::var_os("TEMPO_CDP_CHROME") else {
+            eprintln!("skipping live CDP stable NodeId test; TEMPO_CDP_CHROME is unset");
+            return Ok(());
+        };
+        let url = serve_fixture()?;
+        let config = CdpConfig::default()
+            .with_executable(chrome.to_string_lossy())
+            .with_no_sandbox_env_opt_in();
+        let mut driver = CdpTempoDriver::launch_with(config)
+            .await?
+            .allow_private_network_access();
+
+        let observation = driver.goto(&url).await?;
+        let save_node = observation
+            .elements
+            .iter()
+            .find(|element| {
+                element.role == "button"
+                    && element.name.first().map(|span| span.text.as_str()) == Some("Save")
+            })
+            .map(|element| element.node_id.clone())
+            .ok_or_else(|| std::io::Error::other("missing save button"))?;
+        assert!(save_node.0.starts_with("node:"));
+
+        driver
+            .evaluate_script(
+                "(() => { document.getElementById('save').id = 'renamed-save'; return true; })()",
+                false,
+            )
+            .await?;
+        let outcome = driver.act(&Action::Click { node: save_node }).await?;
+        assert!(matches!(outcome, StepOutcome::Applied { .. }));
+
+        let clicked = driver
+            .evaluate_script("Promise.resolve(document.body.dataset.clicked)", true)
+            .await?;
+        assert_eq!(clicked, serde_json::json!("yes"));
+        driver.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn live_cdp_driver_passes_conformance_v2() -> Result<(), Box<dyn std::error::Error>> {
         let Some(chrome) = std::env::var_os("TEMPO_CDP_CHROME") else {
             eprintln!("skipping live CDP conformance test; TEMPO_CDP_CHROME is unset");
             return Ok(());
         };
         let url = serve_fixture()?;
-        let config = CdpConfig::default().with_executable(chrome.to_string_lossy());
+        let config = CdpConfig::default()
+            .with_executable(chrome.to_string_lossy())
+            .with_no_sandbox_env_opt_in();
         let mut driver = CdpTempoDriver::launch_with(config)
             .await?
             .allow_private_network_access();
@@ -1740,8 +2039,8 @@ mod tests {
             .collect();
 
         let mut calls: Vec<String> = Vec::new();
-        enrich_elements(&mut elements, MAX_AX_ENRICHED_ELEMENTS, |selector| {
-            calls.push(selector);
+        enrich_elements(&mut elements, MAX_AX_ENRICHED_ELEMENTS, |node_id| {
+            calls.push(node_id.0);
             async move { Ok::<_, TransportError>(Some(enriched_summary())) }
         })
         .await?;
@@ -1786,7 +2085,7 @@ mod tests {
         enrich_elements(
             &mut elements,
             MAX_AX_ENRICHED_ELEMENTS,
-            |_selector: String| {
+            |_node_id: NodeId| {
                 calls += 1;
                 async move { Ok::<_, TransportError>(Some(enriched_summary())) }
             },

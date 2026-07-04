@@ -46,7 +46,9 @@ async fn cdp_driver_serves_commands_over_engine_host_uds() -> Result<(), Box<dyn
         },
     );
 
-    let config = CdpConfig::default().with_executable(chrome.to_string_lossy());
+    let config = CdpConfig::default()
+        .with_executable(chrome.to_string_lossy())
+        .with_no_sandbox_env_opt_in();
     let mut driver = CdpTempoDriver::launch_with(config)
         .await?
         .allow_private_network_access();
@@ -57,9 +59,15 @@ async fn cdp_driver_serves_commands_over_engine_host_uds() -> Result<(), Box<dyn
     match observed {
         DriverResponse::Observation { observation } => {
             assert_eq!(observation.schema_version, tempo_schema::SCHEMA_VERSION);
-            assert!(observation.elements.iter().any(|element| {
-                element.node_id == tempo_schema::NodeId("[id=\"save\"]".into())
-            }));
+            let save = observation
+                .elements
+                .iter()
+                .find(|element| {
+                    element.role == "button"
+                        && element.name.first().map(|span| span.text.as_str()) == Some("Save")
+                })
+                .ok_or_else(|| std::io::Error::other("missing save button"))?;
+            assert!(save.node_id.0.starts_with("node:"));
         }
         other => return Err(format!("unexpected driver response: {other:?}").into()),
     }
