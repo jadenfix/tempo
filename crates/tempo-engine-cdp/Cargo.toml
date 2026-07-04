@@ -16,7 +16,7 @@ tempo-driver = { path = "../tempo-driver" }
 tempo-engine-host = { path = "../tempo-engine-host" }
 tempo-net = { path = "../tempo-net" }
 tempo-observe = { path = "../tempo-observe" }
-tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "time"] }
 url = "2"
 
 [lints]

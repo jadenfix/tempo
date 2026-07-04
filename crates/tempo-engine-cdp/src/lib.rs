@@ -42,6 +42,8 @@ use tempo_schema::{
     Action, ActionBatch, CompiledObservation, InteractiveElement, NodeId, ObservationDiff,
     Provenance, QuiescencePolicy, TaintSpan,
 };
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener as TokioTcpListener, TcpStream};
 use tokio::task::JoinHandle;
 
 /// Maximum number of interactive elements that receive expensive per-element
@@ -57,6 +59,15 @@ use tokio::task::JoinHandle;
 /// so every element that actually survives into the marked observation is still
 /// enriched, while the long tail stays present but without an AX overlay.
 const MAX_AX_ENRICHED_ELEMENTS: usize = 16;
+const POLICY_PROXY_MAX_HEADER_BYTES: usize = 64 * 1024;
+const CDP_POLICY_PROXY_ARGS: [&str; 6] = [
+    "--host-resolver-rules",
+    "--no-proxy-server",
+    "--proxy-auto-detect",
+    "--proxy-bypass-list",
+    "--proxy-pac-url",
+    "--proxy-server",
+];
 
 /// Explicit opt-out for Chromium sandboxing in constrained CI/container setups.
 pub const TEMPO_CDP_NO_SANDBOX_ENV: &str = "TEMPO_CDP_NO_SANDBOX";
@@ -126,6 +137,19 @@ impl CdpConfig {
         }
         builder.build().map_err(TransportError::Other)
     }
+
+    fn validate_policy_proxy_args(&self) -> Result<(), TransportError> {
+        if let Some(arg) = self
+            .args
+            .iter()
+            .find(|arg| is_policy_proxy_arg(arg.as_str()))
+        {
+            return Err(TransportError::Other(format!(
+                "CDP launch arg {arg:?} conflicts with the mandatory policy proxy"
+            )));
+        }
+        Ok(())
+    }
 }
 
 impl Default for CdpConfig {
@@ -145,6 +169,7 @@ pub struct CdpTempoDriver {
     page: Option<Page>,
     handler_task: JoinHandle<()>,
     request_policy_task: Option<JoinHandle<()>>,
+    policy_proxy: Option<PolicyProxy>,
     browser_context_id: Option<BrowserContextId>,
     profile_dir: Option<tempfile::TempDir>,
     owns_browser: bool,
@@ -164,31 +189,58 @@ impl CdpTempoDriver {
 
     /// Launch a real browser with an explicit CDP configuration.
     pub async fn launch_with(config: CdpConfig) -> Result<Self, TransportError> {
+        config.validate_policy_proxy_args()?;
         let profile_dir = tempfile::Builder::new()
             .prefix("tempo-cdp-profile-")
             .tempdir()
             .map_err(|error| {
                 TransportError::Other(format!("failed to create private CDP profile: {error}"))
             })?;
+        let url_policy = Arc::new(Mutex::new(UrlPolicy::block_private()));
+        let blocked_request_url = Arc::new(Mutex::new(None));
+        let policy_proxy =
+            PolicyProxy::start(url_policy.clone(), blocked_request_url.clone()).await?;
+        let mut config = config;
+        config.args.extend([
+            format!("--proxy-server=http://{}", policy_proxy.addr),
+            "--proxy-bypass-list=<-loopback>".to_string(),
+            "--disable-quic".to_string(),
+            "--dns-prefetch-disable".to_string(),
+            "--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1".to_string(),
+        ]);
         let browser_config = config.browser_config(profile_dir.path())?;
-        let (browser, mut handler) = Browser::launch(browser_config)
+        let (mut browser, mut handler) = Browser::launch(browser_config)
             .await
             .map_err(map_cdp_error)?;
         let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
-        let page = browser
-            .new_page("about:blank")
-            .await
-            .map_err(map_cdp_error)?;
-        let url_policy = Arc::new(Mutex::new(UrlPolicy::block_private()));
-        let blocked_request_url = Arc::new(Mutex::new(None));
+        let page = match browser.new_page("about:blank").await {
+            Ok(page) => page,
+            Err(error) => {
+                let _ = browser.close().await;
+                let _ = browser.wait().await;
+                handler_task.abort();
+                return Err(map_cdp_error(error));
+            }
+        };
         let request_policy_task =
-            install_request_policy(&page, url_policy.clone(), blocked_request_url.clone()).await?;
+            match install_request_policy(&page, url_policy.clone(), blocked_request_url.clone())
+                .await
+            {
+                Ok(task) => task,
+                Err(error) => {
+                    let _ = browser.close().await;
+                    let _ = browser.wait().await;
+                    handler_task.abort();
+                    return Err(error);
+                }
+            };
 
         Ok(Self {
             browser,
             page: Some(page),
             handler_task,
             request_policy_task: Some(request_policy_task),
+            policy_proxy: Some(policy_proxy),
             browser_context_id: None,
             profile_dir: Some(profile_dir),
             owns_browser: true,
@@ -608,12 +660,21 @@ impl CdpTempoDriver {
     }
 }
 
+fn is_policy_proxy_arg(arg: &str) -> bool {
+    let name = arg
+        .split_once('=')
+        .map(|(name, _value)| name)
+        .unwrap_or(arg);
+    CDP_POLICY_PROXY_ARGS.contains(&name)
+}
+
 impl Drop for CdpTempoDriver {
     fn drop(&mut self) {
         self.handler_task.abort();
         if let Some(task) = self.request_policy_task.take() {
             task.abort();
         }
+        self.policy_proxy.take();
     }
 }
 
@@ -710,27 +771,59 @@ impl DriverTrait for CdpTempoDriver {
                     .build(),
             )
             .await
-            .map_err(|_error| Unsupported("fresh CDP browsing context"))?;
-        let page_params = CreateTargetParams::builder()
+            .map_err(|_error| {
+                handler_task.abort();
+                Unsupported("fresh CDP browsing context")
+            })?;
+        let page_params = match CreateTargetParams::builder()
             .url("about:blank")
             .browser_context_id(browser_context_id.clone())
             .build()
-            .map_err(|_error| Unsupported("fresh CDP browsing context"))?;
-        let page = browser
-            .new_page(page_params)
-            .await
-            .map_err(|_error| Unsupported("fresh CDP browsing context"))?;
+        {
+            Ok(params) => params,
+            Err(_error) => {
+                let _ = browser
+                    .dispose_browser_context(browser_context_id.clone())
+                    .await;
+                handler_task.abort();
+                return Err(Unsupported("fresh CDP browsing context"));
+            }
+        };
+        let page = match browser.new_page(page_params).await {
+            Ok(page) => page,
+            Err(_error) => {
+                let _ = browser
+                    .dispose_browser_context(browser_context_id.clone())
+                    .await;
+                handler_task.abort();
+                return Err(Unsupported("fresh CDP browsing context"));
+            }
+        };
         let blocked_request_url = Arc::new(Mutex::new(None));
-        let request_policy_task =
-            install_request_policy(&page, self.url_policy.clone(), blocked_request_url.clone())
-                .await
-                .map_err(|_error| Unsupported("fresh CDP browsing context"))?;
+        let request_policy_task = match install_request_policy(
+            &page,
+            self.url_policy.clone(),
+            blocked_request_url.clone(),
+        )
+        .await
+        {
+            Ok(task) => task,
+            Err(_error) => {
+                let _ = page.close().await;
+                let _ = browser
+                    .dispose_browser_context(browser_context_id.clone())
+                    .await;
+                handler_task.abort();
+                return Err(Unsupported("fresh CDP browsing context"));
+            }
+        };
 
         Ok(Box::new(Self {
             browser,
             page: Some(page),
             handler_task,
             request_policy_task: Some(request_policy_task),
+            policy_proxy: None,
             browser_context_id: Some(browser_context_id),
             profile_dir: None,
             owns_browser: false,
@@ -805,6 +898,7 @@ impl DriverTrait for CdpTempoDriver {
         if self.owns_browser {
             self.browser.close().await.map_err(map_cdp_error)?;
             let _ = self.browser.wait().await;
+            self.policy_proxy.take();
         } else {
             let page_result = if let Some(page) = self.page.take() {
                 page.close().await.map_err(map_cdp_error)
@@ -876,9 +970,7 @@ async fn install_request_policy(
                 Err(_error) => None,
             };
             let allowed = match policy {
-                Some(policy) => enforce_request_url_policy(&request_url, &policy)
-                    .await
-                    .is_ok(),
+                Some(policy) => enforce_url_policy(&request_url, &policy).is_ok(),
                 None => false,
             };
 
@@ -905,30 +997,284 @@ async fn install_request_policy(
     }))
 }
 
-async fn enforce_request_url_policy(url: &str, policy: &UrlPolicy) -> Result<(), TransportError> {
-    enforce_url_policy(url, policy)?;
-    if *policy == UrlPolicy::allow_all() {
-        return Ok(());
-    }
+struct PolicyProxy {
+    addr: SocketAddr,
+    task: JoinHandle<()>,
+}
 
-    let parsed = url::Url::parse(url).map_err(|_error| TransportError::UrlBlocked)?;
-    let host = parsed.host_str().ok_or(TransportError::UrlBlocked)?;
-    let port = parsed
-        .port_or_known_default()
-        .ok_or(TransportError::UrlBlocked)?;
-    let addrs = tokio::net::lookup_host((host, port))
-        .await
-        .map_err(|_error| TransportError::UrlBlocked)?;
-    let mut saw_addr = false;
-    for resolved_socket in addrs {
-        saw_addr = true;
-        enforce_url_policy_with_resolved_socket(url, policy, resolved_socket)?;
+impl PolicyProxy {
+    async fn start(
+        url_policy: Arc<Mutex<UrlPolicy>>,
+        blocked_request_url: Arc<Mutex<Option<String>>>,
+    ) -> Result<Self, TransportError> {
+        let listener = TokioTcpListener::bind(("127.0.0.1", 0))
+            .await
+            .map_err(|error| {
+                TransportError::Other(format!("failed to bind CDP policy proxy: {error}"))
+            })?;
+        let addr = listener.local_addr().map_err(|error| {
+            TransportError::Other(format!("failed to read CDP policy proxy address: {error}"))
+        })?;
+        let task = tokio::spawn(async move {
+            while let Ok((stream, _peer)) = listener.accept().await {
+                let url_policy = url_policy.clone();
+                let blocked_request_url = blocked_request_url.clone();
+                tokio::spawn(async move {
+                    handle_policy_proxy_connection(stream, url_policy, blocked_request_url).await;
+                });
+            }
+        });
+        Ok(Self { addr, task })
     }
-    if saw_addr {
-        Ok(())
+}
+
+impl Drop for PolicyProxy {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+struct ProxyRequest {
+    method: String,
+    target: String,
+    version: String,
+    headers: Vec<(String, String)>,
+    body_prefix: Vec<u8>,
+}
+
+async fn handle_policy_proxy_connection(
+    mut client: TcpStream,
+    url_policy: Arc<Mutex<UrlPolicy>>,
+    blocked_request_url: Arc<Mutex<Option<String>>>,
+) {
+    let request = match read_proxy_request(&mut client).await {
+        Some(request) => request,
+        None => {
+            let _ = write_proxy_response(&mut client, 400, "Bad Request").await;
+            return;
+        }
+    };
+    let policy = {
+        match url_policy.lock() {
+            Ok(policy) => Some(policy.clone()),
+            Err(_error) => None,
+        }
+    };
+    let Some(policy) = policy else {
+        let _ = write_proxy_response(&mut client, 403, "Forbidden").await;
+        return;
+    };
+
+    if request.method.eq_ignore_ascii_case("CONNECT") {
+        handle_connect_proxy_request(client, request, &policy, blocked_request_url).await;
     } else {
-        Err(TransportError::UrlBlocked)
+        handle_http_proxy_request(client, request, &policy, blocked_request_url).await;
     }
+}
+
+async fn read_proxy_request(client: &mut TcpStream) -> Option<ProxyRequest> {
+    let mut buffer = Vec::with_capacity(4096);
+    let header_end = loop {
+        if let Some(index) = find_header_end(&buffer) {
+            break index;
+        }
+        if buffer.len() >= POLICY_PROXY_MAX_HEADER_BYTES {
+            return None;
+        }
+        let mut chunk = [0_u8; 1024];
+        let read = client.read(&mut chunk).await.ok()?;
+        if read == 0 {
+            return None;
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+    };
+    let head = std::str::from_utf8(&buffer[..header_end]).ok()?;
+    let mut lines = head.split("\r\n");
+    let mut request_line = lines.next()?.split_whitespace();
+    let method = request_line.next()?.to_string();
+    let target = request_line.next()?.to_string();
+    let version = request_line.next()?.to_string();
+    if request_line.next().is_some() || !version.starts_with("HTTP/") {
+        return None;
+    }
+    let mut headers = Vec::new();
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        let (name, value) = line.split_once(':')?;
+        headers.push((name.trim().to_string(), value.trim().to_string()));
+    }
+    Some(ProxyRequest {
+        method,
+        target,
+        version,
+        headers,
+        body_prefix: buffer[header_end + 4..].to_vec(),
+    })
+}
+
+fn find_header_end(buffer: &[u8]) -> Option<usize> {
+    buffer.windows(4).position(|window| window == b"\r\n\r\n")
+}
+
+async fn handle_connect_proxy_request(
+    mut client: TcpStream,
+    request: ProxyRequest,
+    policy: &UrlPolicy,
+    blocked_request_url: Arc<Mutex<Option<String>>>,
+) {
+    let Some((policy_url, host, port)) = connect_target(&request.target) else {
+        let _ = write_proxy_response(&mut client, 400, "Bad Request").await;
+        return;
+    };
+    let mut upstream = match connect_policy_target(&policy_url, &host, port, policy).await {
+        Some(upstream) => upstream,
+        None => {
+            mark_proxy_blocked_request(&blocked_request_url, &policy_url);
+            let _ = write_proxy_response(&mut client, 403, "Forbidden").await;
+            return;
+        }
+    };
+    if client
+        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        .await
+        .is_err()
+    {
+        return;
+    }
+    let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+}
+
+async fn handle_http_proxy_request(
+    mut client: TcpStream,
+    request: ProxyRequest,
+    policy: &UrlPolicy,
+    blocked_request_url: Arc<Mutex<Option<String>>>,
+) {
+    let parsed = match url::Url::parse(&request.target) {
+        Ok(parsed) if parsed.scheme() == "http" => parsed,
+        _ => {
+            let _ = write_proxy_response(&mut client, 400, "Bad Request").await;
+            return;
+        }
+    };
+    let Some(host) = parsed.host_str().map(str::to_string) else {
+        let _ = write_proxy_response(&mut client, 400, "Bad Request").await;
+        return;
+    };
+    let Some(port) = parsed.port_or_known_default() else {
+        let _ = write_proxy_response(&mut client, 400, "Bad Request").await;
+        return;
+    };
+    let mut upstream = match connect_policy_target(parsed.as_str(), &host, port, policy).await {
+        Some(upstream) => upstream,
+        None => {
+            mark_proxy_blocked_request(&blocked_request_url, parsed.as_str());
+            let _ = write_proxy_response(&mut client, 403, "Forbidden").await;
+            return;
+        }
+    };
+    let origin_form = origin_form(&parsed);
+    let mut forwarded = format!("{} {} {}\r\n", request.method, origin_form, request.version);
+    let mut has_host = false;
+    for (name, value) in &request.headers {
+        let lower = name.to_ascii_lowercase();
+        if lower == "proxy-authorization" || lower == "proxy-connection" {
+            continue;
+        }
+        if lower == "host" {
+            has_host = true;
+        }
+        forwarded.push_str(name);
+        forwarded.push_str(": ");
+        forwarded.push_str(value);
+        forwarded.push_str("\r\n");
+    }
+    if !has_host {
+        forwarded.push_str("Host: ");
+        forwarded.push_str(parsed.host_str().unwrap_or_default());
+        if let Some(port) = parsed.port() {
+            forwarded.push(':');
+            forwarded.push_str(&port.to_string());
+        }
+        forwarded.push_str("\r\n");
+    }
+    forwarded.push_str("\r\n");
+    if upstream.write_all(forwarded.as_bytes()).await.is_err() {
+        let _ = write_proxy_response(&mut client, 502, "Bad Gateway").await;
+        return;
+    }
+    if !request.body_prefix.is_empty() && upstream.write_all(&request.body_prefix).await.is_err() {
+        return;
+    }
+    let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+}
+
+fn mark_proxy_blocked_request(blocked_request_url: &Arc<Mutex<Option<String>>>, url: &str) {
+    if let Ok(mut blocked) = blocked_request_url.lock() {
+        *blocked = Some(url.to_string());
+    }
+}
+
+fn connect_target(authority: &str) -> Option<(String, String, u16)> {
+    if authority.contains('/') || authority.contains('@') {
+        return None;
+    }
+    let policy_url = format!("https://{authority}/");
+    let parsed = url::Url::parse(&policy_url).ok()?;
+    let host = parsed.host_str()?.to_string();
+    let port = parsed.port_or_known_default()?;
+    Some((policy_url, host, port))
+}
+
+fn origin_form(parsed: &url::Url) -> String {
+    let mut path = parsed.path().to_string();
+    if path.is_empty() {
+        path.push('/');
+    }
+    if let Some(query) = parsed.query() {
+        path.push('?');
+        path.push_str(query);
+    }
+    path
+}
+
+async fn connect_policy_target(
+    url: &str,
+    host: &str,
+    port: u16,
+    policy: &UrlPolicy,
+) -> Option<TcpStream> {
+    enforce_url_policy(url, policy).ok()?;
+    let mut addrs = tokio::net::lookup_host((host, port))
+        .await
+        .ok()?
+        .collect::<Vec<_>>();
+    if addrs.is_empty() {
+        return None;
+    }
+    addrs.sort_unstable();
+    addrs.dedup();
+    for resolved_socket in &addrs {
+        enforce_url_policy_with_resolved_socket(url, policy, *resolved_socket).ok()?;
+    }
+    for resolved_socket in addrs {
+        if let Ok(stream) = TcpStream::connect(resolved_socket).await {
+            return Some(stream);
+        }
+    }
+    None
+}
+
+async fn write_proxy_response(
+    client: &mut TcpStream,
+    status: u16,
+    reason: &str,
+) -> Result<(), std::io::Error> {
+    let response =
+        format!("HTTP/1.1 {status} {reason}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    client.write_all(response.as_bytes()).await
 }
 
 fn enforce_url_policy_with_resolved_socket(
@@ -1727,6 +2073,7 @@ mod tests {
     use chromiumoxide::cdp::browser_protocol::dom::BackendNodeId;
     use std::io::Write;
     use std::net::{SocketAddr, TcpListener};
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     #[test]
     fn extracts_selector_backed_interactive_elements_from_real_dom_html() {
@@ -2083,7 +2430,34 @@ mod tests {
     }
 
     #[test]
-    fn blocks_public_hostname_when_resolved_socket_is_private() {
+    fn rejects_launch_args_that_bypass_the_policy_proxy() {
+        for arg in [
+            "--proxy-server=http://proxy.example",
+            "--proxy-server",
+            "--no-proxy-server",
+            "--proxy-pac-url=http://proxy.example/proxy.pac",
+            "--proxy-auto-detect",
+            "--proxy-bypass-list=*",
+            "--host-resolver-rules=MAP * 127.0.0.1",
+        ] {
+            let config = CdpConfig::default().with_arg(arg);
+            assert!(
+                matches!(
+                    config.validate_policy_proxy_args(),
+                    Err(TransportError::Other(_))
+                ),
+                "expected proxy arg rejection for {arg}"
+            );
+        }
+        assert!(CdpConfig::default()
+            .with_arg("--user-agent=tempo-test")
+            .validate_policy_proxy_args()
+            .is_ok());
+    }
+
+    #[test]
+    fn blocks_public_hostname_when_resolved_socket_is_private(
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let policy = UrlPolicy::block_private();
         let loopback = SocketAddr::from(([127, 0, 0, 1], 443));
         let public = SocketAddr::from(([93, 184, 216, 34], 443));
@@ -2104,6 +2478,115 @@ mod tests {
             loopback,
         )
         .is_ok());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn policy_proxy_blocks_private_connect_before_origin_socket(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let origin = TokioTcpListener::bind(("127.0.0.1", 0)).await?;
+        let origin_addr = origin.local_addr()?;
+        let accepted = Arc::new(AtomicBool::new(false));
+        let accepted_probe = accepted.clone();
+        let accept_task = tokio::spawn(async move {
+            if let Ok(Ok((_stream, _peer))) =
+                tokio::time::timeout(Duration::from_millis(150), origin.accept()).await
+            {
+                accepted_probe.store(true, Ordering::SeqCst);
+            }
+        });
+
+        let blocked_request_url = Arc::new(Mutex::new(None));
+        let proxy = PolicyProxy::start(
+            Arc::new(Mutex::new(UrlPolicy::block_private())),
+            blocked_request_url.clone(),
+        )
+        .await?;
+        let mut client = TcpStream::connect(proxy.addr).await?;
+        let request = format!("CONNECT {origin_addr} HTTP/1.1\r\nHost: {origin_addr}\r\n\r\n");
+        client.write_all(request.as_bytes()).await?;
+        let mut response = [0_u8; 128];
+        let read = client.read(&mut response).await?;
+        let response = std::str::from_utf8(&response[..read])?;
+        let expected_blocked_url = format!("https://{origin_addr}/");
+
+        assert!(response.starts_with("HTTP/1.1 403 Forbidden"));
+        assert_eq!(
+            blocked_request_url
+                .lock()
+                .map_err(|_error| std::io::Error::other("blocked URL lock poisoned"))?
+                .as_deref(),
+            Some(expected_blocked_url.as_str())
+        );
+        accept_task.await?;
+        assert!(!accepted.load(Ordering::SeqCst));
+        drop(proxy);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn policy_proxy_marks_http_socket_blocks_for_navigation_mapping(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let origin = TokioTcpListener::bind(("127.0.0.1", 0)).await?;
+        let origin_addr = origin.local_addr()?;
+        let blocked_request_url = Arc::new(Mutex::new(None));
+        let proxy = PolicyProxy::start(
+            Arc::new(Mutex::new(UrlPolicy::block_private())),
+            blocked_request_url.clone(),
+        )
+        .await?;
+        let mut client = TcpStream::connect(proxy.addr).await?;
+        let request = format!(
+            "GET http://{origin_addr}/blocked HTTP/1.1\r\nHost: {origin_addr}\r\nConnection: close\r\n\r\n"
+        );
+        client.write_all(request.as_bytes()).await?;
+        let mut response = [0_u8; 128];
+        let read = client.read(&mut response).await?;
+        let response = std::str::from_utf8(&response[..read])?;
+        let expected_blocked_url = format!("http://{origin_addr}/blocked");
+
+        assert!(response.starts_with("HTTP/1.1 403 Forbidden"));
+        assert_eq!(
+            blocked_request_url
+                .lock()
+                .map_err(|_error| std::io::Error::other("blocked URL lock poisoned"))?
+                .as_deref(),
+            Some(expected_blocked_url.as_str())
+        );
+        drop(proxy);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_cdp_default_blocks_private_fixture_before_origin_socket(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(chrome) = std::env::var_os("TEMPO_CDP_CHROME") else {
+            eprintln!("skipping live CDP default private block test; TEMPO_CDP_CHROME is unset");
+            return Ok(());
+        };
+        let origin = TokioTcpListener::bind(("127.0.0.1", 0)).await?;
+        let url = format!("http://{}/", origin.local_addr()?);
+        let accepted = Arc::new(AtomicBool::new(false));
+        let accepted_probe = accepted.clone();
+        let accept_task = tokio::spawn(async move {
+            if let Ok(Ok((_stream, _peer))) =
+                tokio::time::timeout(Duration::from_millis(300), origin.accept()).await
+            {
+                accepted_probe.store(true, Ordering::SeqCst);
+            }
+        });
+
+        let config = CdpConfig::default()
+            .with_executable(chrome.to_string_lossy())
+            .with_no_sandbox_env_opt_in();
+        let mut driver = CdpTempoDriver::launch_with(config).await?;
+        let result = driver.goto(&url).await;
+
+        assert!(matches!(result, Err(TransportError::UrlBlocked)));
+        accept_task.await?;
+        assert!(!accepted.load(Ordering::SeqCst));
+        driver.close().await?;
+        Ok(())
     }
 
     #[tokio::test]
