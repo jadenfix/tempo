@@ -41,11 +41,13 @@ Commands:
 
 Options:
   --tempod ADDR   tempod address, default 127.0.0.1:8787
+  --auth-token TOKEN
 ";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShellOptions {
     pub tempod_addr: String,
+    pub auth_token: Option<String>,
     pub command: ShellCommand,
 }
 
@@ -55,8 +57,20 @@ impl ShellOptions {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
+        Self::parse_with_env(
+            args,
+            std::env::var(tempo_headless::TEMPO_TEMPOD_AUTH_TOKEN_ENV).ok(),
+        )
+    }
+
+    fn parse_with_env<I, S>(args: I, env_auth_token: Option<String>) -> Result<Self, ShellError>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
         let args = args.into_iter().map(Into::into).collect::<Vec<_>>();
         let mut tempod_addr = DEFAULT_TEMPOD_ADDR.to_string();
+        let mut auth_token = env_auth_token.filter(|token| !token.is_empty());
         let mut index = 0;
 
         while index < args.len() {
@@ -69,9 +83,20 @@ impl ShellOptions {
                         .clone();
                     index += 1;
                 }
+                "--auth-token" => {
+                    index += 1;
+                    let token = args
+                        .get(index)
+                        .ok_or_else(|| ShellError::Usage("--auth-token requires TOKEN".into()))?
+                        .clone();
+                    validate_auth_token(&token)?;
+                    auth_token = Some(token);
+                    index += 1;
+                }
                 "-h" | "--help" | "help" => {
                     return Ok(Self {
                         tempod_addr,
+                        auth_token,
                         command: ShellCommand::Help,
                     });
                 }
@@ -82,6 +107,7 @@ impl ShellOptions {
         let command = parse_command(&args[index..])?;
         Ok(Self {
             tempod_addr,
+            auth_token,
             command,
         })
     }
@@ -148,13 +174,14 @@ where
     S: Into<String>,
 {
     let options = ShellOptions::parse(args)?;
-    let client = ShellClient::new(options.tempod_addr);
+    let client = ShellClient::new(options.tempod_addr).with_optional_auth_token(options.auth_token);
     options.command.execute(&client, stdout)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShellClient {
     tempod_addr: String,
+    auth_token: Option<String>,
     timeout: Duration,
     max_response_bytes: usize,
     max_mcp_response_bytes: usize,
@@ -164,10 +191,21 @@ impl ShellClient {
     pub fn new(tempod_addr: impl Into<String>) -> Self {
         Self {
             tempod_addr: tempod_addr.into(),
+            auth_token: None,
             timeout: Duration::from_secs(5),
             max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
             max_mcp_response_bytes: DEFAULT_MAX_MCP_RESPONSE_BYTES,
         }
+    }
+
+    pub fn with_auth_token(mut self, auth_token: impl Into<String>) -> Self {
+        self.auth_token = Some(auth_token.into());
+        self
+    }
+
+    fn with_optional_auth_token(mut self, auth_token: Option<String>) -> Self {
+        self.auth_token = auth_token;
+        self
     }
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
@@ -307,11 +345,18 @@ impl ShellClient {
         let mut stream = TcpStream::connect(&self.tempod_addr)?;
         stream.set_read_timeout(Some(self.timeout))?;
         stream.set_write_timeout(Some(self.timeout))?;
-        let request = format!(
-            "{method} {path} HTTP/1.1\r\nhost: {}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        let mut request = format!(
+            "{method} {path} HTTP/1.1\r\nhost: {}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n",
             self.tempod_addr,
             body.len()
         );
+        if let Some(auth_token) = &self.auth_token {
+            validate_auth_token(auth_token)?;
+            request.push_str("authorization: Bearer ");
+            request.push_str(auth_token);
+            request.push_str("\r\n");
+        }
+        request.push_str("connection: close\r\n\r\n");
         stream.write_all(request.as_bytes())?;
         stream.write_all(body)?;
         stream.shutdown(std::net::Shutdown::Write)?;
@@ -636,6 +681,22 @@ fn safe_path_segment(segment: &str) -> Result<&str, ShellError> {
     }
 }
 
+fn validate_auth_token(token: &str) -> Result<(), ShellError> {
+    if token.is_empty() {
+        return Err(ShellError::Usage("auth token is required".into()));
+    }
+    if token.trim() != token
+        || token
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+    {
+        return Err(ShellError::Usage(
+            "auth token must not contain whitespace or control characters".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn write_json<T: Serialize>(stdout: &mut dyn Write, value: &T) -> Result<(), ShellError> {
     serde_json::to_writer_pretty(&mut *stdout, value)?;
     stdout.write_all(b"\n")?;
@@ -693,7 +754,8 @@ mod tests {
         serve_driver_connection, EngineHostError, EngineIpcClient, EngineIpcConnection,
     };
     use tempo_headless::{
-        serve_one, SessionPool, TempodError, TempodSessionEventKind, TempodSessionState,
+        serve_one, serve_one_with_auth, SessionPool, TempodAuth, TempodError,
+        TempodSessionEventKind, TempodSessionState,
     };
 
     type TestResult = Result<(), Box<dyn Error>>;
@@ -710,6 +772,19 @@ mod tests {
                 url: "https://example.com".into()
             }
         );
+        Ok(())
+    }
+
+    #[test]
+    fn parses_auth_token_option_and_env_default() -> TestResult {
+        let from_option = ShellOptions::parse_with_env(
+            ["--auth-token", "cli-token", "sessions"],
+            Some("env-token".into()),
+        )?;
+        assert_eq!(from_option.auth_token.as_deref(), Some("cli-token"));
+
+        let from_env = ShellOptions::parse_with_env(["sessions"], Some("env-token".into()))?;
+        assert_eq!(from_env.auth_token.as_deref(), Some("env-token"));
         Ok(())
     }
 
@@ -839,6 +914,22 @@ mod tests {
         let drained = with_tempod(&pool, |addr| ShellClient::new(addr.to_string()).drain())?;
         assert!(drained.draining);
         assert_eq!(drained.sessions[0].state, TempodSessionState::Killed);
+        Ok(())
+    }
+
+    #[test]
+    fn client_sends_auth_token_to_real_tempod() -> TestResult {
+        let pool = Arc::new(Mutex::new(SessionPool::default()));
+        let auth = TempodAuth::bearer("secret-token")?;
+
+        let opened = with_tempod_auth(&pool, auth, |addr| {
+            ShellClient::new(addr.to_string())
+                .with_auth_token("secret-token")
+                .open("https://auth.test")
+        })?;
+
+        assert_eq!(opened.id.0, "session-0");
+        assert_eq!(opened.url, "https://auth.test");
         Ok(())
     }
 
@@ -1189,6 +1280,23 @@ mod tests {
         let addr = listener.local_addr()?;
         let server_pool = Arc::clone(pool);
         let handle = thread::spawn(move || serve_one(listener, server_pool));
+        let result = call(addr);
+        join_server(handle)?;
+        Ok(result?)
+    }
+
+    fn with_tempod_auth<T, F>(
+        pool: &Arc<Mutex<SessionPool>>,
+        auth: TempodAuth,
+        call: F,
+    ) -> Result<T, Box<dyn Error>>
+    where
+        F: FnOnce(SocketAddr) -> Result<T, ShellError>,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let server_pool = Arc::clone(pool);
+        let handle = thread::spawn(move || serve_one_with_auth(listener, server_pool, auth));
         let result = call(addr);
         join_server(handle)?;
         Ok(result?)

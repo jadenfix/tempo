@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -101,11 +101,99 @@ const WS_OPCODE_PONG: u8 = 0xA;
 const HTTP_CONNECTION_LIMIT_MESSAGE: &str = "too many active tempod HTTP connections";
 const WEBSOCKET_CONNECTION_LIMIT_MESSAGE: &str = "too many active tempod WebSocket connections";
 pub const TEMPO_OTLP_JSONL_ENV: &str = "TEMPO_OTLP_JSONL";
+pub const TEMPO_TEMPOD_AUTH_TOKEN_ENV: &str = "TEMPO_TEMPOD_AUTH_TOKEN";
 /// Constant marker written in place of any secret-bearing field in OTLP
 /// telemetry (issue #214 review). A constant — never a hash, length, or prefix
 /// of the secret — so low-entropy secrets (PINs, OTPs, common passwords/tokens)
 /// cannot be recovered by an offline dictionary search of the exported value.
 const REDACTED_MARKER: &str = "[redacted]";
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TempodAuth {
+    bearer_token: Option<String>,
+}
+
+impl TempodAuth {
+    pub fn disabled() -> Self {
+        Self { bearer_token: None }
+    }
+
+    pub fn bearer(token: impl Into<String>) -> Result<Self, TempodError> {
+        let token = token.into();
+        validate_bearer_token(&token)?;
+        Ok(Self {
+            bearer_token: Some(token),
+        })
+    }
+
+    pub fn is_required(&self) -> bool {
+        self.bearer_token.is_some()
+    }
+
+    fn authorize(&self, request: &HttpRequest) -> Result<(), TempodError> {
+        let Some(expected) = &self.bearer_token else {
+            return Ok(());
+        };
+        let Some(header) = request.header("authorization") else {
+            return Err(TempodError::Unauthorized("missing bearer token".into()));
+        };
+        let Some(actual) = authorization_bearer_token(header) else {
+            return Err(TempodError::Unauthorized("invalid bearer token".into()));
+        };
+        if constant_time_eq(actual.as_bytes(), expected.as_bytes()) {
+            Ok(())
+        } else {
+            Err(TempodError::Unauthorized("invalid bearer token".into()))
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TempodServerConfig {
+    allow_remote_binds: bool,
+    auth: TempodAuth,
+}
+
+impl TempodServerConfig {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn allow_remote_binds(mut self) -> Self {
+        self.allow_remote_binds = true;
+        self
+    }
+
+    pub fn with_auth(mut self, auth: TempodAuth) -> Self {
+        self.auth = auth;
+        self
+    }
+
+    fn validate_bind_addr(&self, addr: &str) -> Result<(), TempodError> {
+        if bind_addr_is_loopback(addr)? {
+            return Ok(());
+        }
+        if self.allow_remote_binds && self.auth.is_required() {
+            return Ok(());
+        }
+        Err(TempodError::BadRequest(format!(
+            "non-loopback tempod bind {addr:?} requires --allow-remote and {TEMPO_TEMPOD_AUTH_TOKEN_ENV} or --auth-token"
+        )))
+    }
+
+    fn validate_listener(&self, listener: &TcpListener) -> Result<(), TempodError> {
+        let addr = listener.local_addr()?;
+        if addr.ip().is_loopback() {
+            return Ok(());
+        }
+        if self.allow_remote_binds && self.auth.is_required() {
+            return Ok(());
+        }
+        Err(TempodError::BadRequest(format!(
+            "non-loopback tempod listener {addr:?} requires allow_remote_binds() and TempodAuth::bearer(...)"
+        )))
+    }
+}
 
 /// Stable tempod session id.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -1356,9 +1444,14 @@ fn redact_goto_url(url: &str) -> serde_json::Value {
 
 /// Run tempod forever on an address such as `127.0.0.1:8787`.
 pub fn run_tempod(addr: &str) -> Result<(), TempodError> {
+    run_tempod_with_config(addr, TempodServerConfig::default())
+}
+
+pub fn run_tempod_with_config(addr: &str, config: TempodServerConfig) -> Result<(), TempodError> {
+    config.validate_bind_addr(addr)?;
     let listener = TcpListener::bind(addr)?;
     let pool = Arc::new(Mutex::new(SessionPool::from_env()));
-    serve_forever(listener, pool)
+    serve_forever_with_config(listener, pool, config)
 }
 
 /// Run tempod with an already-running engine reachable through the UDS driver protocol.
@@ -1367,10 +1460,20 @@ pub fn run_tempod_with_attached_driver(
     engine: Engine,
     socket_path: impl AsRef<Path>,
 ) -> Result<(), TempodError> {
+    run_tempod_with_attached_driver_config(addr, TempodServerConfig::default(), engine, socket_path)
+}
+
+pub fn run_tempod_with_attached_driver_config(
+    addr: &str,
+    config: TempodServerConfig,
+    engine: Engine,
+    socket_path: impl AsRef<Path>,
+) -> Result<(), TempodError> {
+    config.validate_bind_addr(addr)?;
     let listener = TcpListener::bind(addr)?;
     let mut pool = SessionPool::from_env();
     pool.attach_engine_driver(engine, connect_engine_ipc(socket_path)?);
-    serve_forever(listener, Arc::new(Mutex::new(pool)))
+    serve_forever_with_config(listener, Arc::new(Mutex::new(pool)), config)
 }
 
 /// Connect to the engine host UDS and apply an IPC read/write timeout so a
@@ -1481,12 +1584,39 @@ pub fn serve_forever(
     listener: TcpListener,
     pool: Arc<Mutex<SessionPool>>,
 ) -> Result<(), TempodError> {
-    serve_forever_with_limits(listener, pool, ConnectionLimiter::default())
+    serve_forever_with_config(listener, pool, TempodServerConfig::default())
 }
 
+pub fn serve_forever_with_auth(
+    listener: TcpListener,
+    pool: Arc<Mutex<SessionPool>>,
+    auth: TempodAuth,
+) -> Result<(), TempodError> {
+    serve_forever_with_config(listener, pool, TempodServerConfig::new().with_auth(auth))
+}
+
+pub fn serve_forever_with_config(
+    listener: TcpListener,
+    pool: Arc<Mutex<SessionPool>>,
+    config: TempodServerConfig,
+) -> Result<(), TempodError> {
+    config.validate_listener(&listener)?;
+    serve_forever_trusted(listener, pool, config.auth, ConnectionLimiter::default())
+}
+
+#[cfg(test)]
 fn serve_forever_with_limits(
     listener: TcpListener,
     pool: Arc<Mutex<SessionPool>>,
+    limiter: ConnectionLimiter,
+) -> Result<(), TempodError> {
+    serve_forever_trusted(listener, pool, TempodAuth::disabled(), limiter)
+}
+
+fn serve_forever_trusted(
+    listener: TcpListener,
+    pool: Arc<Mutex<SessionPool>>,
+    auth: TempodAuth,
     limiter: ConnectionLimiter,
 ) -> Result<(), TempodError> {
     for stream in listener.incoming() {
@@ -1498,8 +1628,10 @@ fn serve_forever_with_limits(
                 };
                 let pool = Arc::clone(&pool);
                 let limiter = limiter.clone();
+                let auth = auth.clone();
                 thread::spawn(move || {
-                    if let Err(err) = handle_connection(stream, &pool, &limiter, http_permit) {
+                    if let Err(err) = handle_connection(stream, &pool, &auth, &limiter, http_permit)
+                    {
                         log_connection_error(&err);
                     }
                 });
@@ -1515,12 +1647,30 @@ fn serve_forever_with_limits(
 
 /// Serve exactly one HTTP request. Tests use this against a real TCP listener.
 pub fn serve_one(listener: TcpListener, pool: Arc<Mutex<SessionPool>>) -> Result<(), TempodError> {
-    serve_one_with_limits(listener, pool, ConnectionLimiter::default())
+    serve_one_with_config(listener, pool, TempodServerConfig::default())
 }
 
-fn serve_one_with_limits(
+pub fn serve_one_with_auth(
     listener: TcpListener,
     pool: Arc<Mutex<SessionPool>>,
+    auth: TempodAuth,
+) -> Result<(), TempodError> {
+    serve_one_with_config(listener, pool, TempodServerConfig::new().with_auth(auth))
+}
+
+pub fn serve_one_with_config(
+    listener: TcpListener,
+    pool: Arc<Mutex<SessionPool>>,
+    config: TempodServerConfig,
+) -> Result<(), TempodError> {
+    config.validate_listener(&listener)?;
+    serve_one_trusted(listener, pool, config.auth, ConnectionLimiter::default())
+}
+
+fn serve_one_trusted(
+    listener: TcpListener,
+    pool: Arc<Mutex<SessionPool>>,
+    auth: TempodAuth,
     limiter: ConnectionLimiter,
 ) -> Result<(), TempodError> {
     let (stream, _addr) = listener.accept()?;
@@ -1530,7 +1680,7 @@ fn serve_one_with_limits(
             HTTP_CONNECTION_LIMIT_MESSAGE.into(),
         ));
     };
-    handle_connection(stream, &pool, &limiter, http_permit)
+    handle_connection(stream, &pool, &auth, &limiter, http_permit)
 }
 
 /// Apply per-connection socket timeouts, then handle the connection. Timeouts
@@ -1538,11 +1688,12 @@ fn serve_one_with_limits(
 fn handle_connection(
     stream: TcpStream,
     pool: &Arc<Mutex<SessionPool>>,
+    auth: &TempodAuth,
     limiter: &ConnectionLimiter,
     http_permit: ConnectionPermit,
 ) -> Result<(), TempodError> {
     apply_socket_timeouts(&stream)?;
-    handle_stream(stream, pool, limiter, http_permit)
+    handle_stream(stream, pool, auth, limiter, http_permit)
 }
 
 /// Apply read and write timeouts to an accepted connection. A stalled client
@@ -1561,6 +1712,7 @@ fn log_connection_error(err: &TempodError) {
 fn handle_stream(
     mut stream: TcpStream,
     pool: &Arc<Mutex<SessionPool>>,
+    auth: &TempodAuth,
     limiter: &ConnectionLimiter,
     http_permit: ConnectionPermit,
 ) -> Result<(), TempodError> {
@@ -1582,7 +1734,7 @@ fn handle_stream(
             return Ok(());
         }
     };
-    match websocket_upgrade_key(&request) {
+    match websocket_upgrade_key_with_auth(&request, auth) {
         Ok(Some(key)) => {
             let Some(websocket_permit) = limiter.try_acquire_websocket() else {
                 let response = tempod_error_response(&TempodError::ConnectionLimit(
@@ -1612,7 +1764,7 @@ fn handle_stream(
     }
     let response = {
         let mut pool = pool.lock().map_err(|_| TempodError::PoolLock)?;
-        handle_http_request(&mut pool, request)
+        handle_http_request_with_auth(&mut pool, request, auth)
     };
     stream.write_all(response.to_bytes().as_slice())?;
     stream.flush()?;
@@ -1628,17 +1780,38 @@ fn tempod_error_response(err: &TempodError) -> HttpResponse {
     )
 }
 
+#[cfg(test)]
 fn handle_http_request(pool: &mut SessionPool, request: HttpRequest) -> HttpResponse {
-    match route_http_request(pool, request) {
+    handle_http_request_with_auth(pool, request, &TempodAuth::disabled())
+}
+
+fn handle_http_request_with_auth(
+    pool: &mut SessionPool,
+    request: HttpRequest,
+    auth: &TempodAuth,
+) -> HttpResponse {
+    match route_http_request_with_auth(pool, request, auth) {
         Ok(response) => response,
         Err(err) => tempod_error_response(&err),
     }
 }
 
+#[cfg(test)]
 fn route_http_request(
     pool: &mut SessionPool,
     request: HttpRequest,
 ) -> Result<HttpResponse, TempodError> {
+    route_http_request_with_auth(pool, request, &TempodAuth::disabled())
+}
+
+fn route_http_request_with_auth(
+    pool: &mut SessionPool,
+    request: HttpRequest,
+    auth: &TempodAuth,
+) -> Result<HttpResponse, TempodError> {
+    if route_requires_auth(&request.method, &request.path) {
+        auth.authorize(&request)?;
+    }
     // DNS-rebinding defence (issue #83 follow-up): the session/control-plane
     // routes mutate or expose browser state, so they get the same loopback-Origin
     // guard already applied to /mcp and /bidi. Without this a malicious page could
@@ -1743,7 +1916,15 @@ fn after_seq(query: Option<&str>) -> Result<Option<u64>, TempodError> {
     Ok(None)
 }
 
+#[cfg(test)]
 fn websocket_upgrade_key(request: &HttpRequest) -> Result<Option<String>, TempodError> {
+    websocket_upgrade_key_with_auth(request, &TempodAuth::disabled())
+}
+
+fn websocket_upgrade_key_with_auth(
+    request: &HttpRequest,
+    auth: &TempodAuth,
+) -> Result<Option<String>, TempodError> {
     if request.method != "GET" || request.path != "/bidi" {
         return Ok(None);
     }
@@ -1758,6 +1939,7 @@ fn websocket_upgrade_key(request: &HttpRequest) -> Result<Option<String>, Tempod
     if !upgrade && !connection_upgrade && request.header("sec-websocket-key").is_none() {
         return Ok(None);
     }
+    auth.authorize(request)?;
     if !upgrade || !connection_upgrade {
         return Err(TempodError::BadRequest(
             "WebSocket upgrade requires Upgrade: websocket and Connection: Upgrade".into(),
@@ -1812,6 +1994,67 @@ fn control_route_requires_origin_check(method: &str, path: &str) -> bool {
             | ("GET", "/bidi")
             | ("POST", "/bidi")
     )
+}
+
+fn route_requires_auth(method: &str, path: &str) -> bool {
+    matches!(
+        (method, path),
+        ("GET", "/mcp") | ("POST", "/mcp") | ("GET", "/bidi") | ("POST", "/bidi")
+    ) || control_route_requires_origin_check(method, path)
+}
+
+fn bind_addr_is_loopback(addr: &str) -> Result<bool, TempodError> {
+    let addrs = addr.to_socket_addrs()?;
+    let mut saw_addr = false;
+    for addr in addrs {
+        saw_addr = true;
+        if !addr.ip().is_loopback() {
+            return Ok(false);
+        }
+    }
+    if saw_addr {
+        Ok(true)
+    } else {
+        Err(TempodError::BadRequest(
+            "bind address did not resolve".into(),
+        ))
+    }
+}
+
+fn validate_bearer_token(token: &str) -> Result<(), TempodError> {
+    if token.is_empty() {
+        return Err(TempodError::BadRequest("auth token is required".into()));
+    }
+    if token.trim() != token
+        || token
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+    {
+        return Err(TempodError::BadRequest(
+            "auth token must not contain whitespace or control characters".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn authorization_bearer_token(header: &str) -> Option<&str> {
+    let (scheme, token) = header.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("bearer") || token.trim() != token {
+        return None;
+    }
+    validate_bearer_token(token).ok()?;
+    Some(token)
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    let max_len = left.len().max(right.len());
+    let mut diff = left.len() ^ right.len();
+    for index in 0..max_len {
+        let left_byte = left.get(index).copied().unwrap_or(0);
+        let right_byte = right.get(index).copied().unwrap_or(0);
+        diff |= usize::from(left_byte ^ right_byte);
+    }
+    diff == 0
 }
 
 fn header_has_token(value: &str, token: &str) -> bool {
@@ -2664,6 +2907,7 @@ impl HttpResponse {
         let reason = match self.status {
             200 => "OK",
             201 => "Created",
+            401 => "Unauthorized",
             400 => "Bad Request",
             403 => "Forbidden",
             404 => "Not Found",
@@ -2692,6 +2936,8 @@ pub enum TempodError {
     Json(#[from] serde_json::Error),
     #[error("bad request: {0}")]
     BadRequest(String),
+    #[error("unauthorized: {0}")]
+    Unauthorized(String),
     #[error("forbidden: {0}")]
     Forbidden(String),
     #[error("connection limit reached: {0}")]
@@ -2714,6 +2960,7 @@ impl TempodError {
     fn status(&self) -> u16 {
         match self {
             Self::BadRequest(_) => 400,
+            Self::Unauthorized(_) => 401,
             Self::Forbidden(_) => 403,
             Self::SessionNotFound(_) | Self::EngineNotFound(_) => 404,
             Self::Draining | Self::ConnectionLimit(_) => 503,
@@ -5844,6 +6091,36 @@ mod tests {
         }
     }
 
+    fn with_bearer(mut request: HttpRequest, token: &str) -> HttpRequest {
+        request
+            .headers
+            .insert("authorization".into(), format!("Bearer {token}"));
+        request
+    }
+
+    fn bidi_websocket_request(token: Option<&str>) -> HttpRequest {
+        let mut request = HttpRequest {
+            method: "GET".into(),
+            path: "/bidi".into(),
+            headers: BTreeMap::from([
+                ("upgrade".into(), "websocket".into()),
+                ("connection".into(), "Upgrade".into()),
+                ("sec-websocket-version".into(), "13".into()),
+                (
+                    "sec-websocket-key".into(),
+                    "dGhlIHNhbXBsZSBub25jZQ==".into(),
+                ),
+            ]),
+            host: None,
+            origin: None,
+            body: Vec::new(),
+        };
+        if let Some(token) = token {
+            request = with_bearer(request, token);
+        }
+        request
+    }
+
     #[test]
     fn control_routes_reject_cross_origin_requests() -> TestResult {
         // #83 follow-up: session/control-plane routes must share the loopback
@@ -5904,6 +6181,198 @@ mod tests {
             ),
         );
         assert_eq!(loopback.status, 201);
+        Ok(())
+    }
+
+    // ---- Issue #256: capability auth for non-loopback tempod binds ----
+
+    #[test]
+    fn non_loopback_bind_requires_remote_flag_and_auth_token() -> TestResult {
+        assert!(TempodServerConfig::new()
+            .validate_bind_addr("127.0.0.1:8787")
+            .is_ok());
+
+        assert!(matches!(
+            TempodServerConfig::new().validate_bind_addr("0.0.0.0:8787"),
+            Err(TempodError::BadRequest(_))
+        ));
+        assert!(matches!(
+            TempodServerConfig::new()
+                .allow_remote_binds()
+                .validate_bind_addr("0.0.0.0:8787"),
+            Err(TempodError::BadRequest(_))
+        ));
+        assert!(matches!(
+            TempodServerConfig::new()
+                .with_auth(TempodAuth::bearer("secret-token")?)
+                .validate_bind_addr("0.0.0.0:8787"),
+            Err(TempodError::BadRequest(_))
+        ));
+        assert!(TempodServerConfig::new()
+            .allow_remote_binds()
+            .with_auth(TempodAuth::bearer("secret-token")?)
+            .validate_bind_addr("0.0.0.0:8787")
+            .is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn listener_apis_reject_non_loopback_without_remote_policy() -> TestResult {
+        let pool = Arc::new(Mutex::new(SessionPool::default()));
+
+        let listener = TcpListener::bind("0.0.0.0:0")?;
+        assert!(matches!(
+            serve_forever(listener, Arc::clone(&pool)),
+            Err(TempodError::BadRequest(_))
+        ));
+
+        let listener = TcpListener::bind("0.0.0.0:0")?;
+        assert!(matches!(
+            serve_forever_with_auth(
+                listener,
+                Arc::clone(&pool),
+                TempodAuth::bearer("secret-token")?
+            ),
+            Err(TempodError::BadRequest(_))
+        ));
+
+        let listener = TcpListener::bind("0.0.0.0:0")?;
+        assert!(matches!(
+            serve_one(listener, Arc::clone(&pool)),
+            Err(TempodError::BadRequest(_))
+        ));
+
+        let listener = TcpListener::bind("0.0.0.0:0")?;
+        assert!(matches!(
+            serve_one_with_config(
+                listener,
+                pool,
+                TempodServerConfig::new().allow_remote_binds()
+            ),
+            Err(TempodError::BadRequest(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn listener_config_allows_non_loopback_with_remote_flag_and_auth() -> TestResult {
+        let listener = TcpListener::bind("0.0.0.0:0")?;
+        let connect_addr =
+            std::net::SocketAddr::from(([127, 0, 0, 1], listener.local_addr()?.port()));
+        let pool = Arc::new(Mutex::new(SessionPool::default()));
+        let config = TempodServerConfig::new()
+            .allow_remote_binds()
+            .with_auth(TempodAuth::bearer("secret-token")?);
+        let handle = thread::spawn(move || serve_one_with_config(listener, pool, config));
+        let body = r#"{"url":"https://one.test"}"#;
+
+        let response = send_http(
+            connect_addr,
+            &format!(
+                "POST /sessions HTTP/1.1\r\nauthorization: Bearer secret-token\r\ncontent-length: {}\r\n\r\n{body}",
+                body.len()
+            ),
+        )?;
+        join_server(handle)?;
+
+        assert!(response.starts_with("HTTP/1.1 201 Created"));
+        assert!(response.contains("\"id\":\"session-0\""));
+        Ok(())
+    }
+
+    #[test]
+    fn auth_config_requires_bearer_for_rest_control_and_allows_missing_origin_with_token(
+    ) -> TestResult {
+        let auth = TempodAuth::bearer("secret-token")?;
+        let create_body = br#"{"url":"https://example.test"}"#;
+        let mut pool = SessionPool::default();
+
+        let missing = handle_http_request_with_auth(
+            &mut pool,
+            control_request("POST", "/sessions", None, create_body),
+            &auth,
+        );
+        assert_eq!(missing.status, 401);
+        assert!(pool.list().is_empty());
+
+        let wrong = handle_http_request_with_auth(
+            &mut pool,
+            with_bearer(
+                control_request("POST", "/sessions", None, create_body),
+                "wrong-token",
+            ),
+            &auth,
+        );
+        assert_eq!(wrong.status, 401);
+        assert!(pool.list().is_empty());
+
+        let allowed = handle_http_request_with_auth(
+            &mut pool,
+            with_bearer(
+                control_request("POST", "/sessions", None, create_body),
+                "secret-token",
+            ),
+            &auth,
+        );
+        assert_eq!(allowed.status, 201);
+        assert_eq!(pool.list().len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn auth_config_requires_bearer_for_mcp_post() -> TestResult {
+        let auth = TempodAuth::bearer("secret-token")?;
+        let body = br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
+        let mut pool = SessionPool::default();
+
+        let get_missing = handle_http_request_with_auth(
+            &mut pool,
+            control_request("GET", "/mcp", None, b""),
+            &auth,
+        );
+        assert_eq!(get_missing.status, 401);
+
+        let missing = handle_http_request_with_auth(
+            &mut pool,
+            control_request("POST", "/mcp", None, body),
+            &auth,
+        );
+        assert_eq!(missing.status, 401);
+
+        let wrong = handle_http_request_with_auth(
+            &mut pool,
+            with_bearer(control_request("POST", "/mcp", None, body), "wrong-token"),
+            &auth,
+        );
+        assert_eq!(wrong.status, 401);
+
+        let allowed = handle_http_request_with_auth(
+            &mut pool,
+            with_bearer(control_request("POST", "/mcp", None, body), "secret-token"),
+            &auth,
+        );
+        assert_eq!(allowed.status, 200);
+        let value: Value = serde_json::from_slice(&allowed.body)?;
+        assert!(value["result"]["tools"].is_array());
+        Ok(())
+    }
+
+    #[test]
+    fn auth_config_requires_bearer_for_bidi_websocket_upgrade() -> TestResult {
+        let auth = TempodAuth::bearer("secret-token")?;
+
+        match websocket_upgrade_key_with_auth(&bidi_websocket_request(None), &auth) {
+            Err(TempodError::Unauthorized(_)) => {}
+            other => return Err(format!("expected Unauthorized, got {other:?}").into()),
+        }
+        match websocket_upgrade_key_with_auth(&bidi_websocket_request(Some("wrong-token")), &auth) {
+            Err(TempodError::Unauthorized(_)) => {}
+            other => return Err(format!("expected Unauthorized, got {other:?}").into()),
+        }
+        assert_eq!(
+            websocket_upgrade_key_with_auth(&bidi_websocket_request(Some("secret-token")), &auth)?,
+            Some("dGhlIHNhbXBsZSBub25jZQ==".into())
+        );
         Ok(())
     }
 
