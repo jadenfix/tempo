@@ -17,7 +17,7 @@ use tempo_headless::SessionStepKey;
 use tempo_headless::{
     SessionStepOutcome, SessionStepTriple, TempodSessionEvent, TempodSessionEventKind,
 };
-use tempo_schema::{Action, InteractiveElement, NodeId, ObservationDiff, TaintSpan};
+use tempo_schema::{Action, HumanTakeover, InteractiveElement, NodeId, ObservationDiff, TaintSpan};
 
 /// The taint badge state, derived from the latest step's observation spans.
 /// Always visible in the chrome; `Unknown` until the first observation-bearing
@@ -106,6 +106,11 @@ impl JournalEntry {
             TempodSessionEventKind::StepTriple { triple } => {
                 ("step", step_detail(triple), step_is_tainted(triple))
             }
+            TempodSessionEventKind::HumanTakeoverRequired { takeover } => (
+                "human_takeover_required",
+                format!("{} — {}", takeover.kind.label(), takeover.url),
+                false,
+            ),
         };
         Self {
             seq: event.seq,
@@ -146,6 +151,77 @@ fn action_kind(action: &Action) -> &'static str {
     }
 }
 
+/// The blocking human-takeover banner state, derived purely from the session
+/// event stream (#354, over the #343 seam).
+///
+/// When [`TempodSessionEventKind::HumanTakeoverRequired`] surfaces for the active
+/// session, [`Self::raise`] latches the [`HumanTakeover`] and [`Self::is_blocking`]
+/// reads `true`. It stays blocking — the shell must not auto-advance the agent —
+/// until a human explicitly clicks Resume ([`Self::resume`]).
+///
+/// **Never auto-continues (#343 semantics):** [`Self::resume`] only clears the
+/// *local* block. Takeover detection is pure over the observation, so a resumed
+/// run that re-observes the same unresolved challenge journals the takeover again,
+/// which re-surfaces here on the next poll. The banner therefore re-appears until
+/// the human has actually cleared the challenge in the page — it never silently
+/// waves the agent past an unresolved CAPTCHA/auth-wall.
+///
+/// **Resume transport is a documented seam:** there is no tempod resume endpoint
+/// and no `ShellClient::resume` today (checked against the whole `ShellClient`
+/// surface), so Resume cannot yet POST a "continue this run" to the backend.
+/// Wiring that call is a follow-up on the same deferred agent↔tempod bridge that
+/// gates step-event production; see the crate PR for #354.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TakeoverBanner {
+    /// The latched takeover the human must resolve, if any.
+    pending: Option<HumanTakeover>,
+}
+
+impl TakeoverBanner {
+    /// The pending takeover the human must resolve, if the banner is up.
+    pub fn pending(&self) -> Option<&HumanTakeover> {
+        self.pending.as_ref()
+    }
+
+    /// Whether the shell is blocked on a human takeover (banner up). While this is
+    /// `true` the agent must not be auto-advanced.
+    pub fn is_blocking(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// The takeover-kind label (`captcha` / `auth_wall` / `login_required`) for
+    /// the banner heading, if a takeover is pending.
+    pub fn reason_label(&self) -> Option<&'static str> {
+        self.pending.as_ref().map(|takeover| takeover.kind.label())
+    }
+
+    /// A single-line banner summary — kind, reason, and URL — for the renderer, if
+    /// a takeover is pending. Kept here (not in the winit glue) so it is testable.
+    pub fn banner_line(&self) -> Option<String> {
+        self.pending.as_ref().map(|takeover| {
+            format!(
+                "Human takeover required ({}): {} — {}",
+                takeover.kind.label(),
+                takeover.reason,
+                takeover.url
+            )
+        })
+    }
+
+    /// Latch a detected takeover. Idempotent for the same page: re-raising simply
+    /// keeps the latest detection.
+    fn raise(&mut self, takeover: HumanTakeover) {
+        self.pending = Some(takeover);
+    }
+
+    /// Human clicked Resume: clear the local block. See the type docs — this does
+    /// not auto-continue past an unresolved challenge, and the actual run-resume
+    /// wire call is a documented follow-up.
+    pub fn resume(&mut self) {
+        self.pending = None;
+    }
+}
+
 /// The ordered, deduplicated journal-event log for one session, plus the session
 /// taint state accumulated across its observation-bearing events.
 ///
@@ -175,6 +251,10 @@ pub struct JournalLog {
     tainted_nodes: HashSet<NodeId>,
     /// Whether any observation-bearing step has been seen for this session.
     observed: bool,
+    /// The blocking human-takeover banner for this session (#354). Set when a
+    /// `HumanTakeoverRequired` event is ingested; cleared on Resume or a session
+    /// switch.
+    takeover: TakeoverBanner,
 }
 
 impl JournalLog {
@@ -191,8 +271,21 @@ impl JournalLog {
         }
     }
 
-    /// Point the log at `session_id`, clearing entries/cursor/taint if it changed.
-    /// Returns the cursor the next poll should use (`None` on a fresh session).
+    /// The blocking human-takeover banner for the active session (#354).
+    pub fn takeover(&self) -> &TakeoverBanner {
+        &self.takeover
+    }
+
+    /// Human clicked Resume: clear the blocking takeover banner. See
+    /// [`TakeoverBanner::resume`] — this never auto-continues past an unresolved
+    /// challenge, and the run-resume wire call is a documented follow-up.
+    pub fn resume_takeover(&mut self) {
+        self.takeover.resume();
+    }
+
+    /// Point the log at `session_id`, clearing entries/cursor/taint/takeover if it
+    /// changed. Returns the cursor the next poll should use (`None` on a fresh
+    /// session).
     pub fn follow(&mut self, session_id: &str) -> Option<u64> {
         if self.session_id.as_deref() != Some(session_id) {
             self.session_id = Some(session_id.to_string());
@@ -200,6 +293,7 @@ impl JournalLog {
             self.cursor = None;
             self.tainted_nodes.clear();
             self.observed = false;
+            self.takeover = TakeoverBanner::default();
         }
         self.cursor
     }
@@ -213,10 +307,16 @@ impl JournalLog {
             .collect();
         fresh.sort_by_key(|event| event.seq);
         for event in fresh {
-            if let TempodSessionEventKind::StepTriple { triple } = &event.event
-                && let SessionStepOutcome::Applied { diff } = &triple.outcome
-            {
-                self.accumulate_taint(diff);
+            match &event.event {
+                TempodSessionEventKind::StepTriple { triple } => {
+                    if let SessionStepOutcome::Applied { diff } = &triple.outcome {
+                        self.accumulate_taint(diff);
+                    }
+                }
+                TempodSessionEventKind::HumanTakeoverRequired { takeover } => {
+                    self.takeover.raise(takeover.clone());
+                }
+                _ => {}
             }
             self.cursor = Some(
                 self.cursor
@@ -248,7 +348,7 @@ impl JournalLog {
 mod tests {
     use super::*;
     use tempo_headless::TempodSessionId;
-    use tempo_schema::{NodeId, Provenance};
+    use tempo_schema::{NodeId, Provenance, TakeoverKind};
 
     fn span(provenance: Provenance, text: &str) -> TaintSpan {
         TaintSpan {
@@ -318,6 +418,114 @@ mod tests {
                 url: "https://created.test".to_string(),
             },
         }
+    }
+
+    fn takeover_event(seq: u64, kind: TakeoverKind) -> TempodSessionEvent {
+        TempodSessionEvent {
+            session_id: TempodSessionId("session-0".to_string()),
+            seq,
+            timestamp_ms: 0,
+            event: TempodSessionEventKind::HumanTakeoverRequired {
+                takeover: HumanTakeover {
+                    kind,
+                    reason: "challenge detected".to_string(),
+                    url: "https://takeover.test/challenge".to_string(),
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn takeover_event_raises_blocking_banner_with_kind_and_url() {
+        let mut log = JournalLog::default();
+        log.follow("session-0");
+        assert!(!log.takeover().is_blocking(), "no banner before any event");
+
+        log.ingest(&[takeover_event(0, TakeoverKind::Captcha)]);
+
+        assert!(log.takeover().is_blocking());
+        let Some(pending) = log.takeover().pending() else {
+            panic!("takeover pending");
+        };
+        assert_eq!(pending.kind, TakeoverKind::Captcha);
+        assert_eq!(pending.url, "https://takeover.test/challenge");
+        assert_eq!(log.takeover().reason_label(), Some("captcha"));
+        assert_eq!(
+            log.takeover().banner_line().as_deref(),
+            Some("Human takeover required (captcha): challenge detected — https://takeover.test/challenge")
+        );
+        // It is also recorded as a journal line.
+        assert_eq!(
+            log.entries.last().map(|entry| entry.kind.as_str()),
+            Some("human_takeover_required")
+        );
+    }
+
+    #[test]
+    fn non_takeover_events_do_not_raise_the_banner() {
+        let mut log = JournalLog::default();
+        log.follow("session-0");
+        log.ingest(&[
+            created_event(0),
+            step_event(
+                1,
+                diff_with(vec![element("n0", vec![span(Provenance::Page, "evil")])]),
+            ),
+        ]);
+        assert!(
+            !log.takeover().is_blocking(),
+            "session/step events must not raise the takeover banner"
+        );
+        assert!(log.takeover().pending().is_none());
+        assert!(log.takeover().banner_line().is_none());
+    }
+
+    #[test]
+    fn resume_clears_the_blocking_banner() {
+        let mut log = JournalLog::default();
+        log.follow("session-0");
+        log.ingest(&[takeover_event(0, TakeoverKind::LoginRequired)]);
+        assert!(log.takeover().is_blocking());
+
+        log.resume_takeover();
+        assert!(
+            !log.takeover().is_blocking(),
+            "Resume clears the local block"
+        );
+        assert!(log.takeover().pending().is_none());
+    }
+
+    #[test]
+    fn resume_never_auto_continues_when_challenge_persists() {
+        // #343 act-loop scenario: the human resumes, but the challenge is still on
+        // the page, so the agent re-detects it and re-journals the takeover. The
+        // next poll must re-raise the banner — never silently wave the agent past.
+        let mut log = JournalLog::default();
+        log.follow("session-0");
+        log.ingest(&[takeover_event(0, TakeoverKind::AuthWall)]);
+        assert!(log.takeover().is_blocking());
+
+        log.resume_takeover();
+        assert!(!log.takeover().is_blocking());
+
+        // A later, unresolved re-detection surfaces as a fresh event on the stream.
+        log.ingest(&[takeover_event(1, TakeoverKind::AuthWall)]);
+        assert!(
+            log.takeover().is_blocking(),
+            "an unresolved challenge must re-raise the banner after resume"
+        );
+    }
+
+    #[test]
+    fn switching_sessions_clears_the_takeover_banner() {
+        let mut log = JournalLog::default();
+        log.follow("session-0");
+        log.ingest(&[takeover_event(0, TakeoverKind::Captcha)]);
+        assert!(log.takeover().is_blocking());
+
+        // Following a different session resets the per-session banner.
+        log.follow("session-1");
+        assert!(!log.takeover().is_blocking());
     }
 
     #[test]

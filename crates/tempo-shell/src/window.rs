@@ -346,6 +346,31 @@ impl eframe::App for ShellApp {
         {
             let model = &mut self.model;
             ui.heading("tempo-shell");
+
+            // Blocking human-takeover banner (#354): when the session event stream
+            // surfaces a HumanTakeoverRequired, the agent is paused and this banner
+            // stays up until the human clicks Resume. It never auto-continues — see
+            // `TakeoverBanner`. Rendered first, above the rest of the chrome.
+            if let Some(line) = model.journal.takeover().banner_line() {
+                ui.group(|ui| {
+                    ui.label(
+                        egui::RichText::new("⚠ HUMAN TAKEOVER REQUIRED")
+                            .heading()
+                            .strong()
+                            .color(egui::Color32::from_rgb(220, 50, 50)),
+                    );
+                    ui.label(egui::RichText::new(&line).strong());
+                    ui.label(
+                        "The agent is paused and will NOT auto-continue. Resolve the challenge \
+                         in the page, then click Resume.",
+                    );
+                    if ui.button("Resume").clicked() {
+                        pending = Some(UiAction::ResumeTakeover);
+                    }
+                });
+                ui.separator();
+            }
+
             ui.horizontal(|ui| {
                 ui.label("tempod:");
                 ui.text_edit_singleline(&mut model.base_url);
