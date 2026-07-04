@@ -159,6 +159,10 @@ impl PrivacyMode {
     const fn retains_history(self) -> bool {
         matches!(self, Self::Audit)
     }
+
+    const fn retains_idempotency_cache(self) -> bool {
+        matches!(self, Self::Audit)
+    }
 }
 
 /// Driver handle attached to tempod through the engine-host UDS protocol.
@@ -805,6 +809,9 @@ impl SessionPool {
         if !self.sessions.contains_key(id) {
             return Err(TempodError::SessionNotFound(id.clone()));
         }
+        if !self.privacy_mode.retains_idempotency_cache() {
+            return Ok(None);
+        }
         let Some(entry) = self
             .session_act_batch_idempotency
             .get(&(id.clone(), key.to_owned()))
@@ -826,6 +833,9 @@ impl SessionPool {
     ) -> Result<(), TempodError> {
         if !self.sessions.contains_key(id) {
             return Err(TempodError::SessionNotFound(id.clone()));
+        }
+        if !self.privacy_mode.retains_idempotency_cache() {
+            return Ok(());
         }
         if self
             .session_act_batch_idempotency
@@ -849,6 +859,9 @@ impl SessionPool {
     ) -> Result<(), TempodError> {
         if !self.sessions.contains_key(id) {
             return Err(TempodError::SessionNotFound(id.clone()));
+        }
+        if !self.privacy_mode.retains_idempotency_cache() {
+            return Ok(());
         }
         self.ensure_session_idempotency_capacity(id, key)?;
         self.session_act_batch_idempotency.insert(
@@ -1455,7 +1468,6 @@ fn write_otlp_json_record(path: &Path, record: &JsonValue) -> Result<(), TempodE
 
 fn redacted_step_triple_body(triple: &StepTriple) -> serde_json::Value {
     json!({
-        "key": triple.key.0,
         "seq": triple.seq,
         "action": {
             "kind": action_kind(&triple.action),
@@ -4668,6 +4680,44 @@ mod tests {
     }
 
     #[test]
+    fn stealth_mode_skips_session_act_batch_idempotency_cache() -> TestResult {
+        let mut pool = SessionPool::default().with_privacy_mode(PrivacyMode::Stealth);
+        let session = pool.create("https://private-act-batch.test")?;
+        let fingerprint = json!({
+            "batch": {
+                "actions": [{
+                    "kind": "type",
+                    "node": "password-field",
+                    "text": "typed-secret"
+                }],
+                "quiescence": "composite"
+            },
+            "input_tainted": false,
+            "confirmed": true
+        });
+
+        pool.remember_session_act_batch_response(
+            &session.id,
+            "secret-idempotency-key",
+            fingerprint.clone(),
+            200,
+            json!({"status": "applied"}),
+        )?;
+
+        assert_eq!(pool.session_idempotency_record_count(&session.id), 0);
+        assert!(pool.session_act_batch_idempotency.is_empty());
+        assert!(
+            pool.cached_session_act_batch_response(
+                &session.id,
+                "secret-idempotency-key",
+                &fingerprint,
+            )?
+            .is_none()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn otlp_json_exporter_writes_bare_file_path() -> TestResult {
         let unique = unique_dir("bare-otlp")?;
         let bare_path = PathBuf::from(
@@ -7391,6 +7441,7 @@ mod tests {
         assert_eq!(value["body"]["seq"], 1);
         assert_eq!(value["body"]["action"]["kind"], "scroll");
         assert_eq!(value["body"]["outcome"]["kind"], "applied");
+        assert!(value["body"].get("key").is_none());
 
         remove_dir_if_exists(&root)?;
         Ok(())
@@ -7424,6 +7475,7 @@ mod tests {
         assert_eq!(value["body"]["outcome"]["reason"], "[redacted]");
         assert!(!text.contains("secret-token"));
         assert!(!text.contains("password-field"));
+        assert!(!text.contains("step-secret"));
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
