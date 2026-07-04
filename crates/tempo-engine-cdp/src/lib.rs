@@ -40,7 +40,7 @@ use tempo_driver::{
     MAX_SCREENSHOT_BYTES, MAX_SCREENSHOT_HEIGHT, MAX_SCREENSHOT_WIDTH,
 };
 use tempo_net::UrlPolicy;
-use tempo_observe::{RawElement, StableIdMapper};
+use tempo_observe::{finalize_observation, CompileOptions, RawElement, StableIdMapper};
 use tempo_schema::{
     Action, ActionBatch, CompiledObservation, InteractiveElement, NodeId, ObservationDiff,
     Provenance, QuiescencePolicy, TaintSpan,
@@ -69,7 +69,8 @@ const MAX_AX_ENRICHED_ELEMENTS: usize = 16;
 /// missing base to a full snapshot, so evicting older entries is safe. Without this
 /// bound `history` grew by one full observation clone on every observe and was never
 /// pruned — a steady RSS leak on long-lived sessions (and each live fork keeps its
-/// own driver + history). Mirrors `StableIdMapper`'s retention window (#107).
+/// own driver + history). Uses the same bounded-retention pattern as
+/// `StableIdMapper`, while keeping a driver-local diff window.
 const HISTORY_RETENTION_SNAPSHOTS: u64 = 16;
 const MAX_BLOCKED_REQUESTS: usize = 64;
 const REQUEST_POLICY_EVENT_GRACE: Duration = Duration::from_millis(25);
@@ -456,6 +457,17 @@ impl CdpTempoDriver {
             compile_observation(&mut self.stable_id_mapper, url, dom_html, self.seq);
         self.selectors_by_node = selectors_by_node;
         self.enrich_observation_from_ax_tree(&mut compiled).await?;
+        // Finish the live observation the same way the fixture compiler does:
+        // rank-sort, apply the byte/token budget, and populate set-of-marks labels.
+        // Run after enrichment so the budget accounts for enriched AX names/values.
+        // Without this the CDP lane shipped the full, unranked, unbudgeted
+        // document-order element dump with no marks (#477).
+        let compiled = finalize_observation(
+            compiled.url,
+            compiled.seq,
+            compiled.elements,
+            CompileOptions::default(),
+        );
         self.history.insert(compiled.seq, compiled.clone());
         prune_observation_history(&mut self.history, compiled.seq);
         Ok(compiled)
@@ -2931,14 +2943,15 @@ mod tests {
         for seq in 1..=100 {
             history.insert(seq, obs(seq));
             prune_observation_history(&mut history, seq);
+            assert!(history.len() as u64 <= HISTORY_RETENTION_SNAPSHOTS);
         }
         // Never exceeds the window, and keeps exactly the most-recent K seqs.
         assert_eq!(history.len() as u64, HISTORY_RETENTION_SNAPSHOTS);
         assert_eq!(
-            *history.keys().next().unwrap(),
-            100 - HISTORY_RETENTION_SNAPSHOTS + 1
+            history.keys().next().copied(),
+            Some(100 - HISTORY_RETENTION_SNAPSHOTS + 1)
         );
-        assert_eq!(*history.keys().next_back().unwrap(), 100);
+        assert_eq!(history.keys().next_back().copied(), Some(100));
         // Early seqs (before the window fills) are all retained.
         let mut early: BTreeMap<u64, CompiledObservation> = BTreeMap::new();
         for seq in 1..=3 {
