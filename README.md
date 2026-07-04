@@ -6,6 +6,13 @@ Today's agentic browsers drive the web the way a human would — *screenshot →
 
 Engine strategy is **Rust-first**: [Servo](https://servo.org) is the primary rendering engine; a headless-Chromium lane (CDP) is a per-origin fallback behind the same driver trait. tempo reuses the sibling **beater** stack (`../beater-agents`, `../beater.js`, `../beater.js-connect`, `../beatbox`).
 
+Servo compatibility is explicit. The default `servo-vanilla` lane stays pinned
+to the upstream-compatible Servo crate, while `scripts/cargo-servo-tempo.sh`
+checks the audited `github.com/jadenfix/servo` fork rev used by Tempo-specific
+integration work. Set `TEMPO_SERVO_PATH=../servo` for a local checkout, or
+`TEMPO_SERVO_REPO` / `TEMPO_SERVO_REF` for another fork source; non-default
+sources require `TEMPO_SERVO_ALLOW_UNAUDITED=1`.
+
 ## Read this first
 
 **[`final.md`](./final.md)** is the full engineering design — vision, first-principles requirements, component architecture, the Servo hook map, the dependency graph (what's parallel vs sequential), the beatbox sandbox integration, the Definition of Done (per-crate acceptance bars + milestone gates), risks, and verification.
