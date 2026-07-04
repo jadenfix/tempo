@@ -24,6 +24,12 @@ fi
 
 raw_slug="$1"
 base_ref="${2:-origin/main}"
+
+if [[ "$base_ref" == -* ]]; then
+  echo "tempo: base ref must not start with '-': $base_ref" >&2
+  exit 2
+fi
+
 repo_root="$(git rev-parse --show-toplevel)"
 common_dir="$(git rev-parse --git-common-dir)"
 case "$common_dir" in
