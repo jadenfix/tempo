@@ -2813,7 +2813,7 @@ mod tests {
     fn element_text_reads_inner_text_without_allocating_the_tail() {
         // `from` points just past the element's open tag; text runs to "</tag".
         let html = "<p>lead</p><button>Click <b>me</b></button>tail";
-        let open = html.find("<button>").unwrap() + "<button>".len();
+        let open = "<p>lead</p><button>".len();
         assert_eq!(
             element_text(html, open, "button").as_deref(),
             Some("Click me")
