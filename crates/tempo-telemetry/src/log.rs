@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::io::Write;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -74,6 +74,7 @@ pub struct LogEvent {
 #[derive(Debug)]
 pub struct Logger {
     min_level: AtomicU8,
+    local_output_enabled: AtomicBool,
     ring: Mutex<VecDeque<LogEvent>>,
     ring_capacity: usize,
     write_stderr: bool,
@@ -83,6 +84,7 @@ impl Logger {
     pub fn new(ring_capacity: usize, write_stderr: bool) -> Self {
         Self {
             min_level: AtomicU8::new(Level::Info as u8),
+            local_output_enabled: AtomicBool::new(true),
             // Pre-allocation is bounded independently of the logical capacity
             // so a huge capacity doesn't reserve memory up front; the ring
             // still grows to (and is evicted at) `ring_capacity`.
@@ -104,6 +106,22 @@ impl Logger {
         level >= self.min_level()
     }
 
+    /// Enable or disable all local log artifacts: stderr JSONL and the
+    /// in-memory recent-event ring. Disabling clears already-retained events.
+    pub fn set_local_output_enabled(&self, enabled: bool) {
+        self.local_output_enabled.store(enabled, Ordering::Relaxed);
+        if !enabled {
+            self.ring
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clear();
+        }
+    }
+
+    pub fn local_output_enabled(&self) -> bool {
+        self.local_output_enabled.load(Ordering::Relaxed)
+    }
+
     /// Starts a structured event; finish it with [`EventBuilder::emit`].
     pub fn event<'a>(&'a self, level: Level, target: &str, message: &str) -> EventBuilder<'a> {
         EventBuilder {
@@ -120,6 +138,9 @@ impl Logger {
 
     /// The most recent events, oldest first, at most `limit`.
     pub fn recent(&self, limit: usize) -> Vec<LogEvent> {
+        if !self.local_output_enabled() {
+            return Vec::new();
+        }
         let ring = self.ring.lock().unwrap_or_else(PoisonError::into_inner);
         ring.iter()
             .skip(ring.len().saturating_sub(limit))
@@ -129,6 +150,9 @@ impl Logger {
 
     fn emit_event(&self, event: LogEvent) {
         if !self.enabled(event.level) {
+            return;
+        }
+        if !self.local_output_enabled() {
             return;
         }
         if self.write_stderr
@@ -228,6 +252,26 @@ mod tests {
         assert_eq!(messages, vec!["event-2", "event-3", "event-4"]);
         assert_eq!(logger.recent(1).len(), 1);
         assert_eq!(logger.recent(1)[0].message, "event-4");
+    }
+
+    #[test]
+    fn local_output_disable_clears_and_suppresses_recent_events() {
+        let logger = quiet_logger(4);
+        logger.event(Level::Info, "test", "before").emit();
+        assert_eq!(logger.recent(10).len(), 1);
+
+        logger.set_local_output_enabled(false);
+        assert!(!logger.local_output_enabled());
+        assert!(logger.recent(10).is_empty());
+
+        logger.event(Level::Error, "test", "suppressed").emit();
+        assert!(logger.recent(10).is_empty());
+
+        logger.set_local_output_enabled(true);
+        logger.event(Level::Info, "test", "after").emit();
+        let recent = logger.recent(10);
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].message, "after");
     }
 
     #[test]
