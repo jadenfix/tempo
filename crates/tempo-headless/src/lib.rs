@@ -324,6 +324,7 @@ impl DriverTrait for AttachedEngineDriver {
     }
 
     async fn goto(&mut self, url: &str) -> Result<CompiledObservation, TransportError> {
+        enforce_tempod_navigation_url_transport(url)?;
         self.request_observation(HostDriverCommand::Goto { url: url.into() }, "goto")
     }
 
@@ -336,6 +337,7 @@ impl DriverTrait for AttachedEngineDriver {
     }
 
     async fn act(&mut self, action: &Action) -> Result<StepOutcome, TransportError> {
+        enforce_action_navigation_url_policy(action)?;
         self.request_step(
             HostDriverCommand::Act {
                 action: action.clone(),
@@ -345,6 +347,7 @@ impl DriverTrait for AttachedEngineDriver {
     }
 
     async fn act_batch(&mut self, batch: &ActionBatch) -> Result<StepOutcome, TransportError> {
+        enforce_batch_navigation_url_policy_transport(batch)?;
         self.request_step(
             HostDriverCommand::ActBatch {
                 batch: batch.clone(),
@@ -366,6 +369,7 @@ impl DriverTrait for AttachedEngineDriver {
         expression: &str,
         await_promise: bool,
     ) -> Result<serde_json::Value, TransportError> {
+        enforce_script_navigation_policy_transport(expression)?;
         self.request_evaluation(
             HostDriverCommand::EvaluateScript {
                 expression: expression.into(),
@@ -1980,6 +1984,77 @@ fn enforce_batch_navigation_url_policy(batch: &ActionBatch) -> Result<(), Tempod
     Ok(())
 }
 
+fn enforce_tempod_navigation_url_transport(url: &str) -> Result<(), TransportError> {
+    if tempod_navigation_url_policy_denial(url).is_some() {
+        return Err(TransportError::UrlBlocked);
+    }
+    Ok(())
+}
+
+fn enforce_action_navigation_url_policy(action: &Action) -> Result<(), TransportError> {
+    if let Action::Goto { url } = action {
+        enforce_tempod_navigation_url_transport(url)?;
+    }
+    Ok(())
+}
+
+fn enforce_batch_navigation_url_policy_transport(
+    batch: &ActionBatch,
+) -> Result<(), TransportError> {
+    for action in &batch.actions {
+        enforce_action_navigation_url_policy(action)?;
+    }
+    Ok(())
+}
+
+fn script_navigation_policy_denial(expression: &str) -> Option<&'static str> {
+    let compact = expression
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    const NAVIGATION_PATTERNS: &[&str] = &[
+        "location=",
+        "location.href=",
+        "window.location=",
+        "window.location.href=",
+        "document.location=",
+        "document.location.href=",
+        "location.assign(",
+        "location.replace(",
+        "window.location.assign(",
+        "window.location.replace(",
+        "document.location.assign(",
+        "document.location.replace(",
+    ];
+
+    NAVIGATION_PATTERNS
+        .iter()
+        .any(|pattern| contains_script_navigation_pattern(&compact, pattern))
+        .then_some("script navigation denied by tempod URL policy")
+}
+
+fn contains_script_navigation_pattern(expression: &str, pattern: &str) -> bool {
+    expression
+        .match_indices(pattern)
+        .any(|(start, _)| has_script_navigation_boundary(expression.as_bytes(), start))
+}
+
+fn has_script_navigation_boundary(expression: &[u8], start: usize) -> bool {
+    start == 0
+        || !matches!(
+            expression[start - 1],
+            b'a'..=b'z' | b'0'..=b'9' | b'_' | b'$' | b'.'
+        )
+}
+
+fn enforce_script_navigation_policy_transport(expression: &str) -> Result<(), TransportError> {
+    if script_navigation_policy_denial(expression).is_some() {
+        return Err(TransportError::UrlBlocked);
+    }
+    Ok(())
+}
+
 fn session_act_batch_idempotency_fingerprint(body: &SessionActBatchRequest) -> JsonValue {
     json!({
         "batch": &body.batch,
@@ -3434,6 +3509,12 @@ fn route_bidi_driver(
                 command.confirmed,
             ) {
                 return denied;
+            }
+            if let Some(message) = script_navigation_policy_denial(&command.expression) {
+                return BidiDispatchResult::new(
+                    200,
+                    BidiMessage::error(Some(id), BidiErrorCode::InvalidArgument, message),
+                );
             }
             let context = command.target.context.clone();
             let Some(mut driver) = pool.bidi_driver_for(&context) else {
@@ -6347,6 +6428,57 @@ mod tests {
     }
 
     #[test]
+    fn bidi_endpoint_rejects_blocked_script_navigation_before_driver_execution() -> TestResult {
+        let (client_stream, mut server_stream) = UnixStream::pair()?;
+        server_stream.set_nonblocking(true)?;
+        let mut pool = SessionPool::default();
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+
+        let response = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/bidi".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: br#"{"id":20,"method":"script.evaluate","params":{"expression":"window.location.href = 'http://127.0.0.1/admin'","target":{"context":"tempo-root"},"inputTainted":false}}"#.to_vec(),
+            },
+        )?;
+
+        assert_eq!(response.status, 200);
+        let value: Value = serde_json::from_slice(&response.body)?;
+        assert_eq!(value["type"], "error");
+        assert_eq!(value["id"], 20);
+        assert_eq!(value["error"], "invalid argument");
+        let message = value["message"]
+            .as_str()
+            .ok_or("BiDi error response should include a message")?;
+        assert!(message.contains("script navigation denied by tempod URL policy"));
+        assert_no_driver_ipc(&mut server_stream)?;
+        Ok(())
+    }
+
+    #[test]
+    fn script_navigation_policy_detects_direct_location_navigation() {
+        assert!(
+            script_navigation_policy_denial("location . assign ('https://example.test')").is_some()
+        );
+    }
+
+    #[test]
+    fn script_navigation_policy_ignores_identifier_substrings() {
+        assert_eq!(
+            script_navigation_policy_denial("const allocation = 1;"),
+            None
+        );
+        assert_eq!(
+            script_navigation_policy_denial("const relocation = 1;"),
+            None
+        );
+    }
+
+    #[test]
     fn bidi_endpoint_routes_script_evaluate_to_attached_engine_driver() -> TestResult {
         let mut pool = SessionPool::default();
         let handle = attach_driver_handler(&mut pool, |request| {
@@ -6826,6 +6958,40 @@ mod tests {
         assert_eq!(value["id"], 12);
         assert_eq!(value["result"]["structuredContent"]["status"], "applied");
         assert_eq!(value["result"]["structuredContent"]["diff"]["seq"], 2);
+        Ok(())
+    }
+
+    #[test]
+    fn mcp_endpoint_rejects_blocked_act_batch_goto_before_driver_execution() -> TestResult {
+        let (client_stream, mut server_stream) = UnixStream::pair()?;
+        server_stream.set_nonblocking(true)?;
+        let mut pool = SessionPool::default();
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+
+        let response = route_http_request(
+            &mut pool,
+            mcp_tool_request(
+                16,
+                "act_batch",
+                json!({
+                    "batch": {
+                        "actions": [{"kind": "goto", "url": "http://127.0.0.1/admin"}],
+                        "quiescence": "composite",
+                    },
+                    "input_tainted": false
+                }),
+            )?,
+        )?;
+
+        assert_eq!(response.status, 200);
+        let value: Value = serde_json::from_slice(&response.body)?;
+        assert_eq!(value["id"], 16);
+        assert_eq!(value["result"]["isError"], true);
+        let error = value["result"]["structuredContent"]["error"]
+            .as_str()
+            .ok_or("MCP tool error should include a message")?;
+        assert!(error.contains("blocked by URL policy"));
+        assert_no_driver_ipc(&mut server_stream)?;
         Ok(())
     }
 
