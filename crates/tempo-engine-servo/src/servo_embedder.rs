@@ -7,8 +7,8 @@ use servo::{
 use tempo_driver::Unsupported;
 
 use crate::{
-    ServoBuildFlavor, ServoEngineConfig, ServoVanillaBuildPlan, Viewport,
-    PINNED_VANILLA_SERVO_VERSION,
+    current_servo_platform, servo_platform_support_matrix, ServoBuildFlavor, ServoEngineConfig,
+    ServoVanillaBuildPlan, Viewport, PINNED_VANILLA_SERVO_VERSION,
 };
 
 pub(crate) struct VanillaServoEmbedderPlan {
@@ -53,6 +53,8 @@ impl From<VanillaServoEmbedderPlan> for ServoVanillaBuildPlan {
         Self {
             servo_crate_version: PINNED_VANILLA_SERVO_VERSION.into(),
             build_flavor: plan.build_flavor,
+            current_platform: current_servo_platform(),
+            supported_platforms: servo_platform_support_matrix(),
             viewport: plan.viewport,
             user_agent: plan.user_agent,
             access_tree: plan.access_tree,

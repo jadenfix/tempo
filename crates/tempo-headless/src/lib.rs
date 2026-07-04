@@ -3180,12 +3180,22 @@ mod tests {
                 },
             )?;
 
-            // The orphaned late-success context must be closed, not leaked.
-            let close = connection.read_driver_request()?;
-            assert_eq!(close.driver_id.as_deref(), Some("session-context-late"));
-            assert_eq!(close.command, HostDriverCommand::Close);
-            let _ = close_tx.send(());
-            connection.write_driver_response(close.id, DriverResponse::Closed)
+            // The orphaned late-success context must be closed, not leaked. The
+            // root driver can also be closed during invalidation, and close order
+            // is not deterministic, so acknowledge every `Close` and signal only
+            // when the late session context is observed.
+            loop {
+                let close = match connection.read_driver_request() {
+                    Ok(close) => close,
+                    Err(_) => break,
+                };
+                assert_eq!(close.command, HostDriverCommand::Close);
+                if close.driver_id.as_deref() == Some("session-context-late") {
+                    let _ = close_tx.send(());
+                }
+                connection.write_driver_response(close.id, DriverResponse::Closed)?;
+            }
+            Ok(())
         });
 
         let mut pool = SessionPool::default();

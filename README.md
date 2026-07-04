@@ -13,6 +13,12 @@ integration work. Set `TEMPO_SERVO_PATH=../servo` for a local checkout, or
 `TEMPO_SERVO_REPO` / `TEMPO_SERVO_REF` for another fork source; non-default
 sources require `TEMPO_SERVO_ALLOW_UNAUDITED=1`.
 
+## Platform Direction
+
+Tempo tracks the platforms where upstream Servo is available: macOS, Linux, Windows, Android, and OpenHarmony. `tempo-engine-servo` exposes this as `servo_platform_support_matrix()` so Swift/macOS, Android, OpenHarmony, desktop, and other SDK wrappers can read the same source of truth.
+
+Android and OpenHarmony use the Unix-domain-socket control plane in app-private storage. Windows is listed as an upstream Servo platform, but Tempo's local `tempod`/engine-host path is not Windows-ready until the Unix-only IPC code is replaced with a Windows-native transport adapter and matching cfg gates.
+
 ## Read this first
 
 **[`final.md`](./final.md)** is the full engineering design — vision, first-principles requirements, component architecture, the Servo hook map, the dependency graph (what's parallel vs sequential), the beatbox sandbox integration, the Definition of Done (per-crate acceptance bars + milestone gates), risks, and verification.
