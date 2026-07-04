@@ -62,7 +62,9 @@ use tempo_policy::trust::{
     CallerPolicyClaims,
 };
 use tempo_policy::ConfirmationGate;
-use tempo_schema::{Action, ActionBatch, CompiledObservation, NodeId, ObservationDiff, SideEffect};
+use tempo_schema::{
+    Action, ActionBatch, CompiledObservation, HumanTakeover, NodeId, ObservationDiff, SideEffect,
+};
 use thiserror::Error;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use url::Url;
@@ -261,11 +263,24 @@ pub struct TempodSessionEvent {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TempodSessionEventKind {
-    SessionCreated { url: String },
+    SessionCreated {
+        url: String,
+    },
     SessionAdopted,
     SessionKilled,
     SessionDrained,
-    StepTriple { triple: StepTriple },
+    StepTriple {
+        triple: StepTriple,
+    },
+    /// A hard pause: the agent loop detected a CAPTCHA / auth-wall / login state
+    /// ([`tempo_schema::HumanTakeover`], #244/#343) and stopped so a human can
+    /// take over. Carried on the typed session-event stream so a windowed client
+    /// ([`tempo-shell`], #354) can raise a blocking takeover banner from the same
+    /// `/sessions/{id}/events` poll it already runs. Detection is pure over the
+    /// observation and never auto-solves the challenge.
+    HumanTakeoverRequired {
+        takeover: HumanTakeover,
+    },
 }
 
 /// Controls intentional local history retention for the headless control plane.
@@ -1255,6 +1270,28 @@ impl SessionPool {
             }
         }
         Ok(self.record_event(id, TempodSessionEventKind::StepTriple { triple }))
+    }
+
+    /// Record a human-takeover pause onto the session's event stream (#244/#343):
+    /// the typed signal a windowed client turns into a blocking takeover banner.
+    ///
+    /// This is the recording API for the takeover event; the producer wire that
+    /// calls it — the agent loop reporting a detected takeover to tempod — is the
+    /// same deferred agent↔tempod bridge that already gates [`Self::record_step`]
+    /// (both have no HTTP route today; #247 shared-session wiring). tempod never
+    /// solves the challenge: this only journals that a human is needed.
+    pub fn record_human_takeover(
+        &mut self,
+        id: &TempodSessionId,
+        takeover: HumanTakeover,
+    ) -> Result<TempodSessionEvent, TempodError> {
+        if !self.sessions.contains_key(id) {
+            return Err(TempodError::SessionNotFound(id.clone()));
+        }
+        Ok(self.record_event(
+            id,
+            TempodSessionEventKind::HumanTakeoverRequired { takeover },
+        ))
     }
 
     fn cached_session_act_batch_response(
@@ -6304,6 +6341,45 @@ mod tests {
         let after_adopt = pool.events(&session.id, Some(1))?;
         assert_eq!(after_adopt.len(), 2);
         assert_eq!(after_adopt[0].seq, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn session_pool_records_human_takeover_on_the_event_stream() -> TestResult {
+        use tempo_schema::TakeoverKind;
+
+        let mut pool = SessionPool::default();
+        let session = pool.create("https://captcha.test")?;
+        let takeover = HumanTakeover {
+            kind: TakeoverKind::Captcha,
+            reason: "cloudflare turnstile detected".into(),
+            url: "https://captcha.test/challenge".into(),
+        };
+        let event = pool.record_human_takeover(&session.id, takeover.clone())?;
+
+        // It lands on the same /events stream the shell already polls.
+        assert_eq!(
+            event.event,
+            TempodSessionEventKind::HumanTakeoverRequired {
+                takeover: takeover.clone()
+            }
+        );
+        let events = pool.events(&session.id, None)?;
+        assert!(events.iter().any(|event| matches!(
+            &event.event,
+            TempodSessionEventKind::HumanTakeoverRequired { takeover: seen } if *seen == takeover
+        )));
+
+        // Serde tag is the snake_case variant the wire/client agree on.
+        let json = serde_json::to_value(&event.event)?;
+        assert_eq!(json["kind"], "human_takeover_required");
+        assert_eq!(json["takeover"]["kind"], "captcha");
+
+        // Unknown session id is rejected, like record_step.
+        assert!(matches!(
+            pool.record_human_takeover(&TempodSessionId("missing".into()), takeover),
+            Err(TempodError::SessionNotFound(_))
+        ));
         Ok(())
     }
 

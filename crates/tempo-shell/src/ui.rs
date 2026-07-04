@@ -143,6 +143,11 @@ pub enum UiAction {
     PollEvents,
     /// Toggle the set-of-marks overlay for the page-state screenshot.
     ToggleMarks,
+    /// Human clicked Resume on the blocking takeover banner (#354): clear the
+    /// local block. Never auto-continues past an unresolved challenge; the actual
+    /// run-resume wire call is a documented follow-up (no tempod resume endpoint /
+    /// `ShellClient::resume` yet).
+    ResumeTakeover,
 }
 
 /// Which way [`ShellUiModel::step_history`] walks the active tab's stack.
@@ -233,6 +238,7 @@ impl ShellUiModel {
             UiAction::RefreshScreenshot => self.refresh_screenshot(service),
             UiAction::PollEvents => self.poll_events(service),
             UiAction::ToggleMarks => self.toggle_marks(),
+            UiAction::ResumeTakeover => self.resume_takeover(),
         }
     }
 
@@ -410,6 +416,22 @@ impl ShellUiModel {
         }
     }
 
+    /// Resume from the blocking human-takeover banner (#354). Clears the local
+    /// block only; because takeover detection is pure over the observation, a
+    /// resumed run that re-observes an unresolved challenge re-journals the
+    /// takeover, which re-raises the banner on the next poll — it never
+    /// auto-continues past an unresolved CAPTCHA/auth-wall. The actual run-resume
+    /// wire call is a documented follow-up: there is no tempod resume endpoint or
+    /// `ShellClient::resume` today, so there is nothing to POST yet.
+    fn resume_takeover(&mut self) {
+        if self.journal.takeover().is_blocking() {
+            self.journal.resume_takeover();
+            self.status =
+                "Takeover resumed — control handed back; the banner returns if the challenge persists."
+                    .to_string();
+        }
+    }
+
     /// Flip the set-of-marks overlay flag. The next screenshot refresh requests
     /// the overlaid image; this only touches request state (no I/O here).
     fn toggle_marks(&mut self) {
@@ -516,6 +538,22 @@ mod tests {
             timestamp_ms: 0,
             event: TempodSessionEventKind::SessionCreated {
                 url: url.to_string(),
+            },
+        }
+    }
+
+    fn takeover_event(session_id: &str, seq: u64) -> TempodSessionEvent {
+        use tempo_schema::{HumanTakeover, TakeoverKind};
+        TempodSessionEvent {
+            session_id: TempodSessionId(session_id.to_string()),
+            seq,
+            timestamp_ms: 0,
+            event: TempodSessionEventKind::HumanTakeoverRequired {
+                takeover: HumanTakeover {
+                    kind: TakeoverKind::Captcha,
+                    reason: "turnstile challenge".to_string(),
+                    url: "https://a.test/verify".to_string(),
+                },
             },
         }
     }
@@ -1037,6 +1075,80 @@ mod tests {
             vec!["events:session-0:-", "events:session-0:1"]
         );
         assert_eq!(model.journal.entries.len(), 2);
+    }
+
+    #[test]
+    fn poll_events_raises_blocking_takeover_banner_then_resume_clears_it() {
+        use tempo_schema::TakeoverKind;
+
+        // A takeover surfaces on the same /events poll the agent panel runs.
+        let service = MockService {
+            canned_events: vec![
+                created_event("session-0", 0, "https://a.test"),
+                takeover_event("session-0", 1),
+            ],
+            ..MockService::default()
+        };
+        let mut model = ShellUiModel {
+            tabs: vec![Tab::new("session-0", None, "https://a.test")],
+            active_tab: Some(0),
+            ..ShellUiModel::default()
+        };
+
+        model.dispatch(UiAction::PollEvents, &service);
+
+        // The banner is up and blocking, naming the reason variant + URL.
+        let banner = model.journal.takeover();
+        assert!(banner.is_blocking(), "takeover must block the shell");
+        let Some(pending) = banner.pending() else {
+            panic!("takeover pending");
+        };
+        assert_eq!(pending.kind, TakeoverKind::Captcha);
+        assert_eq!(pending.url, "https://a.test/verify");
+        assert_eq!(banner.reason_label(), Some("captcha"));
+
+        // The human clicks Resume: the local block clears (control handed back).
+        model.dispatch(UiAction::ResumeTakeover, &service);
+        assert!(
+            !model.journal.takeover().is_blocking(),
+            "Resume hands control back"
+        );
+        assert!(model.status.contains("Takeover resumed"));
+    }
+
+    #[test]
+    fn poll_events_without_takeover_does_not_raise_the_banner() {
+        let service = MockService {
+            canned_events: vec![
+                created_event("session-0", 0, "https://a.test"),
+                created_event("session-0", 1, "https://a.test"),
+            ],
+            ..MockService::default()
+        };
+        let mut model = ShellUiModel {
+            tabs: vec![Tab::new("session-0", None, "https://a.test")],
+            active_tab: Some(0),
+            ..ShellUiModel::default()
+        };
+
+        model.dispatch(UiAction::PollEvents, &service);
+
+        assert!(
+            !model.journal.takeover().is_blocking(),
+            "ordinary events must not raise the takeover banner"
+        );
+    }
+
+    #[test]
+    fn resume_takeover_without_a_pending_banner_is_a_no_op() {
+        let service = MockService::default();
+        let mut model = ShellUiModel::default();
+        let before = model.status.clone();
+
+        model.dispatch(UiAction::ResumeTakeover, &service);
+
+        assert!(!model.journal.takeover().is_blocking());
+        assert_eq!(model.status, before, "no spurious status change");
     }
 
     #[test]
