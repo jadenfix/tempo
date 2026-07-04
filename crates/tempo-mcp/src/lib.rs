@@ -2128,16 +2128,17 @@ mod tests {
     #[tokio::test]
     async fn act_recomputes_taint_from_observation_and_blocks_clean_claim() -> Result<(), String> {
         // The MemoryDriver observation carries the page-provenance span
-        // "Continue". Navigating to a URL derived from it while claiming
-        // input_tainted=false must be blocked by server-side recomputation;
-        // this fails if the recomputation is removed.
+        // "Continue". Navigating to a case-only variant derived from it while
+        // claiming input_tainted=false must be blocked by server-side
+        // recomputation; this fails if recomputation is removed or
+        // case-sensitive.
         let mut server = TempoMcpServer::new(MemoryDriver::new());
 
         let denied = call_tool(
             &mut server,
             "act",
             json!({
-                "action": {"kind": "goto", "url": "https://evil.example/Continue"},
+                "action": {"kind": "goto", "url": "https://evil.example/continue"},
                 "input_tainted": false,
                 "confirmed": true
             }),
@@ -2175,7 +2176,7 @@ mod tests {
                 "batch": {
                     "actions": [
                         {"kind": "scroll", "x": 0.0, "y": 12.0},
-                        {"kind": "goto", "url": "https://evil.example/Continue"}
+                        {"kind": "goto", "url": "https://evil.example/continue"}
                     ],
                     "quiescence": "composite"
                 },

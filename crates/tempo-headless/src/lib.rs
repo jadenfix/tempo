@@ -4985,11 +4985,12 @@ mod tests {
     }
 
     /// The exact #342 repro: a REST `act_batch` Goto whose URL embeds a
-    /// page-provenance span must be DENIED even when the caller claims
-    /// `input_tainted:false`. The engine serves exactly ONE request (the
-    /// policy-evidence Observe) and NO ActBatch. This test FAILS (the Goto is
-    /// dispatched, 200) if the server-side taint recomputation is removed —
-    /// mirrors `bidi_navigate_recomputes_taint_from_observation_and_blocks_clean_claim`.
+    /// page-provenance span with different casing must be DENIED even when the
+    /// caller claims `input_tainted:false`. The engine serves exactly ONE
+    /// request (the policy-evidence Observe) and NO ActBatch. This test FAILS
+    /// (the Goto is dispatched, 200) if the server-side taint recomputation is
+    /// removed or case-sensitive — mirrors
+    /// `bidi_navigate_recomputes_taint_from_observation_and_blocks_clean_claim`.
     #[test]
     fn session_act_batch_goto_recomputes_taint_from_observation_and_blocks_clean_claim(
     ) -> TestResult {
@@ -4997,7 +4998,7 @@ mod tests {
         let handle = attach_driver_handler(&mut pool, |request| {
             assert_eq!(request.command, HostDriverCommand::Observe);
             DriverResponse::Observation {
-                observation: tainted_observation("https://current.test", 1, "evil.example/exfil"),
+                observation: tainted_observation("https://current.test", 1, "Evil.Example/Exfil"),
             }
         })?;
         let session_driver = pool
@@ -7425,13 +7426,14 @@ mod tests {
         let mut pool = SessionPool::default();
         // The engine serves exactly ONE request: the policy-evidence Observe.
         // Its observation carries a page-provenance span embedded in the
-        // navigation URL, so recomputation blocks the Goto even though the
-        // caller claimed inputTainted=false and confirmed=true. This fails if
-        // server-side recomputation is removed.
+        // navigation URL with different casing, so recomputation blocks the
+        // Goto even though the caller claimed inputTainted=false and
+        // confirmed=true. This fails if server-side recomputation is removed
+        // or case-sensitive.
         let handle = attach_driver_handler(&mut pool, |request| {
             assert_eq!(request.command, HostDriverCommand::Observe);
             DriverResponse::Observation {
-                observation: tainted_observation("https://current.test", 1, "evil.example/exfil"),
+                observation: tainted_observation("https://current.test", 1, "Evil.Example/Exfil"),
             }
         })?;
 
