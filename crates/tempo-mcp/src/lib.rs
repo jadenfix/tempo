@@ -195,8 +195,10 @@ where
             }
         };
 
-        let Some(id) = message.get("id").filter(|id| !id.is_null()).cloned() else {
-            return McpHttpResponse::empty(202);
+        let id = match json_rpc_response_id(&message) {
+            Ok(Some(id)) => id,
+            Ok(None) => return McpHttpResponse::empty(202),
+            Err(response) => return response,
         };
 
         let reply = self.handle_message(&message).await;
@@ -483,8 +485,10 @@ pub fn handle_post_driverless_with_config(
         }
     };
 
-    let Some(id) = message.get("id").filter(|id| !id.is_null()).cloned() else {
-        return McpHttpResponse::empty(202);
+    let id = match json_rpc_response_id(&message) {
+        Ok(Some(id)) => id,
+        Ok(None) => return McpHttpResponse::empty(202),
+        Err(response) => return response,
     };
 
     let reply = handle_driverless_message(&message, handshake_probe_config);
@@ -1150,6 +1154,22 @@ fn json_rpc_result(id: Value, result: Value) -> Value {
 
 fn json_rpc_error(id: Value, code: i64, message: impl Into<String>) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message.into()}})
+}
+
+fn json_rpc_response_id(message: &Value) -> Result<Option<Value>, McpHttpResponse> {
+    let Some(id) = message.get("id") else {
+        return Ok(None);
+    };
+    if !(id.is_null() || id.is_string() || id.is_number()) {
+        return Err(McpHttpResponse::json(
+            400,
+            json_rpc_error(Value::Null, -32600, "id must be a string, number, or null"),
+        ));
+    }
+    if id.is_null() {
+        return Ok(None);
+    }
+    Ok(Some(id.clone()))
 }
 
 fn tool_call_json(call: ToolCall) -> Value {
@@ -2032,6 +2052,18 @@ mod tests {
             .await;
         assert_eq!(notification.status, 202);
         assert!(notification.body.is_empty());
+
+        let invalid_id = server
+            .handle_post(None, br#"{"jsonrpc":"2.0","id":{},"method":"tools/list"}"#)
+            .await;
+        assert_eq!(invalid_id.status, 400);
+        let invalid_id = invalid_id.json_value().map_err(|error| error.to_string())?;
+        assert_eq!(invalid_id["id"], Value::Null);
+        assert_eq!(invalid_id["error"]["code"], -32600);
+        assert!(invalid_id["error"]["message"]
+            .as_str()
+            .ok_or("missing invalid id message")?
+            .contains("id must be a string, number, or null"));
 
         let get = handle_get();
         assert_eq!(get.status, 405);
