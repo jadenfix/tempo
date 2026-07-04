@@ -1,0 +1,45 @@
+# cargo-deny configuration — supply-chain gates for tempo.
+# Checked in CI by .github/workflows/audit.yml.
+
+[graph]
+# The default feature set is what ships; Servo lanes are opt-in features
+# audited through their own CI gates and fork-audit script.
+all-features = false
+
+[advisories]
+version = 2
+yanked = "deny"
+
+[licenses]
+version = 2
+# Permissive-only. Additions require review — tempo itself is Apache-2.0 and
+# binaries are redistributed from CI.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "CC0-1.0",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "warn"
+# "warn", not "deny": workspace-internal `{ path = ... }` deps are versionless
+# by design, and cargo-deny only excuses those when every crate is marked
+# publish = false. External wildcard versions still surface in the report.
+wildcards = "warn"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+
+[sources.allow-org]
+# beater sibling crates are consumed as rev-pinned git dependencies.
+github = ["jadenfix", "servo"]
