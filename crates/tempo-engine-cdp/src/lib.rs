@@ -25,7 +25,6 @@ use chromiumoxide::cdp::browser_protocol::target::{
 };
 use chromiumoxide::cdp::js_protocol::runtime::EvaluateParams;
 use chromiumoxide::error::CdpError;
-use chromiumoxide::handler::HandlerConfig;
 use chromiumoxide::page::{Page, ScreenshotParams};
 use futures::StreamExt;
 use std::collections::{BTreeMap, HashMap};
@@ -775,11 +774,7 @@ impl DriverTrait for CdpTempoDriver {
         _options: BrowsingContextCreateOptions,
     ) -> Result<Box<dyn DriverTrait>, Unsupported> {
         let browser_ws = self.browser.websocket_address().clone();
-        let handler_config = HandlerConfig {
-            cache_enabled: false,
-            ..HandlerConfig::default()
-        };
-        let (browser, mut handler) = Browser::connect_with_config(browser_ws, handler_config)
+        let (browser, mut handler) = Browser::connect(browser_ws)
             .await
             .map_err(|_error| Unsupported("fresh CDP browsing context"))?;
         let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
