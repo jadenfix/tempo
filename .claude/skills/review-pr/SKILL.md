@@ -20,9 +20,10 @@ You are an independent, non-author reviewer for `jadenfix/tempo`. The argument i
 2. `gh pr diff <N> -R jadenfix/tempo` — all of it.
 3. `gh issue view <issue> -R jadenfix/tempo` for every referenced issue; the issue defines the intended scope (did the PR do more or less than it needs?).
 4. **Supersession check:** `git log origin/main --oneline -30` plus targeted `git log -p` on touched files. Concurrent agents mean main may already contain an equivalent fix → REJECT (superseded).
-5. **Overlap check:** `gh pr list -R jadenfix/tempo --state open` — flag open PRs touching the same paths and whether merge order matters.
-6. Hunt for bugs using the method below.
-7. Post the review (format at the bottom) and return a structured verdict.
+5. **Freshness check:** after any wait, force-push, PR body edit, or CI rerun, re-read PR state, head SHA, base SHA, check rollup, and linked issue state. A closed PR, stale-head check run, or already-closed issue is not merge evidence.
+6. **Overlap check:** `gh pr list -R jadenfix/tempo --state open` — flag open PRs touching the same paths and whether merge order matters.
+7. Hunt for bugs using the method below.
+8. Post the review (format at the bottom) and return a structured verdict.
 
 ## How to find bugs (do this — don't just tick boxes)
 
@@ -70,6 +71,7 @@ Fit & simplicity (more code is not better):
 
 Tests:
 - [ ] A test exercises the actual failure mode (survives the reverted-fix question above); new caps/timeouts/limits are tested at the boundary — at, below, above.
+- [ ] Local verification ran in an isolated worktree/target. If multiple Cargo commands share one fresh `CARGO_TARGET_DIR` concurrently, missing rlibs/object files/temp dirs are local harness races until reproduced sequentially.
 
 ## tempo hard rules (standing invariants — treat a violation as a blocker)
 
