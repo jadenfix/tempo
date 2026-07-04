@@ -197,6 +197,14 @@ enum ForkEntry {
 struct ForkMap {
     entries: BTreeMap<String, ForkEntry>,
     next_fork_id: u64,
+    /// Set permanently by [`ForkSlots::retire`] when the server's forks are
+    /// being torn down (drain/detach). A `fork` tool call whose engine
+    /// round-trip completes AFTER the teardown snapshot must not register into
+    /// a registry nobody will close again — registration is refused and the
+    /// caller closes the fresh fork instead (#230 review blocker: the
+    /// lock-split made this race reachable; pre-#230 the global locks made it
+    /// impossible). Mirrors the BiDi CreateContext re-check-after-unlock.
+    retired: bool,
 }
 
 impl Default for ForkMap {
@@ -204,6 +212,7 @@ impl Default for ForkMap {
         Self {
             entries: BTreeMap::new(),
             next_fork_id: 1,
+            retired: false,
         }
     }
 }
@@ -232,8 +241,15 @@ impl ForkSlots {
                 reason: "MCP fork registry lock poisoned".into(),
             });
         };
-        // Cap check and registration are atomic under the registry lock so two
-        // concurrent `fork` calls cannot both slip past the cap.
+        // Retirement, cap check, and registration are all atomic under the
+        // registry lock: a fork either registers before the teardown snapshot
+        // (and is closed by it) or is refused here (and closed by its caller).
+        if map.retired {
+            return Err(ForkRegisterRejection {
+                forked,
+                reason: "MCP forks are shut down (drain/detach); the new fork was closed".into(),
+            });
+        }
         if map.entries.len() >= MAX_LIVE_FORKS {
             return Err(ForkRegisterRejection {
                 forked,
@@ -332,9 +348,18 @@ impl ForkSlots {
         }
     }
 
-    fn ids(&self) -> Vec<String> {
+    /// Permanently refuse new registrations and return the ids live at the
+    /// moment of retirement. Setting the flag and taking the snapshot under
+    /// ONE lock acquisition closes the in-flight-`fork`-across-drain race:
+    /// every fork is either in this snapshot (closed by the caller of
+    /// [`TempoMcpServer::close_all_forks`]) or refused at registration
+    /// (closed by the `fork` tool call itself).
+    fn retire(&self) -> Vec<String> {
         match self.inner.lock() {
-            Ok(map) => map.entries.keys().cloned().collect(),
+            Ok(mut map) => {
+                map.retired = true;
+                map.entries.keys().cloned().collect()
+            }
             Err(_) => Vec::new(),
         }
     }
@@ -383,12 +408,15 @@ impl<D> TempoMcpServer<D>
 where
     D: DriverTrait,
 {
-    /// Close and drop every live fork. Call when a session ends so forked engine
-    /// contexts do not leak for the process lifetime. Returns per-fork close errors.
-    /// Waits (bounded) for any fork still owned by an in-flight tool call.
+    /// Close and drop every live fork, and permanently retire the fork
+    /// registry so a `fork` tool call still in flight cannot register (and
+    /// leak) a context after this snapshot — it is refused at registration and
+    /// closes its own fork instead. Call when a session ends so forked engine
+    /// contexts do not leak for the process lifetime. Returns per-fork close
+    /// errors. Waits (bounded) for any fork still owned by an in-flight call.
     pub async fn close_all_forks(&self) -> Vec<String> {
         let mut errors = Vec::new();
-        for driver_id in self.forks.ids() {
+        for driver_id in self.forks.retire() {
             match self.forks.remove(&driver_id, DRIVER_LEASE_TIMEOUT) {
                 Ok(mut forked) => {
                     if let Err(error) = forked.close().await {
@@ -2632,6 +2660,38 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn fork_in_flight_across_close_all_forks_is_closed_not_leaked() -> Result<(), String> {
+        // #230 review blocker: a `fork` whose engine round-trip completes
+        // AFTER close_all_forks took its teardown snapshot must not register
+        // into a registry nobody will close again. The retired registry
+        // refuses the late registration and the tool call closes its own
+        // fork. Reverted (no retirement), the late fork registers
+        // successfully and is never closed — both assertions below fail.
+        let driver = MemoryDriver::new().with_fork_delay(Duration::from_millis(300));
+        let closed_counter = Arc::clone(&driver.closed);
+        let server = Arc::new(TempoMcpServer::new(driver));
+
+        let fork_server = Arc::clone(&server);
+        let in_flight =
+            std::thread::spawn(move || blocking_tool_call(&fork_server, 1, "fork", json!({})));
+        // Let the fork reach its engine round-trip, then tear down (drain).
+        std::thread::sleep(Duration::from_millis(100));
+        let errors = futures::executor::block_on(server.close_all_forks());
+        assert!(errors.is_empty(), "{errors:?}");
+
+        let fork_result = in_flight.join().map_err(|_| "fork call panicked")??;
+        let error_text = fork_result["result"]["structuredContent"]["error"]
+            .as_str()
+            .ok_or_else(|| {
+                format!("late fork must be refused after close_all_forks: {fork_result}")
+            })?;
+        assert!(error_text.contains("shut down"), "{error_text}");
+        // The refused fork was closed, not leaked.
+        assert_eq!(closed_counter.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
     async fn call_tool(
         server: &mut TempoMcpServer<MemoryDriver>,
         name: &str,
@@ -2761,6 +2821,9 @@ mod tests {
         /// When set, `observe` blocks this long — used by the issue #230
         /// concurrency tests to prove overlap/serialization.
         observe_delay: Option<Duration>,
+        /// When set, `fork` blocks this long — used to race an in-flight fork
+        /// against `close_all_forks` (#230 review blocker).
+        fork_delay: Option<Duration>,
         /// Start/end instants of every delayed `observe`, shared across forks.
         observe_spans: Arc<Mutex<Vec<(Instant, Instant)>>>,
     }
@@ -2770,6 +2833,7 @@ mod tests {
             Self {
                 closed: Arc::new(AtomicUsize::new(0)),
                 observe_delay: None,
+                fork_delay: None,
                 observe_spans: Arc::new(Mutex::new(Vec::new())),
                 web_mcp_available: false,
                 web_mcp_has_tools: false,
@@ -2834,6 +2898,11 @@ mod tests {
             self.observe_delay = Some(delay);
             self
         }
+
+        fn with_fork_delay(mut self, delay: Duration) -> Self {
+            self.fork_delay = Some(delay);
+            self
+        }
     }
 
     #[async_trait]
@@ -2893,6 +2962,9 @@ mod tests {
         }
 
         async fn fork(&mut self) -> Result<Box<dyn DriverTrait>, Unsupported> {
+            if let Some(delay) = self.fork_delay {
+                std::thread::sleep(delay);
+            }
             Ok(Box::new(self.clone()))
         }
 

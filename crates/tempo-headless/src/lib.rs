@@ -249,7 +249,14 @@ struct OpGate {
 impl OpGate {
     fn acquire(self: &Arc<Self>, timeout: Duration) -> Option<OpGateGuard> {
         let deadline = std::time::Instant::now().checked_add(timeout);
-        let mut busy = self.busy.lock().ok()?;
+        // Poisoning is recovered (`into_inner`): the guarded state is one bool
+        // whose invariant cannot be broken mid-panic, and treating poison as
+        // fatal would wedge every later operation on this driver behind a
+        // one-off panic (#305 review nit).
+        let mut busy = self
+            .busy
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         loop {
             if !*busy {
                 *busy = true;
@@ -259,8 +266,10 @@ impl OpGate {
             }
             let remaining = deadline
                 .and_then(|deadline| deadline.checked_duration_since(std::time::Instant::now()))?;
-            let (guard, _) = self.released.wait_timeout(busy, remaining).ok()?;
-            busy = guard;
+            busy = match self.released.wait_timeout(busy, remaining) {
+                Ok((guard, _)) => guard,
+                Err(poisoned) => poisoned.into_inner().0,
+            };
         }
     }
 }
@@ -271,9 +280,11 @@ struct OpGateGuard {
 
 impl Drop for OpGateGuard {
     fn drop(&mut self) {
-        if let Ok(mut busy) = self.gate.busy.lock() {
-            *busy = false;
-        }
+        *self
+            .gate
+            .busy
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = false;
         self.gate.released.notify_one();
     }
 }
@@ -4488,6 +4499,63 @@ mod tests {
         // The in-flight ops must resolve (success or error, but never hang).
         let _ = nav_root.join().map_err(|_| "root navigate panicked")?;
         let _ = nav_fork.join().map_err(|_| "fork navigate panicked")?;
+        for server in servers {
+            server.join().map_err(|_| "server thread panicked")??;
+        }
+        Ok(())
+    }
+
+    /// (#305 review blocker) An MCP `fork` in flight when `/drain` fires must
+    /// not leak the forked browsing context: the fork's engine round-trip can
+    /// complete AFTER drain's `close_all_forks` snapshot, so the retired MCP
+    /// fork registry refuses the late registration and the tool call closes
+    /// its own fork. Reverted, the engine never receives a Close for the late
+    /// fork and the recv below times out.
+    #[test]
+    fn mcp_fork_in_flight_across_drain_is_closed_not_leaked() -> TestResult {
+        let (fork_closed_tx, fork_closed_rx) = std::sync::mpsc::channel();
+        let pool = shared_pool_with_fake_engine(move |request| match &request.command {
+            HostDriverCommand::Fork => FakeEngineReply::RespondAfter(
+                Duration::from_millis(300),
+                DriverResponse::Forked {
+                    driver_id: "fork-1".into(),
+                },
+            ),
+            HostDriverCommand::Close if request.driver_id.as_deref() == Some("fork-1") => {
+                let _ = fork_closed_tx.send(());
+                FakeEngineReply::Respond(DriverResponse::Closed)
+            }
+            _ => FakeEngineReply::Respond(DriverResponse::Closed),
+        })?;
+
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let servers = spawn_servers(&listener, &pool, 2)?;
+
+        let fork_call = thread::spawn(move || {
+            http_post(
+                addr,
+                "/mcp",
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"fork","arguments":{}}}"#,
+            )
+        });
+        // Drain while the fork's engine round-trip is still in flight.
+        thread::sleep(Duration::from_millis(100));
+        let drain = http_post(addr, "/drain", "")?;
+        assert!(drain.starts_with("HTTP/1.1 200"), "{drain}");
+
+        // The late fork must be closed engine-side, not leaked.
+        fork_closed_rx
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(|_| {
+                "fork completing after the drain snapshot was never closed: \
+             the forked browsing context leaked engine-side"
+            })?;
+        let fork_response = fork_call.join().map_err(|_| "fork call panicked")??;
+        assert!(
+            fork_response.contains("shut down"),
+            "late fork must be refused after drain: {fork_response}"
+        );
         for server in servers {
             server.join().map_err(|_| "server thread panicked")??;
         }
