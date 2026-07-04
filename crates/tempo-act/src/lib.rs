@@ -84,11 +84,52 @@ impl ActionExecution {
     }
 }
 
-/// Execute a single action and always verify the resulting page state by asking
-/// the driver for a post-action diff from the pre-action observation sequence.
+/// How `finish_execution` obtains the post-action grounding diff.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Grounding {
+    /// Trust an Applied outcome's embedded diff when it was computed against
+    /// exactly the pre-action base; re-ground with a forced `observe_diff`
+    /// otherwise. The live engines produce that diff from a genuine
+    /// post-settle observe, so re-reading the same settled page would only
+    /// duplicate work on the latency-critical path.
+    TrustMatchingDiff,
+    /// Always re-ground with an independent `observe_diff`, even when the
+    /// embedded diff matches the base. For paths where the diff is a
+    /// verification witness — replay divergence detection — the read-back
+    /// must be independent of the act path it is checking.
+    IndependentRediff,
+}
+
+/// Execute a single action and verify the resulting page state with a
+/// post-action diff from the pre-action observation sequence (the engine's
+/// own post-settle diff when it matches that base).
 pub async fn execute_action<D>(
     driver: &mut D,
     action: &Action,
+) -> Result<ActionExecution, TransportError>
+where
+    D: DriverTrait + ?Sized,
+{
+    execute_action_grounded(driver, action, Grounding::TrustMatchingDiff).await
+}
+
+/// [`execute_action`], but the grounding diff always comes from an independent
+/// post-action `observe_diff`. Use where the diff is a verification witness
+/// (e.g. replay divergence detection) rather than a latency-sensitive product.
+pub async fn execute_action_verified<D>(
+    driver: &mut D,
+    action: &Action,
+) -> Result<ActionExecution, TransportError>
+where
+    D: DriverTrait + ?Sized,
+{
+    execute_action_grounded(driver, action, Grounding::IndependentRediff).await
+}
+
+async fn execute_action_grounded<D>(
+    driver: &mut D,
+    action: &Action,
+    grounding: Grounding,
 ) -> Result<ActionExecution, TransportError>
 where
     D: DriverTrait + ?Sized,
@@ -102,14 +143,40 @@ where
         1,
         action.side_effect(),
         driver.engine(),
+        grounding,
     )
     .await
 }
 
-/// Execute a batch through the driver and verify one post-batch diff.
+/// Execute a batch through the driver and verify one post-batch diff (the
+/// engine's own post-settle diff when it matches the pre-batch base).
 pub async fn execute_batch<D>(
     driver: &mut D,
     batch: &ActionBatch,
+) -> Result<ActionExecution, TransportError>
+where
+    D: DriverTrait + ?Sized,
+{
+    execute_batch_grounded(driver, batch, Grounding::TrustMatchingDiff).await
+}
+
+/// [`execute_batch`], but the grounding diff always comes from an independent
+/// post-batch `observe_diff`. Use where the diff is a verification witness
+/// (e.g. replay divergence detection) rather than a latency-sensitive product.
+pub async fn execute_batch_verified<D>(
+    driver: &mut D,
+    batch: &ActionBatch,
+) -> Result<ActionExecution, TransportError>
+where
+    D: DriverTrait + ?Sized,
+{
+    execute_batch_grounded(driver, batch, Grounding::IndependentRediff).await
+}
+
+async fn execute_batch_grounded<D>(
+    driver: &mut D,
+    batch: &ActionBatch,
+    grounding: Grounding,
 ) -> Result<ActionExecution, TransportError>
 where
     D: DriverTrait + ?Sized,
@@ -123,6 +190,7 @@ where
         batch.actions.len(),
         max_side_effect(&batch.actions),
         driver.engine(),
+        grounding,
     )
     .await
 }
@@ -149,10 +217,37 @@ async fn finish_execution<D>(
     action_count: usize,
     max_side_effect: SideEffect,
     engine: Engine,
+    grounding: Grounding,
 ) -> Result<ActionExecution, TransportError>
 where
     D: DriverTrait + ?Sized,
 {
+    // An Applied outcome whose embedded diff was computed against exactly our
+    // pre-action base already IS the post-action grounding diff: the live
+    // engines produce it from a genuine post-settle observe, so re-issuing
+    // observe_diff would pull the same settled page a second time (on CDP: a
+    // full DOM fetch plus the AX-enrichment round-trips plus the observe-side
+    // policy grace). Trust it only on an exact base match; any other base —
+    // e.g. a per-action default batch impl whose last diff is relative to the
+    // previous action, not the batch base — re-grounds below. Verification
+    // callers (Grounding::IndependentRediff) always re-ground.
+    let outcome = match outcome {
+        StepOutcome::Applied { diff }
+            if grounding == Grounding::TrustMatchingDiff && diff.since_seq == since_seq =>
+        {
+            return Ok(ActionExecution {
+                engine,
+                status: ExecutionStatus::Applied,
+                action_count,
+                max_side_effect,
+                since_seq,
+                seq: diff.seq,
+                diff,
+            });
+        }
+        other => other,
+    };
+
     // Ground the outcome against a forced post-batch diff. The batch driver
     // applies actions in order and breaks on the first step error, so a
     // StepError with a non-empty diff means earlier actions already grounded:
@@ -567,6 +662,67 @@ mod tests {
         assert_eq!(execution.since_seq, 10);
         assert_eq!(execution.seq, 11);
         assert_eq!(execution.diff.changed.len(), 1);
+        // The action's embedded diff was computed against exactly the
+        // pre-action base (since_seq 10), so no forced re-diff is issued.
+        assert!(driver.observe_diff_calls.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn applied_batch_with_matching_base_skips_forced_rediff() -> Result<(), String> {
+        let mut driver = ContractDriver::new();
+        let batch = ActionBatch {
+            actions: vec![Action::Click {
+                node: NodeId("button".into()),
+            }],
+            quiescence: QuiescencePolicy::Composite,
+        };
+        let execution =
+            block_on(execute_batch(&mut driver, &batch)).map_err(|error| error.to_string())?;
+        assert!(execution.applied());
+        assert_eq!(execution.since_seq, 10);
+        assert_eq!(execution.seq, 11);
+        assert_eq!(execution.diff.changed.len(), 1);
+        assert!(driver.observe_diff_calls.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn verified_execution_regrounds_even_on_matching_base() -> Result<(), String> {
+        let mut driver = ContractDriver::new();
+        let action = Action::Click {
+            node: NodeId("button".into()),
+        };
+        let execution = block_on(execute_action_verified(&mut driver, &action))
+            .map_err(|error| error.to_string())?;
+        assert!(execution.applied());
+        // The embedded diff matches the base, but verification callers must
+        // still get an independent read-back.
+        assert_eq!(driver.observe_diff_calls, vec![10]);
+        Ok(())
+    }
+
+    #[test]
+    fn applied_batch_with_mismatched_base_regrounds_with_forced_rediff() -> Result<(), String> {
+        let mut driver = ContractDriver::new();
+        // Two actions through the per-action mock batch: the last embedded
+        // diff is relative to the previous action (since_seq 11), not the
+        // batch base (10), so the executor must re-ground from the base.
+        let batch = ActionBatch {
+            actions: vec![
+                Action::Click {
+                    node: NodeId("button".into()),
+                },
+                Action::Click {
+                    node: NodeId("button".into()),
+                },
+            ],
+            quiescence: QuiescencePolicy::Composite,
+        };
+        let execution =
+            block_on(execute_batch(&mut driver, &batch)).map_err(|error| error.to_string())?;
+        assert!(execution.applied());
+        assert_eq!(execution.since_seq, 10);
         assert_eq!(driver.observe_diff_calls, vec![10]);
         Ok(())
     }

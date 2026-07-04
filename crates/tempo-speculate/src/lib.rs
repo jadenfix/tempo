@@ -8,7 +8,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use tempo_act::{execute_action, execute_batch, ActionExecution, ExecutionStatus};
+use tempo_act::{
+    execute_action_verified, execute_batch_verified, ActionExecution, ExecutionStatus,
+};
 use tempo_driver::{DriverTrait, Engine, TransportError, Unsupported};
 use tempo_schema::{Action, ActionBatch, ObservationDiff};
 use tempo_session::{
@@ -352,7 +354,10 @@ where
 
     let mut prefix = Vec::with_capacity(branch.prefix.len());
     for expected in &branch.prefix {
-        let execution = execute_action(driver, expected.action())
+        // Replay verification needs the diff as an independent witness: the
+        // verified variant always re-grounds with its own observe_diff instead
+        // of trusting the act path it is checking.
+        let execution = execute_action_verified(driver, expected.action())
             .await
             .map_err(|source| SpeculateError::DriverTransport {
                 context: "replay action",
@@ -373,7 +378,7 @@ where
         });
     }
 
-    let branch_execution = execute_batch(driver, &branch.batch)
+    let branch_execution = execute_batch_verified(driver, &branch.batch)
         .await
         .map_err(|source| SpeculateError::DriverTransport {
             context: "branch batch",
