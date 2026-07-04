@@ -26,6 +26,8 @@ Android and OpenHarmony use the Unix-domain-socket control plane in app-private 
 When multiple agents are working, use **[`docs/agent-worktrees.md`](./docs/agent-worktrees.md)**
 and `scripts/new-agent-worktree.sh` to create isolated PR-sized checkouts.
 
+**[`docs/PLATFORMS.md`](./docs/PLATFORMS.md)** is the cross-platform plan — how the same agent contract ships on macOS, Windows, Android, and iOS via three engine tiers (embedded Servo, system webview, API-first no-engine), with per-hop latency budgets and per-tier RAM discipline as milestone gates.
+
 ## Layout
 
 Cargo workspace under `crates/`. The implementation is split into contract, engine,
