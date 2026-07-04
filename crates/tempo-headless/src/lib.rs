@@ -817,11 +817,28 @@ impl SessionPool {
             "tempod: {label} was abandoned while sharing the attached engine IPC; \
              detaching engine state to avoid future pool-lock stalls (#200)"
         );
-        self.driver = None;
-        self.mcp = None;
-        self.session_drivers.clear();
-        self.bidi_contexts.clear();
-        self.next_bidi_context_id = 1;
+        // Detach the engine, but do NOT merely drop the remaining pre-existing
+        // session/BiDi contexts: dropping an `AttachedEngineDriver` sends no
+        // `Close`, so any context that was already live would leak engine-side
+        // (the maps are cleared, so no later `kill`/BiDi-close can reclaim it)
+        // (#213 review). Delegate to the same bounded, detached best-effort
+        // teardown used elsewhere: it `mem::take`s the forked BiDi contexts, MCP
+        // forks, session-owned contexts, and root driver, runs their `Close`es in
+        // order on one detached worker, and awaits with a single `recv_timeout`
+        // -- so the engine still ends up invalidated (`driver`/`mcp` nulled, maps
+        // cleared, so later engine requests fast-fail) while the pre-existing
+        // contexts get a best-effort `Close` instead of a silent drop. The shared
+        // IPC handle is wedged, so these closes cannot complete synchronously; the
+        // bound (200ms in tests) caps the extra lock-hold and the detached worker
+        // owns/finishes the closes once the engine answers or disconnects.
+        //
+        // Not re-entrant: `bounded_engine_teardown` never calls back into
+        // `abandon_*`. Not a double-close of a caller-owned driver either --
+        // `close_session_driver` `remove`s its single driver before its own
+        // bounded attempt, and the create `on_orphan` path owns the freshly
+        // created context, so the map contents drained here are disjoint from
+        // those already-owned drivers.
+        self.bounded_engine_teardown(true, ENGINE_TEARDOWN_TIMEOUT);
     }
 
     fn bidi_driver_for(&self, context: &BrowsingContextId) -> Option<AttachedEngineDriver> {
@@ -2958,6 +2975,158 @@ mod tests {
         })?;
 
         join_driver_handler(late_engine)?;
+        Ok(())
+    }
+
+    #[test]
+    fn wedged_create_closes_pre_existing_session_context_on_invalidation() -> TestResult {
+        // Regression for the #213 review leak: when a session context is ALREADY
+        // live and a LATER create times out on a wedged navigation, the engine is
+        // invalidated. The pre-existing context must receive a best-effort `Close`
+        // -- not be dropped silently. The pre-fix `abandon_*` merely `.clear()`ed
+        // `session_drivers`/`bidi_contexts`; dropping an `AttachedEngineDriver`
+        // sends no `Close`, so the live browsing context leaked engine-side (the
+        // maps were cleared, so no later `kill`/BiDi-close could reclaim it).
+        // Against the pre-fix branch no `Close` is ever sent for the pre-existing
+        // context, so `pre_close_rx` never fires and this test fails. With the fix
+        // `abandon_*` delegates to the bounded detached teardown, which `Close`s the
+        // pre-existing context once the wedged `goto` frees the shared engine mutex.
+        let (client_stream, server_stream) = UnixStream::pair()?;
+        let (pre_close_tx, pre_close_rx) = std::sync::mpsc::channel();
+        let engine = thread::spawn(move || -> Result<(), EngineHostError> {
+            let mut connection = EngineIpcConnection::from_stream(server_stream);
+
+            // (1) Pre-existing session context: create + goto, both answered, so it
+            // is live in `pool.session_drivers` before the wedged create runs.
+            let create_pre = connection.read_driver_request()?;
+            assert!(create_pre.driver_id.is_none());
+            assert!(matches!(
+                create_pre.command,
+                HostDriverCommand::CreateBrowsingContext { .. }
+            ));
+            connection.write_driver_response(
+                create_pre.id,
+                DriverResponse::BrowsingContextCreated {
+                    driver_id: "session-context-pre".into(),
+                },
+            )?;
+            let goto_pre = connection.read_driver_request()?;
+            assert_eq!(goto_pre.driver_id.as_deref(), Some("session-context-pre"));
+            assert!(matches!(goto_pre.command, HostDriverCommand::Goto { .. }));
+            connection.write_driver_response(
+                goto_pre.id,
+                DriverResponse::Observation {
+                    observation: observation("https://pre-existing.test", 1),
+                },
+            )?;
+
+            // (2) The create that times out: create answered, `goto` answered only
+            // AFTER the create bound (200ms in cfg(test)) so the caller's
+            // `recv_timeout` expires and invalidates the engine. Answering it late
+            // then releases the shared engine mutex so the detached teardown worker
+            // can send its best-effort `Close`es for the pre-existing context.
+            let create_wedged = connection.read_driver_request()?;
+            assert!(matches!(
+                create_wedged.command,
+                HostDriverCommand::CreateBrowsingContext { .. }
+            ));
+            connection.write_driver_response(
+                create_wedged.id,
+                DriverResponse::BrowsingContextCreated {
+                    driver_id: "session-context-wedged".into(),
+                },
+            )?;
+            let goto_wedged = connection.read_driver_request()?;
+            assert_eq!(
+                goto_wedged.driver_id.as_deref(),
+                Some("session-context-wedged")
+            );
+            assert!(matches!(
+                goto_wedged.command,
+                HostDriverCommand::Goto { .. }
+            ));
+            thread::sleep(Duration::from_millis(400));
+            connection.write_driver_response(
+                goto_wedged.id,
+                DriverResponse::Observation {
+                    observation: observation("https://wedged-nav.test", 2),
+                },
+            )?;
+
+            // (3) After invalidation, the pre-existing context must be closed. The
+            // orphaned wedged context and the root are also closed here; their order
+            // is not deterministic, so respond `Closed` to every `Close` and signal
+            // when the PRE-EXISTING context's `Close` is observed. Read until the
+            // client ends (all engine handles dropped once the closes complete).
+            loop {
+                let request = match connection.read_driver_request() {
+                    Ok(request) => request,
+                    Err(_) => break,
+                };
+                if request.command == HostDriverCommand::Close {
+                    if request.driver_id.as_deref() == Some("session-context-pre") {
+                        let _ = pre_close_tx.send(());
+                    }
+                    connection.write_driver_response(request.id, DriverResponse::Closed)?;
+                }
+            }
+            Ok(())
+        });
+
+        let mut pool = SessionPool::default();
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+
+        // Create the pre-existing, live session context.
+        let pre = handle_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/sessions".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: br#"{"url":"https://pre-existing.test"}"#.to_vec(),
+            },
+        );
+        assert_eq!(pre.status, 201);
+        assert_eq!(pool.session_drivers.len(), 1);
+
+        // A second create times out on the wedged navigation and invalidates the
+        // shared engine.
+        let wedged = handle_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/sessions".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: br#"{"url":"https://wedged-nav.test"}"#.to_vec(),
+            },
+        );
+        assert_eq!(wedged.status, 500);
+        // Engine invalidated: no root driver / MCP fork / leaked session drivers.
+        assert!(
+            pool.driver.is_none(),
+            "attached engine was not invalidated after a create timeout"
+        );
+        assert!(pool.mcp.is_none());
+        assert!(pool.session_drivers.is_empty());
+        assert!(pool.bidi_contexts.is_empty());
+
+        // The KEY assertion: the pre-existing session context must get a best-effort
+        // `Close`, not be dropped silently. Bound the wait so the pre-fix leak
+        // surfaces as a failure here (no `Close` ever arrives) rather than hanging
+        // the suite.
+        pre_close_rx
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(|_| {
+                "engine invalidation dropped the pre-existing session context without a \
+             Close: the live browsing context was leaked engine-side"
+            })?;
+
+        drop(pool);
+        join_driver_handler(engine)?;
         Ok(())
     }
 
