@@ -76,11 +76,15 @@ pub struct CompiledObservation {
     pub elements: Vec<InteractiveElement>,
     /// Ranked elements omitted by the observation budgeter. Zero means the
     /// compiled observation contains every candidate the compiler considered.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "u32_is_zero")]
     pub omitted: u32,
     /// Optional set-of-marks overlay: NodeId -> mark label drawn over the screenshot.
     #[serde(default)]
     pub marks: Vec<(NodeId, u32)>,
+}
+
+fn u32_is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 /// Diff-based re-observation: only what changed since `since_seq` (final.md §2.3).
@@ -1005,8 +1009,21 @@ mod tests {
             marks: vec![],
         };
         let s = serde_json::to_string(&obs)?;
+        assert!(
+            !s.contains("\"omitted\""),
+            "zero omitted count should stay out of the wire: {s}"
+        );
         let back: CompiledObservation = serde_json::from_str(&s)?;
         assert_eq!(obs, back);
+
+        let truncated = CompiledObservation { omitted: 7, ..obs };
+        let s = serde_json::to_string(&truncated)?;
+        assert!(
+            s.contains("\"omitted\":7"),
+            "nonzero omitted count must be visible to agents: {s}"
+        );
+        let back: CompiledObservation = serde_json::from_str(&s)?;
+        assert_eq!(truncated, back);
         Ok(())
     }
 
