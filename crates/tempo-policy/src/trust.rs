@@ -7,12 +7,13 @@
 //! seam where those claims are sanitized against server-derived evidence
 //! before any policy decision is made:
 //!
-//! 1. **Taint is recomputed server-side.** An action input is tainted when any
-//!    of its caller-controlled text parameters overlaps page-provenance span
-//!    text in the current compiled observation (the same `Provenance::Page`
-//!    predicate `tempo-taint` labels spans with). A caller claim can only
-//!    ESCALATE the result (mark input MORE tainted), never clear
-//!    server-derived taint.
+//! 1. **Taint is recomputed server-side.** External writable side effects are
+//!    treated as tainted until a trusted confirmation/provenance channel exists.
+//!    For read effects, action input is tainted when any caller-controlled text
+//!    parameter overlaps page-provenance span text in the current compiled
+//!    observation (the same `Provenance::Page` predicate `tempo-taint` labels
+//!    spans with). A caller claim can only ESCALATE the result (mark input MORE
+//!    tainted), never clear server-derived taint.
 //! 2. **`confirmed` needs an attributable channel.** A bare `confirmed: true`
 //!    from the caller is never proof that a human confirmed anything. No
 //!    server-minted confirmation channel exists at the MCP/BiDi boundary
@@ -143,10 +144,17 @@ fn collect_string_leaves<'a>(value: &'a serde_json::Value, out: &mut Vec<&'a str
 /// Whether a boundary must fetch a fresh observation before gating.
 ///
 /// Skipping is exact, never a weakening: when the caller already claims taint
-/// the effective taint is already at its maximum, and when the action carries
-/// no matchable text the recomputation is constantly clean.
-pub fn requires_observation_evidence(texts: &[&str], claims: CallerPolicyClaims) -> bool {
-    !claims.claims_tainted() && texts.iter().any(|text| !text.trim().is_empty())
+/// the effective taint is already at its maximum, writable effects are forced
+/// tainted at this untrusted boundary, and actions without matchable text have
+/// no evidence to recompute.
+pub fn requires_observation_evidence(
+    effect: SideEffect,
+    texts: &[&str],
+    claims: CallerPolicyClaims,
+) -> bool {
+    !boundary_forces_taint(effect)
+        && !claims.claims_tainted()
+        && texts.iter().any(|text| !text.trim().is_empty())
 }
 
 /// Server-side taint recomputation: tainted iff any caller text overlaps a
@@ -208,8 +216,13 @@ pub fn gate_boundary_effect(
         .map(|observation| observation_text_taint(observation, texts))
         .unwrap_or(InputTaint::CLEAN);
     // Escalate-only merge: the caller claim can add taint on top of the
-    // server's evidence, never remove it.
-    let effective = InputTaint::new(recomputed.is_tainted() || claims.claims_tainted());
+    // server's evidence, never remove it. External writable effects are also
+    // tainted until a server-attributable confirmation/provenance channel
+    // exists; otherwise caller-claimed clean writes would bypass the policy
+    // gate that issue #254 is closing.
+    let effective = InputTaint::new(
+        boundary_forces_taint(effect) || recomputed.is_tainted() || claims.claims_tainted(),
+    );
     let decision = decide_effect(effect, effective);
     if decision.requires_confirmation() {
         // No server-attributable confirmation channel exists at the MCP/BiDi
@@ -221,6 +234,10 @@ pub fn gate_boundary_effect(
     } else {
         Ok(decision)
     }
+}
+
+fn boundary_forces_taint(effect: SideEffect) -> bool {
+    effect >= SideEffect::Write
 }
 
 #[cfg(test)]
@@ -355,28 +372,30 @@ mod tests {
     }
 
     #[test]
-    fn caller_claim_escalates_over_clean_server_evidence() -> Result<(), String> {
+    fn external_write_is_tainted_even_with_clean_server_evidence() -> Result<(), String> {
         let observation = observation_with_page_text("unrelated page text");
-        let action = Action::Type {
+        let write = Action::Type {
             node: NodeId("field.note".into()),
             text: "fresh user words".into(),
         };
 
-        // Server evidence alone: clean write, no confirmation.
-        let allowed = gate_boundary_action(
-            &action,
+        let denied = denial(gate_boundary_action(
+            &write,
             Some(&observation),
             CallerPolicyClaims::new(Some(false), false),
-        );
-        assert!(allowed.is_ok());
-
-        // Caller marks it more tainted: honored (escalate-only).
-        let denied = denial(gate_boundary_action(
-            &action,
-            Some(&observation),
-            CallerPolicyClaims::new(Some(true), false),
         ))?;
         assert!(denied.decision.input_taint.is_tainted());
+        assert_eq!(denied.decision.gate, ConfirmationGate::Confirm);
+
+        let read = Action::Goto {
+            url: "https://fresh.example".into(),
+        };
+        assert!(gate_boundary_action(
+            &read,
+            Some(&observation),
+            CallerPolicyClaims::new(Some(false), false),
+        )
+        .is_ok());
         Ok(())
     }
 
@@ -403,20 +422,31 @@ mod tests {
     fn observation_skip_conditions_are_exact() {
         // Already-tainted claim: recomputation cannot change the outcome.
         assert!(!requires_observation_evidence(
+            SideEffect::Read,
             &["text"],
             CallerPolicyClaims::new(Some(true), false)
         ));
+        // Writable effects are forced tainted at the boundary, so evidence
+        // cannot make them clean.
+        assert!(!requires_observation_evidence(
+            SideEffect::Write,
+            &["text"],
+            CallerPolicyClaims::new(Some(false), false)
+        ));
         // No matchable text: recomputation is constantly clean.
         assert!(!requires_observation_evidence(
+            SideEffect::Read,
             &[],
             CallerPolicyClaims::new(Some(false), false)
         ));
         assert!(!requires_observation_evidence(
+            SideEffect::Read,
             &["   "],
             CallerPolicyClaims::new(Some(false), false)
         ));
         // Clean claim with real text: evidence is required.
         assert!(requires_observation_evidence(
+            SideEffect::Read,
             &["text"],
             CallerPolicyClaims::new(Some(false), false)
         ));
@@ -424,16 +454,24 @@ mod tests {
 
     #[test]
     fn gate_without_observation_still_applies_caller_escalation() -> Result<(), String> {
-        let action = Action::Click {
+        let read = Action::Scroll { x: 0.0, y: 1.0 };
+        assert!(
+            gate_boundary_action(&read, None, CallerPolicyClaims::new(Some(false), false)).is_ok()
+        );
+
+        let click = Action::Click {
             node: NodeId("button.buy".into()),
         };
 
-        assert!(
-            gate_boundary_action(&action, None, CallerPolicyClaims::new(Some(false), false))
-                .is_ok()
-        );
         let denied = denial(gate_boundary_action(
-            &action,
+            &click,
+            None,
+            CallerPolicyClaims::new(Some(false), false),
+        ))?;
+        assert!(denied.decision.input_taint.is_tainted());
+
+        let denied = denial(gate_boundary_action(
+            &click,
             None,
             CallerPolicyClaims::new(Some(true), true),
         ))?;

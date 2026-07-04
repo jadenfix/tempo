@@ -2725,7 +2725,7 @@ fn gate_bidi_command(
     texts: &[&str],
     claims: CallerPolicyClaims,
 ) -> Option<BidiDispatchResult> {
-    let observation = if requires_observation_evidence(texts, claims) {
+    let observation = if requires_observation_evidence(effect, texts, claims) {
         match futures::executor::block_on(driver.observe()) {
             Ok(observation) => Some(observation),
             Err(error) => {
@@ -5543,26 +5543,12 @@ mod tests {
     }
 
     #[test]
-    fn bidi_endpoint_routes_script_evaluate_to_attached_engine_driver() -> TestResult {
+    fn bidi_endpoint_denies_client_claimed_clean_script_without_confirmation_channel() -> TestResult
+    {
+        let (client_stream, mut server_stream) = UnixStream::pair()?;
+        server_stream.set_nonblocking(true)?;
         let mut pool = SessionPool::default();
-        // A clean-claimed script.evaluate first fetches policy taint evidence
-        // (Observe), then executes the script (#254).
-        let handle = attach_driver_handler_seq(&mut pool, 2, |request| match request.command {
-            HostDriverCommand::Observe => DriverResponse::Observation {
-                observation: observation("about:blank", 0),
-            },
-            HostDriverCommand::EvaluateScript {
-                expression,
-                await_promise,
-            } => {
-                assert_eq!(expression, "document.title");
-                assert!(await_promise);
-                DriverResponse::Evaluated {
-                    value: json!("Tempo"),
-                }
-            }
-            _ => DriverResponse::Closed,
-        })?;
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream))?;
 
         let response = route_http_request(
             &mut pool,
@@ -5575,14 +5561,18 @@ mod tests {
                 body: br#"{"id":8,"method":"script.evaluate","params":{"expression":"document.title","target":{"context":"tempo-root"},"awaitPromise":true,"inputTainted":false}}"#.to_vec(),
             },
         )?;
-        join_driver_handler(handle)?;
 
         assert_eq!(response.status, 200);
         let value: Value = serde_json::from_slice(&response.body)?;
-        assert_eq!(value["type"], "success");
+        assert_eq!(value["type"], "error");
         assert_eq!(value["id"], 8);
-        assert_eq!(value["result"]["result"], "Tempo");
-        assert_eq!(value["result"]["realm"], "tempo-root");
+        assert_eq!(value["error"], "invalid argument");
+        let message = value["message"]
+            .as_str()
+            .ok_or("BiDi error response should include a message")?;
+        assert!(message.contains("policy denied"));
+        assert!(message.contains("input_tainted=true"));
+        assert_no_driver_ipc(&mut server_stream)?;
         Ok(())
     }
 
@@ -5711,18 +5701,11 @@ mod tests {
     }
 
     #[test]
-    fn bidi_script_recomputes_taint_from_observation_and_blocks_clean_claim() -> TestResult {
+    fn bidi_script_denies_confirmed_clean_claim_without_confirmation_channel() -> TestResult {
+        let (client_stream, mut server_stream) = UnixStream::pair()?;
+        server_stream.set_nonblocking(true)?;
         let mut pool = SessionPool::default();
-        // The engine serves exactly ONE request: the policy-evidence Observe.
-        // The script expression embeds a page-provenance span (an account
-        // number rendered by the page), so the recomputed taint blocks
-        // evaluation despite inputTainted=false.
-        let handle = attach_driver_handler(&mut pool, |request| {
-            assert_eq!(request.command, HostDriverCommand::Observe);
-            DriverResponse::Observation {
-                observation: tainted_observation("https://current.test", 1, "12345678"),
-            }
-        })?;
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream))?;
 
         let response = route_http_request(
             &mut pool,
@@ -5735,7 +5718,6 @@ mod tests {
                 body: br#"{"id":27,"method":"script.evaluate","params":{"expression":"pay('12345678')","target":{"context":"tempo-root"},"inputTainted":false,"confirmed":true}}"#.to_vec(),
             },
         )?;
-        join_driver_handler(handle)?;
 
         assert_eq!(response.status, 200);
         let value: Value = serde_json::from_slice(&response.body)?;
@@ -5747,6 +5729,8 @@ mod tests {
             .ok_or("BiDi error response should include a message")?;
         assert!(message.contains("policy denied"));
         assert!(message.contains("input_tainted=true"));
+        assert!(message.contains("confirmed=true was ignored"));
+        assert_no_driver_ipc(&mut server_stream)?;
         Ok(())
     }
 
