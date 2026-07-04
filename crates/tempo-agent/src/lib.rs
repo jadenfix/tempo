@@ -2202,7 +2202,10 @@ fn structured_signal_from_name(name: &str) -> Option<StructuredSignal> {
 
 fn structured_remote_side_effect(action: &Action) -> SideEffect {
     match action {
-        Action::Skill { .. } => SideEffect::Send,
+        // Remote MCP catalogs do not carry a trusted Tempo side-effect
+        // declaration yet. Treat unknown remote tools as maximally destructive
+        // so threshold origin rules for Purchase/Delete cannot be bypassed.
+        Action::Skill { .. } => SideEffect::Delete,
         other => other.side_effect(),
     }
 }
@@ -2939,7 +2942,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runner_mcp_fast_path_requires_confirmation_for_unknown_remote_tools() -> TestResult {
+    async fn runner_mcp_fast_path_treats_unknown_remote_tools_as_destructive() -> TestResult {
         let root = unique_dir("runner-structured-fast-path-policy")?;
         remove_dir_if_exists(&root)?;
         fs::create_dir_all(&root)?;
@@ -2964,12 +2967,64 @@ mod tests {
         assert_eq!(report.engine, AgentRunEngine::Structured);
         assert_eq!(driver.goto_calls, 0);
         assert_eq!(report.actions_completed, 1);
-        assert_eq!(report.steps[0].policy.side_effect, SideEffect::Send);
+        assert_eq!(report.steps[0].policy.side_effect, SideEffect::Delete);
         assert_eq!(
             report.steps[0].policy.confirmation_gate,
             ConfirmationGate::Confirm
         );
         assert!(!report.steps[0].policy.confirmed);
+        assert!(!read_journal_entries(&journal_path)?
+            .iter()
+            .any(|entry| matches!(entry.event, JournalEvent::StepApplied { .. })));
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runner_mcp_fast_path_purchase_origin_rule_blocks_unknown_remote_tools() -> TestResult {
+        let root = unique_dir("runner-structured-fast-path-origin-rule")?;
+        remove_dir_if_exists(&root)?;
+        fs::create_dir_all(&root)?;
+        let journal_path = root.join("session.jsonl");
+        let origin = "http://127.0.0.1:9";
+        let task = DriverTask::new(
+            format!("{origin}/app"),
+            vec![Action::Skill {
+                name: "delete_account".into(),
+                input: serde_json::json!({"account_id": "acct-123"}),
+            }],
+        );
+        let mut driver = FailingDriver::new(TransportFailurePoint::Goto);
+        let runner = AgentRunner::new_plaintext_unsafe(
+            &journal_path,
+            AgentRunIds::new(
+                "run-structured-origin-rule",
+                "session-structured-origin-rule",
+            ),
+        )
+        .with_confirmation_mode(ConfirmationMode::AutoConfirmAll)
+        .with_origin_policy(OriginPolicy::new(vec![OriginRule::new(
+            Origin::parse(origin)?,
+            SideEffect::Purchase,
+            OriginRuleMode::Block,
+        )]))
+        .with_structured_fast_path(StructuredFastPath::with_probe(fake_mcp_fast_path_probe));
+
+        let report = runner.run_driver_task(&mut driver, &task).await?;
+
+        assert!(matches!(report.status, AgentRunStatus::PolicyDenied { .. }));
+        assert_eq!(report.engine, AgentRunEngine::Structured);
+        assert_eq!(driver.goto_calls, 0);
+        assert_eq!(report.actions_completed, 1);
+        assert_eq!(report.steps[0].policy.side_effect, SideEffect::Delete);
+        assert!(report.steps[0].policy.denied);
+        assert_eq!(report.steps[0].policy.origin_rules_matched, 1);
+        assert_eq!(
+            report.steps[0].policy.origin_rule_mode,
+            OriginRuleMode::Block
+        );
+        assert_eq!(report.steps[0].policy.origin.as_deref(), Some(origin));
         assert!(!read_journal_entries(&journal_path)?
             .iter()
             .any(|entry| matches!(entry.event, JournalEvent::StepApplied { .. })));
