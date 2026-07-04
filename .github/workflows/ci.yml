@@ -75,6 +75,18 @@ jobs:
       - name: servo tempo fork build gate
         run: bash scripts/cargo-servo-tempo.sh
 
+  bench-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.96.1
+      - name: criterion benches compile and run once (test mode)
+        run: >
+          cargo bench
+          -p tempo-observe -p tempo-engine-host -p tempo-act
+          -p tempo-policy -p tempo-session
+          -- --test
+
   live-cdp:
     runs-on: ubuntu-latest
     steps:
