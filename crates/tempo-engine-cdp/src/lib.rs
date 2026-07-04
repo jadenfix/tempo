@@ -16,7 +16,7 @@ use chromiumoxide::cdp::browser_protocol::dom::{
 };
 use chromiumoxide::cdp::browser_protocol::fetch::{
     ContinueRequestParams, EnableParams as FetchEnableParams, EventRequestPaused,
-    FailRequestParams, RequestPattern,
+    FailRequestParams, RequestPattern, RequestStage,
 };
 use chromiumoxide::cdp::browser_protocol::network::ErrorReason;
 use chromiumoxide::cdp::browser_protocol::page::{CaptureScreenshotFormat, Viewport};
@@ -27,7 +27,7 @@ use chromiumoxide::cdp::js_protocol::runtime::EvaluateParams;
 use chromiumoxide::error::CdpError;
 use chromiumoxide::page::{Page, ScreenshotParams};
 use futures::StreamExt;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -44,6 +44,7 @@ use tempo_schema::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener as TokioTcpListener, TcpStream};
+use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
 /// Maximum number of interactive elements that receive expensive per-element
@@ -59,6 +60,9 @@ use tokio::task::JoinHandle;
 /// so every element that actually survives into the marked observation is still
 /// enriched, while the long tail stays present but without an AX overlay.
 const MAX_AX_ENRICHED_ELEMENTS: usize = 16;
+const MAX_BLOCKED_REQUESTS: usize = 64;
+const REQUEST_POLICY_EVENT_GRACE: Duration = Duration::from_millis(25);
+const BLOCKED_REQUEST_SETTLE_TIMEOUT: Duration = Duration::from_millis(750);
 const POLICY_PROXY_MAX_HEADER_BYTES: usize = 64 * 1024;
 const CDP_POLICY_PROXY_ARGS: [&str; 6] = [
     "--host-resolver-rules",
@@ -179,6 +183,7 @@ pub struct CdpTempoDriver {
     selectors_by_node: BTreeMap<NodeId, String>,
     url_policy: Arc<Mutex<UrlPolicy>>,
     blocked_request_url: Arc<Mutex<Option<String>>>,
+    request_policy_tracker: Arc<RequestPolicyTracker>,
 }
 
 impl CdpTempoDriver {
@@ -198,8 +203,13 @@ impl CdpTempoDriver {
             })?;
         let url_policy = Arc::new(Mutex::new(UrlPolicy::block_private()));
         let blocked_request_url = Arc::new(Mutex::new(None));
-        let policy_proxy =
-            PolicyProxy::start(url_policy.clone(), blocked_request_url.clone()).await?;
+        let request_policy_tracker = Arc::new(RequestPolicyTracker::new());
+        let policy_proxy = PolicyProxy::start(
+            url_policy.clone(),
+            blocked_request_url.clone(),
+            request_policy_tracker.clone(),
+        )
+        .await?;
         let mut config = config;
         config.args.extend([
             format!("--proxy-server=http://{}", policy_proxy.addr),
@@ -222,18 +232,22 @@ impl CdpTempoDriver {
                 return Err(map_cdp_error(error));
             }
         };
-        let request_policy_task =
-            match install_request_policy(&page, url_policy.clone(), blocked_request_url.clone())
-                .await
-            {
-                Ok(task) => task,
-                Err(error) => {
-                    let _ = browser.close().await;
-                    let _ = browser.wait().await;
-                    handler_task.abort();
-                    return Err(error);
-                }
-            };
+        let request_policy_task = match install_request_policy(
+            &page,
+            url_policy.clone(),
+            blocked_request_url.clone(),
+            request_policy_tracker.clone(),
+        )
+        .await
+        {
+            Ok(task) => task,
+            Err(error) => {
+                let _ = browser.close().await;
+                let _ = browser.wait().await;
+                handler_task.abort();
+                return Err(error);
+            }
+        };
 
         Ok(Self {
             browser,
@@ -250,6 +264,7 @@ impl CdpTempoDriver {
             selectors_by_node: BTreeMap::new(),
             url_policy,
             blocked_request_url,
+            request_policy_tracker,
         })
     }
 
@@ -297,10 +312,43 @@ impl CdpTempoDriver {
             .take())
     }
 
-    fn map_navigation_error(&self, error: CdpError) -> TransportError {
-        match self.take_blocked_request() {
-            Ok(Some(_url)) => TransportError::UrlBlocked,
-            _ => TransportError::Other(error.to_string()),
+    fn request_policy_cursor(&self) -> u64 {
+        self.request_policy_tracker.cursor()
+    }
+
+    fn enforce_current_url_policy_value(&self, url: &str) -> Result<(), TransportError> {
+        if url.is_empty() || url == "about:blank" {
+            return Ok(());
+        }
+        self.enforce_url_policy(url)
+    }
+
+    fn enforce_no_blocked_request_since(&self, cursor: u64) -> Result<(), TransportError> {
+        if self.request_policy_tracker.has_blocked_since(cursor) {
+            Err(TransportError::UrlBlocked)
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn enforce_no_blocked_request_soon_since(
+        &self,
+        cursor: u64,
+    ) -> Result<(), TransportError> {
+        wait_for_no_blocked_request_since(&self.request_policy_tracker, cursor).await
+    }
+
+    async fn map_cdp_result_since<T>(
+        &self,
+        cursor: u64,
+        result: Result<T, CdpError>,
+    ) -> Result<T, TransportError> {
+        match result {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                self.enforce_no_blocked_request_soon_since(cursor).await?;
+                Err(map_cdp_error(error))
+            }
         }
     }
 
@@ -321,13 +369,22 @@ impl CdpTempoDriver {
 
     async fn enforce_current_url_policy(&self) -> Result<String, TransportError> {
         let url = self.current_url().await?;
-        self.enforce_url_policy(&url)?;
+        self.enforce_current_url_policy_value(&url)?;
         Ok(url)
     }
 
-    async fn snapshot(&self) -> Result<(String, String), TransportError> {
-        let url = self.enforce_current_url_policy().await?;
-        let dom_html = self.page()?.content().await.map_err(map_cdp_error)?;
+    async fn snapshot_since(&self, cursor: u64) -> Result<(String, String), TransportError> {
+        let url = self.current_url().await?;
+        self.enforce_current_url_policy_value(&url)?;
+        self.enforce_no_blocked_request_since(cursor)?;
+        let dom_html = match self.page()?.content().await {
+            Ok(dom_html) => dom_html,
+            Err(error) => {
+                self.enforce_no_blocked_request_soon_since(cursor).await?;
+                return Err(map_cdp_error(error));
+            }
+        };
+        self.enforce_no_blocked_request_since(cursor)?;
         Ok((url, dom_html))
     }
 
@@ -345,9 +402,28 @@ impl CdpTempoDriver {
         Ok(compiled)
     }
 
+    async fn record_snapshot_since(
+        &mut self,
+        cursor: u64,
+        url: String,
+        dom_html: String,
+    ) -> Result<CompiledObservation, TransportError> {
+        let compiled = self.record_snapshot(url, dom_html).await?;
+        self.enforce_no_blocked_request_soon_since(cursor).await?;
+        Ok(compiled)
+    }
+
     async fn record_current_observation(&mut self) -> Result<CompiledObservation, TransportError> {
-        let (url, dom_html) = self.snapshot().await?;
-        self.record_snapshot(url, dom_html).await
+        let cursor = self.request_policy_cursor();
+        self.record_current_observation_since(cursor).await
+    }
+
+    async fn record_current_observation_since(
+        &mut self,
+        cursor: u64,
+    ) -> Result<CompiledObservation, TransportError> {
+        let (url, dom_html) = self.snapshot_since(cursor).await?;
+        self.record_snapshot_since(cursor, url, dom_html).await
     }
 
     async fn enrich_observation_from_ax_tree(
@@ -540,13 +616,14 @@ impl CdpTempoDriver {
             .map_err(|error| TransportError::Other(error.to_string()))
     }
 
-    async fn node_outcome(
+    async fn node_outcome_since(
         &mut self,
         previous_seq: u64,
         target: &str,
         grounded: bool,
+        cursor: u64,
     ) -> Result<StepOutcome, TransportError> {
-        let compiled = self.record_current_observation().await?;
+        let compiled = self.record_current_observation_since(cursor).await?;
         if grounded {
             Ok(StepOutcome::Applied {
                 diff: diff_from_base(self.history.get(&previous_seq), &compiled, previous_seq),
@@ -568,16 +645,19 @@ impl CdpTempoDriver {
                 })
             }
             Action::Click { node } => {
+                let cursor = self.request_policy_cursor();
                 let grounding = self
                     .with_node_element(node, |element| async move {
                         element.click().await.map_err(map_cdp_error)?;
                         Ok(())
                     })
                     .await?;
-                self.node_outcome(previous_seq, &grounding.target, grounding.grounded)
+                self.enforce_no_blocked_request_soon_since(cursor).await?;
+                self.node_outcome_since(previous_seq, &grounding.target, grounding.grounded, cursor)
                     .await
             }
             Action::Type { node, text } => {
+                let cursor = self.request_policy_cursor();
                 let text = text.clone();
                 let grounding = self
                     .with_node_element(node, |element| {
@@ -589,10 +669,12 @@ impl CdpTempoDriver {
                         }
                     })
                     .await?;
-                self.node_outcome(previous_seq, &grounding.target, grounding.grounded)
+                self.enforce_no_blocked_request_soon_since(cursor).await?;
+                self.node_outcome_since(previous_seq, &grounding.target, grounding.grounded, cursor)
                     .await
             }
             Action::Select { node, value } => {
+                let cursor = self.request_policy_cursor();
                 let encoded = serde_json::to_string(value)
                     .map_err(|error| TransportError::Other(error.to_string()))?;
                 let grounding = self
@@ -611,32 +693,39 @@ impl CdpTempoDriver {
                         }
                     })
                     .await?;
-                self.node_outcome(previous_seq, &grounding.target, grounding.grounded)
+                self.enforce_no_blocked_request_soon_since(cursor).await?;
+                self.node_outcome_since(previous_seq, &grounding.target, grounding.grounded, cursor)
                     .await
             }
             Action::Scroll { x, y } => {
                 self.enforce_current_url_policy().await?;
+                let cursor = self.request_policy_cursor();
                 self.page()?
                     .evaluate(format!("window.scrollTo({}, {});", *x as i64, *y as i64))
                     .await
                     .map_err(map_cdp_error)?;
-                let compiled = self.record_current_observation().await?;
+                self.enforce_no_blocked_request_soon_since(cursor).await?;
+                let compiled = self.record_current_observation_since(cursor).await?;
                 Ok(StepOutcome::Applied {
                     diff: diff_from_base(self.history.get(&previous_seq), &compiled, previous_seq),
                 })
             }
             Action::Wait { millis } => {
+                let cursor = self.request_policy_cursor();
                 tokio::time::sleep(Duration::from_millis(*millis)).await;
-                let compiled = self.record_current_observation().await?;
+                self.enforce_no_blocked_request_soon_since(cursor).await?;
+                let compiled = self.record_current_observation_since(cursor).await?;
                 Ok(StepOutcome::Applied {
                     diff: diff_from_base(self.history.get(&previous_seq), &compiled, previous_seq),
                 })
             }
             Action::Extract { node } => {
+                let cursor = self.request_policy_cursor();
                 let grounding = self
                     .with_node_element(node, |_element| async move { Ok(()) })
                     .await?;
-                self.node_outcome(previous_seq, &grounding.target, grounding.grounded)
+                self.enforce_no_blocked_request_soon_since(cursor).await?;
+                self.node_outcome_since(previous_seq, &grounding.target, grounding.grounded, cursor)
                     .await
             }
             Action::Skill { name, .. } => Ok(StepOutcome::StepError {
@@ -651,15 +740,17 @@ impl CdpTempoDriver {
 
         loop {
             self.enforce_current_url_policy().await?;
+            let cursor = self.request_policy_cursor();
+            let ready_result = self.page()?.evaluate("document.readyState").await;
             let ready_state = self
-                .page()?
-                .evaluate("document.readyState")
-                .await
-                .map_err(map_cdp_error)?
+                .map_cdp_result_since(cursor, ready_result)
+                .await?
                 .into_value::<String>()
                 .map_err(|error| TransportError::Other(error.to_string()))?;
             self.enforce_current_url_policy().await?;
-            let dom_html = self.page()?.content().await.map_err(map_cdp_error)?;
+            let content_result = self.page()?.content().await;
+            let dom_html = self.map_cdp_result_since(cursor, content_result).await?;
+            self.enforce_no_blocked_request_since(cursor)?;
             let sample = PageStabilitySample {
                 ready: ready_state != "loading",
                 dom_hash: fnv1a64(dom_html.as_bytes()),
@@ -702,15 +793,16 @@ impl DriverTrait for CdpTempoDriver {
     async fn goto(&mut self, url: &str) -> Result<CompiledObservation, TransportError> {
         self.enforce_url_policy(url)?;
         self.clear_blocked_request()?;
-        self.page()?
-            .goto(url)
-            .await
-            .map_err(|error| self.map_navigation_error(error))?;
+        let cursor = self.request_policy_cursor();
+        let goto_result = self.page()?.goto(url).await;
+        self.map_cdp_result_since(cursor, goto_result).await?;
+        self.enforce_no_blocked_request_soon_since(cursor).await?;
         if self.take_blocked_request()?.is_some() {
             return Err(TransportError::UrlBlocked);
         }
-        let (final_url, dom_html) = self.snapshot().await?;
-        self.record_snapshot(final_url, dom_html).await
+        let (final_url, dom_html) = self.snapshot_since(cursor).await?;
+        self.record_snapshot_since(cursor, final_url, dom_html)
+            .await
     }
 
     async fn observe(&mut self) -> Result<CompiledObservation, TransportError> {
@@ -741,8 +833,10 @@ impl DriverTrait for CdpTempoDriver {
 
         match batch.quiescence {
             QuiescencePolicy::FixedMillis(millis) => {
+                let cursor = self.request_policy_cursor();
                 tokio::time::sleep(Duration::from_millis(millis)).await;
-                let compiled = self.record_current_observation().await?;
+                self.enforce_no_blocked_request_soon_since(cursor).await?;
+                let compiled = self.record_current_observation_since(cursor).await?;
                 Ok(StepOutcome::Applied {
                     diff: diff_from_base(
                         self.history.get(&batch_base_seq),
@@ -814,10 +908,12 @@ impl DriverTrait for CdpTempoDriver {
             }
         };
         let blocked_request_url = Arc::new(Mutex::new(None));
+        let request_policy_tracker = Arc::new(RequestPolicyTracker::new());
         let request_policy_task = match install_request_policy(
             &page,
             self.url_policy.clone(),
             blocked_request_url.clone(),
+            request_policy_tracker.clone(),
         )
         .await
         {
@@ -847,6 +943,7 @@ impl DriverTrait for CdpTempoDriver {
             selectors_by_node: BTreeMap::new(),
             url_policy: self.url_policy.clone(),
             blocked_request_url,
+            request_policy_tracker,
         }))
     }
 
@@ -884,10 +981,11 @@ impl DriverTrait for CdpTempoDriver {
             .build()
             .map_err(TransportError::Other)?;
         self.enforce_current_url_policy().await?;
-        self.page()?
-            .evaluate(params)
-            .await
-            .map_err(map_cdp_error)?
+        let cursor = self.request_policy_cursor();
+        let evaluate_result = self.page()?.evaluate(params).await;
+        let remote_object = self.map_cdp_result_since(cursor, evaluate_result).await?;
+        self.enforce_no_blocked_request_soon_since(cursor).await?;
+        remote_object
             .into_value::<serde_json::Value>()
             .map_err(|error| TransportError::Other(error.to_string()))
     }
@@ -938,10 +1036,129 @@ impl DriverTrait for CdpTempoDriver {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BlockedRequest {
+    seq: u64,
+    url: String,
+}
+
+#[derive(Debug, Default)]
+struct RequestPolicyState {
+    next_seq: u64,
+    pending: BTreeSet<u64>,
+    blocked: VecDeque<BlockedRequest>,
+}
+
+struct RequestPolicyTracker {
+    inner: Mutex<RequestPolicyState>,
+    notify: Notify,
+}
+
+impl RequestPolicyTracker {
+    fn new() -> Self {
+        Self {
+            inner: Mutex::new(RequestPolicyState::default()),
+            notify: Notify::new(),
+        }
+    }
+
+    fn cursor(&self) -> u64 {
+        self.lock().next_seq
+    }
+
+    fn start_request(&self) -> u64 {
+        let mut guard = self.lock();
+        let seq = guard.next_seq;
+        guard.next_seq = guard.next_seq.saturating_add(1);
+        guard.pending.insert(seq);
+        drop(guard);
+        self.notify.notify_waiters();
+        seq
+    }
+
+    fn finish_request(&self, seq: u64, blocked_url: Option<String>) {
+        let mut guard = self.lock();
+        guard.pending.remove(&seq);
+        Self::push_blocked(&mut guard, seq, blocked_url);
+        drop(guard);
+        self.notify.notify_waiters();
+    }
+
+    fn record_blocked(&self, blocked_url: String) {
+        let mut guard = self.lock();
+        let seq = guard.next_seq;
+        guard.next_seq = guard.next_seq.saturating_add(1);
+        Self::push_blocked(&mut guard, seq, Some(blocked_url));
+        drop(guard);
+        self.notify.notify_waiters();
+    }
+
+    fn has_blocked_since(&self, cursor: u64) -> bool {
+        self.lock()
+            .blocked
+            .iter()
+            .any(|request| request.seq >= cursor && !request.url.is_empty())
+    }
+
+    fn has_pending_since(&self, cursor: u64) -> bool {
+        self.lock().pending.range(cursor..).next().is_some()
+    }
+
+    async fn notified(&self) {
+        self.notify.notified().await;
+    }
+
+    #[cfg(test)]
+    fn blocked_len(&self) -> usize {
+        self.lock().blocked.len()
+    }
+
+    fn push_blocked(guard: &mut RequestPolicyState, seq: u64, blocked_url: Option<String>) {
+        if let Some(url) = blocked_url {
+            guard.blocked.push_back(BlockedRequest { seq, url });
+            while guard.blocked.len() > MAX_BLOCKED_REQUESTS {
+                guard.blocked.pop_front();
+            }
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, RequestPolicyState> {
+        match self.inner.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+}
+
+async fn wait_for_no_blocked_request_since(
+    tracker: &RequestPolicyTracker,
+    cursor: u64,
+) -> Result<(), TransportError> {
+    let event_deadline = Instant::now() + REQUEST_POLICY_EVENT_GRACE;
+    let deadline = Instant::now() + BLOCKED_REQUEST_SETTLE_TIMEOUT;
+    loop {
+        if tracker.has_blocked_since(cursor) {
+            return Err(TransportError::UrlBlocked);
+        }
+        if !tracker.has_pending_since(cursor) {
+            if Instant::now() >= event_deadline {
+                return Ok(());
+            }
+        } else if Instant::now() >= deadline {
+            return Err(TransportError::UrlBlocked);
+        }
+        tokio::select! {
+            () = tracker.notified() => {}
+            () = tokio::time::sleep(Duration::from_millis(5)) => {}
+        }
+    }
+}
+
 async fn install_request_policy(
     page: &Page,
     url_policy: Arc<Mutex<UrlPolicy>>,
     blocked_request_url: Arc<Mutex<Option<String>>>,
+    request_policy_tracker: Arc<RequestPolicyTracker>,
 ) -> Result<JoinHandle<()>, TransportError> {
     let mut request_paused = page
         .event_listener::<EventRequestPaused>()
@@ -949,7 +1166,12 @@ async fn install_request_policy(
         .map_err(map_cdp_error)?;
     page.execute(
         FetchEnableParams::builder()
-            .pattern(RequestPattern::builder().url_pattern("*").build())
+            .pattern(
+                RequestPattern::builder()
+                    .url_pattern("*")
+                    .request_stage(RequestStage::Request)
+                    .build(),
+            )
             .build(),
     )
     .await
@@ -958,6 +1180,7 @@ async fn install_request_policy(
     let page = page.clone();
     Ok(tokio::spawn(async move {
         while let Some(event) = request_paused.next().await {
+            let seq = request_policy_tracker.start_request();
             let request_url = event.request.url.clone();
             let policy = match url_policy.lock() {
                 Ok(policy) => Some(policy.clone()),
@@ -968,21 +1191,26 @@ async fn install_request_policy(
                 None => false,
             };
 
-            let request_handled = if allowed {
-                page.execute(ContinueRequestParams::new(event.request_id.clone()))
-                    .await
-                    .is_ok()
+            let (request_handled, blocked_url) = if allowed {
+                (
+                    page.execute(ContinueRequestParams::new(event.request_id.clone()))
+                        .await
+                        .is_ok(),
+                    None,
+                )
             } else {
-                if let Ok(mut blocked) = blocked_request_url.lock() {
-                    *blocked = Some(request_url);
-                }
-                page.execute(FailRequestParams::new(
-                    event.request_id.clone(),
-                    ErrorReason::BlockedByClient,
-                ))
-                .await
-                .is_ok()
+                mark_blocked_request_url(&blocked_request_url, &request_url);
+                (
+                    page.execute(FailRequestParams::new(
+                        event.request_id.clone(),
+                        ErrorReason::BlockedByClient,
+                    ))
+                    .await
+                    .is_ok(),
+                    Some(request_url),
+                )
             };
+            request_policy_tracker.finish_request(seq, blocked_url);
 
             if !request_handled {
                 break;
@@ -1000,6 +1228,7 @@ impl PolicyProxy {
     async fn start(
         url_policy: Arc<Mutex<UrlPolicy>>,
         blocked_request_url: Arc<Mutex<Option<String>>>,
+        request_policy_tracker: Arc<RequestPolicyTracker>,
     ) -> Result<Self, TransportError> {
         let listener = TokioTcpListener::bind(("127.0.0.1", 0))
             .await
@@ -1013,8 +1242,15 @@ impl PolicyProxy {
             while let Ok((stream, _peer)) = listener.accept().await {
                 let url_policy = url_policy.clone();
                 let blocked_request_url = blocked_request_url.clone();
+                let request_policy_tracker = request_policy_tracker.clone();
                 tokio::spawn(async move {
-                    handle_policy_proxy_connection(stream, url_policy, blocked_request_url).await;
+                    handle_policy_proxy_connection(
+                        stream,
+                        url_policy,
+                        blocked_request_url,
+                        request_policy_tracker,
+                    )
+                    .await;
                 });
             }
         });
@@ -1040,6 +1276,7 @@ async fn handle_policy_proxy_connection(
     mut client: TcpStream,
     url_policy: Arc<Mutex<UrlPolicy>>,
     blocked_request_url: Arc<Mutex<Option<String>>>,
+    request_policy_tracker: Arc<RequestPolicyTracker>,
 ) {
     let request = match read_proxy_request(&mut client).await {
         Some(request) => request,
@@ -1060,9 +1297,23 @@ async fn handle_policy_proxy_connection(
     };
 
     if request.method.eq_ignore_ascii_case("CONNECT") {
-        handle_connect_proxy_request(client, request, &policy, blocked_request_url).await;
+        handle_connect_proxy_request(
+            client,
+            request,
+            &policy,
+            blocked_request_url,
+            request_policy_tracker,
+        )
+        .await;
     } else {
-        handle_http_proxy_request(client, request, &policy, blocked_request_url).await;
+        handle_http_proxy_request(
+            client,
+            request,
+            &policy,
+            blocked_request_url,
+            request_policy_tracker,
+        )
+        .await;
     }
 }
 
@@ -1117,6 +1368,7 @@ async fn handle_connect_proxy_request(
     request: ProxyRequest,
     policy: &UrlPolicy,
     blocked_request_url: Arc<Mutex<Option<String>>>,
+    request_policy_tracker: Arc<RequestPolicyTracker>,
 ) {
     let Some((policy_url, host, port)) = connect_target(&request.target) else {
         let _ = write_proxy_response(&mut client, 400, "Bad Request").await;
@@ -1125,7 +1377,7 @@ async fn handle_connect_proxy_request(
     let mut upstream = match connect_policy_target(&policy_url, &host, port, policy).await {
         Ok(upstream) => upstream,
         Err(PolicyProxyConnectError::PolicyBlocked) => {
-            mark_proxy_blocked_request(&blocked_request_url, &policy_url);
+            record_blocked_request(&blocked_request_url, &request_policy_tracker, &policy_url);
             let _ = write_proxy_response(&mut client, 403, "Forbidden").await;
             return;
         }
@@ -1149,6 +1401,7 @@ async fn handle_http_proxy_request(
     request: ProxyRequest,
     policy: &UrlPolicy,
     blocked_request_url: Arc<Mutex<Option<String>>>,
+    request_policy_tracker: Arc<RequestPolicyTracker>,
 ) {
     let parsed = match url::Url::parse(&request.target) {
         Ok(parsed) if parsed.scheme() == "http" => parsed,
@@ -1168,7 +1421,11 @@ async fn handle_http_proxy_request(
     let mut upstream = match connect_policy_target(parsed.as_str(), &host, port, policy).await {
         Ok(upstream) => upstream,
         Err(PolicyProxyConnectError::PolicyBlocked) => {
-            mark_proxy_blocked_request(&blocked_request_url, parsed.as_str());
+            record_blocked_request(
+                &blocked_request_url,
+                &request_policy_tracker,
+                parsed.as_str(),
+            );
             let _ = write_proxy_response(&mut client, 403, "Forbidden").await;
             return;
         }
@@ -1213,10 +1470,19 @@ async fn handle_http_proxy_request(
     let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
 }
 
-fn mark_proxy_blocked_request(blocked_request_url: &Arc<Mutex<Option<String>>>, url: &str) {
+fn mark_blocked_request_url(blocked_request_url: &Arc<Mutex<Option<String>>>, url: &str) {
     if let Ok(mut blocked) = blocked_request_url.lock() {
         *blocked = Some(url.to_string());
     }
+}
+
+fn record_blocked_request(
+    blocked_request_url: &Arc<Mutex<Option<String>>>,
+    request_policy_tracker: &Arc<RequestPolicyTracker>,
+    url: &str,
+) {
+    mark_blocked_request_url(blocked_request_url, url);
+    request_policy_tracker.record_blocked(url.to_string());
 }
 
 fn connect_target(authority: &str) -> Option<(String, String, u16)> {
@@ -2123,8 +2389,8 @@ mod tests {
     use super::*;
     use chromiumoxide::cdp::browser_protocol::accessibility::{AxNodeId, AxValueType};
     use chromiumoxide::cdp::browser_protocol::dom::BackendNodeId;
-    use std::io::Write;
-    use std::net::{SocketAddr, TcpListener};
+    use std::io::{Read, Write};
+    use std::net::{SocketAddr, TcpListener, TcpStream as StdTcpStream};
     use std::sync::atomic::{AtomicBool, Ordering};
 
     #[test]
@@ -2472,6 +2738,82 @@ mod tests {
         assert!(enforce_url_policy("https://example.com", &policy).is_ok());
     }
 
+    #[tokio::test]
+    async fn request_policy_tracker_clean_path_returns_without_settle_delay() {
+        let tracker = RequestPolicyTracker::new();
+        let cursor = tracker.cursor();
+
+        match tokio::time::timeout(
+            Duration::from_millis(75),
+            wait_for_no_blocked_request_since(&tracker, cursor),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => panic!("clean policy tracker reported a block: {error}"),
+            Err(_elapsed) => {
+                panic!("clean policy tracker waited for the full settle deadline");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn request_policy_tracker_pending_request_fails_closed_after_settle_delay() {
+        let tracker = RequestPolicyTracker::new();
+        let cursor = tracker.cursor();
+        let _seq = tracker.start_request();
+
+        let result = wait_for_no_blocked_request_since(&tracker, cursor).await;
+
+        assert!(matches!(result, Err(TransportError::UrlBlocked)));
+    }
+
+    #[tokio::test]
+    async fn request_policy_tracker_catches_event_registered_during_grace() {
+        let tracker = Arc::new(RequestPolicyTracker::new());
+        let cursor = tracker.cursor();
+        let delayed_tracker = tracker.clone();
+        let finisher = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            let seq = delayed_tracker.start_request();
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            delayed_tracker.finish_request(seq, Some("http://127.0.0.1/private".into()));
+        });
+
+        let result = wait_for_no_blocked_request_since(&tracker, cursor).await;
+
+        assert!(matches!(result, Err(TransportError::UrlBlocked)));
+        match finisher.await {
+            Ok(()) => {}
+            Err(error) => panic!("late request finisher task failed: {error}"),
+        }
+    }
+
+    #[test]
+    fn request_policy_tracker_scopes_blocks_to_operation_cursor() {
+        let tracker = RequestPolicyTracker::new();
+        let first_cursor = tracker.cursor();
+        tracker.record_blocked("http://127.0.0.1/private".into());
+
+        assert!(tracker.has_blocked_since(first_cursor));
+
+        let later_cursor = tracker.cursor();
+        assert!(
+            !tracker.has_blocked_since(later_cursor),
+            "a stale blocked request must not poison a later unrelated operation"
+        );
+    }
+
+    #[test]
+    fn request_policy_tracker_caps_blocked_request_log() {
+        let tracker = RequestPolicyTracker::new();
+        for index in 0..(MAX_BLOCKED_REQUESTS + 8) {
+            tracker.record_blocked(format!("http://127.0.0.1/{index}"));
+        }
+
+        assert_eq!(tracker.blocked_len(), MAX_BLOCKED_REQUESTS);
+    }
+
     #[test]
     fn blocks_full_zero_ipv4_block() {
         let policy = UrlPolicy::block_private();
@@ -2557,9 +2899,12 @@ mod tests {
         });
 
         let blocked_request_url = Arc::new(Mutex::new(None));
+        let request_policy_tracker = Arc::new(RequestPolicyTracker::new());
+        let cursor = request_policy_tracker.cursor();
         let proxy = PolicyProxy::start(
             Arc::new(Mutex::new(UrlPolicy::block_private())),
             blocked_request_url.clone(),
+            request_policy_tracker.clone(),
         )
         .await?;
         let mut client = TcpStream::connect(proxy.addr).await?;
@@ -2578,6 +2923,7 @@ mod tests {
                 .as_deref(),
             Some(expected_blocked_url.as_str())
         );
+        assert!(request_policy_tracker.has_blocked_since(cursor));
         accept_task.await?;
         assert!(!accepted.load(Ordering::SeqCst));
         drop(proxy);
@@ -2590,9 +2936,12 @@ mod tests {
         let origin = TokioTcpListener::bind(("127.0.0.1", 0)).await?;
         let origin_addr = origin.local_addr()?;
         let blocked_request_url = Arc::new(Mutex::new(None));
+        let request_policy_tracker = Arc::new(RequestPolicyTracker::new());
+        let cursor = request_policy_tracker.cursor();
         let proxy = PolicyProxy::start(
             Arc::new(Mutex::new(UrlPolicy::block_private())),
             blocked_request_url.clone(),
+            request_policy_tracker.clone(),
         )
         .await?;
         let mut client = TcpStream::connect(proxy.addr).await?;
@@ -2613,6 +2962,7 @@ mod tests {
                 .as_deref(),
             Some(expected_blocked_url.as_str())
         );
+        assert!(request_policy_tracker.has_blocked_since(cursor));
         drop(proxy);
         Ok(())
     }
@@ -2625,9 +2975,12 @@ mod tests {
         drop(reserved);
 
         let blocked_request_url = Arc::new(Mutex::new(None));
+        let request_policy_tracker = Arc::new(RequestPolicyTracker::new());
+        let cursor = request_policy_tracker.cursor();
         let proxy = PolicyProxy::start(
             Arc::new(Mutex::new(UrlPolicy::allow_all())),
             blocked_request_url.clone(),
+            request_policy_tracker.clone(),
         )
         .await?;
         let mut client = TcpStream::connect(proxy.addr).await?;
@@ -2647,6 +3000,7 @@ mod tests {
                 .as_deref(),
             None
         );
+        assert!(!request_policy_tracker.has_blocked_since(cursor));
         drop(proxy);
         Ok(())
     }
@@ -2679,6 +3033,154 @@ mod tests {
         assert!(matches!(result, Err(TransportError::UrlBlocked)));
         accept_task.await?;
         assert!(!accepted.load(Ordering::SeqCst));
+        driver.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_cdp_driver_blocks_page_triggered_private_navigation(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(chrome) = std::env::var_os("TEMPO_CDP_CHROME") else {
+            eprintln!("skipping live CDP page navigation policy test; TEMPO_CDP_CHROME is unset");
+            return Ok(());
+        };
+        let fixture = serve_policy_fixture()?;
+        let config = CdpConfig::default()
+            .with_executable(chrome.to_string_lossy())
+            .with_no_sandbox_env_opt_in();
+        let mut driver = CdpTempoDriver::launch_with(config)
+            .await?
+            .allow_private_network_access();
+
+        let observation = driver.goto(&fixture.allowed_url("/page-nav")).await?;
+        let go_node = observation
+            .elements
+            .iter()
+            .find(|element| {
+                element.role == "link"
+                    && element.name.first().map(|span| span.text.as_str()) == Some("Go")
+            })
+            .map(|element| element.node_id.clone())
+            .ok_or_else(|| std::io::Error::other("missing page-nav link"))?;
+        driver = driver.with_url_policy(UrlPolicy::block_private());
+
+        let result = driver.act(&Action::Click { node: go_node }).await;
+
+        assert!(
+            matches!(result, Err(TransportError::UrlBlocked)),
+            "expected page-triggered loopback navigation to be blocked, got {result:?}"
+        );
+        assert!(
+            !fixture.private_requested.load(Ordering::SeqCst),
+            "page-triggered loopback navigation reached the fixture"
+        );
+        driver.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_cdp_click_prevent_default_does_not_preblock_private_href(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(chrome) = std::env::var_os("TEMPO_CDP_CHROME") else {
+            eprintln!("skipping live CDP preventDefault policy test; TEMPO_CDP_CHROME is unset");
+            return Ok(());
+        };
+        let config = CdpConfig::default()
+            .with_executable(chrome.to_string_lossy())
+            .with_no_sandbox_env_opt_in();
+        let mut driver = CdpTempoDriver::launch_with(config).await?;
+        driver
+            .evaluate_script(
+                r#"(() => {
+                    document.body.innerHTML = '<a id="go" href="http://127.0.0.1:1/private">Stay</a>';
+                    document.getElementById('go').addEventListener('click', (event) => {
+                        event.preventDefault();
+                        document.body.dataset.clicked = 'yes';
+                    });
+                    return true;
+                })()"#,
+                true,
+            )
+            .await?;
+        let observation = driver.observe().await?;
+        let go_node = observation
+            .elements
+            .iter()
+            .find(|element| element.name.first().map(|span| span.text.as_str()) == Some("Stay"))
+            .map(|element| element.node_id.clone())
+            .ok_or_else(|| std::io::Error::other("missing prevented private link"))?;
+
+        let outcome = driver.act(&Action::Click { node: go_node }).await?;
+
+        assert!(matches!(outcome, StepOutcome::Applied { .. }));
+        let clicked = driver
+            .evaluate_script("Promise.resolve(document.body.dataset.clicked)", true)
+            .await?;
+        assert_eq!(clicked, serde_json::json!("yes"));
+        driver.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_cdp_driver_blocks_script_triggered_private_request(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(chrome) = std::env::var_os("TEMPO_CDP_CHROME") else {
+            eprintln!("skipping live CDP script request policy test; TEMPO_CDP_CHROME is unset");
+            return Ok(());
+        };
+        let fixture = serve_policy_fixture()?;
+        let private_url = serde_json::to_string(&fixture.private_url)?;
+        let config = CdpConfig::default()
+            .with_executable(chrome.to_string_lossy())
+            .with_no_sandbox_env_opt_in();
+        let mut driver = CdpTempoDriver::launch_with(config).await?;
+
+        let result = driver
+            .evaluate_script(&format!("fetch({private_url}).catch(() => null)"), true)
+            .await;
+
+        assert!(
+            matches!(result, Err(TransportError::UrlBlocked)),
+            "expected script-triggered loopback request to be blocked, got {result:?}"
+        );
+        assert!(
+            !fixture.private_requested.load(Ordering::SeqCst),
+            "script-triggered loopback request reached the fixture"
+        );
+        driver.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_cdp_driver_blocks_private_requests_during_wait_windows(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(chrome) = std::env::var_os("TEMPO_CDP_CHROME") else {
+            eprintln!("skipping live CDP wait-window policy test; TEMPO_CDP_CHROME is unset");
+            return Ok(());
+        };
+        let fixture = serve_policy_fixture()?;
+        let private_url = serde_json::to_string(&fixture.private_url)?;
+        let config = CdpConfig::default()
+            .with_executable(chrome.to_string_lossy())
+            .with_no_sandbox_env_opt_in();
+        let mut driver = CdpTempoDriver::launch_with(config).await?;
+
+        let script =
+            format!("setTimeout(() => fetch({private_url}).catch(() => null), 100); 'scheduled'");
+        assert_eq!(
+            driver.evaluate_script(&script, true).await?,
+            serde_json::json!("scheduled")
+        );
+        let result = driver.act(&Action::Wait { millis: 250 }).await;
+
+        assert!(
+            matches!(result, Err(TransportError::UrlBlocked)),
+            "expected wait-window private request to be blocked, got {result:?}"
+        );
+        assert!(
+            !fixture.private_requested.load(Ordering::SeqCst),
+            "wait-window private request reached the fixture"
+        );
         driver.close().await?;
         Ok(())
     }
@@ -2952,6 +3454,86 @@ mod tests {
         });
 
         Ok(format!("http://{addr}/"))
+    }
+
+    struct PolicyFixture {
+        origin: String,
+        private_url: String,
+        private_requested: Arc<AtomicBool>,
+    }
+
+    impl PolicyFixture {
+        fn allowed_url(&self, path: &str) -> String {
+            format!("{}{}", self.origin, path)
+        }
+    }
+
+    fn serve_policy_fixture() -> Result<PolicyFixture, std::io::Error> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let private_url = format!("http://{addr}/private");
+        let private_requested = Arc::new(AtomicBool::new(false));
+        let requested = private_requested.clone();
+        let thread_private_url = private_url.clone();
+
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(64) {
+                let Ok(mut stream) = stream else {
+                    continue;
+                };
+                let path = read_request_path(&mut stream).unwrap_or_default();
+                let response = match path.as_str() {
+                    "/page-nav" => {
+                        let body = format!(
+                            r#"<!doctype html><html><body><a id="go" href="{thread_private_url}">Go</a></body></html>"#
+                        );
+                        http_response("200 OK", "text/html", &body)
+                    }
+                    "/private" => {
+                        requested.store(true, Ordering::SeqCst);
+                        http_response("200 OK", "text/plain", "private")
+                    }
+                    _ => http_response("200 OK", "text/plain", "ok"),
+                };
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+
+        Ok(PolicyFixture {
+            origin: format!("http://{addr}"),
+            private_url,
+            private_requested,
+        })
+    }
+
+    fn http_response(status: &str, content_type: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn read_request_path(stream: &mut StdTcpStream) -> Result<String, std::io::Error> {
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 512];
+        loop {
+            let read = stream.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&buffer[..read]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") || request.len() > 8192 {
+                break;
+            }
+        }
+        let request = String::from_utf8_lossy(&request);
+        let first_line = request.lines().next().unwrap_or_default();
+        Ok(first_line
+            .split_whitespace()
+            .nth(1)
+            .unwrap_or_default()
+            .to_string())
     }
 
     fn sample_element(id: &str, rank: f32) -> InteractiveElement {
