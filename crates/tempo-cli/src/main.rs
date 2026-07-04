@@ -285,6 +285,7 @@ impl Command {
                     chrome,
                     allow_private_network,
                     confirmation_mode,
+                    structured_fast_path: StructuredFastPath::live(),
                     retention_policy: None,
                 })?;
                 write_json(&output, &report, stdout)
@@ -853,6 +854,7 @@ struct RunCdpTaskConfig {
     chrome: Option<String>,
     allow_private_network: bool,
     confirmation_mode: ConfirmationMode,
+    structured_fast_path: StructuredFastPath,
     retention_policy: Option<DurableRetentionPolicy>,
 }
 
@@ -935,7 +937,7 @@ impl From<&tempo_agent::AgentStepReport> for RunCdpTaskStep {
 }
 
 fn run_cdp_task(config: RunCdpTaskConfig) -> Result<RunCdpTaskReport, CliError> {
-    let mut structured_fast_path = StructuredFastPath::live();
+    let mut structured_fast_path = config.structured_fast_path;
     if config.allow_private_network {
         structured_fast_path = structured_fast_path.allow_private_network_access();
     }
@@ -1183,10 +1185,8 @@ mod tests {
     use serde_json::Value;
     use std::error::Error;
     use std::fs;
-    use std::io::{self, Read, Write};
-    use std::net::TcpListener;
-    use std::thread;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::io;
+    use std::time::{SystemTime, UNIX_EPOCH};
     use tempo_agent::{StructuredFastPathDecision, StructuredLane, StructuredSignal};
     use tempo_compat::{CompatScorecard, EngineProbe, OriginScore};
     use tempo_observe::RawElement;
@@ -1760,7 +1760,7 @@ mod tests {
         let dir = unique_dir("run-cdp-structured-private")?;
         remove_dir(&dir)?;
         fs::create_dir_all(&dir)?;
-        let (origin, server) = serve_mcp_catalog_probe_fixture()?;
+        let origin = "http://127.0.0.1:7421";
         let retention_policy = DurableRetentionPolicy::encrypted(
             tempo_session::DurableEncryptionKey::from_bytes([23; 32]),
         );
@@ -1774,11 +1774,9 @@ mod tests {
             chrome: Some("/definitely/not/a/chrome/binary".into()),
             allow_private_network: true,
             confirmation_mode: ConfirmationMode::DenyHumanRequired,
+            structured_fast_path: StructuredFastPath::with_probe(fake_mcp_fast_path_probe),
             retention_policy: Some(retention_policy.clone()),
         })?;
-        server
-            .join()
-            .map_err(|_| "structured probe fixture thread panicked")??;
 
         assert_eq!(report.engine, "structured");
         assert_eq!(report.status.state, "structured_fast_path");
@@ -1800,6 +1798,19 @@ mod tests {
 
         remove_dir(&dir)?;
         Ok(())
+    }
+
+    fn fake_mcp_fast_path_probe(
+        target: &str,
+        _config: tempo_agent::HttpProbeConfig,
+    ) -> Option<StructuredFastPathDecision> {
+        let origin = target.strip_suffix("/app").unwrap_or(target);
+        Some(StructuredFastPathDecision::new(
+            origin,
+            StructuredLane::Mcp,
+            StructuredSignal::McpCatalog,
+            "/mcp/catalog.json",
+        ))
     }
 
     #[test]
@@ -1835,50 +1846,6 @@ mod tests {
             other => return Err(unexpected_result(other)),
         }
         Ok(())
-    }
-
-    fn serve_mcp_catalog_probe_fixture() -> io::Result<(String, thread::JoinHandle<io::Result<()>>)>
-    {
-        let listener = TcpListener::bind("127.0.0.1:0")?;
-        listener.set_nonblocking(true)?;
-        let origin = format!("http://{}", listener.local_addr()?);
-        let handle = thread::spawn(move || -> io::Result<()> {
-            let deadline = std::time::Instant::now() + Duration::from_secs(3);
-            let mut handled = 0_usize;
-            while handled < 5 && std::time::Instant::now() < deadline {
-                match listener.accept() {
-                    Ok((mut stream, _peer)) => {
-                        handled += 1;
-                        stream.set_read_timeout(Some(Duration::from_secs(1)))?;
-                        let mut buffer = [0_u8; 1024];
-                        let read = stream.read(&mut buffer)?;
-                        let request = String::from_utf8_lossy(&buffer[..read]);
-                        let (status, content_type, body) =
-                            if request.starts_with("GET /mcp/catalog.json ") {
-                                (
-                                    "200 OK",
-                                    "application/json",
-                                    r#"{"tools":[{"name":"search"}]}"#,
-                                )
-                            } else {
-                                ("404 Not Found", "text/plain", "not found")
-                            };
-                        let response = format!(
-                            "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                            body.len()
-                        );
-                        stream.write_all(response.as_bytes())?;
-                        stream.flush()?;
-                    }
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(10));
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
-            Ok(())
-        });
-        Ok((origin, handle))
     }
 
     struct EvalRecordBuilder {
