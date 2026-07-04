@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use tempo_driver::Engine;
+use tempo_net::UrlPolicy;
 
 fn main() {
     let options = match TempodOptions::parse(std::env::args().skip(1)) {
@@ -10,13 +11,20 @@ fn main() {
         }
     };
 
+    let navigation_url_policy = options.navigation_url_policy();
     let result = match options.engine_socket {
-        Some(socket_path) => tempo_headless::run_tempod_with_attached_driver(
+        Some(socket_path) => {
+            tempo_headless::run_tempod_with_attached_driver_and_navigation_url_policy(
+                &options.addr,
+                options.engine,
+                socket_path,
+                navigation_url_policy,
+            )
+        }
+        None => tempo_headless::run_tempod_with_navigation_url_policy(
             &options.addr,
-            options.engine,
-            socket_path,
+            navigation_url_policy,
         ),
-        None => tempo_headless::run_tempod(&options.addr),
     };
 
     if let Err(err) = result {
@@ -29,6 +37,7 @@ struct TempodOptions {
     addr: String,
     engine: Engine,
     engine_socket: Option<PathBuf>,
+    allow_private_network: bool,
 }
 
 impl TempodOptions {
@@ -37,6 +46,7 @@ impl TempodOptions {
         let mut engine = Engine::Cdp;
         let mut engine_was_set = false;
         let mut engine_socket = None;
+        let mut allow_private_network = false;
         let mut args = args.into_iter();
 
         while let Some(arg) = args.next() {
@@ -53,6 +63,9 @@ impl TempodOptions {
                         .next()
                         .ok_or_else(|| "--engine-socket requires a path".to_string())?;
                     engine_socket = Some(PathBuf::from(value));
+                }
+                "--allow-private-network" => {
+                    allow_private_network = true;
                 }
                 "-h" | "--help" => return Err(usage()),
                 value if value.starts_with('-') => {
@@ -77,7 +90,16 @@ impl TempodOptions {
             addr: addr.unwrap_or_else(|| "127.0.0.1:8787".into()),
             engine,
             engine_socket,
+            allow_private_network,
         })
+    }
+
+    fn navigation_url_policy(&self) -> UrlPolicy {
+        if self.allow_private_network {
+            UrlPolicy::allow_all()
+        } else {
+            UrlPolicy::block_private()
+        }
     }
 }
 
@@ -90,7 +112,8 @@ fn parse_engine(value: &str) -> Result<Engine, String> {
 }
 
 fn usage() -> String {
-    "usage: tempod [ADDR] [--engine cdp|servo] [--engine-socket PATH]".into()
+    "usage: tempod [ADDR] [--engine cdp|servo] [--engine-socket PATH] [--allow-private-network]"
+        .into()
 }
 
 #[cfg(test)]
@@ -121,6 +144,15 @@ mod tests {
             options.engine_socket,
             Some(PathBuf::from("/tmp/tempo-engine.sock"))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn allow_private_network_sets_navigation_policy() -> Result<(), String> {
+        let options = TempodOptions::parse(["--allow-private-network".to_string()])?;
+
+        assert!(options.allow_private_network);
+        assert_eq!(options.navigation_url_policy(), UrlPolicy::allow_all());
         Ok(())
     }
 }
