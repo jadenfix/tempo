@@ -12,6 +12,8 @@ use std::time::Duration;
 use tempo_headless::{TempodSession, TempodSessionEvent, TempodSessionId};
 use thiserror::Error;
 
+pub mod app;
+
 pub const DEFAULT_TEMPOD_ADDR: &str = "127.0.0.1:8787";
 
 const USAGE: &str = "\
