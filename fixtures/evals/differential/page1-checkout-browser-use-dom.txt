@@ -1,0 +1,17 @@
+[Start of page]
+Checkout
+Enter your billing details below to complete your purchase.
+[0]<a href=/>Example Shop home</a>
+[1]<a href=/shop>Shop</a>
+[2]<a href=/account>My account</a>
+[3]<a href=/cart>Cart (1 item)</a>
+[4]<input type=email value=me@example.com>Email</input>
+[5]<div role=checkbox tabindex=0>Remember me</div>
+[6]<a href=/terms>Terms</a>
+Secure checkout badge
+Your total is $64.98, including tax and shipping.
+[7]<button type=submit>Pay now</button>
+[8]<a href=/about>About us</a>
+[9]<a href=/contact>Contact support</a>
+[10]<a href=/privacy>Privacy policy</a>
+[End of page]

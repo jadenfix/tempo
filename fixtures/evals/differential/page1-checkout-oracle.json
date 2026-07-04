@@ -1,10 +1,10 @@
 {
   "page": "https://shop.example/checkout",
-  "note": "Ground-truth interactive elements per a CDP AX tree capture (Chrome DevTools Protocol Accessibility.getFullAXTree). Hand-authored representative oracle — see README.md in this directory.",
+  "derivation": "Ground-truth task-relevant interactive elements: every element inside the page's primary content region (<main>) that a CDP AX tree (Accessibility.getFullAXTree) reports with an interactive role or that is keyboard-focusable. Global site chrome (the <header> nav and <footer> nav) is intentionally excluded — it is identical across every page and is not part of this page's task. Derived from the fixture page's HTML/AX semantics, independent of tempo's own observation. See README.md 'Oracle derivation'.",
   "elements": [
-    { "role": "button", "name": "Pay now" },
     { "role": "textbox", "name": "Email" },
+    { "role": "checkbox", "name": "Remember me" },
     { "role": "link", "name": "Terms" },
-    { "role": "checkbox", "name": "Remember me" }
+    { "role": "button", "name": "Pay now" }
   ]
 }

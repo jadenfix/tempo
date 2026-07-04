@@ -12,6 +12,14 @@
       "rank": 0.9
     },
     {
+      "node_id": "sort-select",
+      "role": "combobox",
+      "name": [{ "provenance": "page", "text": "Sort by" }],
+      "value": [{ "provenance": "page", "text": "Relevance" }],
+      "bounds": [380.0, 20.0, 160.0, 36.0],
+      "rank": 0.55
+    },
+    {
       "node_id": "in-stock-checkbox",
       "role": "checkbox",
       "name": [{ "provenance": "page", "text": "In stock only" }],
@@ -46,9 +54,10 @@
   ],
   "marks": [
     ["search-input", 1],
-    ["in-stock-checkbox", 2],
-    ["add-to-cart-mouse", 3],
-    ["add-to-cart-keyboard", 4],
-    ["next-page-link", 5]
+    ["sort-select", 2],
+    ["in-stock-checkbox", 3],
+    ["add-to-cart-mouse", 4],
+    ["add-to-cart-keyboard", 5],
+    ["next-page-link", 6]
   ]
 }

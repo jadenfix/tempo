@@ -1,0 +1,34 @@
+- banner:
+  - link "Example Shop home" [ref=e1]
+  - navigation "Primary":
+    - link "Shop" [ref=e2]
+    - link "Deals" [ref=e3]
+    - link "My account" [ref=e4]
+    - link "Cart (2 items)" [ref=e5]
+- main:
+  - heading "12 results for \"electronics\"" [level=1] [ref=e6]
+  - searchbox "Search products" [ref=e7]: electronics
+  - combobox "Sort by" [ref=e8]: Relevance
+  - checkbox "In stock only" [ref=e9]
+  - list "Results":
+    - listitem:
+      - heading "Wireless Mouse" [level=3] [ref=e10]
+      - img "4.5 out of 5 stars, 1,204 ratings"
+      - text: $24.99
+      - text: Ergonomic wireless mouse with USB-C rechargeable battery.
+      - button "Add Wireless Mouse to cart" [ref=e11]
+    - listitem:
+      - heading "Mechanical Keyboard" [level=3] [ref=e12]
+      - img "5 out of 5 stars, 812 ratings"
+      - text: $89.99
+      - text: Hot-swappable mechanical keyboard with per-key RGB lighting.
+      - button "Add Mechanical Keyboard to cart" [ref=e13]
+  - navigation "Pagination":
+    - link "Next page" [ref=e14]
+- contentinfo:
+  - navigation "Footer":
+    - link "About us" [ref=e15]
+    - link "Contact support" [ref=e16]
+    - link "Privacy policy" [ref=e17]
+    - link "Shipping FAQ" [ref=e18]
+  - text: © 2026 Example Shop, Inc.

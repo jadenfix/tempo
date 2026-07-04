@@ -1,0 +1,21 @@
+- banner:
+  - link "Example Shop home" [ref=e1]
+  - navigation "Primary":
+    - link "Shop" [ref=e2]
+    - link "My account" [ref=e3]
+    - link "Cart (1 item)" [ref=e4]
+- main:
+  - heading "Checkout" [level=1] [ref=e5]
+  - text: Enter your billing details below to complete your purchase.
+  - textbox "Email" [ref=e6]: me@example.com
+  - checkbox "Remember me" [ref=e7]
+  - link "Terms" [ref=e8]
+  - img "Secure checkout badge"
+  - text: Your total is $64.98, including tax and shipping.
+  - button "Pay now" [ref=e9]
+- contentinfo:
+  - navigation "Footer":
+    - link "About us" [ref=e10]
+    - link "Contact support" [ref=e11]
+    - link "Privacy policy" [ref=e12]
+  - text: © 2026 Example Shop, Inc.
