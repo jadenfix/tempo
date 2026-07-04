@@ -690,6 +690,17 @@ impl SessionPool {
                 }
                 Ok(session_driver)
             },
+            // If the create+goto succeeds AFTER the caller has already timed out
+            // (receiver gone), close the freshly-created session context here on
+            // the worker thread instead of dropping it. The engine has been
+            // invalidated on the timeout path, so nothing else owns this context;
+            // dropping it silently would leak the browsing context engine-side
+            // (#213 review). `Err(_)` values carry no engine resource to release.
+            |orphaned: Result<AttachedEngineDriver, TempodError>| {
+                if let Ok(mut orphaned_driver) = orphaned {
+                    let _ = futures::executor::block_on(orphaned_driver.close());
+                }
+            },
         );
         match outcome {
             Some(result) => result.map(Some),
@@ -957,17 +968,33 @@ where
 /// timeout; the detached worker then owns and abandons/finishes the wedged work
 /// once the engine answers or disconnects, so the caller is released promptly.
 /// Mirrors `run_teardown_bounded` (#200) but for the create path.
-fn run_create_bounded<T, F>(timeout: Duration, op: F) -> Option<T>
+///
+/// If the caller has already timed out (`recv_timeout` returned `None`) but the
+/// worker's `op()` LATER produces a value, `tx.send` fails and that value would
+/// otherwise be dropped on the floor. For the create path that value can be a
+/// freshly-created, engine-owned session context; silently dropping it leaks the
+/// browsing context on the engine side (the shared engine has already been
+/// invalidated, so no later pool code owns/closes it). `on_orphan` is invoked ON
+/// THE WORKER THREAD with exactly that un-sent value so the caller can release it
+/// (e.g. close the orphaned session context) instead of leaking it (#213 review).
+fn run_create_bounded<T, F, C>(timeout: Duration, op: F, on_orphan: C) -> Option<T>
 where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
+    C: FnOnce(T) + Send + 'static,
 {
     let (tx, rx) = std::sync::mpsc::channel();
     // Detached on purpose: on timeout we must not join (that would reintroduce
     // the unbounded block); the worker finishes on its own and drops the owned
     // session driver / engine handle once the engine responds or disconnects.
     thread::spawn(move || {
-        let _ = tx.send(op());
+        // If the receiver already timed out, `send` hands the value back inside
+        // the `SendError`; run the orphan cleanup on this worker thread so the
+        // late success is torn down (bounded by the same engine window) rather
+        // than abandoned.
+        if let Err(std::sync::mpsc::SendError(orphaned)) = tx.send(op()) {
+            on_orphan(orphaned);
+        }
     });
 
     match rx.recv_timeout(timeout) {
@@ -2842,6 +2869,95 @@ mod tests {
 
         wedged_engine.thread().unpark();
         join_driver_handler(wedged_engine)?;
+        Ok(())
+    }
+
+    #[test]
+    fn create_closes_session_context_that_succeeds_after_timeout() -> TestResult {
+        // The detached create worker's `op()` can finish JUST AFTER the caller's
+        // `recv_timeout` has already expired (create timed out). In that window the
+        // engine DID create+navigate a real browsing context, so `op()` returns
+        // `Ok(session_driver)`, but the receiver is gone and `tx.send` fails. If that
+        // `Ok(driver)` is dropped on the floor, the freshly-created context is leaked
+        // engine-side -- and because the timeout path already invalidated the shared
+        // engine, no later pool code owns/closes it. The fix closes the orphaned
+        // context on the worker thread; this test asserts the engine receives that
+        // `Close`. Against the pre-fix branch no `Close` is ever sent (driver dropped),
+        // so the engine blocks awaiting it and the `close_seen` signal never fires.
+        let (client_stream, server_stream) = UnixStream::pair()?;
+        let (close_tx, close_rx) = std::sync::mpsc::channel();
+        let late_engine = thread::spawn(move || -> Result<(), EngineHostError> {
+            let mut connection = EngineIpcConnection::from_stream(server_stream);
+
+            let create = connection.read_driver_request()?;
+            assert!(matches!(
+                create.command,
+                HostDriverCommand::CreateBrowsingContext { .. }
+            ));
+            connection.write_driver_response(
+                create.id,
+                DriverResponse::BrowsingContextCreated {
+                    driver_id: "session-context-late".into(),
+                },
+            )?;
+
+            let goto = connection.read_driver_request()?;
+            assert_eq!(goto.driver_id.as_deref(), Some("session-context-late"));
+            assert!(matches!(goto.command, HostDriverCommand::Goto { .. }));
+            // Answer the goto only AFTER the create bound (200ms in cfg(test)) has
+            // elapsed, so the caller's `recv_timeout` has already returned `None`
+            // and the worker's late `Ok(session_driver)` fails to send.
+            thread::sleep(Duration::from_millis(400));
+            connection.write_driver_response(
+                goto.id,
+                DriverResponse::Observation {
+                    observation: observation("https://late-success.test", 1),
+                },
+            )?;
+
+            // The orphaned late-success context must be closed, not leaked.
+            let close = connection.read_driver_request()?;
+            assert_eq!(close.driver_id.as_deref(), Some("session-context-late"));
+            assert_eq!(close.command, HostDriverCommand::Close);
+            let _ = close_tx.send(());
+            connection.write_driver_response(close.id, DriverResponse::Closed)
+        });
+
+        let mut pool = SessionPool::default();
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+
+        let started = std::time::Instant::now();
+        let response = handle_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/sessions".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: br#"{"url":"https://late-success.test"}"#.to_vec(),
+            },
+        );
+        let elapsed = started.elapsed();
+
+        // The caller is released at the bound even though the engine answers later.
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "session create hung past the create bound: took {elapsed:?}"
+        );
+        assert_eq!(response.status, 500);
+        assert!(pool.list().is_empty());
+        assert!(pool.session_drivers.is_empty());
+
+        // The worker's late `Ok(session_driver)` must be torn down via `close()`,
+        // not dropped. Bound the wait so the pre-fix leak surfaces as a failure
+        // here (no `Close` ever arrives) rather than hanging the suite.
+        close_rx.recv_timeout(Duration::from_secs(5)).map_err(|_| {
+            "create worker that succeeded after the timeout leaked the session \
+             context: engine never received a Close for it"
+        })?;
+
+        join_driver_handler(late_engine)?;
         Ok(())
     }
 
