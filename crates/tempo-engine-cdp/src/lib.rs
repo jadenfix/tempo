@@ -76,6 +76,8 @@ const CDP_POLICY_PROXY_ARGS: [&str; 6] = [
     "--proxy-server",
 ];
 const CDP_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const TIMED_OUT_NAVIGATION_RECOVERY_TIMEOUT: Duration = Duration::from_secs(5);
+const TIMED_OUT_NAVIGATION_RECOVERY_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Explicit opt-out for Chromium sandboxing in constrained CI/container setups.
 pub const TEMPO_CDP_NO_SANDBOX_ENV: &str = "TEMPO_CDP_NO_SANDBOX";
@@ -366,14 +368,21 @@ impl CdpTempoDriver {
         cursor: u64,
         requested_url: &str,
     ) -> Result<(), TransportError> {
-        self.enforce_no_blocked_request_soon_since(cursor).await?;
-        let current_url = self.current_url().await?;
-        self.enforce_current_url_policy_value(&current_url)?;
-        self.enforce_no_blocked_request_since(cursor)?;
-        if navigation_urls_match(requested_url, &current_url) {
-            Ok(())
-        } else {
-            Err(TransportError::NavTimeout)
+        let deadline = Instant::now() + TIMED_OUT_NAVIGATION_RECOVERY_TIMEOUT;
+        loop {
+            self.enforce_no_blocked_request_soon_since(cursor).await?;
+            let current_url = self.current_url().await?;
+            self.enforce_current_url_policy_value(&current_url)?;
+            self.enforce_no_blocked_request_since(cursor)?;
+            if let Some(ready_state) = self.document_ready_state_since(cursor).await?
+                && timed_out_navigation_recovered(requested_url, &current_url, &ready_state)
+            {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(TransportError::NavTimeout);
+            }
+            tokio::time::sleep(TIMED_OUT_NAVIGATION_RECOVERY_INTERVAL).await;
         }
     }
 
@@ -390,6 +399,22 @@ impl CdpTempoDriver {
             .await
             .map_err(map_cdp_error)?
             .unwrap_or_default())
+    }
+
+    async fn document_ready_state_since(
+        &self,
+        cursor: u64,
+    ) -> Result<Option<String>, TransportError> {
+        match self.page()?.evaluate("document.readyState").await {
+            Ok(remote_object) => {
+                self.enforce_no_blocked_request_since(cursor)?;
+                Ok(remote_object.into_value::<String>().ok())
+            }
+            Err(_error) => {
+                self.enforce_no_blocked_request_soon_since(cursor).await?;
+                Ok(None)
+            }
+        }
     }
 
     async fn enforce_current_url_policy(&self) -> Result<String, TransportError> {
@@ -1816,6 +1841,14 @@ fn navigation_urls_match(requested_url: &str, current_url: &str) -> bool {
     }
 }
 
+fn timed_out_navigation_recovered(
+    requested_url: &str,
+    current_url: &str,
+    ready_state: &str,
+) -> bool {
+    ready_state == "complete" && navigation_urls_match(requested_url, current_url)
+}
+
 fn env_flag_enabled(name: &str) -> bool {
     std::env::var(name)
         .map(|value| {
@@ -2675,6 +2708,30 @@ mod tests {
         assert!(!navigation_urls_match(
             "https://example.test/path",
             "https://other.test/path"
+        ));
+    }
+
+    #[test]
+    fn timed_out_navigation_recovery_requires_complete_ready_state() {
+        assert!(timed_out_navigation_recovered(
+            "http://example.test",
+            "http://example.test/",
+            "complete"
+        ));
+        for ready_state in ["loading", "interactive", ""] {
+            assert!(
+                !timed_out_navigation_recovered(
+                    "http://example.test",
+                    "http://example.test/",
+                    ready_state
+                ),
+                "readyState={ready_state:?} must not recover a timed-out navigation"
+            );
+        }
+        assert!(!timed_out_navigation_recovered(
+            "http://example.test/a",
+            "http://example.test/b",
+            "complete"
         ));
     }
 
