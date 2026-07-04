@@ -2934,7 +2934,10 @@ mod tests {
         }
         // Never exceeds the window, and keeps exactly the most-recent K seqs.
         assert_eq!(history.len() as u64, HISTORY_RETENTION_SNAPSHOTS);
-        assert_eq!(*history.keys().next().unwrap(), 100 - HISTORY_RETENTION_SNAPSHOTS + 1);
+        assert_eq!(
+            *history.keys().next().unwrap(),
+            100 - HISTORY_RETENTION_SNAPSHOTS + 1
+        );
         assert_eq!(*history.keys().next_back().unwrap(), 100);
         // Early seqs (before the window fills) are all retained.
         let mut early: BTreeMap<u64, CompiledObservation> = BTreeMap::new();
