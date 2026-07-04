@@ -1886,6 +1886,7 @@ mod tests {
             diff: ObservationDiff {
                 since_seq: 1,
                 seq: 2,
+                omitted: 0,
                 added: vec![],
                 removed: vec![],
                 changed: vec![],
@@ -1947,6 +1948,7 @@ mod tests {
             diff: ObservationDiff {
                 since_seq: 1,
                 seq: 2,
+                omitted: 0,
                 added: vec![],
                 removed: vec![],
                 changed: vec![],
@@ -2221,6 +2223,7 @@ mod tests {
                 bounds: Some([0.0, 0.0, 80.0, 24.0]),
                 rank: 1.0,
             }],
+            omitted: 0,
             marks: vec![],
         }
     }
@@ -2268,6 +2271,7 @@ mod tests {
                 bounds: None,
                 rank: 1.0,
             }],
+            omitted: 0,
             marks: vec![],
         }
     }

@@ -5190,6 +5190,7 @@ mod tests {
                     diff: ObservationDiff {
                         since_seq: 1,
                         seq: 2,
+                        omitted: 0,
                         added: Vec::new(),
                         removed: Vec::new(),
                         changed: Vec::new(),
@@ -8183,6 +8184,7 @@ mod tests {
                 diff: ObservationDiff {
                     since_seq: 7,
                     seq: 9,
+                    omitted: 0,
                     added: Vec::new(),
                     removed: Vec::new(),
                     changed: Vec::new(),
@@ -8223,6 +8225,7 @@ mod tests {
                     diff: ObservationDiff {
                         since_seq: 1,
                         seq: 2,
+                        omitted: 0,
                         added: Vec::new(),
                         removed: Vec::new(),
                         changed: Vec::new(),
@@ -8886,6 +8889,7 @@ mod tests {
                 diff: ObservationDiff {
                     since_seq: 0,
                     seq: 1,
+                    omitted: 0,
                     added: vec![],
                     removed: vec![],
                     changed: vec![],
@@ -8972,6 +8976,7 @@ mod tests {
                 diff: ObservationDiff {
                     since_seq: 4,
                     seq: 5,
+                    omitted: 0,
                     added: vec![],
                     removed: vec![],
                     changed: vec![],
@@ -9060,6 +9065,7 @@ mod tests {
                 diff: ObservationDiff {
                     since_seq: 6,
                     seq: 7,
+                    omitted: 0,
                     added: vec![],
                     removed: vec![],
                     changed: vec![],
@@ -10766,6 +10772,7 @@ mod tests {
             url: url.into(),
             seq,
             elements: Vec::new(),
+            omitted: 0,
             marks: Vec::new(),
         }
     }
@@ -10797,6 +10804,7 @@ mod tests {
                 diff: ObservationDiff {
                     since_seq: seq.saturating_sub(1),
                     seq,
+                    omitted: 0,
                     added: vec![],
                     removed: vec![],
                     changed: vec![],

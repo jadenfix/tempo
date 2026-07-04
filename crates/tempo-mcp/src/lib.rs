@@ -3170,6 +3170,7 @@ mod tests {
                         bounds: Some([0.0, 0.0, 120.0, 32.0]),
                         rank: 1.0,
                     }],
+                    omitted: 0,
                     marks: vec![(NodeId("button.primary".into()), 1)],
                 },
             }
@@ -3255,6 +3256,7 @@ mod tests {
             Ok(ObservationDiff {
                 since_seq,
                 seq: self.observation.seq,
+                omitted: 0,
                 added: Vec::new(),
                 removed: Vec::new(),
                 changed: self.observation.elements.clone(),
@@ -3272,6 +3274,7 @@ mod tests {
                 diff: ObservationDiff {
                     since_seq: self.observation.seq - 1,
                     seq: self.observation.seq,
+                    omitted: 0,
                     added: Vec::new(),
                     removed: Vec::new(),
                     changed: self.observation.elements.clone(),

@@ -1693,6 +1693,7 @@ mod tests {
                 diff: ObservationDiff {
                     since_seq: 0,
                     seq: 1,
+                    omitted: 0,
                     added: vec![],
                     removed: vec![],
                     changed: vec![],
@@ -3325,6 +3326,7 @@ mod tests {
                     url: "https://example.com".into(),
                     seq: 0,
                     elements: vec![],
+                    omitted: 0,
                     marks: vec![],
                 },
             },
@@ -3340,6 +3342,7 @@ mod tests {
                 diff: ObservationDiff {
                     since_seq: 0,
                     seq: 1,
+                    omitted: 0,
                     added: vec![],
                     removed: vec![],
                     changed: vec![],

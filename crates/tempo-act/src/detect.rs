@@ -315,6 +315,7 @@ mod tests {
             url: url.into(),
             seq: 1,
             elements,
+            omitted: 0,
             marks: vec![],
         }
     }

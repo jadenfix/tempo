@@ -1307,6 +1307,7 @@ fn reconstruct_observation(
         url: base.url.clone(),
         seq: diff.seq,
         elements,
+        omitted: diff.omitted,
         marks: base.marks.clone(),
     })
 }
@@ -1487,6 +1488,7 @@ mod tests {
             url: url.into(),
             seq,
             elements: vec![button("submit")],
+            omitted: 0,
             marks: vec![],
         }
     }
@@ -1728,6 +1730,7 @@ mod tests {
                 url: "https://example.com/".into(),
                 seq: self.seq,
                 elements,
+                omitted: 0,
                 marks: vec![],
             }
         }
@@ -1736,6 +1739,7 @@ mod tests {
             tempo_schema::ObservationDiff {
                 since_seq,
                 seq: self.seq,
+                omitted: 0,
                 added: Vec::new(),
                 removed: Vec::new(),
                 changed: vec![button("submit")],
@@ -2580,6 +2584,7 @@ mod tests {
                 url: self.url.clone(),
                 seq: self.seq,
                 elements: self.ordered_elements(),
+                omitted: 0,
                 marks: vec![],
             };
             self.history
@@ -2595,6 +2600,7 @@ mod tests {
                 url: self.url.clone(),
                 seq: self.seq,
                 elements: self.elements.clone(),
+                omitted: 0,
                 marks: vec![],
             };
             let base =
@@ -2606,6 +2612,7 @@ mod tests {
                         url: self.url.clone(),
                         seq: since_seq,
                         elements: Vec::new(),
+                        omitted: 0,
                         marks: vec![],
                     });
             let before: HashSet<&str> =
@@ -2640,6 +2647,7 @@ mod tests {
             ObservationDiff {
                 since_seq,
                 seq: self.seq,
+                omitted: current.omitted,
                 added,
                 removed,
                 changed,
@@ -2682,6 +2690,7 @@ mod tests {
                 return Ok(ObservationDiff {
                     since_seq,
                     seq: self.seq,
+                    omitted: 0,
                     added: self.elements.clone(),
                     removed: Vec::new(),
                     changed: Vec::new(),
@@ -2706,6 +2715,7 @@ mod tests {
                 diff: ObservationDiff {
                     since_seq: self.seq - 1,
                     seq: self.seq,
+                    omitted: 0,
                     added: Vec::new(),
                     removed: Vec::new(),
                     changed: Vec::new(),
@@ -3004,12 +3014,14 @@ mod tests {
             url: "https://example.com/".into(),
             seq: 4,
             elements: vec![el("a", 0.9), el("b", 0.5), el("c", 0.3)],
+            omitted: 0,
             marks: vec![],
         };
         // Change "a" in place, remove "b" — no additions, so order is preserved.
         let diff = ObservationDiff {
             since_seq: 4,
             seq: 5,
+            omitted: 2,
             added: vec![],
             removed: vec![NodeId("b".into())],
             changed: vec![el("a", 0.2)],
@@ -3027,6 +3039,7 @@ mod tests {
         // Survivors keep their original order; "a" stays first with new content.
         assert_eq!(ids, vec!["a", "c"]);
         assert_eq!(rebuilt.elements[0].rank, 0.2, "changed content not applied");
+        assert_eq!(rebuilt.omitted, 2);
     }
 
     #[test]
@@ -3036,11 +3049,13 @@ mod tests {
             url: "https://example.com/".into(),
             seq: 4,
             elements: vec![el("a", 0.9)],
+            omitted: 0,
             marks: vec![],
         };
         let ok = ObservationDiff {
             since_seq: 4,
             seq: 5,
+            omitted: 0,
             added: vec![],
             removed: vec![],
             changed: vec![],

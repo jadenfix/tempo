@@ -191,6 +191,7 @@ impl TestDriver {
             url: self.url.clone(),
             seq: self.seq,
             elements: self.elements.clone(),
+            omitted: 0,
             marks: vec![],
         }
     }
@@ -231,6 +232,7 @@ impl DriverTrait for TestDriver {
         Ok(ObservationDiff {
             since_seq,
             seq: self.seq,
+            omitted: 0,
             added: vec![],
             removed: vec![],
             changed: vec![],
@@ -245,6 +247,7 @@ impl DriverTrait for TestDriver {
                 diff: ObservationDiff {
                     since_seq,
                     seq: observation.seq,
+                    omitted: 0,
                     added: vec![],
                     removed: vec![],
                     changed: vec![],
@@ -270,6 +273,7 @@ impl DriverTrait for TestDriver {
             diff: ObservationDiff {
                 since_seq: self.seq - 1,
                 seq: self.seq,
+                omitted: 0,
                 added: vec![],
                 removed: vec![],
                 changed: vec![],
@@ -282,6 +286,7 @@ impl DriverTrait for TestDriver {
             diff: ObservationDiff {
                 since_seq: self.seq,
                 seq: self.seq,
+                omitted: 0,
                 added: vec![],
                 removed: vec![],
                 changed: vec![],

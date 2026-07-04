@@ -641,6 +641,7 @@ pub fn diff_observations(
     ObservationDiff {
         since_seq: previous.seq,
         seq: current.seq,
+        omitted: current.omitted,
         added,
         removed,
         changed,
@@ -950,9 +951,10 @@ fn apply_budget(
     // serializations, each computed once and reused for both the byte and token
     // gate. Every probe serializes a *borrowed* prefix through a counting sink,
     // so the search allocates nothing and copies no elements.
+    let total_elements = elements.len();
     let full_marks = mark_labels(&elements, options.max_marks);
-    if elements.is_empty() || prefix_within_budget(&url, seq, &elements, &full_marks, &options) {
-        return assemble_observation(url, seq, elements, full_marks);
+    if elements.is_empty() || prefix_within_budget(&url, seq, &elements, 0, &full_marks, &options) {
+        return assemble_observation(url, seq, elements, 0, full_marks);
     }
 
     // Invariant: prefix of length `hi` is known not to fit; `lo` tracks the
@@ -962,17 +964,19 @@ fn apply_budget(
     while lo + 1 < hi {
         let mid = lo + (hi - lo) / 2;
         let marks = &full_marks[..mid.min(full_marks.len())];
-        if prefix_within_budget(&url, seq, &elements[..mid], marks, &options) {
+        let omitted = total_elements.saturating_sub(mid);
+        if prefix_within_budget(&url, seq, &elements[..mid], omitted, marks, &options) {
             lo = mid;
         } else {
             hi = mid;
         }
     }
 
+    let omitted = total_elements.saturating_sub(lo);
     elements.truncate(lo);
     let mut marks = full_marks;
     marks.truncate(lo);
-    assemble_observation(url, seq, elements, marks)
+    assemble_observation(url, seq, elements, omitted, marks)
 }
 
 /// Serialization proxy that borrows an element prefix while producing byte
@@ -983,7 +987,18 @@ struct ObservationPrefixProbe<'a> {
     url: &'a str,
     seq: u64,
     elements: &'a [InteractiveElement],
+    #[serde(skip_serializing_if = "usize_is_zero")]
+    omitted: usize,
+    #[serde(skip_serializing_if = "mark_slice_is_empty")]
     marks: &'a [(NodeId, u32)],
+}
+
+fn usize_is_zero(value: &usize) -> bool {
+    *value == 0
+}
+
+fn mark_slice_is_empty(value: &&[(NodeId, u32)]) -> bool {
+    value.is_empty()
 }
 
 /// `io::Write` sink that only counts bytes: budget probing needs the
@@ -1008,6 +1023,7 @@ fn prefix_within_budget(
     url: &str,
     seq: u64,
     elements: &[InteractiveElement],
+    omitted: usize,
     marks: &[(NodeId, u32)],
     options: &CompileOptions,
 ) -> bool {
@@ -1016,6 +1032,7 @@ fn prefix_within_budget(
         url,
         seq,
         elements,
+        omitted,
         marks,
     };
     let mut sink = CountingSink(0);
@@ -1041,6 +1058,7 @@ fn assemble_observation(
     url: String,
     seq: u64,
     elements: Vec<InteractiveElement>,
+    omitted: usize,
     marks: Vec<(NodeId, u32)>,
 ) -> CompiledObservation {
     CompiledObservation {
@@ -1048,6 +1066,7 @@ fn assemble_observation(
         url,
         seq,
         elements,
+        omitted: omitted.min(u32::MAX as usize) as u32,
         marks,
     }
 }
@@ -1059,7 +1078,7 @@ fn make_observation(
     max_marks: usize,
 ) -> CompiledObservation {
     let marks = mark_labels(&elements, max_marks);
-    assemble_observation(url.into(), seq, elements, marks)
+    assemble_observation(url.into(), seq, elements, 0, marks)
 }
 
 fn area_bonus(bounds: [f32; 4]) -> f32 {
@@ -1724,7 +1743,7 @@ mod tests {
     fn diff_reports_only_added_removed_and_changed_elements() {
         let mut compiler = ObservationCompiler::new();
         let previous = compiler.compile(checkout_fixture());
-        let current = compiler.compile(ObservationInput::new(
+        let mut current = compiler.compile(ObservationInput::new(
             "https://shop.example/checkout",
             vec![
                 RawElement::new("button", "Pay now")
@@ -1742,16 +1761,43 @@ mod tests {
                     .bounds([120.0, 240.0, 140.0, 38.0]),
             ],
         ));
+        current.omitted = 2;
 
         let diff = diff_observations(&previous, &current);
 
         assert_eq!(diff.since_seq, previous.seq);
         assert_eq!(diff.seq, current.seq);
+        assert_eq!(diff.omitted, 2);
         assert_eq!(diff.added.len(), 1);
         assert_eq!(diff.added[0].name[0].text, "Apply coupon");
         assert_eq!(diff.removed.len(), 1);
         assert_eq!(diff.changed.len(), 1);
         assert_eq!(diff.changed[0].name[0].text, "Email address");
+    }
+
+    #[test]
+    fn budget_probe_matches_zero_omitted_wire_shape() -> Result<(), serde_json::Error> {
+        let url = "https://budget.test";
+        let elements = vec![test_element("node:submit", "button", 1.0)];
+        let marks = Vec::new();
+        let full = assemble_observation(url.into(), 1, elements.clone(), 0, marks.clone());
+        let max_bytes = serialized_len(&full);
+        let serialized = serde_json::to_string(&full)?;
+        assert!(
+            !serialized.contains("\"omitted\""),
+            "zero omitted count must not change the wire budget: {serialized}"
+        );
+        let options = CompileOptions {
+            max_bytes,
+            max_tokens: 0,
+            max_marks: 0,
+        };
+
+        assert!(prefix_within_budget(url, 1, &elements, 0, &marks, &options));
+        let budgeted = apply_budget(url.into(), 1, elements, options);
+        assert_eq!(budgeted.elements.len(), 1);
+        assert_eq!(budgeted.omitted, 0);
+        Ok(())
     }
 
     #[test]
@@ -1785,6 +1831,10 @@ mod tests {
         assert!(estimated_tokens(&observation) <= 400);
         assert_eq!(observation.elements[0].role, "textbox");
         assert!(observation.elements.len() < 81);
+        assert_eq!(
+            observation.omitted as usize,
+            81 - observation.elements.len()
+        );
         assert_eq!(observation.marks.len(), 4.min(observation.elements.len()));
     }
 
@@ -1920,6 +1970,7 @@ mod tests {
         let lossy_diff = ObservationDiff {
             since_seq: previous.seq,
             seq: current.seq,
+            omitted: 0,
             added: Vec::new(),
             removed: Vec::new(),
             changed: Vec::new(),
@@ -2013,6 +2064,10 @@ mod tests {
         assert_eq!(observation.elements[0].role, "textbox");
         assert!(!observation.elements.is_empty());
         assert!(observation.elements.len() < 5_001);
+        assert_eq!(
+            observation.omitted as usize,
+            5_001 - observation.elements.len()
+        );
         // Relative ordering is preserved: ranks are non-increasing.
         for pair in observation.elements.windows(2) {
             assert!(pair[0].rank >= pair[1].rank);
@@ -2144,6 +2199,7 @@ mod tests {
             url: "https://marks.test".into(),
             seq: 1,
             elements: Vec::new(),
+            omitted: 0,
             marks: Vec::new(),
         };
 

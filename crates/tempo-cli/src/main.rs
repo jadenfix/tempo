@@ -2146,6 +2146,7 @@ mod tests {
             diff: ObservationDiff {
                 since_seq: 0,
                 seq: 1,
+                omitted: 0,
                 added: Vec::new(),
                 removed: Vec::new(),
                 changed: Vec::new(),
@@ -2175,6 +2176,7 @@ mod tests {
                 bounds: None,
                 rank: 1.0,
             }],
+            omitted: 0,
             marks: Vec::new(),
         }
     }
@@ -2195,6 +2197,7 @@ mod tests {
                 bounds: None,
                 rank: 1.0,
             }],
+            omitted: 0,
             marks: Vec::new(),
         }
     }
