@@ -11,55 +11,71 @@
 //! the act loop can hard-pause. It performs no network I/O, clicks nothing, and
 //! answers nothing.
 //!
-//! # What this is
+//! # Structure over prose (false-positive discipline)
 //!
-//! A pure, total classifier over a [`CompiledObservation`]. Given the current
-//! page's taint-labeled interactive elements and URL, it returns
-//! `Some(HumanTakeover)` when the page is a CAPTCHA / bot challenge, an access
-//! wall (401/403/session-expired), or a login / one-time-code form — otherwise
-//! `None`. The false-positive guard is critical: a trigger-happy detector would
-//! stall normal automation, so login detection requires an actual credential
-//! field plus a sign-in affordance (a lone "Sign in" nav link or a
-//! change-password settings form does not fire).
+//! A trigger-happy detector is a bug: every false positive hard-pauses normal
+//! automation and demands a human for nothing. So detection keys on **page
+//! structure**, not on a word appearing somewhere in body text. Concretely:
+//!
+//! * **CAPTCHA** requires a *widget*: a vendor name (recaptcha / hcaptcha /
+//!   turnstile / cloudflare) on an **embedding** element (iframe / frame / embed
+//!   / widget container), or the challenge checkbox itself (`role=checkbox`
+//!   named for a vendor or "I'm not a robot"), or a Cloudflare challenge **URL**.
+//!   A settings toggle labeled "Enable CAPTCHA protection" or a help link
+//!   mentioning reCAPTCHA is *not* a widget and does not fire.
+//! * **Auth wall** requires **two corroborating signals**: an access-denial
+//!   statement in a *prominent* role (heading / alert / status / banner) **and**
+//!   an authenticate path (a sign-in control or a login URL). A help link
+//!   "Access Denied — Troubleshooting" or an article that mentions "session
+//!   expired" in body text lacks the prominent-role statement and does not fire.
+//! * **Login** requires a real credential **input** (password or one-time code)
+//!   **and** an authenticate path. A lone "Sign in" nav link (no credential
+//!   field) and a change-password settings form (no sign-in path) do not fire.
+//!
+//! HTTP status (401/403) and script/iframe *origins* would strengthen the auth
+//! wall and CAPTCHA signals respectively, but the [`CompiledObservation`] does
+//! not carry them today; wiring those in is a follow-up. The classifier stays
+//! deliberately conservative (under-fire rather than over-fire) until then.
 
 use tempo_schema::{CompiledObservation, HumanTakeover, InteractiveElement, TakeoverKind};
 
-/// Well-known CAPTCHA / bot-challenge markers, matched as lowercase substrings of
-/// the page URL or any interactive element's name/value. Ordered most-specific
-/// first so the reason names the vendor before the generic `captcha` fallback.
-const CAPTCHA_MARKERS: &[(&str, &str)] = &[
+/// Vendor tokens that name a CAPTCHA widget, most-specific first. Matched only on
+/// an embedding element or the challenge checkbox — never on arbitrary prose.
+const CAPTCHA_VENDORS: &[(&str, &str)] = &[
     ("recaptcha", "reCAPTCHA challenge widget"),
     ("hcaptcha", "hCaptcha challenge widget"),
     ("turnstile", "Cloudflare Turnstile challenge widget"),
-    ("cdn-cgi/challenge", "Cloudflare challenge page"),
-    (
-        "cloudflare security challenge",
-        "Cloudflare security challenge",
-    ),
-    ("checking your browser", "Cloudflare interstitial challenge"),
-    ("i'm not a robot", "\"I'm not a robot\" challenge checkbox"),
-    ("im not a robot", "\"I'm not a robot\" challenge checkbox"),
-    ("i am not a robot", "\"I'm not a robot\" challenge checkbox"),
-    ("verify you are human", "\"verify you are human\" challenge"),
-    ("captcha", "CAPTCHA challenge widget"),
+    ("cloudflare", "Cloudflare challenge widget"),
 ];
 
-/// Access-wall text cues, matched as lowercase substrings of the URL or any
-/// element's name/value. Ordered most-specific first.
-const AUTH_WALL_MARKERS: &[(&str, &str)] = &[
+/// The reCAPTCHA challenge-checkbox label. Only meaningful on `role=checkbox`.
+const ROBOT_PHRASES: &[&str] = &[
+    "i'm not a robot",
+    "im not a robot",
+    "i am not a robot",
+    "not a robot",
+];
+
+/// URL fragments that are, by themselves, a bot-challenge page.
+const CAPTCHA_URL_MARKERS: &[&str] = &[
+    "cdn-cgi/challenge",
+    "challenges.cloudflare.com",
+    "/recaptcha/api",
+    "/hcaptcha",
+];
+
+/// Access-denial statements. Only fire on a prominent role (see [`is_wall_role`]).
+const WALL_PHRASES: &[(&str, &str)] = &[
     ("403 forbidden", "HTTP 403 Forbidden"),
     ("401 unauthorized", "HTTP 401 Unauthorized"),
-    ("session has expired", "session expired"),
-    ("session expired", "session expired"),
-    ("access denied", "access denied"),
     ("you are not authorized", "not authorized"),
     ("you do not have permission", "permission denied"),
     ("you don't have permission", "permission denied"),
+    ("session has expired", "session expired"),
+    ("session expired", "session expired"),
+    ("you must be logged in", "login required"),
     ("authentication required", "authentication required"),
-    ("you must be logged in", "login-required auth wall"),
-    ("please log in to continue", "login-required auth wall"),
-    ("please sign in to continue", "login-required auth wall"),
-    ("unauthorized", "unauthorized"),
+    ("access denied", "access denied"),
 ];
 
 /// URL path fragments that identify a login / SSO endpoint.
@@ -104,25 +120,99 @@ const AFFORDANCE_MARKERS: &[&str] = &[
 /// Classify the current observation. Returns the typed hard-pause signal when the
 /// page requires a human (CAPTCHA / auth wall / login), else `None`.
 ///
-/// Pure and total: no I/O, no mutation, no panics.
+/// Pure and total: no I/O, no mutation, no panics. A single pass gathers the
+/// structural signals; precedence is CAPTCHA > auth wall > login.
 pub fn detect_human_takeover(observation: &CompiledObservation) -> Option<HumanTakeover> {
-    // Substring corpus for the CAPTCHA and auth-wall markers: the URL plus every
-    // interactive element's taint-labeled name/value text, lowercased once.
-    let mut corpus = observation.url.to_lowercase();
+    let url_lc = observation.url.to_lowercase();
+
+    let mut captcha_reason: Option<&'static str> = None;
+    let mut wall_reason: Option<&'static str> = None;
+    let mut authenticate = false;
+    let mut credential: Option<&'static str> = None;
+
     for element in &observation.elements {
-        corpus.push(' ');
-        push_element_text(&mut corpus, element);
+        let role = element.role.to_lowercase();
+        let text = element_text_lc(element);
+
+        // CAPTCHA widget: a vendor name on an embedding element, or the challenge
+        // checkbox itself. Never on a plain button/link/label.
+        if is_embedding_role(&role)
+            && let Some(reason) = first_vendor(&text)
+        {
+            captcha_reason.get_or_insert(reason);
+        }
+        if is_checkbox_role(&role) {
+            if let Some(reason) = first_vendor(&text) {
+                captcha_reason.get_or_insert(reason);
+            } else if contains_any(&text, ROBOT_PHRASES) {
+                captcha_reason.get_or_insert("\"I'm not a robot\" challenge checkbox");
+            }
+        }
+
+        // Auth-wall statement: only when it sits in a prominent role.
+        if is_wall_role(&role)
+            && let Some(reason) = first_wall(&text)
+        {
+            wall_reason.get_or_insert(reason);
+        }
+
+        // Authenticate affordance (shared corroborating signal).
+        if !authenticate && is_affordance_role(&role) && contains_any(&text, AFFORDANCE_MARKERS) {
+            authenticate = true;
+        }
+
+        // Credential input.
+        if is_input_role(&role) {
+            if credential != Some("password") && contains_any(&text, PASSWORD_MARKERS) {
+                credential = Some("password");
+            } else if credential.is_none() && contains_any(&text, OTP_MARKERS) {
+                credential = Some("one-time-code");
+            }
+        }
     }
 
-    if let Some(reason) = first_marker(&corpus, CAPTCHA_MARKERS) {
+    let login_url = contains_any(&url_lc, LOGIN_URL_MARKERS);
+
+    // CAPTCHA (widget structure or a challenge URL).
+    if let Some(reason) = captcha_reason {
         return Some(takeover(TakeoverKind::Captcha, reason, observation));
     }
-    if let Some(reason) = first_marker(&corpus, AUTH_WALL_MARKERS) {
-        return Some(takeover(TakeoverKind::AuthWall, reason, observation));
+    if contains_any(&url_lc, CAPTCHA_URL_MARKERS) {
+        return Some(takeover(
+            TakeoverKind::Captcha,
+            "Cloudflare challenge page",
+            observation,
+        ));
     }
-    if let Some(reason) = login_reason(&observation.url.to_lowercase(), &observation.elements) {
-        return Some(takeover(TakeoverKind::LoginRequired, reason, observation));
+
+    // Auth wall: a prominent access-denial statement AND an authenticate path.
+    if let Some(reason) = wall_reason
+        && (authenticate || login_url)
+    {
+        return Some(takeover(
+            TakeoverKind::AuthWall,
+            format!("{reason} with a sign-in path"),
+            observation,
+        ));
     }
+
+    // Login: a credential input AND an authenticate path.
+    if let Some(cred) = credential
+        && (authenticate || login_url)
+    {
+        let via = match (authenticate, login_url) {
+            (true, true) => "sign-in control and login URL",
+            (true, false) => "sign-in control",
+            (false, true) => "login URL",
+            (false, false) => "",
+        };
+        return Some(takeover(
+            TakeoverKind::LoginRequired,
+            format!("{cred} field with {via}"),
+            observation,
+        ));
+    }
+
     None
 }
 
@@ -155,15 +245,41 @@ fn element_text_lc(element: &InteractiveElement) -> String {
     text
 }
 
-fn first_marker(corpus: &str, markers: &[(&str, &'static str)]) -> Option<&'static str> {
-    markers
+fn contains_any(haystack: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| haystack.contains(needle))
+}
+
+fn first_vendor(text: &str) -> Option<&'static str> {
+    CAPTCHA_VENDORS
         .iter()
-        .find(|(needle, _)| corpus.contains(needle))
+        .find(|(needle, _)| text.contains(needle))
         .map(|(_, reason)| *reason)
 }
 
-fn contains_any(haystack: &str, needles: &[&str]) -> bool {
-    needles.iter().any(|needle| haystack.contains(needle))
+fn first_wall(text: &str) -> Option<&'static str> {
+    WALL_PHRASES
+        .iter()
+        .find(|(needle, _)| text.contains(needle))
+        .map(|(_, reason)| *reason)
+}
+
+/// True for roles that embed a foreign widget (where a CAPTCHA renders).
+fn is_embedding_role(role_lc: &str) -> bool {
+    ["iframe", "frame", "embed", "group", "region", "widget"]
+        .iter()
+        .any(|r| role_lc.contains(r))
+}
+
+fn is_checkbox_role(role_lc: &str) -> bool {
+    role_lc.contains("checkbox")
+}
+
+/// True for prominent roles a page-blocking statement would occupy — deliberately
+/// NOT link/button/paragraph, so a help link or an article body cannot fire.
+fn is_wall_role(role_lc: &str) -> bool {
+    ["heading", "alert", "status", "banner", "alertdialog"]
+        .iter()
+        .any(|r| role_lc.contains(r))
 }
 
 /// True for roles that accept text entry (where a password/OTP would live).
@@ -186,49 +302,6 @@ fn is_affordance_role(role_lc: &str) -> bool {
     ["button", "link", "menuitem"]
         .iter()
         .any(|r| role_lc.contains(r))
-}
-
-/// Detect a login / OTP credential wall.
-///
-/// Requires a credential *input* (password or one-time-code) **and** a sign-in
-/// affordance or a login URL. This two-signal rule is the false-positive guard:
-/// a change-password settings form (password field, but a "Save" button and a
-/// non-login URL) and a marketing page with a lone "Sign in" link (affordance,
-/// but no credential field) both fail it.
-fn login_reason(url_lc: &str, elements: &[InteractiveElement]) -> Option<String> {
-    let mut credential: Option<&'static str> = None;
-    let mut has_affordance = false;
-
-    for element in elements {
-        let role = element.role.to_lowercase();
-        if is_input_role(&role) {
-            let text = element_text_lc(element);
-            if credential != Some("password") && contains_any(&text, PASSWORD_MARKERS) {
-                credential = Some("password");
-            } else if credential.is_none() && contains_any(&text, OTP_MARKERS) {
-                credential = Some("one-time-code");
-            }
-        }
-        if !has_affordance && is_affordance_role(&role) {
-            let text = element_text_lc(element);
-            if contains_any(&text, AFFORDANCE_MARKERS) {
-                has_affordance = true;
-            }
-        }
-    }
-
-    let login_url = contains_any(url_lc, LOGIN_URL_MARKERS);
-    let credential = credential?;
-    if !(has_affordance || login_url) {
-        return None;
-    }
-    let via = match (has_affordance, login_url) {
-        (true, true) => "sign-in control and login URL",
-        (true, false) => "sign-in control",
-        (false, true) => "login URL",
-        (false, false) => unreachable!(),
-    };
-    Some(format!("{credential} field with {via}"))
 }
 
 #[cfg(test)]
@@ -266,6 +339,8 @@ mod tests {
             .ok_or_else(|| "expected a human-takeover detection".to_string())
     }
 
+    // ---- CAPTCHA (widget structure / challenge URL) ----
+
     #[test]
     fn recaptcha_iframe_is_captcha() -> Result<(), String> {
         let o = obs(
@@ -282,7 +357,7 @@ mod tests {
     }
 
     #[test]
-    fn hcaptcha_widget_is_captcha() -> Result<(), String> {
+    fn hcaptcha_checkbox_is_captcha() -> Result<(), String> {
         let o = obs(
             "https://example.com",
             vec![element(
@@ -295,7 +370,7 @@ mod tests {
     }
 
     #[test]
-    fn turnstile_widget_is_captcha() -> Result<(), String> {
+    fn turnstile_widget_container_is_captcha() -> Result<(), String> {
         let o = obs(
             "https://example.com",
             vec![element(
@@ -317,13 +392,16 @@ mod tests {
         Ok(())
     }
 
+    // ---- Auth wall (prominent statement + authenticate path) ----
+
     #[test]
-    fn forbidden_text_is_auth_wall() -> Result<(), String> {
+    fn forbidden_heading_with_signin_is_auth_wall() -> Result<(), String> {
         let o = obs(
             "https://api.example/private",
             vec![
                 element("heading", "403 Forbidden"),
-                element("paragraph", "Access denied"),
+                element("paragraph", "You do not have access."),
+                element("link", "Sign in"),
             ],
         );
         assert_eq!(detect_kind(&o)?, TakeoverKind::AuthWall);
@@ -331,14 +409,16 @@ mod tests {
     }
 
     #[test]
-    fn session_expired_is_auth_wall() -> Result<(), String> {
+    fn session_expired_alert_at_login_url_is_auth_wall() -> Result<(), String> {
         let o = obs(
-            "https://app.example/dashboard",
-            vec![element("heading", "Your session has expired")],
+            "https://app.example/login?returnTo=/dashboard",
+            vec![element("alert", "Your session has expired")],
         );
         assert_eq!(detect_kind(&o)?, TakeoverKind::AuthWall);
         Ok(())
     }
+
+    // ---- Login (credential input + authenticate path) ----
 
     #[test]
     fn login_form_with_password_and_signin_is_login_required() -> Result<(), String> {
@@ -364,6 +444,20 @@ mod tests {
             ],
         );
         assert_eq!(detect_kind(&o)?, TakeoverKind::LoginRequired);
+        Ok(())
+    }
+
+    #[test]
+    fn captcha_takes_precedence_over_login() -> Result<(), String> {
+        let o = obs(
+            "https://app.example/login",
+            vec![
+                element("textbox", "Password"),
+                element("button", "Sign in"),
+                element("iframe", "reCAPTCHA"),
+            ],
+        );
+        assert_eq!(detect_kind(&o)?, TakeoverKind::Captcha);
         Ok(())
     }
 
@@ -429,18 +523,66 @@ mod tests {
     }
 
     #[test]
-    fn captcha_takes_precedence_over_login() -> Result<(), String> {
-        // A login page that also presents a CAPTCHA: the CAPTCHA is the blocking
-        // challenge, so it wins.
+    fn enable_captcha_settings_toggle_is_not_flagged() {
+        // An admin settings toggle that merely mentions "CAPTCHA": not a widget,
+        // not a vendor name, not the challenge checkbox. Must not hard-pause.
         let o = obs(
-            "https://app.example/login",
+            "https://app.example/settings/security",
             vec![
-                element("textbox", "Password"),
-                element("button", "Sign in"),
-                element("iframe", "reCAPTCHA"),
+                element("checkbox", "Enable CAPTCHA protection"),
+                element("switch", "Enable CAPTCHA on signup"),
+                element("button", "Save"),
             ],
         );
-        assert_eq!(detect_kind(&o)?, TakeoverKind::Captcha);
-        Ok(())
+        assert_eq!(detect_human_takeover(&o), None);
+    }
+
+    #[test]
+    fn access_denied_help_link_is_not_flagged() {
+        // A docs page with a help link whose label contains "Access Denied":
+        // a link is not a prominent wall statement, so no auth wall fires.
+        let o = obs(
+            "https://docs.example/guides",
+            vec![
+                element("link", "Access Denied — Troubleshooting Guide"),
+                element("link", "Sign in"),
+                element("heading", "Troubleshooting"),
+            ],
+        );
+        assert_eq!(detect_human_takeover(&o), None);
+    }
+
+    #[test]
+    fn article_mentioning_session_expired_is_not_flagged() {
+        // A blog article whose body text mentions "session expired", with a
+        // "Sign in" nav link. Neither the body role nor the nav link is a
+        // prominent access-denial statement, so nothing fires.
+        let o = obs(
+            "https://blog.example/posts/auth-pitfalls",
+            vec![
+                element("heading", "Common auth pitfalls"),
+                element(
+                    "paragraph",
+                    "Last week my session expired mid-request and I lost data.",
+                ),
+                element("link", "Sign in"),
+                element("link", "Subscribe"),
+            ],
+        );
+        assert_eq!(detect_human_takeover(&o), None);
+    }
+
+    #[test]
+    fn recaptcha_help_link_is_not_flagged() {
+        // A support page linking to reCAPTCHA docs: the vendor name is on a link,
+        // not an embedding widget or challenge checkbox, so no CAPTCHA fires.
+        let o = obs(
+            "https://support.example/articles",
+            vec![
+                element("link", "How reCAPTCHA protects your account"),
+                element("button", "Contact support"),
+            ],
+        );
+        assert_eq!(detect_human_takeover(&o), None);
     }
 }
