@@ -27,8 +27,9 @@ use chromiumoxide::cdp::browser_protocol::target::{
 };
 use chromiumoxide::cdp::js_protocol::runtime::{EvaluateParams, ExecutionContextId};
 use chromiumoxide::error::CdpError;
+use chromiumoxide::handler::HandlerConfig;
 use chromiumoxide::page::{Page, ScreenshotParams};
-use futures::StreamExt;
+use futures::{future::join_all, StreamExt};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::Path;
@@ -74,6 +75,7 @@ const CDP_POLICY_PROXY_ARGS: [&str; 6] = [
     "--proxy-pac-url",
     "--proxy-server",
 ];
+const CDP_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Explicit opt-out for Chromium sandboxing in constrained CI/container setups.
 pub const TEMPO_CDP_NO_SANDBOX_ENV: &str = "TEMPO_CDP_NO_SANDBOX";
@@ -128,6 +130,7 @@ impl CdpConfig {
         let mut builder = BrowserConfig::builder()
             .headless_mode(HeadlessMode::New)
             .launch_timeout(self.launch_timeout)
+            .request_timeout(CDP_REQUEST_TIMEOUT)
             .user_data_dir(user_data_dir)
             .incognito()
             .enable_request_intercept()
@@ -771,7 +774,7 @@ impl CdpTempoDriver {
     }
 
     /// One O(1) stability sample: a single `Runtime.evaluate` in a CDP
-    /// isolated world that installs a page-wide MutationObserver once and
+    /// isolated world that installs or reuses a page-wide MutationObserver and
     /// returns `readyState|mutationGen`.
     ///
     /// The previous sampler pulled the full serialized DOM over CDP and hashed
@@ -932,15 +935,20 @@ fn parse_stability_probe(probe: &str) -> Option<PageStabilitySample> {
 const QUIESCENCE_POLL_INTERVALS_MS: [u64; 2] = [25, 50];
 const QUIESCENCE_POLL_INTERVAL_CAP_MS: u64 = 50;
 
-/// In-page probe: installs a document-wide MutationObserver once per window
-/// and reports `readyState|generation` (`generation = -1` when the observer
-/// cannot run, signalling the caller to use the DOM-hash fallback).
+/// In-page probe: installs a document-wide MutationObserver, rebinds it if the
+/// document root is replaced, and reports `readyState|generation`
+/// (`generation = -1` when the observer cannot run, signalling the caller to
+/// use the DOM-hash fallback).
 const STABILITY_PROBE_SCRIPT: &str = r#"(() => {
   const w = window;
-  if (w.__tempoMutObs === undefined) {
-    w.__tempoMutGen = 0;
+  const target = document.documentElement || document;
+  if (w.__tempoMutObs === undefined || w.__tempoMutTarget !== target) {
+    if (w.__tempoMutObs && typeof w.__tempoMutObs.disconnect === 'function') {
+      try { w.__tempoMutObs.disconnect(); } catch (e) {}
+    }
+    w.__tempoMutTarget = target;
+    w.__tempoMutGen = typeof w.__tempoMutGen === 'number' ? w.__tempoMutGen + 1 : 0;
     try {
-      const target = document.documentElement || document;
       const obs = new MutationObserver(() => { w.__tempoMutGen += 1; });
       obs.observe(target, { subtree: true, childList: true, attributes: true, characterData: true });
       w.__tempoMutObs = obs;
@@ -1053,22 +1061,33 @@ impl DriverTrait for CdpTempoDriver {
         &mut self,
         _options: BrowsingContextCreateOptions,
     ) -> Result<Box<dyn DriverTrait>, Unsupported> {
-        let browser_ws = self.browser.websocket_address().clone();
-        let (browser, mut handler) = Browser::connect(browser_ws)
-            .await
-            .map_err(|_error| Unsupported("fresh CDP browsing context"))?;
-        let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
-        let browser_context_id = browser
+        let browser_context_id = self
+            .browser
             .create_browser_context(
                 CreateBrowserContextParams::builder()
                     .dispose_on_detach(true)
                     .build(),
             )
             .await
-            .map_err(|_error| {
-                handler_task.abort();
-                Unsupported("fresh CDP browsing context")
-            })?;
+            .map_err(|_error| Unsupported("fresh CDP browsing context"))?;
+        let browser_ws = self.browser.websocket_address().clone();
+        let handler_config = HandlerConfig {
+            context_ids: vec![browser_context_id.clone()],
+            request_timeout: CDP_REQUEST_TIMEOUT,
+            ..HandlerConfig::default()
+        };
+        let (browser, mut handler) =
+            match Browser::connect_with_config(browser_ws, handler_config).await {
+                Ok(pair) => pair,
+                Err(_error) => {
+                    let _ = self
+                        .browser
+                        .dispose_browser_context(browser_context_id.clone())
+                        .await;
+                    return Err(Unsupported("fresh CDP browsing context"));
+                }
+            };
+        let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
         let page_params = match CreateTargetParams::builder()
             .url("about:blank")
             .browser_context_id(browser_context_id.clone())
@@ -1816,6 +1835,11 @@ fn grounded_selector(
     selectors_by_node.get(node).cloned()
 }
 
+/// Beater compatibility boundary: tempo-schema's
+/// `From<beater_browser::BrowserAction>` still emits raw CSS selectors as
+/// NodeIds that never passed through StableIdMapper. Those legacy selectors may
+/// be tried as querySelector inputs, but tempo-owned `node:*` IDs are opaque
+/// capabilities and must never fall through to raw selector lookup.
 fn selector_or_legacy_fallback(
     selectors_by_node: &BTreeMap<NodeId, String>,
     node: &NodeId,
@@ -2157,12 +2181,27 @@ where
     F: FnMut(NodeId) -> Fut,
     Fut: std::future::Future<Output = Result<Option<AxSummary>, TransportError>>,
 {
+    let mut jobs = Vec::new();
     for index in top_ranked_indices(elements, max_enriched) {
-        let Some(element) = elements.get_mut(index) else {
+        let Some(element) = elements.get(index) else {
             continue;
         };
         let node_id = element.node_id.clone();
-        if let Some(summary) = lookup(node_id).await? {
+        jobs.push((index, lookup(node_id)));
+    }
+
+    // The selected set is capped at `max_enriched`, so running these lookups
+    // together bounds concurrency while avoiding serial CDP round-trip waits.
+    let results = join_all(
+        jobs.into_iter()
+            .map(|(index, lookup)| async move { (index, lookup.await) }),
+    )
+    .await;
+    for (index, summary) in results {
+        if let Some(summary) = summary? {
+            let Some(element) = elements.get_mut(index) else {
+                continue;
+            };
             apply_ax_summary(element, &summary);
         }
     }
@@ -2739,6 +2778,14 @@ mod tests {
         assert_eq!(parse_stability_probe("complete|abc"), None);
         assert_eq!(parse_stability_probe(""), None);
         assert_eq!(parse_stability_probe("|"), None);
+    }
+
+    #[test]
+    fn stability_probe_rebinds_when_document_root_changes() {
+        assert!(STABILITY_PROBE_SCRIPT.contains("__tempoMutTarget !== target"));
+        assert!(STABILITY_PROBE_SCRIPT.contains("__tempoMutObs.disconnect()"));
+        assert!(STABILITY_PROBE_SCRIPT
+            .contains("typeof w.__tempoMutGen === 'number' ? w.__tempoMutGen + 1 : 0"));
     }
 
     #[test]
@@ -3424,6 +3471,189 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn live_cdp_current_url_guard_rejects_redirected_private_url_before_snapshot(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(chrome) = std::env::var_os("TEMPO_CDP_CHROME") else {
+            eprintln!(
+                "skipping live CDP redirected current URL guard test; TEMPO_CDP_CHROME is unset"
+            );
+            return Ok(());
+        };
+        let fixture = serve_policy_fixture()?;
+        let config = CdpConfig::default()
+            .with_executable(chrome.to_string_lossy())
+            .with_no_sandbox_env_opt_in();
+        let mut driver = CdpTempoDriver::launch_with(config)
+            .await?
+            .allow_private_network_access();
+
+        driver
+            .goto(&fixture.allowed_url("/redirect-private"))
+            .await?;
+        assert!(
+            fixture.private_requested.load(Ordering::SeqCst),
+            "redirect fixture did not land on the private target"
+        );
+        driver = driver.with_url_policy(UrlPolicy::block_private());
+
+        let observe_result = driver.observe().await;
+        assert!(
+            matches!(observe_result, Err(TransportError::UrlBlocked)),
+            "expected snapshot path to reject the private current URL before reading DOM, got {observe_result:?}"
+        );
+
+        let wait_result = driver
+            .act_batch(&ActionBatch {
+                actions: Vec::new(),
+                quiescence: QuiescencePolicy::Composite,
+            })
+            .await;
+
+        assert!(
+            matches!(wait_result, Err(TransportError::UrlBlocked)),
+            "expected composite quiescence to reject the private current URL before reading DOM, got {wait_result:?}"
+        );
+        driver.close().await?;
+        Ok(())
+    }
+
+    /// Unmasked guard coverage for `with_element` and `Action::Scroll` (#321),
+    /// complementing `live_cdp_current_url_guard_rejects_redirected_private_url_before_snapshot`
+    /// above (which never issues a Click or Scroll).
+    ///
+    /// Both call sites have a *downstream* re-check that fires regardless of
+    /// whether the site's own guard ran: after the action executes, every path
+    /// calls `record_current_observation_since` -> `snapshot_since`, whose own
+    /// `enforce_current_url_policy_value` also returns `UrlBlocked`. So a test
+    /// that only asserts the final `Err(UrlBlocked)` cannot tell "blocked
+    /// before touching the page" apart from "clicked/scrolled the page, then
+    /// blocked afterward" — reverting the guard at the top of `with_element`
+    /// or in the `Action::Scroll` arm would keep such a test green while the
+    /// interaction silently lands on the blocked page.
+    ///
+    /// This test therefore asserts the *converse* as well: after the blocked
+    /// Click/Scroll attempts, the page-side effects (`document.body.dataset.clicked`,
+    /// `window.scrollY`) must be absent. It also keeps a direct call to
+    /// `wait_for_composite_quiescence()` so the quiescence loop's own guard is
+    /// exercised without `act_batch`'s post-quiescence observation guard in
+    /// the way, and ends with an allow-case control proving the very same
+    /// probes do fire once the policy permits — so the negative assertions
+    /// cannot pass vacuously.
+    #[tokio::test]
+    async fn live_cdp_current_url_guard_prevents_click_and_scroll_side_effects(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(chrome) = std::env::var_os("TEMPO_CDP_CHROME") else {
+            eprintln!("skipping live CDP guard side-effect test; TEMPO_CDP_CHROME is unset");
+            return Ok(());
+        };
+        let url = serve_click_scroll_probe_fixture()?;
+        let config = CdpConfig::default()
+            .with_executable(chrome.to_string_lossy())
+            .with_no_sandbox_env_opt_in();
+        let mut driver = CdpTempoDriver::launch_with(config)
+            .await?
+            .allow_private_network_access();
+
+        let observation = driver.goto(&url).await?;
+        let save_node = observation
+            .elements
+            .iter()
+            .find(|element| {
+                element.role == "button"
+                    && element.name.first().map(|span| span.text.as_str()) == Some("Save")
+            })
+            .map(|element| element.node_id.clone())
+            .ok_or_else(|| std::io::Error::other("missing probe save button"))?;
+
+        // The driver now sits on a loopback URL; narrowing the policy makes
+        // the *current* page blocked without any further navigation.
+        driver = driver.with_url_policy(UrlPolicy::block_private());
+
+        // Click through with_element: must fail AND must not have clicked.
+        let click_result = driver
+            .act(&Action::Click {
+                node: save_node.clone(),
+            })
+            .await;
+        assert!(
+            matches!(click_result, Err(TransportError::UrlBlocked)),
+            "expected blocked-policy click to return UrlBlocked, got {click_result:?}"
+        );
+
+        // Scroll through the Action::Scroll arm: must fail AND must not have
+        // scrolled.
+        let scroll_result = driver.act(&Action::Scroll { x: 0.0, y: 400.0 }).await;
+        assert!(
+            matches!(scroll_result, Err(TransportError::UrlBlocked)),
+            "expected blocked-policy scroll to return UrlBlocked, got {scroll_result:?}"
+        );
+
+        // Quiescence loop guard, called directly so the assertion is scoped
+        // to the loop's own check rather than act_batch's post-quiescence
+        // observation guard.
+        let quiescence_result = driver.wait_for_composite_quiescence().await;
+        assert!(
+            matches!(quiescence_result, Err(TransportError::UrlBlocked)),
+            "expected blocked-policy quiescence poll to return UrlBlocked, got {quiescence_result:?}"
+        );
+
+        // Re-widen the policy so the probes themselves may be read; the page
+        // was never navigated away, so any side effect the blocked attempts
+        // leaked is still observable here.
+        driver = driver.with_url_policy(UrlPolicy::allow_all());
+        assert_eq!(
+            driver
+                .evaluate_script(
+                    "Promise.resolve(document.body.dataset.clicked ?? 'unset')",
+                    true
+                )
+                .await?,
+            serde_json::json!("unset"),
+            "blocked-policy click still landed on the page: with_element's own \
+             URL-policy guard did not fire before the click"
+        );
+        let blocked_scroll_y = driver
+            .evaluate_script("Promise.resolve(window.scrollY)", true)
+            .await?;
+        assert_eq!(
+            blocked_scroll_y.as_f64(),
+            Some(0.0),
+            "blocked-policy scroll still moved the page: Action::Scroll's own \
+             URL-policy guard did not fire before window.scrollTo"
+        );
+
+        // Allow-case control: the same probes fire once the policy permits,
+        // proving the negative assertions above are not vacuous.
+        assert!(matches!(
+            driver.act(&Action::Click { node: save_node }).await?,
+            StepOutcome::Applied { .. }
+        ));
+        assert_eq!(
+            driver
+                .evaluate_script(
+                    "Promise.resolve(document.body.dataset.clicked ?? 'unset')",
+                    true
+                )
+                .await?,
+            serde_json::json!("yes")
+        );
+        assert!(matches!(
+            driver.act(&Action::Scroll { x: 0.0, y: 400.0 }).await?,
+            StepOutcome::Applied { .. }
+        ));
+        let allowed_scroll_y = driver
+            .evaluate_script("Promise.resolve(window.scrollY)", true)
+            .await?;
+        assert!(
+            allowed_scroll_y.as_f64().unwrap_or_default() > 0.0,
+            "allow-case scroll control did not move the page; the scroll probe is broken"
+        );
+
+        driver.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn live_cdp_driver_navigates_observes_acts_and_screenshots(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let Some(chrome) = std::env::var_os("TEMPO_CDP_CHROME") else {
@@ -3694,6 +3924,40 @@ mod tests {
         Ok(format!("http://{addr}/"))
     }
 
+    /// Like [`serve_fixture`] (same `dataset.clicked` click probe on the Save
+    /// button) plus a tall spacer so `window.scrollTo` has room to move and
+    /// `window.scrollY` doubles as a scroll-landed probe (#321).
+    fn serve_click_scroll_probe_fixture() -> Result<String, std::io::Error> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+
+        std::thread::spawn(move || {
+            let body = r#"<!doctype html>
+                <html>
+                  <body>
+                    <button id="save" onclick="document.body.dataset.clicked='yes'">
+                      <span>Save</span>
+                    </button>
+                    <div style="height: 4000px"></div>
+                  </body>
+                </html>"#;
+            for stream in listener.incoming().take(16) {
+                let Ok(mut stream) = stream else {
+                    continue;
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+
+        Ok(format!("http://{addr}/"))
+    }
+
     struct PolicyFixture {
         origin: String,
         private_url: String,
@@ -3726,6 +3990,11 @@ mod tests {
                             r#"<!doctype html><html><body><a id="go" href="{thread_private_url}">Go</a></body></html>"#
                         );
                         http_response("200 OK", "text/html", &body)
+                    }
+                    "/redirect-private" => {
+                        format!(
+                            "HTTP/1.1 302 Found\r\nLocation: {thread_private_url}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        )
                     }
                     "/private" => {
                         requested.store(true, Ordering::SeqCst);
@@ -3883,6 +4152,44 @@ mod tests {
 
         // Under the cap, every element is enriched exactly once.
         assert_eq!(calls, element_count);
+        assert!(elements
+            .iter()
+            .all(|element| element.name[0].text == "enriched"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn enrichment_lookups_run_concurrently_within_the_cap() -> Result<(), TransportError> {
+        let mut elements = vec![
+            sample_element("#a", 0.5),
+            sample_element("#b", 0.9),
+            sample_element("#c", 0.8),
+            sample_element("#d", 1.0),
+        ];
+        let in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        enrich_elements(&mut elements, MAX_AX_ENRICHED_ELEMENTS, {
+            let in_flight = in_flight.clone();
+            let max_in_flight = max_in_flight.clone();
+            move |_node_id: NodeId| {
+                let in_flight = in_flight.clone();
+                let max_in_flight = max_in_flight.clone();
+                async move {
+                    let current = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_in_flight.fetch_max(current, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                    Ok::<_, TransportError>(Some(enriched_summary()))
+                }
+            }
+        })
+        .await?;
+
+        assert!(
+            max_in_flight.load(Ordering::SeqCst) > 1,
+            "AX enrichment lookups were still serialized"
+        );
         assert!(elements
             .iter()
             .all(|element| element.name[0].text == "enriched"));

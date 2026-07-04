@@ -9,6 +9,8 @@ use std::collections::HashMap;
 use tempo_schema::{Action, SideEffect, TaintSpan};
 use thiserror::Error;
 
+pub mod trust;
+
 /// Stable table of side-effect levels handled by this policy crate.
 pub const SIDE_EFFECTS: [SideEffect; 6] = [
     SideEffect::Read,

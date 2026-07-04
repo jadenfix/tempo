@@ -6,6 +6,43 @@ product reaches **every device a person or agent owns**, with latency as the
 governing constraint, and why a browser invented *today* — in a world with
 200-IQ LLMs that today interact with browsers badly — ships in this shape.
 
+## 0. Current state and tracker reconciliation
+
+This document is a directional, non-committal platform plan until the current
+engine, shell, and daemon gates land. It is not evidence that a platform exists:
+a platform exists only when the conformance suite, observe fixture gate, and
+target latency/RAM budgets pass on that target.
+
+Current repo state to reconcile before treating any milestone below as
+committed implementation work:
+
+- **Servo engine lane**: #246 tracks that `tempo-engine-servo` is still a
+  compatibility/type-check shim, not a production libservo embed. T1 shell work
+  must not assume the Servo lane already satisfies the final.md gates.
+- **Human shell**: #247 tracks that `tempo-shell` is not yet a windowed
+  winit/wgpu shell. It is currently a control-plane client, so shell milestones
+  below are target state, not present-tense product state.
+- **Daemon/protocol conformance**: #249 tracks that `tempod` still needs to
+  converge on the final transport/protocol shape. Platform shell work must not
+  hide that behind app packaging.
+- **Cross-platform secure IPC**: #260 owns native secure transports and peer
+  authentication. Windows named pipes, Android app-private sockets, and mobile
+  packaging must satisfy that issue's security bar rather than bypass it.
+- **Servo availability source of truth**: #294 is the conservative platform
+  availability matrix. Tempo follows upstream Servo availability for macOS,
+  Linux, Windows, Android, and OpenHarmony; this document focuses on app/shell
+  sequencing and keeps #294 as the code-backed truth.
+- **Latency series**: #297, #298, #299, #300, #301, and #302 own the binary
+  frame, event-driven settle, batched enrichment, per-driver IPC, CI benchmark,
+  and benchmark-harness work. The latency table here summarizes those gates; it
+  does not replace their acceptance criteria.
+
+Concrete platform implementation issues should be filed before work starts on
+the macOS windowed shell, Windows named-pipe transport, Android NDK/WebView port,
+iOS static-lib/WKWebView shell, or `tempo-engine-webview`. Until those issues
+exist and #246/#247/#249 are resolved, §7 is sequencing guidance rather than a
+delivery commitment.
+
 ## 1. First principles
 
 A browser designed from scratch in 2026 would not start from "render HTML for
@@ -61,18 +98,22 @@ extraction script).
 
 ## 4. Platform shells
 
-- **macOS (first)**: winit + wgpu surface for the Servo compositor; menu-bar
-  daemon mode for headless agent fleets; Keychain-backed identity. tempod
-  already runs here — the shell is a window over the same control plane.
-- **Windows**: same winit/wgpu shell; WebView2 as the T2 lane; named-pipe
-  transport replaces UDS behind the same framing (the `write_frame`/
-  `read_frame` contract is transport-agnostic already).
-- **Android**: NDK build of tempo-core (Rust cross-compiles cleanly; rusqlite
-  bundles SQLite); Servo-on-Android for T1 on capable devices, WebView T2
-  below a RAM threshold; binder-friendly local socket transport.
-- **iOS**: tempo-core as a static lib behind a Swift shell; WKWebView T2 lane;
-  Network Extension is *not* required because tempo's net layer proxies
-  in-process; MCP served on localhost for on-device agent apps.
+- **macOS (first target)**: target state is a winit + wgpu surface for the
+  Servo compositor, menu-bar daemon mode for headless agent fleets, and
+  Keychain-backed identity. `tempod` can run locally today, but #247 and #249
+  mean the windowed shell and spec-conformant daemon are still future work.
+- **Windows**: target state is the same winit/wgpu shell, WebView2 as the T2
+  lane, and a Windows-native transport behind the same frame contract.
+  Named-pipe work is gated by #260 peer authentication and platform-specific
+  cfg coverage; it is not a drop-in replacement until those checks exist.
+- **Android**: target state is an NDK build of tempo-core, app-private local
+  control sockets, WebView T2 below a RAM threshold, and Servo T1 on capable
+  devices when #294 says the upstream Servo target is available. Android work
+  must stay RAM-bounded and avoid desktop-only assumptions in shared crates.
+- **iOS**: target state is tempo-core as a static lib behind a Swift shell,
+  WKWebView T2, and localhost MCP for on-device agent apps. Network Extension
+  should remain unnecessary unless a future issue proves an out-of-process net
+  layer is required.
 
 Milestone gates (same style as final.md §8): a platform "exists" when (1) the
 conformance suite passes on-device, (2) the observe fixture gate passes, (3)
@@ -82,7 +123,8 @@ recorded by the benchmark suite in CI for that target.
 ## 5. Latency architecture (applies to every tier)
 
 Measured floors first — `scripts/bench.sh` owns the numbers; targets below are
-budgets the benches enforce, not aspirations:
+budgets the benches enforce, not aspirations. The implementation work is tracked
+in #297-#302; this table is the platform-facing summary of those gates:
 
 | Hop | Budget | How |
 |-----|--------|-----|
@@ -145,15 +187,19 @@ using the same browser state, at the same time, with provenance.
 
 ## 7. Sequencing
 
-1. **Now**: land the benchmark harness + latency PR series (observation,
-   IPC framing, cassette indexing, settle polling) — these shrink the core
-   every port inherits.
-2. **M+1**: macOS shell (winit/wgpu over the existing daemon); binary
+This sequence is a dependency order, not a release promise. Each milestone must
+be backed by a concrete implementation issue or PR before it is treated as
+committed work.
+
+1. **Now**: close the current-state blockers (#246, #247, #249), keep platform
+   availability grounded in #294, and land the benchmark/latency series
+   (#297-#302). These shrink and harden the core every port inherits.
+2. **M+1**: macOS shell (winit/wgpu over a conformant local daemon); binary
    screenshot frames; event-driven settle from the Servo embedder.
-3. **M+2**: Windows shell (named-pipe transport + WebView2 T2);
-   `tempo-engine-webview` adapter passing conformance.
-4. **M+3**: Android (NDK core, WebView T2 first, Servo T1 behind a device
-   gate); per-tier RAM budgets enforced in CI.
+3. **M+2**: Windows shell (secure named-pipe transport under #260 + WebView2
+   T2); `tempo-engine-webview` adapter passing conformance.
+4. **M+3**: Android (NDK core, WebView T2 first, Servo T1 behind #294/device
+   gates); per-tier RAM budgets enforced in CI.
 5. **M+4**: iOS (static-lib core + WKWebView T2), on-device MCP; app-store
    packaging.
 
