@@ -46,9 +46,11 @@ Correctness & honesty of the contract:
 - [ ] Docs, comments, and declared schemas/types match what the code actually does — no present-tense claims for a stub, no `{"type":"object"}` standing in for a real schema.
 - [ ] Runtime-visible contract changes update every public description in the same slice: OpenAPI paths/statuses/schemas, agent cards, SDK-facing docs, and compatibility fixtures. A route or response field that exists at runtime but is absent from the contract is a blocker for SDK workflows.
 - [ ] Public Rust schema struct changes update source callers too: `serde(default)` preserves old JSON compatibility, but it does not make existing struct literals compile. Scan/update workspace literals and downstream crates.
+- [ ] Compact wire-format changes that omit default, empty, or optional fields preserve both directions of compatibility: compact serialization, populated serialization, and default-filled deserialization all have reverted-fix-sensitive tests.
 
 Resource, lifecycle & availability:
 - [ ] Everything that can grow is bounded: input/response sizes, queues, maps, caches, retries, spawned tasks, and session/connection counts. Unbounded growth on remote-driven input is a blocker.
+- [ ] Size caps are enforced before or during construction/serialization of remote-driven JSON, DOM, screenshot, log, and tool-result data. A check that rejects only after allocating the complete payload is not a memory bound.
 - [ ] Stateful protocol handlers enforce live-state quotas in addition to per-message size caps; repeated valid commands must not grow maps, vectors, or dispatch scans without bound.
 - [ ] Every engine/remote/subprocess round-trip has a timeout **and** a recovery path — a crash or hang is detected and healed (restart/reconnect, with backoff), not permanently terminal.
 - [ ] Health/readiness signals reflect real state (draining, dependency-down, at-capacity); cleanup and teardown run on every exit path including error and cancel.
@@ -59,6 +61,7 @@ Resource, lifecycle & availability:
 Trust boundaries & security:
 - [ ] Caller-supplied trust/policy/side-effect classifications (`taint`, `confirmed`, …) are recomputed server-side, never trusted.
 - [ ] Untrusted data is size-checked, provenance-tracked, and cannot cause side effects or leak secret headers; a policy (URL, egress, redaction) is enforced across the whole path — redirects, retries, interception — not just the entrypoint.
+- [ ] Egress and proxy policy is bound to the concrete endpoint actually used after DNS, proxy resolution, redirects, and retries; validating a hostname, URL string, or only one candidate address is not enough when another resolved socket can be selected later.
 - [ ] Untrusted descriptors and attestations (OpenAPI/WebMCP catalogs, handshake evidence) are origin-bound and cannot themselves drive side effects or inject secret headers.
 - [ ] Tests and docs that verify redaction do not commit realistic secret, token, password, API-key, or credential literals. Use scanner-safe inert fragments while still proving the sensitive value never appears in debug/display/error/export output.
 - [ ] Secret-bearing clients parse and validate configured base URLs before constructing requests: reject userinfo/query/fragment/path injection, require a pinned secure production origin, and make loopback/insecure fixtures use an explicitly named test opt-in.
