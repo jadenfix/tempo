@@ -431,18 +431,18 @@ The sections above describe the destination; this section tracks the *operationa
 - **Performance floor**: criterion benchmark harness across the hot paths (merged) plus a shipping profile (thin LTO, codegen-units=1, stripped) so release binaries and benches measure what users run.
 - **Forkability & governance**: LICENSE (Apache-2.0, matching the long-declared workspace license), CONTRIBUTING (invariants + CI gates + multi-agent conventions), SECURITY (scope ordered by §2's threat model), `cargo-deny` supply-chain CI (advisories/bans/sources/licenses), and a tag-triggered release pipeline producing checksummed macOS/Linux binaries. tempo builds standalone from a fresh clone — beater reuse is rev-pinned git deps, not sibling-path coupling.
 
-### 11.2 In flight (tracked, not duplicated here)
+### 11.2 Recently landed adjacent work (context, not duplicated here)
 
-Cassette replay indexing and observe-pipeline allocation work, UDS/WebSocket transport syscall reduction, and CDP-lane latency (perf PR chain); per-session concurrent dispatch in tempod (#305); journal WAL mode (#304); remote-bind auth (#276); privacy redaction surfaces (#268).
+The 2026-07-04 wave merged: per-session concurrent dispatch in tempod (#305), remote-bind bearer auth (#276), journal WAL mode (#304), privacy redaction across net/observe (#268), agent budget/replay guards (#269), and the perf chain — criterion harness (#302), observe-pipeline allocation cuts (#309), cassette/origin-rule indexing (#310), transport framing/syscall reduction (#311), CDP page-settled sampling (#312). The paired observability PR wires `TempodConfig` into tempod (defaults < file < env < flags), so config adoption is no longer a gap.
 
 ### 11.3 Next most-critical gaps (ranked)
 
-1. **Session admission control** — the pool is an unbounded map; `limits.max_sessions` + idle eviction from `tempo-config` must be enforced at create/adopt once #305 lands (its dispatch rework owns that region).
+1. **Session admission control** — the pool is an unbounded map; `limits.max_sessions` + idle eviction from `tempo-config` should now be enforced at create/adopt (unblocked: #305's dispatch rework has landed).
 2. **Readiness vs liveness** — `/health` is liveness only; a readiness probe should reflect drain state and engine-host health so fleet load-balancers stop routing before drain completes.
 3. **Engine-host restart backoff** — restart-on-exit is immediate today; a crash-looping engine needs exponential backoff + a `tempo-telemetry` counter so loops are visible, not silent.
-4. **Config adoption in binaries** — `tempod` should load `TempodConfig` at startup (flags override) and log the effective config; blocked only by #276's flag surface to avoid conflicts.
-5. **Structured logging adoption** — the daemon's remaining `eprintln!` sites and the engine-host/net crates should emit `tempo-telemetry` events so fleet operators get one log shape.
-6. **Budget gates on live telemetry** — CI budget evaluators (§10) should consume `tempo-telemetry` JSON snapshots from eval runs, closing the loop between the exposition and the §8.2 milestone evidence.
+4. **Structured logging adoption** — the daemon's remaining `eprintln!` sites and the engine-host/net crates should emit `tempo-telemetry` events so fleet operators get one log shape.
+5. **Budget gates on live telemetry** — CI budget evaluators (§10) should consume `tempo-telemetry` JSON snapshots from eval runs, closing the loop between the exposition and the §8.2 milestone evidence.
+6. **Host-header validation on control routes** — the loopback-Origin guard alone does not stop a DNS-rebinding page issuing *same-origin* fetches (which carry no Origin header); control routes should also require a loopback/expected Host.
 
 ## Appendix — key beater files reused
 
