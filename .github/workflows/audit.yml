@@ -35,3 +35,27 @@ jobs:
           arguments: --locked
           command: check advisories bans sources licenses
           rust-version: "1.96.1"
+
+  servo-supply-chain:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: cargo deny (Servo lane, all features)
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          # Scheduled/manual only: make the optional Servo dependency graph
+          # visible without blocking day-to-day PRs on upstream Servo advisories.
+          arguments: >
+            --manifest-path crates/tempo-engine-servo/Cargo.toml
+            --all-features
+            --locked
+          command: >
+            check
+            --config deny-servo.toml
+            --warn vulnerability
+            --warn unmaintained
+            --warn unsound
+            --warn notice
+            advisories bans sources licenses
+          rust-version: "1.96.1"
