@@ -1629,6 +1629,41 @@ fn grounded_selector(
     selectors_by_node.get(node).cloned()
 }
 
+/// Resolve a `NodeId` to a live CSS selector, falling back to treating the
+/// `NodeId` itself as a raw selector for legacy (non-`node:`) ids.
+///
+/// # Why this exists
+///
+/// `tempo-schema`'s `From<beater_browser::BrowserAction> for Action` builds
+/// `Action::Click`/`Type`/`Select`/`Extract` directly from beater's legacy
+/// `selector: String` field (see `crates/tempo-schema/src/lib.rs`):
+/// `NodeId(selector)`. Those `NodeId`s never pass through
+/// `StableIdMapper::allocate` and so are never present in `selectors_by_node`
+/// — `grounded_selector` always misses for them. Without this fallback every
+/// beater-compat action would fail grounding, breaking the beater
+/// compatibility lane this crate exists to serve.
+///
+/// # Why the fallback is safe
+///
+/// `StableIdMapper::allocate` (see `crates/tempo-observe/src/lib.rs`) only
+/// ever mints ids of the form `node:<hex>[-<n>]`, so every genuine
+/// tempo-native id is `node:`-prefixed by construction. This function
+/// refuses to fall back for any id that looks like one of those
+/// (`node.0.starts_with("node:")`): a `node:`-prefixed id that fails to
+/// ground is a real grounding miss (stale/removed element) and must surface
+/// as a step error, never be re-interpreted as a literal CSS selector like
+/// `document.querySelector("node:...")`.
+///
+/// For everything else, the fallback only ever hands back a string that a
+/// caller already chose to use as a raw CSS selector — exactly what beater's
+/// pre-tempo browser driver did with the same value — so this does not let a
+/// hostile *page* run anything it couldn't already target via a legacy
+/// selector-based action; it only restores compatibility for the trusted
+/// caller-supplied selector string. It also does not interact with the
+/// redirect/URL-policy guard (`enforce_current_url_policy`, see #315):
+/// every caller of the resolved selector (`with_element` et al.) still
+/// enforces that guard before touching the page, regardless of which branch
+/// resolved the selector.
 fn selector_or_legacy_fallback(
     selectors_by_node: &BTreeMap<NodeId, String>,
     node: &NodeId,
@@ -3185,6 +3220,156 @@ mod tests {
         Ok(())
     }
 
+    /// Regression coverage for #315 / PR #278's `enforce_current_url_policy()`
+    /// guard (~9 call sites: snapshot/observe, AX enrichment, `with_element`
+    /// click/type/select grounding, extraction, `Action::Scroll`, the
+    /// composite-quiescence poll loop, `evaluate_script`, and `screenshot`).
+    ///
+    /// A literal HTTP/JS redirect straight to a policy-blocked host is
+    /// already stopped *before* it commits by the Fetch-domain/proxy request
+    /// interception installed in `install_request_policy` /
+    /// `PolicyProxy::start` (see
+    /// `live_cdp_driver_blocks_page_triggered_private_navigation` and
+    /// `live_cdp_driver_blocks_script_triggered_private_request` above) —
+    /// `page.url()` can never actually settle on a target the *current*
+    /// policy would reject via that path, so there is nothing left there for
+    /// `enforce_current_url_policy()` to catch.
+    ///
+    /// `enforce_current_url_policy()`'s job is the complementary case: the
+    /// driver has *already* navigated (here, via a real same-session,
+    /// in-page redirect, followed while the policy still allowed it) to a
+    /// host that becomes disallowed afterward — e.g. an operator narrows the
+    /// policy mid-task without issuing any further navigation. Every
+    /// DOM-touching operation must refuse to keep reading that page, purely
+    /// because of what the *current* URL now is, even though no new network
+    /// request is involved (screenshot, scroll, and evaluate/observe/extract
+    /// reads never hit the network at all, so only this guard protects them).
+    #[tokio::test]
+    async fn live_cdp_current_url_guard_blocks_reads_after_mid_session_redirect_to_blocked_host(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(chrome) = std::env::var_os("TEMPO_CDP_CHROME") else {
+            eprintln!("skipping live CDP current-url guard test; TEMPO_CDP_CHROME is unset");
+            return Ok(());
+        };
+        let fixture = serve_redirect_guard_fixture()?;
+        let config = CdpConfig::default()
+            .with_executable(chrome.to_string_lossy())
+            .with_no_sandbox_env_opt_in();
+        let mut driver = CdpTempoDriver::launch_with(config)
+            .await?
+            .allow_private_network_access();
+
+        // Land on the start page under the permissive test policy.
+        let observation = driver.goto(&fixture.start_url()).await?;
+        let go_node = observation
+            .elements
+            .iter()
+            .find(|element| {
+                element.role == "link"
+                    && element.name.first().map(|span| span.text.as_str()) == Some("Go")
+            })
+            .map(|element| element.node_id.clone())
+            .ok_or_else(|| std::io::Error::other("missing start-page Go link"))?;
+
+        // Perform the in-session redirect while the policy still allows it.
+        let outcome = driver.act(&Action::Click { node: go_node }).await?;
+        assert!(matches!(outcome, StepOutcome::Applied { .. }));
+
+        // Allow case: guarded operations still succeed on the redirected
+        // page while the policy allows it, and give us grounded node ids for
+        // the block-case assertions below.
+        let observation = driver.observe().await?;
+        let save_node = observation
+            .elements
+            .iter()
+            .find(|element| {
+                element.role == "button"
+                    && element.name.first().map(|span| span.text.as_str()) == Some("Save")
+            })
+            .map(|element| element.node_id.clone())
+            .ok_or_else(|| std::io::Error::other("missing redirected-page save button"))?;
+        let email_node = observation
+            .elements
+            .iter()
+            .find(|element| element.role == "textbox")
+            .map(|element| element.node_id.clone())
+            .ok_or_else(|| std::io::Error::other("missing redirected-page email input"))?;
+        driver.screenshot().await?;
+        assert_eq!(
+            driver.evaluate_script("1 + 1", false).await?,
+            serde_json::json!(2)
+        );
+        assert!(matches!(
+            driver.act(&Action::Scroll { x: 0.0, y: 0.0 }).await?,
+            StepOutcome::Applied { .. }
+        ));
+
+        // Narrow the policy without navigating again: the driver is still
+        // sitting on the same (loopback) host, which `block_private()` now
+        // disallows. This is the "mid-session redirect to a blocked host"
+        // scenario: from the guard's point of view it is indistinguishable
+        // from a redirect that landed on an already-blocked host, since the
+        // guard only ever compares the *current* URL against the *current*
+        // policy.
+        driver = driver.with_url_policy(UrlPolicy::block_private());
+
+        // snapshot()/observe() path (`snapshot_since` ->
+        // `enforce_current_url_policy_value`).
+        assert!(matches!(
+            driver.observe().await,
+            Err(TransportError::UrlBlocked)
+        ));
+        // extract_with_selector path.
+        assert!(matches!(
+            driver.extract(&email_node).await,
+            Err(TransportError::UrlBlocked)
+        ));
+        // with_element/with_node_element path (click/type/select grounding).
+        assert!(matches!(
+            driver.act(&Action::Click { node: save_node }).await,
+            Err(TransportError::UrlBlocked)
+        ));
+        // Action::Scroll path.
+        assert!(matches!(
+            driver.act(&Action::Scroll { x: 0.0, y: 0.0 }).await,
+            Err(TransportError::UrlBlocked)
+        ));
+        // evaluate_script path.
+        assert!(matches!(
+            driver.evaluate_script("1 + 1", false).await,
+            Err(TransportError::UrlBlocked)
+        ));
+        // screenshot path.
+        assert!(matches!(
+            driver.screenshot().await,
+            Err(TransportError::UrlBlocked)
+        ));
+        // Composite-quiescence poll-loop path, called directly so this
+        // assertion is scoped to `wait_for_composite_quiescence`'s own guard
+        // calls rather than the separate guard `record_current_observation`
+        // would invoke afterward — going through `act_batch` alone would
+        // still fail even if the loop's internal checks were removed,
+        // because `act_batch` calls `record_current_observation` (guarded via
+        // `snapshot_since`) right after quiescence resolves.
+        assert!(matches!(
+            driver.wait_for_composite_quiescence().await,
+            Err(TransportError::UrlBlocked)
+        ));
+        // Same path through the public API, end to end.
+        assert!(matches!(
+            driver
+                .act_batch(&ActionBatch {
+                    actions: Vec::new(),
+                    quiescence: QuiescencePolicy::Composite,
+                })
+                .await,
+            Err(TransportError::UrlBlocked)
+        ));
+
+        driver.close().await?;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn live_cdp_driver_navigates_observes_acts_and_screenshots(
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -3504,6 +3689,63 @@ mod tests {
             origin: format!("http://{addr}"),
             private_url,
             private_requested,
+        })
+    }
+
+    struct RedirectGuardFixture {
+        origin: String,
+    }
+
+    impl RedirectGuardFixture {
+        fn start_url(&self) -> String {
+            format!("{}/start", self.origin)
+        }
+    }
+
+    /// Fixture for the mid-session redirect / current-url guard test: `/start`
+    /// links to `/after-redirect`, whose page carries the same
+    /// button+textbox shape as [`serve_fixture`] so click/type/extract
+    /// call paths have real elements to ground against on the far side of
+    /// the redirect.
+    fn serve_redirect_guard_fixture() -> Result<RedirectGuardFixture, std::io::Error> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(32) {
+                let Ok(mut stream) = stream else {
+                    continue;
+                };
+                let path = read_request_path(&mut stream).unwrap_or_default();
+                let response = match path.as_str() {
+                    "/start" => http_response(
+                        "200 OK",
+                        "text/html",
+                        r#"<!doctype html><html><body><a id="go" href="/after-redirect">Go</a></body></html>"#,
+                    ),
+                    "/after-redirect" => http_response(
+                        "200 OK",
+                        "text/html",
+                        r#"<!doctype html>
+                            <html>
+                              <body>
+                                <button id="save" onclick="document.body.dataset.clicked='yes'">
+                                  <span>Save</span>
+                                </button>
+                                <label for="email">Email Address</label>
+                                <input id="email" value="me@example.com">
+                              </body>
+                            </html>"#,
+                    ),
+                    _ => http_response("404 Not Found", "text/plain", "not found"),
+                };
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+
+        Ok(RedirectGuardFixture {
+            origin: format!("http://{addr}"),
         })
     }
 
