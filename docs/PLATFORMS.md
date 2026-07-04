@@ -97,14 +97,51 @@ buffers instead of cloning element vectors; cassette/journal lookups are
 offset-indexed (no whole-file loads); mapper and cache structures are
 generation-evicted (already true) and byte-bounded (to enforce per-tier).
 
-## 6. Humans use it too
+## 6. Two first-class users: agents and humans
 
-The same shell renders the T1/T2 surface for people. What changes vs a legacy
-browser is that agent state is a first-class UI citizen: the set-of-marks
-overlay, the taint/provenance of what the agent is about to submit, the
-policy confirmation gates (`tempo-policy`) — rendered natively by the shell,
-not injected into page DOM. One core, two projections; the human view is a
-projection with pixels.
+tempo is **agent-first, not agent-only-by-default** — but it ships an explicit
+agent-only mode where every human-facing subsystem is compiled out or never
+initialized. One core, two projections; each projection gets first-principles
+treatment rather than one being emulated on top of the other.
+
+### Agent-only mode (the full-optimization path)
+
+- No compositor, no window, no font/paint pipeline warm-up: the observation
+  projection (`tempo-observe`) is the *only* output surface unless a
+  screenshot is explicitly requested.
+- Headless daemon (`tempod`) is the product: UDS/named-pipe control plane,
+  MCP + BiDi + OpenAPI in front, N engines behind, state forking
+  (`tempo-speculate`) for parallel exploration.
+- Every latency budget in §5 is measured in this mode first — it is the mode
+  with nothing to hide behind.
+
+### Any LLM plugs in
+
+The model is a *client*, never baked in. Three seams, all already in the tree:
+
+- **MCP** (`tempo-mcp`): any MCP-speaking model/runtime drives tempo today.
+- **Decider trait** (`tempo-agent`): the in-process loop is provider-abstracted
+  (one trait; Anthropic client is just the first implementation) — plug in any
+  local or hosted model without touching the loop.
+- **OpenAPI/BiDi** (`tempo-headless`): generated SDKs for everything else.
+
+The contract these seams expose (C1/C2/C3: observation, action, lifecycle) is
+the product surface. A 200-IQ model and a 7B on-device model get the same
+ranked, stable, diff-able state and the same transactional actions; they
+differ only in how much of the budget they need.
+
+### Human mode
+
+The same shell renders the T1/T2 pixel surface for people, and the agent
+state is a first-class UI citizen rather than an extension hack: the
+set-of-marks overlay, taint/provenance of what an agent is about to submit,
+and `tempo-policy` confirmation gates render natively in the shell, outside
+page DOM (uninjectable by the page). Humans get the first-principles wins
+too: the API-first fast path, speculative prefetch, and session replay are
+speed and safety features for people, not just for models. Human mode is a
+strict superset — flip it on and the agent plane keeps running underneath,
+which is what the future of the internet looks like: people and their agents
+using the same browser state, at the same time, with provenance.
 
 ## 7. Sequencing
 
