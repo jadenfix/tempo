@@ -2495,6 +2495,9 @@ fn extract_interactive_elements(html: &str) -> Vec<InteractiveElement> {
     // bytes of HTML, capped) so a big page doesn't pay repeated grow-copies of
     // the element vector while streaming.
     let mut elements = Vec::with_capacity((html.len() / 400).clamp(8, 1024));
+    // #402: count of prominent non-interactive nodes carried so far, bounded by
+    // MAX_CARRIED_NONINTERACTIVE so a heading-heavy page can't bloat the budget.
+    let mut carried_noninteractive = 0usize;
     let mut search_from = 0;
     // Sentinel document-root frame; its empty tag never matches a real close tag.
     let mut stack: Vec<Frame> = vec![Frame {
@@ -2561,6 +2564,50 @@ fn extract_interactive_elements(html: &str) -> Vec<InteractiveElement> {
 
         let role_attr = attrs.get("role").map(String::as_str);
         if !is_interactive(&tag, role_attr, &attrs) {
+            // #402: the interactive-only filter above strips exactly the roles the
+            // human-takeover detector keys on — a 403/expired auth WALL
+            // (heading/alert/status/banner/alertdialog) and a CAPTCHA-hosting
+            // IFRAME/frame/embed — leaving those states structurally invisible.
+            // Carry a bounded set of *only* those prominent roles/tags into the
+            // observation so `detect_human_takeover` can see them. The interactive
+            // path is unchanged.
+            if carried_noninteractive < MAX_CARRIED_NONINTERACTIVE
+                && let Some(role) = prominent_noninteractive_role(&tag, role_attr)
+            {
+                let text = element_text(html, search_from, &tag).unwrap_or_default();
+                let name = attrs
+                    .get("aria-label")
+                    .or_else(|| attrs.get("title"))
+                    .cloned()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or_else(|| text.trim().to_string());
+                let selector = selector_for(&tag, &attrs).unwrap_or(fallback_selector);
+                // For an embedding frame, carry its `src` origin so a vendor URL
+                // (…/recaptcha/…, challenges.cloudflare.com) still matches even when
+                // the frame carries no title/aria-label.
+                let value = attrs
+                    .get("src")
+                    .filter(|src| !src.trim().is_empty())
+                    .map(|src| {
+                        vec![TaintSpan {
+                            provenance: Provenance::Page,
+                            text: src.clone(),
+                        }]
+                    })
+                    .unwrap_or_default();
+                elements.push(InteractiveElement {
+                    node_id: NodeId(selector),
+                    role,
+                    name: vec![TaintSpan {
+                        provenance: Provenance::Page,
+                        text: name,
+                    }],
+                    value,
+                    bounds: None,
+                    rank: 0.5,
+                });
+                carried_noninteractive += 1;
+            }
             continue;
         }
 
@@ -2704,6 +2751,41 @@ fn is_interactive(tag: &str, role: Option<&str>, attrs: &BTreeMap<String, String
         )
         || attrs.contains_key("onclick")
         || attrs.contains_key("tabindex")
+}
+
+/// #402: prominent non-interactive roles the human-takeover detector keys on.
+/// Kept in lockstep with `tempo_act::detect::is_wall_role` (page-blocking walls)
+/// and `is_embedding_role` (CAPTCHA-hosting frames), but deliberately tighter on
+/// the embedding side — no group/region/widget — so ordinary containers do not
+/// flood the observation.
+const CARRIED_WALL_ROLES: &[&str] = &["heading", "alert", "status", "banner", "alertdialog"];
+const CARRIED_EMBED_ROLES: &[&str] = &["iframe", "frame", "embed"];
+
+/// Upper bound on non-interactive nodes carried into one observation, so a
+/// heading-heavy page cannot bloat the observation / token budget (final.md §8.1).
+/// The detector only needs to *find* one matching wall/frame; the cap keeps the
+/// earliest (document-order) prominent nodes, where walls and challenge frames sit.
+const MAX_CARRIED_NONINTERACTIVE: usize = 16;
+
+/// The role to carry for a non-interactive element the takeover detector cares
+/// about, or `None` to leave it filtered. An explicit ARIA role wins; otherwise
+/// headings (`h1`–`h6`) and embedding tags (`iframe`/`frame`/`embed`) map to
+/// their implicit role. This is the *only* way such nodes enter the observation:
+/// the interactive path (`is_interactive`) is untouched.
+fn prominent_noninteractive_role(tag: &str, role: Option<&str>) -> Option<String> {
+    if let Some(role) = role {
+        let role_lc = role.to_ascii_lowercase();
+        if CARRIED_WALL_ROLES.contains(&role_lc.as_str())
+            || CARRIED_EMBED_ROLES.contains(&role_lc.as_str())
+        {
+            return Some(role.to_string());
+        }
+    }
+    match tag {
+        "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => Some("heading".to_string()),
+        "iframe" | "frame" | "embed" => Some(tag.to_string()),
+        _ => None,
+    }
 }
 
 fn selector_for(tag: &str, attrs: &BTreeMap<String, String>) -> Option<String> {
@@ -3081,6 +3163,67 @@ mod tests {
             history_base(&history, 1).map(|observation| observation.seq),
             Some(1)
         );
+    }
+
+    #[test]
+    fn carries_prominent_noninteractive_wall_and_frame_nodes() {
+        // #402: a 403 heading, a session-expired alert, and a reCAPTCHA iframe are
+        // all non-interactive, so the interactive-only filter used to strip them
+        // and the takeover detector never saw the wall/CAPTCHA. They must now be
+        // carried into the observation.
+        let html = r#"
+            <main>
+              <h1>403 Forbidden</h1>
+              <div role="alert">Your session has expired</div>
+              <p>ordinary body copy</p>
+              <a href="/login">Sign in</a>
+              <iframe title="reCAPTCHA" src="https://www.google.com/recaptcha/api2/anchor"></iframe>
+            </main>
+        "#;
+
+        let elements = extract_interactive_elements(html);
+        let by_role = |role: &str| elements.iter().find(|e| e.role == role);
+
+        let Some(heading) = by_role("heading") else {
+            panic!("heading node carried");
+        };
+        assert_eq!(heading.name[0].text, "403 Forbidden");
+
+        let Some(alert) = by_role("alert") else {
+            panic!("alert node carried");
+        };
+        assert_eq!(alert.name[0].text, "Your session has expired");
+
+        let Some(frame) = by_role("iframe") else {
+            panic!("iframe node carried");
+        };
+        assert_eq!(frame.name[0].text, "reCAPTCHA");
+        // The frame's src origin is threaded through so a vendor URL still matches
+        // even when a frame carries no title.
+        assert_eq!(
+            frame.value[0].text,
+            "https://www.google.com/recaptcha/api2/anchor"
+        );
+
+        // A plain paragraph is NOT prominent and must stay filtered.
+        assert!(by_role("paragraph").is_none());
+        // The interactive sign-in link is unaffected.
+        assert!(elements.iter().any(|e| e.role == "link"));
+    }
+
+    #[test]
+    fn carried_noninteractive_nodes_are_bounded() {
+        // A heading-heavy page must not bloat the observation: only the first
+        // MAX_CARRIED_NONINTERACTIVE prominent non-interactive nodes are carried.
+        let mut html = String::from("<main>");
+        for i in 0..(MAX_CARRIED_NONINTERACTIVE * 3) {
+            html.push_str(&format!("<h2>heading {i}</h2>"));
+        }
+        html.push_str("</main>");
+
+        let elements = extract_interactive_elements(&html);
+        let headings = elements.iter().filter(|e| e.role == "heading").count();
+        assert_eq!(headings, MAX_CARRIED_NONINTERACTIVE);
     }
 
     #[test]
