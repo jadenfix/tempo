@@ -459,12 +459,20 @@ impl CdpTempoDriver {
         dom_html: String,
     ) -> Result<CompiledObservation, TransportError> {
         let compiled = self.record_snapshot(url, dom_html).await?;
-        self.enforce_no_blocked_request_soon_since(cursor).await?;
+        // Every `_since` caller has already served the full 25ms event grace
+        // for this same cursor immediately after its action command returned
+        // (click/type/select/scroll/wait/goto/fixed-millis), so this side only
+        // drains still-pending requests to surface a blocked verdict — it does
+        // not re-pay the grace floor.
+        wait_for_no_blocked_request_settled(&self.request_policy_tracker, cursor).await?;
         Ok(compiled)
     }
 
     async fn record_current_observation(&mut self) -> Result<CompiledObservation, TransportError> {
         let cursor = self.request_policy_cursor();
+        // Bare observes (no preceding action wait) keep the full event grace as
+        // the policy watchdog before the snapshot is trusted.
+        self.enforce_no_blocked_request_soon_since(cursor).await?;
         self.record_current_observation_since(cursor).await
     }
 
@@ -510,12 +518,19 @@ impl CdpTempoDriver {
         .await
     }
 
+    /// URL policy is enforced once by `enrich_observation_from_ax_tree` before
+    /// the per-element fan-out — not re-checked per element. A mid-enrichment
+    /// navigation invalidates the DOM node ids (querySelector/getPartialAXTree
+    /// fail soft to `None`), policy-blocked loads are still caught at the
+    /// network layer by the request tracker, and every observe path ends in a
+    /// blocked-request check before the observation is returned. Re-issuing
+    /// `page.url()` here cost one extra CDP round-trip per enriched element
+    /// (up to 16 per observation).
     async fn ax_summary_for_selector(
         &self,
         root: DomNodeId,
         selector: &str,
     ) -> Result<Option<AxSummary>, TransportError> {
-        self.enforce_current_url_policy().await?;
         let page = self.page()?;
         let queried = match page.execute(QuerySelectorParams::new(root, selector)).await {
             Ok(response) => response.result,
@@ -784,7 +799,10 @@ impl CdpTempoDriver {
         // has nearly the same chance to be observed before settle.
         let mut poll_index = 0_usize;
         loop {
-            self.enforce_current_url_policy().await?;
+            // URL policy is enforced inside each stability sample (from the
+            // probe-reported href on the isolated path, or an explicit
+            // page.url() on the fallback path) — no separate per-poll
+            // round-trip here.
             let cursor = self.request_policy_cursor();
             let sample = self.sample_page_stability_since(cursor).await?;
             if tracker.observe(sample) {
@@ -822,9 +840,19 @@ impl CdpTempoDriver {
         &self,
         cursor: u64,
     ) -> Result<PageStabilitySample, TransportError> {
-        if let Some(sample) = self.probe_stability_isolated(cursor).await? {
+        if let Some(probe) = self.probe_stability_isolated(cursor).await? {
+            // The probe reports the frame's location.href from the isolated
+            // world, so URL policy is enforced on every sample without the
+            // extra per-poll `page.url()` round-trip; older probe payloads
+            // without a URL keep the round-trip.
+            match &probe.url {
+                Some(url) => self.enforce_current_url_policy_value(url)?,
+                None => {
+                    self.enforce_current_url_policy().await?;
+                }
+            }
             self.enforce_no_blocked_request_since(cursor)?;
-            return Ok(sample);
+            return Ok(probe.sample);
         }
         self.enforce_no_blocked_request_since(cursor)?;
 
@@ -852,7 +880,7 @@ impl CdpTempoDriver {
     async fn probe_stability_isolated(
         &self,
         cursor: u64,
-    ) -> Result<Option<PageStabilitySample>, TransportError> {
+    ) -> Result<Option<ParsedStabilityProbe>, TransportError> {
         for recreate in [false, true] {
             let Some(context_id) = self.probe_context_id(recreate, cursor).await? else {
                 return Ok(None);
@@ -943,18 +971,32 @@ impl CdpTempoDriver {
     }
 }
 
-/// Parse a `readyState|generation` probe string into a stability sample.
+/// Stability probe parse result: the sample plus the frame URL reported from
+/// the isolated world (absent on older two-field probe payloads).
+#[derive(Debug, PartialEq)]
+struct ParsedStabilityProbe {
+    sample: PageStabilitySample,
+    url: Option<String>,
+}
+
+/// Parse a `readyState|generation|href` probe string into a stability sample.
 /// `generation < 0` (observer unavailable) and malformed strings yield `None`,
-/// which routes the caller to the DOM-hash fallback.
-fn parse_stability_probe(probe: &str) -> Option<PageStabilitySample> {
-    let (ready_state, generation) = probe.split_once('|')?;
-    let generation = generation.parse::<i64>().ok()?;
+/// which routes the caller to the DOM-hash fallback. The URL is the remainder
+/// after the second separator, so an href containing `|` stays intact.
+fn parse_stability_probe(probe: &str) -> Option<ParsedStabilityProbe> {
+    let mut parts = probe.splitn(3, '|');
+    let ready_state = parts.next()?;
+    let generation = parts.next()?.parse::<i64>().ok()?;
     if generation < 0 {
         return None;
     }
-    Some(PageStabilitySample {
-        ready: ready_state != "loading",
-        dom_hash: generation as u64,
+    let url = parts.next().map(str::to_owned);
+    Some(ParsedStabilityProbe {
+        sample: PageStabilitySample {
+            ready: ready_state != "loading",
+            dom_hash: generation as u64,
+        },
+        url,
     })
 }
 
@@ -986,7 +1028,7 @@ const STABILITY_PROBE_SCRIPT: &str = r#"(() => {
     }
   }
   const gen = w.__tempoMutObs ? w.__tempoMutGen : -1;
-  return `${document.readyState}|${gen}`;
+  return `${document.readyState}|${gen}|${location.href}`;
 })()"#;
 
 fn is_policy_proxy_arg(arg: &str) -> bool {
@@ -1031,6 +1073,12 @@ impl DriverTrait for CdpTempoDriver {
         if self.take_blocked_request()?.is_some() {
             return Err(TransportError::UrlBlocked);
         }
+        // Pre-warm the stability-probe isolated world for the destination
+        // document. Without this, the first composite-quiescence sample after
+        // navigation pays the stale-context miss (failed evaluate + mainframe
+        // + createIsolatedWorld) inside the settle loop itself. Best-effort:
+        // the sampler still recreates on demand if this fails.
+        let _ = self.probe_context_id(true, cursor).await;
         let (final_url, dom_html) = self.snapshot_since(cursor).await?;
         self.record_snapshot_since(cursor, final_url, dom_html)
             .await
@@ -1377,7 +1425,29 @@ async fn wait_for_no_blocked_request_since(
     tracker: &RequestPolicyTracker,
     cursor: u64,
 ) -> Result<(), TransportError> {
-    let event_deadline = Instant::now() + REQUEST_POLICY_EVENT_GRACE;
+    wait_for_no_blocked_request_with_grace(tracker, cursor, REQUEST_POLICY_EVENT_GRACE).await
+}
+
+/// Settle variant with no minimum event grace: drains pending requests since
+/// `cursor` so a policy-blocked verdict still surfaces, but returns as soon as
+/// nothing is pending. Sound ONLY when a full `REQUEST_POLICY_EVENT_GRACE` has
+/// already been served for the same `cursor` (every `record_*_since` caller
+/// waits right after its action command returns), so re-paying the 25ms floor
+/// on the observation side of the same action would watch a window the first
+/// wait already covered.
+async fn wait_for_no_blocked_request_settled(
+    tracker: &RequestPolicyTracker,
+    cursor: u64,
+) -> Result<(), TransportError> {
+    wait_for_no_blocked_request_with_grace(tracker, cursor, Duration::ZERO).await
+}
+
+async fn wait_for_no_blocked_request_with_grace(
+    tracker: &RequestPolicyTracker,
+    cursor: u64,
+    grace: Duration,
+) -> Result<(), TransportError> {
+    let event_deadline = Instant::now() + grace;
     let deadline = Instant::now() + BLOCKED_REQUEST_SETTLE_TIMEOUT;
     loop {
         if tracker.has_blocked_since(cursor) {
@@ -2860,25 +2930,110 @@ mod tests {
     fn stability_probe_parses_ready_state_and_generation() {
         assert_eq!(
             parse_stability_probe("complete|42"),
-            Some(PageStabilitySample {
-                ready: true,
-                dom_hash: 42,
+            Some(ParsedStabilityProbe {
+                sample: PageStabilitySample {
+                    ready: true,
+                    dom_hash: 42,
+                },
+                url: None,
             })
         );
         assert_eq!(
             parse_stability_probe("loading|7"),
-            Some(PageStabilitySample {
-                ready: false,
-                dom_hash: 7,
+            Some(ParsedStabilityProbe {
+                sample: PageStabilitySample {
+                    ready: false,
+                    dom_hash: 7,
+                },
+                url: None,
             })
         );
         assert_eq!(
             parse_stability_probe("interactive|0"),
-            Some(PageStabilitySample {
-                ready: true,
-                dom_hash: 0,
+            Some(ParsedStabilityProbe {
+                sample: PageStabilitySample {
+                    ready: true,
+                    dom_hash: 0,
+                },
+                url: None,
             })
         );
+    }
+
+    #[test]
+    fn stability_probe_parses_frame_url_including_pipe_characters() {
+        assert_eq!(
+            parse_stability_probe("complete|42|https://example.test/search?q=a"),
+            Some(ParsedStabilityProbe {
+                sample: PageStabilitySample {
+                    ready: true,
+                    dom_hash: 42,
+                },
+                url: Some("https://example.test/search?q=a".into()),
+            })
+        );
+        // An href containing the separator stays intact: only the first two
+        // fields split, the remainder is the URL.
+        assert_eq!(
+            parse_stability_probe("interactive|3|https://example.test/?q=a|b|c"),
+            Some(ParsedStabilityProbe {
+                sample: PageStabilitySample {
+                    ready: true,
+                    dom_hash: 3,
+                },
+                url: Some("https://example.test/?q=a|b|c".into()),
+            })
+        );
+        // Malformed generation still rejects even with a URL present.
+        assert_eq!(parse_stability_probe("complete|-1|https://x.test"), None);
+    }
+
+    #[test]
+    fn stability_probe_script_reports_frame_url() {
+        assert!(STABILITY_PROBE_SCRIPT.contains("location.href"));
+    }
+
+    #[tokio::test]
+    async fn settled_wait_returns_immediately_when_nothing_pending(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let tracker = RequestPolicyTracker::new();
+        let cursor = tracker.cursor();
+        let started = Instant::now();
+        wait_for_no_blocked_request_settled(&tracker, cursor).await?;
+        // No event grace: an idle tracker settles without the 25ms floor.
+        assert!(started.elapsed() < REQUEST_POLICY_EVENT_GRACE);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn settled_wait_still_surfaces_blocked_requests() {
+        let tracker = RequestPolicyTracker::new();
+        let cursor = tracker.cursor();
+        let seq = tracker.start_request();
+        tracker.finish_request(seq, Some("https://blocked.test/".into()));
+        let result = wait_for_no_blocked_request_settled(&tracker, cursor).await;
+        assert!(matches!(result, Err(TransportError::UrlBlocked)));
+    }
+
+    #[tokio::test]
+    async fn settled_wait_drains_pending_before_returning() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let tracker = std::sync::Arc::new(RequestPolicyTracker::new());
+        let cursor = tracker.cursor();
+        let seq = tracker.start_request();
+        let finisher = {
+            let tracker = tracker.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(40)).await;
+                tracker.finish_request(seq, Some("https://blocked.test/".into()));
+            })
+        };
+        // The pending request forces the settled wait to keep watching; the
+        // blocked verdict registered while draining must still surface.
+        let result = wait_for_no_blocked_request_settled(&tracker, cursor).await;
+        assert!(matches!(result, Err(TransportError::UrlBlocked)));
+        finisher.await?;
+        Ok(())
     }
 
     #[test]
