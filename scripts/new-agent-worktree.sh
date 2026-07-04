@@ -62,6 +62,12 @@ if git show-ref --verify --quiet "refs/remotes/origin/$branch"; then
   exit 1
 fi
 
+if [[ "${TEMPO_WORKTREE_NO_FETCH:-}" != "1" ]] &&
+  git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+  echo "tempo: remote branch already exists: origin/$branch" >&2
+  exit 1
+fi
+
 if [[ -e "$path" ]]; then
   echo "tempo: worktree path already exists: $path" >&2
   exit 1
