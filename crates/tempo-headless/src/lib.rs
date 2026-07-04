@@ -42,6 +42,10 @@ use url::Url;
 
 const MAX_HTTP_BYTES: usize = 64 * 1024;
 const MAX_WS_PAYLOAD_BYTES: u64 = MAX_HTTP_BYTES as u64;
+/// Maximum accepted TCP control-plane connections handled concurrently.
+const MAX_HTTP_CONNECTIONS: usize = 128;
+/// Maximum upgraded BiDi WebSocket sessions held concurrently.
+const MAX_WEBSOCKET_CONNECTIONS: usize = 32;
 /// Maximum number of live BiDi browsing contexts (forked drivers) held at once.
 const MAX_BIDI_CONTEXTS: usize = 64;
 /// Per-connection socket read/write timeout, bounding slowloris-style stalls.
@@ -94,6 +98,8 @@ const WS_OPCODE_BINARY: u8 = 0x2;
 const WS_OPCODE_CLOSE: u8 = 0x8;
 const WS_OPCODE_PING: u8 = 0x9;
 const WS_OPCODE_PONG: u8 = 0xA;
+const HTTP_CONNECTION_LIMIT_MESSAGE: &str = "too many active tempod HTTP connections";
+const WEBSOCKET_CONNECTION_LIMIT_MESSAGE: &str = "too many active tempod WebSocket connections";
 pub const TEMPO_OTLP_JSONL_ENV: &str = "TEMPO_OTLP_JSONL";
 /// Constant marker written in place of any secret-bearing field in OTLP
 /// telemetry (issue #214 review). A constant — never a hash, length, or prefix
@@ -1376,6 +1382,96 @@ fn connect_engine_ipc(socket_path: impl AsRef<Path>) -> Result<EngineIpcClient, 
     Ok(EngineIpcClient::from_stream(stream))
 }
 
+#[derive(Clone)]
+struct ConnectionLimiter {
+    state: Arc<Mutex<ConnectionLimiterState>>,
+    max_http: usize,
+    max_websocket: usize,
+}
+
+#[derive(Debug, Default)]
+struct ConnectionLimiterState {
+    active_http: usize,
+    active_websocket: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ConnectionPermitKind {
+    Http,
+    WebSocket,
+}
+
+struct ConnectionPermit {
+    limiter: ConnectionLimiter,
+    kind: ConnectionPermitKind,
+}
+
+impl Default for ConnectionLimiter {
+    fn default() -> Self {
+        Self::new(MAX_HTTP_CONNECTIONS, MAX_WEBSOCKET_CONNECTIONS)
+    }
+}
+
+impl ConnectionLimiter {
+    fn new(max_http: usize, max_websocket: usize) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(ConnectionLimiterState::default())),
+            max_http,
+            max_websocket,
+        }
+    }
+
+    fn try_acquire_http(&self) -> Option<ConnectionPermit> {
+        let mut state = self.state();
+        if state.active_http >= self.max_http {
+            return None;
+        }
+        state.active_http += 1;
+        Some(ConnectionPermit {
+            limiter: self.clone(),
+            kind: ConnectionPermitKind::Http,
+        })
+    }
+
+    fn try_acquire_websocket(&self) -> Option<ConnectionPermit> {
+        let mut state = self.state();
+        if state.active_websocket >= self.max_websocket {
+            return None;
+        }
+        state.active_websocket += 1;
+        Some(ConnectionPermit {
+            limiter: self.clone(),
+            kind: ConnectionPermitKind::WebSocket,
+        })
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, ConnectionLimiterState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    #[cfg(test)]
+    fn active_counts(&self) -> (usize, usize) {
+        let state = self.state();
+        (state.active_http, state.active_websocket)
+    }
+}
+
+impl Drop for ConnectionPermit {
+    fn drop(&mut self) {
+        let mut state = self.limiter.state();
+        match self.kind {
+            ConnectionPermitKind::Http => {
+                state.active_http = state.active_http.saturating_sub(1);
+            }
+            ConnectionPermitKind::WebSocket => {
+                state.active_websocket = state.active_websocket.saturating_sub(1);
+            }
+        }
+    }
+}
+
 /// Serve requests until the listener fails or the process is stopped.
 ///
 /// Each connection is handled on its own thread so that a slow, stalled, or
@@ -1385,12 +1481,25 @@ pub fn serve_forever(
     listener: TcpListener,
     pool: Arc<Mutex<SessionPool>>,
 ) -> Result<(), TempodError> {
+    serve_forever_with_limits(listener, pool, ConnectionLimiter::default())
+}
+
+fn serve_forever_with_limits(
+    listener: TcpListener,
+    pool: Arc<Mutex<SessionPool>>,
+    limiter: ConnectionLimiter,
+) -> Result<(), TempodError> {
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
+                let Some(http_permit) = limiter.try_acquire_http() else {
+                    drop(stream);
+                    continue;
+                };
                 let pool = Arc::clone(&pool);
+                let limiter = limiter.clone();
                 thread::spawn(move || {
-                    if let Err(err) = handle_connection(stream, &pool) {
+                    if let Err(err) = handle_connection(stream, &pool, &limiter, http_permit) {
                         log_connection_error(&err);
                     }
                 });
@@ -1406,15 +1515,34 @@ pub fn serve_forever(
 
 /// Serve exactly one HTTP request. Tests use this against a real TCP listener.
 pub fn serve_one(listener: TcpListener, pool: Arc<Mutex<SessionPool>>) -> Result<(), TempodError> {
+    serve_one_with_limits(listener, pool, ConnectionLimiter::default())
+}
+
+fn serve_one_with_limits(
+    listener: TcpListener,
+    pool: Arc<Mutex<SessionPool>>,
+    limiter: ConnectionLimiter,
+) -> Result<(), TempodError> {
     let (stream, _addr) = listener.accept()?;
-    handle_connection(stream, &pool)
+    let Some(http_permit) = limiter.try_acquire_http() else {
+        drop(stream);
+        return Err(TempodError::ConnectionLimit(
+            HTTP_CONNECTION_LIMIT_MESSAGE.into(),
+        ));
+    };
+    handle_connection(stream, &pool, &limiter, http_permit)
 }
 
 /// Apply per-connection socket timeouts, then handle the connection. Timeouts
 /// bound how long a stalled client can occupy a handler thread (slowloris).
-fn handle_connection(stream: TcpStream, pool: &Arc<Mutex<SessionPool>>) -> Result<(), TempodError> {
+fn handle_connection(
+    stream: TcpStream,
+    pool: &Arc<Mutex<SessionPool>>,
+    limiter: &ConnectionLimiter,
+    http_permit: ConnectionPermit,
+) -> Result<(), TempodError> {
     apply_socket_timeouts(&stream)?;
-    handle_stream(stream, pool)
+    handle_stream(stream, pool, limiter, http_permit)
 }
 
 /// Apply read and write timeouts to an accepted connection. A stalled client
@@ -1430,7 +1558,13 @@ fn log_connection_error(err: &TempodError) {
     eprintln!("tempod connection error: {err}");
 }
 
-fn handle_stream(mut stream: TcpStream, pool: &Arc<Mutex<SessionPool>>) -> Result<(), TempodError> {
+fn handle_stream(
+    mut stream: TcpStream,
+    pool: &Arc<Mutex<SessionPool>>,
+    limiter: &ConnectionLimiter,
+    http_permit: ConnectionPermit,
+) -> Result<(), TempodError> {
+    let mut http_permit = Some(http_permit);
     let request = match read_http_request(&mut stream) {
         Ok(request) => request,
         Err(err) => {
@@ -1450,9 +1584,18 @@ fn handle_stream(mut stream: TcpStream, pool: &Arc<Mutex<SessionPool>>) -> Resul
     };
     match websocket_upgrade_key(&request) {
         Ok(Some(key)) => {
+            let Some(websocket_permit) = limiter.try_acquire_websocket() else {
+                let response = tempod_error_response(&TempodError::ConnectionLimit(
+                    WEBSOCKET_CONNECTION_LIMIT_MESSAGE.into(),
+                ));
+                stream.write_all(response.to_bytes().as_slice())?;
+                stream.flush()?;
+                return Ok(());
+            };
+            drop(http_permit.take());
             stream.write_all(websocket_upgrade_response(&key).as_slice())?;
             stream.flush()?;
-            return serve_bidi_websocket(stream, pool);
+            return serve_bidi_websocket(stream, pool, websocket_permit);
         }
         Ok(None) => {}
         Err(err) => {
@@ -1476,15 +1619,19 @@ fn handle_stream(mut stream: TcpStream, pool: &Arc<Mutex<SessionPool>>) -> Resul
     Ok(())
 }
 
+fn tempod_error_response(err: &TempodError) -> HttpResponse {
+    HttpResponse::json(
+        err.status(),
+        json!({
+            "error": err.to_string(),
+        }),
+    )
+}
+
 fn handle_http_request(pool: &mut SessionPool, request: HttpRequest) -> HttpResponse {
     match route_http_request(pool, request) {
         Ok(response) => response,
-        Err(err) => HttpResponse::json(
-            err.status(),
-            json!({
-                "error": err.to_string(),
-            }),
-        ),
+        Err(err) => tempod_error_response(&err),
     }
 }
 
@@ -1687,6 +1834,7 @@ fn websocket_upgrade_response(key: &str) -> Vec<u8> {
 fn serve_bidi_websocket(
     mut stream: TcpStream,
     pool: &Arc<Mutex<SessionPool>>,
+    _websocket_permit: ConnectionPermit,
 ) -> Result<(), TempodError> {
     loop {
         let Some(frame) = read_websocket_frame(&mut stream)? else {
@@ -2546,6 +2694,8 @@ pub enum TempodError {
     BadRequest(String),
     #[error("forbidden: {0}")]
     Forbidden(String),
+    #[error("connection limit reached: {0}")]
+    ConnectionLimit(String),
     #[error("session not found: {0:?}")]
     SessionNotFound(TempodSessionId),
     #[error("engine not found: {0}")]
@@ -2566,7 +2716,7 @@ impl TempodError {
             Self::BadRequest(_) => 400,
             Self::Forbidden(_) => 403,
             Self::SessionNotFound(_) | Self::EngineNotFound(_) => 404,
-            Self::Draining => 503,
+            Self::Draining | Self::ConnectionLimit(_) => 503,
             Self::Io(_) | Self::Json(_) | Self::PoolLock | Self::Driver(_) | Self::Engine(_) => 500,
         }
     }
@@ -2588,7 +2738,7 @@ mod tests {
     use std::net::TcpStream;
     use std::os::unix::net::UnixStream;
     use std::thread;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
     use tempo_agent::IdempotencyKey;
     use tempo_driver::TestDriver;
     use tempo_engine_host::{
@@ -5831,6 +5981,89 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn serve_forever_rejects_excess_http_connections() -> TestResult {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let pool = Arc::new(Mutex::new(SessionPool::default()));
+        let limiter = ConnectionLimiter::new(1, 1);
+        let server_limiter = limiter.clone();
+        let handle =
+            thread::spawn(move || serve_forever_with_limits(listener, pool, server_limiter));
+
+        let held = TcpStream::connect(addr)?;
+        wait_for_connection_counts(&limiter, (1, 0))?;
+
+        let mut rejected = TcpStream::connect(addr)?;
+        rejected.set_read_timeout(Some(Duration::from_secs(5)))?;
+        assert_connection_closed_without_response(&mut rejected)?;
+        assert_eq!(limiter.active_counts(), (1, 0));
+
+        drop(held);
+        assert!(!handle.is_finished());
+        Ok(())
+    }
+
+    #[test]
+    fn bidi_websocket_upgrade_rejects_when_websocket_limit_reached() -> TestResult {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let pool = Arc::new(Mutex::new(SessionPool::default()));
+        let limiter = ConnectionLimiter::new(1, 1);
+        let server_limiter = limiter.clone();
+        let handle =
+            thread::spawn(move || serve_forever_with_limits(listener, pool, server_limiter));
+
+        let mut held = open_bidi_websocket(addr)?;
+        wait_for_connection_counts(&limiter, (0, 1))?;
+
+        let response = send_http(addr, BIDI_WEBSOCKET_UPGRADE_REQUEST)?;
+        assert!(
+            response.starts_with("HTTP/1.1 503"),
+            "expected 503 when WebSocket connection limit is reached, got: {response}"
+        );
+        assert!(response.contains(WEBSOCKET_CONNECTION_LIMIT_MESSAGE));
+        assert!(!response.starts_with("HTTP/1.1 101"));
+
+        held.write_all(&masked_client_frame(WS_OPCODE_CLOSE, &[])?)?;
+        let (opcode, payload) = read_server_frame(&mut held)?;
+        assert_eq!(opcode, WS_OPCODE_CLOSE);
+        assert!(payload.is_empty());
+        wait_for_connection_counts(&limiter, (0, 0))?;
+        assert!(!handle.is_finished());
+        Ok(())
+    }
+
+    #[test]
+    fn websocket_permit_is_released_on_close() -> TestResult {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let pool = Arc::new(Mutex::new(SessionPool::default()));
+        let limiter = ConnectionLimiter::new(1, 1);
+        let server_limiter = limiter.clone();
+        let handle =
+            thread::spawn(move || serve_forever_with_limits(listener, pool, server_limiter));
+
+        let mut first = open_bidi_websocket(addr)?;
+        wait_for_connection_counts(&limiter, (0, 1))?;
+        first.write_all(&masked_client_frame(WS_OPCODE_CLOSE, &[])?)?;
+        let (opcode, payload) = read_server_frame(&mut first)?;
+        assert_eq!(opcode, WS_OPCODE_CLOSE);
+        assert!(payload.is_empty());
+        wait_for_connection_counts(&limiter, (0, 0))?;
+
+        let mut second = open_bidi_websocket(addr)?;
+        wait_for_connection_counts(&limiter, (0, 1))?;
+        second.write_all(&masked_client_frame(WS_OPCODE_CLOSE, &[])?)?;
+        let (opcode, payload) = read_server_frame(&mut second)?;
+        assert_eq!(opcode, WS_OPCODE_CLOSE);
+        assert!(payload.is_empty());
+        wait_for_connection_counts(&limiter, (0, 0))?;
+
+        assert!(!handle.is_finished());
+        Ok(())
+    }
+
     // ---- Issue #86: read timeout is applied per connection ----
 
     #[test]
@@ -6246,13 +6479,69 @@ mod tests {
         Ok(())
     }
 
+    const BIDI_WEBSOCKET_UPGRADE_REQUEST: &str = "GET /bidi HTTP/1.1\r\n\
+        host: 127.0.0.1\r\n\
+        upgrade: websocket\r\n\
+        connection: Upgrade\r\n\
+        sec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+        sec-websocket-version: 13\r\n\r\n";
+
     fn send_http(addr: std::net::SocketAddr, request: &str) -> Result<String, std::io::Error> {
         let mut stream = TcpStream::connect(addr)?;
+        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
         stream.write_all(request.as_bytes())?;
         stream.shutdown(std::net::Shutdown::Write)?;
+        read_http_response(&mut stream)
+    }
+
+    fn read_http_response(stream: &mut TcpStream) -> Result<String, std::io::Error> {
         let mut response = String::new();
         stream.read_to_string(&mut response)?;
         Ok(response)
+    }
+
+    fn assert_connection_closed_without_response(stream: &mut TcpStream) -> TestResult {
+        let mut byte = [0_u8; 1];
+        match stream.read(&mut byte) {
+            Ok(0) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => Ok(()),
+            Ok(read) => Err(format!(
+                "expected over-limit HTTP connection to close without a response, read {read} byte(s)"
+            )
+            .into()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn open_bidi_websocket(addr: std::net::SocketAddr) -> Result<TcpStream, Box<dyn Error>> {
+        let mut stream = TcpStream::connect(addr)?;
+        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+        stream.write_all(BIDI_WEBSOCKET_UPGRADE_REQUEST.as_bytes())?;
+        let response = read_http_head(&mut stream)?;
+        assert!(
+            response.starts_with("HTTP/1.1 101 Switching Protocols"),
+            "expected WebSocket upgrade, got: {response}"
+        );
+        Ok(stream)
+    }
+
+    fn wait_for_connection_counts(
+        limiter: &ConnectionLimiter,
+        expected: (usize, usize),
+    ) -> TestResult {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let actual = limiter.active_counts();
+            if actual == expected {
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        Err(format!(
+            "connection counts did not settle to {expected:?}; last observed {:?}",
+            limiter.active_counts()
+        )
+        .into())
     }
 
     fn read_http_head(stream: &mut TcpStream) -> Result<String, Box<dyn Error>> {
