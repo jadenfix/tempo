@@ -8455,6 +8455,7 @@ dependencies = [
  "tempo-schema",
  "tempo-session",
  "tempo-skills",
+ "tempo-taint",
  "thiserror 2.0.18",
  "tokio",
 ]

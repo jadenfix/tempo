@@ -22,4 +22,6 @@
 - Model/tool result envelopes should carry one authoritative structured payload. Text fallbacks must be summaries, not a second serialized copy of large JSON or binary data.
 - Untrusted remote tool catalogs must not weaken local side-effect policy. If a remote descriptor lacks trusted side-effect metadata, classify the action at the strongest supported side effect before applying threshold origin rules.
 - UI-local state transitions and teardown/cancel paths must stay bounded independently of backend health. Moving I/O off-thread is incomplete if local controls or shutdown still serialize behind blocking transport work.
+- Security gates must exercise the production call path, not just a helper with the intended behavior. If model-facing or network-facing serialization is certified, assert the live request builder uses that exact serializer.
+- Page-controlled metadata belongs inside the same provenance framing as visible page text. Escaped-but-bare attributes in model prompts are still unlabeled untrusted input.
 - More code is not more optimized. Prefer the smallest change that proves the invariant, removes duplicated paths, or makes an existing contract honest.
