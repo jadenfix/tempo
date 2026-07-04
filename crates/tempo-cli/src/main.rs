@@ -269,8 +269,9 @@ impl Command {
                 if report.passed() {
                     Ok(())
                 } else {
-                    Err(CliError::GateFailed {
+                    Err(CliError::InjectionGateFailed {
                         violations: report.violations.len(),
+                        rate_violations: report.rate_violations.len(),
                     })
                 }
             }
@@ -1188,6 +1189,14 @@ enum CliError {
     Transport(#[from] TransportError),
     #[error("scorecard gate failed with {violations} violation(s)")]
     GateFailed { violations: usize },
+    #[error(
+        "injection gate failed with {violations} dangerous-effect violation(s) and \
+         {rate_violations} rate violation(s)"
+    )]
+    InjectionGateFailed {
+        violations: usize,
+        rate_violations: usize,
+    },
     #[error("invalid value for {flag}: {value}")]
     InvalidValue { flag: &'static str, value: String },
 }
@@ -1215,6 +1224,7 @@ impl CliError {
         match self {
             Self::Usage(_) | Self::InvalidValue { .. } => 2,
             Self::GateFailed { .. }
+            | Self::InjectionGateFailed { .. }
             | Self::Io { .. }
             | Self::JsonRead { .. }
             | Self::JsonWrite { .. }
@@ -1469,7 +1479,13 @@ mod tests {
         );
 
         match result {
-            Err(CliError::GateFailed { violations }) => assert_eq!(violations, 1),
+            Err(CliError::InjectionGateFailed {
+                violations,
+                rate_violations,
+            }) => {
+                assert_eq!(violations, 1);
+                assert_eq!(rate_violations, 0);
+            }
             other => return Err(unexpected_result(other)),
         }
         assert!(stdout.is_empty());
@@ -1477,6 +1493,50 @@ mod tests {
         assert_eq!(value["total_cases"], 3);
         assert_eq!(value["violations"].as_array().map(Vec::len), Some(1));
         assert_eq!(value["violations"][0]["id"], "send");
+        remove_dir(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn injection_gate_command_reports_rate_only_failures() -> TestResult {
+        let dir = unique_dir("injection-rate-gate")?;
+        let input = dir.join("cases.json");
+        let output = dir.join("report.json");
+        let cases = vec![
+            InjectionCaseResult::new("draft", "https://mail.test", SideEffect::Draft).complied(),
+        ];
+        write_json_file(&input, &cases)?;
+        let mut stdout = Vec::new();
+
+        let result = run_with_writer(
+            [
+                "injection-gate".to_string(),
+                "--input".into(),
+                input_string(&input),
+                "--output".into(),
+                input_string(&output),
+            ],
+            &mut stdout,
+        );
+
+        match result {
+            Err(CliError::InjectionGateFailed {
+                violations,
+                rate_violations,
+            }) => {
+                assert_eq!(violations, 0);
+                assert_eq!(rate_violations, 1);
+            }
+            other => return Err(unexpected_result(other)),
+        }
+        assert!(stdout.is_empty());
+        let value: Value = serde_json::from_reader(File::open(&output)?)?;
+        assert_eq!(value["violations"].as_array().map(Vec::len), Some(0));
+        assert_eq!(value["rate_violations"].as_array().map(Vec::len), Some(1));
+        assert_eq!(
+            value["rate_violations"][0]["gate"],
+            "end_to_end_attacker_success_rate"
+        );
         remove_dir(&dir)?;
         Ok(())
     }
