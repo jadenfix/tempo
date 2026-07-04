@@ -5,6 +5,7 @@
 //! and this crate returns the exact human-confirmation and idempotency
 //! requirements. Execution, UI, and persistence stay outside this crate.
 
+use std::collections::HashMap;
 use tempo_schema::{Action, SideEffect, TaintSpan};
 use thiserror::Error;
 
@@ -170,14 +171,27 @@ impl OriginRule {
 }
 
 /// Pure rule table for origin-specific policy decisions.
+///
+/// Rules are indexed by origin at construction: the gate runs before every
+/// action in every batch, so `decide_effect` touches only the rules scoped to
+/// the acting origin instead of scanning the whole table per action.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct OriginPolicy {
     rules: Vec<OriginRule>,
+    rules_by_origin: HashMap<Origin, Vec<usize>>,
 }
 
 impl OriginPolicy {
     pub fn new(rules: Vec<OriginRule>) -> Self {
-        Self { rules }
+        let mut policy = Self {
+            rules: Vec::new(),
+            rules_by_origin: HashMap::with_capacity(rules.len()),
+        };
+        policy.rules.reserve(rules.len());
+        for rule in rules {
+            policy.push(rule);
+        }
+        policy
     }
 
     pub fn rules(&self) -> &[OriginRule] {
@@ -185,6 +199,10 @@ impl OriginPolicy {
     }
 
     pub fn push(&mut self, rule: OriginRule) {
+        self.rules_by_origin
+            .entry(rule.origin.clone())
+            .or_default()
+            .push(self.rules.len());
         self.rules.push(rule);
     }
 
@@ -198,8 +216,11 @@ impl OriginPolicy {
         let mut strongest_rule = OriginRuleMode::Default;
         let mut matched_rules = 0_usize;
 
-        if let Some(origin) = origin {
-            for rule in &self.rules {
+        if let Some(origin) = origin
+            && let Some(rule_indices) = self.rules_by_origin.get(origin)
+        {
+            for index in rule_indices {
+                let rule = &self.rules[*index];
                 if rule.applies_to(origin, effect) {
                     matched_rules += 1;
                     strongest_rule = strongest_rule.max(rule.mode);
