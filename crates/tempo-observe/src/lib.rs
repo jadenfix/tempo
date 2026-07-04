@@ -989,11 +989,16 @@ struct ObservationPrefixProbe<'a> {
     elements: &'a [InteractiveElement],
     #[serde(skip_serializing_if = "usize_is_zero")]
     omitted: usize,
+    #[serde(skip_serializing_if = "mark_slice_is_empty")]
     marks: &'a [(NodeId, u32)],
 }
 
 fn usize_is_zero(value: &usize) -> bool {
     *value == 0
+}
+
+fn mark_slice_is_empty(value: &&[(NodeId, u32)]) -> bool {
+    value.is_empty()
 }
 
 /// `io::Write` sink that only counts bytes: budget probing needs the
