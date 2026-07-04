@@ -38,6 +38,103 @@ pub enum ServoBuildFlavor {
     TempoFork,
 }
 
+/// Runtime platforms tracked by upstream Servo and exposed to Tempo SDKs.
+///
+/// Servo currently develops on desktop, mobile, and OpenHarmony targets. Tempo
+/// keeps the control-plane transport explicit so SDKs can distinguish "Servo is
+/// available here" from "this Tempo IPC transport still needs a platform-native
+/// adapter".
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServoRuntimePlatform {
+    Macos,
+    Linux,
+    Windows,
+    Android,
+    #[serde(rename = "openharmony")]
+    OpenHarmony,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServoControlPlaneTransport {
+    UnixDomainSocket,
+    WindowsNativePlanned,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServoPlatformSupport {
+    pub platform: ServoRuntimePlatform,
+    pub rust_targets: Vec<String>,
+    pub servo_available: bool,
+    pub control_transport: ServoControlPlaneTransport,
+    pub note: String,
+}
+
+pub fn servo_platform_support_matrix() -> Vec<ServoPlatformSupport> {
+    vec![
+        ServoPlatformSupport {
+            platform: ServoRuntimePlatform::Macos,
+            rust_targets: vec!["aarch64-apple-darwin".into(), "x86_64-apple-darwin".into()],
+            servo_available: true,
+            control_transport: ServoControlPlaneTransport::UnixDomainSocket,
+            note: "desktop Servo target with Unix-domain-socket tempod IPC".into(),
+        },
+        ServoPlatformSupport {
+            platform: ServoRuntimePlatform::Linux,
+            rust_targets: vec!["x86_64-unknown-linux-gnu".into(), "aarch64-unknown-linux-gnu".into()],
+            servo_available: true,
+            control_transport: ServoControlPlaneTransport::UnixDomainSocket,
+            note: "desktop/server Servo target with Unix-domain-socket tempod IPC".into(),
+        },
+        ServoPlatformSupport {
+            platform: ServoRuntimePlatform::Windows,
+            rust_targets: vec!["x86_64-pc-windows-msvc".into(), "aarch64-pc-windows-msvc".into()],
+            servo_available: true,
+            control_transport: ServoControlPlaneTransport::WindowsNativePlanned,
+            note: "Servo target; Tempo engine-host IPC needs a Windows-native transport adapter before tempod can run locally".into(),
+        },
+        ServoPlatformSupport {
+            platform: ServoRuntimePlatform::Android,
+            rust_targets: vec![
+                "aarch64-linux-android".into(),
+                "armv7-linux-androideabi".into(),
+                "x86_64-linux-android".into(),
+            ],
+            servo_available: true,
+            control_transport: ServoControlPlaneTransport::UnixDomainSocket,
+            note: "Android Servo target; Tempo should package the engine host as a local app-private service".into(),
+        },
+        ServoPlatformSupport {
+            platform: ServoRuntimePlatform::OpenHarmony,
+            rust_targets: vec![
+                "aarch64-unknown-linux-ohos".into(),
+                "armv7-unknown-linux-ohos".into(),
+                "x86_64-unknown-linux-ohos".into(),
+            ],
+            servo_available: true,
+            control_transport: ServoControlPlaneTransport::UnixDomainSocket,
+            note: "OpenHarmony Servo target; Rust reports target_os=linux and target_env=ohos".into(),
+        },
+    ]
+}
+
+pub fn current_servo_platform() -> Option<ServoRuntimePlatform> {
+    if cfg!(target_os = "macos") {
+        Some(ServoRuntimePlatform::Macos)
+    } else if cfg!(all(target_os = "linux", target_env = "ohos")) {
+        Some(ServoRuntimePlatform::OpenHarmony)
+    } else if cfg!(target_os = "linux") {
+        Some(ServoRuntimePlatform::Linux)
+    } else if cfg!(target_os = "windows") {
+        Some(ServoRuntimePlatform::Windows)
+    } else if cfg!(target_os = "android") {
+        Some(ServoRuntimePlatform::Android)
+    } else {
+        None
+    }
+}
+
 /// Engine-side viewport in CSS pixels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Viewport {
@@ -99,6 +196,8 @@ impl ServoEngineConfig {
 pub struct ServoVanillaBuildPlan {
     pub servo_crate_version: String,
     pub build_flavor: ServoBuildFlavor,
+    pub current_platform: Option<ServoRuntimePlatform>,
+    pub supported_platforms: Vec<ServoPlatformSupport>,
     pub viewport: Viewport,
     pub user_agent: String,
     pub access_tree: bool,
@@ -1067,6 +1166,60 @@ mod tests {
     }
 
     #[test]
+    fn servo_platform_matrix_tracks_android_and_openharmony() -> TestResult {
+        let platforms = servo_platform_support_matrix();
+        let names: Vec<_> = platforms.iter().map(|support| support.platform).collect();
+
+        assert_eq!(
+            names,
+            vec![
+                ServoRuntimePlatform::Macos,
+                ServoRuntimePlatform::Linux,
+                ServoRuntimePlatform::Windows,
+                ServoRuntimePlatform::Android,
+                ServoRuntimePlatform::OpenHarmony,
+            ]
+        );
+
+        let android = platforms
+            .iter()
+            .find(|support| support.platform == ServoRuntimePlatform::Android)
+            .ok_or("missing android support entry")?;
+        assert!(android.servo_available);
+        assert_eq!(
+            android.control_transport,
+            ServoControlPlaneTransport::UnixDomainSocket
+        );
+        assert!(android
+            .rust_targets
+            .contains(&"aarch64-linux-android".to_string()));
+
+        let openharmony = platforms
+            .iter()
+            .find(|support| support.platform == ServoRuntimePlatform::OpenHarmony)
+            .ok_or("missing openharmony support entry")?;
+        assert!(openharmony.servo_available);
+        assert_eq!(
+            openharmony.control_transport,
+            ServoControlPlaneTransport::UnixDomainSocket
+        );
+        assert!(openharmony
+            .rust_targets
+            .contains(&"aarch64-unknown-linux-ohos".to_string()));
+
+        let windows = platforms
+            .iter()
+            .find(|support| support.platform == ServoRuntimePlatform::Windows)
+            .ok_or("missing windows support entry")?;
+        assert!(windows.servo_available);
+        assert_eq!(
+            windows.control_transport,
+            ServoControlPlaneTransport::WindowsNativePlanned
+        );
+        Ok(())
+    }
+
+    #[test]
     fn vanilla_servo_build_plan_requires_feature_or_returns_private_mapping() -> TestResult {
         let config = ServoEngineConfig::vanilla();
 
@@ -1077,6 +1230,10 @@ mod tests {
             let plan = result?;
             assert_eq!(plan.servo_crate_version, PINNED_VANILLA_SERVO_VERSION);
             assert_eq!(plan.build_flavor, ServoBuildFlavor::Vanilla);
+            assert!(plan
+                .supported_platforms
+                .iter()
+                .any(|support| support.platform == ServoRuntimePlatform::Android));
             assert_eq!(plan.viewport, config.viewport);
             assert_eq!(plan.user_agent, config.user_agent);
             assert!(plan.access_tree);
