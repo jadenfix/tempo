@@ -738,33 +738,93 @@ impl CdpTempoDriver {
         let deadline = Instant::now() + Duration::from_secs(2);
         let mut tracker = CompositeQuiescenceTracker::new(3);
 
+        // Ramp the sampling interval instead of a fixed 50ms: a page that is
+        // already quiet settles after ~35ms of evidence instead of ~100ms,
+        // while a busy page converges to the same 50ms cadence.
+        let mut poll_index = 0_usize;
         loop {
             self.enforce_current_url_policy().await?;
-            let cursor = self.request_policy_cursor();
-            let ready_result = self.page()?.evaluate("document.readyState").await;
-            let ready_state = self
-                .map_cdp_result_since(cursor, ready_result)
-                .await?
-                .into_value::<String>()
-                .map_err(|error| TransportError::Other(error.to_string()))?;
-            self.enforce_current_url_policy().await?;
-            let content_result = self.page()?.content().await;
-            let dom_html = self.map_cdp_result_since(cursor, content_result).await?;
-            self.enforce_no_blocked_request_since(cursor)?;
-            let sample = PageStabilitySample {
-                ready: ready_state != "loading",
-                dom_hash: fnv1a64(dom_html.as_bytes()),
-            };
+            let sample = self.sample_page_stability().await?;
             if tracker.observe(sample) {
                 return Ok(());
             }
             if Instant::now() >= deadline {
                 return Err(TransportError::NavTimeout);
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            let interval = QUIESCENCE_POLL_INTERVALS_MS
+                .get(poll_index)
+                .copied()
+                .unwrap_or(QUIESCENCE_POLL_INTERVAL_CAP_MS);
+            poll_index += 1;
+            tokio::time::sleep(Duration::from_millis(interval)).await;
         }
     }
+
+    /// One O(1) stability sample: a single `Runtime.evaluate` that installs a
+    /// page-wide MutationObserver once and returns `readyState|mutationGen`.
+    ///
+    /// The previous sampler pulled the full serialized DOM over CDP and hashed
+    /// it on every poll — O(page size) CPU and transfer per tick, which
+    /// dominated settle latency on large pages. The observer generation is
+    /// also more sensitive: two polls that straddle a mutate-and-revert see a
+    /// generation bump where equal DOM hashes would alias. If the observer
+    /// cannot be installed, the sampler falls back to the DOM-hash path.
+    async fn sample_page_stability(&self) -> Result<PageStabilitySample, TransportError> {
+        let cursor = self.request_policy_cursor();
+        let probe_result = self.page()?.evaluate(STABILITY_PROBE_SCRIPT).await;
+        let probe = self
+            .map_cdp_result_since(cursor, probe_result)
+            .await?
+            .into_value::<String>()
+            .map_err(|error| TransportError::Other(error.to_string()))?;
+
+        if let Some((ready_state, generation)) = probe.split_once('|')
+            && let Ok(generation) = generation.parse::<i64>()
+            && generation >= 0
+        {
+            return Ok(PageStabilitySample {
+                ready: ready_state != "loading",
+                dom_hash: generation as u64,
+            });
+        }
+
+        // Observer unavailable (probe returned `<ready>|-1` or malformed):
+        // fall back to hashing the serialized DOM as before.
+        let ready = !probe.starts_with("loading|");
+        self.enforce_current_url_policy().await?;
+        let content_result = self.page()?.content().await;
+        let dom_html = self.map_cdp_result_since(cursor, content_result).await?;
+        self.enforce_no_blocked_request_since(cursor)?;
+        Ok(PageStabilitySample {
+            ready,
+            dom_hash: fnv1a64(dom_html.as_bytes()),
+        })
+    }
 }
+
+/// Poll ramp for composite quiescence sampling, capped at the legacy 50ms.
+const QUIESCENCE_POLL_INTERVALS_MS: [u64; 3] = [15, 20, 40];
+const QUIESCENCE_POLL_INTERVAL_CAP_MS: u64 = 50;
+
+/// In-page probe: installs a document-wide MutationObserver once per window
+/// and reports `readyState|generation` (`generation = -1` when the observer
+/// cannot run, signalling the caller to use the DOM-hash fallback).
+const STABILITY_PROBE_SCRIPT: &str = r#"(() => {
+  const w = window;
+  if (w.__tempoMutObs === undefined) {
+    w.__tempoMutGen = 0;
+    try {
+      const target = document.documentElement || document;
+      const obs = new MutationObserver(() => { w.__tempoMutGen += 1; });
+      obs.observe(target, { subtree: true, childList: true, attributes: true, characterData: true });
+      w.__tempoMutObs = obs;
+    } catch (e) {
+      w.__tempoMutObs = null;
+    }
+  }
+  const gen = w.__tempoMutObs ? w.__tempoMutGen : -1;
+  return `${document.readyState}|${gen}`;
+})()"#;
 
 fn is_policy_proxy_arg(arg: &str) -> bool {
     let name = arg
@@ -2079,7 +2139,10 @@ fn extract_interactive_elements(html: &str) -> Vec<InteractiveElement> {
         selector_path: String,
     }
 
-    let mut elements = Vec::new();
+    // Pre-size from a cheap density estimate (~1 interactive element per 400
+    // bytes of HTML, capped) so a big page doesn't pay repeated grow-copies of
+    // the element vector while streaming.
+    let mut elements = Vec::with_capacity((html.len() / 400).clamp(8, 1024));
     let mut search_from = 0;
     // Sentinel document-root frame; its empty tag never matches a real close tag.
     let mut stack: Vec<Frame> = vec![Frame {
