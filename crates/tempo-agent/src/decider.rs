@@ -22,13 +22,13 @@ use crate::{
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 use std::time::Duration;
 use tempo_act::{detect_human_takeover, execute_action, ExecutionStatus};
 use tempo_driver::{DriverTrait, TransportError};
 use tempo_policy::Origin;
-use tempo_schema::{Action, CompiledObservation, HumanTakeover};
+use tempo_schema::{Action, CompiledObservation, HumanTakeover, ObservationDiff};
 use tempo_session::{read_journal_entries, JournalEntry, JournalEvent, SessionJournal};
 use thiserror::Error;
 
@@ -971,11 +971,9 @@ impl AgentRunner {
             state.actions_completed += 1;
             state.steps_executed += 1;
 
-            let next = driver.observe().await.map_err(|source| {
-                decided_transport_error(&mut state.journal, "decided post-action observe", source)
-            })?;
-            *observation =
-                self.record_decided_observation(state, next, "decided post-action observation")?;
+            *observation = self
+                .reobserve_after_action(driver, state, observation, action)
+                .await?;
 
             // Hard-pause on a CAPTCHA / auth-wall / login state before running
             // any further queued action (#244). Takes precedence over a plain
@@ -1013,6 +1011,62 @@ impl AgentRunner {
         Ok(Some(DecidedRunStatus::HumanTakeoverRequired { takeover }))
     }
 
+    /// Re-observe the page after an action, recording the observation the next
+    /// decision (and the #343 takeover detector and #254 origin/taint
+    /// recomputation) will run on.
+    ///
+    /// Incremental fast path (#235): for a same-document action, ask the driver
+    /// for an [`ObservationDiff`] relative to the pre-action observation and
+    /// reconstruct the full observation locally, instead of paying a full
+    /// re-observe. This shrinks the post-action re-observation (only the delta
+    /// crosses the driver transport) without changing what the consumers see:
+    /// [`reconstruct_observation`] rebuilds the element set exactly and carries
+    /// the URL/marks forward, which is equivalent to a full observe precisely
+    /// because a same-document action cannot change the origin (the browser's
+    /// same-origin history invariant) — so the recomputed policy origin is
+    /// unchanged.
+    ///
+    /// Correctness gates (any failure falls back to a full `observe()`):
+    ///   * navigating actions (`Goto`/`Click`/`Skill`) always full-observe — a
+    ///     diff carries no URL, so the post-navigation origin must be read fresh;
+    ///   * a diff that was not computed against our exact base, or that a page
+    ///     with a set-of-marks overlay cannot reproduce, is rejected by
+    ///     [`reconstruct_observation`] and full-observed instead.
+    async fn reobserve_after_action<D>(
+        &self,
+        driver: &mut D,
+        state: &mut DecidedRunState,
+        base: &CompiledObservation,
+        action: &Action,
+    ) -> Result<CompiledObservation, AgentError>
+    where
+        D: DriverTrait + ?Sized,
+    {
+        if !action_may_navigate(action) {
+            let diff = driver.observe_diff(base.seq).await.map_err(|source| {
+                decided_transport_error(
+                    &mut state.journal,
+                    "decided post-action observe_diff",
+                    source,
+                )
+            })?;
+            if let Some(observation) = reconstruct_observation(base, &diff) {
+                return self.record_decided_observation(
+                    state,
+                    observation,
+                    "decided post-action observation (diff)",
+                );
+            }
+            // The diff could not be applied equivalently: fall back to a full
+            // observe (correctness > latency).
+        }
+
+        let next = driver.observe().await.map_err(|source| {
+            decided_transport_error(&mut state.journal, "decided post-action observe", source)
+        })?;
+        self.record_decided_observation(state, next, "decided post-action observation")
+    }
+
     /// Validate the observation budget, journal the observation, and update
     /// the tracked origin. Returns the observation for the next decision.
     fn record_decided_observation(
@@ -1038,6 +1092,117 @@ impl AgentRunner {
             usage: state.usage,
         }
     }
+}
+
+/// Whether executing `action` can cause a cross-document navigation, i.e. move
+/// the page to a new URL/origin.
+///
+/// Only these actions force a full post-action re-observe (#235): an
+/// [`ObservationDiff`] carries element deltas + `seq` but not the URL, and the
+/// tracked policy origin (#254 taint / policy gating) is derived from
+/// `observation.url`. Same-document actions cannot change the origin — the
+/// browser only permits same-origin history mutation — so their post-action URL
+/// is unchanged and a diff-based reconstruction is equivalent to a full observe.
+/// `Skill` is included defensively: the decided loop rejects skills before they
+/// execute, so it never reaches the post-action re-observe.
+fn action_may_navigate(action: &Action) -> bool {
+    matches!(
+        action,
+        Action::Goto { .. } | Action::Click { .. } | Action::Skill { .. }
+    )
+}
+
+/// Rebuild the full post-action observation from the pre-action observation
+/// `base` and the `diff` describing what changed, or return `None` when the diff
+/// cannot be applied equivalently to a full re-observe (so the caller falls back
+/// to a full `observe()`).
+///
+/// Equivalence argument. Elements are identified by stable `NodeId`, so applying
+/// `removed`/`changed`/`added` to `base.elements` reproduces the engine's current
+/// element set with its current per-element content exactly — this is the inverse
+/// of the engine's diff. `seq` is taken from the diff; `url`, `marks`, and
+/// `schema_version` are carried from `base`. The caller only takes this path for
+/// same-document actions, so the URL (hence the policy origin, #254) is unchanged;
+/// and the takeover detector (#343) and taint recomputation both read the element
+/// set / URL, which are preserved. Surviving elements keep their base order and
+/// additions are appended, a deterministic order the order-insensitive consumers
+/// do not depend on.
+///
+/// Fallback conditions (return `None`):
+///   * `diff.since_seq != base.seq` — the diff was not computed against our base
+///     (a stale/evicted base or a diff-unsupported engine), so applying it is
+///     unsound;
+///   * the delta is structurally inconsistent with `base` (a `changed`/`removed`
+///     node absent from `base`, or an `added` node already present) — again a
+///     sign the diff was taken against a different base;
+///   * `base` carries a set-of-marks overlay, which the diff cannot reproduce.
+fn reconstruct_observation(
+    base: &CompiledObservation,
+    diff: &ObservationDiff,
+) -> Option<CompiledObservation> {
+    if diff.since_seq != base.seq {
+        return None;
+    }
+    // A diff carries no set-of-marks overlay; only reconstruct when there is
+    // none to preserve.
+    if !base.marks.is_empty() {
+        return None;
+    }
+
+    let base_ids: HashSet<&str> = base
+        .elements
+        .iter()
+        .map(|element| element.node_id.0.as_str())
+        .collect();
+    let removed: HashSet<&str> = diff.removed.iter().map(|node| node.0.as_str()).collect();
+
+    // Structural consistency: the delta must reference exactly the base it
+    // claims to. A mismatch means the diff was computed against a different
+    // observation, so reconstruction would be wrong.
+    if !removed.iter().all(|node| base_ids.contains(node)) {
+        return None;
+    }
+    if !diff
+        .changed
+        .iter()
+        .all(|element| base_ids.contains(element.node_id.0.as_str()))
+    {
+        return None;
+    }
+    if diff
+        .added
+        .iter()
+        .any(|element| base_ids.contains(element.node_id.0.as_str()))
+    {
+        return None;
+    }
+
+    let changed: std::collections::HashMap<&str, &tempo_schema::InteractiveElement> = diff
+        .changed
+        .iter()
+        .map(|element| (element.node_id.0.as_str(), element))
+        .collect();
+
+    let mut elements = Vec::with_capacity(base.elements.len() + diff.added.len());
+    for element in &base.elements {
+        let id = element.node_id.0.as_str();
+        if removed.contains(id) {
+            continue;
+        }
+        match changed.get(id) {
+            Some(updated) => elements.push((*updated).clone()),
+            None => elements.push(element.clone()),
+        }
+    }
+    elements.extend(diff.added.iter().cloned());
+
+    Some(CompiledObservation {
+        schema_version: base.schema_version.clone(),
+        url: base.url.clone(),
+        seq: diff.seq,
+        elements,
+        marks: base.marks.clone(),
+    })
 }
 
 fn charge_decision(
@@ -2160,5 +2325,547 @@ mod tests {
         assert!(decided.usage.input_tokens > 0);
         assert!(decided.usage.output_tokens > 0);
         Ok(())
+    }
+
+    // --- #235: incremental observe_diff in the decided step loop -------------
+
+    fn el(id: &str, rank: f32) -> tempo_schema::InteractiveElement {
+        let mut element = button(id);
+        element.rank = rank;
+        element
+    }
+
+    fn captcha_element() -> tempo_schema::InteractiveElement {
+        tempo_schema::InteractiveElement {
+            node_id: NodeId("captcha".into()),
+            role: "iframe".into(),
+            name: vec![tempo_schema::TaintSpan {
+                provenance: tempo_schema::Provenance::Page,
+                text: "reCAPTCHA".into(),
+            }],
+            value: Vec::new(),
+            bounds: None,
+            rank: 1.0,
+        }
+    }
+
+    fn type_action(node: &str) -> Action {
+        Action::Type {
+            node: NodeId(node.into()),
+            text: "hello".into(),
+        }
+    }
+
+    /// A scripted driver whose `observe` and `observe_diff` are mutually
+    /// consistent: each `act` swaps to the next page state, and `observe_diff`
+    /// returns the exact element delta from a recorded base (as a real engine
+    /// does). `reject_diff` makes `observe_diff` return the "no base" full-add
+    /// shape a real engine emits when it lacks the requested base seq, which the
+    /// loop must detect and fall back on.
+    struct DiffDriver {
+        url: String,
+        seq: u64,
+        elements: Vec<tempo_schema::InteractiveElement>,
+        pages: VecDeque<Vec<tempo_schema::InteractiveElement>>,
+        history: std::collections::HashMap<u64, CompiledObservation>,
+        reject_diff: bool,
+        calls: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl DiffDriver {
+        fn new(
+            initial: Vec<tempo_schema::InteractiveElement>,
+            pages: Vec<Vec<tempo_schema::InteractiveElement>>,
+            reject_diff: bool,
+        ) -> Self {
+            Self {
+                url: "https://example.com/".into(),
+                seq: 0,
+                elements: initial,
+                pages: pages.into(),
+                history: std::collections::HashMap::new(),
+                reject_diff,
+                calls: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn snapshot(&mut self) -> CompiledObservation {
+            let observation = CompiledObservation {
+                schema_version: tempo_schema::SCHEMA_VERSION.into(),
+                url: self.url.clone(),
+                seq: self.seq,
+                elements: self.elements.clone(),
+                marks: vec![],
+            };
+            self.history
+                .entry(self.seq)
+                .or_insert_with(|| observation.clone());
+            observation
+        }
+
+        /// Exact element delta between the recorded base and the current page.
+        fn true_diff(&self, since_seq: u64) -> ObservationDiff {
+            let current = CompiledObservation {
+                schema_version: tempo_schema::SCHEMA_VERSION.into(),
+                url: self.url.clone(),
+                seq: self.seq,
+                elements: self.elements.clone(),
+                marks: vec![],
+            };
+            let base =
+                self.history
+                    .get(&since_seq)
+                    .cloned()
+                    .unwrap_or_else(|| CompiledObservation {
+                        schema_version: tempo_schema::SCHEMA_VERSION.into(),
+                        url: self.url.clone(),
+                        seq: since_seq,
+                        elements: Vec::new(),
+                        marks: vec![],
+                    });
+            let before: HashSet<&str> =
+                base.elements.iter().map(|e| e.node_id.0.as_str()).collect();
+            let after: HashSet<&str> = current
+                .elements
+                .iter()
+                .map(|e| e.node_id.0.as_str())
+                .collect();
+            let added = current
+                .elements
+                .iter()
+                .filter(|e| !before.contains(e.node_id.0.as_str()))
+                .cloned()
+                .collect();
+            let removed = base
+                .elements
+                .iter()
+                .filter(|e| !after.contains(e.node_id.0.as_str()))
+                .map(|e| e.node_id.clone())
+                .collect();
+            let changed = current
+                .elements
+                .iter()
+                .filter(|e| {
+                    base.elements
+                        .iter()
+                        .any(|b| b.node_id == e.node_id && b != *e)
+                })
+                .cloned()
+                .collect();
+            ObservationDiff {
+                since_seq,
+                seq: self.seq,
+                added,
+                removed,
+                changed,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl DriverTrait for DiffDriver {
+        fn engine(&self) -> tempo_driver::Engine {
+            tempo_driver::Engine::Test
+        }
+
+        async fn goto(&mut self, _url: &str) -> Result<CompiledObservation, TransportError> {
+            self.seq += 1;
+            Ok(self.snapshot())
+        }
+
+        async fn observe(&mut self) -> Result<CompiledObservation, TransportError> {
+            self.calls
+                .lock()
+                .map_err(|_| TransportError::Other("poisoned".into()))?
+                .push("observe");
+            Ok(self.snapshot())
+        }
+
+        async fn observe_diff(
+            &mut self,
+            since_seq: u64,
+        ) -> Result<ObservationDiff, TransportError> {
+            self.calls
+                .lock()
+                .map_err(|_| TransportError::Other("poisoned".into()))?
+                .push("observe_diff");
+            let _ = self.snapshot();
+            if self.reject_diff {
+                // The "no base" shape: every current element reported as added.
+                // Applied to a non-empty base this double-counts, so the loop
+                // must reject it and full-observe instead.
+                return Ok(ObservationDiff {
+                    since_seq,
+                    seq: self.seq,
+                    added: self.elements.clone(),
+                    removed: Vec::new(),
+                    changed: Vec::new(),
+                });
+            }
+            Ok(self.true_diff(since_seq))
+        }
+
+        async fn act(
+            &mut self,
+            _action: &Action,
+        ) -> Result<tempo_driver::StepOutcome, TransportError> {
+            if let Some(next) = self.pages.pop_front() {
+                self.elements = next;
+            }
+            self.seq += 1;
+            let _ = self.snapshot();
+            Ok(tempo_driver::StepOutcome::Applied {
+                diff: ObservationDiff {
+                    since_seq: self.seq - 1,
+                    seq: self.seq,
+                    added: Vec::new(),
+                    removed: Vec::new(),
+                    changed: Vec::new(),
+                },
+            })
+        }
+
+        async fn act_batch(
+            &mut self,
+            batch: &tempo_schema::ActionBatch,
+        ) -> Result<tempo_driver::StepOutcome, TransportError> {
+            let mut last = tempo_driver::StepOutcome::Applied {
+                diff: self.true_diff(self.seq),
+            };
+            for action in &batch.actions {
+                last = self.act(action).await?;
+            }
+            Ok(last)
+        }
+
+        async fn fork(&mut self) -> Result<Box<dyn DriverTrait>, tempo_driver::Unsupported> {
+            Err(tempo_driver::Unsupported("diff driver does not fork"))
+        }
+
+        async fn extract(&mut self, _node: &NodeId) -> Result<serde_json::Value, TransportError> {
+            Ok(serde_json::Value::Null)
+        }
+
+        async fn evaluate_script(
+            &mut self,
+            _expression: &str,
+            _await_promise: bool,
+        ) -> Result<serde_json::Value, TransportError> {
+            Ok(serde_json::Value::Null)
+        }
+
+        async fn screenshot(&mut self) -> Result<Vec<u8>, TransportError> {
+            Ok(Vec::new())
+        }
+
+        async fn close(&mut self) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
+    fn observation_events(entries: &[JournalEntry]) -> Vec<CompiledObservation> {
+        entries
+            .iter()
+            .filter_map(|entry| match &entry.event {
+                JournalEvent::Observation { observation } => Some(observation.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn decision_actions(entries: &[JournalEntry]) -> Vec<Vec<Action>> {
+        entries
+            .iter()
+            .filter_map(|entry| match &entry.event {
+                JournalEvent::ModelDecision { actions, .. } => Some(actions.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// (a) Equivalence: a decided run that reconstructs from `observe_diff`
+    /// journals byte-identical observations and decisions to one forced onto the
+    /// full-observe fallback, over the same scripted multi-step page script.
+    #[tokio::test]
+    async fn decided_incremental_observe_matches_full_observe() -> TestResult {
+        // Two same-document (`Type`) steps: element mutates, then one is added.
+        let script = || {
+            (
+                vec![el("a", 0.9)],
+                vec![
+                    vec![el("a", 0.5)],               // step 1: change rank of "a"
+                    vec![el("a", 0.5), el("b", 0.7)], // step 2: add "b"
+                ],
+            )
+        };
+        let batches = || vec![vec![type_action("a")], vec![type_action("a")], vec![]];
+        let spec = DecidedTaskSpec::new("https://example.com", "fill the form");
+
+        let (root_inc, journal_inc) = journal_root("incremental-observe-inc")?;
+        let (init, pages) = script();
+        let mut inc_driver = DiffDriver::new(init, pages, false);
+        let inc_calls = Arc::clone(&inc_driver.calls);
+        let mut inc_decider = ScriptedDecider::new(batches());
+        AgentRunner::new(&journal_inc, AgentRunIds::new("run-inc", "session-inc"))
+            .run_decided_task(&mut inc_driver, &mut inc_decider, &spec)
+            .await?;
+        let inc_entries = read_journal_entries(&journal_inc)?;
+
+        let (root_full, journal_full) = journal_root("incremental-observe-full")?;
+        let (init, pages) = script();
+        let mut full_driver = DiffDriver::new(init, pages, true);
+        let full_calls = Arc::clone(&full_driver.calls);
+        let mut full_decider = ScriptedDecider::new(batches());
+        AgentRunner::new(&journal_full, AgentRunIds::new("run-full", "session-full"))
+            .run_decided_task(&mut full_driver, &mut full_decider, &spec)
+            .await?;
+        let full_entries = read_journal_entries(&journal_full)?;
+
+        // The reconstructed observations equal the full-observe ones.
+        assert_eq!(
+            observation_events(&inc_entries),
+            observation_events(&full_entries),
+            "reconstructed observations diverged from full observe"
+        );
+        assert_eq!(
+            decision_actions(&inc_entries),
+            decision_actions(&full_entries),
+            "decisions diverged"
+        );
+
+        // The incremental run actually took the diff path and paid fewer full
+        // observes than the forced-fallback run.
+        let inc_calls = inc_calls.lock().map_err(|_| "poisoned")?.clone();
+        let full_calls = full_calls.lock().map_err(|_| "poisoned")?.clone();
+        assert!(
+            inc_calls.contains(&"observe_diff"),
+            "incremental run never issued observe_diff"
+        );
+        let inc_full = inc_calls.iter().filter(|c| **c == "observe").count();
+        let fallback_full = full_calls.iter().filter(|c| **c == "observe").count();
+        assert!(
+            inc_full < fallback_full,
+            "incremental run did not reduce full observes ({inc_full} vs {fallback_full})"
+        );
+
+        remove_dir_if_exists(&root_inc)?;
+        remove_dir_if_exists(&root_full)?;
+        Ok(())
+    }
+
+    /// (c) A CAPTCHA that appears as a diff `added` element after a same-document
+    /// action is still detected: the takeover detector runs on the reconstructed
+    /// observation, so the run hard-pauses without a full re-observe.
+    #[tokio::test]
+    async fn decided_incremental_observe_still_detects_takeover_mid_run() -> TestResult {
+        let (root, journal) = journal_root("incremental-observe-takeover")?;
+        let mut driver = DiffDriver::new(
+            vec![el("a", 0.9)],
+            vec![vec![el("a", 0.9), captcha_element()]],
+            false,
+        );
+        let calls = Arc::clone(&driver.calls);
+        let mut decider = ScriptedDecider::new(vec![vec![type_action("a")], vec![]]);
+        let spec = DecidedTaskSpec::new("https://example.com", "type then stop");
+
+        let report = AgentRunner::new(&journal, AgentRunIds::new("run-tk", "session-tk"))
+            .run_decided_task(&mut driver, &mut decider, &spec)
+            .await?;
+
+        let DecidedRunStatus::HumanTakeoverRequired { takeover } = &report.status else {
+            return Err(format!("expected HumanTakeoverRequired, got {:?}", report.status).into());
+        };
+        assert_eq!(takeover.kind, tempo_schema::TakeoverKind::Captcha);
+        // The takeover was surfaced from the diff path, not a full re-observe.
+        let calls = calls.lock().map_err(|_| "poisoned")?.clone();
+        assert!(calls.contains(&"observe_diff"));
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    /// (d) Overlap/ordering: effects are never reordered by the incremental path
+    /// and each decision is made on the recorded (settled) observation. Two
+    /// identical runs also produce byte-identical journals (determinism).
+    #[tokio::test]
+    async fn decided_incremental_observe_preserves_effect_ordering() -> TestResult {
+        let run = |label: String| async move {
+            let spec = DecidedTaskSpec::new("https://example.com", "two steps");
+            let (root, journal) = journal_root(&label)?;
+            let mut driver = DiffDriver::new(
+                vec![el("a", 0.9)],
+                vec![vec![el("a", 0.5)], vec![el("a", 0.5), el("b", 0.7)]],
+                false,
+            );
+            let mut decider =
+                ScriptedDecider::new(vec![vec![type_action("a")], vec![type_action("a")], vec![]]);
+            AgentRunner::new(&journal, AgentRunIds::new(&label, &label))
+                .run_decided_task(&mut driver, &mut decider, &spec)
+                .await?;
+            let entries = read_journal_entries(&journal)?;
+            remove_dir_if_exists(&root)?;
+            Ok::<Vec<JournalEntry>, Box<dyn Error>>(entries)
+        };
+
+        let first = run("incremental-observe-order-1".to_string()).await?;
+        let second = run("incremental-observe-order-2".to_string()).await?;
+
+        // Determinism: identical inputs -> identical journals.
+        let kinds = |entries: &[JournalEntry]| {
+            entries
+                .iter()
+                .map(|entry| std::mem::discriminant(&entry.event))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            kinds(&first),
+            kinds(&second),
+            "journal ordering not deterministic"
+        );
+
+        // Within each executed step the effect order holds: a decision precedes
+        // its planned action, which precedes the applied effect, which precedes
+        // the observation the next decision runs on.
+        let mut planned_before_applied = false;
+        let mut prev_was_observation = false;
+        let mut seen_first_decision = false;
+        for entry in &first {
+            match &entry.event {
+                JournalEvent::ModelDecision { .. } => {
+                    // Every decision after the first must run on a freshly
+                    // recorded (settled) observation.
+                    if seen_first_decision {
+                        assert!(
+                            prev_was_observation,
+                            "decision made before the prior observation settled"
+                        );
+                    }
+                    seen_first_decision = true;
+                }
+                JournalEvent::ActionPlanned { .. } => planned_before_applied = true,
+                JournalEvent::StepApplied { .. } => {
+                    assert!(
+                        planned_before_applied,
+                        "effect applied before it was planned"
+                    );
+                    planned_before_applied = false;
+                }
+                _ => {}
+            }
+            prev_was_observation = matches!(entry.event, JournalEvent::Observation { .. });
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn reconstruct_observation_inverts_a_consistent_diff() {
+        let base = CompiledObservation {
+            schema_version: tempo_schema::SCHEMA_VERSION.into(),
+            url: "https://example.com/".into(),
+            seq: 4,
+            elements: vec![el("a", 0.9), el("b", 0.5)],
+            marks: vec![],
+        };
+        // Change "a", remove "b", add "c".
+        let diff = ObservationDiff {
+            since_seq: 4,
+            seq: 5,
+            added: vec![el("c", 0.7)],
+            removed: vec![NodeId("b".into())],
+            changed: vec![el("a", 0.2)],
+        };
+        let Some(rebuilt) = reconstruct_observation(&base, &diff) else {
+            panic!("consistent diff must reconstruct");
+        };
+        assert_eq!(rebuilt.seq, 5);
+        assert_eq!(rebuilt.url, base.url);
+        let ids: Vec<&str> = rebuilt
+            .elements
+            .iter()
+            .map(|e| e.node_id.0.as_str())
+            .collect();
+        assert_eq!(ids, vec!["a", "c"]);
+        assert_eq!(rebuilt.elements[0].rank, 0.2, "changed content not applied");
+    }
+
+    #[test]
+    fn reconstruct_observation_falls_back_on_inequivalent_diffs() {
+        let base = CompiledObservation {
+            schema_version: tempo_schema::SCHEMA_VERSION.into(),
+            url: "https://example.com/".into(),
+            seq: 4,
+            elements: vec![el("a", 0.9)],
+            marks: vec![],
+        };
+        let ok = ObservationDiff {
+            since_seq: 4,
+            seq: 5,
+            added: vec![],
+            removed: vec![],
+            changed: vec![],
+        };
+        // since_seq mismatch: diff not computed against our base.
+        assert!(reconstruct_observation(
+            &base,
+            &ObservationDiff {
+                since_seq: 3,
+                ..ok.clone()
+            }
+        )
+        .is_none());
+        // "no base" full-add: an added node already present in the base.
+        assert!(reconstruct_observation(
+            &base,
+            &ObservationDiff {
+                added: vec![el("a", 0.9)],
+                ..ok.clone()
+            }
+        )
+        .is_none());
+        // changed/removed referencing an unknown node.
+        assert!(reconstruct_observation(
+            &base,
+            &ObservationDiff {
+                changed: vec![el("z", 0.1)],
+                ..ok.clone()
+            }
+        )
+        .is_none());
+        assert!(reconstruct_observation(
+            &base,
+            &ObservationDiff {
+                removed: vec![NodeId("z".into())],
+                ..ok.clone()
+            }
+        )
+        .is_none());
+        // A set-of-marks overlay the diff cannot reproduce.
+        let marked = CompiledObservation {
+            marks: vec![(NodeId("a".into()), 1)],
+            ..base.clone()
+        };
+        assert!(reconstruct_observation(&marked, &ok).is_none());
+    }
+
+    #[test]
+    fn only_navigating_actions_force_full_observe() {
+        assert!(action_may_navigate(&click("x")));
+        assert!(action_may_navigate(&Action::Goto {
+            url: "https://e.com".into()
+        }));
+        assert!(action_may_navigate(&Action::Skill {
+            name: "s".into(),
+            input: serde_json::Value::Null
+        }));
+        assert!(!action_may_navigate(&type_action("x")));
+        assert!(!action_may_navigate(&Action::Select {
+            node: NodeId("x".into()),
+            value: "v".into()
+        }));
+        assert!(!action_may_navigate(&Action::Scroll { x: 0.0, y: 1.0 }));
+        assert!(!action_may_navigate(&Action::Wait { millis: 1 }));
+        assert!(!action_may_navigate(&Action::Extract {
+            node: NodeId("x".into())
+        }));
     }
 }
