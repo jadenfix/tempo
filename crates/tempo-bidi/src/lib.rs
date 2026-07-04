@@ -11,6 +11,15 @@ use serde_json::{json, Value};
 use tempo_schema::Action;
 use thiserror::Error;
 
+/// Maximum live BiDi subscriptions retained by one router session.
+pub const MAX_BIDI_SUBSCRIPTIONS: usize = 256;
+/// Maximum requested events accepted in one `session.subscribe` command.
+pub const MAX_BIDI_SUBSCRIPTION_EVENTS: usize = 16;
+/// Maximum contexts stored in one subscription.
+pub const MAX_BIDI_SUBSCRIPTION_CONTEXTS: usize = 64;
+/// Maximum bytes accepted for event names and context identifiers.
+pub const MAX_BIDI_SUBSCRIPTION_IDENTIFIER_BYTES: usize = 256;
+
 /// A WebDriver BiDi command id.
 pub type CommandId = u64;
 
@@ -348,6 +357,13 @@ impl BidiRouter {
             Ok(params) => params,
             Err(routed) => return Ok(routed),
         };
+        if let Some(message) = validate_subscription_request_size(&params) {
+            return Ok(RoutedCommand::Immediate(BidiMessage::error(
+                Some(id),
+                BidiErrorCode::InvalidArgument,
+                message,
+            )));
+        }
         let event_names = match expand_event_names(&params.events, "session.subscribe") {
             Ok(event_names) => event_names,
             Err(message) => {
@@ -370,6 +386,13 @@ impl BidiRouter {
                 Some(id),
                 BidiErrorCode::InvalidArgument,
                 "tempo BiDi endpoint has no browser user contexts",
+            )));
+        }
+        if self.subscriptions.len() >= MAX_BIDI_SUBSCRIPTIONS {
+            return Ok(RoutedCommand::Immediate(BidiMessage::error(
+                Some(id),
+                BidiErrorCode::InvalidArgument,
+                format!("BiDi subscription limit reached (max {MAX_BIDI_SUBSCRIPTIONS})"),
             )));
         }
 
@@ -931,6 +954,69 @@ fn expand_event_names(events: &[String], command: &str) -> Result<BTreeSet<Strin
     Ok(expanded)
 }
 
+fn validate_subscription_request_size(params: &SessionSubscribeParameters) -> Option<String> {
+    if params.events.len() > MAX_BIDI_SUBSCRIPTION_EVENTS {
+        return Some(format!(
+            "session.subscribe accepts at most {MAX_BIDI_SUBSCRIPTION_EVENTS} events"
+        ));
+    }
+    if params.contexts.len() > MAX_BIDI_SUBSCRIPTION_CONTEXTS {
+        return Some(format!(
+            "session.subscribe accepts at most {MAX_BIDI_SUBSCRIPTION_CONTEXTS} contexts"
+        ));
+    }
+    if params.user_contexts.len() > MAX_BIDI_SUBSCRIPTION_CONTEXTS {
+        return Some(format!(
+            "session.subscribe accepts at most {MAX_BIDI_SUBSCRIPTION_CONTEXTS} userContexts"
+        ));
+    }
+
+    if let Some(event) = params
+        .events
+        .iter()
+        .find(|event| event.len() > MAX_BIDI_SUBSCRIPTION_IDENTIFIER_BYTES)
+    {
+        return Some(format!(
+            "session.subscribe event name exceeds {MAX_BIDI_SUBSCRIPTION_IDENTIFIER_BYTES} bytes: {}",
+            truncate_for_error(event)
+        ));
+    }
+    if let Some(context) = params
+        .contexts
+        .iter()
+        .find(|context| context.0.len() > MAX_BIDI_SUBSCRIPTION_IDENTIFIER_BYTES)
+    {
+        return Some(format!(
+            "session.subscribe context id exceeds {MAX_BIDI_SUBSCRIPTION_IDENTIFIER_BYTES} bytes: {}",
+            truncate_for_error(&context.0)
+        ));
+    }
+    if let Some(user_context) = params
+        .user_contexts
+        .iter()
+        .find(|user_context| user_context.len() > MAX_BIDI_SUBSCRIPTION_IDENTIFIER_BYTES)
+    {
+        return Some(format!(
+            "session.subscribe userContext id exceeds {MAX_BIDI_SUBSCRIPTION_IDENTIFIER_BYTES} bytes: {}",
+            truncate_for_error(user_context)
+        ));
+    }
+
+    None
+}
+
+fn truncate_for_error(value: &str) -> String {
+    const MAX_ERROR_VALUE_BYTES: usize = 64;
+    if value.len() <= MAX_ERROR_VALUE_BYTES {
+        return value.to_string();
+    }
+    let mut end = MAX_ERROR_VALUE_BYTES;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &value[..end])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1135,6 +1221,146 @@ mod tests {
                 message: "unsupported BiDi event: script.message".into(),
             })
         );
+        Ok(())
+    }
+
+    #[test]
+    fn session_subscribe_caps_live_subscription_table() -> TestResult {
+        let mut router = BidiRouter::new();
+
+        for index in 0..MAX_BIDI_SUBSCRIPTIONS {
+            let routed = router.route(BidiCommand {
+                id: index as u64 + 1,
+                method: "session.subscribe".into(),
+                params: json!({
+                    "events": ["network.beforeRequestSent"],
+                    "contexts": [format!("ctx-{index}")],
+                }),
+            })?;
+            match routed {
+                RoutedCommand::Immediate(BidiMessage::Success { .. }) => {}
+                other => return Err(format!("expected subscribe success, got {other:?}").into()),
+            }
+        }
+
+        let rejected = router.route(BidiCommand {
+            id: 1_000,
+            method: "session.subscribe".into(),
+            params: json!({
+                "events": ["network.beforeRequestSent"],
+                "contexts": ["ctx-overflow"],
+            }),
+        })?;
+        assert_eq!(
+            rejected,
+            RoutedCommand::Immediate(BidiMessage::Error {
+                id: Some(1_000),
+                error: "invalid argument".into(),
+                message: format!("BiDi subscription limit reached (max {MAX_BIDI_SUBSCRIPTIONS})"),
+            })
+        );
+        assert!(router.event_subscribed(
+            BidiEventMethod::NetworkBeforeRequestSent,
+            Some(&BrowsingContextId("ctx-0".into()))
+        ));
+        assert!(!router.event_subscribed(
+            BidiEventMethod::NetworkBeforeRequestSent,
+            Some(&BrowsingContextId("ctx-overflow".into()))
+        ));
+
+        router.route_json(
+            br#"{"id":1001,"method":"session.unsubscribe","params":{"subscriptions":["tempo-subscription-1"]}}"#,
+        )?;
+        let resubscribed = router.route(BidiCommand {
+            id: 1_002,
+            method: "session.subscribe".into(),
+            params: json!({
+                "events": ["network.beforeRequestSent"],
+                "contexts": ["ctx-reclaimed"],
+            }),
+        })?;
+        assert_eq!(
+            resubscribed,
+            RoutedCommand::Immediate(BidiMessage::Success {
+                id: 1_002,
+                result: json!({"subscription": format!("tempo-subscription-{}", MAX_BIDI_SUBSCRIPTIONS + 1)}),
+            })
+        );
+        assert!(router.event_subscribed(
+            BidiEventMethod::NetworkBeforeRequestSent,
+            Some(&BrowsingContextId("ctx-reclaimed".into()))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn session_subscribe_rejects_oversized_vectors() -> TestResult {
+        let mut router = BidiRouter::new();
+        let events = (0..=MAX_BIDI_SUBSCRIPTION_EVENTS)
+            .map(|_| "network.beforeRequestSent".to_string())
+            .collect::<Vec<_>>();
+        let too_many_events = router.route(BidiCommand {
+            id: 11,
+            method: "session.subscribe".into(),
+            params: json!({ "events": events }),
+        })?;
+        assert_eq!(
+            too_many_events,
+            RoutedCommand::Immediate(BidiMessage::Error {
+                id: Some(11),
+                error: "invalid argument".into(),
+                message: format!(
+                    "session.subscribe accepts at most {MAX_BIDI_SUBSCRIPTION_EVENTS} events"
+                ),
+            })
+        );
+
+        let contexts = (0..=MAX_BIDI_SUBSCRIPTION_CONTEXTS)
+            .map(|index| format!("ctx-{index}"))
+            .collect::<Vec<_>>();
+        let too_many_contexts = router.route(BidiCommand {
+            id: 12,
+            method: "session.subscribe".into(),
+            params: json!({
+                "events": ["network.beforeRequestSent"],
+                "contexts": contexts,
+            }),
+        })?;
+        assert_eq!(
+            too_many_contexts,
+            RoutedCommand::Immediate(BidiMessage::Error {
+                id: Some(12),
+                error: "invalid argument".into(),
+                message: format!(
+                    "session.subscribe accepts at most {MAX_BIDI_SUBSCRIPTION_CONTEXTS} contexts"
+                ),
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn session_subscribe_rejects_oversized_identifiers() -> TestResult {
+        let mut router = BidiRouter::new();
+        let oversized_context = "c".repeat(MAX_BIDI_SUBSCRIPTION_IDENTIFIER_BYTES + 1);
+
+        let routed = router.route(BidiCommand {
+            id: 13,
+            method: "session.subscribe".into(),
+            params: json!({
+                "events": ["network.beforeRequestSent"],
+                "contexts": [oversized_context],
+            }),
+        })?;
+
+        match routed {
+            RoutedCommand::Immediate(BidiMessage::Error { id, error, message }) => {
+                assert_eq!(id, Some(13));
+                assert_eq!(error, "invalid argument");
+                assert!(message.contains("session.subscribe context id exceeds"));
+            }
+            other => return Err(format!("expected invalid-argument error, got {other:?}").into()),
+        }
         Ok(())
     }
 

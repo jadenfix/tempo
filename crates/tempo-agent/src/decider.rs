@@ -23,6 +23,7 @@ use crate::{
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashSet, VecDeque};
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 use tempo_act::{detect_human_takeover, execute_action, ExecutionStatus};
@@ -200,6 +201,9 @@ pub struct AnthropicConfig {
     pub model: String,
     /// API origin; defaults to [`DEFAULT_ANTHROPIC_BASE_URL`].
     pub base_url: String,
+    /// Allow `http://` loopback Messages-API fixtures. This is intentionally
+    /// opt-in so tests do not normalize unsafe production configuration.
+    allow_insecure_local_base_url: bool,
     /// `max_tokens` per decision response.
     pub max_output_tokens: u64,
     /// Response body size cap (see [`DEFAULT_MAX_RESPONSE_BODY_BYTES`]).
@@ -219,6 +223,7 @@ impl AnthropicConfig {
             api_key: api_key.into(),
             model: DEFAULT_ANTHROPIC_MODEL.into(),
             base_url: DEFAULT_ANTHROPIC_BASE_URL.into(),
+            allow_insecure_local_base_url: false,
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             max_body_bytes: DEFAULT_MAX_RESPONSE_BODY_BYTES,
             timeout: DEFAULT_TIMEOUT,
@@ -254,6 +259,14 @@ impl AnthropicConfig {
         self
     }
 
+    /// Allow an insecure loopback Messages-API fixture. Do not use for live
+    /// model traffic; production keys are only sent to the pinned Anthropic
+    /// origin.
+    pub fn with_insecure_local_base_url_for_tests(mut self) -> Self {
+        self.allow_insecure_local_base_url = true;
+        self
+    }
+
     /// Override the response body cap.
     pub fn with_max_body_bytes(mut self, max_body_bytes: usize) -> Self {
         self.max_body_bytes = max_body_bytes;
@@ -281,6 +294,7 @@ impl AnthropicConfig {
 pub struct AnthropicDecider {
     config: AnthropicConfig,
     client: reqwest::Client,
+    messages_endpoint: reqwest::Url,
 }
 
 impl AnthropicDecider {
@@ -290,22 +304,23 @@ impl AnthropicDecider {
         if config.api_key.trim().is_empty() {
             return Err(DeciderError::Config("API key is empty".into()));
         }
+        let messages_endpoint = anthropic_messages_endpoint(&config)?;
         let client = reqwest::Client::builder()
             .timeout(config.timeout)
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|error| DeciderError::Config(error.to_string()))?;
-        Ok(Self { config, client })
+        Ok(Self {
+            config,
+            client,
+            messages_endpoint,
+        })
     }
 
-    async fn attempt_decide(
-        &self,
-        endpoint: &str,
-        body: &serde_json::Value,
-    ) -> Result<DecidedBatch, AttemptError> {
+    async fn attempt_decide(&self, body: &serde_json::Value) -> Result<DecidedBatch, AttemptError> {
         let response = self
             .client
-            .post(endpoint)
+            .post(self.messages_endpoint.clone())
             .header("x-api-key", &self.config.api_key)
             .header("anthropic-version", ANTHROPIC_VERSION)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -357,7 +372,6 @@ impl Decider for AnthropicDecider {
         request: &DecisionRequest<'_>,
     ) -> Result<DecidedBatch, DeciderError> {
         let body = decide_request_body(&self.config, request)?;
-        let endpoint = format!("{}/v1/messages", self.config.base_url.trim_end_matches('/'));
 
         let max_attempts = self.config.max_retries.saturating_add(1).max(1);
         let mut last_failure = Failure::Transport("no attempt was made".into());
@@ -366,7 +380,7 @@ impl Decider for AnthropicDecider {
                 let exponent = (attempt - 2).min(8);
                 tokio::time::sleep(self.config.retry_backoff.saturating_mul(1 << exponent)).await;
             }
-            match self.attempt_decide(&endpoint, &body).await {
+            match self.attempt_decide(&body).await {
                 Ok(batch) => return Ok(batch),
                 Err(AttemptError::Fatal(error)) => return Err(error),
                 Err(AttemptError::Retryable(failure)) => last_failure = failure,
@@ -395,6 +409,78 @@ enum Failure {
     Transport(String),
     Api { status: u16, detail: String },
     Malformed(String),
+}
+
+fn anthropic_messages_endpoint(config: &AnthropicConfig) -> Result<reqwest::Url, DeciderError> {
+    let base = validate_anthropic_base_url(config)?;
+    let mut endpoint = base;
+    endpoint.set_path("/v1/messages");
+    Ok(endpoint)
+}
+
+fn validate_anthropic_base_url(config: &AnthropicConfig) -> Result<reqwest::Url, DeciderError> {
+    let raw = config.base_url.trim();
+    let mut url = reqwest::Url::parse(raw).map_err(|error| {
+        DeciderError::Config(format!("ANTHROPIC_BASE_URL is not a valid URL: {error}"))
+    })?;
+
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(DeciderError::Config(
+            "ANTHROPIC_BASE_URL must not include userinfo".into(),
+        ));
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(DeciderError::Config(
+            "ANTHROPIC_BASE_URL must not include query or fragment".into(),
+        ));
+    }
+    if url.path() != "/" {
+        return Err(DeciderError::Config(
+            "ANTHROPIC_BASE_URL must be an origin with no path".into(),
+        ));
+    }
+
+    let host = url
+        .host_str()
+        .ok_or_else(|| DeciderError::Config("ANTHROPIC_BASE_URL must include a host".into()))?;
+
+    if config.allow_insecure_local_base_url && is_loopback_base_url(&url) {
+        url.set_path("");
+        return Ok(url);
+    }
+
+    if url.scheme() != "https" {
+        return Err(DeciderError::Config(
+            "ANTHROPIC_BASE_URL must use https".into(),
+        ));
+    }
+    if !host.eq_ignore_ascii_case("api.anthropic.com") {
+        return Err(DeciderError::Config(
+            "ANTHROPIC_BASE_URL must be https://api.anthropic.com".into(),
+        ));
+    }
+    if url.port_or_known_default() != Some(443) {
+        return Err(DeciderError::Config(
+            "ANTHROPIC_BASE_URL must use the default HTTPS port".into(),
+        ));
+    }
+
+    url.set_path("");
+    Ok(url)
+}
+
+fn is_loopback_base_url(url: &reqwest::Url) -> bool {
+    matches!(url.scheme(), "http" | "https")
+        && url
+            .host_str()
+            .map(|host| {
+                host.eq_ignore_ascii_case("localhost")
+                    || host
+                        .parse::<IpAddr>()
+                        .map(|addr| addr.is_loopback())
+                        .unwrap_or(false)
+            })
+            .unwrap_or(false)
 }
 
 fn truncate_detail(text: &str) -> String {
@@ -1487,6 +1573,7 @@ mod tests {
     fn fixture_config(origin: &str) -> AnthropicConfig {
         AnthropicConfig::new("test-key")
             .with_base_url(origin)
+            .with_insecure_local_base_url_for_tests()
             .with_retry_backoff(Duration::ZERO)
     }
 
@@ -1496,6 +1583,54 @@ mod tests {
             .map(|(_, body)| body)
             .ok_or("request missing body")?;
         Ok(serde_json::from_str(body)?)
+    }
+
+    #[test]
+    fn anthropic_base_url_requires_pinned_secure_origin() {
+        assert!(AnthropicDecider::new(AnthropicConfig::new("test-key")).is_ok());
+
+        for base_url in [
+            "http://api.anthropic.com",
+            "https://api.anthropic.com.evil.test",
+            "https://user:secret@api.anthropic.com",
+            "https://api.anthropic.com/v1",
+            "https://api.anthropic.com?x=1",
+            "https://api.anthropic.com#fragment",
+            "https://api.anthropic.com:8443",
+            "https://127.0.0.1",
+        ] {
+            let config = AnthropicConfig::new("test-key").with_base_url(base_url);
+            assert!(
+                matches!(AnthropicDecider::new(config), Err(DeciderError::Config(_))),
+                "{base_url} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn anthropic_base_url_allows_loopback_only_with_explicit_test_opt_in() {
+        let local = AnthropicConfig::new("test-key").with_base_url("http://127.0.0.1:8123");
+        assert!(matches!(
+            AnthropicDecider::new(local.clone()),
+            Err(DeciderError::Config(_))
+        ));
+        assert!(AnthropicDecider::new(local.with_insecure_local_base_url_for_tests()).is_ok());
+
+        let spoofed_local = AnthropicConfig::new("test-key")
+            .with_base_url("http://127.0.0.1.evil.test")
+            .with_insecure_local_base_url_for_tests();
+        assert!(matches!(
+            AnthropicDecider::new(spoofed_local),
+            Err(DeciderError::Config(_))
+        ));
+    }
+
+    #[test]
+    fn anthropic_endpoint_is_built_from_validated_origin() -> TestResult {
+        let config = AnthropicConfig::new("test-key").with_base_url("https://api.anthropic.com/");
+        let endpoint = anthropic_messages_endpoint(&config)?;
+        assert_eq!(endpoint.as_str(), "https://api.anthropic.com/v1/messages");
+        Ok(())
     }
 
     /// A decider with fixed actions and usage, counting how often it is asked.

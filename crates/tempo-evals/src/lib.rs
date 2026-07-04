@@ -2491,9 +2491,11 @@ mod tests {
         // comparison is deferred with the live slice, #363). See the README
         // "Honesty note on the token result".
         //
-        // Measured (bytes/tokens): page1 tempo 813/204 vs playwright 704/176
-        // vs browser-use 587/147; page2 tempo 1280/320 vs playwright 1246/312
-        // vs browser-use 926/232.
+        // Measured (bytes/tokens): page1 tempo 780/195 vs playwright 704/176
+        // vs browser-use 587/147; page2 tempo 1236/309 vs playwright 1246/312
+        // vs browser-use 926/232. (tempo shed the empty `"value":[]` arrays
+        // once `InteractiveElement.value` gained `skip_serializing_if` — it is
+        // still heavier than browser-use here, the honest direction below.)
         for stem in PAGES {
             let report = load_page_report(stem)?;
 

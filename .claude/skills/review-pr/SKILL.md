@@ -20,9 +20,10 @@ You are an independent, non-author reviewer for `jadenfix/tempo`. The argument i
 2. `gh pr diff <N> -R jadenfix/tempo` — all of it.
 3. `gh issue view <issue> -R jadenfix/tempo` for every referenced issue; the issue defines the intended scope (did the PR do more or less than it needs?).
 4. **Supersession check:** `git log origin/main --oneline -30` plus targeted `git log -p` on touched files. Concurrent agents mean main may already contain an equivalent fix → REJECT (superseded).
-5. **Overlap check:** `gh pr list -R jadenfix/tempo --state open` — flag open PRs touching the same paths and whether merge order matters.
-6. Hunt for bugs using the method below.
-7. Post the review (format at the bottom) and return a structured verdict.
+5. **Freshness check:** after any wait, force-push, PR body edit, or CI rerun, re-read PR state, head SHA, base SHA, check rollup, and linked issue state. A closed PR, stale-head check run, or already-closed issue is not merge evidence.
+6. **Overlap check:** `gh pr list -R jadenfix/tempo --state open` — flag open PRs touching the same paths and whether merge order matters.
+7. Hunt for bugs using the method below.
+8. Post the review (format at the bottom) and return a structured verdict.
 
 ## How to find bugs (do this — don't just tick boxes)
 
@@ -34,6 +35,7 @@ The checklist further down is a memory aid. These techniques are what actually s
 - **Follow the seams the diff hides:** the callers of every changed signature, the callees it now leans on, and any invariant elsewhere that assumed the old behavior.
 - **Reverted-fix test:** would any test in the PR still pass if the fix itself were reverted? If yes, the test proves nothing — that's a blocker for a bugfix PR.
 - **Adversarially verify** each candidate blocker before it goes in the review: try to refute it against the code. Survives refutation → blocker. Can't build a concrete trace → nit.
+- **Preserve durable lessons without breaking read-only review.** If a review uncovers a persistent, non-overfit invariant that would catch future unrelated bugs, call it out in the review under `Durable guidance`. Do not edit repo files as part of the read-only review. A coordinator or follow-up author should land accepted guidance in this file and in `AGENTS.md` or `CLAUDE.md` from a separate worktree/PR. Do not add issue numbers, branch names, or frozen file:line examples unless they are explicitly marked as temporary examples.
 
 ## What to look for (general bug classes — check every one that the diff touches)
 
@@ -42,16 +44,24 @@ Correctness & honesty of the contract:
 - [ ] Output that drops, truncates, samples, or rate-limits data says so, so the consumer can distinguish "absent" from "omitted."
 - [ ] Handles/IDs the caller reuses across calls are stable, or their churn is handled rather than silently breaking multi-step callers.
 - [ ] Docs, comments, and declared schemas/types match what the code actually does — no present-tense claims for a stub, no `{"type":"object"}` standing in for a real schema.
+- [ ] Runtime-visible contract changes update every public description in the same slice: OpenAPI paths/statuses/schemas, agent cards, SDK-facing docs, and compatibility fixtures. A route or response field that exists at runtime but is absent from the contract is a blocker for SDK workflows.
+- [ ] Public Rust schema struct changes update source callers too: `serde(default)` preserves old JSON compatibility, but it does not make existing struct literals compile. Scan/update workspace literals and downstream crates.
 
 Resource, lifecycle & availability:
 - [ ] Everything that can grow is bounded: input/response sizes, queues, maps, caches, retries, spawned tasks, and session/connection counts. Unbounded growth on remote-driven input is a blocker.
+- [ ] Stateful protocol handlers enforce live-state quotas in addition to per-message size caps; repeated valid commands must not grow maps, vectors, or dispatch scans without bound.
 - [ ] Every engine/remote/subprocess round-trip has a timeout **and** a recovery path — a crash or hang is detected and healed (restart/reconnect, with backoff), not permanently terminal.
 - [ ] Health/readiness signals reflect real state (draining, dependency-down, at-capacity); cleanup and teardown run on every exit path including error and cancel.
+- [ ] Operational metadata routes that expose dependency health, capacity, policy, or topology are guarded like control-plane routes unless they intentionally return only static liveness.
 - [ ] Locks are narrow, consistently ordered, released on panic (poison recovered, not fatal), and never held across `.await`, navigation, or subprocess I/O — the pool lock especially, so `/health` and `/drain` stay responsive.
+- [ ] Durable/journal writes use a batched single-writer path (e.g. WAL + a dedicated writer), not per-write open + full fsync; a crash or kill mid-write must be recoverable on restart with no torn or lost committed state.
 
 Trust boundaries & security:
 - [ ] Caller-supplied trust/policy/side-effect classifications (`taint`, `confirmed`, …) are recomputed server-side, never trusted.
 - [ ] Untrusted data is size-checked, provenance-tracked, and cannot cause side effects or leak secret headers; a policy (URL, egress, redaction) is enforced across the whole path — redirects, retries, interception — not just the entrypoint.
+- [ ] Untrusted descriptors and attestations (OpenAPI/WebMCP catalogs, handshake evidence) are origin-bound and cannot themselves drive side effects or inject secret headers.
+- [ ] Tests and docs that verify redaction do not commit realistic secret, token, password, API-key, or credential literals. Use scanner-safe inert fragments while still proving the sensitive value never appears in debug/display/error/export output.
+- [ ] Secret-bearing clients parse and validate configured base URLs before constructing requests: reject userinfo/query/fragment/path injection, require a pinned secure production origin, and make loopback/insecure fixtures use an explicitly named test opt-in.
 - [ ] A detector or guard runs on data that actually reaches it: check that upstream filtering/compilation didn't strip the very signal the check needs.
 
 Performance on hot paths (a regression here is a correctness bug for this project):
@@ -64,6 +74,7 @@ Fit & simplicity (more code is not better):
 
 Tests:
 - [ ] A test exercises the actual failure mode (survives the reverted-fix question above); new caps/timeouts/limits are tested at the boundary — at, below, above.
+- [ ] Local verification ran in an isolated worktree/target. If multiple Cargo commands share one fresh `CARGO_TARGET_DIR` concurrently, missing rlibs/object files/temp dirs are local harness races until reproduced sequentially.
 
 ## tempo hard rules (standing invariants — treat a violation as a blocker)
 
@@ -97,6 +108,8 @@ Blockers:
 
 Nits:
 - <file:line — suggestion>                (or "none")
+
+Durable guidance: <candidate reusable invariant for follow-up docs, or "none">
 
 Overlap: <open PRs touching same paths + merge-order note, or "none">
 

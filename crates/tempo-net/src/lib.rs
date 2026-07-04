@@ -1590,6 +1590,13 @@ impl ProxyRoute {
     }
 }
 
+/// Host/port that must be resolved and pinned before using a proxy endpoint.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProxyEndpointTarget {
+    pub host: String,
+    pub port: u16,
+}
+
 /// Default egress behavior when no domain rule matches.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EgressDefault {
@@ -1604,6 +1611,7 @@ pub struct EgressPolicy {
     allowed: BTreeSet<DomainRule>,
     blocked: BTreeSet<DomainRule>,
     proxies: BTreeMap<DomainRule, ProxyRoute>,
+    allow_insecure_local_proxy_endpoints: bool,
 }
 
 impl EgressPolicy {
@@ -1613,6 +1621,7 @@ impl EgressPolicy {
             allowed: BTreeSet::new(),
             blocked: BTreeSet::new(),
             proxies: BTreeMap::new(),
+            allow_insecure_local_proxy_endpoints: false,
         }
     }
 
@@ -1622,6 +1631,7 @@ impl EgressPolicy {
             allowed: BTreeSet::new(),
             blocked: BTreeSet::new(),
             proxies: BTreeMap::new(),
+            allow_insecure_local_proxy_endpoints: false,
         }
     }
 
@@ -1640,6 +1650,36 @@ impl EgressPolicy {
         self
     }
 
+    /// Permit cleartext proxy endpoints only when they target loopback.
+    ///
+    /// This is intended for local development and tests. Public proxy routes
+    /// must use secure proxy transport by default.
+    pub fn allow_insecure_local_proxy_endpoints(mut self) -> Self {
+        self.allow_insecure_local_proxy_endpoints = true;
+        self
+    }
+
+    /// Return the proxy host/port a transport adapter must resolve and pin.
+    pub fn proxy_endpoint_target(
+        &self,
+        proxy: &ProxyRoute,
+    ) -> Result<ProxyEndpointTarget, UrlBlocked> {
+        proxy_endpoint_target(&proxy.endpoint, self.allow_insecure_local_proxy_endpoints)
+    }
+
+    /// Validate a proxy endpoint socket after adapter-side DNS resolution.
+    pub fn enforce_proxy_endpoint_resolved_socket(
+        &self,
+        proxy: &ProxyRoute,
+        resolved_socket: SocketAddr,
+    ) -> Result<(), UrlBlocked> {
+        enforce_proxy_endpoint_resolved_socket(
+            &proxy.endpoint,
+            resolved_socket,
+            self.allow_insecure_local_proxy_endpoints,
+        )
+    }
+
     pub fn decide(&self, request: &NetworkRequest) -> Result<EgressDecision, EgressDenied> {
         let parts =
             UrlParts::parse(&request.url).map_err(|reason| EgressDenied::from_block(reason, ""))?;
@@ -1655,6 +1695,15 @@ impl EgressPolicy {
         }
 
         if let Some(proxy) = self.proxy_for(&domain) {
+            enforce_proxy_endpoint_preflight(
+                &proxy.endpoint,
+                self.allow_insecure_local_proxy_endpoints,
+            )
+            .map_err(|blocked| EgressDenied {
+                domain: domain.clone(),
+                port,
+                reason: format!("proxy endpoint rejected: {}", blocked.reason.detail),
+            })?;
             return Ok(EgressDecision::Proxied {
                 domain,
                 port,
@@ -2429,6 +2478,7 @@ impl<'a> CrawlDispatchGuard<'a> {
             resolved_socket,
             self.signer.map(|signer| (signer.key, signer.created)),
             egress_decision,
+            self.egress_policy.allow_insecure_local_proxy_endpoints,
         )
     }
 
@@ -2812,6 +2862,7 @@ fn checked_crawl_dispatch(
         resolved_socket,
         signer,
         egress_decision,
+        egress_policy.allow_insecure_local_proxy_endpoints,
     )
 }
 
@@ -2821,6 +2872,7 @@ fn checked_crawl_dispatch_with_decision(
     resolved_socket: SocketAddr,
     signer: Option<(&WebBotAuthSigningKey, u64)>,
     egress_decision: EgressDecision,
+    allow_insecure_local_proxy_endpoints: bool,
 ) -> Result<CheckedCrawlDispatch, CrawlDispatchError> {
     let audit = match &egress_decision {
         EgressDecision::Direct { .. } => AuditRecord::from_request_with_resolved_socket(
@@ -2829,7 +2881,11 @@ fn checked_crawl_dispatch_with_decision(
             resolved_socket,
         )?,
         EgressDecision::Proxied { proxy, .. } => {
-            enforce_proxy_endpoint_resolved_socket(&proxy.endpoint, resolved_socket)?;
+            enforce_proxy_endpoint_resolved_socket(
+                &proxy.endpoint,
+                resolved_socket,
+                allow_insecure_local_proxy_endpoints,
+            )?;
             AuditRecord::from_request(&dispatch.request, url_policy)?
         }
     };
@@ -2839,16 +2895,10 @@ fn checked_crawl_dispatch_with_decision(
 fn enforce_proxy_endpoint_resolved_socket(
     endpoint: &str,
     resolved_socket: SocketAddr,
+    allow_insecure_local_proxy_endpoints: bool,
 ) -> Result<(), UrlBlocked> {
     let parts = UrlParts::parse(endpoint).map_err(|reason| UrlBlocked { reason })?;
-    if parts.scheme.trim().is_empty() {
-        return Err(UrlBlocked {
-            reason: BlockReason::new(
-                BlockCode::UnsupportedScheme,
-                "proxy endpoint scheme is empty",
-            ),
-        });
-    }
+    enforce_proxy_endpoint_parts_policy(&parts, allow_insecure_local_proxy_endpoints)?;
     let expected_port = proxy_endpoint_port(&parts)?;
     if expected_port != resolved_socket.port() {
         return Err(UrlBlocked {
@@ -2862,18 +2912,20 @@ fn enforce_proxy_endpoint_resolved_socket(
         });
     }
 
-    let host_for_name_checks = parts.host.trim_end_matches('.');
-    if host_for_name_checks == "localhost" || host_for_name_checks.ends_with(".localhost") {
+    if proxy_endpoint_uses_insecure_local_override(
+        &parts,
+        resolved_socket,
+        allow_insecure_local_proxy_endpoints,
+    ) {
+        return Ok(());
+    }
+
+    if proxy_endpoint_host_is_localhost_name(&parts) {
         return Err(UrlBlocked {
             reason: BlockReason::new(BlockCode::Localhost, "proxy endpoint is localhost"),
         });
     }
-    let endpoint_ip = parts
-        .host
-        .parse::<IpAddr>()
-        .ok()
-        .or_else(|| parse_relaxed_ipv4(&parts.host).map(IpAddr::V4));
-    if let Some(ip) = endpoint_ip
+    if let Some(ip) = proxy_endpoint_ip(&parts)
         && let Some(detail) = blocked_ip_reason(&ip)
     {
         return Err(UrlBlocked {
@@ -2886,6 +2938,99 @@ fn enforce_proxy_endpoint_resolved_socket(
         });
     }
     Ok(())
+}
+
+fn enforce_proxy_endpoint_preflight(
+    endpoint: &str,
+    allow_insecure_local_proxy_endpoints: bool,
+) -> Result<(), UrlBlocked> {
+    let _ = proxy_endpoint_target(endpoint, allow_insecure_local_proxy_endpoints)?;
+    Ok(())
+}
+
+fn proxy_endpoint_target(
+    endpoint: &str,
+    allow_insecure_local_proxy_endpoints: bool,
+) -> Result<ProxyEndpointTarget, UrlBlocked> {
+    let parts = UrlParts::parse(endpoint).map_err(|reason| UrlBlocked { reason })?;
+    enforce_proxy_endpoint_parts_policy(&parts, allow_insecure_local_proxy_endpoints)?;
+    let port = proxy_endpoint_port(&parts)?;
+    Ok(ProxyEndpointTarget {
+        host: parts.host,
+        port,
+    })
+}
+
+fn enforce_proxy_endpoint_parts_policy(
+    parts: &UrlParts,
+    allow_insecure_local_proxy_endpoints: bool,
+) -> Result<(), UrlBlocked> {
+    let scheme = parts.scheme.as_str();
+    if scheme.trim().is_empty() {
+        return Err(UrlBlocked {
+            reason: BlockReason::new(
+                BlockCode::UnsupportedScheme,
+                "proxy endpoint scheme is empty",
+            ),
+        });
+    }
+    if scheme == "https" {
+        return Ok(());
+    }
+    if proxy_endpoint_scheme_is_cleartext(scheme) {
+        if allow_insecure_local_proxy_endpoints && proxy_endpoint_host_is_loopback(parts) {
+            return Ok(());
+        }
+        let detail = if allow_insecure_local_proxy_endpoints {
+            format!("cleartext proxy endpoint scheme '{scheme}' is allowed only for loopback")
+        } else {
+            format!(
+                "cleartext proxy endpoint scheme '{scheme}' is not allowed by default; use https:// or explicit local/test opt-in"
+            )
+        };
+        return Err(UrlBlocked {
+            reason: BlockReason::new(BlockCode::UnsupportedScheme, detail),
+        });
+    }
+    Err(UrlBlocked {
+        reason: BlockReason::new(
+            BlockCode::UnsupportedScheme,
+            format!("proxy endpoint scheme '{scheme}' is unsupported; use https://"),
+        ),
+    })
+}
+
+fn proxy_endpoint_scheme_is_cleartext(scheme: &str) -> bool {
+    matches!(scheme, "http" | "socks4" | "socks4a" | "socks5" | "socks5h")
+}
+
+fn proxy_endpoint_uses_insecure_local_override(
+    parts: &UrlParts,
+    resolved_socket: SocketAddr,
+    allow_insecure_local_proxy_endpoints: bool,
+) -> bool {
+    allow_insecure_local_proxy_endpoints
+        && proxy_endpoint_scheme_is_cleartext(parts.scheme.as_str())
+        && proxy_endpoint_host_is_loopback(parts)
+        && resolved_socket.ip().is_loopback()
+}
+
+fn proxy_endpoint_host_is_loopback(parts: &UrlParts) -> bool {
+    proxy_endpoint_host_is_localhost_name(parts)
+        || proxy_endpoint_ip(parts).is_some_and(|ip| ip.is_loopback())
+}
+
+fn proxy_endpoint_host_is_localhost_name(parts: &UrlParts) -> bool {
+    let host_for_name_checks = parts.host.trim_end_matches('.');
+    host_for_name_checks == "localhost" || host_for_name_checks.ends_with(".localhost")
+}
+
+fn proxy_endpoint_ip(parts: &UrlParts) -> Option<IpAddr> {
+    parts
+        .host
+        .parse::<IpAddr>()
+        .ok()
+        .or_else(|| parse_relaxed_ipv4(&parts.host).map(IpAddr::V4))
 }
 
 fn proxy_endpoint_port(parts: &UrlParts) -> Result<u16, UrlBlocked> {
@@ -4033,6 +4178,26 @@ mod tests {
         }
     }
 
+    fn proxy_endpoint_with_credentials(
+        scheme: &str,
+        username: &str,
+        password: &str,
+        host: &str,
+        port: u16,
+    ) -> String {
+        let mut endpoint = String::new();
+        endpoint.push_str(scheme);
+        endpoint.push_str("://");
+        endpoint.push_str(username);
+        endpoint.push(':');
+        endpoint.push_str(password);
+        endpoint.push('@');
+        endpoint.push_str(host);
+        endpoint.push(':');
+        endpoint.push_str(&port.to_string());
+        endpoint
+    }
+
     fn rfc9421_b26_request() -> NetworkRequest {
         NetworkRequest::new(
             "rfc9421-b26",
@@ -4811,11 +4976,11 @@ mod tests {
         let policy = EgressPolicy::block_by_default()
             .proxy_domain(
                 DomainRule::suffix("example.com"),
-                ProxyRoute::new("general", "socks5://proxy.example:1080"),
+                ProxyRoute::new("general", "https://proxy.example:8443"),
             )
             .proxy_domain(
                 DomainRule::exact("payments.example.com"),
-                ProxyRoute::new("payments", "socks5://payments-proxy.example:1080"),
+                ProxyRoute::new("payments", "https://payments-proxy.example:9443"),
             );
 
         let decision = policy.decide(&request)?;
@@ -4823,6 +4988,73 @@ mod tests {
         assert_eq!(decision.proxy_id(), Some("payments"));
         assert_eq!(decision.port(), 443);
         Ok(())
+    }
+
+    #[test]
+    fn egress_policy_rejects_cleartext_proxy_credentials_by_default() {
+        let request = NetworkRequest::new(
+            "r1",
+            "GET",
+            "https://proxied.example/page",
+            "profile-a",
+            IdentityMode::AgentDeclared,
+        );
+        let proxy_user = "proxy-user";
+        let proxy_pass = "proxy-pass";
+        let endpoint =
+            proxy_endpoint_with_credentials("http", proxy_user, proxy_pass, "proxy.example", 8080);
+        let route = ProxyRoute::new("proxy-a", endpoint);
+        let policy = EgressPolicy::block_by_default()
+            .proxy_domain(DomainRule::exact("proxied.example"), route.clone());
+
+        let denied = match policy.decide(&request) {
+            Ok(decision) => panic!("expected rejection, got {decision:?}"),
+            Err(denied) => denied,
+        };
+        let debug = format!("{route:?}\n{denied:?}");
+
+        assert_eq!(denied.domain, "proxied.example");
+        assert_eq!(denied.port, 443);
+        assert!(denied
+            .reason
+            .contains("cleartext proxy endpoint scheme 'http'"));
+        assert!(denied.reason.contains("not allowed by default"));
+        for secret in [
+            proxy_user,
+            proxy_pass,
+            "proxy.example:8080",
+            &format!("{proxy_user}:{proxy_pass}"),
+        ] {
+            assert!(!debug.contains(secret), "leaked {secret}: {debug}");
+        }
+    }
+
+    #[test]
+    fn egress_policy_insecure_proxy_opt_in_is_loopback_only() {
+        let request = NetworkRequest::new(
+            "r1",
+            "GET",
+            "https://proxied.example/page",
+            "profile-a",
+            IdentityMode::AgentDeclared,
+        );
+        let policy = EgressPolicy::block_by_default()
+            .allow_insecure_local_proxy_endpoints()
+            .proxy_domain(
+                DomainRule::exact("proxied.example"),
+                ProxyRoute::new("proxy-a", "http://proxy.example:8080"),
+            );
+
+        let denied = match policy.decide(&request) {
+            Ok(decision) => panic!("expected rejection, got {decision:?}"),
+            Err(denied) => denied,
+        };
+
+        assert_eq!(denied.domain, "proxied.example");
+        assert!(denied
+            .reason
+            .contains("cleartext proxy endpoint scheme 'http'"));
+        assert!(denied.reason.contains("allowed only for loopback"));
     }
 
     #[test]
@@ -4837,7 +5069,7 @@ mod tests {
         let policy = EgressPolicy::allow_all()
             .proxy_domain(
                 DomainRule::suffix("example.com"),
-                ProxyRoute::new("general", "socks5://proxy.example:1080"),
+                ProxyRoute::new("general", "https://proxy.example:8443"),
             )
             .block_domain(DomainRule::exact("blocked.example.com"));
 
@@ -6463,21 +6695,21 @@ Disallow: /private
         let url_policy = UrlPolicy::block_private();
         let egress_policy = EgressPolicy::block_by_default().proxy_domain(
             DomainRule::exact("proxied.example"),
-            ProxyRoute::new("proxy-a", "socks5://proxy.example:1080"),
+            ProxyRoute::new("proxy-a", "https://proxy.example:8443"),
         );
         let guard = CrawlDispatchGuard::new(&url_policy, &egress_policy);
         let mut resolve_calls = 0usize;
         let batch = frontier.dispatch_checked_ready(1, 1, guard, |dispatch| {
             resolve_calls += 1;
             assert_eq!(dispatch.request.url, "https://proxied.example/page");
-            Ok(SocketAddr::from(([93, 184, 216, 34], 1080)))
+            Ok(SocketAddr::from(([93, 184, 216, 34], 8443)))
         })?;
 
         assert_eq!(resolve_calls, 1);
         assert!(batch.rejected.is_empty());
         assert_eq!(batch.dispatches.len(), 1);
         let checked = &batch.dispatches[0];
-        assert_eq!(checked.resolved_socket.port(), 1080);
+        assert_eq!(checked.resolved_socket.port(), 8443);
         assert_eq!(checked.egress.domain, "proxied.example");
         assert_eq!(checked.egress.port, 443);
         assert_eq!(checked.egress.proxy_id.as_deref(), Some("proxy-a"));
@@ -6499,11 +6731,11 @@ Disallow: /private
         let url_policy = UrlPolicy::block_private();
         let egress_policy = EgressPolicy::block_by_default().proxy_domain(
             DomainRule::exact("proxied.example"),
-            ProxyRoute::new("proxy-a", "socks5://proxy.example:1080"),
+            ProxyRoute::new("proxy-a", "https://proxy.example:8443"),
         );
         let guard = CrawlDispatchGuard::new(&url_policy, &egress_policy);
         let batch = frontier
-            .dispatch_checked_ready(1, 1, guard, |_| Ok(SocketAddr::from(([10, 0, 0, 5], 1080))))?;
+            .dispatch_checked_ready(1, 1, guard, |_| Ok(SocketAddr::from(([10, 0, 0, 5], 8443))))?;
 
         assert!(batch.dispatches.is_empty());
         assert_eq!(batch.rejected.len(), 1);
@@ -6515,6 +6747,118 @@ Disallow: /private
         ));
         assert_eq!(frontier.snapshot().pending, 0);
         assert_eq!(frontier.snapshot().inflight, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn checked_frontier_rejects_cleartext_proxy_before_resolve() -> Result<(), CrawlError> {
+        let mut frontier = CrawlFrontier::new(
+            CrawlPolicy::default()
+                .without_robots_txt()
+                .with_min_delay_ticks_per_origin(0),
+        );
+        frontier.enqueue(crawl_request("r1", "https://proxied.example/page"))?;
+
+        let url_policy = UrlPolicy::block_private();
+        let proxy_user = "proxy-user";
+        let proxy_pass = "proxy-pass";
+        let endpoint =
+            proxy_endpoint_with_credentials("http", proxy_user, proxy_pass, "proxy.example", 8080);
+        let egress_policy = EgressPolicy::block_by_default().proxy_domain(
+            DomainRule::exact("proxied.example"),
+            ProxyRoute::new("proxy-a", endpoint),
+        );
+        let guard = CrawlDispatchGuard::new(&url_policy, &egress_policy);
+        let mut resolve_calls = 0usize;
+        let batch = frontier.dispatch_checked_ready(1, 1, guard, |_| {
+            resolve_calls += 1;
+            Ok(SocketAddr::from(([93, 184, 216, 34], 8080)))
+        })?;
+
+        assert_eq!(resolve_calls, 0);
+        assert!(batch.dispatches.is_empty());
+        assert_eq!(batch.rejected.len(), 1);
+        assert!(matches!(
+            &batch.rejected[0].error,
+            CrawlDispatchError::Egress(EgressDenied { reason, .. })
+                if reason.contains("cleartext proxy endpoint scheme 'http'")
+                    && !reason.contains(proxy_user)
+                    && !reason.contains(proxy_pass)
+        ));
+        let display = batch.rejected[0].error.to_string();
+        assert!(!display.contains(proxy_user), "{display}");
+        assert!(!display.contains(proxy_pass), "{display}");
+        assert!(!display.contains("proxy.example:8080"), "{display}");
+        assert_eq!(frontier.snapshot().pending, 0);
+        assert_eq!(frontier.snapshot().inflight, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn checked_frontier_allows_explicit_insecure_loopback_proxy() -> Result<(), CrawlError> {
+        let mut frontier = CrawlFrontier::new(
+            CrawlPolicy::default()
+                .without_robots_txt()
+                .with_min_delay_ticks_per_origin(0),
+        );
+        frontier.enqueue(crawl_request("r1", "https://proxied.example/page"))?;
+
+        let url_policy = UrlPolicy::block_private();
+        let proxy_user = "proxy-user";
+        let proxy_pass = "proxy-pass";
+        let endpoint =
+            proxy_endpoint_with_credentials("http", proxy_user, proxy_pass, "localhost", 8080);
+        let egress_policy = EgressPolicy::block_by_default()
+            .allow_insecure_local_proxy_endpoints()
+            .proxy_domain(
+                DomainRule::exact("proxied.example"),
+                ProxyRoute::new("local-proxy", endpoint),
+            );
+        let guard = CrawlDispatchGuard::new(&url_policy, &egress_policy);
+        let batch = frontier.dispatch_checked_ready(1, 1, guard, |_| {
+            Ok(SocketAddr::from(([127, 0, 0, 1], 8080)))
+        })?;
+
+        assert!(batch.rejected.is_empty());
+        assert_eq!(batch.dispatches.len(), 1);
+        let checked = &batch.dispatches[0];
+        assert_eq!(
+            checked.resolved_socket,
+            SocketAddr::from(([127, 0, 0, 1], 8080))
+        );
+        assert_eq!(checked.egress.proxy_id.as_deref(), Some("local-proxy"));
+        assert_eq!(frontier.snapshot().pending, 0);
+        assert_eq!(frontier.snapshot().inflight, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn checked_frontier_allows_explicit_insecure_ipv6_loopback_proxy() -> Result<(), CrawlError> {
+        let mut frontier = CrawlFrontier::new(
+            CrawlPolicy::default()
+                .without_robots_txt()
+                .with_min_delay_ticks_per_origin(0),
+        );
+        frontier.enqueue(crawl_request("r1", "https://proxied.example/page"))?;
+
+        let url_policy = UrlPolicy::block_private();
+        let egress_policy = EgressPolicy::block_by_default()
+            .allow_insecure_local_proxy_endpoints()
+            .proxy_domain(
+                DomainRule::exact("proxied.example"),
+                ProxyRoute::new("local-proxy", "http://[::1]:8080"),
+            );
+        let guard = CrawlDispatchGuard::new(&url_policy, &egress_policy);
+        let batch = frontier.dispatch_checked_ready(1, 1, guard, |_| {
+            Ok(SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 8080)))
+        })?;
+
+        assert!(batch.rejected.is_empty());
+        assert_eq!(batch.dispatches.len(), 1);
+        assert_eq!(
+            batch.dispatches[0].egress.proxy_id.as_deref(),
+            Some("local-proxy")
+        );
         Ok(())
     }
 

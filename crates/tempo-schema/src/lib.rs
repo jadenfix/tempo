@@ -56,10 +56,15 @@ pub struct InteractiveElement {
     /// Accessible name / label, taint-labeled.
     pub name: Vec<TaintSpan>,
     /// Current value where applicable (inputs, selects), taint-labeled.
-    #[serde(default)]
+    ///
+    /// Omitted from the wire when empty (the common case — most elements have no
+    /// value); `#[serde(default)]` reconstructs the empty vec on read. The field
+    /// is already non-`required` in the published JSON Schema, so this is a
+    /// pure byte-size reduction, not a contract change (see the schema below).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub value: Vec<TaintSpan>,
-    /// Bounding box in CSS pixels: [x, y, w, h].
-    #[serde(default)]
+    /// Bounding box in CSS pixels: [x, y, w, h]. Omitted when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bounds: Option<[f32; 4]>,
     /// Ranker score — higher means more likely to be task-relevant.
     pub rank: f32,
@@ -79,7 +84,8 @@ pub struct CompiledObservation {
     #[serde(default, skip_serializing_if = "u32_is_zero")]
     pub omitted: u32,
     /// Optional set-of-marks overlay: NodeId -> mark label drawn over the screenshot.
-    #[serde(default)]
+    /// Omitted from the wire when empty; already non-`required` in the JSON Schema.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub marks: Vec<(NodeId, u32)>,
 }
 
@@ -220,7 +226,7 @@ pub enum StepStatus {
 /// Grounding evidence for a semantic action.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Grounding {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node: Option<NodeId>,
     pub selector_existed: bool,
     pub matched_element: bool,
@@ -230,11 +236,11 @@ pub struct Grounding {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ActionOutcome {
     pub status: StepStatus,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     pub grounding: Grounding,
     pub observation: CompiledObservation,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diff: Option<ObservationDiff>,
 }
 
@@ -243,7 +249,7 @@ pub struct ActionOutcome {
 pub struct StepTriple {
     pub seq: u64,
     pub observation_before: CompiledObservation,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decision: Option<Value>,
     pub action: Action,
     pub outcome: ActionOutcome,
@@ -1030,6 +1036,110 @@ mod tests {
         );
         let back: CompiledObservation = serde_json::from_str(&s)?;
         assert_eq!(truncated, back);
+        Ok(())
+    }
+
+    #[test]
+    fn defaulted_optional_fields_serialize_compactly() -> Result<(), serde_json::Error> {
+        let observation = CompiledObservation {
+            schema_version: SCHEMA_VERSION.into(),
+            url: "https://example.com".into(),
+            seq: 1,
+            elements: vec![InteractiveElement {
+                node_id: NodeId("n1".into()),
+                role: "button".into(),
+                name: vec![TaintSpan {
+                    provenance: Provenance::Page,
+                    text: "Buy".into(),
+                }],
+                value: vec![],
+                bounds: None,
+                rank: 0.9,
+            }],
+            marks: vec![],
+        };
+
+        let observation_wire = serde_json::to_value(&observation)?;
+        assert_eq!(
+            observation_wire["elements"]
+                .as_array()
+                .map(|elements| elements.len()),
+            Some(1)
+        );
+        assert!(observation_wire.get("marks").is_none());
+        assert!(observation_wire["elements"][0].get("value").is_none());
+        assert!(observation_wire["elements"][0].get("bounds").is_none());
+
+        let verbose_observation = json!({
+            "schema_version": SCHEMA_VERSION,
+            "url": "https://example.com",
+            "seq": 1,
+            "elements": [{
+                "node_id": "n1",
+                "role": "button",
+                "name": [{"provenance": "page", "text": "Buy"}],
+                "value": [],
+                "bounds": null,
+                "rank": 0.9
+            }],
+            "marks": []
+        });
+        let back: CompiledObservation = serde_json::from_value(verbose_observation.clone())?;
+        assert_eq!(observation, back);
+
+        let outcome = ActionOutcome {
+            status: StepStatus::Ok,
+            error: None,
+            grounding: Grounding {
+                node: None,
+                selector_existed: true,
+                matched_element: true,
+            },
+            observation: observation.clone(),
+            diff: None,
+        };
+        let step = StepTriple {
+            seq: 1,
+            observation_before: observation,
+            decision: None,
+            action: Action::Wait { millis: 1 },
+            outcome,
+        };
+
+        let step_wire = serde_json::to_value(&step)?;
+        assert!(step_wire.get("decision").is_none());
+        assert!(step_wire["outcome"].get("error").is_none());
+        assert!(step_wire["outcome"].get("diff").is_none());
+        assert!(step_wire["outcome"]["grounding"].get("node").is_none());
+
+        let verbose_step: StepTriple = serde_json::from_value(json!({
+            "seq": 1,
+            "observation_before": verbose_observation,
+            "decision": null,
+            "action": {"kind": "wait", "millis": 1},
+            "outcome": {
+                "status": "ok",
+                "error": null,
+                "grounding": {
+                    "node": null,
+                    "selector_existed": true,
+                    "matched_element": true
+                },
+                "observation": {
+                    "schema_version": SCHEMA_VERSION,
+                    "url": "https://example.com",
+                    "seq": 1,
+                    "elements": [],
+                    "marks": []
+                },
+                "diff": null
+            }
+        }))?;
+        assert!(verbose_step.decision.is_none());
+        assert!(verbose_step.outcome.error.is_none());
+        assert!(verbose_step.outcome.diff.is_none());
+        assert!(verbose_step.outcome.grounding.node.is_none());
+
         Ok(())
     }
 
