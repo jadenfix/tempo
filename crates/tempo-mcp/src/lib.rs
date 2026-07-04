@@ -605,7 +605,7 @@ where
                     }
                 }
                 match driver.act(&args.action).await {
-                    Ok(outcome) => Ok(ToolCall::success(step_outcome_json(outcome))),
+                    Ok(outcome) => Ok(step_outcome_tool_call(outcome)),
                     Err(error) => Ok(ToolCall::error(error.to_string())),
                 }
             }
@@ -644,7 +644,7 @@ where
                     }
                 }
                 match driver.act_batch(&args.batch).await {
-                    Ok(outcome) => Ok(ToolCall::success(step_outcome_json(outcome))),
+                    Ok(outcome) => Ok(step_outcome_tool_call(outcome)),
                     Err(error) => Ok(ToolCall::error(error.to_string())),
                 }
             }
@@ -1735,6 +1735,14 @@ fn step_outcome_json(outcome: StepOutcome) -> Value {
     }
 }
 
+fn step_outcome_tool_call(outcome: StepOutcome) -> ToolCall {
+    let is_error = matches!(outcome, StepOutcome::StepError { .. });
+    ToolCall {
+        is_error,
+        structured_content: step_outcome_json(outcome),
+    }
+}
+
 fn probe_hit_json(hit: &ProbeHit) -> Value {
     json!({
         "signal": signal_name(hit.signal),
@@ -1970,6 +1978,62 @@ mod tests {
         .ok_or("act without input_tainted should fail")?;
 
         assert!(error.contains("input_tainted is required"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn act_step_error_sets_mcp_error_envelope() -> Result<(), String> {
+        let mut server = TempoMcpServer::new(MemoryDriver::new().with_step_error("node not found"));
+
+        let response = call_tool_envelope(
+            &mut server,
+            "act",
+            json!({
+                "action": {"kind": "scroll", "x": 0.0, "y": 12.0},
+                "input_tainted": false
+            }),
+        )
+        .await?;
+
+        assert_eq!(response["result"]["isError"], true);
+        assert_eq!(
+            response["result"]["structuredContent"]["status"],
+            "step_error"
+        );
+        assert_eq!(
+            response["result"]["structuredContent"]["reason"],
+            "node not found"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn act_batch_step_error_sets_mcp_error_envelope() -> Result<(), String> {
+        let mut server =
+            TempoMcpServer::new(MemoryDriver::new().with_step_error("not interactable"));
+
+        let response = call_tool_envelope(
+            &mut server,
+            "act_batch",
+            json!({
+                "batch": {
+                    "actions": [{"kind": "scroll", "x": 0.0, "y": 12.0}],
+                    "quiescence": "composite"
+                },
+                "input_tainted": false
+            }),
+        )
+        .await?;
+
+        assert_eq!(response["result"]["isError"], true);
+        assert_eq!(
+            response["result"]["structuredContent"]["status"],
+            "step_error"
+        );
+        assert_eq!(
+            response["result"]["structuredContent"]["reason"],
+            "not interactable"
+        );
         Ok(())
     }
 
@@ -2938,6 +3002,18 @@ mod tests {
         name: &str,
         arguments: Value,
     ) -> Result<Value, String> {
+        let value = call_tool_envelope(server, name, arguments).await?;
+        if value.get("error").is_some() {
+            return Err(value.to_string());
+        }
+        Ok(value["result"]["structuredContent"].clone())
+    }
+
+    async fn call_tool_envelope(
+        server: &mut TempoMcpServer<MemoryDriver>,
+        name: &str,
+        arguments: Value,
+    ) -> Result<Value, String> {
         let body = json!({
             "jsonrpc": "2.0",
             "id": 7,
@@ -2945,11 +3021,7 @@ mod tests {
             "params": {"name": name, "arguments": arguments}
         });
         let response = server.handle_post(None, body.to_string().as_bytes()).await;
-        let value = response.json_value().map_err(|error| error.to_string())?;
-        if value.get("error").is_some() {
-            return Err(value.to_string());
-        }
-        Ok(value["result"]["structuredContent"].clone())
+        response.json_value().map_err(|error| error.to_string())
     }
 
     fn decode_base64_field(value: &Value, field: &str) -> Result<Vec<u8>, String> {
@@ -3056,6 +3128,7 @@ mod tests {
         web_mcp_method_only: bool,
         extract_value: Option<Value>,
         screenshot_bytes: Option<Vec<u8>>,
+        step_error: Option<String>,
         // Shared across forks (fork() clones this handle) so tests can assert that
         // close() actually ran on a forked driver rather than it merely being dropped.
         closed: Arc<AtomicUsize>,
@@ -3081,6 +3154,7 @@ mod tests {
                 web_mcp_method_only: false,
                 extract_value: None,
                 screenshot_bytes: None,
+                step_error: None,
                 observation: CompiledObservation {
                     schema_version: tempo_schema::SCHEMA_VERSION.into(),
                     url: "https://example.test/".into(),
@@ -3135,6 +3209,11 @@ mod tests {
             self
         }
 
+        fn with_step_error(mut self, reason: impl Into<String>) -> Self {
+            self.step_error = Some(reason.into());
+            self
+        }
+
         fn with_observe_delay(mut self, delay: Duration) -> Self {
             self.observe_delay = Some(delay);
             self
@@ -3183,6 +3262,11 @@ mod tests {
         }
 
         async fn act(&mut self, _action: &Action) -> Result<StepOutcome, TransportError> {
+            if let Some(reason) = &self.step_error {
+                return Ok(StepOutcome::StepError {
+                    reason: reason.clone(),
+                });
+            }
             self.observation.seq += 1;
             Ok(StepOutcome::Applied {
                 diff: ObservationDiff {
