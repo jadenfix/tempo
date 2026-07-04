@@ -99,17 +99,17 @@ pub fn servo_platform_support_matrix() -> Vec<ServoPlatformSupport> {
             rust_targets: vec![
                 "aarch64-linux-android".into(),
                 "armv7-linux-androideabi".into(),
+                "i686-linux-android".into(),
                 "x86_64-linux-android".into(),
             ],
             servo_available: true,
             control_transport: ServoControlPlaneTransport::UnixDomainSocket,
-            note: "Android Servo target; Tempo should package the engine host as a local app-private service".into(),
+            note: "Android Servo target; Tempo should package the engine host as a local app-private service. The listed Rust targets mirror the Servo Android release/emulator lanes Tempo exposes to SDKs.".into(),
         },
         ServoPlatformSupport {
             platform: ServoRuntimePlatform::OpenHarmony,
             rust_targets: vec![
                 "aarch64-unknown-linux-ohos".into(),
-                "armv7-unknown-linux-ohos".into(),
                 "x86_64-unknown-linux-ohos".into(),
             ],
             servo_available: true,
@@ -196,7 +196,9 @@ impl ServoEngineConfig {
 pub struct ServoVanillaBuildPlan {
     pub servo_crate_version: String,
     pub build_flavor: ServoBuildFlavor,
+    #[serde(default)]
     pub current_platform: Option<ServoRuntimePlatform>,
+    #[serde(default)]
     pub supported_platforms: Vec<ServoPlatformSupport>,
     pub viewport: Viewport,
     pub user_agent: String,
@@ -1193,6 +1195,9 @@ mod tests {
         assert!(android
             .rust_targets
             .contains(&"aarch64-linux-android".to_string()));
+        assert!(android
+            .rust_targets
+            .contains(&"i686-linux-android".to_string()));
 
         let openharmony = platforms
             .iter()
@@ -1206,6 +1211,12 @@ mod tests {
         assert!(openharmony
             .rust_targets
             .contains(&"aarch64-unknown-linux-ohos".to_string()));
+        assert!(openharmony
+            .rust_targets
+            .contains(&"x86_64-unknown-linux-ohos".to_string()));
+        assert!(!openharmony
+            .rust_targets
+            .contains(&"armv7-unknown-linux-ohos".to_string()));
 
         let windows = platforms
             .iter()
@@ -1216,6 +1227,22 @@ mod tests {
             windows.control_transport,
             ServoControlPlaneTransport::WindowsNativePlanned
         );
+        Ok(())
+    }
+
+    #[test]
+    fn servo_build_plan_deserializes_without_platform_metadata() -> TestResult {
+        let plan: ServoVanillaBuildPlan = serde_json::from_value(serde_json::json!({
+            "servo_crate_version": PINNED_VANILLA_SERVO_VERSION,
+            "build_flavor": "vanilla",
+            "viewport": { "width": 1280, "height": 720 },
+            "user_agent": "tempo-servo/0.1",
+            "access_tree": true,
+            "intercept_network": true
+        }))?;
+
+        assert_eq!(plan.current_platform, None);
+        assert!(plan.supported_platforms.is_empty());
         Ok(())
     }
 
