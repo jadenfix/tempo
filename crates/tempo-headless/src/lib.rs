@@ -1130,11 +1130,13 @@ fn redact_step_outcome(outcome: &StepTripleOutcome) -> serde_json::Value {
             "removed": diff.removed.len(),
             "changed": diff.changed.len(),
         }),
-        // `reason` is an engine-produced error string (diagnostics), not raw page
-        // content, so it is retained for telemetry usefulness.
+        // `reason` is free-form and can embed arbitrary remote/secret content
+        // (e.g. a failed navigation echoing a URL with `?token=...`, or a remote
+        // error body), so hash it rather than logging it verbatim — consistent
+        // with how `Type.text`/`Select.value`/`Skill.input` are redacted.
         StepTripleOutcome::StepError { reason } => json!({
             "kind": "step_error",
-            "reason": reason,
+            "reason": hash_secret(reason),
         }),
     }
 }
@@ -4660,6 +4662,48 @@ mod tests {
         let goto_value: Value = serde_json::from_str(goto_text.trim_end())?;
         assert_eq!(goto_value["body"]["action"]["url"], "https://ex.test/login");
         assert_eq!(goto_value["body"]["action"]["kind"], "goto");
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn otlp_export_redacts_secrets_from_step_error_reason() -> TestResult {
+        // Issue #214 (review follow-up): a StepError reason is free-form and can
+        // echo remote/secret content (e.g. a failed navigation URL carrying a
+        // token). It must be hashed, not written verbatim.
+        let root = unique_dir("otlp-redact-reason")?;
+        remove_dir_if_exists(&root)?;
+
+        let path = root.join("step-error.jsonl");
+        let reason = "navigation failed: https://ex.test/login?token=SECRET123 refused";
+        let triple = StepTriple {
+            key: IdempotencyKey("step-error".into()),
+            seq: 7,
+            action: Action::Click {
+                node: NodeId("submit".into()),
+            },
+            outcome: StepTripleOutcome::StepError {
+                reason: reason.into(),
+            },
+        };
+        OtlpJsonExporter::new(&path).export_step(&triple)?;
+        let text = String::from_utf8(std::fs::read(&path)?)?;
+        assert!(
+            !text.contains("SECRET123"),
+            "raw token in StepError reason must not be written verbatim"
+        );
+        assert!(
+            !text.contains("token=SECRET123"),
+            "URL query secret in StepError reason must not leak"
+        );
+        assert!(text.contains("sha256:"), "StepError reason must be hashed");
+        let value: Value = serde_json::from_str(text.trim_end())?;
+        assert_eq!(value["body"]["outcome"]["kind"], "step_error");
+        assert_eq!(
+            value["body"]["outcome"]["reason"],
+            Value::String(hash_secret(reason))
+        );
 
         remove_dir_if_exists(&root)?;
         Ok(())
