@@ -23,6 +23,9 @@ Android and OpenHarmony use the Unix-domain-socket control plane in app-private 
 
 **[`final.md`](./final.md)** is the full engineering design — vision, first-principles requirements, component architecture, the Servo hook map, the dependency graph (what's parallel vs sequential), the beatbox sandbox integration, the Definition of Done (per-crate acceptance bars + milestone gates), risks, and verification.
 
+When multiple agents are working, use **[`docs/agent-worktrees.md`](./docs/agent-worktrees.md)**
+and `scripts/new-agent-worktree.sh` to create isolated PR-sized checkouts.
+
 ## Layout
 
 Cargo workspace under `crates/`. The implementation is split into contract, engine,
