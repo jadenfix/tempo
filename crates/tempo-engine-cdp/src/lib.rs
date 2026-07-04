@@ -2814,7 +2814,10 @@ mod tests {
         // `from` points just past the element's open tag; text runs to "</tag".
         let html = "<p>lead</p><button>Click <b>me</b></button>tail";
         let open = html.find("<button>").unwrap() + "<button>".len();
-        assert_eq!(element_text(html, open, "button").as_deref(), Some("Click me"));
+        assert_eq!(
+            element_text(html, open, "button").as_deref(),
+            Some("Click me")
+        );
         // input/select never carry inner text.
         assert_eq!(element_text("<input>", 7, "input"), None);
     }
