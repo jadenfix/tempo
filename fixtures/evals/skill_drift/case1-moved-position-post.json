@@ -1,0 +1,15 @@
+{
+  "url": "https://shop.example/cart",
+  "elements": [
+    {
+      "role": "link",
+      "name": [{ "provenance": "page", "text": "View cart" }],
+      "bounds": [600.0, 20.0, 90.0, 24.0]
+    },
+    {
+      "role": "button",
+      "name": [{ "provenance": "page", "text": "Add to cart" }],
+      "bounds": [40.0, 860.0, 140.0, 36.0]
+    }
+  ]
+}

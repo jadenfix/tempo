@@ -1,0 +1,15 @@
+{
+  "url": "https://shop.example/checkout",
+  "elements": [
+    {
+      "role": "link",
+      "name": [{ "provenance": "page", "text": "View cart" }],
+      "bounds": [600.0, 20.0, 90.0, 24.0]
+    },
+    {
+      "role": "button",
+      "name": [{ "provenance": "page", "text": "Sign up for newsletter" }],
+      "bounds": [40.0, 500.0, 220.0, 36.0]
+    }
+  ]
+}

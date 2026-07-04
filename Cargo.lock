@@ -8587,8 +8587,10 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "tempo-observe",
  "tempo-schema",
  "tempo-session",
+ "tempo-skills",
  "thiserror 2.0.18",
 ]
 
