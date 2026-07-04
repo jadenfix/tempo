@@ -8,8 +8,10 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::fmt::Write as _;
 use std::io::Cursor;
 
+use sha2::{Digest, Sha256};
 use tempo_schema::{
     CompiledObservation, InteractiveElement, NodeId, ObservationDiff, Provenance, TaintSpan,
 };
@@ -51,7 +53,7 @@ impl Default for CompileOptions {
 }
 
 /// One raw interactive candidate emitted by an engine adapter or recorded fixture.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct RawElement {
     #[serde(default)]
     pub source_id: Option<String>,
@@ -70,6 +72,22 @@ pub struct RawElement {
     pub enabled: bool,
     #[serde(default = "default_true")]
     pub interactive: bool,
+}
+
+impl fmt::Debug for RawElement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RawElement")
+            .field("source_id_present", &self.source_id.is_some())
+            .field("stable_hint_present", &self.stable_hint.is_some())
+            .field("role", &self.role)
+            .field("name_spans", &self.name.len())
+            .field("value_spans", &self.value.len())
+            .field("bounds", &self.bounds)
+            .field("visible", &self.visible)
+            .field("enabled", &self.enabled)
+            .field("interactive", &self.interactive)
+            .finish()
+    }
 }
 
 fn default_true() -> bool {
@@ -144,36 +162,50 @@ impl RawElement {
     }
 
     fn source_key(&self) -> Option<String> {
-        self.source_id.as_ref().map(|id| format!("source:{id}"))
+        self.source_id
+            .as_ref()
+            .map(|id| opaque_identity_key("source", &[id.as_str()]))
     }
 
     fn fingerprint_key(&self) -> String {
         if let Some(stable_hint) = &self.stable_hint {
-            return format!("hint:{}", normalize(stable_hint));
+            let stable_hint = normalize(stable_hint);
+            return opaque_identity_key("hint", &[stable_hint.as_str()]);
         }
 
-        format!(
-            "fp:role={};name={};value={}",
-            normalize(&self.role),
-            normalize(&span_text(&self.name)),
-            normalize(&span_text(&self.value))
-        )
+        let role = normalize(&self.role);
+        let name = normalize(&span_text(&self.name));
+        let value = normalize(&span_text(&self.value));
+        opaque_identity_key("fp", &[role.as_str(), name.as_str(), value.as_str()])
     }
 
     fn allocation_key(&self) -> String {
         self.stable_hint
             .as_ref()
-            .map(|hint| format!("hint:{}", normalize(hint)))
+            .map(|hint| {
+                let hint = normalize(hint);
+                opaque_identity_key("hint", &[hint.as_str()])
+            })
             .or_else(|| self.source_key())
             .unwrap_or_else(|| self.fingerprint_key())
     }
 }
 
 /// Raw observation input for one page snapshot.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct ObservationInput {
     pub url: String,
     pub elements: Vec<RawElement>,
+}
+
+impl fmt::Debug for ObservationInput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let url = redacted_url_for_debug(&self.url);
+        f.debug_struct("ObservationInput")
+            .field("url", &url)
+            .field("elements", &self.elements)
+            .finish()
+    }
 }
 
 impl ObservationInput {
@@ -240,11 +272,21 @@ impl ObservationCorpusReport {
 /// Stateful compiler. The mapper remembers identities across snapshots so NodeIds
 /// survive relayout, reorder, and re-render when either engine IDs or stable DOM
 /// hints/fingerprints line up.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct ObservationCompiler {
     seq: u64,
     mapper: StableIdMapper,
     options: CompileOptions,
+}
+
+impl fmt::Debug for ObservationCompiler {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ObservationCompiler")
+            .field("seq", &self.seq)
+            .field("mapper", &self.mapper)
+            .field("options", &self.options)
+            .finish()
+    }
 }
 
 impl ObservationCompiler {
@@ -343,7 +385,7 @@ struct MappedId {
 /// across a long-lived session (issue #107). Within a single snapshot, identical
 /// fingerprints are disambiguated by occurrence index so distinct elements never
 /// collapse onto one NodeId (issue #105).
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct StableIdMapper {
     by_source: HashMap<String, MappedId>,
     by_fingerprint: HashMap<String, MappedId>,
@@ -352,9 +394,37 @@ pub struct StableIdMapper {
     occurrences: HashMap<String, usize>,
 }
 
+impl fmt::Debug for StableIdMapper {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StableIdMapper")
+            .field("by_source", &self.by_source.len())
+            .field("by_fingerprint", &self.by_fingerprint.len())
+            .field("allocated", &self.allocated.len())
+            .field("seq", &self.seq)
+            .field("occurrences", &self.occurrences.len())
+            .finish()
+    }
+}
+
 impl StableIdMapper {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Map one full snapshot of raw elements to stable IDs.
+    ///
+    /// This is the adapter-level API for engines that already own their ranking,
+    /// budgeting, or grounding metadata. It preserves the caller's element order,
+    /// resets duplicate-fingerprint occurrence counters for the snapshot, and
+    /// performs the same bounded stale-entry eviction as `ObservationCompiler`.
+    pub fn map_snapshot(&mut self, seq: u64, raw: &[RawElement]) -> Vec<NodeId> {
+        self.begin_snapshot(seq);
+        let node_ids = raw
+            .iter()
+            .map(|element| self.node_id_for(element))
+            .collect();
+        self.evict_stale();
+        node_ids
     }
 
     /// Begin a new snapshot generation. Resets the per-snapshot occurrence
@@ -661,7 +731,8 @@ fn diff_reconstructs_current(
 
 fn corpus_identity_key(raw: &RawElement) -> String {
     if let Some(stable_hint) = &raw.stable_hint {
-        return format!("hint:{}", normalize(stable_hint));
+        let stable_hint = normalize(stable_hint);
+        return opaque_identity_key("hint", &[stable_hint.as_str()]);
     }
     raw.source_key().unwrap_or_else(|| raw.fingerprint_key())
 }
@@ -1204,6 +1275,45 @@ fn normalize(value: &str) -> String {
         .to_ascii_lowercase()
 }
 
+fn opaque_identity_key(kind: &str, parts: &[&str]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(kind.as_bytes());
+    hasher.update([0]);
+    for part in parts {
+        let bytes = part.as_bytes();
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(bytes);
+    }
+    let digest = hasher.finalize();
+
+    let mut suffix = String::with_capacity(32);
+    for byte in digest.iter().take(16) {
+        let _ = write!(suffix, "{byte:02x}");
+    }
+    format!("{kind}:sha256:{suffix}")
+}
+
+fn redacted_url_for_debug(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return "[invalid-url]".into();
+    };
+    let authority = rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default()
+        .rsplit_once('@')
+        .map(|(_, host)| host)
+        .unwrap_or_else(|| rest.split(['/', '?', '#']).next().unwrap_or_default());
+    if authority.is_empty() {
+        return "[invalid-url]".into();
+    }
+    format!(
+        "{}://{}",
+        scheme.to_ascii_lowercase(),
+        authority.to_ascii_lowercase()
+    )
+}
+
 fn fnv1a64(bytes: &[u8]) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
     for byte in bytes {
@@ -1357,6 +1467,87 @@ mod tests {
                 "{first_element:?}"
             );
         }
+    }
+
+    #[test]
+    fn stable_mapper_maps_full_snapshots_for_engine_adapters() {
+        let mut mapper = StableIdMapper::new();
+        let first = mapper.map_snapshot(
+            1,
+            &[
+                RawElement::new("button", "Continue").source_id("css:#continue"),
+                RawElement::new("link", "Help").source_id("css:#help"),
+            ],
+        );
+        let second = mapper.map_snapshot(
+            2,
+            &[
+                RawElement::new("button", "Continue").source_id("css:#renamed"),
+                RawElement::new("link", "Help").source_id("css:#help"),
+            ],
+        );
+
+        assert_eq!(first.len(), 2);
+        assert!(first.iter().all(|node_id| node_id.0.starts_with("node:")));
+        assert_eq!(second[0], first[0]);
+        assert_eq!(second[1], first[1]);
+    }
+
+    #[test]
+    fn stable_mapper_retains_opaque_identity_keys() {
+        let mut mapper = StableIdMapper::new();
+        let element = RawElement::new("textbox", "Account secret")
+            .source_id("css:input[value='4111-secret']")
+            .stable_hint("account-secret")
+            .value("4111-secret-value");
+
+        mapper.map_snapshot(1, std::slice::from_ref(&element));
+        let retained = format!(
+            "{:?}\n{:?}\n{}",
+            mapper.by_source.keys().collect::<Vec<_>>(),
+            mapper.by_fingerprint.keys().collect::<Vec<_>>(),
+            corpus_identity_key(&element)
+        );
+
+        assert!(retained.contains("sha256"));
+        for secret in [
+            "Account secret",
+            "account-secret",
+            "4111-secret",
+            "4111-secret-value",
+            "css:input",
+        ] {
+            assert!(!retained.contains(secret), "leaked {secret}: {retained}");
+        }
+    }
+
+    #[test]
+    fn debug_output_redacts_raw_observation_material() {
+        let element = RawElement::new("textbox", "Account secret")
+            .source_id("css:input[value='4111-secret']")
+            .stable_hint("account-secret")
+            .value("4111-secret-value");
+        let input = ObservationInput::new(
+            "https://user:secret@example.com/path?token=secret#fragment",
+            vec![element.clone()],
+        );
+        let mut compiler = ObservationCompiler::new();
+        compiler.compile(input.clone());
+
+        let debug = format!("{element:?}\n{input:?}\n{compiler:?}");
+        for secret in [
+            "user:secret",
+            "token=secret",
+            "Account secret",
+            "account-secret",
+            "4111-secret",
+            "4111-secret-value",
+            "css:input",
+        ] {
+            assert!(!debug.contains(secret), "leaked {secret}: {debug}");
+        }
+        assert!(debug.contains("https://example.com"));
+        assert!(debug.contains("name_spans"));
     }
 
     #[test]

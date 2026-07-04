@@ -195,6 +195,23 @@ impl UrlPolicy {
         url: &str,
         resolved_socket: SocketAddr,
     ) -> Result<(), UrlBlocked> {
+        if self.mode == UrlPolicyMode::AllowAll {
+            return Ok(());
+        }
+
+        let parts = UrlParts::parse(url).map_err(|reason| UrlBlocked { reason })?;
+        let expected_port = egress_port(&parts);
+        if expected_port != resolved_socket.port() {
+            return Err(UrlBlocked {
+                reason: BlockReason::new(
+                    BlockCode::InvalidUrl,
+                    format!(
+                        "resolved socket port {} does not match URL port {expected_port}",
+                        resolved_socket.port()
+                    ),
+                ),
+            });
+        }
         self.enforce_resolved_ip(url, resolved_socket.ip())
     }
 }
@@ -404,7 +421,7 @@ impl WebBotAuthVerifier {
 }
 
 /// RFC 9421 signature parameters for one signature label.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SignatureParameters {
     pub label: String,
     pub key_id: String,
@@ -416,20 +433,21 @@ pub struct SignatureParameters {
 }
 
 impl SignatureParameters {
-    /// Default Web Bot Auth coverage: method, authority, scheme, and path.
+    /// Default Web Bot Auth coverage: method, authority, scheme, path, and query.
     pub fn web_bot_auth(key_id: impl Into<String>, created: u64) -> Self {
         Self {
             label: "sig1".into(),
             key_id: key_id.into(),
             created,
-            expires: None,
+            expires: Some(created.saturating_add(DEFAULT_WEB_BOT_AUTH_MAX_SIGNATURE_AGE.as_secs())),
             nonce: None,
-            tag: None,
+            tag: Some("web-bot-auth".into()),
             components: vec![
                 CoveredComponent::Method,
                 CoveredComponent::Authority,
                 CoveredComponent::Scheme,
                 CoveredComponent::Path,
+                CoveredComponent::Query,
             ],
         }
     }
@@ -469,6 +487,20 @@ impl SignatureParameters {
     }
 }
 
+impl fmt::Debug for SignatureParameters {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SignatureParameters")
+            .field("label", &self.label)
+            .field("key_id", &"[redacted]")
+            .field("created", &self.created)
+            .field("expires", &self.expires)
+            .field("nonce_present", &self.nonce.is_some())
+            .field("tag", &self.tag)
+            .field("components", &self.components)
+            .finish()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ParsedSignatureInput {
     params: SignatureParameters,
@@ -476,7 +508,7 @@ struct ParsedSignatureInput {
 }
 
 /// Headers produced by signing an HTTP request.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SignatureHeaders {
     pub signature_agent: Option<String>,
     pub signature_input: String,
@@ -498,6 +530,16 @@ impl SignatureHeaders {
         }
         headers.extend(self.as_header_pairs());
         headers
+    }
+}
+
+impl fmt::Debug for SignatureHeaders {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SignatureHeaders")
+            .field("signature_agent_present", &self.signature_agent.is_some())
+            .field("signature_input", &"[redacted]")
+            .field("signature", &"[redacted]")
+            .finish()
     }
 }
 
@@ -622,18 +664,46 @@ impl NetworkProfile {
 }
 
 /// Minimal cookie representation for profile-isolation tests and driver adapters.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Cookie {
     pub origin: String,
     pub name: String,
     pub value: String,
 }
 
+impl fmt::Debug for Cookie {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Cookie")
+            .field("origin", &self.origin)
+            .field("name", &self.name)
+            .field("value", &"[redacted]")
+            .finish()
+    }
+}
+
 /// Deterministic profile manager with isolated cookie partitions.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct ProfileStore {
     profiles: BTreeMap<ProfileId, NetworkProfile>,
     cookies: BTreeMap<ProfileId, BTreeMap<String, BTreeMap<String, String>>>,
+}
+
+impl fmt::Debug for ProfileStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let cookie_origin_count = self.cookies.values().map(BTreeMap::len).sum::<usize>();
+        let cookie_count = self
+            .cookies
+            .values()
+            .flat_map(BTreeMap::values)
+            .map(BTreeMap::len)
+            .sum::<usize>();
+        f.debug_struct("ProfileStore")
+            .field("profiles", &self.profiles.len())
+            .field("cookie_profiles", &self.cookies.len())
+            .field("cookie_origins", &cookie_origin_count)
+            .field("cookie_count", &cookie_count)
+            .finish()
+    }
 }
 
 impl ProfileStore {
@@ -717,7 +787,7 @@ impl fmt::Display for ProfileError {
 impl Error for ProfileError {}
 
 /// How tempo declares itself on the wire for this origin.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum IdentityMode {
     /// Human-driven browsing surface.
     UserDriven,
@@ -944,7 +1014,7 @@ fn identity_origin(url: &str) -> Result<String, IdentityStrategyError> {
 }
 
 /// Request metadata accepted by tempo-net before engine/network dispatch.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct NetworkRequest {
     pub id: RequestId,
     pub method: String,
@@ -953,6 +1023,23 @@ pub struct NetworkRequest {
     pub identity_mode: IdentityMode,
     headers: BTreeMap<String, Vec<String>>,
     body_size: u64,
+    body_sha256: Option<[u8; 32]>,
+}
+
+impl fmt::Debug for NetworkRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let url = redacted_url_for_debug(&self.url);
+        f.debug_struct("NetworkRequest")
+            .field("id", &self.id)
+            .field("method", &self.method)
+            .field("url", &url)
+            .field("profile_id", &self.profile_id)
+            .field("identity_mode", &self.identity_mode)
+            .field("header_count", &header_value_count(&self.headers))
+            .field("body_size", &self.body_size)
+            .field("body_sha256_present", &self.body_sha256.is_some())
+            .finish()
+    }
 }
 
 impl NetworkRequest {
@@ -971,6 +1058,7 @@ impl NetworkRequest {
             identity_mode,
             headers: BTreeMap::new(),
             body_size: 0,
+            body_sha256: None,
         }
     }
 
@@ -984,11 +1072,29 @@ impl NetworkRequest {
 
     pub fn with_body_size(mut self, body_size: u64) -> Self {
         self.body_size = body_size;
+        self.body_sha256 = None;
+        self
+    }
+
+    pub fn with_body_sha256(mut self, body_size: u64, body_sha256: [u8; 32]) -> Self {
+        self.body_size = body_size;
+        self.body_sha256 = Some(body_sha256);
+        self
+    }
+
+    pub fn with_body_bytes(mut self, body: impl AsRef<[u8]>) -> Self {
+        let body = body.as_ref();
+        self.body_size = body.len() as u64;
+        self.body_sha256 = Some(Sha256::digest(body).into());
         self
     }
 
     pub fn body_size(&self) -> u64 {
         self.body_size
+    }
+
+    pub fn body_sha256(&self) -> Option<[u8; 32]> {
+        self.body_sha256
     }
 
     pub fn headers(&self) -> impl Iterator<Item = (&str, &str)> {
@@ -1172,13 +1278,26 @@ fn signature_base_with_params_value(
 }
 
 /// Response metadata accepted back from the network layer for protocol events.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct NetworkResponseRecord {
     pub request_id: RequestId,
     pub url: String,
     pub status: u16,
     headers: BTreeMap<String, Vec<String>>,
     body_size: u64,
+}
+
+impl fmt::Debug for NetworkResponseRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let url = redacted_url_for_debug(&self.url);
+        f.debug_struct("NetworkResponseRecord")
+            .field("request_id", &self.request_id)
+            .field("url", &url)
+            .field("status", &self.status)
+            .field("header_count", &header_value_count(&self.headers))
+            .field("body_size", &self.body_size)
+            .finish()
+    }
 }
 
 impl NetworkResponseRecord {
@@ -1315,10 +1434,19 @@ impl DomainRule {
 }
 
 /// Proxy route selected by egress policy.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ProxyRoute {
     pub id: String,
     pub endpoint: String,
+}
+
+impl fmt::Debug for ProxyRoute {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProxyRoute")
+            .field("id", &self.id)
+            .field("endpoint", &"[redacted]")
+            .finish()
+    }
 }
 
 impl ProxyRoute {
@@ -1519,6 +1647,1210 @@ impl EgressRecord {
             proxy_id: decision.proxy_id().map(str::to_string),
             bytes_sent,
             bytes_received,
+        }
+    }
+}
+
+/// Default per-origin request concurrency for crawler/scraper workloads.
+///
+/// Tempo is meant to be highly parallel across origins, while each individual
+/// origin remains bounded and auditable.
+pub const DEFAULT_CRAWL_MAX_CONCURRENT_PER_ORIGIN: usize = 4;
+
+/// Default global request concurrency for one crawler frontier.
+pub const DEFAULT_CRAWL_MAX_GLOBAL_INFLIGHT: usize = 128;
+
+/// Default minimum spacing between starts for one origin, expressed in caller
+/// supplied deterministic ticks.
+pub const DEFAULT_CRAWL_MIN_DELAY_TICKS: u64 = 1;
+
+/// Origin-scoped crawl policy evaluated before dispatching a request.
+#[derive(Clone, PartialEq, Eq)]
+pub struct CrawlPolicy {
+    pub max_global_inflight: usize,
+    pub max_concurrent_per_origin: usize,
+    pub min_delay_ticks_per_origin: u64,
+    pub respect_robots_txt: bool,
+    pub user_agent: String,
+}
+
+impl CrawlPolicy {
+    pub fn new(user_agent: impl Into<String>) -> Self {
+        Self {
+            user_agent: user_agent.into(),
+            ..Self::default()
+        }
+    }
+
+    pub fn with_max_concurrent_per_origin(mut self, max_concurrent: usize) -> Self {
+        self.max_concurrent_per_origin = max_concurrent.max(1);
+        self
+    }
+
+    pub fn with_max_global_inflight(mut self, max_inflight: usize) -> Self {
+        self.max_global_inflight = max_inflight.max(1);
+        self
+    }
+
+    pub fn with_min_delay_ticks_per_origin(mut self, min_delay_ticks: u64) -> Self {
+        self.min_delay_ticks_per_origin = min_delay_ticks;
+        self
+    }
+
+    pub fn without_robots_txt(mut self) -> Self {
+        self.respect_robots_txt = false;
+        self
+    }
+}
+
+impl fmt::Debug for CrawlPolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CrawlPolicy")
+            .field("max_global_inflight", &self.max_global_inflight)
+            .field("max_concurrent_per_origin", &self.max_concurrent_per_origin)
+            .field(
+                "min_delay_ticks_per_origin",
+                &self.min_delay_ticks_per_origin,
+            )
+            .field("respect_robots_txt", &self.respect_robots_txt)
+            .field("user_agent", &"[redacted]")
+            .finish()
+    }
+}
+
+impl Default for CrawlPolicy {
+    fn default() -> Self {
+        Self {
+            max_global_inflight: DEFAULT_CRAWL_MAX_GLOBAL_INFLIGHT,
+            max_concurrent_per_origin: DEFAULT_CRAWL_MAX_CONCURRENT_PER_ORIGIN,
+            min_delay_ticks_per_origin: DEFAULT_CRAWL_MIN_DELAY_TICKS,
+            respect_robots_txt: true,
+            user_agent: "tempo-agent".into(),
+        }
+    }
+}
+
+/// Minimal robots.txt directives used by the crawl scheduler.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RobotsRules {
+    directives: Vec<RobotsDirective>,
+    crawl_delay_ticks: Option<u64>,
+}
+
+impl RobotsRules {
+    pub fn allow_all() -> Self {
+        Self::default()
+    }
+
+    pub fn disallow_all() -> Self {
+        Self {
+            directives: vec![RobotsDirective {
+                kind: RobotsDirectiveKind::Disallow,
+                path: "/".into(),
+            }],
+            crawl_delay_ticks: None,
+        }
+    }
+
+    /// Parse the directives that apply to `user_agent`.
+    ///
+    /// This deliberately implements the scheduler-critical subset: `User-agent`,
+    /// `Allow`, `Disallow`, and integer `Crawl-delay`. Unknown fields are ignored.
+    pub fn parse_for_agent(user_agent: &str, body: &str) -> Self {
+        let target = user_agent.to_ascii_lowercase();
+        let mut groups = Vec::new();
+        let mut current_group = RobotsGroup::default();
+        let mut current_group_has_rules = false;
+
+        for raw_line in body.lines() {
+            let line = raw_line
+                .split_once('#')
+                .map(|(before, _)| before)
+                .unwrap_or(raw_line)
+                .trim();
+            if line.is_empty() {
+                current_group.finish_into(&mut groups);
+                current_group_has_rules = false;
+                continue;
+            }
+
+            let Some((field, value)) = line.split_once(':') else {
+                continue;
+            };
+            let field = field.trim().to_ascii_lowercase();
+            let value = value.trim();
+
+            if field == "user-agent" {
+                if current_group_has_rules {
+                    current_group.finish_into(&mut groups);
+                    current_group_has_rules = false;
+                }
+                if !value.is_empty() {
+                    current_group.agents.push(value.to_ascii_lowercase());
+                }
+                continue;
+            }
+
+            if current_group.agents.is_empty() {
+                continue;
+            }
+
+            match field.as_str() {
+                "allow" => {
+                    if !value.is_empty() {
+                        current_group.directives.push(RobotsDirective {
+                            kind: RobotsDirectiveKind::Allow,
+                            path: normalize_robots_pattern(value),
+                        });
+                    }
+                    current_group_has_rules = true;
+                }
+                "disallow" => {
+                    if !value.is_empty() {
+                        current_group.directives.push(RobotsDirective {
+                            kind: RobotsDirectiveKind::Disallow,
+                            path: normalize_robots_pattern(value),
+                        });
+                    }
+                    current_group_has_rules = true;
+                }
+                "crawl-delay" => {
+                    if let Some(delay) = parse_crawl_delay_ticks(value) {
+                        current_group.crawl_delay_ticks = Some(
+                            current_group
+                                .crawl_delay_ticks
+                                .map(|current| current.max(delay))
+                                .unwrap_or(delay),
+                        );
+                    }
+                    current_group_has_rules = true;
+                }
+                _ => {}
+            }
+        }
+
+        current_group.finish_into(&mut groups);
+        select_robots_rules(&target, groups)
+    }
+
+    pub fn allows_path(&self, path: &str) -> bool {
+        let mut best: Option<(usize, RobotsDirectiveKind)> = None;
+        for directive in &self.directives {
+            if !robots_path_matches(&directive.path, path) {
+                continue;
+            }
+            let specificity = robots_specificity(&directive.path);
+            let replace = best
+                .map(|(best_specificity, best_kind)| {
+                    specificity > best_specificity
+                        || (specificity == best_specificity
+                            && best_kind == RobotsDirectiveKind::Disallow
+                            && directive.kind == RobotsDirectiveKind::Allow)
+                })
+                .unwrap_or(true);
+            if replace {
+                best = Some((specificity, directive.kind));
+            }
+        }
+
+        !matches!(best, Some((_, RobotsDirectiveKind::Disallow)))
+    }
+
+    pub fn crawl_delay_ticks(&self) -> Option<u64> {
+        self.crawl_delay_ticks
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RobotsDirective {
+    kind: RobotsDirectiveKind,
+    path: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RobotsDirectiveKind {
+    Allow,
+    Disallow,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct RobotsGroup {
+    agents: Vec<String>,
+    directives: Vec<RobotsDirective>,
+    crawl_delay_ticks: Option<u64>,
+}
+
+impl RobotsGroup {
+    fn finish_into(&mut self, groups: &mut Vec<Self>) {
+        if self.agents.is_empty() {
+            self.directives.clear();
+            self.crawl_delay_ticks = None;
+            return;
+        }
+        groups.push(std::mem::take(self));
+    }
+}
+
+fn select_robots_rules(target: &str, groups: Vec<RobotsGroup>) -> RobotsRules {
+    let mut rules = RobotsRules::default();
+    let mut best_agent_specificity = None;
+    for group in groups {
+        let Some(agent_specificity) = group
+            .agents
+            .iter()
+            .filter_map(|agent| robots_agent_specificity(target, agent))
+            .max()
+        else {
+            continue;
+        };
+        match best_agent_specificity {
+            Some(best) if agent_specificity < best => continue,
+            Some(best) if agent_specificity > best => {
+                rules = RobotsRules::default();
+                best_agent_specificity = Some(agent_specificity);
+            }
+            None => best_agent_specificity = Some(agent_specificity),
+            Some(_) => {}
+        }
+        rules.directives.extend(group.directives);
+        if let Some(delay) = group.crawl_delay_ticks {
+            rules.crawl_delay_ticks = Some(
+                rules
+                    .crawl_delay_ticks
+                    .map(|current| current.max(delay))
+                    .unwrap_or(delay),
+            );
+        }
+    }
+    rules
+}
+
+/// Deterministic crawl decision for a request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CrawlDecision {
+    Allow {
+        origin: String,
+    },
+    Wait {
+        origin: String,
+        until_tick: u64,
+        reason: String,
+    },
+    Block {
+        origin: String,
+        reason: String,
+    },
+}
+
+impl CrawlDecision {
+    pub const fn is_allowed(&self) -> bool {
+        matches!(self, Self::Allow { .. })
+    }
+
+    pub fn origin(&self) -> &str {
+        match self {
+            Self::Allow { origin } | Self::Wait { origin, .. } | Self::Block { origin, .. } => {
+                origin
+            }
+        }
+    }
+}
+
+/// Public per-origin scheduler snapshot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OriginCrawlSnapshot {
+    pub origin: String,
+    pub inflight: usize,
+    pub last_started_tick: Option<u64>,
+    pub backoff_until_tick: Option<u64>,
+    pub robots_known: bool,
+}
+
+/// Pure crawl scheduler for high-throughput, policy-respecting scraping.
+#[derive(Clone, PartialEq, Eq)]
+pub struct CrawlScheduler {
+    policy: CrawlPolicy,
+    origins: BTreeMap<String, OriginCrawlState>,
+    active_requests: BTreeMap<RequestId, ActiveCrawlRequest>,
+    active_request_keys: BTreeSet<CrawlRequestKey>,
+}
+
+impl fmt::Debug for CrawlScheduler {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CrawlScheduler")
+            .field("policy", &self.policy)
+            .field("origins", &self.origins.len())
+            .field("active_requests", &self.active_requests.len())
+            .field("active_request_keys", &self.active_request_keys.len())
+            .finish()
+    }
+}
+
+impl CrawlScheduler {
+    pub fn new(policy: CrawlPolicy) -> Self {
+        Self {
+            policy,
+            origins: BTreeMap::new(),
+            active_requests: BTreeMap::new(),
+            active_request_keys: BTreeSet::new(),
+        }
+    }
+
+    pub fn policy(&self) -> &CrawlPolicy {
+        &self.policy
+    }
+
+    pub fn set_robots_for_origin(
+        &mut self,
+        origin_or_url: &str,
+        rules: RobotsRules,
+    ) -> Result<(), CrawlError> {
+        let origin = crawl_origin(origin_or_url)?;
+        self.origins.entry(origin).or_default().robots = Some(rules);
+        Ok(())
+    }
+
+    pub fn decide(&self, request: &NetworkRequest, tick: u64) -> Result<CrawlDecision, CrawlError> {
+        let target = CrawlTarget::parse_request(request)?;
+        let origin = target.origin;
+        let state = self.origins.get(&origin);
+
+        if self.policy.respect_robots_txt && !is_robots_txt_path(&target.path) {
+            match state.and_then(|state| state.robots.as_ref()) {
+                Some(robots)
+                    if target
+                        .robots_paths
+                        .iter()
+                        .any(|path| !robots.allows_path(path)) =>
+                {
+                    return Ok(CrawlDecision::Block {
+                        origin,
+                        reason: "blocked by robots.txt".into(),
+                    });
+                }
+                Some(_) => {}
+                None => {
+                    return Ok(CrawlDecision::Wait {
+                        origin,
+                        until_tick: tick.saturating_add(1),
+                        reason: "robots.txt rules are unknown".into(),
+                    });
+                }
+            }
+        }
+
+        if self.active_request_keys.contains(&target.request_key) {
+            return Ok(CrawlDecision::Wait {
+                origin,
+                until_tick: tick.saturating_add(1),
+                reason: "canonical crawl request is already active".into(),
+            });
+        }
+
+        if let Some(until_tick) = state.and_then(|state| state.backoff_until_tick)
+            && tick < until_tick
+        {
+            return Ok(CrawlDecision::Wait {
+                origin,
+                until_tick,
+                reason: "origin is in Retry-After backoff".into(),
+            });
+        }
+
+        if self.active_requests.len() >= self.policy.max_global_inflight {
+            return Ok(CrawlDecision::Wait {
+                origin,
+                until_tick: tick.saturating_add(1),
+                reason: "global crawl concurrency cap reached".into(),
+            });
+        }
+
+        let inflight = state.map(|state| state.inflight).unwrap_or_default();
+        if inflight >= self.policy.max_concurrent_per_origin {
+            return Ok(CrawlDecision::Wait {
+                origin,
+                until_tick: tick.saturating_add(1),
+                reason: "per-origin concurrency cap reached".into(),
+            });
+        }
+
+        let min_delay = self.effective_delay_ticks(state);
+        if min_delay > 0
+            && let Some(last_started_tick) = state.and_then(|state| state.last_started_tick)
+        {
+            let next_allowed_tick = last_started_tick.saturating_add(min_delay);
+            if tick < next_allowed_tick {
+                return Ok(CrawlDecision::Wait {
+                    origin,
+                    until_tick: next_allowed_tick,
+                    reason: "per-origin crawl delay has not elapsed".into(),
+                });
+            }
+        }
+
+        Ok(CrawlDecision::Allow { origin })
+    }
+
+    pub fn begin(
+        &mut self,
+        request: &NetworkRequest,
+        tick: u64,
+    ) -> Result<CrawlDecision, CrawlError> {
+        let target = CrawlTarget::parse_request(request)?;
+        if self.active_requests.contains_key(&request.id) {
+            return Ok(CrawlDecision::Block {
+                origin: target.origin,
+                reason: "request id is already active".into(),
+            });
+        }
+        let decision = self.decide(request, tick)?;
+        if let CrawlDecision::Allow { origin } = &decision {
+            let state = self.origins.entry(origin.clone()).or_default();
+            state.inflight = state.inflight.saturating_add(1);
+            state.last_started_tick = Some(tick);
+            self.active_request_keys.insert(target.request_key.clone());
+            self.active_requests.insert(
+                request.id.clone(),
+                ActiveCrawlRequest {
+                    origin: origin.clone(),
+                    url_key: target.url_key,
+                    request_key: target.request_key,
+                },
+            );
+        }
+        Ok(decision)
+    }
+
+    pub fn finish(&mut self, response: &NetworkResponseRecord, tick: u64) -> bool {
+        let Some(active) = self.active_requests.remove(&response.request_id) else {
+            return false;
+        };
+        self.active_request_keys.remove(&active.request_key);
+        let state = self.origins.entry(active.origin).or_default();
+        state.inflight = state.inflight.saturating_sub(1);
+        if let Some(until_tick) = retry_after_until_tick(response, tick) {
+            state.backoff_until_tick = Some(
+                state
+                    .backoff_until_tick
+                    .map(|current| current.max(until_tick))
+                    .unwrap_or(until_tick),
+            );
+        }
+        true
+    }
+
+    pub fn snapshot_for_origin(
+        &self,
+        origin_or_url: &str,
+    ) -> Result<Option<OriginCrawlSnapshot>, CrawlError> {
+        let origin = crawl_origin(origin_or_url)?;
+        Ok(self.snapshot_for_canonical_origin(&origin))
+    }
+
+    pub fn snapshots(&self) -> Vec<OriginCrawlSnapshot> {
+        self.origins
+            .iter()
+            .map(|(origin, state)| state.snapshot(origin.clone()))
+            .collect()
+    }
+
+    pub fn global_inflight(&self) -> usize {
+        self.active_requests.len()
+    }
+
+    pub fn is_url_active(&self, url: &str) -> Result<bool, CrawlError> {
+        let key = crawl_url_key(url)?;
+        Ok(self
+            .active_requests
+            .values()
+            .any(|active| active.url_key == key))
+    }
+
+    pub fn is_request_active(&self, request: &NetworkRequest) -> Result<bool, CrawlError> {
+        let key = crawl_request_key(request)?;
+        Ok(self.active_request_keys.contains(&key))
+    }
+
+    fn snapshot_for_canonical_origin(&self, origin: &str) -> Option<OriginCrawlSnapshot> {
+        self.origins
+            .get(origin)
+            .map(|state| state.snapshot(origin.into()))
+    }
+
+    fn effective_delay_ticks(&self, state: Option<&OriginCrawlState>) -> u64 {
+        let robots_delay = state
+            .and_then(|state| state.robots.as_ref())
+            .and_then(RobotsRules::crawl_delay_ticks)
+            .unwrap_or(0);
+        self.policy.min_delay_ticks_per_origin.max(robots_delay)
+    }
+}
+
+impl Default for CrawlScheduler {
+    fn default() -> Self {
+        Self::new(CrawlPolicy::default())
+    }
+}
+
+/// A scheduled crawl request ready for network dispatch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CrawlDispatch {
+    pub request: NetworkRequest,
+    pub origin: String,
+}
+
+impl CrawlDispatch {
+    /// Validate this dispatch against socket SSRF, egress, and audit policy.
+    pub fn check(
+        &self,
+        url_policy: &UrlPolicy,
+        egress_policy: &EgressPolicy,
+        resolved_socket: SocketAddr,
+    ) -> Result<CheckedCrawlDispatch, CrawlDispatchError> {
+        checked_crawl_dispatch(self, url_policy, egress_policy, resolved_socket, None)
+    }
+
+    /// Validate this dispatch and attach Tempo's default Web Bot Auth signature.
+    pub fn check_signed(
+        &self,
+        url_policy: &UrlPolicy,
+        egress_policy: &EgressPolicy,
+        resolved_socket: SocketAddr,
+        key: &WebBotAuthSigningKey,
+        created: u64,
+    ) -> Result<CheckedCrawlDispatch, CrawlDispatchError> {
+        checked_crawl_dispatch(
+            self,
+            url_policy,
+            egress_policy,
+            resolved_socket,
+            Some((key, created)),
+        )
+    }
+}
+
+/// Crawl dispatch after all mandatory network policy checks have passed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CheckedCrawlDispatch {
+    pub dispatch: CrawlDispatch,
+    pub resolved_socket: SocketAddr,
+    pub audit: AuditRecord,
+    pub egress: EgressRecord,
+    pub web_bot_auth_headers: Option<SignatureHeaders>,
+}
+
+/// Policy bundle used by checked frontier dispatch.
+#[derive(Clone, Copy)]
+pub struct CrawlDispatchGuard<'a> {
+    pub url_policy: &'a UrlPolicy,
+    pub egress_policy: &'a EgressPolicy,
+    pub signer: Option<CrawlDispatchSigner<'a>>,
+}
+
+impl<'a> CrawlDispatchGuard<'a> {
+    pub fn new(url_policy: &'a UrlPolicy, egress_policy: &'a EgressPolicy) -> Self {
+        Self {
+            url_policy,
+            egress_policy,
+            signer: None,
+        }
+    }
+
+    pub fn with_signer(
+        mut self,
+        key: &'a WebBotAuthSigningKey,
+        created: u64,
+    ) -> CrawlDispatchGuard<'a> {
+        self.signer = Some(CrawlDispatchSigner { key, created });
+        self
+    }
+
+    pub fn check(
+        &self,
+        dispatch: &CrawlDispatch,
+        resolved_socket: SocketAddr,
+    ) -> Result<CheckedCrawlDispatch, CrawlDispatchError> {
+        checked_crawl_dispatch(
+            dispatch,
+            self.url_policy,
+            self.egress_policy,
+            resolved_socket,
+            self.signer.map(|signer| (signer.key, signer.created)),
+        )
+    }
+
+    fn check_with_egress_decision(
+        &self,
+        dispatch: &CrawlDispatch,
+        resolved_socket: SocketAddr,
+        egress_decision: EgressDecision,
+    ) -> Result<CheckedCrawlDispatch, CrawlDispatchError> {
+        checked_crawl_dispatch_with_decision(
+            dispatch,
+            self.url_policy,
+            resolved_socket,
+            self.signer.map(|signer| (signer.key, signer.created)),
+            egress_decision,
+        )
+    }
+
+    fn precheck(&self, dispatch: &CrawlDispatch) -> Result<EgressDecision, CrawlDispatchError> {
+        self.url_policy.enforce(&dispatch.request.url)?;
+        Ok(self.egress_policy.decide(&dispatch.request)?)
+    }
+}
+
+/// Web Bot Auth signing material for checked frontier dispatch.
+#[derive(Clone, Copy)]
+pub struct CrawlDispatchSigner<'a> {
+    pub key: &'a WebBotAuthSigningKey,
+    pub created: u64,
+}
+
+/// Failure while turning a raw crawl dispatch into a checked dispatch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CrawlDispatchError {
+    Url(UrlBlocked),
+    Egress(EgressDenied),
+    Signature(SignatureError),
+}
+
+impl fmt::Display for CrawlDispatchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Url(error) => write!(f, "{error}"),
+            Self::Egress(error) => write!(
+                f,
+                "egress denied for {}:{}: {}",
+                error.domain, error.port, error.reason
+            ),
+            Self::Signature(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl Error for CrawlDispatchError {}
+
+impl From<UrlBlocked> for CrawlDispatchError {
+    fn from(value: UrlBlocked) -> Self {
+        Self::Url(value)
+    }
+}
+
+impl From<EgressDenied> for CrawlDispatchError {
+    fn from(value: EgressDenied) -> Self {
+        Self::Egress(value)
+    }
+}
+
+impl From<SignatureError> for CrawlDispatchError {
+    fn from(value: SignatureError) -> Self {
+        Self::Signature(value)
+    }
+}
+
+/// Result of one deterministic frontier scheduling pass.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CrawlBatch {
+    pub dispatches: Vec<CrawlDispatch>,
+    pub waiting: Vec<CrawlDecision>,
+    pub blocked: Vec<CrawlDecision>,
+}
+
+impl CrawlBatch {
+    pub fn is_empty(&self) -> bool {
+        self.dispatches.is_empty() && self.waiting.is_empty() && self.blocked.is_empty()
+    }
+}
+
+/// Result of a checked frontier scheduling pass.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CrawlCheckedBatch {
+    pub dispatches: Vec<CheckedCrawlDispatch>,
+    pub waiting: Vec<CrawlDecision>,
+    pub blocked: Vec<CrawlDecision>,
+    pub rejected: Vec<RejectedCrawlDispatch>,
+}
+
+impl CrawlCheckedBatch {
+    pub fn is_empty(&self) -> bool {
+        self.dispatches.is_empty()
+            && self.waiting.is_empty()
+            && self.blocked.is_empty()
+            && self.rejected.is_empty()
+    }
+}
+
+/// A ready crawl request rejected by connect-time policy before activation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RejectedCrawlDispatch {
+    pub dispatch: CrawlDispatch,
+    pub error: CrawlDispatchError,
+}
+
+/// Public frontier snapshot for SDKs and fleet schedulers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CrawlFrontierSnapshot {
+    pub pending: usize,
+    pub inflight: usize,
+    pub origins: Vec<OriginCrawlSnapshot>,
+}
+
+/// Deterministic crawl frontier backed by [`CrawlScheduler`].
+///
+/// The frontier never performs network I/O. It canonicalizes URL targets, but
+/// deduplicates by crawl request identity: method, canonical target URI, profile,
+/// declared identity mode, caller-supplied headers, and body identity. Empty
+/// GET/HEAD bodies dedupe by target; digest-bearing bodies dedupe by size+SHA-256;
+/// opaque bodies without a digest stay request-id scoped regardless of declared
+/// size so distinct POST/form submissions are not collapsed accidentally.
+#[derive(Clone, PartialEq, Eq)]
+pub struct CrawlFrontier {
+    scheduler: CrawlScheduler,
+    pending: BTreeMap<CrawlRequestKey, NetworkRequest>,
+}
+
+impl fmt::Debug for CrawlFrontier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CrawlFrontier")
+            .field("scheduler", &self.scheduler)
+            .field("pending", &self.pending.len())
+            .finish()
+    }
+}
+
+impl CrawlFrontier {
+    pub fn new(policy: CrawlPolicy) -> Self {
+        Self {
+            scheduler: CrawlScheduler::new(policy),
+            pending: BTreeMap::new(),
+        }
+    }
+
+    pub fn scheduler(&self) -> &CrawlScheduler {
+        &self.scheduler
+    }
+
+    pub fn scheduler_mut(&mut self) -> &mut CrawlScheduler {
+        &mut self.scheduler
+    }
+
+    /// Add a request by canonical crawl request identity. Returns `false` when
+    /// the same identity is already pending or active.
+    pub fn enqueue(&mut self, request: NetworkRequest) -> Result<bool, CrawlError> {
+        let key = crawl_request_key(&request)?;
+        if self.pending.contains_key(&key) || self.scheduler.active_request_keys.contains(&key) {
+            return Ok(false);
+        }
+        self.pending.insert(key, request);
+        Ok(true)
+    }
+
+    /// Dispatch at most `max_requests` pending requests in deterministic request
+    /// identity order, subject to global, per-origin, delay, robots, and backoff
+    /// gates.
+    pub fn dispatch_ready(
+        &mut self,
+        tick: u64,
+        max_requests: usize,
+    ) -> Result<CrawlBatch, CrawlError> {
+        let mut batch = CrawlBatch::default();
+        if max_requests == 0 {
+            return Ok(batch);
+        }
+
+        let keys = self.pending.keys().cloned().collect::<Vec<_>>();
+        let mut dispatched = 0usize;
+        for key in keys {
+            if dispatched >= max_requests {
+                break;
+            }
+            let Some(request) = self.pending.get(&key).cloned() else {
+                continue;
+            };
+            match self.scheduler.begin(&request, tick)? {
+                CrawlDecision::Allow { origin } => {
+                    self.pending.remove(&key);
+                    batch.dispatches.push(CrawlDispatch { request, origin });
+                    dispatched += 1;
+                }
+                decision @ CrawlDecision::Wait { .. } => batch.waiting.push(decision),
+                decision @ CrawlDecision::Block { .. } => {
+                    self.pending.remove(&key);
+                    batch.blocked.push(decision);
+                }
+            }
+        }
+        Ok(batch)
+    }
+
+    /// Dispatch at most `max_requests` requests after connect-time policy checks.
+    ///
+    /// Unlike [`dispatch_ready`](Self::dispatch_ready), this method does not mark a
+    /// request active until the caller-provided socket and the shared Tempo URL,
+    /// egress, audit, and optional Web Bot Auth checks have passed. For direct
+    /// egress, `resolve_socket` must return the target URL socket. For proxied
+    /// egress, it must return the selected proxy endpoint socket; Tempo validates
+    /// that socket against the proxy endpoint without resolving the target host.
+    pub fn dispatch_checked_ready<F>(
+        &mut self,
+        tick: u64,
+        max_requests: usize,
+        guard: CrawlDispatchGuard<'_>,
+        mut resolve_socket: F,
+    ) -> Result<CrawlCheckedBatch, CrawlError>
+    where
+        F: FnMut(&CrawlDispatch) -> Result<SocketAddr, CrawlDispatchError>,
+    {
+        let mut batch = CrawlCheckedBatch::default();
+        if max_requests == 0 {
+            return Ok(batch);
+        }
+
+        let keys = self.pending.keys().cloned().collect::<Vec<_>>();
+        let mut attempted = 0usize;
+        for key in keys {
+            if attempted >= max_requests {
+                break;
+            }
+            let Some(request) = self.pending.get(&key).cloned() else {
+                continue;
+            };
+            if self.scheduler.active_requests.contains_key(&request.id) {
+                let target = CrawlTarget::parse_request(&request)?;
+                self.pending.remove(&key);
+                batch.blocked.push(CrawlDecision::Block {
+                    origin: target.origin,
+                    reason: "request id is already active".into(),
+                });
+                continue;
+            }
+            match self.scheduler.decide(&request, tick)? {
+                CrawlDecision::Allow { origin } => {
+                    let dispatch = CrawlDispatch { request, origin };
+                    attempted += 1;
+                    let egress_decision = match guard.precheck(&dispatch) {
+                        Ok(egress_decision) => egress_decision,
+                        Err(error) => {
+                            self.pending.remove(&key);
+                            batch
+                                .rejected
+                                .push(RejectedCrawlDispatch { dispatch, error });
+                            continue;
+                        }
+                    };
+                    let checked = match resolve_socket(&dispatch) {
+                        Ok(resolved_socket) => guard.check_with_egress_decision(
+                            &dispatch,
+                            resolved_socket,
+                            egress_decision,
+                        ),
+                        Err(error) => Err(error),
+                    };
+                    match checked {
+                        Ok(checked) => match self
+                            .scheduler
+                            .begin(&checked.dispatch.request, tick)?
+                        {
+                            CrawlDecision::Allow { .. } => {
+                                self.pending.remove(&key);
+                                batch.dispatches.push(checked);
+                            }
+                            decision @ CrawlDecision::Wait { .. } => batch.waiting.push(decision),
+                            decision @ CrawlDecision::Block { .. } => {
+                                self.pending.remove(&key);
+                                batch.blocked.push(decision);
+                            }
+                        },
+                        Err(error) => {
+                            self.pending.remove(&key);
+                            batch
+                                .rejected
+                                .push(RejectedCrawlDispatch { dispatch, error });
+                        }
+                    }
+                }
+                decision @ CrawlDecision::Wait { .. } => batch.waiting.push(decision),
+                decision @ CrawlDecision::Block { .. } => {
+                    self.pending.remove(&key);
+                    batch.blocked.push(decision);
+                }
+            }
+        }
+        Ok(batch)
+    }
+
+    pub fn finish(&mut self, response: &NetworkResponseRecord, tick: u64) -> bool {
+        self.scheduler.finish(response, tick)
+    }
+
+    pub fn snapshot(&self) -> CrawlFrontierSnapshot {
+        CrawlFrontierSnapshot {
+            pending: self.pending.len(),
+            inflight: self.scheduler.global_inflight(),
+            origins: self.scheduler.snapshots(),
+        }
+    }
+}
+
+impl Default for CrawlFrontier {
+    fn default() -> Self {
+        Self::new(CrawlPolicy::default())
+    }
+}
+
+fn checked_crawl_dispatch(
+    dispatch: &CrawlDispatch,
+    url_policy: &UrlPolicy,
+    egress_policy: &EgressPolicy,
+    resolved_socket: SocketAddr,
+    signer: Option<(&WebBotAuthSigningKey, u64)>,
+) -> Result<CheckedCrawlDispatch, CrawlDispatchError> {
+    let egress_decision = egress_policy.decide(&dispatch.request)?;
+    checked_crawl_dispatch_with_decision(
+        dispatch,
+        url_policy,
+        resolved_socket,
+        signer,
+        egress_decision,
+    )
+}
+
+fn checked_crawl_dispatch_with_decision(
+    dispatch: &CrawlDispatch,
+    url_policy: &UrlPolicy,
+    resolved_socket: SocketAddr,
+    signer: Option<(&WebBotAuthSigningKey, u64)>,
+    egress_decision: EgressDecision,
+) -> Result<CheckedCrawlDispatch, CrawlDispatchError> {
+    let audit = match &egress_decision {
+        EgressDecision::Direct { .. } => AuditRecord::from_request_with_resolved_socket(
+            &dispatch.request,
+            url_policy,
+            resolved_socket,
+        )?,
+        EgressDecision::Proxied { proxy, .. } => {
+            enforce_proxy_endpoint_resolved_socket(&proxy.endpoint, resolved_socket)?;
+            AuditRecord::from_request(&dispatch.request, url_policy)?
+        }
+    };
+    checked_crawl_dispatch_from_records(dispatch, resolved_socket, signer, audit, egress_decision)
+}
+
+fn enforce_proxy_endpoint_resolved_socket(
+    endpoint: &str,
+    resolved_socket: SocketAddr,
+) -> Result<(), UrlBlocked> {
+    let parts = UrlParts::parse(endpoint).map_err(|reason| UrlBlocked { reason })?;
+    if parts.scheme.trim().is_empty() {
+        return Err(UrlBlocked {
+            reason: BlockReason::new(
+                BlockCode::UnsupportedScheme,
+                "proxy endpoint scheme is empty",
+            ),
+        });
+    }
+    let expected_port = proxy_endpoint_port(&parts)?;
+    if expected_port != resolved_socket.port() {
+        return Err(UrlBlocked {
+            reason: BlockReason::new(
+                BlockCode::InvalidUrl,
+                format!(
+                    "resolved proxy socket port {} does not match proxy endpoint port {expected_port}",
+                    resolved_socket.port()
+                ),
+            ),
+        });
+    }
+
+    let host_for_name_checks = parts.host.trim_end_matches('.');
+    if host_for_name_checks == "localhost" || host_for_name_checks.ends_with(".localhost") {
+        return Err(UrlBlocked {
+            reason: BlockReason::new(BlockCode::Localhost, "proxy endpoint is localhost"),
+        });
+    }
+    let endpoint_ip = parts
+        .host
+        .parse::<IpAddr>()
+        .ok()
+        .or_else(|| parse_relaxed_ipv4(&parts.host).map(IpAddr::V4));
+    if let Some(ip) = endpoint_ip
+        && let Some(detail) = blocked_ip_reason(&ip)
+    {
+        return Err(UrlBlocked {
+            reason: BlockReason::new(BlockCode::BlockedIp, format!("proxy endpoint IP {detail}")),
+        });
+    }
+    if let Some(detail) = blocked_ip_reason(&resolved_socket.ip()) {
+        return Err(UrlBlocked {
+            reason: BlockReason::new(BlockCode::BlockedIp, format!("resolved proxy IP {detail}")),
+        });
+    }
+    Ok(())
+}
+
+fn proxy_endpoint_port(parts: &UrlParts) -> Result<u16, UrlBlocked> {
+    let port = match (parts.scheme.as_str(), parts.port) {
+        (_, Some(port)) => port,
+        ("http", None) => 80,
+        ("https", None) => 443,
+        ("socks4" | "socks4a" | "socks5" | "socks5h", None) => 1080,
+        (scheme, None) => {
+            return Err(UrlBlocked {
+                reason: BlockReason::new(
+                    BlockCode::InvalidUrl,
+                    format!("proxy endpoint port is required for scheme '{scheme}'"),
+                ),
+            });
+        }
+    };
+    if port == 0 {
+        return Err(UrlBlocked {
+            reason: BlockReason::new(
+                BlockCode::InvalidUrl,
+                "proxy endpoint port must be non-zero",
+            ),
+        });
+    }
+    Ok(port)
+}
+
+fn checked_crawl_dispatch_from_records(
+    dispatch: &CrawlDispatch,
+    resolved_socket: SocketAddr,
+    signer: Option<(&WebBotAuthSigningKey, u64)>,
+    audit: AuditRecord,
+    egress_decision: EgressDecision,
+) -> Result<CheckedCrawlDispatch, CrawlDispatchError> {
+    let egress = EgressRecord::from_decision(
+        dispatch.request.id.clone(),
+        &egress_decision,
+        dispatch.request.body_size(),
+        0,
+    );
+    let signer = signer.filter(|_| dispatch.request.identity_mode == IdentityMode::AgentDeclared);
+    let web_bot_auth_headers = signer
+        .map(|(key, created)| dispatch.request.sign_web_bot_auth(key, created))
+        .transpose()?;
+
+    Ok(CheckedCrawlDispatch {
+        dispatch: dispatch.clone(),
+        resolved_socket,
+        audit,
+        egress,
+        web_bot_auth_headers,
+    })
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct OriginCrawlState {
+    inflight: usize,
+    last_started_tick: Option<u64>,
+    backoff_until_tick: Option<u64>,
+    robots: Option<RobotsRules>,
+}
+
+impl OriginCrawlState {
+    fn snapshot(&self, origin: String) -> OriginCrawlSnapshot {
+        OriginCrawlSnapshot {
+            origin,
+            inflight: self.inflight,
+            last_started_tick: self.last_started_tick,
+            backoff_until_tick: self.backoff_until_tick,
+            robots_known: self.robots.is_some(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ActiveCrawlRequest {
+    origin: String,
+    url_key: String,
+    request_key: CrawlRequestKey,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CrawlError {
+    pub reason: BlockReason,
+}
+
+impl fmt::Display for CrawlError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "invalid crawl target: {}", self.reason.detail)
+    }
+}
+
+impl Error for CrawlError {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CrawlTarget {
+    origin: String,
+    path: String,
+    robots_paths: Vec<String>,
+    url_key: String,
+    request_key: CrawlRequestKey,
+}
+
+impl CrawlTarget {
+    fn parse_request(request: &NetworkRequest) -> Result<Self, CrawlError> {
+        let parts = UrlParts::parse(&request.url).map_err(|reason| CrawlError { reason })?;
+        let url_key = parts.target_uri();
+        let robots_paths = crawl_robots_paths(&parts);
+        let request_key = CrawlRequestKey::from_parts(request, url_key.clone());
+        Ok(Self {
+            origin: parts.origin(),
+            path: parts.path,
+            robots_paths,
+            url_key,
+            request_key,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct CrawlRequestKey {
+    target_uri: String,
+    method: String,
+    profile_id: ProfileId,
+    identity_mode: IdentityMode,
+    headers: BTreeMap<String, Vec<String>>,
+    body: CrawlBodyKey,
+}
+
+impl CrawlRequestKey {
+    fn from_parts(request: &NetworkRequest, target_uri: String) -> Self {
+        let method = request.method.trim().to_ascii_uppercase();
+        Self {
+            target_uri,
+            method: method.clone(),
+            profile_id: request.profile_id.clone(),
+            identity_mode: request.identity_mode,
+            headers: request.headers.clone(),
+            body: CrawlBodyKey::from_request(request, &method),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum CrawlBodyKey {
+    Empty,
+    Digest { size: u64, sha256: [u8; 32] },
+    Opaque { request_id: RequestId },
+}
+
+impl CrawlBodyKey {
+    fn from_request(request: &NetworkRequest, method: &str) -> Self {
+        if request.body_size == 0 && matches!(method, "GET" | "HEAD") {
+            return Self::Empty;
+        }
+        match request.body_sha256 {
+            Some(sha256) => Self::Digest {
+                size: request.body_size,
+                sha256,
+            },
+            None => Self::Opaque {
+                request_id: request.id.clone(),
+            },
         }
     }
 }
@@ -1764,6 +3096,11 @@ fn validate_web_bot_auth_components(
                 "signature-agent".into(),
             ));
         }
+        if params.nonce.as_deref().is_none_or(str::is_empty) {
+            return Err(SignatureError::InvalidSignatureInput(
+                "missing nonce parameter".into(),
+            ));
+        }
         vec![
             CoveredComponent::Authority,
             CoveredComponent::Header("signature-agent".into()),
@@ -1774,6 +3111,7 @@ fn validate_web_bot_auth_components(
             CoveredComponent::Authority,
             CoveredComponent::Scheme,
             CoveredComponent::Path,
+            CoveredComponent::Query,
         ]
     };
 
@@ -1983,7 +3321,7 @@ fn path_component(rest: &str) -> String {
     let end = after_authority
         .find(['?', '#'])
         .unwrap_or(after_authority.len());
-    after_authority[..end].to_string()
+    normalize_path_dot_segments(&after_authority[..end])
 }
 
 fn query_component(rest: &str) -> Option<String> {
@@ -1994,23 +3332,83 @@ fn query_component(rest: &str) -> Option<String> {
     Some(after_query[..query_end].to_string())
 }
 
+fn normalize_path_dot_segments(path: &str) -> String {
+    let mut segments: Vec<&str> = Vec::new();
+    for segment in path.split('/').skip(1) {
+        if is_dot_path_segment(segment) {
+            continue;
+        }
+        if is_dot_dot_path_segment(segment) {
+            segments.pop();
+            continue;
+        }
+        segments.push(segment);
+    }
+
+    let mut normalized = String::from("/");
+    normalized.push_str(&segments.join("/"));
+    if normalized.len() > 1
+        && (path.ends_with('/')
+            || path.rsplit('/').next().is_some_and(|segment| {
+                is_dot_path_segment(segment) || is_dot_dot_path_segment(segment)
+            }))
+        && !normalized.ends_with('/')
+    {
+        normalized.push('/');
+    }
+    normalized
+}
+
+fn is_dot_path_segment(segment: &str) -> bool {
+    matches!(segment.to_ascii_lowercase().as_str(), "." | "%2e")
+}
+
+fn is_dot_dot_path_segment(segment: &str) -> bool {
+    matches!(
+        segment.to_ascii_lowercase().as_str(),
+        ".." | ".%2e" | "%2e." | "%2e%2e"
+    )
+}
+
 fn parse_authority(authority: &str) -> Result<(String, String, Option<u16>), BlockReason> {
     if authority.starts_with('[') {
         let (bracketed, after) = authority.split_once(']').ok_or_else(|| {
             BlockReason::new(BlockCode::MalformedIpv6, "malformed bracketed IPv6 host")
         })?;
         let inner = &bracketed[1..];
-        let host = strip_ipv6_zone(inner).to_string();
-        let port = after
-            .strip_prefix(':')
-            .and_then(|digits| digits.parse::<u16>().ok());
+        let host = strip_ipv6_zone(inner).parse::<Ipv6Addr>().map_err(|_| {
+            BlockReason::new(BlockCode::MalformedIpv6, "malformed bracketed IPv6 host")
+        })?;
+        let host = host.to_string();
+        let port = if after.is_empty() {
+            None
+        } else {
+            let digits = after.strip_prefix(':').ok_or_else(|| {
+                BlockReason::new(
+                    BlockCode::InvalidUrl,
+                    "IPv6 authority has invalid port separator",
+                )
+            })?;
+            if digits.is_empty() {
+                return Err(BlockReason::new(
+                    BlockCode::InvalidUrl,
+                    "URL port is not numeric",
+                ));
+            }
+            Some(digits.parse::<u16>().map_err(|_| {
+                BlockReason::new(BlockCode::InvalidUrl, "URL port is outside the u16 range")
+            })?)
+        };
         return Ok((host.clone(), format!("[{host}]"), port));
     }
 
     let (host_part, port) = match authority.rsplit_once(':') {
-        Some((host, port_raw)) if port_raw.chars().all(|ch| ch.is_ascii_digit()) => {
-            (host, port_raw.parse::<u16>().ok())
-        }
+        Some((host, port_raw)) if port_raw.chars().all(|ch| ch.is_ascii_digit()) => (
+            host,
+            Some(port_raw.parse::<u16>().map_err(|_| {
+                BlockReason::new(BlockCode::InvalidUrl, "URL port is outside the u16 range")
+            })?),
+        ),
         _ => (authority, None),
     };
 
@@ -2203,6 +3601,205 @@ fn egress_port(parts: &UrlParts) -> u16 {
     })
 }
 
+fn redacted_url_for_debug(url: &str) -> String {
+    UrlParts::parse(url)
+        .map(|parts| parts.origin())
+        .unwrap_or_else(|_| "[invalid-url]".into())
+}
+
+fn header_value_count(headers: &BTreeMap<String, Vec<String>>) -> usize {
+    headers.values().map(Vec::len).sum()
+}
+
+fn crawl_origin(origin_or_url: &str) -> Result<String, CrawlError> {
+    let parts = UrlParts::parse(origin_or_url).map_err(|reason| CrawlError { reason })?;
+    Ok(parts.origin())
+}
+
+fn crawl_url_key(url: &str) -> Result<String, CrawlError> {
+    let parts = UrlParts::parse(url).map_err(|reason| CrawlError { reason })?;
+    Ok(parts.target_uri())
+}
+
+fn crawl_request_key(request: &NetworkRequest) -> Result<CrawlRequestKey, CrawlError> {
+    let parts = UrlParts::parse(&request.url).map_err(|reason| CrawlError { reason })?;
+    Ok(CrawlRequestKey::from_parts(request, parts.target_uri()))
+}
+
+fn crawl_robots_paths(parts: &UrlParts) -> Vec<String> {
+    let mut primary = parts.path.clone();
+    if let Some(query) = &parts.query {
+        primary.push_str(query);
+    }
+    let mut paths = vec![primary.clone()];
+    if let Some(decoded) = percent_decode_utf8(&primary)
+        && decoded != primary
+    {
+        paths.push(decoded);
+    }
+    paths
+}
+
+fn robots_agent_specificity(target_lowercase: &str, rule_lowercase: &str) -> Option<usize> {
+    let rule = rule_lowercase.trim();
+    if rule.is_empty() {
+        return None;
+    }
+    if rule == "*" {
+        return Some(0);
+    }
+    target_lowercase.contains(rule).then_some(rule.len())
+}
+
+fn percent_decode_utf8(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut changed = false;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && index + 2 < bytes.len()
+            && let (Some(high), Some(low)) =
+                (hex_value(bytes[index + 1]), hex_value(bytes[index + 2]))
+        {
+            decoded.push((high << 4) | low);
+            changed = true;
+            index += 3;
+            continue;
+        }
+        decoded.push(bytes[index]);
+        index += 1;
+    }
+    changed.then(|| String::from_utf8(decoded).ok()).flatten()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn is_robots_txt_path(path: &str) -> bool {
+    path == "/robots.txt"
+}
+
+fn parse_crawl_delay_ticks(value: &str) -> Option<u64> {
+    let value = value.trim();
+    if value.is_empty() || value.starts_with('-') {
+        return None;
+    }
+    if let Some((whole, fraction)) = value.split_once('.') {
+        let whole = whole.parse::<u64>().ok()?;
+        let has_fraction = fraction.chars().any(|ch| ch != '0');
+        return Some(if has_fraction {
+            whole.saturating_add(1)
+        } else {
+            whole
+        });
+    }
+    value.parse::<u64>().ok()
+}
+
+fn normalize_robots_pattern(pattern: &str) -> String {
+    let anchored = pattern.ends_with('$');
+    let pattern = pattern.strip_suffix('$').unwrap_or(pattern);
+    let decoded = percent_decode_utf8(pattern).unwrap_or_else(|| pattern.to_string());
+    let mut normalized = if decoded.starts_with('/') && !decoded.contains(['*', '?']) {
+        normalize_path_dot_segments(&decoded)
+    } else {
+        decoded
+    };
+    if anchored {
+        normalized.push('$');
+    }
+    normalized
+}
+
+fn robots_path_matches(pattern: &str, path: &str) -> bool {
+    if pattern.is_empty() {
+        return false;
+    }
+    let anchored = pattern.ends_with('$');
+    let pattern = pattern.strip_suffix('$').unwrap_or(pattern);
+    if !pattern.contains('*') {
+        return if anchored {
+            path == pattern
+        } else {
+            path.starts_with(pattern)
+        };
+    }
+
+    let parts = pattern.split('*').collect::<Vec<_>>();
+    let Some(prefix) = parts.first().copied() else {
+        return true;
+    };
+    if !path.starts_with(prefix) {
+        return false;
+    }
+    let mut rest = &path[prefix.len()..];
+    let Some((last, middle)) = parts[1..].split_last() else {
+        return true;
+    };
+    for part in middle {
+        if part.is_empty() {
+            continue;
+        }
+        let Some(index) = rest.find(part) else {
+            return false;
+        };
+        rest = &rest[index + part.len()..];
+    }
+    if last.is_empty() {
+        return true;
+    }
+    if anchored {
+        rest.ends_with(last)
+    } else {
+        rest.contains(last)
+    }
+}
+
+fn robots_specificity(pattern: &str) -> usize {
+    pattern
+        .chars()
+        .filter(|ch| !matches!(ch, '*' | '$'))
+        .count()
+}
+
+fn retry_after_until_tick(response: &NetworkResponseRecord, tick: u64) -> Option<u64> {
+    if response.status != 429 && response.status != 503 {
+        return None;
+    }
+    let retry_after = response
+        .header_values("retry-after")
+        .and_then(|values| values.first())
+        .map(|value| value.trim())?;
+
+    parse_retry_after_delta_ticks(retry_after, response)
+        .map(|delay| tick.saturating_add(delay.max(1)))
+}
+
+fn parse_retry_after_delta_ticks(value: &str, response: &NetworkResponseRecord) -> Option<u64> {
+    if let Ok(delay) = value.parse::<u64>() {
+        return Some(delay);
+    }
+
+    let retry_after = httpdate::parse_http_date(value).ok()?;
+    let date = response
+        .header_values("date")
+        .and_then(|values| values.first())
+        .and_then(|value| httpdate::parse_http_date(value.trim()).ok())?;
+    let delta = retry_after.duration_since(date).unwrap_or_default();
+    Some(
+        delta
+            .as_secs()
+            .saturating_add(u64::from(delta.subsec_nanos() > 0)),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2265,7 +3862,7 @@ mod tests {
             key_id: key_id.into(),
             created,
             expires: Some(expires),
-            nonce: None,
+            nonce: Some("test-nonce".into()),
             tag: Some("web-bot-auth".into()),
             components: vec![
                 CoveredComponent::Authority,
@@ -2415,12 +4012,40 @@ mod tests {
     }
 
     #[test]
+    fn url_policy_rejects_resolved_socket_port_mismatch() {
+        let result = UrlPolicy::block_private().enforce_resolved_socket(
+            "https://public.example/agent",
+            SocketAddr::from(([93, 184, 216, 34], 22)),
+        );
+
+        assert!(matches!(
+            result,
+            Err(UrlBlocked { reason })
+                if reason.code == BlockCode::InvalidUrl
+                    && reason.detail.contains("does not match URL port 443")
+        ));
+    }
+
+    #[test]
     fn url_policy_allow_all_skips_resolved_socket_guard() -> Result<(), UrlBlocked> {
         UrlPolicy::allow_all().enforce_resolved_ip(
             "file:///etc/passwd",
             IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
         )?;
+        UrlPolicy::allow_all().enforce_resolved_socket(
+            "file:///etc/passwd",
+            SocketAddr::from(([127, 0, 0, 1], 22)),
+        )?;
         Ok(())
+    }
+
+    #[test]
+    fn url_policy_rejects_non_bracketed_ports_outside_u16() {
+        assert_blocked(
+            &UrlPolicy::block_private(),
+            "https://example.com:99999/a",
+            BlockCode::InvalidUrl,
+        );
     }
 
     #[test]
@@ -2438,6 +4063,18 @@ mod tests {
         assert_blocked(&policy, "not-a-url", BlockCode::InvalidUrl);
         assert_blocked(&policy, "http:///missing-host", BlockCode::EmptyHost);
         assert_blocked(&policy, "http://[::1", BlockCode::MalformedIpv6);
+        assert_blocked(&policy, "http://[not-ip]/", BlockCode::MalformedIpv6);
+        assert_blocked(
+            &policy,
+            "http://[2001:db8::1]:not-a-port/",
+            BlockCode::InvalidUrl,
+        );
+        assert_blocked(
+            &policy,
+            "http://[2001:db8::1]:999999/",
+            BlockCode::InvalidUrl,
+        );
+        assert_blocked(&policy, "http://[2001:db8::1]extra/", BlockCode::InvalidUrl);
         assert_allowed(&UrlPolicy::allow_all(), "file:///etc/passwd");
     }
 
@@ -2808,6 +4445,64 @@ mod tests {
     }
 
     #[test]
+    fn debug_output_redacts_private_network_material() -> Result<(), Box<dyn Error>> {
+        let mut store = ProfileStore::new();
+        let profile = store.create_ephemeral("session-secret");
+        store.set_cookie(
+            &profile.id,
+            "https://example.com",
+            "sid",
+            "session-cookie-value",
+        )?;
+        let cookie = store
+            .cookies_for(&profile.id, "https://example.com")
+            .into_iter()
+            .next()
+            .ok_or("expected cookie")?;
+        let request = NetworkRequest::new(
+            "r1",
+            "POST",
+            "https://user:secret@example.com/path?token=secret#fragment",
+            profile.id.clone(),
+            IdentityMode::AgentDeclared,
+        )
+        .with_header("Authorization", "Bearer top-secret-token")
+        .with_header("Cookie", "sid=session-cookie-value")
+        .with_body_bytes(b"secret request body");
+        let response =
+            NetworkResponseRecord::new("r1", "https://example.com/redirect?token=secret", 302)
+                .with_header("Set-Cookie", "sid=session-cookie-value")
+                .with_header("Location", "https://example.com/path?token=secret")
+                .with_body_size(27);
+        let proxy = ProxyRoute::new(
+            "primary",
+            "https://proxy-user:proxy-secret@proxy.example:8443",
+        );
+        let key = WebBotAuthSigningKey::from_seed("tempo-agent-secret", &[7u8; 32])?;
+        let headers = request.sign_web_bot_auth(&key, 1_800_000_000)?;
+
+        let debug =
+            format!("{request:?}\n{response:?}\n{cookie:?}\n{store:?}\n{proxy:?}\n{headers:?}");
+
+        for secret in [
+            "user:secret",
+            "token=secret",
+            "Bearer",
+            "top-secret-token",
+            "session-cookie-value",
+            "secret request body",
+            "proxy-secret",
+            "tempo-agent-secret",
+            &headers.signature,
+        ] {
+            assert!(!debug.contains(secret), "leaked {secret}: {debug}");
+        }
+        assert!(debug.contains("https://example.com"));
+        assert!(debug.contains("header_count"));
+        Ok(())
+    }
+
+    #[test]
     fn egress_policy_allows_direct_public_request_by_default() -> Result<(), EgressDenied> {
         let request = NetworkRequest::new(
             "r1",
@@ -3018,7 +4713,7 @@ mod tests {
     }
 
     #[test]
-    fn web_bot_auth_signs_and_verifies_rfc_9421_headers() -> Result<(), SignatureError> {
+    fn web_bot_auth_signs_and_verifies_strict_headers() -> Result<(), SignatureError> {
         let key = WebBotAuthSigningKey::from_seed("tempo-agent", &[7u8; 32])?;
         let verifier = key.verifier();
         let request = NetworkRequest::new(
@@ -3034,7 +4729,7 @@ mod tests {
 
         assert_eq!(
             headers.signature_input,
-            "sig1=(\"@method\" \"@authority\" \"@scheme\" \"@path\");created=1800000000;keyid=\"tempo-agent\";alg=\"ed25519\""
+            "sig1=(\"@method\" \"@authority\" \"@scheme\" \"@path\" \"@query\");created=1800000000;keyid=\"tempo-agent\";alg=\"ed25519\";expires=1800000300;tag=\"web-bot-auth\""
         );
         assert!(headers.signature.starts_with("sig1=:"));
         assert!(headers.signature.ends_with(':'));
@@ -3045,10 +4740,10 @@ mod tests {
         )?;
         assert_eq!(
             base,
-            "\"@method\": GET\n\"@authority\": example.com\n\"@scheme\": https\n\"@path\": /agent/path\n\"@signature-params\": (\"@method\" \"@authority\" \"@scheme\" \"@path\");created=1800000000;keyid=\"tempo-agent\";alg=\"ed25519\""
+            "\"@method\": GET\n\"@authority\": example.com\n\"@scheme\": https\n\"@path\": /agent/path\n\"@query\": ?tainted=not-signed\n\"@signature-params\": (\"@method\" \"@authority\" \"@scheme\" \"@path\" \"@query\");created=1800000000;keyid=\"tempo-agent\";alg=\"ed25519\";expires=1800000300;tag=\"web-bot-auth\""
         );
 
-        verify_request_signature_at(
+        verify_web_bot_auth_signature_at(
             &request,
             &headers.signature_input,
             &headers.signature,
@@ -3098,6 +4793,88 @@ mod tests {
             &key.verifier(),
             1_800_000_000,
         )?;
+        Ok(())
+    }
+
+    #[test]
+    fn web_bot_auth_rejects_query_not_covered() -> Result<(), SignatureError> {
+        let key = WebBotAuthSigningKey::from_seed("tempo-agent", &[7u8; 32])?;
+        let request = NetworkRequest::new(
+            "r1",
+            "GET",
+            "https://example.com/agent/path?token=must-be-signed",
+            "profile-a",
+            IdentityMode::AgentDeclared,
+        );
+        let params = SignatureParameters {
+            label: "sig1".into(),
+            key_id: "tempo-agent".into(),
+            created: 1_800_000_000,
+            expires: Some(1_800_000_300),
+            nonce: None,
+            tag: Some("web-bot-auth".into()),
+            components: vec![
+                CoveredComponent::Method,
+                CoveredComponent::Authority,
+                CoveredComponent::Scheme,
+                CoveredComponent::Path,
+            ],
+        };
+        let headers = sign_request(&request, &params, &key)?;
+
+        let result = verify_web_bot_auth_signature_at(
+            &request,
+            &headers.signature_input,
+            &headers.signature,
+            &key.verifier(),
+            1_800_000_000,
+        );
+
+        assert!(matches!(
+            result,
+            Err(SignatureError::MissingRequiredComponent(component)) if component == "@query"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn web_bot_auth_rejects_signature_agent_without_nonce() -> Result<(), SignatureError> {
+        let key = WebBotAuthSigningKey::from_seed("tempo-agent", &[7u8; 32])?;
+        let request = NetworkRequest::new(
+            "r1",
+            "GET",
+            "https://example.com/agent/path",
+            "profile-a",
+            IdentityMode::AgentDeclared,
+        )
+        .with_header("Signature-Agent", "\"https://signature-agent.test\"");
+        let params = SignatureParameters {
+            label: "sig1".into(),
+            key_id: "tempo-agent".into(),
+            created: 1_800_000_000,
+            expires: Some(1_800_000_300),
+            nonce: None,
+            tag: Some("web-bot-auth".into()),
+            components: vec![
+                CoveredComponent::Authority,
+                CoveredComponent::Header("signature-agent".into()),
+            ],
+        };
+        let headers = sign_request(&request, &params, &key)?;
+
+        let result = verify_web_bot_auth_signature_at(
+            &request,
+            &headers.signature_input,
+            &headers.signature,
+            &key.verifier(),
+            1_800_000_000,
+        );
+
+        assert!(matches!(
+            result,
+            Err(SignatureError::InvalidSignatureInput(reason))
+                if reason == "missing nonce parameter"
+        ));
         Ok(())
     }
 
@@ -3218,7 +4995,7 @@ mod tests {
         let created = unix_timestamp(SystemTime::now())?;
         let headers = request.sign_web_bot_auth(&key, created)?;
 
-        verify_request_signature(
+        verify_web_bot_auth_signature(
             &request,
             &headers.signature_input,
             &headers.signature,
@@ -3242,12 +5019,12 @@ mod tests {
         let tampered = NetworkRequest::new(
             "r1",
             "POST",
-            "https://example.com/other/path",
+            "https://example.com/agent/path?tampered=true",
             "profile-a",
             IdentityMode::AgentDeclared,
         );
 
-        let tampered_result = verify_request_signature_at(
+        let tampered_result = verify_web_bot_auth_signature_at(
             &tampered,
             &headers.signature_input,
             &headers.signature,
@@ -3259,7 +5036,7 @@ mod tests {
             Err(SignatureError::VerificationFailed)
         ));
 
-        let wrong_key_result = verify_request_signature_at(
+        let wrong_key_result = verify_web_bot_auth_signature_at(
             &request,
             &headers.signature_input,
             &headers.signature,
@@ -3286,7 +5063,7 @@ mod tests {
         );
 
         let stale_headers = request.sign_web_bot_auth(&key, 1_800_000_000)?;
-        let stale_result = verify_request_signature_at(
+        let stale_result = verify_web_bot_auth_signature_at(
             &request,
             &stale_headers.signature_input,
             &stale_headers.signature,
@@ -3303,7 +5080,7 @@ mod tests {
         ));
 
         let future_headers = request.sign_web_bot_auth(&key, 1_800_001_000)?;
-        let future_result = verify_request_signature_at(
+        let future_result = verify_web_bot_auth_signature_at(
             &request,
             &future_headers.signature_input,
             &future_headers.signature,
@@ -3320,7 +5097,7 @@ mod tests {
         ));
 
         let skewed_headers = request.sign_web_bot_auth(&key, 1_800_000_060)?;
-        verify_request_signature_at(
+        verify_web_bot_auth_signature_at(
             &request,
             &skewed_headers.signature_input,
             &skewed_headers.signature,
@@ -3331,7 +5108,8 @@ mod tests {
     }
 
     #[test]
-    fn web_bot_auth_honors_custom_freshness_policy() -> Result<(), SignatureError> {
+    fn web_bot_auth_honors_custom_clock_skew_but_not_explicit_expiry() -> Result<(), SignatureError>
+    {
         let key = WebBotAuthSigningKey::from_seed("tempo-agent", &[7u8; 32])?;
         let verifier = key
             .verifier()
@@ -3346,16 +5124,24 @@ mod tests {
         );
 
         let old_headers = request.sign_web_bot_auth(&key, 1_800_000_000)?;
-        verify_request_signature_at(
+        let old_result = verify_web_bot_auth_signature_at(
             &request,
             &old_headers.signature_input,
             &old_headers.signature,
             &verifier,
             1_800_000_600,
-        )?;
+        );
+        assert!(matches!(
+            old_result,
+            Err(SignatureError::SignatureExpired {
+                created: 1_800_000_000,
+                now: 1_800_000_600,
+                max_age_secs: 300
+            })
+        ));
 
         let future_headers = request.sign_web_bot_auth(&key, 1_800_000_120)?;
-        verify_request_signature_at(
+        verify_web_bot_auth_signature_at(
             &request,
             &future_headers.signature_input,
             &future_headers.signature,
@@ -3477,5 +5263,1123 @@ mod tests {
                 failed: 0,
             }
         );
+    }
+
+    #[test]
+    fn robots_rules_select_matching_group_and_prefer_specific_allow() {
+        let robots = RobotsRules::parse_for_agent(
+            "tempo-agent",
+            r#"
+User-agent: otherbot
+Disallow: /
+
+User-agent: *
+Disallow: /private
+Allow: /private/public
+Crawl-delay: 3
+"#,
+        );
+
+        assert!(!robots.allows_path("/private"));
+        assert!(!robots.allows_path("/private/deep"));
+        assert!(robots.allows_path("/private/public"));
+        assert!(robots.allows_path("/public"));
+        assert_eq!(robots.crawl_delay_ticks(), Some(3));
+    }
+
+    #[test]
+    fn robots_rules_prefer_specific_agent_group_without_blank_line() {
+        let robots = RobotsRules::parse_for_agent(
+            "tempo-agent",
+            r#"
+User-agent: *
+Allow: /private
+User-agent: tempo-agent
+Disallow: /private
+"#,
+        );
+
+        assert!(!robots.allows_path("/private"));
+    }
+
+    #[test]
+    fn robots_rules_choose_allow_on_equal_specificity() {
+        let robots = RobotsRules::parse_for_agent(
+            "tempo-agent",
+            r#"
+User-agent: tempo-agent
+Allow: /same
+Disallow: /same
+"#,
+        );
+
+        assert!(robots.allows_path("/same"));
+    }
+
+    #[test]
+    fn robots_rules_decode_directive_patterns() {
+        let robots = RobotsRules::parse_for_agent(
+            "tempo-agent",
+            r#"
+User-agent: tempo-agent
+Disallow: /%70rivate
+"#,
+        );
+
+        assert!(!robots.allows_path("/private"));
+    }
+
+    #[test]
+    fn robots_rules_match_repeated_wildcards_in_order() {
+        let robots = RobotsRules::parse_for_agent(
+            "tempo-agent",
+            r#"
+User-agent: tempo-agent
+Disallow: /a/*/c/*/e
+"#,
+        );
+
+        assert!(!robots.allows_path("/a/b/c/d/e"));
+        assert!(robots.allows_path("/a/b/x/d/e"));
+    }
+
+    #[test]
+    fn robots_rules_select_most_specific_agent_group_without_blank_separator() {
+        let robots = RobotsRules::parse_for_agent(
+            "tempo-agent",
+            r#"
+User-agent: *
+Allow: /
+User-agent: tempo-agent
+Disallow: /
+"#,
+        );
+
+        assert!(!robots.allows_path("/"));
+    }
+
+    #[test]
+    fn crawl_scheduler_caps_one_origin_without_blocking_parallel_origins() -> Result<(), CrawlError>
+    {
+        let mut scheduler = CrawlScheduler::new(
+            CrawlPolicy::default()
+                .without_robots_txt()
+                .with_max_concurrent_per_origin(1)
+                .with_min_delay_ticks_per_origin(0),
+        );
+        scheduler.set_robots_for_origin("https://example.com", RobotsRules::allow_all())?;
+        scheduler.set_robots_for_origin("https://other.example", RobotsRules::allow_all())?;
+        let first = crawl_request("r1", "https://example.com/a");
+        let same_origin = crawl_request("r2", "https://example.com/b");
+        let other_origin = crawl_request("r3", "https://other.example/a");
+
+        assert_eq!(
+            scheduler.begin(&first, 10)?,
+            CrawlDecision::Allow {
+                origin: "https://example.com".into()
+            }
+        );
+        assert_eq!(
+            scheduler.begin(&same_origin, 10)?,
+            CrawlDecision::Wait {
+                origin: "https://example.com".into(),
+                until_tick: 11,
+                reason: "per-origin concurrency cap reached".into(),
+            }
+        );
+        assert_eq!(
+            scheduler.begin(&other_origin, 10)?,
+            CrawlDecision::Allow {
+                origin: "https://other.example".into()
+            }
+        );
+
+        assert!(scheduler.finish(
+            &NetworkResponseRecord::new("r1", "https://example.com/a", 200),
+            11,
+        ));
+        assert_eq!(
+            scheduler.begin(&same_origin, 11)?,
+            CrawlDecision::Allow {
+                origin: "https://example.com".into()
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn crawl_scheduler_applies_policy_and_robots_delays() -> Result<(), CrawlError> {
+        let mut scheduler = CrawlScheduler::new(
+            CrawlPolicy::default()
+                .with_max_concurrent_per_origin(2)
+                .with_min_delay_ticks_per_origin(2),
+        );
+        scheduler.set_robots_for_origin("https://example.com", RobotsRules::allow_all())?;
+        let first = crawl_request("r1", "https://example.com/a");
+        let second = crawl_request("r2", "https://example.com/b");
+
+        assert!(scheduler.begin(&first, 10)?.is_allowed());
+        assert_eq!(
+            scheduler.decide(&second, 11)?,
+            CrawlDecision::Wait {
+                origin: "https://example.com".into(),
+                until_tick: 12,
+                reason: "per-origin crawl delay has not elapsed".into(),
+            }
+        );
+        assert!(scheduler.begin(&second, 12)?.is_allowed());
+        assert!(scheduler.finish(
+            &NetworkResponseRecord::new("r1", "https://example.com/a", 200),
+            13,
+        ));
+        assert!(scheduler.finish(
+            &NetworkResponseRecord::new("r2", "https://example.com/b", 200),
+            13,
+        ));
+
+        scheduler.set_robots_for_origin(
+            "https://example.com",
+            RobotsRules::parse_for_agent(
+                "tempo-agent",
+                r#"
+User-agent: tempo-agent
+Crawl-delay: 5
+"#,
+            ),
+        )?;
+        let third = crawl_request("r3", "https://example.com/c");
+        assert_eq!(
+            scheduler.decide(&third, 13)?,
+            CrawlDecision::Wait {
+                origin: "https://example.com".into(),
+                until_tick: 17,
+                reason: "per-origin crawl delay has not elapsed".into(),
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn crawl_scheduler_blocks_robots_disallow_paths() -> Result<(), CrawlError> {
+        let mut scheduler = CrawlScheduler::default();
+        scheduler.set_robots_for_origin("https://example.com/app", RobotsRules::disallow_all())?;
+        let blocked = crawl_request("r1", "https://example.com/admin");
+
+        assert_eq!(
+            scheduler.begin(&blocked, 1)?,
+            CrawlDecision::Block {
+                origin: "https://example.com".into(),
+                reason: "blocked by robots.txt".into(),
+            }
+        );
+        assert_eq!(scheduler.snapshots().len(), 1);
+        assert_eq!(scheduler.snapshots()[0].inflight, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn crawl_scheduler_waits_for_unknown_robots_but_allows_robots_txt() -> Result<(), CrawlError> {
+        let scheduler = CrawlScheduler::default();
+        let page = crawl_request("r1", "https://example.com/page");
+        let robots = crawl_request("robots", "https://example.com/robots.txt");
+
+        assert_eq!(
+            scheduler.decide(&page, 1)?,
+            CrawlDecision::Wait {
+                origin: "https://example.com".into(),
+                until_tick: 2,
+                reason: "robots.txt rules are unknown".into(),
+            }
+        );
+        assert_eq!(
+            scheduler.decide(&robots, 1)?,
+            CrawlDecision::Allow {
+                origin: "https://example.com".into()
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn crawl_scheduler_applies_robots_to_query_and_percent_decoded_paths() -> Result<(), CrawlError>
+    {
+        let mut scheduler = CrawlScheduler::default();
+        scheduler.set_robots_for_origin(
+            "https://example.com",
+            RobotsRules::parse_for_agent(
+                "tempo-agent",
+                r#"
+User-agent: tempo-agent
+Disallow: /search?
+Disallow: /private
+"#,
+            ),
+        )?;
+
+        assert_eq!(
+            scheduler.decide(&crawl_request("query", "https://example.com/search?q=x"), 1)?,
+            CrawlDecision::Block {
+                origin: "https://example.com".into(),
+                reason: "blocked by robots.txt".into(),
+            }
+        );
+        assert_eq!(
+            scheduler.decide(
+                &crawl_request("encoded", "https://example.com/%70rivate"),
+                1
+            )?,
+            CrawlDecision::Block {
+                origin: "https://example.com".into(),
+                reason: "blocked by robots.txt".into(),
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn crawl_scheduler_applies_robots_to_normalized_dot_segments() -> Result<(), CrawlError> {
+        let mut scheduler = CrawlScheduler::default();
+        scheduler.set_robots_for_origin(
+            "https://example.com",
+            RobotsRules::parse_for_agent(
+                "tempo-agent",
+                r#"
+User-agent: tempo-agent
+Disallow: /private
+"#,
+            ),
+        )?;
+
+        assert_eq!(
+            scheduler.decide(
+                &crawl_request("dot", "https://example.com/public/../private"),
+                1,
+            )?,
+            CrawlDecision::Block {
+                origin: "https://example.com".into(),
+                reason: "blocked by robots.txt".into(),
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn crawl_frontier_dedupes_dot_segment_url_equivalents() -> Result<(), CrawlError> {
+        let mut frontier = CrawlFrontier::new(
+            CrawlPolicy::default()
+                .without_robots_txt()
+                .with_min_delay_ticks_per_origin(0),
+        );
+
+        assert!(frontier.enqueue(crawl_request("a", "https://example.com/a/../page"))?);
+        assert!(!frontier.enqueue(crawl_request("b", "https://example.com/page"))?);
+        assert_eq!(frontier.snapshot().pending, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn crawl_scheduler_honors_retry_after_backoff() -> Result<(), CrawlError> {
+        let mut scheduler = CrawlScheduler::new(
+            CrawlPolicy::default()
+                .without_robots_txt()
+                .with_min_delay_ticks_per_origin(0),
+        );
+        scheduler.set_robots_for_origin("https://example.com", RobotsRules::allow_all())?;
+        let first = crawl_request("r1", "https://example.com/a");
+        let second = crawl_request("r2", "https://example.com/b");
+
+        assert!(scheduler.begin(&first, 1)?.is_allowed());
+        assert!(scheduler.finish(
+            &NetworkResponseRecord::new("r1", "https://example.com/a", 429)
+                .with_header("Retry-After", "5"),
+            2,
+        ));
+        assert_eq!(
+            scheduler.decide(&second, 6)?,
+            CrawlDecision::Wait {
+                origin: "https://example.com".into(),
+                until_tick: 7,
+                reason: "origin is in Retry-After backoff".into(),
+            }
+        );
+        assert!(scheduler.begin(&second, 7)?.is_allowed());
+
+        let snapshot = scheduler
+            .snapshot_for_origin("https://example.com/path")?
+            .ok_or_else(|| CrawlError {
+                reason: BlockReason::new(BlockCode::EmptyHost, "missing crawl snapshot"),
+            })?;
+        assert_eq!(snapshot.backoff_until_tick, Some(7));
+        assert_eq!(snapshot.inflight, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn crawl_scheduler_honors_retry_after_http_date_against_response_date() -> Result<(), CrawlError>
+    {
+        let mut scheduler = CrawlScheduler::new(
+            CrawlPolicy::default()
+                .without_robots_txt()
+                .with_min_delay_ticks_per_origin(0),
+        );
+        scheduler.set_robots_for_origin("https://example.com", RobotsRules::allow_all())?;
+        let first = crawl_request("r1", "https://example.com/a");
+        let second = crawl_request("r2", "https://example.com/b");
+
+        assert!(scheduler.begin(&first, 10)?.is_allowed());
+        assert!(scheduler.finish(
+            &NetworkResponseRecord::new("r1", "https://example.com/a", 503)
+                .with_header("Date", "Tue, 20 Apr 2021 02:07:55 GMT")
+                .with_header("Retry-After", "Tue, 20 Apr 2021 02:08:05 GMT"),
+            11,
+        ));
+        assert_eq!(
+            scheduler.decide(&second, 20)?,
+            CrawlDecision::Wait {
+                origin: "https://example.com".into(),
+                until_tick: 21,
+                reason: "origin is in Retry-After backoff".into(),
+            }
+        );
+        assert!(scheduler.begin(&second, 21)?.is_allowed());
+        Ok(())
+    }
+
+    #[test]
+    fn retry_after_http_date_requires_response_date_and_clamps_past_dates() {
+        let no_date = NetworkResponseRecord::new("r1", "https://example.com/a", 429)
+            .with_header("Retry-After", "Tue, 20 Apr 2021 02:08:05 GMT");
+        assert_eq!(retry_after_until_tick(&no_date, 10), None);
+
+        let past = NetworkResponseRecord::new("r1", "https://example.com/a", 429)
+            .with_header("Date", "Tue, 20 Apr 2021 02:08:05 GMT")
+            .with_header("Retry-After", "Tue, 20 Apr 2021 02:07:55 GMT");
+        assert_eq!(retry_after_until_tick(&past, 10), Some(11));
+    }
+
+    #[test]
+    fn crawl_scheduler_caps_global_inflight_across_origins() -> Result<(), CrawlError> {
+        let mut scheduler = CrawlScheduler::new(
+            CrawlPolicy::default()
+                .without_robots_txt()
+                .with_max_global_inflight(1)
+                .with_max_concurrent_per_origin(8)
+                .with_min_delay_ticks_per_origin(0),
+        );
+        scheduler.set_robots_for_origin("https://a.example", RobotsRules::allow_all())?;
+        scheduler.set_robots_for_origin("https://b.example", RobotsRules::allow_all())?;
+        let first = crawl_request("r1", "https://a.example/one");
+        let second = crawl_request("r2", "https://b.example/two");
+
+        assert!(scheduler.begin(&first, 1)?.is_allowed());
+        assert_eq!(scheduler.global_inflight(), 1);
+        assert_eq!(
+            scheduler.decide(&second, 1)?,
+            CrawlDecision::Wait {
+                origin: "https://b.example".into(),
+                until_tick: 2,
+                reason: "global crawl concurrency cap reached".into(),
+            }
+        );
+
+        assert!(scheduler.finish(
+            &NetworkResponseRecord::new("r1", "https://a.example/one", 200),
+            2,
+        ));
+        assert!(scheduler.begin(&second, 2)?.is_allowed());
+        Ok(())
+    }
+
+    #[test]
+    fn crawl_frontier_dedupes_and_dispatches_deterministic_batches() -> Result<(), CrawlError> {
+        let mut frontier = CrawlFrontier::new(
+            CrawlPolicy::default()
+                .with_max_global_inflight(2)
+                .with_max_concurrent_per_origin(1)
+                .with_min_delay_ticks_per_origin(0),
+        );
+        frontier
+            .scheduler_mut()
+            .set_robots_for_origin("https://blocked.example", RobotsRules::disallow_all())?;
+        frontier
+            .scheduler_mut()
+            .set_robots_for_origin("https://a.example", RobotsRules::allow_all())?;
+        frontier
+            .scheduler_mut()
+            .set_robots_for_origin("https://b.example", RobotsRules::allow_all())?;
+
+        assert!(frontier.enqueue(crawl_request("b", "https://b.example/b"))?);
+        assert!(frontier.enqueue(crawl_request("a1", "https://a.example/a#ignored"))?);
+        assert!(!frontier.enqueue(crawl_request("a1-dup", "https://a.example/a"))?);
+        assert!(frontier.enqueue(crawl_request("a2", "https://a.example/c"))?);
+        assert!(frontier.enqueue(crawl_request("blocked", "https://blocked.example/private",))?);
+
+        let batch = frontier.dispatch_ready(1, 8)?;
+        assert_eq!(
+            batch
+                .dispatches
+                .iter()
+                .map(|dispatch| dispatch.request.id.0.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a1", "b"]
+        );
+        assert_eq!(
+            batch.waiting,
+            vec![CrawlDecision::Wait {
+                origin: "https://a.example".into(),
+                until_tick: 2,
+                reason: "per-origin concurrency cap reached".into(),
+            }]
+        );
+        assert_eq!(
+            batch.blocked,
+            vec![CrawlDecision::Block {
+                origin: "https://blocked.example".into(),
+                reason: "blocked by robots.txt".into(),
+            }]
+        );
+        assert_eq!(frontier.snapshot().pending, 1);
+        assert_eq!(frontier.snapshot().inflight, 2);
+
+        assert!(frontier.finish(
+            &NetworkResponseRecord::new("a1", "https://a.example/a", 200),
+            2,
+        ));
+        let second = frontier.dispatch_ready(2, 8)?;
+        assert_eq!(second.dispatches.len(), 1);
+        assert_eq!(second.dispatches[0].request.id.0, "a2");
+        assert_eq!(frontier.snapshot().pending, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn crawl_frontier_dedupes_urls_that_are_already_active() -> Result<(), CrawlError> {
+        let mut frontier = CrawlFrontier::new(
+            CrawlPolicy::default()
+                .without_robots_txt()
+                .with_min_delay_ticks_per_origin(0),
+        );
+
+        assert!(frontier.enqueue(crawl_request("r1", "https://example.com/page#one"))?);
+        let batch = frontier.dispatch_ready(1, 1)?;
+        assert_eq!(batch.dispatches.len(), 1);
+        assert!(frontier
+            .scheduler()
+            .is_url_active("https://example.com/page")?);
+        assert!(!frontier.enqueue(crawl_request("r2", "https://example.com/page#two"))?);
+
+        assert!(frontier.finish(
+            &NetworkResponseRecord::new("r1", "https://example.com/page", 200),
+            2,
+        ));
+        assert!(frontier.enqueue(crawl_request("r3", "https://example.com/page"))?);
+        Ok(())
+    }
+
+    #[test]
+    fn crawl_frontier_dedupes_by_request_identity_not_url_only() -> Result<(), CrawlError> {
+        let mut frontier = CrawlFrontier::new(
+            CrawlPolicy::default()
+                .without_robots_txt()
+                .with_max_concurrent_per_origin(16)
+                .with_min_delay_ticks_per_origin(0),
+        );
+        let url = "https://example.com/page#fragment";
+
+        assert!(frontier.enqueue(crawl_request("get-a", url))?);
+        assert!(!frontier.enqueue(crawl_request(
+            "get-a-dup",
+            "HTTPS://EXAMPLE.COM:443/page#other",
+        ))?);
+        assert!(!frontier.enqueue(
+            crawl_request("get-empty-bytes", "https://example.com/page").with_body_bytes([])
+        )?);
+        assert!(frontier
+            .enqueue(crawl_request("get-json", url).with_header("Accept", "application/json"))?);
+        assert!(!frontier.enqueue(
+            crawl_request("get-json-dup", "https://example.com/page")
+                .with_header("accept", "application/json")
+        )?);
+        assert!(
+            frontier.enqueue(crawl_request("get-html", url).with_header("Accept", "text/html"))?
+        );
+        assert!(frontier.enqueue(NetworkRequest::new(
+            "head-a",
+            "HEAD",
+            url,
+            "profile-a",
+            IdentityMode::AgentDeclared,
+        ))?);
+        assert!(!frontier.enqueue(
+            NetworkRequest::new(
+                "head-empty-bytes",
+                "HEAD",
+                "https://example.com:443/page",
+                "profile-a",
+                IdentityMode::AgentDeclared,
+            )
+            .with_body_bytes([])
+        )?);
+        assert!(frontier.enqueue(NetworkRequest::new(
+            "get-b-profile",
+            "GET",
+            url,
+            "profile-b",
+            IdentityMode::AgentDeclared,
+        ))?);
+        assert!(frontier.enqueue(NetworkRequest::new(
+            "get-user-driven",
+            "GET",
+            url,
+            "profile-a",
+            IdentityMode::UserDriven,
+        ))?);
+        // No digest means the body is opaque to the frontier. Even a zero-size
+        // POST is request-id scoped so two distinct submissions are not collapsed.
+        assert!(frontier.enqueue(NetworkRequest::new(
+            "post-opaque-a",
+            "POST",
+            url,
+            "profile-a",
+            IdentityMode::AgentDeclared,
+        ))?);
+        assert!(!frontier.enqueue(
+            NetworkRequest::new(
+                "post-opaque-a",
+                "POST",
+                "https://example.com:443/page",
+                "profile-a",
+                IdentityMode::AgentDeclared,
+            )
+            .with_body_size(64)
+        )?);
+        assert!(frontier.enqueue(NetworkRequest::new(
+            "post-opaque-b",
+            "POST",
+            "https://example.com/page",
+            "profile-a",
+            IdentityMode::AgentDeclared,
+        ))?);
+
+        let digest_a = Sha256::digest(b"alpha").into();
+        let digest_b = Sha256::digest(b"beta").into();
+        assert!(frontier.enqueue(
+            NetworkRequest::new(
+                "post-digest-a",
+                "POST",
+                url,
+                "profile-a",
+                IdentityMode::AgentDeclared,
+            )
+            .with_body_sha256(5, digest_a),
+        )?);
+        assert!(!frontier.enqueue(
+            NetworkRequest::new(
+                "post-digest-a-dup",
+                "POST",
+                "https://example.com/page",
+                "profile-a",
+                IdentityMode::AgentDeclared,
+            )
+            .with_body_sha256(5, digest_a),
+        )?);
+        assert!(frontier.enqueue(
+            NetworkRequest::new(
+                "post-digest-a-different-size",
+                "POST",
+                "https://example.com/page",
+                "profile-a",
+                IdentityMode::AgentDeclared,
+            )
+            .with_body_sha256(6, digest_a),
+        )?);
+        assert!(frontier.enqueue(
+            NetworkRequest::new(
+                "post-digest-b",
+                "POST",
+                "https://example.com/page",
+                "profile-a",
+                IdentityMode::AgentDeclared,
+            )
+            .with_body_sha256(4, digest_b),
+        )?);
+
+        assert_eq!(frontier.snapshot().pending, 11);
+        let batch = frontier.dispatch_ready(1, 16)?;
+        assert_eq!(batch.dispatches.len(), 11);
+        assert!(frontier
+            .scheduler()
+            .is_request_active(&crawl_request("get-a-check", "https://example.com/page"))?);
+        assert!(frontier.scheduler().is_request_active(
+            &crawl_request("get-json-check", "https://example.com/page")
+                .with_header("accept", "application/json")
+        )?);
+        assert!(frontier
+            .scheduler()
+            .is_url_active("https://example.com/page")?);
+        assert_eq!(frontier.snapshot().inflight, 11);
+        Ok(())
+    }
+
+    #[test]
+    fn crawl_frontier_url_active_tracks_until_last_identity_finishes() -> Result<(), CrawlError> {
+        let mut frontier = CrawlFrontier::new(
+            CrawlPolicy::default()
+                .without_robots_txt()
+                .with_max_concurrent_per_origin(8)
+                .with_min_delay_ticks_per_origin(0),
+        );
+        let profile_a = crawl_request("profile-a", "https://example.com/page");
+        let profile_b = NetworkRequest::new(
+            "profile-b",
+            "GET",
+            "https://example.com/page#fragment",
+            "profile-b",
+            IdentityMode::AgentDeclared,
+        );
+        assert!(frontier.enqueue(profile_a.clone())?);
+        assert!(frontier.enqueue(profile_b.clone())?);
+        let batch = frontier.dispatch_ready(1, 8)?;
+        assert_eq!(batch.dispatches.len(), 2);
+        assert!(frontier
+            .scheduler()
+            .is_url_active("https://example.com/page")?);
+        assert!(frontier.scheduler().is_request_active(&profile_a)?);
+        assert!(frontier.scheduler().is_request_active(&profile_b)?);
+
+        assert!(frontier.finish(
+            &NetworkResponseRecord::new("profile-a", "https://example.com/page", 200),
+            2,
+        ));
+        assert!(!frontier.scheduler().is_request_active(&profile_a)?);
+        assert!(frontier.scheduler().is_request_active(&profile_b)?);
+        assert!(frontier
+            .scheduler()
+            .is_url_active("https://example.com/page")?);
+
+        assert!(frontier.finish(
+            &NetworkResponseRecord::new("profile-b", "https://example.com/page", 200),
+            3,
+        ));
+        assert!(!frontier.scheduler().is_request_active(&profile_b)?);
+        assert!(!frontier
+            .scheduler()
+            .is_url_active("https://example.com/page")?);
+        assert_eq!(frontier.snapshot().inflight, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn checked_crawl_dispatch_blocks_private_resolved_socket() -> Result<(), CrawlError> {
+        let mut frontier = CrawlFrontier::new(
+            CrawlPolicy::default()
+                .without_robots_txt()
+                .with_min_delay_ticks_per_origin(0),
+        );
+        frontier
+            .scheduler_mut()
+            .set_robots_for_origin("https://public.example", RobotsRules::allow_all())?;
+        frontier.enqueue(crawl_request("r1", "https://public.example/page"))?;
+        let mut batch = frontier.dispatch_ready(1, 1)?;
+        let Some(dispatch) = batch.dispatches.pop() else {
+            return Err(CrawlError {
+                reason: BlockReason::new(BlockCode::InvalidUrl, "expected crawl dispatch"),
+            });
+        };
+
+        let result = dispatch.check(
+            &UrlPolicy::block_private(),
+            &EgressPolicy::allow_all(),
+            SocketAddr::from(([10, 0, 0, 5], 443)),
+        );
+
+        assert!(matches!(
+            result,
+            Err(CrawlDispatchError::Url(UrlBlocked { reason }))
+                if reason.code == BlockCode::BlockedIp
+                    && reason.detail.contains("resolved IP")
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn checked_crawl_dispatch_emits_audit_egress_and_signature() -> Result<(), Box<dyn Error>> {
+        let key = WebBotAuthSigningKey::from_seed("tempo-agent", &[7u8; 32])?;
+        let mut frontier = CrawlFrontier::new(
+            CrawlPolicy::default()
+                .without_robots_txt()
+                .with_min_delay_ticks_per_origin(0),
+        );
+        frontier
+            .scheduler_mut()
+            .set_robots_for_origin("https://example.com", RobotsRules::allow_all())?;
+        frontier.enqueue(
+            crawl_request("r1", "https://example.com/page?query=signed").with_body_size(42),
+        )?;
+        let mut batch = frontier.dispatch_ready(1, 1)?;
+        let dispatch = batch.dispatches.pop().ok_or("expected crawl dispatch")?;
+
+        let checked = dispatch.check_signed(
+            &UrlPolicy::block_private(),
+            &EgressPolicy::block_by_default().allow_domain(DomainRule::exact("example.com")),
+            SocketAddr::from(([93, 184, 216, 34], 443)),
+            &key,
+            1_800_000_000,
+        )?;
+
+        assert_eq!(checked.audit.origin, "https://example.com");
+        assert!(checked.audit.taint_free);
+        assert_eq!(checked.egress.domain, "example.com");
+        assert_eq!(checked.egress.port, 443);
+        assert_eq!(checked.egress.bytes_sent, 42);
+
+        let headers = checked
+            .web_bot_auth_headers
+            .as_ref()
+            .ok_or("expected Web Bot Auth headers")?;
+        verify_web_bot_auth_signature_at(
+            &checked.dispatch.request,
+            &headers.signature_input,
+            &headers.signature,
+            &key.verifier(),
+            1_800_000_000,
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn checked_crawl_dispatch_does_not_sign_user_driven_requests() -> Result<(), Box<dyn Error>> {
+        let key = WebBotAuthSigningKey::from_seed("tempo-agent", &[7u8; 32])?;
+        let dispatch = CrawlDispatch {
+            request: NetworkRequest::new(
+                "r1",
+                "GET",
+                "https://example.com/page?private=1",
+                "profile-a",
+                IdentityMode::UserDriven,
+            ),
+            origin: "https://example.com".into(),
+        };
+
+        let checked = dispatch.check_signed(
+            &UrlPolicy::block_private(),
+            &EgressPolicy::block_by_default().allow_domain(DomainRule::exact("example.com")),
+            SocketAddr::from(([93, 184, 216, 34], 443)),
+            &key,
+            1_800_000_000,
+        )?;
+
+        assert_eq!(checked.audit.identity_mode, IdentityMode::UserDriven);
+        assert_eq!(checked.web_bot_auth_headers, None);
+        Ok(())
+    }
+
+    #[test]
+    fn checked_frontier_rejection_does_not_activate_request() -> Result<(), CrawlError> {
+        let mut frontier = CrawlFrontier::new(
+            CrawlPolicy::default()
+                .without_robots_txt()
+                .with_min_delay_ticks_per_origin(0),
+        );
+        frontier.enqueue(crawl_request("r1", "https://public.example/page"))?;
+
+        let url_policy = UrlPolicy::block_private();
+        let egress_policy = EgressPolicy::allow_all();
+        let guard = CrawlDispatchGuard::new(&url_policy, &egress_policy);
+        let batch = frontier
+            .dispatch_checked_ready(1, 1, guard, |_| Ok(SocketAddr::from(([10, 0, 0, 5], 443))))?;
+
+        assert!(batch.dispatches.is_empty());
+        assert!(batch.waiting.is_empty());
+        assert!(batch.blocked.is_empty());
+        assert_eq!(batch.rejected.len(), 1);
+        assert!(matches!(
+            &batch.rejected[0].error,
+            CrawlDispatchError::Url(UrlBlocked { reason })
+                if reason.code == BlockCode::BlockedIp
+                    && reason.detail.contains("resolved IP")
+        ));
+        assert_eq!(frontier.snapshot().pending, 0);
+        assert_eq!(frontier.snapshot().inflight, 0);
+        assert!(!frontier
+            .scheduler()
+            .is_url_active("https://public.example/page")?);
+        assert!(frontier.enqueue(crawl_request("r2", "https://public.example/page"))?);
+        Ok(())
+    }
+
+    #[test]
+    fn checked_frontier_max_requests_bounds_rejected_attempts() -> Result<(), CrawlError> {
+        let mut frontier = CrawlFrontier::new(
+            CrawlPolicy::default()
+                .without_robots_txt()
+                .with_min_delay_ticks_per_origin(0),
+        );
+        frontier.enqueue(crawl_request("a", "https://a.example/page"))?;
+        frontier.enqueue(crawl_request("b", "https://b.example/page"))?;
+
+        let url_policy = UrlPolicy::block_private();
+        let egress_policy = EgressPolicy::allow_all();
+        let guard = CrawlDispatchGuard::new(&url_policy, &egress_policy);
+        let mut resolve_calls = 0usize;
+        let batch = frontier.dispatch_checked_ready(1, 1, guard, |_| {
+            resolve_calls += 1;
+            Ok(SocketAddr::from(([10, 0, 0, 5], 443)))
+        })?;
+
+        assert_eq!(resolve_calls, 1);
+        assert_eq!(batch.rejected.len(), 1);
+        assert_eq!(frontier.snapshot().pending, 1);
+        assert_eq!(frontier.snapshot().inflight, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn checked_frontier_url_policy_denial_does_not_resolve() -> Result<(), CrawlError> {
+        let mut frontier = CrawlFrontier::new(
+            CrawlPolicy::default()
+                .without_robots_txt()
+                .with_min_delay_ticks_per_origin(0),
+        );
+        frontier.enqueue(crawl_request("r1", "http://127.0.0.1/private"))?;
+
+        let url_policy = UrlPolicy::block_private();
+        let egress_policy = EgressPolicy::allow_all();
+        let guard = CrawlDispatchGuard::new(&url_policy, &egress_policy);
+        let mut resolve_calls = 0usize;
+        let batch = frontier.dispatch_checked_ready(1, 1, guard, |_| {
+            resolve_calls += 1;
+            Ok(SocketAddr::from(([127, 0, 0, 1], 80)))
+        })?;
+
+        assert_eq!(resolve_calls, 0);
+        assert!(batch.dispatches.is_empty());
+        assert_eq!(batch.rejected.len(), 1);
+        assert!(matches!(
+            &batch.rejected[0].error,
+            CrawlDispatchError::Url(UrlBlocked { reason })
+                if reason.code == BlockCode::BlockedIp
+        ));
+        assert_eq!(frontier.snapshot().pending, 0);
+        assert_eq!(frontier.snapshot().inflight, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn checked_frontier_proxied_dispatch_validates_proxy_socket() -> Result<(), CrawlError> {
+        let mut frontier = CrawlFrontier::new(
+            CrawlPolicy::default()
+                .without_robots_txt()
+                .with_min_delay_ticks_per_origin(0),
+        );
+        frontier.enqueue(crawl_request("r1", "https://proxied.example/page"))?;
+
+        let url_policy = UrlPolicy::block_private();
+        let egress_policy = EgressPolicy::block_by_default().proxy_domain(
+            DomainRule::exact("proxied.example"),
+            ProxyRoute::new("proxy-a", "socks5://proxy.example:1080"),
+        );
+        let guard = CrawlDispatchGuard::new(&url_policy, &egress_policy);
+        let mut resolve_calls = 0usize;
+        let batch = frontier.dispatch_checked_ready(1, 1, guard, |dispatch| {
+            resolve_calls += 1;
+            assert_eq!(dispatch.request.url, "https://proxied.example/page");
+            Ok(SocketAddr::from(([93, 184, 216, 34], 1080)))
+        })?;
+
+        assert_eq!(resolve_calls, 1);
+        assert!(batch.rejected.is_empty());
+        assert_eq!(batch.dispatches.len(), 1);
+        let checked = &batch.dispatches[0];
+        assert_eq!(checked.resolved_socket.port(), 1080);
+        assert_eq!(checked.egress.domain, "proxied.example");
+        assert_eq!(checked.egress.port, 443);
+        assert_eq!(checked.egress.proxy_id.as_deref(), Some("proxy-a"));
+        assert_eq!(checked.audit.origin, "https://proxied.example");
+        assert_eq!(frontier.snapshot().pending, 0);
+        assert_eq!(frontier.snapshot().inflight, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn checked_frontier_proxied_dispatch_rejects_private_proxy_socket() -> Result<(), CrawlError> {
+        let mut frontier = CrawlFrontier::new(
+            CrawlPolicy::default()
+                .without_robots_txt()
+                .with_min_delay_ticks_per_origin(0),
+        );
+        frontier.enqueue(crawl_request("r1", "https://proxied.example/page"))?;
+
+        let url_policy = UrlPolicy::block_private();
+        let egress_policy = EgressPolicy::block_by_default().proxy_domain(
+            DomainRule::exact("proxied.example"),
+            ProxyRoute::new("proxy-a", "socks5://proxy.example:1080"),
+        );
+        let guard = CrawlDispatchGuard::new(&url_policy, &egress_policy);
+        let batch = frontier
+            .dispatch_checked_ready(1, 1, guard, |_| Ok(SocketAddr::from(([10, 0, 0, 5], 1080))))?;
+
+        assert!(batch.dispatches.is_empty());
+        assert_eq!(batch.rejected.len(), 1);
+        assert!(matches!(
+            &batch.rejected[0].error,
+            CrawlDispatchError::Url(UrlBlocked { reason })
+                if reason.code == BlockCode::BlockedIp
+                    && reason.detail.contains("resolved proxy IP")
+        ));
+        assert_eq!(frontier.snapshot().pending, 0);
+        assert_eq!(frontier.snapshot().inflight, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn checked_frontier_max_requests_bounds_url_policy_rejections() -> Result<(), CrawlError> {
+        let mut frontier = CrawlFrontier::new(
+            CrawlPolicy::default()
+                .without_robots_txt()
+                .with_min_delay_ticks_per_origin(0),
+        );
+        frontier.enqueue(crawl_request("a", "http://127.0.0.1/a"))?;
+        frontier.enqueue(crawl_request("b", "http://127.0.0.2/b"))?;
+
+        let url_policy = UrlPolicy::block_private();
+        let egress_policy = EgressPolicy::allow_all();
+        let guard = CrawlDispatchGuard::new(&url_policy, &egress_policy);
+        let mut resolve_calls = 0usize;
+        let batch = frontier.dispatch_checked_ready(1, 1, guard, |_| {
+            resolve_calls += 1;
+            Ok(SocketAddr::from(([127, 0, 0, 1], 80)))
+        })?;
+
+        assert_eq!(resolve_calls, 0);
+        assert_eq!(batch.rejected.len(), 1);
+        assert_eq!(frontier.snapshot().pending, 1);
+        assert_eq!(frontier.snapshot().inflight, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn checked_frontier_duplicate_active_request_id_does_not_resolve() -> Result<(), CrawlError> {
+        let mut frontier = CrawlFrontier::new(
+            CrawlPolicy::default()
+                .without_robots_txt()
+                .with_min_delay_ticks_per_origin(0),
+        );
+        frontier.enqueue(crawl_request("r1", "https://example.com/first"))?;
+        let url_policy = UrlPolicy::block_private();
+        let egress_policy = EgressPolicy::allow_all();
+        let guard = CrawlDispatchGuard::new(&url_policy, &egress_policy);
+        let first = frontier.dispatch_checked_ready(1, 1, guard, |_| {
+            Ok(SocketAddr::from(([93, 184, 216, 34], 443)))
+        })?;
+        assert_eq!(first.dispatches.len(), 1);
+        assert_eq!(frontier.snapshot().inflight, 1);
+
+        assert!(frontier.enqueue(crawl_request("r1", "https://example.com/second"))?);
+        let mut resolve_calls = 0usize;
+        let second = frontier.dispatch_checked_ready(2, 1, guard, |_| {
+            resolve_calls += 1;
+            Ok(SocketAddr::from(([93, 184, 216, 34], 443)))
+        })?;
+
+        assert_eq!(resolve_calls, 0);
+        assert!(second.dispatches.is_empty());
+        assert_eq!(
+            second.blocked,
+            vec![CrawlDecision::Block {
+                origin: "https://example.com".into(),
+                reason: "request id is already active".into(),
+            }]
+        );
+        assert_eq!(frontier.snapshot().pending, 0);
+        assert_eq!(frontier.snapshot().inflight, 1);
+        assert!(frontier.finish(
+            &NetworkResponseRecord::new("r1", "https://example.com/first", 200),
+            3,
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn checked_frontier_egress_denial_does_not_resolve() -> Result<(), CrawlError> {
+        let mut frontier = CrawlFrontier::new(
+            CrawlPolicy::default()
+                .without_robots_txt()
+                .with_min_delay_ticks_per_origin(0),
+        );
+        frontier.enqueue(crawl_request("r1", "https://blocked.example/page"))?;
+
+        let url_policy = UrlPolicy::block_private();
+        let egress_policy = EgressPolicy::block_by_default();
+        let guard = CrawlDispatchGuard::new(&url_policy, &egress_policy);
+        let mut resolve_calls = 0usize;
+        let batch = frontier.dispatch_checked_ready(1, 1, guard, |_| {
+            resolve_calls += 1;
+            Ok(SocketAddr::from(([93, 184, 216, 34], 443)))
+        })?;
+
+        assert_eq!(resolve_calls, 0);
+        assert!(batch.dispatches.is_empty());
+        assert_eq!(batch.rejected.len(), 1);
+        assert!(matches!(
+            &batch.rejected[0].error,
+            CrawlDispatchError::Egress(EgressDenied { domain, .. })
+                if domain == "blocked.example"
+        ));
+        assert_eq!(frontier.snapshot().pending, 0);
+        assert_eq!(frontier.snapshot().inflight, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn checked_frontier_activates_only_after_signed_policy_passes() -> Result<(), Box<dyn Error>> {
+        let key = WebBotAuthSigningKey::from_seed("tempo-agent", &[9u8; 32])?;
+        let mut frontier = CrawlFrontier::new(
+            CrawlPolicy::default()
+                .without_robots_txt()
+                .with_min_delay_ticks_per_origin(0),
+        );
+        frontier.enqueue(
+            crawl_request("r1", "https://example.com/page?query=signed").with_body_size(7),
+        )?;
+
+        let url_policy = UrlPolicy::block_private();
+        let egress_policy =
+            EgressPolicy::block_by_default().allow_domain(DomainRule::exact("example.com"));
+        let guard =
+            CrawlDispatchGuard::new(&url_policy, &egress_policy).with_signer(&key, 1_800_000_000);
+        let batch = frontier.dispatch_checked_ready(1, 1, guard, |_| {
+            Ok(SocketAddr::from(([93, 184, 216, 34], 443)))
+        })?;
+
+        assert_eq!(batch.dispatches.len(), 1);
+        assert!(batch.rejected.is_empty());
+        assert_eq!(frontier.snapshot().pending, 0);
+        assert_eq!(frontier.snapshot().inflight, 1);
+        let checked = &batch.dispatches[0];
+        assert_eq!(checked.audit.origin, "https://example.com");
+        assert_eq!(checked.egress.bytes_sent, 7);
+        let headers = checked
+            .web_bot_auth_headers
+            .as_ref()
+            .ok_or("expected Web Bot Auth headers")?;
+        verify_web_bot_auth_signature_at(
+            &checked.dispatch.request,
+            &headers.signature_input,
+            &headers.signature,
+            &key.verifier(),
+            1_800_000_000,
+        )?;
+
+        assert!(frontier.finish(
+            &NetworkResponseRecord::new("r1", "https://example.com/page?query=signed", 200),
+            2,
+        ));
+        assert_eq!(frontier.snapshot().inflight, 0);
+        Ok(())
+    }
+
+    fn crawl_request(id: &str, url: &str) -> NetworkRequest {
+        NetworkRequest::new(id, "GET", url, "profile-a", IdentityMode::AgentDeclared)
     }
 }
