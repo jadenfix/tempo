@@ -3236,8 +3236,8 @@ mod tests {
     /// `enforce_current_url_policy()` to catch.
     ///
     /// `enforce_current_url_policy()`'s job is the complementary case: the
-    /// driver has *already* navigated (here, via a real same-session,
-    /// in-page redirect, followed while the policy still allowed it) to a
+    /// driver has *already* navigated (here, via a real same-session HTTP
+    /// redirect, followed while the policy still allowed it) to a
     /// host that becomes disallowed afterward — e.g. an operator narrows the
     /// policy mid-task without issuing any further navigation. Every
     /// DOM-touching operation must refuse to keep reading that page, purely
@@ -3259,26 +3259,10 @@ mod tests {
             .await?
             .allow_private_network_access();
 
-        // Land on the start page under the permissive test policy.
-        let observation = driver.goto(&fixture.start_url()).await?;
-        let go_node = observation
-            .elements
-            .iter()
-            .find(|element| {
-                element.role == "link"
-                    && element.name.first().map(|span| span.text.as_str()) == Some("Go")
-            })
-            .map(|element| element.node_id.clone())
-            .ok_or_else(|| std::io::Error::other("missing start-page Go link"))?;
-
-        // Perform the in-session redirect while the policy still allows it.
-        let outcome = driver.act(&Action::Click { node: go_node }).await?;
-        assert!(matches!(outcome, StepOutcome::Applied { .. }));
-
         // Allow case: guarded operations still succeed on the redirected
         // page while the policy allows it, and give us grounded node ids for
         // the block-case assertions below.
-        let observation = driver.observe().await?;
+        let observation = driver.goto(&fixture.redirect_url()).await?;
         let save_node = observation
             .elements
             .iter()
@@ -3697,16 +3681,16 @@ mod tests {
     }
 
     impl RedirectGuardFixture {
-        fn start_url(&self) -> String {
-            format!("{}/start", self.origin)
+        fn redirect_url(&self) -> String {
+            format!("{}/redirect", self.origin)
         }
     }
 
-    /// Fixture for the mid-session redirect / current-url guard test: `/start`
-    /// links to `/after-redirect`, whose page carries the same
-    /// button+textbox shape as [`serve_fixture`] so click/type/extract
-    /// call paths have real elements to ground against on the far side of
-    /// the redirect.
+    /// Fixture for the mid-session redirect / current-url guard test:
+    /// `/redirect` returns an HTTP 302 to `/after-redirect`, whose page carries
+    /// the same button+textbox shape as [`serve_fixture`] so click/type/extract
+    /// call paths have real elements to ground against on the far side of the
+    /// redirect.
     fn serve_redirect_guard_fixture() -> Result<RedirectGuardFixture, std::io::Error> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let addr = listener.local_addr()?;
@@ -3718,11 +3702,9 @@ mod tests {
                 };
                 let path = read_request_path(&mut stream).unwrap_or_default();
                 let response = match path.as_str() {
-                    "/start" => http_response(
-                        "200 OK",
-                        "text/html",
-                        r#"<!doctype html><html><body><a id="go" href="/after-redirect">Go</a></body></html>"#,
-                    ),
+                    "/redirect" => {
+                        "HTTP/1.1 302 Found\r\nLocation: /after-redirect\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                    }
                     "/after-redirect" => http_response(
                         "200 OK",
                         "text/html",
