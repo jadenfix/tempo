@@ -1517,7 +1517,7 @@ async fn install_request_policy(
     blocked_request_url: Arc<Mutex<Option<String>>>,
     request_policy_tracker: Arc<RequestPolicyTracker>,
 ) -> Result<JoinHandle<()>, TransportError> {
-    let mut request_paused = page
+    let request_paused = page
         .event_listener::<EventRequestPaused>()
         .await
         .map_err(map_cdp_error)?;
@@ -1535,45 +1535,98 @@ async fn install_request_policy(
     .map_err(map_cdp_error)?;
 
     let page = page.clone();
-    Ok(tokio::spawn(async move {
-        while let Some(event) = request_paused.next().await {
-            let seq = request_policy_tracker.start_request();
-            let request_url = event.request.url.clone();
-            let policy = match url_policy.lock() {
-                Ok(policy) => Some(policy.clone()),
-                Err(_error) => None,
-            };
-            let allowed = match policy {
-                Some(policy) => enforce_url_policy(&request_url, &policy).is_ok(),
-                None => false,
-            };
-
-            let (request_handled, blocked_url) = if allowed {
-                (
-                    page.execute(ContinueRequestParams::new(event.request_id.clone()))
-                        .await
-                        .is_ok(),
-                    None,
+    Ok(tokio::spawn(run_request_policy_loop(
+        request_paused,
+        move |event| {
+            let page = page.clone();
+            let url_policy = url_policy.clone();
+            let blocked_request_url = blocked_request_url.clone();
+            let request_policy_tracker = request_policy_tracker.clone();
+            async move {
+                resume_paused_request(
+                    &page,
+                    &url_policy,
+                    &blocked_request_url,
+                    &request_policy_tracker,
+                    &event,
                 )
-            } else {
-                mark_blocked_request_url(&blocked_request_url, &request_url);
-                (
-                    page.execute(FailRequestParams::new(
-                        event.request_id.clone(),
-                        ErrorReason::BlockedByClient,
-                    ))
-                    .await
-                    .is_ok(),
-                    Some(request_url),
-                )
-            };
-            request_policy_tracker.finish_request(seq, blocked_url);
-
-            if !request_handled {
-                break;
+                .await;
             }
-        }
-    }))
+        },
+    )))
+}
+
+/// Pumps `Fetch.requestPaused` events, resuming each on its own task.
+///
+/// Two properties matter here (see #441):
+/// * The pump exits **only** when the event stream itself ends. A single
+///   request's continue/fail failure is handled inside `resume` and never
+///   terminates the loop — otherwise one routine race (`Fetch.continueRequest`
+///   rejected with "Invalid InterceptionId") would leave interception installed
+///   while the pump is gone, hanging every later paused request forever.
+/// * Each request is resumed on its own `tokio::spawn` task, so paused requests
+///   continue/fail concurrently instead of serializing one CDP round-trip at a
+///   time behind the event pump.
+async fn run_request_policy_loop<T, S, R, Fut>(mut request_paused: S, resume: R)
+where
+    S: futures::Stream<Item = T> + Unpin,
+    R: Fn(T) -> Fut,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    while let Some(event) = request_paused.next().await {
+        tokio::spawn(resume(event));
+    }
+}
+
+/// Applies the URL policy to a single paused request and continues or fails it.
+///
+/// A failed continue/fail CDP command is **non-fatal**: it is logged and
+/// swallowed because Chrome rejects `Fetch.continueRequest`/`failRequest`
+/// routinely under races (request cancelled mid-navigation, redirect races,
+/// target detach). `finish_request` always runs so the tracker never leaks a
+/// `seq`, even when the CDP command errors.
+async fn resume_paused_request(
+    page: &Page,
+    url_policy: &Arc<Mutex<UrlPolicy>>,
+    blocked_request_url: &Arc<Mutex<Option<String>>>,
+    request_policy_tracker: &RequestPolicyTracker,
+    event: &EventRequestPaused,
+) {
+    let seq = request_policy_tracker.start_request();
+    let request_url = event.request.url.clone();
+    let policy = match url_policy.lock() {
+        Ok(policy) => Some(policy.clone()),
+        Err(_error) => None,
+    };
+    let allowed = match policy {
+        Some(policy) => enforce_url_policy(&request_url, &policy).is_ok(),
+        None => false,
+    };
+
+    let (result, blocked_url) = if allowed {
+        (
+            page.execute(ContinueRequestParams::new(event.request_id.clone()))
+                .await
+                .map(|_| ()),
+            None,
+        )
+    } else {
+        mark_blocked_request_url(blocked_request_url, &request_url);
+        (
+            page.execute(FailRequestParams::new(
+                event.request_id.clone(),
+                ErrorReason::BlockedByClient,
+            ))
+            .await
+            .map(|_| ()),
+            Some(request_url.clone()),
+        )
+    };
+
+    if let Err(error) = result {
+        eprintln!("tempo-engine-cdp: failed to resume paused request {request_url}: {error}");
+    }
+    request_policy_tracker.finish_request(seq, blocked_url);
 }
 
 struct PolicyProxy {
@@ -3653,6 +3706,48 @@ mod tests {
             Ok(()) => {}
             Err(error) => panic!("late request finisher task failed: {error}"),
         }
+    }
+
+    // Regression for #441: a per-request continue/fail failure must NOT terminate
+    // the interception pump. Every event, including ones whose resume "fails",
+    // has to be processed and finished (no leaked seq); the loop may only end when
+    // the event stream itself ends.
+    #[tokio::test]
+    async fn request_policy_loop_survives_per_request_failures() {
+        const REQUESTS: u64 = 8;
+        let tracker = Arc::new(RequestPolicyTracker::new());
+        let (processed_tx, mut processed_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let events = futures::stream::iter(0..REQUESTS);
+        let resume_tracker = tracker.clone();
+        run_request_policy_loop(events, move |_event| {
+            let tracker = resume_tracker.clone();
+            let processed_tx = processed_tx.clone();
+            async move {
+                let seq = tracker.start_request();
+                // Model `Fetch.continueRequest` being rejected under a race: the
+                // real resume helper swallows the error, so finish_request still
+                // runs and the pump keeps going.
+                tracker.finish_request(seq, None);
+                let _ = processed_tx.send(seq);
+            }
+        })
+        .await;
+
+        // The loop returned because the stream ended — not because an early
+        // failure broke it — after spawning a task for every event.
+        let mut processed = 0usize;
+        while processed_rx.recv().await.is_some() {
+            processed += 1;
+        }
+        assert_eq!(
+            processed, REQUESTS as usize,
+            "every paused request must be resumed despite per-request failures"
+        );
+        assert!(
+            !tracker.has_pending_since(0),
+            "finish_request must run for every request so no seq leaks"
+        );
     }
 
     #[test]
