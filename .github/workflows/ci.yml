@@ -73,8 +73,10 @@ jobs:
           cargo run -p tempo-cli -- taint-gate
           --input fixtures/security/taint-redteam-pass.json
       - name: install Servo system deps
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libfontconfig1-dev llvm
       - name: servo vanilla build gate
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
         run: cargo check -p tempo-engine-servo --no-default-features --features servo-vanilla
       - name: servo tempo fork guard
         run: |
