@@ -180,6 +180,19 @@ impl TempodServerConfig {
             "non-loopback tempod bind {addr:?} requires --allow-remote and {TEMPO_TEMPOD_AUTH_TOKEN_ENV} or --auth-token"
         )))
     }
+
+    fn validate_listener(&self, listener: &TcpListener) -> Result<(), TempodError> {
+        let addr = listener.local_addr()?;
+        if addr.ip().is_loopback() {
+            return Ok(());
+        }
+        if self.allow_remote_binds && self.auth.is_required() {
+            return Ok(());
+        }
+        Err(TempodError::BadRequest(format!(
+            "non-loopback tempod listener {addr:?} requires allow_remote_binds() and TempodAuth::bearer(...)"
+        )))
+    }
 }
 
 /// Stable tempod session id.
@@ -1438,7 +1451,7 @@ pub fn run_tempod_with_config(addr: &str, config: TempodServerConfig) -> Result<
     config.validate_bind_addr(addr)?;
     let listener = TcpListener::bind(addr)?;
     let pool = Arc::new(Mutex::new(SessionPool::from_env()));
-    serve_forever_with_auth(listener, pool, config.auth)
+    serve_forever_with_config(listener, pool, config)
 }
 
 /// Run tempod with an already-running engine reachable through the UDS driver protocol.
@@ -1460,7 +1473,7 @@ pub fn run_tempod_with_attached_driver_config(
     let listener = TcpListener::bind(addr)?;
     let mut pool = SessionPool::from_env();
     pool.attach_engine_driver(engine, connect_engine_ipc(socket_path)?);
-    serve_forever_with_auth(listener, Arc::new(Mutex::new(pool)), config.auth)
+    serve_forever_with_config(listener, Arc::new(Mutex::new(pool)), config)
 }
 
 /// Connect to the engine host UDS and apply an IPC read/write timeout so a
@@ -1571,7 +1584,7 @@ pub fn serve_forever(
     listener: TcpListener,
     pool: Arc<Mutex<SessionPool>>,
 ) -> Result<(), TempodError> {
-    serve_forever_with_auth(listener, pool, TempodAuth::disabled())
+    serve_forever_with_config(listener, pool, TempodServerConfig::default())
 }
 
 pub fn serve_forever_with_auth(
@@ -1579,7 +1592,16 @@ pub fn serve_forever_with_auth(
     pool: Arc<Mutex<SessionPool>>,
     auth: TempodAuth,
 ) -> Result<(), TempodError> {
-    serve_forever_with_auth_and_limits(listener, pool, auth, ConnectionLimiter::default())
+    serve_forever_with_config(listener, pool, TempodServerConfig::new().with_auth(auth))
+}
+
+pub fn serve_forever_with_config(
+    listener: TcpListener,
+    pool: Arc<Mutex<SessionPool>>,
+    config: TempodServerConfig,
+) -> Result<(), TempodError> {
+    config.validate_listener(&listener)?;
+    serve_forever_trusted(listener, pool, config.auth, ConnectionLimiter::default())
 }
 
 #[cfg(test)]
@@ -1588,10 +1610,10 @@ fn serve_forever_with_limits(
     pool: Arc<Mutex<SessionPool>>,
     limiter: ConnectionLimiter,
 ) -> Result<(), TempodError> {
-    serve_forever_with_auth_and_limits(listener, pool, TempodAuth::disabled(), limiter)
+    serve_forever_trusted(listener, pool, TempodAuth::disabled(), limiter)
 }
 
-fn serve_forever_with_auth_and_limits(
+fn serve_forever_trusted(
     listener: TcpListener,
     pool: Arc<Mutex<SessionPool>>,
     auth: TempodAuth,
@@ -1625,7 +1647,7 @@ fn serve_forever_with_auth_and_limits(
 
 /// Serve exactly one HTTP request. Tests use this against a real TCP listener.
 pub fn serve_one(listener: TcpListener, pool: Arc<Mutex<SessionPool>>) -> Result<(), TempodError> {
-    serve_one_with_auth(listener, pool, TempodAuth::disabled())
+    serve_one_with_config(listener, pool, TempodServerConfig::default())
 }
 
 pub fn serve_one_with_auth(
@@ -1633,10 +1655,19 @@ pub fn serve_one_with_auth(
     pool: Arc<Mutex<SessionPool>>,
     auth: TempodAuth,
 ) -> Result<(), TempodError> {
-    serve_one_with_auth_and_limits(listener, pool, auth, ConnectionLimiter::default())
+    serve_one_with_config(listener, pool, TempodServerConfig::new().with_auth(auth))
 }
 
-fn serve_one_with_auth_and_limits(
+pub fn serve_one_with_config(
+    listener: TcpListener,
+    pool: Arc<Mutex<SessionPool>>,
+    config: TempodServerConfig,
+) -> Result<(), TempodError> {
+    config.validate_listener(&listener)?;
+    serve_one_trusted(listener, pool, config.auth, ConnectionLimiter::default())
+}
+
+fn serve_one_trusted(
     listener: TcpListener,
     pool: Arc<Mutex<SessionPool>>,
     auth: TempodAuth,
@@ -6182,6 +6213,70 @@ mod tests {
             .with_auth(TempodAuth::bearer("secret-token")?)
             .validate_bind_addr("0.0.0.0:8787")
             .is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn listener_apis_reject_non_loopback_without_remote_policy() -> TestResult {
+        let pool = Arc::new(Mutex::new(SessionPool::default()));
+
+        let listener = TcpListener::bind("0.0.0.0:0")?;
+        assert!(matches!(
+            serve_forever(listener, Arc::clone(&pool)),
+            Err(TempodError::BadRequest(_))
+        ));
+
+        let listener = TcpListener::bind("0.0.0.0:0")?;
+        assert!(matches!(
+            serve_forever_with_auth(
+                listener,
+                Arc::clone(&pool),
+                TempodAuth::bearer("secret-token")?
+            ),
+            Err(TempodError::BadRequest(_))
+        ));
+
+        let listener = TcpListener::bind("0.0.0.0:0")?;
+        assert!(matches!(
+            serve_one(listener, Arc::clone(&pool)),
+            Err(TempodError::BadRequest(_))
+        ));
+
+        let listener = TcpListener::bind("0.0.0.0:0")?;
+        assert!(matches!(
+            serve_one_with_config(
+                listener,
+                pool,
+                TempodServerConfig::new().allow_remote_binds()
+            ),
+            Err(TempodError::BadRequest(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn listener_config_allows_non_loopback_with_remote_flag_and_auth() -> TestResult {
+        let listener = TcpListener::bind("0.0.0.0:0")?;
+        let connect_addr =
+            std::net::SocketAddr::from(([127, 0, 0, 1], listener.local_addr()?.port()));
+        let pool = Arc::new(Mutex::new(SessionPool::default()));
+        let config = TempodServerConfig::new()
+            .allow_remote_binds()
+            .with_auth(TempodAuth::bearer("secret-token")?);
+        let handle = thread::spawn(move || serve_one_with_config(listener, pool, config));
+        let body = r#"{"url":"https://one.test"}"#;
+
+        let response = send_http(
+            connect_addr,
+            &format!(
+                "POST /sessions HTTP/1.1\r\nauthorization: Bearer secret-token\r\ncontent-length: {}\r\n\r\n{body}",
+                body.len()
+            ),
+        )?;
+        join_server(handle)?;
+
+        assert!(response.starts_with("HTTP/1.1 201 Created"));
+        assert!(response.contains("\"id\":\"session-0\""));
         Ok(())
     }
 
