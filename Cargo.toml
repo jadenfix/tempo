@@ -18,6 +18,7 @@ thiserror = "2"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(tempo_servo_fork_source)", "cfg(tempo_servo_fork_lock_checked)"] }
 
 [workspace.lints.clippy]
 unwrap_used = "deny"

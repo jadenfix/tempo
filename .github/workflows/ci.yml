@@ -42,8 +42,12 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings -D clippy::unwrap_used -D clippy::expect_used
       - name: servo public API boundary
         run: bash scripts/check-servo-public-api.sh
+      - name: servo tempo fork script syntax
+        run: bash -n scripts/check-servo-tempo-fork.sh
       - name: cargo test (contracts + conformance)
         run: cargo test --workspace
+      - name: bidi standard-client smoke
+        run: cargo test -p tempo-headless bidi_standard_client_smoke -- --nocapture
       - name: cargo test (toolexec live beatbox)
         run: cargo test --manifest-path tests/toolexec-live/Cargo.toml
       - name: eval budget fixture gate
@@ -72,6 +76,17 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libfontconfig1-dev llvm
       - name: servo vanilla build gate
         run: cargo check -p tempo-engine-servo --no-default-features --features servo-vanilla
+      - name: servo tempo fork guard
+        run: |
+          set -euo pipefail
+          if cargo check -p tempo-engine-servo --no-default-features --features servo-tempo 2>servo-tempo-bare.log; then
+            echo "bare servo-tempo feature unexpectedly compiled without the fork patch"
+            exit 1
+          fi
+          grep -F "servo-tempo requires the pinned Tempo Servo fork patch" servo-tempo-bare.log
+      - name: servo tempo fork build gate
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        run: bash scripts/check-servo-tempo-fork.sh
 
   live-cdp:
     runs-on: ubuntu-latest

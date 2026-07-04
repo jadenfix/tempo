@@ -28,3 +28,15 @@ observation, action, network, runtime, protocol, shell, eval, and compatibility 
 ```
 cargo test --workspace   # contracts, conformance, runtime, protocol, and shell tests
 ```
+
+Servo compatibility has two lanes: `servo-vanilla` stays pinned to the upstream
+crates.io Servo package, while `servo-tempo` is source-gated for the compatible
+Tempo fork at `https://github.com/jadenfix/servo`. Cargo features cannot select
+a git source by themselves, so validate the fork lane through the pinned patch
+script. A bare `--features servo-tempo` build fails fast instead of linking
+upstream Servo while reporting fork metadata. The script restores the default
+lockfile state when it exits:
+
+```
+scripts/check-servo-tempo-fork.sh
+```

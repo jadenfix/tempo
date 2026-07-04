@@ -22,13 +22,25 @@ use tempo_net::{
 use tempo_schema::{Action, ActionBatch, CompiledObservation, NodeId, ObservationDiff};
 use thiserror::Error;
 
-#[cfg(feature = "servo-vanilla")]
+#[cfg(all(
+    feature = "servo-tempo",
+    not(all(tempo_servo_fork_source, tempo_servo_fork_lock_checked))
+))]
+compile_error!(
+    "servo-tempo requires the pinned Tempo Servo fork patch; run scripts/check-servo-tempo-fork.sh"
+);
+
+#[cfg(any(feature = "servo-vanilla", feature = "servo-tempo"))]
 mod servo_embedder;
 
 /// Default cap for a Servo-intercepted network response body reissued through tempo-net.
 pub const DEFAULT_MAX_SERVO_RESPONSE_BODY_BYTES: usize = 10 * 1024 * 1024;
 pub const MAX_SERVO_REDIRECTS: usize = 10;
 pub const PINNED_VANILLA_SERVO_VERSION: &str = "0.3.0";
+pub const UPSTREAM_SERVO_REPOSITORY: &str = "https://github.com/servo/servo";
+pub const TEMPO_SERVO_FORK_REPOSITORY: &str = "https://github.com/jadenfix/servo";
+pub const TEMPO_SERVO_FORK_BRANCH: &str = "main";
+pub const TEMPO_SERVO_FORK_REVISION: &str = "2947819ecbba89906b2e76b428c8fef782adff11";
 
 /// Which Servo build is backing this engine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -99,10 +111,46 @@ impl ServoEngineConfig {
 pub struct ServoVanillaBuildPlan {
     pub servo_crate_version: String,
     pub build_flavor: ServoBuildFlavor,
+    pub source: ServoSourcePin,
     pub viewport: Viewport,
     pub user_agent: String,
     pub access_tree: bool,
     pub intercept_network: bool,
+}
+
+/// Reproducible Servo source metadata for the selected engine lane.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServoSourcePin {
+    pub crate_name: String,
+    pub crate_version: String,
+    pub upstream_repository: String,
+    pub fork_repository: Option<String>,
+    pub fork_branch: Option<String>,
+    pub fork_revision: Option<String>,
+}
+
+impl ServoSourcePin {
+    pub fn vanilla() -> Self {
+        Self {
+            crate_name: "servo".into(),
+            crate_version: PINNED_VANILLA_SERVO_VERSION.into(),
+            upstream_repository: UPSTREAM_SERVO_REPOSITORY.into(),
+            fork_repository: None,
+            fork_branch: None,
+            fork_revision: None,
+        }
+    }
+
+    pub fn tempo_fork() -> Self {
+        Self {
+            crate_name: "servo".into(),
+            crate_version: PINNED_VANILLA_SERVO_VERSION.into(),
+            upstream_repository: UPSTREAM_SERVO_REPOSITORY.into(),
+            fork_repository: Some(TEMPO_SERVO_FORK_REPOSITORY.into()),
+            fork_branch: Some(TEMPO_SERVO_FORK_BRANCH.into()),
+            fork_revision: Some(TEMPO_SERVO_FORK_REVISION.into()),
+        }
+    }
 }
 
 #[cfg(feature = "servo-vanilla")]
@@ -119,6 +167,33 @@ pub fn vanilla_servo_build_plan(
     Err(Unsupported(
         "vanilla Servo embedder requires the servo-vanilla feature",
     ))
+}
+
+#[cfg(all(
+    feature = "servo-tempo",
+    tempo_servo_fork_source,
+    tempo_servo_fork_lock_checked
+))]
+pub fn tempo_servo_build_plan(
+    config: &ServoEngineConfig,
+) -> Result<ServoVanillaBuildPlan, Unsupported> {
+    servo_embedder::VanillaServoEmbedderPlan::from_tempo_fork_config(config).map(Into::into)
+}
+
+#[cfg(not(feature = "servo-tempo"))]
+pub fn tempo_servo_build_plan(
+    _config: &ServoEngineConfig,
+) -> Result<ServoVanillaBuildPlan, Unsupported> {
+    Err(Unsupported(
+        "tempo Servo fork embedder requires the servo-tempo feature",
+    ))
+}
+
+pub fn servo_build_plan(config: &ServoEngineConfig) -> Result<ServoVanillaBuildPlan, Unsupported> {
+    match config.build_flavor {
+        ServoBuildFlavor::Vanilla => vanilla_servo_build_plan(config),
+        ServoBuildFlavor::TempoFork => tempo_servo_build_plan(config),
+    }
 }
 
 /// Servo-backed driver handle connected to an out-of-process Servo engine.
@@ -1077,6 +1152,7 @@ mod tests {
             let plan = result?;
             assert_eq!(plan.servo_crate_version, PINNED_VANILLA_SERVO_VERSION);
             assert_eq!(plan.build_flavor, ServoBuildFlavor::Vanilla);
+            assert_eq!(plan.source, ServoSourcePin::vanilla());
             assert_eq!(plan.viewport, config.viewport);
             assert_eq!(plan.user_agent, config.user_agent);
             assert!(plan.access_tree);
@@ -1086,6 +1162,68 @@ mod tests {
         #[cfg(not(feature = "servo-vanilla"))]
         {
             assert!(matches!(result, Err(Unsupported(_))));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn tempo_servo_build_plan_documents_fork_source() -> TestResult {
+        let config = ServoEngineConfig::tempo_fork();
+
+        let result = tempo_servo_build_plan(&config);
+
+        #[cfg(all(
+            feature = "servo-tempo",
+            tempo_servo_fork_source,
+            tempo_servo_fork_lock_checked
+        ))]
+        {
+            let plan = result?;
+            assert_eq!(plan.servo_crate_version, PINNED_VANILLA_SERVO_VERSION);
+            assert_eq!(plan.build_flavor, ServoBuildFlavor::TempoFork);
+            assert_eq!(plan.source, ServoSourcePin::tempo_fork());
+            assert_eq!(
+                plan.source.fork_repository.as_deref(),
+                Some(TEMPO_SERVO_FORK_REPOSITORY)
+            );
+            assert_eq!(
+                plan.source.fork_revision.as_deref(),
+                Some(TEMPO_SERVO_FORK_REVISION)
+            );
+        }
+
+        #[cfg(not(feature = "servo-tempo"))]
+        {
+            assert!(matches!(result, Err(Unsupported(_))));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn servo_build_plan_routes_by_build_flavor() -> TestResult {
+        let vanilla_result = servo_build_plan(&ServoEngineConfig::vanilla());
+        let fork_result = servo_build_plan(&ServoEngineConfig::tempo_fork());
+
+        #[cfg(feature = "servo-vanilla")]
+        {
+            assert_eq!(vanilla_result?.build_flavor, ServoBuildFlavor::Vanilla);
+        }
+        #[cfg(not(feature = "servo-vanilla"))]
+        {
+            assert!(matches!(vanilla_result, Err(Unsupported(_))));
+        }
+
+        #[cfg(all(
+            feature = "servo-tempo",
+            tempo_servo_fork_source,
+            tempo_servo_fork_lock_checked
+        ))]
+        {
+            assert_eq!(fork_result?.build_flavor, ServoBuildFlavor::TempoFork);
+        }
+        #[cfg(not(feature = "servo-tempo"))]
+        {
+            assert!(matches!(fork_result, Err(Unsupported(_))));
         }
         Ok(())
     }

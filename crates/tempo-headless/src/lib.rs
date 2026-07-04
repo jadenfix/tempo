@@ -12,7 +12,7 @@ use serde_json::json;
 use sha1::{Digest, Sha1};
 use std::collections::BTreeMap;
 use std::fmt;
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -20,6 +20,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use tempo_agent::StepTriple;
+use tempo_agent::StepTripleOutcome;
 use tempo_bidi::{
     browsing_context_load, network_before_request_sent, network_response_completed, BidiErrorCode,
     BidiEventMethod, BidiMessage, BidiRouter, BrowsingContextId, BrowsingContextInfo,
@@ -38,6 +39,7 @@ use tempo_engine_host::{
 use tempo_policy::{decide_action, decide_effect, InputTaint, PolicyDecision};
 use tempo_schema::{Action, ActionBatch, CompiledObservation, NodeId, ObservationDiff, SideEffect};
 use thiserror::Error;
+use url::Url;
 
 const MAX_HTTP_BYTES: usize = 64 * 1024;
 const MAX_WS_PAYLOAD_BYTES: u64 = MAX_HTTP_BYTES as u64;
@@ -63,12 +65,17 @@ const ENGINE_IPC_TIMEOUT: Duration = Duration::from_secs(30);
 const ENGINE_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(test)]
 const ENGINE_TEARDOWN_TIMEOUT: Duration = Duration::from_millis(200);
+#[cfg(not(test))]
+const SESSION_CREATE_TIMEOUT: Duration = Duration::from_secs(65);
+#[cfg(test)]
+const SESSION_CREATE_TIMEOUT: Duration = Duration::from_millis(200);
 const WS_ACCEPT_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const WS_OPCODE_TEXT: u8 = 0x1;
 const WS_OPCODE_BINARY: u8 = 0x2;
 const WS_OPCODE_CLOSE: u8 = 0x8;
 const WS_OPCODE_PING: u8 = 0x9;
 const WS_OPCODE_PONG: u8 = 0xA;
+const REDACTED_MARKER: &str = "[redacted]";
 pub const TEMPO_OTLP_JSONL_ENV: &str = "TEMPO_OTLP_JSONL";
 
 /// Stable tempod session id.
@@ -91,6 +98,14 @@ pub struct TempodSession {
     pub url: String,
     pub state: TempodSessionState,
     pub created_ms: u128,
+}
+
+/// Best-effort OTLP JSONL exporter health surfaced on `/health`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct OtlpExportStatus {
+    pub enabled: bool,
+    pub failures: u64,
+    pub last_error: Option<String>,
 }
 
 /// One event in tempod's per-session control-plane log.
@@ -128,6 +143,12 @@ impl AttachedEngineDriver {
             client: Arc::new(Mutex::new(client)),
             driver_id: None,
         }
+    }
+
+    fn same_engine_connection(&self, other: &Self) -> bool {
+        self.engine == other.engine
+            && self.driver_id == other.driver_id
+            && Arc::ptr_eq(&self.client, &other.client)
     }
 
     fn request(&self, command: HostDriverCommand) -> Result<DriverResponse, DriverClientError> {
@@ -357,6 +378,8 @@ pub struct SessionPool {
     session_drivers: BTreeMap<TempodSessionId, AttachedEngineDriver>,
     events: BTreeMap<TempodSessionId, Vec<TempodSessionEvent>>,
     otlp_exporter: Option<OtlpJsonExporter>,
+    otlp_export_failures: u64,
+    otlp_last_export_error: Option<String>,
     bidi: BidiRouter,
     driver: Option<AttachedEngineDriver>,
     mcp: Option<Arc<Mutex<tempo_mcp::TempoMcpServer<AttachedEngineDriver>>>>,
@@ -374,6 +397,7 @@ impl fmt::Debug for SessionPool {
             .field("session_drivers", &self.session_drivers.keys())
             .field("event_sessions", &self.events.len())
             .field("otlp_exporter", &self.otlp_exporter)
+            .field("otlp_export_failures", &self.otlp_export_failures)
             .field("bidi", &self.bidi)
             .field("driver", &self.driver)
             .field("mcp_attached", &self.mcp.is_some())
@@ -404,10 +428,20 @@ impl SessionPool {
 
     pub fn set_otlp_exporter(&mut self, exporter: Option<OtlpJsonExporter>) {
         self.otlp_exporter = exporter;
+        self.otlp_export_failures = 0;
+        self.otlp_last_export_error = None;
     }
 
     pub fn otlp_exporter(&self) -> Option<&OtlpJsonExporter> {
         self.otlp_exporter.as_ref()
+    }
+
+    pub fn otlp_export_status(&self) -> OtlpExportStatus {
+        OtlpExportStatus {
+            enabled: self.otlp_exporter.is_some(),
+            failures: self.otlp_export_failures,
+            last_error: self.otlp_last_export_error.clone(),
+        }
     }
 
     pub fn create(&mut self, url: impl Into<String>) -> Result<TempodSession, TempodError> {
@@ -416,6 +450,17 @@ impl SessionPool {
         }
         let url = url.into();
         let session_driver = self.create_session_engine_context(&url)?;
+        self.insert_created_session(url, session_driver)
+    }
+
+    fn insert_created_session(
+        &mut self,
+        url: String,
+        session_driver: Option<AttachedEngineDriver>,
+    ) -> Result<TempodSession, TempodError> {
+        if self.draining {
+            return Err(TempodError::Draining);
+        }
         let id = TempodSessionId(format!("session-{}", self.next_id));
         self.next_id = self.next_id.saturating_add(1);
         let session = TempodSession {
@@ -629,27 +674,11 @@ impl SessionPool {
         &mut self,
         url: &str,
     ) -> Result<Option<AttachedEngineDriver>, TempodError> {
-        let Some(root_driver) = self.driver.as_mut() else {
-            return Ok(None);
-        };
-        let options = BrowsingContextCreateOptions {
-            kind: BrowsingContextKind::Tab,
-            background: true,
-        };
-        let mut session_driver =
-            futures::executor::block_on(root_driver.create_browsing_context_attached(options))
-                .map_err(|error| {
-                    TempodError::Driver(format!(
-                        "attached engine failed to create session context: {error}"
-                    ))
-                })?;
-        if let Err(error) = futures::executor::block_on(session_driver.goto(url)) {
-            let _ = futures::executor::block_on(session_driver.close());
-            return Err(TempodError::Driver(format!(
-                "attached engine failed to navigate session context: {error}"
-            )));
+        let (result, timed_out) = create_session_engine_context_from_root(self.driver.clone(), url);
+        if timed_out {
+            self.detach_attached_engine_after_session_create_timeout();
         }
-        Ok(Some(session_driver))
+        result
     }
 
     /// Best-effort close of one session-owned engine context. Session lifecycle
@@ -741,11 +770,15 @@ impl SessionPool {
             "tempod: {label} was abandoned while sharing the attached engine IPC; \
              detaching engine state to avoid future pool-lock stalls (#200)"
         );
-        self.driver = None;
-        self.mcp = None;
-        self.session_drivers.clear();
-        self.bidi_contexts.clear();
-        self.next_bidi_context_id = 1;
+        self.bounded_engine_teardown(true, Duration::ZERO);
+    }
+
+    fn detach_attached_engine_after_session_create_timeout(&mut self) {
+        eprintln!(
+            "tempod: session-create engine navigation was abandoned while sharing the attached \
+             engine IPC; detaching engine state to avoid future pool-lock stalls (#213)"
+        );
+        self.bounded_engine_teardown(false, Duration::ZERO);
     }
 
     fn bidi_driver_for(&self, context: &BrowsingContextId) -> Option<AttachedEngineDriver> {
@@ -783,8 +816,15 @@ impl SessionPool {
         if !self.sessions.contains_key(id) {
             return Err(TempodError::SessionNotFound(id.clone()));
         }
-        if let Some(exporter) = &self.otlp_exporter {
-            exporter.export_step(&triple)?;
+        if let Some(exporter) = &self.otlp_exporter
+            && let Err(error) = exporter.export_step(&triple)
+        {
+            self.otlp_export_failures = self.otlp_export_failures.saturating_add(1);
+            self.otlp_last_export_error = Some(error.to_string());
+            eprintln!(
+                "tempod: failed to export OTLP step telemetry to {}: {error}",
+                exporter.path().display()
+            );
         }
         Ok(self.record_event(id, TempodSessionEventKind::StepTriple { triple }))
     }
@@ -886,6 +926,102 @@ where
     }
 }
 
+fn run_create_bounded<T, F, C>(timeout: Duration, op: F, on_orphan: C) -> Option<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+    C: FnOnce(T) + Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        if let Err(std::sync::mpsc::SendError(orphaned)) = tx.send(op()) {
+            on_orphan(orphaned);
+        }
+    });
+
+    match rx.recv_timeout(timeout) {
+        Ok(result) => Some(result),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            eprintln!(
+                "tempod: session-create engine navigation did not complete within {timeout:?}; \
+                 detaching the shared engine so the pool lock is released (#213)"
+            );
+            None
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            eprintln!("tempod: session-create engine worker ended without a result");
+            None
+        }
+    }
+}
+
+fn create_session_engine_context_from_root(
+    root_driver: Option<AttachedEngineDriver>,
+    url: &str,
+) -> (Result<Option<AttachedEngineDriver>, TempodError>, bool) {
+    let Some(mut worker_driver) = root_driver else {
+        return (Ok(None), false);
+    };
+    let url = url.to_string();
+    let outcome = run_create_bounded(
+        SESSION_CREATE_TIMEOUT,
+        move || -> Result<AttachedEngineDriver, TempodError> {
+            let options = BrowsingContextCreateOptions {
+                kind: BrowsingContextKind::Tab,
+                background: true,
+            };
+            let mut session_driver = futures::executor::block_on(
+                worker_driver.create_browsing_context_attached(options),
+            )
+            .map_err(|error| {
+                TempodError::Driver(format!(
+                    "attached engine failed to create session context: {error}"
+                ))
+            })?;
+            if let Err(error) = futures::executor::block_on(session_driver.goto(&url)) {
+                let _ = futures::executor::block_on(session_driver.close());
+                return Err(TempodError::Driver(format!(
+                    "attached engine failed to navigate session context: {error}"
+                )));
+            }
+            Ok(session_driver)
+        },
+        |orphaned: Result<AttachedEngineDriver, TempodError>| {
+            if let Ok(mut orphaned_driver) = orphaned {
+                let _ = futures::executor::block_on(orphaned_driver.close());
+            }
+        },
+    );
+    match outcome {
+        Some(result) => (result.map(Some), false),
+        None => (
+            Err(TempodError::Driver(
+                "attached engine timed out creating/navigating session context".into(),
+            )),
+            true,
+        ),
+    }
+}
+
+fn close_orphan_session_driver(driver: Option<AttachedEngineDriver>) {
+    let Some(mut driver) = driver else {
+        return;
+    };
+    match run_teardown_bounded(
+        "orphaned session engine context Close",
+        ENGINE_TEARDOWN_TIMEOUT,
+        move || futures::executor::block_on(driver.close()),
+    ) {
+        Some(Ok(())) => {}
+        Some(Err(error)) => {
+            eprintln!("tempod: error closing orphaned session engine context: {error}");
+        }
+        None => {
+            eprintln!("tempod: orphaned session engine context Close timed out; abandoning it");
+        }
+    }
+}
+
 fn driver_client_transport_error(error: DriverClientError) -> TransportError {
     TransportError::Other(error.to_string())
 }
@@ -980,7 +1116,7 @@ impl OtlpJsonExporter {
         Self { path: path.into() }
     }
 
-    pub fn export_step(&self, triple: &StepTriple) -> Result<(), TempodError> {
+    fn open_append_file(&self) -> Result<File, TempodError> {
         if let Some(parent) = self
             .path
             .parent()
@@ -988,21 +1124,31 @@ impl OtlpJsonExporter {
         {
             std::fs::create_dir_all(parent)?;
         }
-        let mut file = OpenOptions::new()
+        let file = OpenOptions::new()
             .create(true)
             .append(true)
+            .mode(0o600)
             .open(&self.path)?;
-        serde_json::to_writer(
-            &mut file,
-            &json!({
+
+        #[cfg(unix)]
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+
+        Ok(file)
+    }
+
+    pub fn export_step(&self, triple: &StepTriple) -> Result<(), TempodError> {
+        let record = json!({
                 "resource": {
                     "service.name": "tempod",
                 },
                 "name": "tempo.step",
-                "body": triple,
-            }),
-        )?;
-        file.write_all(b"\n")?;
+                "body": redacted_step_triple(triple),
+        });
+        let mut bytes = serde_json::to_vec(&record)?;
+        bytes.push(b'\n');
+
+        let mut file = self.open_append_file()?;
+        file.write_all(&bytes)?;
         file.flush()?;
         Ok(())
     }
@@ -1010,6 +1156,131 @@ impl OtlpJsonExporter {
     pub fn path(&self) -> &Path {
         &self.path
     }
+}
+
+#[cfg(not(unix))]
+trait OtlpOpenOptionsExt {
+    fn mode(&mut self, _mode: u32) -> &mut Self;
+}
+
+#[cfg(not(unix))]
+impl OtlpOpenOptionsExt for OpenOptions {
+    fn mode(&mut self, _mode: u32) -> &mut Self {
+        self
+    }
+}
+
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt as OtlpOpenOptionsExt, PermissionsExt};
+
+fn redacted_step_triple(triple: &StepTriple) -> serde_json::Value {
+    json!({
+        "schema": "tempo.otlp.step.redacted.v1",
+        "key": REDACTED_MARKER,
+        "seq": triple.seq,
+        "side_effect": triple.action.side_effect(),
+        "action": redacted_action(&triple.action),
+        "outcome": redacted_outcome(&triple.outcome),
+    })
+}
+
+fn redacted_action(action: &Action) -> serde_json::Value {
+    match action {
+        Action::Goto { url } => {
+            json!({
+                "kind": "goto",
+                "url": redacted_url_metadata(url),
+            })
+        }
+        Action::Click { node: _ } => {
+            json!({
+                "kind": "click",
+                "node": REDACTED_MARKER,
+            })
+        }
+        Action::Type { node: _, text: _ } => {
+            json!({
+                "kind": "type",
+                "node": REDACTED_MARKER,
+                "text": REDACTED_MARKER,
+            })
+        }
+        Action::Select { node: _, value: _ } => {
+            json!({
+                "kind": "select",
+                "node": REDACTED_MARKER,
+                "value": REDACTED_MARKER,
+            })
+        }
+        Action::Scroll { x, y } => {
+            json!({
+                "kind": "scroll",
+                "x": x,
+                "y": y,
+            })
+        }
+        Action::Wait { millis } => {
+            json!({
+                "kind": "wait",
+                "millis": millis,
+            })
+        }
+        Action::Extract { node: _ } => {
+            json!({
+                "kind": "extract",
+                "node": REDACTED_MARKER,
+            })
+        }
+        Action::Skill { name: _, input: _ } => {
+            json!({
+                "kind": "skill",
+                "name": REDACTED_MARKER,
+                "input": REDACTED_MARKER,
+            })
+        }
+    }
+}
+
+fn redacted_outcome(outcome: &StepTripleOutcome) -> serde_json::Value {
+    match outcome {
+        StepTripleOutcome::Applied { diff } => {
+            json!({
+                "kind": "applied",
+                "diff": {
+                    "since_seq": diff.since_seq,
+                    "seq": diff.seq,
+                    "added_count": diff.added.len(),
+                    "removed_count": diff.removed.len(),
+                    "changed_count": diff.changed.len(),
+                },
+            })
+        }
+        StepTripleOutcome::StepError { reason: _ } => {
+            json!({
+                "kind": "step_error",
+                "reason": REDACTED_MARKER,
+            })
+        }
+    }
+}
+
+fn redacted_url_metadata(value: &str) -> serde_json::Value {
+    let Ok(parsed) = Url::parse(value) else {
+        return json!(REDACTED_MARKER);
+    };
+    if parsed.host_str().is_none() {
+        return json!(REDACTED_MARKER);
+    }
+    let path_segments = parsed
+        .path()
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .count();
+    json!({
+        "path_segments": path_segments,
+        "has_query": parsed.query().is_some(),
+        "has_fragment": parsed.fragment().is_some(),
+    })
 }
 
 /// Run tempod forever on an address such as `127.0.0.1:8787`.
@@ -1131,7 +1402,9 @@ fn handle_stream(mut stream: TcpStream, pool: &Arc<Mutex<SessionPool>>) -> Resul
             return Ok(());
         }
     }
-    let response = {
+    let response = if request.method == "POST" && request.path == "/sessions" {
+        handle_create_session_http(pool, request)
+    } else {
         let mut pool = pool.lock().map_err(|_| TempodError::PoolLock)?;
         handle_http_request(&mut pool, request)
     };
@@ -1152,6 +1425,77 @@ fn handle_http_request(pool: &mut SessionPool, request: HttpRequest) -> HttpResp
     }
 }
 
+fn handle_create_session_http(
+    pool: &Arc<Mutex<SessionPool>>,
+    request: HttpRequest,
+) -> HttpResponse {
+    match route_create_session_http(pool, request) {
+        Ok(response) => response,
+        Err(err) => HttpResponse::json(
+            err.status(),
+            json!({
+                "error": err.to_string(),
+            }),
+        ),
+    }
+}
+
+fn route_create_session_http(
+    pool: &Arc<Mutex<SessionPool>>,
+    request: HttpRequest,
+) -> Result<HttpResponse, TempodError> {
+    if control_route_requires_origin_check(&request.method, &request.path)
+        && !bidi_origin_allowed(&request)
+    {
+        return Err(TempodError::Forbidden("origin not allowed".into()));
+    }
+    let body: CreateSessionRequest = serde_json::from_slice(&request.body)?;
+    if body.url.trim().is_empty() {
+        return Err(TempodError::BadRequest("session url is required".into()));
+    }
+
+    let root_driver = {
+        let pool = pool.lock().map_err(|_| TempodError::PoolLock)?;
+        if pool.draining() {
+            return Err(TempodError::Draining);
+        }
+        pool.driver.clone()
+    };
+
+    let (session_driver, timed_out) =
+        create_session_engine_context_from_root(root_driver.clone(), &body.url);
+    if timed_out {
+        let mut pool = pool.lock().map_err(|_| TempodError::PoolLock)?;
+        if let (Some(expected), Some(current)) = (&root_driver, &pool.driver)
+            && current.same_engine_connection(expected)
+        {
+            pool.detach_attached_engine_after_session_create_timeout();
+        }
+    }
+    let session_driver = session_driver?;
+
+    let mut pool = pool.lock().map_err(|_| TempodError::PoolLock)?;
+    if pool.draining() {
+        close_orphan_session_driver(session_driver);
+        return Err(TempodError::Draining);
+    }
+    if let Some(expected) = &root_driver {
+        match pool.driver.as_ref() {
+            Some(current) if current.same_engine_connection(expected) => {}
+            _ => {
+                close_orphan_session_driver(session_driver);
+                return Err(TempodError::Driver(
+                    "attached engine changed while creating session context".into(),
+                ));
+            }
+        }
+    }
+    Ok(HttpResponse::json(
+        201,
+        pool.insert_created_session(body.url, session_driver)?,
+    ))
+}
+
 fn route_http_request(
     pool: &mut SessionPool,
     request: HttpRequest,
@@ -1167,7 +1511,15 @@ fn route_http_request(
         return Err(TempodError::Forbidden("origin not allowed".into()));
     }
     match (request.method.as_str(), request.path.as_str()) {
-        ("GET", "/health") => Ok(HttpResponse::json(200, json!({"ok": true}))),
+        ("GET", "/health") => Ok(HttpResponse::json(
+            200,
+            json!({
+                "ok": true,
+                "draining": pool.draining(),
+                "sessions": pool.list().len(),
+                "otlp_export": pool.otlp_export_status(),
+            }),
+        )),
         ("GET", tempo_mcp::A2A_AGENT_CARD_PATH) | ("GET", tempo_mcp::A2A_AGENT_JSON_PATH) => Ok(
             HttpResponse::from_mcp(tempo_mcp::agent_card_response(&request.base_url())),
         ),
@@ -2202,7 +2554,10 @@ mod tests {
     use tempo_engine_host::{
         serve_driver_connection, DriverRequest, DriverWireError, EngineIpcConnection, RestartPolicy,
     };
-    use tempo_schema::{Action, ObservationDiff, QuiescencePolicy};
+    use tempo_schema::{
+        Action, InteractiveElement, NodeId, ObservationDiff, Provenance, QuiescencePolicy,
+        TaintSpan,
+    };
 
     type TestResult = Result<(), Box<dyn Error>>;
 
@@ -2413,6 +2768,204 @@ mod tests {
     }
 
     #[test]
+    fn http_create_session_bounds_wedged_navigation_and_detaches_engine() -> TestResult {
+        let (client_stream, server_stream) = UnixStream::pair()?;
+        let wedged_engine = thread::spawn(move || -> Result<(), EngineHostError> {
+            let mut connection = EngineIpcConnection::from_stream(server_stream);
+
+            let create = connection.read_driver_request()?;
+            assert!(create.driver_id.is_none());
+            assert!(matches!(
+                create.command,
+                HostDriverCommand::CreateBrowsingContext { .. }
+            ));
+            connection.write_driver_response(
+                create.id,
+                DriverResponse::BrowsingContextCreated {
+                    driver_id: "session-context-wedged".into(),
+                },
+            )?;
+
+            let goto = connection.read_driver_request()?;
+            assert_eq!(goto.driver_id.as_deref(), Some("session-context-wedged"));
+            assert!(matches!(goto.command, HostDriverCommand::Goto { .. }));
+            thread::park_timeout(Duration::from_secs(60));
+            Ok(())
+        });
+
+        let mut pool = SessionPool::default();
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+
+        let started = std::time::Instant::now();
+        let response = handle_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/sessions".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: br#"{"url":"https://wedged-nav.test"}"#.to_vec(),
+            },
+        );
+        let elapsed = started.elapsed();
+
+        assert_eq!(response.status, 500);
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "session create hung on wedged navigation: took {elapsed:?}"
+        );
+        assert!(pool.list().is_empty());
+        assert!(pool.driver.is_none());
+        assert!(pool.mcp.is_none());
+        assert!(pool.session_drivers.is_empty());
+        assert!(pool.bidi_contexts.is_empty());
+
+        wedged_engine.thread().unpark();
+        join_driver_handler(wedged_engine)?;
+        Ok(())
+    }
+
+    #[test]
+    fn timed_out_create_detaches_and_closes_existing_session_context() -> TestResult {
+        let (client_stream, server_stream) = UnixStream::pair()?;
+        let (existing_close_tx, existing_close_rx) = std::sync::mpsc::channel();
+        let (late_close_tx, late_close_rx) = std::sync::mpsc::channel();
+        let engine = thread::spawn(move || -> Result<(), EngineHostError> {
+            let mut connection = EngineIpcConnection::from_stream(server_stream);
+            let mut closed_existing = false;
+            let mut closed_late = false;
+
+            let create_existing = connection.read_driver_request()?;
+            assert!(matches!(
+                create_existing.command,
+                HostDriverCommand::CreateBrowsingContext { .. }
+            ));
+            connection.write_driver_response(
+                create_existing.id,
+                DriverResponse::BrowsingContextCreated {
+                    driver_id: "session-context-existing".into(),
+                },
+            )?;
+
+            let goto_existing = connection.read_driver_request()?;
+            assert_eq!(
+                goto_existing.driver_id.as_deref(),
+                Some("session-context-existing")
+            );
+            assert!(matches!(
+                goto_existing.command,
+                HostDriverCommand::Goto { .. }
+            ));
+            connection.write_driver_response(
+                goto_existing.id,
+                DriverResponse::Observation {
+                    observation: observation("https://existing.test", 1),
+                },
+            )?;
+
+            let create_late = connection.read_driver_request()?;
+            assert!(matches!(
+                create_late.command,
+                HostDriverCommand::CreateBrowsingContext { .. }
+            ));
+            connection.write_driver_response(
+                create_late.id,
+                DriverResponse::BrowsingContextCreated {
+                    driver_id: "session-context-late".into(),
+                },
+            )?;
+
+            let goto_late = connection.read_driver_request()?;
+            assert_eq!(goto_late.driver_id.as_deref(), Some("session-context-late"));
+            assert!(matches!(goto_late.command, HostDriverCommand::Goto { .. }));
+            thread::sleep(SESSION_CREATE_TIMEOUT + Duration::from_millis(100));
+            connection.write_driver_response(
+                goto_late.id,
+                DriverResponse::Observation {
+                    observation: observation("https://late.test", 2),
+                },
+            )?;
+
+            for _ in 0..4 {
+                let close = connection.read_driver_request()?;
+                if close.command == HostDriverCommand::Close {
+                    if close.driver_id.as_deref() == Some("session-context-existing") {
+                        let _ = existing_close_tx.send(());
+                        closed_existing = true;
+                    }
+                    if close.driver_id.as_deref() == Some("session-context-late") {
+                        let _ = late_close_tx.send(());
+                        closed_late = true;
+                    }
+                    connection.write_driver_response(close.id, DriverResponse::Closed)?;
+                    if closed_existing && closed_late {
+                        return Ok(());
+                    }
+                }
+            }
+
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "engine never received Close for existing and late session contexts",
+            )
+            .into())
+        });
+
+        let mut pool = SessionPool::default();
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+
+        let existing = handle_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/sessions".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: br#"{"url":"https://existing.test"}"#.to_vec(),
+            },
+        );
+        assert_eq!(existing.status, 201);
+        assert_eq!(pool.session_drivers.len(), 1);
+
+        let timed_out = handle_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/sessions".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: br#"{"url":"https://late.test"}"#.to_vec(),
+            },
+        );
+        assert_eq!(timed_out.status, 500);
+        assert!(pool.driver.is_none());
+        assert!(pool.mcp.is_none());
+        assert!(pool.session_drivers.is_empty());
+
+        existing_close_rx
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "timed-out create detached existing session without closing it",
+                )
+            })?;
+        late_close_rx
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "timed-out create orphaned late session context without closing it",
+                )
+            })?;
+        join_driver_handler(engine)?;
+        Ok(())
+    }
+
+    #[test]
     fn http_create_session_cleans_context_when_initial_navigation_fails() -> TestResult {
         let (client_stream, server_stream) = UnixStream::pair()?;
         let server = thread::spawn(move || -> Result<(), EngineHostError> {
@@ -2520,10 +3073,67 @@ mod tests {
         assert_eq!(value["resource"]["service.name"], "tempod");
         assert_eq!(value["name"], "tempo.step");
         assert_eq!(value["body"]["seq"], 11);
+        assert_eq!(value["body"]["schema"], "tempo.otlp.step.redacted.v1");
         assert_eq!(
             step_event.event,
             TempodSessionEventKind::StepTriple { triple: step }
         );
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn session_pool_records_step_when_otlp_export_fails() -> TestResult {
+        let root = unique_dir("pool-otlp-fail")?;
+        remove_dir_if_exists(&root)?;
+        std::fs::create_dir_all(&root)?;
+        let mut pool = SessionPool::default().with_otlp_exporter(OtlpJsonExporter::new(&root));
+        let session = pool.create("https://events.test")?;
+        let step = sample_step_triple(13);
+
+        let step_event = pool.record_step(&session.id, step.clone())?;
+
+        assert_eq!(
+            step_event.event,
+            TempodSessionEventKind::StepTriple { triple: step }
+        );
+        let events = pool.events(&session.id, None)?;
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            events[1].event,
+            TempodSessionEventKind::StepTriple { .. }
+        ));
+        let status = pool.otlp_export_status();
+        assert!(status.enabled);
+        assert_eq!(status.failures, 1);
+        assert!(status
+            .last_error
+            .as_deref()
+            .is_some_and(|error| !error.is_empty()));
+        let health = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "GET".into(),
+                path: "/health".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: Vec::new(),
+            },
+        )?;
+        let health: Value = serde_json::from_slice(&health.body)?;
+        assert_eq!(health["otlp_export"]["enabled"], Value::Bool(true));
+        assert_eq!(health["otlp_export"]["failures"], 1);
+        assert!(health["otlp_export"]["last_error"]
+            .as_str()
+            .is_some_and(|error| !error.is_empty()));
+
+        pool.set_otlp_exporter(None);
+        let status = pool.otlp_export_status();
+        assert!(!status.enabled);
+        assert_eq!(status.failures, 0);
+        assert_eq!(status.last_error, None);
 
         remove_dir_if_exists(&root)?;
         Ok(())
@@ -2798,6 +3408,12 @@ mod tests {
             },
         )?;
         assert_eq!(health.status, 200);
+        let health: Value = serde_json::from_slice(&health.body)?;
+        assert_eq!(health["ok"], Value::Bool(true));
+        assert_eq!(health["draining"], Value::Bool(true));
+        assert_eq!(health["sessions"], 1);
+        assert_eq!(health["otlp_export"]["enabled"], Value::Bool(false));
+        assert_eq!(health["otlp_export"]["failures"], 0);
 
         let list = route_http_request(
             &mut pool,
@@ -2932,6 +3548,144 @@ mod tests {
         assert_eq!(value["type"], "success");
         assert_eq!(value["id"], 1);
         assert_eq!(value["result"]["ready"], true);
+        Ok(())
+    }
+
+    #[test]
+    fn bidi_standard_client_smoke_covers_session_context_script_and_network() -> TestResult {
+        let (client_stream, server_stream) = UnixStream::pair()?;
+        let server = thread::spawn(move || {
+            let mut connection = EngineIpcConnection::from_stream(server_stream);
+            let mut driver = TestDriver::new();
+            futures::executor::block_on(serve_driver_connection(&mut connection, &mut driver))
+        });
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let mut pool = SessionPool::default();
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+        let pool = Arc::new(Mutex::new(pool));
+        let handle = thread::spawn({
+            let pool = Arc::clone(&pool);
+            move || serve_one(listener, pool)
+        });
+        let mut stream = TcpStream::connect(addr)?;
+        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+
+        stream.write_all(
+            b"GET /bidi HTTP/1.1\r\n\
+              host: 127.0.0.1\r\n\
+              upgrade: websocket\r\n\
+              connection: Upgrade\r\n\
+              sec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+              sec-websocket-version: 13\r\n\r\n",
+        )?;
+        let response = read_http_head(&mut stream)?;
+        assert!(response.starts_with("HTTP/1.1 101 Switching Protocols"));
+
+        let session = send_bidi_ws_message(
+            &mut stream,
+            br#"{"id":1,"method":"session.new","params":{"capabilities":{"acceptInsecureCerts":false}}}"#,
+        )?;
+        assert_eq!(session["type"], "success");
+        assert_eq!(session["id"], 1);
+        assert_eq!(session["result"]["sessionId"], "tempo-bidi-1");
+        assert_eq!(
+            session["result"]["capabilities"]["acceptInsecureCerts"],
+            false
+        );
+
+        let subscribed = send_bidi_ws_message(
+            &mut stream,
+            br#"{"id":2,"method":"session.subscribe","params":{"events":["browsingContext.load","network"],"contexts":["tempo-root"]}}"#,
+        )?;
+        assert_eq!(subscribed["type"], "success");
+        assert_eq!(subscribed["id"], 2);
+        assert_eq!(subscribed["result"]["subscription"], "tempo-subscription-1");
+
+        stream.write_all(&masked_client_frame(
+            WS_OPCODE_TEXT,
+            br#"{"id":3,"method":"browsingContext.navigate","params":{"context":"tempo-root","url":"https://standard-client.test","inputTainted":false}}"#,
+        )?)?;
+        let navigate_reply = read_bidi_ws_message(&mut stream)?;
+        assert_eq!(navigate_reply["type"], "success");
+        assert_eq!(navigate_reply["id"], 3);
+        assert_eq!(
+            navigate_reply["result"]["url"],
+            "https://standard-client.test"
+        );
+
+        let navigated = [
+            read_bidi_ws_message(&mut stream)?,
+            read_bidi_ws_message(&mut stream)?,
+            read_bidi_ws_message(&mut stream)?,
+        ];
+        let event_methods = navigated
+            .iter()
+            .filter_map(|message| message["method"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            event_methods,
+            vec![
+                "network.beforeRequestSent",
+                "network.responseCompleted",
+                "browsingContext.load"
+            ]
+        );
+        let load_event = navigated
+            .iter()
+            .find(|message| message["method"] == "browsingContext.load")
+            .ok_or("missing browsingContext.load event")?;
+        assert_eq!(load_event["params"]["context"], "tempo-root");
+        assert_eq!(load_event["params"]["url"], "https://standard-client.test");
+        let before_request = navigated
+            .iter()
+            .find(|message| message["method"] == "network.beforeRequestSent")
+            .ok_or("missing network.beforeRequestSent event")?;
+        assert_eq!(
+            before_request["params"]["url"],
+            "https://standard-client.test"
+        );
+        assert_eq!(before_request["params"]["method"], "GET");
+        let response_completed = navigated
+            .iter()
+            .find(|message| message["method"] == "network.responseCompleted")
+            .ok_or("missing network.responseCompleted event")?;
+        assert_eq!(
+            response_completed["params"]["url"],
+            "https://standard-client.test"
+        );
+        assert_eq!(response_completed["params"]["status"], 200);
+
+        let tree = send_bidi_ws_message(
+            &mut stream,
+            br#"{"id":4,"method":"browsingContext.getTree","params":{"root":"tempo-root"}}"#,
+        )?;
+        assert_eq!(tree["type"], "success");
+        assert_eq!(tree["id"], 4);
+        assert_eq!(tree["result"]["contexts"][0]["context"], "tempo-root");
+        assert_eq!(
+            tree["result"]["contexts"][0]["url"],
+            "https://standard-client.test"
+        );
+
+        let script = send_bidi_ws_message(
+            &mut stream,
+            br#"{"id":5,"method":"script.evaluate","params":{"expression":"document.title","target":{"context":"tempo-root"},"awaitPromise":true,"inputTainted":false}}"#,
+        )?;
+        assert_eq!(script["type"], "success");
+        assert_eq!(script["id"], 5);
+        assert_eq!(script["result"]["realm"], "tempo-root");
+        assert_eq!(script["result"]["result"]["expression"], "document.title");
+        assert_eq!(script["result"]["result"]["awaitPromise"], true);
+
+        stream.write_all(&masked_client_frame(WS_OPCODE_CLOSE, &[])?)?;
+        let (opcode, payload) = read_server_frame(&mut stream)?;
+        assert_eq!(opcode, WS_OPCODE_CLOSE);
+        assert!(payload.is_empty());
+
+        drop(pool);
+        join_server(handle)?;
+        join_driver_handler(server)?;
         Ok(())
     }
 
@@ -4139,6 +4893,77 @@ mod tests {
     }
 
     #[test]
+    fn post_sessions_does_not_hold_pool_lock_during_engine_create() -> TestResult {
+        let (client_stream, server_stream) = UnixStream::pair()?;
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let engine = thread::spawn(move || -> Result<(), String> {
+            let mut connection = EngineIpcConnection::from_stream(server_stream);
+            let request = connection
+                .read_driver_request()
+                .map_err(|error| error.to_string())?;
+            if !matches!(
+                request.command,
+                HostDriverCommand::CreateBrowsingContext { .. }
+            ) {
+                let message = format!("expected create context request, got {request:?}");
+                let _ = ready_tx.send(Err(message.clone()));
+                return Err(message);
+            }
+            ready_tx.send(Ok(())).map_err(|error| error.to_string())?;
+            let _ = release_rx.recv_timeout(Duration::from_secs(2));
+            Ok(())
+        });
+
+        let pool = Arc::new(Mutex::new(SessionPool::default()));
+        {
+            let mut pool = pool.lock().map_err(|_| TempodError::PoolLock)?;
+            pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+        }
+
+        let route_pool = Arc::clone(&pool);
+        let route = thread::spawn(move || {
+            route_create_session_http(
+                &route_pool,
+                HttpRequest {
+                    method: "POST".into(),
+                    path: "/sessions".into(),
+                    headers: BTreeMap::new(),
+                    host: None,
+                    origin: None,
+                    body: br#"{"url":"https://wedged-create.test"}"#.to_vec(),
+                },
+            )
+        });
+
+        ready_rx
+            .recv_timeout(Duration::from_secs(1))
+            .map_err(|error| format!("engine did not receive create request: {error}"))?
+            .map_err(|error| format!("engine setup failed: {error}"))?;
+        match pool.try_lock() {
+            Ok(guard) => drop(guard),
+            Err(error) => {
+                return Err(
+                    format!("POST /sessions held the pool lock during create: {error}").into(),
+                );
+            }
+        }
+
+        let route_result = route.join().map_err(|_| "route thread panicked")?;
+        assert!(
+            matches!(route_result, Err(TempodError::Driver(_))),
+            "wedged create should fail after bounded timeout: {route_result:?}"
+        );
+        let _ = release_tx.send(());
+        match engine.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return Err(error.into()),
+            Err(_) => return Err("engine thread panicked".into()),
+        }
+        Ok(())
+    }
+
+    #[test]
     fn drain_does_not_hang_on_wedged_bidi_fork() -> TestResult {
         // Public #200 regression guard: `drain()` must not hang when a forked
         // BiDi context wedges on `Close`.
@@ -4403,6 +5228,225 @@ mod tests {
         assert_eq!(value["resource"]["service.name"], "tempod");
         assert_eq!(value["name"], "tempo.step");
         assert_eq!(value["body"]["seq"], 1);
+        assert_eq!(value["body"]["action"]["kind"], "scroll");
+        assert_eq!(value["body"]["outcome"]["diff"]["added_count"], 0);
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn otlp_export_redacts_sensitive_step_fields() -> TestResult {
+        let root = unique_dir("otlp-redaction")?;
+        remove_dir_if_exists(&root)?;
+        let path = root.join("steps.jsonl");
+        let exporter = OtlpJsonExporter::new(&path);
+        let selector = NodeId(r#"a[href="/reset?token=secret-token"]"#.into());
+        let diff_node = NodeId(r#"input[name="secret_token"]"#.into());
+        let removed_node = NodeId("button#secret-delete".into());
+
+        let typed = StepTriple {
+            key: IdempotencyKey("step-redacted-type".into()),
+            seq: 1,
+            action: Action::Type {
+                node: selector,
+                text: "secret typed value".into(),
+            },
+            outcome: StepTripleOutcome::Applied {
+                diff: ObservationDiff {
+                    since_seq: 0,
+                    seq: 1,
+                    added: vec![InteractiveElement {
+                        node_id: diff_node,
+                        role: "textbox".into(),
+                        name: vec![TaintSpan {
+                            provenance: Provenance::Page,
+                            text: "secret label".into(),
+                        }],
+                        value: vec![TaintSpan {
+                            provenance: Provenance::Page,
+                            text: "secret observed value".into(),
+                        }],
+                        bounds: Some([1.0, 2.0, 3.0, 4.0]),
+                        rank: 1.0,
+                    }],
+                    removed: vec![removed_node],
+                    changed: vec![],
+                },
+            },
+        };
+        let goto = StepTriple {
+            key: IdempotencyKey("step-redacted-goto".into()),
+            seq: 2,
+            action: Action::Goto {
+                url: "https://user:secret-pass@example.test/reset?token=secret-token#frag".into(),
+            },
+            outcome: StepTripleOutcome::StepError {
+                reason: "failed with reason-secret at https://user:secret-pass@example.test/reset?token=secret-token#frag".into(),
+            },
+        };
+        let skill = StepTriple {
+            key: IdempotencyKey("step-redacted-skill".into()),
+            seq: 3,
+            action: Action::Skill {
+                name: "skill-secret-token".into(),
+                input: serde_json::json!({"token": "skill-input-secret"}),
+            },
+            outcome: StepTripleOutcome::StepError {
+                reason: "skill reason secret".into(),
+            },
+        };
+
+        exporter.export_step(&typed)?;
+        exporter.export_step(&goto)?;
+        exporter.export_step(&skill)?;
+        let raw = String::from_utf8(std::fs::read(&path)?)?;
+        for forbidden in [
+            "secret-token",
+            "secret-pass",
+            "secret typed value",
+            "secret observed value",
+            "secret label",
+            "reason-secret",
+            "skill-secret-token",
+            "skill-input-secret",
+            "skill reason secret",
+            "step-redacted",
+            "a[href",
+            "example.test",
+            "reset",
+            "secret_token",
+            "button#secret-delete",
+            "user:",
+            "#frag",
+            "idempotency_key_bytes",
+            "node_id_bytes",
+            "text_bytes",
+            "value_bytes",
+            "input_bytes",
+            "reason_bytes",
+            "sha256:",
+        ] {
+            assert!(
+                !raw.contains(forbidden),
+                "OTLP export leaked forbidden fragment: {forbidden}"
+            );
+        }
+
+        let records: Vec<Value> = raw
+            .lines()
+            .map(serde_json::from_str)
+            .collect::<Result<_, _>>()?;
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0]["body"]["action"]["kind"], "type");
+        assert_eq!(records[0]["body"]["outcome"]["diff"]["added_count"], 1);
+        assert_eq!(records[0]["body"]["outcome"]["diff"]["removed_count"], 1);
+        assert_eq!(records[0]["body"]["key"], REDACTED_MARKER);
+        assert!(records[0]["body"]["action"].get("node_hash").is_none());
+        assert!(records[0]["body"]["action"].get("text_hash").is_none());
+        assert_eq!(records[0]["body"]["action"]["node"], REDACTED_MARKER);
+        assert_eq!(records[0]["body"]["action"]["text"], REDACTED_MARKER);
+        assert!(records[1]["body"]["action"]["url"].get("origin").is_none());
+        assert_eq!(records[1]["body"]["action"]["url"]["path_segments"], 1);
+        assert_eq!(
+            records[1]["body"]["action"]["url"]["has_query"],
+            Value::Bool(true)
+        );
+        assert_eq!(
+            records[1]["body"]["action"]["url"]["has_fragment"],
+            Value::Bool(true)
+        );
+        assert!(records[1]["body"]["outcome"].get("reason_hash").is_none());
+        assert_eq!(records[1]["body"]["outcome"]["reason"], REDACTED_MARKER);
+        assert_eq!(records[2]["body"]["action"]["kind"], "skill");
+        assert_eq!(records[2]["body"]["action"]["name"], REDACTED_MARKER);
+        assert_eq!(records[2]["body"]["action"]["input"], REDACTED_MARKER);
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn otlp_url_metadata_redacts_paths_userinfo_and_opaque_urls() -> TestResult {
+        for url in [
+            "https://user:secret-pass@example.test/reset/secret-path?token=secret-token#frag",
+            "//user:secret-pass@example.test/reset/secret-path?token=secret-token#frag",
+            "data:text/plain,secret-token",
+            "file:///Users/name/secret-token",
+        ] {
+            let encoded = serde_json::to_string(&redacted_url_metadata(url))?;
+            for forbidden in [
+                "secret-pass",
+                "reset",
+                "secret-path",
+                "secret-token",
+                "example.test",
+                "/Users",
+                "name",
+            ] {
+                assert!(
+                    !encoded.contains(forbidden),
+                    "URL metadata leaked forbidden fragment: {forbidden} from {url}"
+                );
+            }
+        }
+
+        let https = redacted_url_metadata(
+            "https://user:secret-pass@example.test/reset/secret-path?token=secret-token#frag",
+        );
+        assert!(https.get("scheme").is_none());
+        assert!(https.get("authority").is_none());
+        assert!(https.get("origin").is_none());
+        assert_eq!(https["path_segments"], 2);
+        assert_eq!(https["has_query"], Value::Bool(true));
+        assert_eq!(https["has_fragment"], Value::Bool(true));
+
+        let with_port = redacted_url_metadata("https://user:pass@example.test:8443/a/b");
+        assert!(with_port.get("origin").is_none());
+        assert_eq!(with_port["path_segments"], 2);
+
+        let data = redacted_url_metadata("data:text/plain,secret-token");
+        assert_eq!(data, REDACTED_MARKER);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn otlp_export_tightens_existing_jsonl_permissions() -> TestResult {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = unique_dir("otlp-permissions")?;
+        remove_dir_if_exists(&root)?;
+        std::fs::create_dir_all(&root)?;
+        let path = root.join("steps.jsonl");
+        std::fs::write(&path, b"")?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))?;
+
+        OtlpJsonExporter::new(&path).export_step(&sample_step_triple(14))?;
+
+        let mode = std::fs::metadata(&path)?.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn otlp_export_reopens_configured_path_for_each_record() -> TestResult {
+        let root = unique_dir("otlp-reopen")?;
+        remove_dir_if_exists(&root)?;
+        let path = root.join("steps.jsonl");
+        let exporter = OtlpJsonExporter::new(&path);
+
+        exporter.export_step(&sample_step_triple(15))?;
+        std::fs::remove_file(&path)?;
+        exporter.export_step(&sample_step_triple(16))?;
+
+        let records = String::from_utf8(std::fs::read(&path)?)?;
+        let lines = records.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 1);
+        let value: Value = serde_json::from_str(lines[0])?;
+        assert_eq!(value["body"]["seq"], 16);
 
         remove_dir_if_exists(&root)?;
         Ok(())
@@ -5093,6 +6137,22 @@ mod tests {
                 .map(|(index, byte)| byte ^ mask[index % mask.len()]),
         );
         Ok(frame)
+    }
+
+    fn send_bidi_ws_message(
+        stream: &mut TcpStream,
+        payload: &[u8],
+    ) -> Result<Value, Box<dyn Error>> {
+        stream.write_all(&masked_client_frame(WS_OPCODE_TEXT, payload)?)?;
+        read_bidi_ws_message(stream)
+    }
+
+    fn read_bidi_ws_message(stream: &mut TcpStream) -> Result<Value, Box<dyn Error>> {
+        let (opcode, payload) = read_server_frame(stream)?;
+        if opcode != WS_OPCODE_TEXT {
+            return Err(format!("expected BiDi text frame, got opcode {opcode}").into());
+        }
+        Ok(serde_json::from_slice(&payload)?)
     }
 
     fn read_server_frame(stream: &mut TcpStream) -> Result<(u8, Vec<u8>), Box<dyn Error>> {

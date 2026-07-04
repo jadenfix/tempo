@@ -3829,6 +3829,7 @@ mod tests {
                 match listener.accept() {
                     Ok((mut stream, _peer)) => {
                         handled += 1;
+                        stream.set_nonblocking(false)?;
                         stream.set_read_timeout(Some(std::time::Duration::from_secs(1)))?;
                         let request = read_http_request(&mut stream)?;
                         let response = if request.starts_with("GET /mcp/catalog.json ") {

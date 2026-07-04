@@ -5,7 +5,7 @@
 //! session in an isolated profile, emit audit records that do not carry page
 //! payloads, and expose network-idle counters for the action quiescence gate.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::fmt::Write as _;
@@ -1523,6 +1523,427 @@ impl EgressRecord {
     }
 }
 
+/// Default maximum number of crawl requests admitted across the whole process.
+pub const DEFAULT_CRAWL_MAX_GLOBAL_INFLIGHT: usize = 256;
+/// Default maximum number of crawl requests admitted for one origin at a time.
+pub const DEFAULT_CRAWL_MAX_PER_ORIGIN_INFLIGHT: usize = 8;
+/// Default post-request per-origin quiet period. `0` means no extra delay.
+pub const DEFAULT_CRAWL_DELAY_TICKS: u64 = 0;
+/// Default retained canonical URL dedupe window.
+pub const DEFAULT_CRAWL_MAX_SEEN_URLS: usize = 65_536;
+/// Default retained request-id dedupe window.
+pub const DEFAULT_CRAWL_MAX_SEEN_REQUEST_IDS: usize = 65_536;
+/// Default retained origin state window for idle politeness metadata.
+pub const DEFAULT_CRAWL_MAX_TRACKED_ORIGINS: usize = 4_096;
+
+/// Pure admission policy for fast, bounded, polite crawler scheduling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CrawlAdmissionConfig {
+    pub max_global_inflight: usize,
+    pub max_per_origin_inflight: usize,
+    pub max_seen_urls: usize,
+    pub max_seen_request_ids: usize,
+    pub max_tracked_origins: usize,
+    /// Caller-supplied logical ticks to wait after an origin completes a request.
+    ///
+    /// The unit is intentionally abstract: production can use milliseconds, while
+    /// replay/tests can use deterministic ticks.
+    pub crawl_delay_ticks: u64,
+}
+
+impl CrawlAdmissionConfig {
+    fn normalized(self) -> Self {
+        let max_global_inflight = self.max_global_inflight.max(1);
+        Self {
+            max_global_inflight,
+            max_per_origin_inflight: self.max_per_origin_inflight.max(1),
+            max_seen_urls: self.max_seen_urls.max(max_global_inflight),
+            max_seen_request_ids: self.max_seen_request_ids.max(max_global_inflight),
+            max_tracked_origins: self.max_tracked_origins.max(max_global_inflight),
+            crawl_delay_ticks: self.crawl_delay_ticks,
+        }
+    }
+}
+
+impl Default for CrawlAdmissionConfig {
+    fn default() -> Self {
+        Self {
+            max_global_inflight: DEFAULT_CRAWL_MAX_GLOBAL_INFLIGHT,
+            max_per_origin_inflight: DEFAULT_CRAWL_MAX_PER_ORIGIN_INFLIGHT,
+            max_seen_urls: DEFAULT_CRAWL_MAX_SEEN_URLS,
+            max_seen_request_ids: DEFAULT_CRAWL_MAX_SEEN_REQUEST_IDS,
+            max_tracked_origins: DEFAULT_CRAWL_MAX_TRACKED_ORIGINS,
+            crawl_delay_ticks: DEFAULT_CRAWL_DELAY_TICKS,
+        }
+    }
+}
+
+/// One URL the crawler wants to schedule.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CrawlCandidate {
+    pub request_id: RequestId,
+    pub url: String,
+    pub depth: u32,
+}
+
+impl CrawlCandidate {
+    pub fn new(id: impl Into<RequestId>, url: impl Into<String>, depth: u32) -> Self {
+        Self {
+            request_id: id.into(),
+            url: url.into(),
+            depth,
+        }
+    }
+}
+
+/// Lease returned for an admitted crawl request.
+///
+/// The caller must pass the lease back to [`CrawlAdmission::finish`] when the
+/// request completes so per-origin and global capacity are released.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CrawlLease {
+    pub request_id: RequestId,
+    pub url: String,
+    pub origin: String,
+    pub admitted_at_tick: u64,
+}
+
+/// Why a crawl candidate cannot run yet but may be retried later.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CrawlDelayReason {
+    GlobalConcurrencyLimit { max: usize },
+    PerOriginConcurrencyLimit { origin: String, max: usize },
+    PolitenessWindow { origin: String },
+}
+
+/// Why a crawl candidate was rejected and should not be retried as-is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CrawlRejectReason {
+    UrlPolicy(BlockReason),
+    DuplicateUrl { origin: String },
+    DuplicateRequestId { request_id: RequestId },
+}
+
+/// Why a resolved crawl target is not allowed to connect.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CrawlResolvedTargetError {
+    StaleLease { request_id: RequestId },
+    UrlPolicy(BlockReason),
+}
+
+/// Scheduling decision for one crawl candidate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CrawlAdmissionDecision {
+    Admit(CrawlLease),
+    Delay {
+        retry_after_tick: u64,
+        reason: CrawlDelayReason,
+    },
+    Drop {
+        reason: CrawlRejectReason,
+    },
+}
+
+impl CrawlAdmissionDecision {
+    pub fn admitted(&self) -> bool {
+        matches!(self, Self::Admit(_))
+    }
+}
+
+/// Bounded crawler admission table.
+///
+/// This is intentionally an admission primitive, not a downloader. It enforces
+/// the security and systems invariants tempo needs before a crawler worker ever
+/// receives work: URL policy, canonical dedupe, global parallelism, per-origin
+/// parallelism, and per-origin quiet windows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CrawlAdmission {
+    config: CrawlAdmissionConfig,
+    url_policy: UrlPolicy,
+    global_inflight: BTreeSet<RequestId>,
+    live_leases: BTreeMap<RequestId, CrawlLease>,
+    live_urls: BTreeSet<String>,
+    origins: BTreeMap<String, OriginCrawlState>,
+    seen_request_ids: BTreeSet<RequestId>,
+    seen_request_id_order: VecDeque<RequestId>,
+    seen_urls: BTreeSet<String>,
+    seen_url_order: VecDeque<String>,
+    origin_order: VecDeque<String>,
+}
+
+impl CrawlAdmission {
+    pub fn new(config: CrawlAdmissionConfig, url_policy: UrlPolicy) -> Self {
+        Self {
+            config: config.normalized(),
+            url_policy,
+            global_inflight: BTreeSet::new(),
+            live_leases: BTreeMap::new(),
+            live_urls: BTreeSet::new(),
+            origins: BTreeMap::new(),
+            seen_request_ids: BTreeSet::new(),
+            seen_request_id_order: VecDeque::new(),
+            seen_urls: BTreeSet::new(),
+            seen_url_order: VecDeque::new(),
+            origin_order: VecDeque::new(),
+        }
+    }
+
+    /// Secure default: block private/local targets while permitting high
+    /// parallelism on public origins.
+    pub fn secure_default() -> Self {
+        Self::new(CrawlAdmissionConfig::default(), UrlPolicy::block_private())
+    }
+
+    pub fn config(&self) -> CrawlAdmissionConfig {
+        self.config
+    }
+
+    pub fn inflight(&self) -> usize {
+        self.global_inflight.len()
+    }
+
+    pub fn inflight_for_origin(&self, origin: &str) -> usize {
+        self.origins
+            .get(origin)
+            .map(|state| state.inflight.len())
+            .unwrap_or(0)
+    }
+
+    pub fn seen_count(&self) -> usize {
+        self.seen_urls.len()
+    }
+
+    pub fn seen_request_id_count(&self) -> usize {
+        self.seen_request_ids.len()
+    }
+
+    pub fn tracked_origin_count(&self) -> usize {
+        self.origins.len()
+    }
+
+    /// Enforce the socket-level SSRF guard after DNS resolution and before connect.
+    pub fn enforce_resolved_ip(
+        &self,
+        lease: &CrawlLease,
+        resolved_ip: IpAddr,
+    ) -> Result<(), CrawlResolvedTargetError> {
+        if self.live_leases.get(&lease.request_id) != Some(lease) {
+            return Err(CrawlResolvedTargetError::StaleLease {
+                request_id: lease.request_id.clone(),
+            });
+        }
+        self.url_policy
+            .enforce_resolved_ip(&lease.url, resolved_ip)
+            .map_err(|error| CrawlResolvedTargetError::UrlPolicy(error.reason))
+    }
+
+    /// Enforce the socket-level SSRF guard after DNS resolution and before connect.
+    pub fn enforce_resolved_socket(
+        &self,
+        lease: &CrawlLease,
+        resolved_socket: SocketAddr,
+    ) -> Result<(), CrawlResolvedTargetError> {
+        self.enforce_resolved_ip(lease, resolved_socket.ip())
+    }
+
+    /// Decide whether a crawl candidate may start at `tick`.
+    pub fn admit(&mut self, candidate: CrawlCandidate, tick: u64) -> CrawlAdmissionDecision {
+        if self.seen_request_ids.contains(&candidate.request_id) {
+            return CrawlAdmissionDecision::Drop {
+                reason: CrawlRejectReason::DuplicateRequestId {
+                    request_id: candidate.request_id,
+                },
+            };
+        }
+
+        let canonical = match canonical_crawl_url(&candidate.url, &self.url_policy) {
+            Ok(canonical) => canonical,
+            Err(reason) => {
+                return CrawlAdmissionDecision::Drop {
+                    reason: CrawlRejectReason::UrlPolicy(reason),
+                };
+            }
+        };
+        if self.seen_urls.contains(&canonical.url) {
+            return CrawlAdmissionDecision::Drop {
+                reason: CrawlRejectReason::DuplicateUrl {
+                    origin: canonical.origin,
+                },
+            };
+        }
+
+        if self.global_inflight.len() >= self.config.max_global_inflight {
+            return CrawlAdmissionDecision::Delay {
+                retry_after_tick: tick.saturating_add(1),
+                reason: CrawlDelayReason::GlobalConcurrencyLimit {
+                    max: self.config.max_global_inflight,
+                },
+            };
+        }
+
+        if let Some(state) = self.origins.get(&canonical.origin) {
+            if state.inflight.len() >= self.config.max_per_origin_inflight {
+                return CrawlAdmissionDecision::Delay {
+                    retry_after_tick: state.next_allowed_tick.max(tick.saturating_add(1)),
+                    reason: CrawlDelayReason::PerOriginConcurrencyLimit {
+                        origin: canonical.origin,
+                        max: self.config.max_per_origin_inflight,
+                    },
+                };
+            }
+            if tick < state.next_allowed_tick {
+                return CrawlAdmissionDecision::Delay {
+                    retry_after_tick: state.next_allowed_tick,
+                    reason: CrawlDelayReason::PolitenessWindow {
+                        origin: canonical.origin,
+                    },
+                };
+            }
+        }
+
+        let is_new_origin = !self.origins.contains_key(&canonical.origin);
+        if is_new_origin {
+            self.origin_order.push_back(canonical.origin.clone());
+        }
+        let state = self.origins.entry(canonical.origin.clone()).or_default();
+        self.seen_urls.insert(canonical.url.clone());
+        self.seen_url_order.push_back(canonical.url.clone());
+        self.seen_request_ids.insert(candidate.request_id.clone());
+        self.seen_request_id_order
+            .push_back(candidate.request_id.clone());
+        self.global_inflight.insert(candidate.request_id.clone());
+        state.inflight.insert(candidate.request_id.clone());
+        let lease = CrawlLease {
+            request_id: candidate.request_id,
+            url: canonical.url,
+            origin: canonical.origin,
+            admitted_at_tick: tick,
+        };
+        self.live_urls.insert(lease.url.clone());
+        self.live_leases
+            .insert(lease.request_id.clone(), lease.clone());
+        self.prune_retained_history();
+        CrawlAdmissionDecision::Admit(lease)
+    }
+
+    fn prune_retained_history(&mut self) {
+        self.prune_seen_request_ids();
+        self.prune_seen_urls();
+        self.prune_tracked_origins();
+    }
+
+    fn prune_seen_request_ids(&mut self) {
+        let queue_len = self.seen_request_id_order.len();
+        for _ in 0..queue_len {
+            if self.seen_request_ids.len() <= self.config.max_seen_request_ids {
+                break;
+            }
+            let Some(request_id) = self.seen_request_id_order.pop_front() else {
+                break;
+            };
+            if self.global_inflight.contains(&request_id) {
+                self.seen_request_id_order.push_back(request_id);
+            } else {
+                self.seen_request_ids.remove(&request_id);
+            }
+        }
+    }
+
+    fn prune_seen_urls(&mut self) {
+        let queue_len = self.seen_url_order.len();
+        for _ in 0..queue_len {
+            if self.seen_urls.len() <= self.config.max_seen_urls {
+                break;
+            }
+            let Some(url) = self.seen_url_order.pop_front() else {
+                break;
+            };
+            if self.live_urls.contains(&url) {
+                self.seen_url_order.push_back(url);
+            } else {
+                self.seen_urls.remove(&url);
+            }
+        }
+    }
+
+    fn prune_tracked_origins(&mut self) {
+        let queue_len = self.origin_order.len();
+        for _ in 0..queue_len {
+            if self.origins.len() <= self.config.max_tracked_origins {
+                break;
+            }
+            let Some(origin) = self.origin_order.pop_front() else {
+                break;
+            };
+            match self.origins.get(&origin) {
+                Some(state) if state.inflight.is_empty() => {
+                    self.origins.remove(&origin);
+                }
+                Some(_) => self.origin_order.push_back(origin),
+                None => {}
+            }
+        }
+    }
+
+    /// Release a previously admitted request. Returns `true` when the lease was live.
+    pub fn finish(&mut self, lease: &CrawlLease, tick: u64) -> bool {
+        if self.live_leases.get(&lease.request_id) != Some(lease) {
+            return false;
+        }
+        let Some(state) = self.origins.get_mut(&lease.origin) else {
+            return false;
+        };
+        if !self.global_inflight.contains(&lease.request_id)
+            || !state.inflight.contains(&lease.request_id)
+        {
+            false
+        } else {
+            self.global_inflight.remove(&lease.request_id);
+            self.live_urls.remove(&lease.url);
+            state.inflight.remove(&lease.request_id);
+            self.live_leases.remove(&lease.request_id);
+            state.next_allowed_tick = state
+                .next_allowed_tick
+                .max(tick.saturating_add(self.config.crawl_delay_ticks));
+            self.prune_retained_history();
+            true
+        }
+    }
+}
+
+impl Default for CrawlAdmission {
+    fn default() -> Self {
+        Self::secure_default()
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct OriginCrawlState {
+    inflight: BTreeSet<RequestId>,
+    next_allowed_tick: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CanonicalCrawlUrl {
+    url: String,
+    origin: String,
+}
+
+fn canonical_crawl_url(
+    url: &str,
+    url_policy: &UrlPolicy,
+) -> Result<CanonicalCrawlUrl, BlockReason> {
+    match url_policy.check(url) {
+        UrlPolicyVerdict::Allow => {}
+        UrlPolicyVerdict::Block(reason) => return Err(reason),
+    }
+    let parts = UrlParts::parse(url)?;
+    Ok(CanonicalCrawlUrl {
+        url: parts.target_uri(),
+        origin: parts.origin(),
+    })
+}
+
 /// Outcome used by network quiescence accounting.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RequestOutcome {
@@ -2987,6 +3408,370 @@ mod tests {
         assert_eq!(record.bytes_sent, 123);
         assert_eq!(record.bytes_received, 456);
         assert!(!record.domain.contains("token"));
+        Ok(())
+    }
+
+    #[test]
+    fn crawl_admission_blocks_private_targets_and_dedupes_canonical_urls() -> Result<(), String> {
+        let mut admission = CrawlAdmission::secure_default();
+
+        let blocked = admission.admit(
+            CrawlCandidate::new("private", "http://169.254.169.254/latest/meta-data", 0),
+            0,
+        );
+        assert!(
+            matches!(
+                blocked,
+                CrawlAdmissionDecision::Drop {
+                    reason: CrawlRejectReason::UrlPolicy(BlockReason {
+                        code: BlockCode::BlockedIp,
+                        ..
+                    }),
+                }
+            ),
+            "private target should be rejected: {blocked:?}"
+        );
+
+        let first = admission.admit(
+            CrawlCandidate::new(
+                "r1",
+                "https://Example.COM:443/path/reset-token?q=secret#fragment",
+                0,
+            ),
+            1,
+        );
+        let CrawlAdmissionDecision::Admit(lease) = first else {
+            return Err(format!("public URL should be admitted: {first:?}"));
+        };
+        assert_eq!(lease.url, "https://example.com/path/reset-token?q=secret");
+        assert_eq!(lease.origin, "https://example.com");
+
+        let duplicate = admission.admit(
+            CrawlCandidate::new(
+                "r2",
+                "https://example.com/path/reset-token?q=secret#other",
+                0,
+            ),
+            2,
+        );
+        assert_eq!(
+            duplicate,
+            CrawlAdmissionDecision::Drop {
+                reason: CrawlRejectReason::DuplicateUrl {
+                    origin: "https://example.com".into(),
+                },
+            }
+        );
+        let duplicate_debug = format!("{duplicate:?}");
+        assert!(!duplicate_debug.contains("reset-token"));
+        assert!(!duplicate_debug.contains("q=secret"));
+        assert_eq!(admission.seen_count(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn crawl_admission_requires_resolved_socket_check_before_connect() -> Result<(), String> {
+        let mut admission = CrawlAdmission::secure_default();
+        let decision = admission.admit(
+            CrawlCandidate::new("public-host", "https://public.example/agent", 0),
+            0,
+        );
+        let CrawlAdmissionDecision::Admit(lease) = decision else {
+            return Err(format!("public hostname should be admitted: {decision:?}"));
+        };
+
+        let metadata_socket = SocketAddr::from(([169, 254, 169, 254], 443));
+        let blocked = admission.enforce_resolved_socket(&lease, metadata_socket);
+        assert!(
+            matches!(
+                &blocked,
+                Err(CrawlResolvedTargetError::UrlPolicy(BlockReason {
+                    code: BlockCode::BlockedIp,
+                    ..
+                }))
+            ),
+            "resolved metadata target should be blocked: {blocked:?}"
+        );
+
+        let public_socket = SocketAddr::from(([93, 184, 216, 34], 443));
+        admission
+            .enforce_resolved_socket(&lease, public_socket)
+            .map_err(|error| format!("public resolved target should be allowed: {error:?}"))?;
+        assert!(admission.finish(&lease, 1));
+
+        let stale = admission.enforce_resolved_socket(&lease, public_socket);
+        assert_eq!(
+            stale,
+            Err(CrawlResolvedTargetError::StaleLease {
+                request_id: "public-host".into(),
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn crawl_admission_enforces_global_and_per_origin_limits() -> Result<(), String> {
+        let mut admission = CrawlAdmission::new(
+            CrawlAdmissionConfig {
+                max_global_inflight: 2,
+                max_per_origin_inflight: 1,
+                crawl_delay_ticks: 0,
+                ..CrawlAdmissionConfig::default()
+            },
+            UrlPolicy::block_private(),
+        );
+
+        let first = admission.admit(CrawlCandidate::new("a1", "https://a.example/1", 0), 10);
+        let CrawlAdmissionDecision::Admit(first_lease) = first else {
+            return Err(format!("first request should be admitted: {first:?}"));
+        };
+
+        let same_origin = admission.admit(CrawlCandidate::new("a2", "https://a.example/2", 0), 11);
+        assert_eq!(
+            same_origin,
+            CrawlAdmissionDecision::Delay {
+                retry_after_tick: 12,
+                reason: CrawlDelayReason::PerOriginConcurrencyLimit {
+                    origin: "https://a.example".into(),
+                    max: 1,
+                },
+            }
+        );
+
+        let second = admission.admit(CrawlCandidate::new("b1", "https://b.example/1", 0), 12);
+        assert!(
+            second.admitted(),
+            "different origin should use remaining global capacity: {second:?}"
+        );
+
+        let global_limited =
+            admission.admit(CrawlCandidate::new("c1", "https://c.example/1", 0), 13);
+        assert_eq!(
+            global_limited,
+            CrawlAdmissionDecision::Delay {
+                retry_after_tick: 14,
+                reason: CrawlDelayReason::GlobalConcurrencyLimit { max: 2 },
+            }
+        );
+
+        assert!(admission.finish(&first_lease, 20));
+        let after_finish = admission.admit(CrawlCandidate::new("a3", "https://a.example/3", 0), 21);
+        assert!(
+            after_finish.admitted(),
+            "finishing a lease should free per-origin and global capacity: {after_finish:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn crawl_admission_rejects_live_duplicate_request_ids() -> Result<(), String> {
+        let mut admission = CrawlAdmission::new(
+            CrawlAdmissionConfig {
+                max_global_inflight: 4,
+                max_per_origin_inflight: 4,
+                crawl_delay_ticks: 0,
+                ..CrawlAdmissionConfig::default()
+            },
+            UrlPolicy::block_private(),
+        );
+
+        let first = admission.admit(CrawlCandidate::new("dup", "https://a.example/1", 0), 0);
+        let CrawlAdmissionDecision::Admit(_lease) = first else {
+            return Err(format!("first request should be admitted: {first:?}"));
+        };
+
+        let duplicate =
+            admission.admit(CrawlCandidate::new("dup", "https://b.example/other", 0), 1);
+        assert_eq!(
+            duplicate,
+            CrawlAdmissionDecision::Drop {
+                reason: CrawlRejectReason::DuplicateRequestId {
+                    request_id: "dup".into(),
+                },
+            }
+        );
+        assert_eq!(admission.inflight(), 1);
+        assert_eq!(admission.inflight_for_origin("https://a.example"), 1);
+        assert_eq!(admission.inflight_for_origin("https://b.example"), 0);
+        assert_eq!(admission.seen_count(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn crawl_admission_rejects_reused_request_ids_after_finish() -> Result<(), String> {
+        let mut admission = CrawlAdmission::new(
+            CrawlAdmissionConfig {
+                max_global_inflight: 4,
+                max_per_origin_inflight: 4,
+                crawl_delay_ticks: 0,
+                ..CrawlAdmissionConfig::default()
+            },
+            UrlPolicy::block_private(),
+        );
+
+        let first = admission.admit(
+            CrawlCandidate::new("stable-id", "https://a.example/1", 0),
+            0,
+        );
+        let CrawlAdmissionDecision::Admit(lease) = first else {
+            return Err(format!("first request should be admitted: {first:?}"));
+        };
+        assert!(admission.finish(&lease, 1));
+
+        let reused = admission.admit(
+            CrawlCandidate::new("stable-id", "https://b.example/other", 0),
+            2,
+        );
+        assert_eq!(
+            reused,
+            CrawlAdmissionDecision::Drop {
+                reason: CrawlRejectReason::DuplicateRequestId {
+                    request_id: "stable-id".into(),
+                },
+            }
+        );
+        assert_eq!(admission.inflight(), 0);
+        assert_eq!(admission.inflight_for_origin("https://b.example"), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn crawl_admission_finish_ignores_forged_or_wrong_origin_leases() -> Result<(), String> {
+        let mut admission = CrawlAdmission::new(
+            CrawlAdmissionConfig {
+                max_global_inflight: 1,
+                max_per_origin_inflight: 1,
+                crawl_delay_ticks: 10,
+                ..CrawlAdmissionConfig::default()
+            },
+            UrlPolicy::block_private(),
+        );
+
+        let first = admission.admit(CrawlCandidate::new("r1", "https://a.example/1", 0), 0);
+        let CrawlAdmissionDecision::Admit(lease) = first else {
+            return Err(format!("first request should be admitted: {first:?}"));
+        };
+
+        let wrong_origin = CrawlLease {
+            origin: "https://b.example".into(),
+            ..lease.clone()
+        };
+        assert!(!admission.finish(&wrong_origin, 5));
+        assert_eq!(admission.inflight(), 1);
+        assert_eq!(admission.inflight_for_origin("https://a.example"), 1);
+
+        let unknown_request = CrawlLease {
+            request_id: "missing".into(),
+            ..lease.clone()
+        };
+        assert!(!admission.finish(&unknown_request, 6));
+        assert_eq!(admission.inflight(), 1);
+        assert_eq!(admission.inflight_for_origin("https://a.example"), 1);
+
+        let wrong_url = CrawlLease {
+            url: "https://a.example/forged".into(),
+            ..lease.clone()
+        };
+        assert!(!admission.finish(&wrong_url, 7));
+        assert_eq!(admission.inflight(), 1);
+        assert_eq!(admission.inflight_for_origin("https://a.example"), 1);
+
+        assert!(admission.finish(&lease, 8));
+        assert_eq!(admission.inflight(), 0);
+        assert_eq!(admission.inflight_for_origin("https://a.example"), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn crawl_admission_respects_per_origin_politeness_window() -> Result<(), String> {
+        let mut admission = CrawlAdmission::new(
+            CrawlAdmissionConfig {
+                max_global_inflight: 4,
+                max_per_origin_inflight: 2,
+                crawl_delay_ticks: 10,
+                ..CrawlAdmissionConfig::default()
+            },
+            UrlPolicy::block_private(),
+        );
+
+        let first = admission.admit(
+            CrawlCandidate::new("r1", "https://polite.example/first", 0),
+            0,
+        );
+        let CrawlAdmissionDecision::Admit(lease) = first else {
+            return Err(format!("first request should be admitted: {first:?}"));
+        };
+        assert!(admission.finish(&lease, 5));
+
+        let delayed = admission.admit(
+            CrawlCandidate::new("r2", "https://polite.example/second", 0),
+            14,
+        );
+        assert_eq!(
+            delayed,
+            CrawlAdmissionDecision::Delay {
+                retry_after_tick: 15,
+                reason: CrawlDelayReason::PolitenessWindow {
+                    origin: "https://polite.example".into(),
+                },
+            }
+        );
+
+        let admitted = admission.admit(
+            CrawlCandidate::new("r3", "https://polite.example/third", 0),
+            15,
+        );
+        assert!(
+            admitted.admitted(),
+            "candidate should run once the quiet window expires: {admitted:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn crawl_admission_retention_tables_stay_bounded_after_finish() -> Result<(), String> {
+        let mut admission = CrawlAdmission::new(
+            CrawlAdmissionConfig {
+                max_global_inflight: 1,
+                max_per_origin_inflight: 1,
+                max_seen_urls: 2,
+                max_seen_request_ids: 2,
+                max_tracked_origins: 2,
+                crawl_delay_ticks: 0,
+            },
+            UrlPolicy::block_private(),
+        );
+
+        for index in 0..5 {
+            let decision = admission.admit(
+                CrawlCandidate::new(
+                    format!("r{index}"),
+                    format!("https://site{index}.example/path"),
+                    0,
+                ),
+                index,
+            );
+            let CrawlAdmissionDecision::Admit(lease) = decision else {
+                return Err(format!("request {index} should be admitted: {decision:?}"));
+            };
+            assert!(admission.finish(&lease, index.saturating_add(1)));
+        }
+
+        assert!(
+            admission.seen_count() <= 2,
+            "seen URL table should be capped: {:?}",
+            admission.seen_urls
+        );
+        assert!(
+            admission.seen_request_id_count() <= 2,
+            "seen request id table should be capped: {:?}",
+            admission.seen_request_ids
+        );
+        assert!(
+            admission.tracked_origin_count() <= 2,
+            "origin table should be capped: {:?}",
+            admission.origins.keys().collect::<Vec<_>>()
+        );
         Ok(())
     }
 

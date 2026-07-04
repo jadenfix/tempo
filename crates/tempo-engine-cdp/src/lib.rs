@@ -43,6 +43,10 @@ use tokio::task::JoinHandle;
 /// so every element that actually survives into the marked observation is still
 /// enriched, while the long tail stays present but without an AX overlay.
 const MAX_AX_ENRICHED_ELEMENTS: usize = 16;
+const CDP_TYPE_ACTION_BASE_TIMEOUT: Duration = Duration::from_secs(15);
+const CDP_TYPE_ACTION_MAX_TIMEOUT: Duration = Duration::from_secs(30);
+const CDP_TYPE_ACTION_TIMEOUT_PER_CHAR: Duration = Duration::from_millis(25);
+const CDP_TYPE_ACTION_RECOVERY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Launch configuration for the CDP fallback lane.
 #[derive(Clone, Debug)]
@@ -59,6 +63,11 @@ pub struct CdpConfig {
 impl CdpConfig {
     pub fn with_executable(mut self, path: impl Into<String>) -> Self {
         self.executable = Some(path.into());
+        self
+    }
+
+    pub fn with_launch_timeout(mut self, launch_timeout: Duration) -> Self {
+        self.launch_timeout = launch_timeout;
         self
     }
 
@@ -95,6 +104,14 @@ pub struct CdpTempoDriver {
     seq: u64,
     history: BTreeMap<u64, CompiledObservation>,
     url_policy: UrlPolicy,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TypeTarget {
+    Missing,
+    NotEditable,
+    TimedOut,
+    Inserted,
 }
 
 impl CdpTempoDriver {
@@ -288,6 +305,84 @@ impl CdpTempoDriver {
         }
     }
 
+    async fn type_into_selector(
+        &self,
+        selector: &str,
+        text: &str,
+    ) -> Result<TypeTarget, TransportError> {
+        match tokio::time::timeout(
+            cdp_type_action_timeout(text),
+            self.type_into_selector_inner(selector, text),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Ok(TypeTarget::TimedOut),
+        }
+    }
+
+    async fn type_into_selector_inner(
+        &self,
+        selector: &str,
+        text: &str,
+    ) -> Result<TypeTarget, TransportError> {
+        let page = self.page()?;
+        let element = match page.find_element(selector).await {
+            Ok(element) => element,
+            Err(CdpError::NotFound) => return Ok(TypeTarget::Missing),
+            Err(error) if is_node_not_found_msg(&error.to_string()) => {
+                return Ok(TypeTarget::Missing);
+            }
+            Err(error) => return Err(map_cdp_error(error)),
+        };
+        let editable_response = match element
+            .call_js_fn(
+                r#"function() {
+                    const tag = this.tagName ? this.tagName.toLowerCase() : '';
+                    const type = this.type ? this.type.toLowerCase() : 'text';
+                    const textInputTypes = new Set([
+                        'date', 'datetime-local', 'email', 'month', 'number', 'password',
+                        'search', 'tel', 'text', 'time', 'url', 'week'
+                    ]);
+                    const acceptsText = this.isContentEditable ||
+                        tag === 'textarea' ||
+                        (tag === 'input' && textInputTypes.has(type));
+                    const disabled = Boolean(this.disabled) || this.matches(':disabled');
+                    const readOnly = Boolean(this.readOnly) || this.matches(':read-only');
+                    const editable = acceptsText && !disabled && !readOnly;
+                    if (!editable) {
+                        return false;
+                    }
+                    this.focus({ preventScroll: true });
+                    return document.activeElement === this ||
+                        (this.shadowRoot && this.shadowRoot.activeElement !== null);
+                }"#,
+                true,
+            )
+            .await
+        {
+            Ok(response) => response,
+            Err(error) if is_node_not_found_msg(&error.to_string()) => {
+                return Ok(TypeTarget::Missing);
+            }
+            Err(error) => return Err(map_cdp_error(error)),
+        };
+        let editable = editable_response
+            .result
+            .value
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        if !editable {
+            return Ok(TypeTarget::NotEditable);
+        }
+        match tokio::time::timeout(cdp_type_action_timeout(text), element.type_str(text)).await {
+            Ok(Ok(_)) => Ok(TypeTarget::Inserted),
+            Ok(Err(error)) if is_node_not_found_msg(&error.to_string()) => Ok(TypeTarget::Missing),
+            Ok(Err(error)) => Err(map_cdp_error(error)),
+            Err(_) => Ok(TypeTarget::TimedOut),
+        }
+    }
+
     async fn selector_outcome(
         &mut self,
         previous_seq: u64,
@@ -328,16 +423,32 @@ impl CdpTempoDriver {
             }
             Action::Type { node, text } => {
                 let selector = node.0.clone();
-                let text = text.clone();
-                let grounded = self
-                    .with_element(&selector, |element| async move {
-                        element.focus().await.map_err(map_cdp_error)?;
-                        element.type_str(&text).await.map_err(map_cdp_error)?;
-                        Ok(())
-                    })
-                    .await?;
-                self.selector_outcome(previous_seq, &selector, grounded)
-                    .await
+                match self.type_into_selector(&selector, text).await? {
+                    TypeTarget::Inserted => {
+                        self.selector_outcome(previous_seq, &selector, true).await
+                    }
+                    TypeTarget::Missing => {
+                        self.selector_outcome(previous_seq, &selector, false).await
+                    }
+                    TypeTarget::NotEditable => {
+                        let _ = self.record_current_observation().await?;
+                        Ok(StepOutcome::StepError {
+                            reason: format!("selector not editable: {selector}"),
+                        })
+                    }
+                    TypeTarget::TimedOut => {
+                        // Best effort: record partial page state, but never let
+                        // timeout recovery hang the action path a second time.
+                        let _ = tokio::time::timeout(
+                            CDP_TYPE_ACTION_RECOVERY_TIMEOUT,
+                            self.record_current_observation(),
+                        )
+                        .await;
+                        Ok(StepOutcome::StepError {
+                            reason: format!("CDP type action timed out: {selector}"),
+                        })
+                    }
+                }
             }
             Action::Select { node, value } => {
                 let selector = node.0.clone();
@@ -579,6 +690,14 @@ fn map_cdp_error(error: CdpError) -> TransportError {
 fn is_node_not_found_msg(message: &str) -> bool {
     let lowered = message.to_lowercase();
     lowered.contains("could not find node") || lowered.contains("no node with given id")
+}
+
+fn cdp_type_action_timeout(text: &str) -> Duration {
+    let chars = text.chars().take(1000).count() as u32;
+    std::cmp::min(
+        CDP_TYPE_ACTION_MAX_TIMEOUT,
+        CDP_TYPE_ACTION_BASE_TIMEOUT + (CDP_TYPE_ACTION_TIMEOUT_PER_CHAR * chars),
+    )
 }
 
 fn is_uninteresting_ax_node_msg(message: &str) -> bool {
@@ -1553,6 +1672,16 @@ mod tests {
     }
 
     #[test]
+    fn type_action_timeout_scales_with_input_and_caps() {
+        assert_eq!(cdp_type_action_timeout(""), CDP_TYPE_ACTION_BASE_TIMEOUT);
+        assert!(cdp_type_action_timeout("hello") > CDP_TYPE_ACTION_BASE_TIMEOUT);
+        assert_eq!(
+            cdp_type_action_timeout(&"x".repeat(10_000)),
+            CDP_TYPE_ACTION_MAX_TIMEOUT
+        );
+    }
+
+    #[test]
     fn blocks_full_zero_ipv4_block() {
         let policy = UrlPolicy::block_private();
         // GAP B: the whole 0.0.0.0/8 must be blocked, not just 0.0.0.0.
@@ -1577,7 +1706,9 @@ mod tests {
             return Ok(());
         };
         let url = serve_fixture()?;
-        let config = CdpConfig::default().with_executable(chrome.to_string_lossy());
+        let config = CdpConfig::default()
+            .with_executable(chrome.to_string_lossy())
+            .with_launch_timeout(Duration::from_secs(60));
         let mut driver = CdpTempoDriver::launch_with(config)
             .await?
             .allow_private_network_access();
@@ -1633,13 +1764,147 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn live_cdp_driver_handles_form_actions_and_extract(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(chrome) = std::env::var_os("TEMPO_CDP_CHROME") else {
+            eprintln!("skipping live CDP form action test; TEMPO_CDP_CHROME is unset");
+            return Ok(());
+        };
+        let url = serve_fixture()?;
+        let config = CdpConfig::default()
+            .with_executable(chrome.to_string_lossy())
+            .with_launch_timeout(Duration::from_secs(60));
+        let mut driver = CdpTempoDriver::launch_with(config)
+            .await?
+            .allow_private_network_access();
+
+        tokio::time::timeout(
+            Duration::from_secs(90),
+            run_live_form_actions(&mut driver, &url),
+        )
+        .await
+        .map_err(|_| std::io::Error::other("live CDP form actions timed out"))??;
+
+        driver.close().await?;
+        Ok(())
+    }
+
+    async fn run_live_form_actions(
+        driver: &mut CdpTempoDriver,
+        url: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        driver.goto(url).await?;
+        for action in [
+            Action::Type {
+                node: NodeId(r#"[id="name"]"#.into()),
+                text: "Ada".into(),
+            },
+            Action::Type {
+                node: NodeId(r#"[id="limited"]"#.into()),
+                text: "WXYZ".into(),
+            },
+            Action::Select {
+                node: NodeId(r#"[id="plan"]"#.into()),
+                value: "pro".into(),
+            },
+            Action::Click {
+                node: NodeId(r#"[id="add"]"#.into()),
+            },
+            Action::Click {
+                node: NodeId(r#"[id="finish"]"#.into()),
+            },
+            Action::Extract {
+                node: NodeId(r#"[id="summary"]"#.into()),
+            },
+        ] {
+            let outcome = driver.act(&action).await?;
+            assert!(
+                matches!(outcome, StepOutcome::Applied { .. }),
+                "action should apply: {action:?}, got {outcome:?}"
+            );
+        }
+
+        let before_action = Action::Type {
+            node: NodeId(r#"[id="before"]"#.into()),
+            text: "safe".into(),
+        };
+        let before_outcome = driver.act(&before_action).await?;
+        assert!(
+            matches!(before_outcome, StepOutcome::Applied { .. }),
+            "focus-control action should apply: {before_action:?}, got {before_outcome:?}"
+        );
+
+        for action in [
+            Action::Type {
+                node: NodeId(r#"[id="readonly"]"#.into()),
+                text: "locked".into(),
+            },
+            Action::Type {
+                node: NodeId(r#"[id="disabled"]"#.into()),
+                text: "blocked".into(),
+            },
+            Action::Type {
+                node: NodeId(r#"[id="fieldset-disabled"]"#.into()),
+                text: "blocked".into(),
+            },
+        ] {
+            let outcome = driver.act(&action).await?;
+            assert!(
+                matches!(outcome, StepOutcome::StepError { .. }),
+                "non-editable action should be a step error: {action:?}, got {outcome:?}"
+            );
+        }
+
+        let final_state = driver
+            .evaluate_script(
+                r#"(() => ({
+                    name: document.querySelector('#name').value,
+                    limited: document.querySelector('#limited').value,
+                    readonly: document.querySelector('#readonly').value,
+                    disabled: document.querySelector('#disabled').value,
+                    before: document.querySelector('#before').value,
+                    fieldsetDisabled: document.querySelector('#fieldset-disabled').value,
+                    plan: document.querySelector('#plan').value,
+                    count: Number(document.body.dataset.count || '0'),
+                    finished: document.body.dataset.finished,
+                    summary: document.querySelector('#summary').textContent.trim(),
+                    events: window.__events
+                }))()"#,
+                true,
+            )
+            .await?;
+        assert_eq!(final_state["name"], serde_json::json!("Ada"));
+        assert_eq!(final_state["limited"], serde_json::json!("WX"));
+        assert_eq!(final_state["readonly"], serde_json::json!("fixed"));
+        assert_eq!(final_state["disabled"], serde_json::json!("fixed"));
+        assert_eq!(final_state["before"], serde_json::json!("safe"));
+        assert_eq!(
+            final_state["fieldsetDisabled"],
+            serde_json::json!("blocked-by-fieldset")
+        );
+        assert_eq!(final_state["plan"], serde_json::json!("pro"));
+        assert_eq!(final_state["count"], serde_json::json!(1));
+        assert_eq!(final_state["finished"], serde_json::json!("yes"));
+        assert_eq!(final_state["summary"], serde_json::json!("Ada:pro:1"));
+        let name_events = &final_state["events"]["name"];
+        assert!(name_events["keydown"].as_u64().unwrap_or(0) >= 1);
+        assert!(name_events["beforeinput"].as_u64().unwrap_or(0) >= 1);
+        assert!(name_events["input"].as_u64().unwrap_or(0) >= 1);
+        assert!(name_events["keyup"].as_u64().unwrap_or(0) >= 1);
+        assert!(name_events["change"].as_u64().unwrap_or(0) >= 1);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn live_cdp_driver_passes_conformance_v2() -> Result<(), Box<dyn std::error::Error>> {
         let Some(chrome) = std::env::var_os("TEMPO_CDP_CHROME") else {
             eprintln!("skipping live CDP conformance test; TEMPO_CDP_CHROME is unset");
             return Ok(());
         };
         let url = serve_fixture()?;
-        let config = CdpConfig::default().with_executable(chrome.to_string_lossy());
+        let config = CdpConfig::default()
+            .with_executable(chrome.to_string_lossy())
+            .with_launch_timeout(Duration::from_secs(60));
         let mut driver = CdpTempoDriver::launch_with(config)
             .await?
             .allow_private_network_access();
@@ -1667,6 +1932,36 @@ mod tests {
                     </button>
                     <label for="email">Email Address</label>
                     <input id="email" value="me@example.com">
+                    <label for="name">Name</label>
+                    <input id="name">
+                    <label for="limited">Limited</label>
+                    <input id="limited" maxlength="2">
+                    <label for="readonly">Readonly</label>
+                    <input id="readonly" readonly value="fixed">
+                    <label for="disabled">Disabled</label>
+                    <input id="disabled" disabled value="fixed">
+                    <input id="before" value="">
+                    <fieldset disabled>
+                      <input id="fieldset-disabled" value="blocked-by-fieldset">
+                    </fieldset>
+                    <label for="plan">Plan</label>
+                    <select id="plan">
+                      <option value="free">Free</option>
+                      <option value="pro">Pro</option>
+                    </select>
+                    <button id="add" onclick="document.body.dataset.count = String(Number(document.body.dataset.count || '0') + 1);">Add</button>
+                    <button id="finish" onclick="document.body.dataset.finished='yes'; document.getElementById('summary').textContent = document.getElementById('name').value + ':' + document.getElementById('plan').value + ':' + (document.body.dataset.count || '0');">Finish</button>
+                    <div id="summary" tabindex="0"></div>
+                    <script>
+                      window.__events = {};
+                      for (const id of ['name', 'limited', 'readonly', 'disabled', 'before', 'fieldset-disabled']) {
+                        const element = document.getElementById(id);
+                        window.__events[id] = { keydown: 0, beforeinput: 0, input: 0, keyup: 0, change: 0 };
+                        for (const eventName of Object.keys(window.__events[id])) {
+                          element.addEventListener(eventName, () => { window.__events[id][eventName] += 1; });
+                        }
+                      }
+                    </script>
                   </body>
                 </html>"#;
             for stream in listener.incoming().take(16) {

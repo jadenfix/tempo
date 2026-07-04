@@ -8,7 +8,7 @@ license.workspace = true
 [features]
 default = []
 servo-vanilla = ["dep:servo"]
-servo-tempo = ["servo-vanilla"]
+servo-tempo = ["dep:servo"]
 
 [dependencies]
 tempo-schema = { path = "../tempo-schema" }
