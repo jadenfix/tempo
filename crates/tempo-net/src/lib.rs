@@ -483,7 +483,7 @@ impl WebBotAuthSigningKey {
 }
 
 /// Ed25519 verification key for incoming or replayed Web Bot Auth signatures.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct WebBotAuthVerifier {
     key_id: String,
     verifying_key: VerifyingKey,
@@ -525,6 +525,17 @@ impl WebBotAuthVerifier {
 
     pub fn allowed_clock_skew(&self) -> Duration {
         self.allowed_clock_skew
+    }
+}
+
+impl fmt::Debug for WebBotAuthVerifier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WebBotAuthVerifier")
+            .field("key_id", &"[redacted]")
+            .field("verifying_key", &"[redacted]")
+            .field("max_signature_age", &self.max_signature_age)
+            .field("allowed_clock_skew", &self.allowed_clock_skew)
+            .finish()
     }
 }
 
@@ -733,7 +744,7 @@ pub enum ProfileKind {
 }
 
 /// Isolated browser profile metadata.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct NetworkProfile {
     pub id: ProfileId,
     pub session_id: SessionId,
@@ -768,6 +779,18 @@ impl NetworkProfile {
             cookie_partition: format!("cookies-{suffix}"),
             storage_partition: format!("storage-{suffix}"),
         }
+    }
+}
+
+impl fmt::Debug for NetworkProfile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NetworkProfile")
+            .field("id", &"[redacted]")
+            .field("session_id", &"[redacted]")
+            .field("kind", &self.kind)
+            .field("cookie_partition", &"[redacted]")
+            .field("storage_partition", &"[redacted]")
+            .finish()
     }
 }
 
@@ -3896,10 +3919,13 @@ fn parse_retry_after_delta_ticks(value: &str, response: &NetworkResponseRecord) 
     }
 
     let retry_after = httpdate::parse_http_date(value).ok()?;
-    let date = response
+    let Some(date) = response
         .header_values("date")
         .and_then(|values| values.first())
-        .and_then(|value| httpdate::parse_http_date(value.trim()).ok())?;
+        .and_then(|value| httpdate::parse_http_date(value.trim()).ok())
+    else {
+        return Some(1);
+    };
     let delta = retry_after.duration_since(date).unwrap_or_default();
     Some(
         delta
@@ -4627,17 +4653,24 @@ mod tests {
         );
         let key = WebBotAuthSigningKey::from_seed("tempo-agent-secret", &[7u8; 32])?;
         let headers = request.sign_web_bot_auth(&key, 1_800_000_000)?;
+        let profile_debug = format!("{profile:?}");
+        let verifier_debug = format!("{:?}", key.verifier());
 
-        let debug =
-            format!("{request:?}\n{response:?}\n{cookie:?}\n{store:?}\n{proxy:?}\n{headers:?}");
+        let debug = format!(
+            "{request:?}\n{response:?}\n{cookie:?}\n{store:?}\n{profile_debug}\n{proxy:?}\n{headers:?}\n{verifier_debug}"
+        );
 
         for secret in [
             "user:secret",
             "token=secret",
             "Bearer",
             "top-secret-token",
+            "session-secret",
             "session-cookie-value",
             "secret request body",
+            &profile.session_id.0,
+            &profile.cookie_partition,
+            &profile.storage_partition,
             "proxy-secret",
             "tempo-agent-secret",
             &headers.signature,
@@ -5796,7 +5829,7 @@ Disallow: /private
     fn retry_after_http_date_requires_response_date_and_clamps_past_dates() {
         let no_date = NetworkResponseRecord::new("r1", "https://example.com/a", 429)
             .with_header("Retry-After", "Tue, 20 Apr 2021 02:08:05 GMT");
-        assert_eq!(retry_after_until_tick(&no_date, 10), None);
+        assert_eq!(retry_after_until_tick(&no_date, 10), Some(11));
 
         let past = NetworkResponseRecord::new("r1", "https://example.com/a", 429)
             .with_header("Date", "Tue, 20 Apr 2021 02:08:05 GMT")
