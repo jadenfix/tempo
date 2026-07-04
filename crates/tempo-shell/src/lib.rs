@@ -14,8 +14,14 @@ use thiserror::Error;
 
 pub const DEFAULT_TEMPOD_ADDR: &str = "127.0.0.1:8787";
 pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+// Mirrors tempo-engine-host::MAX_SCREENSHOT_BYTES without depending on that crate
+// from production shell code. MCP screenshot results base64-encode that raw
+// screenshot and wrap it in JSON, so the response cap must allow the encoded
+// 64 MiB engine-host screenshot ceiling plus envelope/header overhead.
+const ENGINE_HOST_MAX_SCREENSHOT_BYTES: usize = 64 * 1024 * 1024;
+const MCP_SCREENSHOT_RESPONSE_OVERHEAD_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_MAX_MCP_RESPONSE_BYTES: usize =
-    DEFAULT_MAX_RESPONSE_BYTES.div_ceil(3) * 4 + 1024 * 1024;
+    ENGINE_HOST_MAX_SCREENSHOT_BYTES.div_ceil(3) * 4 + MCP_SCREENSHOT_RESPONSE_OVERHEAD_BYTES;
 const MAX_RESPONSE_HEADER_BYTES: usize = 64 * 1024;
 
 const USAGE: &str = "\
@@ -1015,12 +1021,8 @@ mod tests {
     }
 
     #[test]
-    fn client_accepts_mcp_base64_screenshot_payload_above_plain_response_cap() -> TestResult {
-        let default_raw_screenshot_len: usize = 6 * 1024 * 1024;
-        let default_base64_len = default_raw_screenshot_len.div_ceil(3) * 4;
-        assert!(default_base64_len + 1024 * 1024 <= DEFAULT_MAX_MCP_RESPONSE_BYTES);
-
-        let raw_screenshot_len: usize = 384;
+    fn client_accepts_full_engine_host_sized_mcp_base64_screenshot_payload() -> TestResult {
+        let raw_screenshot_len = ENGINE_HOST_MAX_SCREENSHOT_BYTES;
         let base64_len = raw_screenshot_len.div_ceil(3) * 4;
         let encoded = "A".repeat(base64_len);
         let body = serde_json::to_vec(&json!({
@@ -1035,10 +1037,8 @@ mod tests {
                 }
             }
         }))?;
-        let plain_cap = 256;
-        let mcp_cap = 4096;
-        assert!(body.len() > plain_cap);
-        assert!(body.len() <= mcp_cap);
+        assert!(body.len() > DEFAULT_MAX_RESPONSE_BYTES);
+        assert!(body.len() <= DEFAULT_MAX_MCP_RESPONSE_BYTES);
 
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let addr = listener.local_addr()?;
@@ -1055,15 +1055,50 @@ mod tests {
             write_fixture_response(&mut stream, &body)
         });
 
-        let result = ShellClient::new(addr.to_string())
-            .with_max_response_bytes(plain_cap)
-            .with_max_mcp_response_bytes(mcp_cap)
-            .mcp_tool("screenshot", json!({}))?;
+        let result = ShellClient::new(addr.to_string()).mcp_tool("screenshot", json!({}))?;
 
         assert_eq!(result["encoding"], "base64");
         assert_eq!(result["data"].as_str().map(str::len), Some(expected_len));
         match handle.join() {
             Ok(result) => result?,
+            Err(_) => return Err("server thread failed".into()),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn mcp_client_rejects_oversized_content_length_before_body_read() -> TestResult {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let handle = thread::spawn(move || -> Result<(), Box<dyn Error + Send + Sync>> {
+            let (mut stream, _) = listener.accept()?;
+            let content_length = DEFAULT_MAX_MCP_RESPONSE_BYTES + 1;
+            let header = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {content_length}\r\nconnection: close\r\n\r\n"
+            );
+            stream.write_all(header.as_bytes())?;
+            let _ = done_rx.recv_timeout(Duration::from_secs(1));
+            Ok(())
+        });
+
+        let err = match ShellClient::new(addr.to_string())
+            .with_timeout(Duration::from_millis(200))
+            .mcp_tool("screenshot", json!({}))
+        {
+            Ok(_) => return Err("advertised oversized MCP response should be rejected".into()),
+            Err(err) => err,
+        };
+        let _ = done_tx.send(());
+
+        assert!(matches!(
+            err,
+            ShellError::ResponseTooLarge {
+                max_bytes: DEFAULT_MAX_MCP_RESPONSE_BYTES
+            }
+        ));
+        match handle.join() {
+            Ok(result) => result.map_err(|err| err.to_string())?,
             Err(_) => return Err("server thread failed".into()),
         }
         Ok(())
