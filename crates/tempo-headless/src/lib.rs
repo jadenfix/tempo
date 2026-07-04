@@ -6996,6 +6996,37 @@ mod tests {
     }
 
     #[test]
+    fn mcp_endpoint_rejects_blocked_act_goto_before_driver_execution() -> TestResult {
+        let (client_stream, mut server_stream) = UnixStream::pair()?;
+        server_stream.set_nonblocking(true)?;
+        let mut pool = SessionPool::default();
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream));
+
+        let response = route_http_request(
+            &mut pool,
+            mcp_tool_request(
+                17,
+                "act",
+                json!({
+                    "action": {"kind": "goto", "url": "http://127.0.0.1/admin"},
+                    "input_tainted": false
+                }),
+            )?,
+        )?;
+
+        assert_eq!(response.status, 200);
+        let value: Value = serde_json::from_slice(&response.body)?;
+        assert_eq!(value["id"], 17);
+        assert_eq!(value["result"]["isError"], true);
+        let error = value["result"]["structuredContent"]["error"]
+            .as_str()
+            .ok_or("MCP tool error should include a message")?;
+        assert!(error.contains("blocked by URL policy"));
+        assert_no_driver_ipc(&mut server_stream)?;
+        Ok(())
+    }
+
+    #[test]
     fn mcp_endpoint_rejects_act_without_input_taint_evidence() -> TestResult {
         let (client_stream, mut server_stream) = UnixStream::pair()?;
         server_stream.set_nonblocking(true)?;
