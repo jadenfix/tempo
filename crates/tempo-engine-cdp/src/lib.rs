@@ -458,11 +458,13 @@ impl CdpTempoDriver {
         match self.page()?.find_element(selector).await {
             Ok(element) => match op(element).await {
                 Ok(()) => Ok(true),
-                Err(TransportError::Other(message)) if is_node_not_found_msg(&message) => Ok(false),
+                Err(TransportError::Other(message)) if is_selector_grounding_miss_msg(&message) => {
+                    Ok(false)
+                }
                 Err(other) => Err(other),
             },
             Err(CdpError::NotFound) => Ok(false),
-            Err(error) if is_node_not_found_msg(&error.to_string()) => Ok(false),
+            Err(error) if is_selector_grounding_miss_msg(&error.to_string()) => Ok(false),
             Err(error) => Err(map_cdp_error(error)),
         }
     }
@@ -1339,6 +1341,14 @@ fn env_flag_enabled(name: &str) -> bool {
 fn is_node_not_found_msg(message: &str) -> bool {
     let lowered = message.to_lowercase();
     lowered.contains("could not find node") || lowered.contains("no node with given id")
+}
+
+fn is_selector_grounding_miss_msg(message: &str) -> bool {
+    let lowered = message.to_lowercase();
+    is_node_not_found_msg(&lowered)
+        || lowered.contains("invalid selector")
+        || lowered.contains("not a valid selector")
+        || lowered.contains("dom error while querying")
 }
 
 fn is_uninteresting_ax_node_msg(message: &str) -> bool {
@@ -2787,6 +2797,60 @@ mod tests {
         assert_eq!(clicked, serde_json::json!("yes"));
         driver.close().await?;
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_cdp_invalid_legacy_node_ids_are_step_errors(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(chrome) = std::env::var_os("TEMPO_CDP_CHROME") else {
+            eprintln!("skipping live CDP invalid legacy NodeId test; TEMPO_CDP_CHROME is unset");
+            return Ok(());
+        };
+        let url = serve_fixture()?;
+        let config = CdpConfig::default()
+            .with_executable(chrome.to_string_lossy())
+            .with_no_sandbox_env_opt_in();
+        let mut driver = CdpTempoDriver::launch_with(config)
+            .await?
+            .allow_private_network_access();
+
+        driver.goto(&url).await?;
+        let bad_node = NodeId("button:message".into());
+
+        assert_step_error(
+            driver
+                .act(&Action::Click {
+                    node: bad_node.clone(),
+                })
+                .await?,
+        );
+        assert_step_error(
+            driver
+                .act(&Action::Type {
+                    node: bad_node.clone(),
+                    text: "secret".into(),
+                })
+                .await?,
+        );
+        assert_step_error(
+            driver
+                .act(&Action::Select {
+                    node: bad_node.clone(),
+                    value: "option".into(),
+                })
+                .await?,
+        );
+        assert_step_error(driver.act(&Action::Extract { node: bad_node }).await?);
+
+        driver.close().await?;
+        Ok(())
+    }
+
+    fn assert_step_error(outcome: StepOutcome) {
+        assert!(
+            matches!(outcome, StepOutcome::StepError { .. }),
+            "expected recoverable StepError for malformed legacy NodeId, got {outcome:?}"
+        );
     }
 
     #[tokio::test]
