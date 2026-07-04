@@ -21,16 +21,29 @@ tempo-config = { path = "../tempo-config" }
 tempo-policy = { path = "../tempo-policy" }
 tempo-telemetry = { path = "../tempo-telemetry" }
 async-trait.workspace = true
+# Spec transport (final.md §3.1, issue #249): axum serves the HTTP control
+# plane and the BiDi WebSocket; the ws feature pulls the RFC 6455 protocol
+# implementation that replaces the previous hand-rolled framing.
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "ws"] }
 base64 = "0.22"
 futures = "0.3"
+# hyper/hyper-util are already in axum's dependency tree; direct deps only to
+# drive per-connection serving (serve_one semantics + accept-time connection caps).
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["service", "tokio"] }
+# Thin OTLP/HTTP exporter transport (issue #249): rustls + blocking client on a
+# dedicated worker thread, matching reqwest usage elsewhere in the workspace.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 serde.workspace = true
 serde_json.workspace = true
-sha1 = "0.10"
 thiserror.workspace = true
+tokio = { version = "1", features = ["macros", "net", "rt", "sync", "time"] }
 url = "2"
 
 [dev-dependencies]
 tempo-driver = { path = "../tempo-driver", features = ["test-driver"] }
+# In-process router tests drive the axum Router directly via ServiceExt::oneshot.
+tower = { version = "0.5", features = ["util"] }
 
 [lints]
 workspace = true
