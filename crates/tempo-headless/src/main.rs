@@ -99,22 +99,25 @@ mod tests {
 
     #[test]
     fn explicit_engine_requires_engine_socket() {
-        let error = TempodOptions::parse(["--engine".to_string(), "servo".to_string()])
-            .err()
-            .expect("--engine without --engine-socket should be rejected");
+        let error = match TempodOptions::parse(["--engine".to_string(), "servo".to_string()]) {
+            Ok(_) => panic!("--engine without --engine-socket should be rejected"),
+            Err(error) => error,
+        };
 
         assert!(error.contains("--engine only applies with --engine-socket"));
     }
 
     #[test]
     fn explicit_engine_with_socket_is_accepted() {
-        let options = TempodOptions::parse([
+        let options = match TempodOptions::parse([
             "--engine".to_string(),
             "servo".to_string(),
             "--engine-socket".to_string(),
             "/tmp/tempo-engine.sock".to_string(),
-        ])
-        .expect("--engine with --engine-socket should parse");
+        ]) {
+            Ok(options) => options,
+            Err(error) => panic!("--engine with --engine-socket should parse: {error}"),
+        };
 
         assert_eq!(options.engine, Engine::Servo);
         assert_eq!(
