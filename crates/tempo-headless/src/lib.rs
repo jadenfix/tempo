@@ -810,11 +810,13 @@ impl SessionPool {
                     Ok(endpoint) => match OtlpHttpExporter::new(endpoint) {
                         Ok(exporter) => pool.otlp_http_exporter = Some(exporter),
                         Err(error) => {
-                            eprintln!("tempod: ignoring {TEMPO_OTLP_ENDPOINT_ENV}: {error}");
+                            log_tempod_error("ignoring invalid OTLP endpoint", error);
                         }
                     },
                     Err(_) => {
-                        eprintln!("tempod: ignoring non-UTF-8 {TEMPO_OTLP_ENDPOINT_ENV}");
+                        log_tempod_warn("ignoring non-UTF-8 OTLP endpoint")
+                            .field("env", TEMPO_OTLP_ENDPOINT_ENV)
+                            .emit();
                     }
                 },
                 _ => {}
@@ -1070,39 +1072,47 @@ impl SessionPool {
             // engine-host connection exits on the root Close.
             for mut driver in forks {
                 if let Err(error) = futures::executor::block_on(driver.close()) {
-                    eprintln!("tempod: error closing forked BiDi context at teardown: {error}");
+                    log_tempod_error("error closing forked BiDi context at teardown", error);
                 }
             }
             // Then MCP forks.
             if let Some(server) = mcp {
                 for error in futures::executor::block_on(server.close_all_forks()) {
-                    eprintln!("tempod: error closing MCP fork at teardown: {error}");
+                    log_tempod_error("error closing MCP fork at teardown", error);
                 }
             }
             // Then session-owned engine contexts.
             for (id, mut driver) in session_drivers {
                 if let Err(error) = futures::executor::block_on(driver.close()) {
-                    eprintln!("tempod: error closing session engine context {id}: {error}");
+                    tempo_telemetry::logger()
+                        .event(
+                            tempo_telemetry::Level::Error,
+                            "tempod",
+                            "error closing session engine context at teardown",
+                        )
+                        .field("session_id", id)
+                        .field("error", error.to_string())
+                        .emit();
                 }
             }
             // Finally the root driver's Close (only when close_root).
             if let Some(mut driver) = root
                 && let Err(error) = futures::executor::block_on(driver.close())
             {
-                eprintln!("tempod: error closing root engine driver at teardown: {error}");
+                log_tempod_error("error closing root engine driver at teardown", error);
             }
             let _ = tx.send(());
         });
         match rx.recv_timeout(timeout) {
             Ok(()) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                eprintln!(
-                    "tempod: engine-resource teardown did not complete within {timeout:?}; \
-                     abandoning it so the pool lock is released (#200)"
-                );
+                log_tempod_warn("engine-resource teardown timed out")
+                    .field("timeout", format!("{timeout:?}"))
+                    .field("issue", "#200")
+                    .emit();
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                eprintln!("tempod: engine-resource teardown thread ended without a result");
+                log_tempod_warn("engine-resource teardown thread ended without a result").emit();
             }
         }
     }
@@ -1157,7 +1167,15 @@ impl SessionPool {
         ) {
             Some(Ok(())) => {}
             Some(Err(error)) => {
-                eprintln!("tempod: error closing engine driver for session {id}: {error}");
+                tempo_telemetry::logger()
+                    .event(
+                        tempo_telemetry::Level::Error,
+                        "tempod",
+                        "error closing engine driver for session",
+                    )
+                    .field("session_id", id)
+                    .field("error", error.to_string())
+                    .emit();
             }
             None => {
                 self.abandon_attached_engine_after_teardown_timeout("session engine context Close");
@@ -1202,7 +1220,7 @@ impl SessionPool {
         };
 
         for error in errors {
-            eprintln!("tempod: error closing forked BiDi context at teardown: {error}");
+            log_tempod_error("error closing forked BiDi context at teardown", error);
         }
     }
 
@@ -1217,7 +1235,7 @@ impl SessionPool {
         ) {
             Some(Ok(())) => {}
             Some(Err(error)) => {
-                eprintln!("tempod: error closing removed BiDi context at teardown: {error}");
+                log_tempod_error("error closing removed BiDi context at teardown", error);
             }
             None => {
                 self.abandon_attached_engine_after_teardown_timeout("removed BiDi context Close");
@@ -1226,10 +1244,10 @@ impl SessionPool {
     }
 
     fn abandon_attached_engine_after_teardown_timeout(&mut self, label: &'static str) {
-        eprintln!(
-            "tempod: {label} was abandoned while sharing the attached engine IPC; \
-             detaching engine state to avoid future pool-lock stalls (#200)"
-        );
+        log_tempod_warn("attached engine IPC was abandoned")
+            .field("label", label)
+            .field("issue", "#200")
+            .emit();
         // Detach the engine, but do NOT merely drop the remaining pre-existing
         // session/BiDi contexts: dropping an `AttachedEngineDriver` sends no
         // `Close`, so any context that was already live would leak engine-side
@@ -1294,7 +1312,7 @@ impl SessionPool {
             // never break the core step-recording path. Log and continue rather
             // than propagating the IO error out of `record_step`.
             if let Err(error) = exporter.export_step(&triple) {
-                eprintln!("tempod: OTLP step export failed (telemetry only): {error}");
+                log_tempod_error("OTLP step export failed", error);
             }
         }
         if let Some(exporter) = &self.otlp_http_exporter {
@@ -1302,7 +1320,7 @@ impl SessionPool {
             // the span is redacted, then handed to the export worker without
             // blocking; a full queue or dead worker only logs.
             if let Err(error) = exporter.export_step(&triple) {
-                eprintln!("tempod: OTLP/HTTP step export failed (telemetry only): {error}");
+                log_tempod_error("OTLP/HTTP step export failed", error);
             }
         }
         Ok(self.record_event(id, TempodSessionEventKind::StepTriple { triple }))
@@ -1516,8 +1534,9 @@ impl Drop for SessionPool {
             self.close_engine_resources(false);
         }));
         if closed.is_err() {
-            eprintln!(
-                "tempod: panic while closing engine resources during SessionPool drop; ignoring"
+            log_tempod_error(
+                "panic while closing engine resources during SessionPool drop",
+                "panic",
             );
         }
     }
@@ -1539,14 +1558,17 @@ where
     match rx.recv_timeout(timeout) {
         Ok(result) => Some(result),
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            eprintln!(
-                "tempod: {label} did not complete within {timeout:?} at teardown; \
-                 abandoning it so the pool lock is released (#200)"
-            );
+            log_tempod_warn("teardown worker timed out")
+                .field("label", label)
+                .field("timeout", format!("{timeout:?}"))
+                .field("issue", "#200")
+                .emit();
             None
         }
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            eprintln!("tempod: {label} thread ended without a result at teardown");
+            log_tempod_warn("teardown worker ended without a result")
+                .field("label", label)
+                .emit();
             None
         }
     }
@@ -1590,14 +1612,14 @@ where
     match rx.recv_timeout(timeout) {
         Ok(result) => Some(result),
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            eprintln!(
-                "tempod: session-create engine navigation did not complete within {timeout:?}; \
-                 abandoning it so the pool lock is released (#213)"
-            );
+            log_tempod_warn("session-create engine navigation timed out")
+                .field("timeout", format!("{timeout:?}"))
+                .field("issue", "#213")
+                .emit();
             None
         }
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            eprintln!("tempod: session-create engine worker ended without a result");
+            log_tempod_warn("session-create engine worker ended without a result").emit();
             None
         }
     }
@@ -2065,7 +2087,7 @@ fn otlp_export_worker(endpoint: &str, receiver: &std::sync::mpsc::Receiver<serde
         Err(error) => {
             // Without a client every span would silently vanish; exit so
             // `export_step` reports a dead worker instead.
-            eprintln!("tempod: OTLP export worker failed to start: {error}");
+            log_tempod_error("OTLP export worker failed to start", error);
             return;
         }
     };
@@ -2093,7 +2115,7 @@ fn otlp_export_worker(endpoint: &str, receiver: &std::sync::mpsc::Receiver<serde
         let body = match serde_json::to_vec(&request) {
             Ok(body) => body,
             Err(error) => {
-                eprintln!("tempod: OTLP export encoding failed (telemetry only): {error}");
+                log_tempod_error("OTLP export encoding failed", error);
                 continue;
             }
         };
@@ -2104,14 +2126,13 @@ fn otlp_export_worker(endpoint: &str, receiver: &std::sync::mpsc::Receiver<serde
             .send()
         {
             Ok(response) if !response.status().is_success() => {
-                eprintln!(
-                    "tempod: OTLP collector rejected export (telemetry only): {}",
-                    response.status()
-                );
+                log_tempod_warn("OTLP collector rejected export")
+                    .field("status", response.status().as_u16())
+                    .emit();
             }
             Ok(_) => {}
             Err(error) => {
-                eprintln!("tempod: OTLP export failed (telemetry only): {error}");
+                log_tempod_error("OTLP export failed", error);
             }
         }
     }
@@ -2547,10 +2568,18 @@ async fn serve_tcp_connection(
 }
 
 fn log_connection_error(err: &TempodError) {
+    log_tempod_error("connection error", err);
+}
+
+fn log_tempod_error(message: &'static str, error: impl fmt::Display) {
     tempo_telemetry::logger()
-        .event(tempo_telemetry::Level::Error, "tempod", "connection error")
-        .field("error", err.to_string())
+        .event(tempo_telemetry::Level::Error, "tempod", message)
+        .field("error", error.to_string())
         .emit();
+}
+
+fn log_tempod_warn(message: &'static str) -> tempo_telemetry::EventBuilder<'static> {
+    tempo_telemetry::logger().event(tempo_telemetry::Level::Warn, "tempod", message)
 }
 
 /// Shared state behind every route.
@@ -3195,9 +3224,7 @@ fn create_session_shared(
             )
             .is_none()
         {
-            eprintln!(
-                "tempod: session context created during drain was abandoned to a detached worker"
-            );
+            log_tempod_warn("session context created during drain was abandoned").emit();
         }
         return Err(TempodError::Draining);
     }
