@@ -98,6 +98,8 @@ const HTTP_CONNECTION_LIMIT_MESSAGE: &str = "too many active tempod HTTP connect
 const WEBSOCKET_CONNECTION_LIMIT_MESSAGE: &str = "too many active tempod WebSocket connections";
 pub const TEMPO_OTLP_JSONL_ENV: &str = "TEMPO_OTLP_JSONL";
 pub const TEMPO_TEMPOD_AUTH_TOKEN_ENV: &str = "TEMPO_TEMPOD_AUTH_TOKEN";
+/// Prometheus text exposition endpoint (`GET /metrics`).
+pub const TEMPOD_METRICS_PATH: &str = "/metrics";
 /// Constant marker written in place of any secret-bearing field in OTLP
 /// telemetry (issue #214 review). A constant — never a hash, length, or prefix
 /// of the secret — so low-entropy secrets (PINs, OTPs, common passwords/tokens)
@@ -655,6 +657,10 @@ impl SessionPool {
 
     pub fn list(&self) -> Vec<TempodSession> {
         self.sessions.values().cloned().collect()
+    }
+
+    pub fn active_session_count(&self) -> usize {
+        self.sessions.len()
     }
 
     pub fn adopt(&mut self, id: &TempodSessionId) -> Result<TempodSession, TempodError> {
@@ -1702,6 +1708,7 @@ fn serve_forever_trusted(
     auth: TempodAuth,
     limiter: ConnectionLimiter,
 ) -> Result<(), TempodError> {
+    let _ = process_start();
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
@@ -1756,6 +1763,7 @@ fn serve_one_trusted(
     auth: TempodAuth,
     limiter: ConnectionLimiter,
 ) -> Result<(), TempodError> {
+    let _ = process_start();
     let (stream, _addr) = listener.accept()?;
     let Some(http_permit) = limiter.try_acquire_http() else {
         drop(stream);
@@ -1793,7 +1801,10 @@ fn apply_socket_options(stream: &TcpStream) -> Result<(), TempodError> {
 }
 
 fn log_connection_error(err: &TempodError) {
-    eprintln!("tempod connection error: {err}");
+    tempo_telemetry::logger()
+        .event(tempo_telemetry::Level::Error, "tempod", "connection error")
+        .field("error", err.to_string())
+        .emit();
 }
 
 fn handle_stream(
@@ -1881,10 +1892,104 @@ fn handle_http_request_with_auth(
     request: HttpRequest,
     auth: &TempodAuth,
 ) -> HttpResponse {
-    match route_http_request_with_auth(pool, request, auth) {
+    let route = metrics_route_class(&request.method, &request.path);
+    let timer = tempo_telemetry::global()
+        .histogram(
+            "tempod_http_request_seconds",
+            "Latency of HTTP requests that reached the route handler",
+            &[("route", route)],
+            None,
+        )
+        .start_timer();
+    let response = match route_http_request_with_auth(pool, request, auth) {
         Ok(response) => response,
         Err(err) => tempod_error_response(&err),
+    };
+    drop(timer);
+    tempo_telemetry::global()
+        .counter(
+            "tempod_http_requests_total",
+            "HTTP requests that reached the route handler, by route and status class \
+             (parse failures, connection-limit rejections, and WebSocket upgrades are not counted)",
+            &[("route", route), ("status", status_class(response.status))],
+        )
+        .inc();
+    response
+}
+
+/// Route label with bounded cardinality: per-session paths collapse into one
+/// `session` class so session ids can never grow the metric space.
+fn metrics_route_class(method: &str, path: &str) -> &'static str {
+    match (method, path) {
+        ("GET", "/health") => "health",
+        ("GET", TEMPOD_METRICS_PATH) => "metrics",
+        (_, "/mcp") => "mcp",
+        (_, "/bidi") => "bidi",
+        (_, "/sessions") => "sessions",
+        (_, "/drain") => "drain",
+        _ if path.starts_with("/sessions/") => "session",
+        ("GET", path)
+            if path == tempo_mcp::A2A_AGENT_CARD_PATH || path == tempo_mcp::A2A_AGENT_JSON_PATH =>
+        {
+            "agent_card"
+        }
+        _ => "other",
     }
+}
+
+fn status_class(status: u16) -> &'static str {
+    match status {
+        100..=199 => "1xx",
+        200..=299 => "2xx",
+        300..=399 => "3xx",
+        400..=499 => "4xx",
+        500..=599 => "5xx",
+        _ => "other",
+    }
+}
+
+static PROCESS_START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+/// Anchor for the uptime gauge. The serve entry points call this at startup;
+/// if only a scrape ever calls it, uptime under-reports rather than lying.
+fn process_start() -> std::time::Instant {
+    *PROCESS_START.get_or_init(std::time::Instant::now)
+}
+
+/// Prometheus text exposition. Point-in-time gauges (uptime, build info,
+/// active sessions, draining) are refreshed at scrape time; counters and
+/// histograms accumulate at their call sites.
+fn metrics_response(pool: &SessionPool) -> HttpResponse {
+    let registry = tempo_telemetry::global();
+    registry
+        .gauge("tempod_uptime_seconds", "Seconds since daemon start", &[])
+        .set(process_start().elapsed().as_secs_f64());
+    registry
+        .gauge(
+            "tempod_build_info",
+            "Constant 1, labeled with the tempod version",
+            &[("version", env!("CARGO_PKG_VERSION"))],
+        )
+        .set(1.0);
+    registry
+        .gauge(
+            "tempod_sessions_active",
+            "Sessions currently attached to the pool",
+            &[],
+        )
+        .set(pool.active_session_count() as f64);
+    registry
+        .gauge(
+            "tempod_draining",
+            "1 while the daemon is draining, else 0",
+            &[],
+        )
+        .set(if pool.draining() { 1.0 } else { 0.0 });
+    HttpResponse::new(
+        200,
+        tempo_telemetry::PROMETHEUS_CONTENT_TYPE,
+        registry.render_prometheus().into_bytes(),
+    )
 }
 
 /// Route one HTTP request. Locking discipline (issue #230): metadata routes
@@ -1926,6 +2031,10 @@ fn route_http_request_with_auth(
         // Health never touches the pool at all: it must answer even while
         // metadata routes are briefly holding the lock.
         ("GET", "/health") => Ok(HttpResponse::json(200, json!({"ok": true}))),
+        // Deliberately behind the loopback-Origin guard (and bearer auth on
+        // remote binds): exposition is control-plane data. Scrapers send no
+        // Origin header, so they pass the guard. Short in-memory lock only.
+        ("GET", TEMPOD_METRICS_PATH) => Ok(metrics_response(&lock_pool(pool)?)),
         ("GET", tempo_mcp::A2A_AGENT_CARD_PATH) | ("GET", tempo_mcp::A2A_AGENT_JSON_PATH) => Ok(
             HttpResponse::from_mcp(tempo_mcp::agent_card_response(&request.base_url())),
         ),
@@ -1943,10 +2052,15 @@ fn route_http_request_with_auth(
             if body.url.trim().is_empty() {
                 return Err(TempodError::BadRequest("session url is required".into()));
             }
-            Ok(HttpResponse::json(
-                201,
-                create_session_shared(pool, body.url)?,
-            ))
+            let created = create_session_shared(pool, body.url)?;
+            tempo_telemetry::global()
+                .counter(
+                    "tempod_sessions_created_total",
+                    "Sessions created over the HTTP control plane",
+                    &[],
+                )
+                .inc();
+            Ok(HttpResponse::json(201, created))
         }
         ("POST", "/drain") => {
             let mut pool = lock_pool(pool)?;
@@ -7072,6 +7186,71 @@ mod tests {
             request = with_bearer(request, token);
         }
         request
+    }
+
+    #[test]
+    fn metrics_endpoint_exposes_prometheus_counters() -> TestResult {
+        let mut pool = SessionPool::default();
+        // Drive requests through the funnel so counters and histograms move.
+        let health = handle_http_request(&mut pool, control_request("GET", "/health", None, b""));
+        assert_eq!(health.status, 200);
+        let created = handle_http_request(
+            &mut pool,
+            control_request(
+                "POST",
+                "/sessions",
+                None,
+                br#"{"url":"https://example.test"}"#,
+            ),
+        );
+        assert_eq!(created.status, 201);
+
+        let metrics = handle_http_request(
+            &mut pool,
+            control_request("GET", TEMPOD_METRICS_PATH, None, b""),
+        );
+        assert_eq!(metrics.status, 200);
+        assert_eq!(
+            metrics.content_type,
+            tempo_telemetry::PROMETHEUS_CONTENT_TYPE
+        );
+        let text = String::from_utf8(metrics.body.clone())?;
+        assert!(text.contains("tempod_http_requests_total{route=\"health\",status=\"2xx\"}"));
+        assert!(text.contains("tempod_sessions_created_total"));
+        assert!(text.contains("tempod_sessions_active 1"));
+        assert!(text.contains("tempod_build_info{version="));
+        assert!(text.contains("tempod_uptime_seconds"));
+        assert!(text.contains("tempod_http_request_seconds_bucket"));
+        assert!(text.contains("tempod_draining 0"));
+        Ok(())
+    }
+
+    #[test]
+    fn metrics_endpoint_is_origin_guarded() -> TestResult {
+        // The exposition is control-plane data: a DNS-rebinding page must not
+        // be able to read operational state cross-origin. Scrapers and CLI
+        // clients send no Origin header, so they pass the guard.
+        let mut pool = SessionPool::default();
+        let blocked = handle_http_request(
+            &mut pool,
+            control_request("GET", TEMPOD_METRICS_PATH, Some("http://evil.example"), b""),
+        );
+        assert_eq!(blocked.status, 403);
+        Ok(())
+    }
+
+    #[test]
+    fn metrics_route_class_bounds_label_cardinality() {
+        assert_eq!(metrics_route_class("GET", "/health"), "health");
+        assert_eq!(metrics_route_class("GET", "/metrics"), "metrics");
+        assert_eq!(metrics_route_class("POST", "/sessions"), "sessions");
+        assert_eq!(
+            metrics_route_class("POST", "/sessions/abc123/act_batch"),
+            "session"
+        );
+        assert_eq!(metrics_route_class("DELETE", "/sessions/abc123"), "session");
+        assert_eq!(metrics_route_class("POST", "/mcp"), "mcp");
+        assert_eq!(metrics_route_class("GET", "/favicon.ico"), "other");
     }
 
     #[test]
