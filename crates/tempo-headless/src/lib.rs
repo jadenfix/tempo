@@ -3794,6 +3794,15 @@ pub fn tempod_openapi(base_url: &str) -> JsonValue {
                     "responses": {"200": {"description": "tempod is reachable"}}
                 }
             },
+            "/ready": {
+                "get": {
+                    "operationId": "ready",
+                    "responses": {
+                        "200": {"description": "tempod is ready for new sessions"},
+                        "503": {"description": "tempod is alive but not ready"}
+                    }
+                }
+            },
             TEMPOD_OPENAPI_PATH: {
                 "get": {
                     "operationId": "openapi",
@@ -3898,7 +3907,7 @@ fn after_seq(query: Option<&str>) -> Result<Option<u64>, TempodError> {
 /// Whether a route must pass the loopback-Origin guard. Session/control-plane routes (create, drain, adopt, delete, list,
 /// session events, and any unrecognised — hence potentially state-changing —
 /// route) are guarded. Exempt are the public idempotent metadata routes
-/// (`/health`, `/ready`, the A2A agent card, `GET /mcp`) and the routes that already run
+/// (`/health`, the A2A agent card, `GET /mcp`) and the routes that already run
 /// their own Origin check (`POST /mcp` via `route_mcp`, `POST /bidi`, and the
 /// `GET /bidi` WebSocket upgrade handler). The guard relies
 /// on `origin_allowed` returning `true` when no Origin header is present, so
@@ -3907,7 +3916,6 @@ fn control_route_requires_origin_check(method: &str, path: &str) -> bool {
     !matches!(
         (method, path),
         ("GET", "/health")
-            | ("GET", "/ready")
             | ("GET", tempo_mcp::A2A_AGENT_CARD_PATH)
             | ("GET", tempo_mcp::A2A_AGENT_JSON_PATH)
             | ("GET", TEMPOD_OPENAPI_PATH)
@@ -7073,17 +7081,7 @@ mod tests {
         )?;
         assert_eq!(health.status, 200);
 
-        let ready = route_http_request(
-            &mut pool,
-            HttpRequest {
-                method: "GET".into(),
-                path: "/ready".into(),
-                headers: BTreeMap::new(),
-                host: None,
-                origin: None,
-                body: Vec::new(),
-            },
-        )?;
+        let ready = handle_http_request(&mut pool, control_request("GET", "/ready", None, b""));
         assert_eq!(ready.status, 503);
         let value: Value = serde_json::from_slice(&ready.body)?;
         assert_eq!(value["ready"], false);
@@ -7091,17 +7089,8 @@ mod tests {
         assert!(json_array_contains(&value["reasons"], "engine_detached"));
 
         pool.drain();
-        let draining_ready = route_http_request(
-            &mut pool,
-            HttpRequest {
-                method: "GET".into(),
-                path: "/ready".into(),
-                headers: BTreeMap::new(),
-                host: None,
-                origin: None,
-                body: Vec::new(),
-            },
-        )?;
+        let draining_ready =
+            handle_http_request(&mut pool, control_request("GET", "/ready", None, b""));
         assert_eq!(draining_ready.status, 503);
         let value: Value = serde_json::from_slice(&draining_ready.body)?;
         assert_eq!(value["draining"], true);
@@ -7144,17 +7133,7 @@ mod tests {
             "session limit reached: max 1 retained sessions"
         );
 
-        let ready = route_http_request(
-            &mut pool,
-            HttpRequest {
-                method: "GET".into(),
-                path: "/ready".into(),
-                headers: BTreeMap::new(),
-                host: None,
-                origin: None,
-                body: Vec::new(),
-            },
-        )?;
+        let ready = handle_http_request(&mut pool, control_request("GET", "/ready", None, b""));
         assert_eq!(ready.status, 503);
         let value: Value = serde_json::from_slice(&ready.body)?;
         assert_eq!(value["sessions"], 1);
@@ -7163,6 +7142,26 @@ mod tests {
             &value["reasons"],
             "session_limit_reached"
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn ready_endpoint_is_origin_and_host_guarded() -> TestResult {
+        let mut pool = SessionPool::default();
+        let blocked_origin = handle_http_request(
+            &mut pool,
+            control_request("GET", "/ready", Some("http://evil.example"), b""),
+        );
+        assert_eq!(blocked_origin.status, 403);
+
+        let blocked_host = handle_http_request(
+            &mut pool,
+            with_host(
+                control_request("GET", "/ready", None, b""),
+                "attacker.example:8787",
+            ),
+        );
+        assert_eq!(blocked_host.status, 403);
         Ok(())
     }
 
@@ -7261,6 +7260,7 @@ mod tests {
         assert_eq!(response.status, 200);
         let openapi: Value = serde_json::from_slice(&response.body)?;
         assert_eq!(openapi["servers"][0]["url"], "http://localhost");
+        assert_eq!(openapi["paths"]["/ready"]["get"]["operationId"], "ready");
         Ok(())
     }
 
