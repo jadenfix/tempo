@@ -182,10 +182,32 @@ pub struct ResumeState {
 /// The journal holds a sidecar lock file for its whole lifetime. This prevents
 /// two live writers from concurrently allocating sequence numbers while keeping
 /// every event durable as its own SQLite transaction.
+///
+/// # Dedicated writer
+///
+/// `conn` is the journal's dedicated writer: the only read-write SQLite connection
+/// this crate ever opens for a journal. The sidecar lock makes it unique across
+/// processes and `append(&mut self)` serializes writes within one, so all writes flow
+/// through this single connection without any cross-connection write contention.
+/// Every other connection ([`resume`](SessionJournal::resume),
+/// [`read_journal_entries`]) is read-only, and in WAL mode reads never block on this
+/// writer (and vice versa).
+///
+/// # WAL sidecar files and cross-host portability
+///
+/// While a journal is open it runs in `journal_mode=WAL`, so recent commits live in
+/// `<journal>-wal` (with a `<journal>-shm` index). Dropping the journal converts it
+/// back to rollback mode, which checkpoints the WAL into the main file and removes
+/// both sidecars: a cleanly closed journal is a single self-contained file that any
+/// host can open — including read-only, which not every SQLite build supports for a
+/// WAL-stamped file missing its sidecars. If a process died mid-session, copy the
+/// `-wal` and `-shm` files along with the journal — or open and cleanly close it
+/// locally first — otherwise the most recent commits are left behind.
 pub struct SessionJournal {
     path: PathBuf,
     /// Held for the journal's lifetime. Dropping the handle releases the advisory lock.
     _lock: File,
+    /// Dedicated writer connection; see the struct-level docs.
     conn: Connection,
     retention_policy: DurableRetentionPolicy,
     run_id: RunId,
@@ -348,6 +370,23 @@ impl SessionJournal {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+}
+
+impl Drop for SessionJournal {
+    fn drop(&mut self) {
+        // Checkpoint on clean close: converting out of WAL checkpoints the log,
+        // deletes the -wal/-shm sidecars, and stamps the header back to rollback
+        // mode, leaving one self-contained file for cross-host copies. This matters
+        // because a sidecar-less WAL-stamped database cannot be opened by read-only
+        // connections on every SQLite build (macOS system SQLite returns
+        // SQLITE_CANTOPEN), which would break the lock-free read/resume paths.
+        // Best-effort by design — Drop cannot fail; if a concurrent read snapshot
+        // holds the database past the busy timeout, the file simply stays in WAL
+        // mode (with its sidecars) until the next clean close.
+        let _ = self
+            .conn
+            .query_row("PRAGMA journal_mode=DELETE", [], |_| Ok(()));
     }
 }
 
@@ -653,6 +692,8 @@ pub enum JournalError {
         "journal file {path:?} is not a tempo SQLite journal (legacy JSONL or foreign format); it cannot be opened by this version"
     )]
     LegacyFormat { path: PathBuf },
+    #[error("journal could not enter WAL mode; sqlite reported journal_mode={mode}")]
+    WalModeUnavailable { mode: String },
 }
 
 /// Human-readable crate summary retained for callers that expose crate capabilities.
@@ -768,9 +809,10 @@ const SQLITE_HEADER_MAGIC: &[u8; 16] = b"SQLite format 3\0";
 
 /// How long a connection waits for a competing lock before returning `SQLITE_BUSY`.
 ///
-/// The read/resume snapshot must be able to wait out a writer's short commit window
-/// (rollback-journal `DELETE` + `synchronous=FULL`) instead of failing immediately, so
-/// both readers and the writer use a non-zero timeout.
+/// In WAL mode readers never wait on the writer, so this no longer couples reader
+/// latency to the writer's commit window. It still bounds the waits that remain: the
+/// `journal_mode` conversions on writer open and clean close, which need a moment of
+/// exclusive access and may have to wait out a long-lived read snapshot.
 const JOURNAL_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 enum JournalOpenMode {
@@ -801,8 +843,13 @@ fn open_journal_connection(path: &Path, mode: JournalOpenMode) -> Result<Connect
     if let JournalOpenMode::ReadWriteCreate = &mode {
         ensure_private_path_permissions(path)?;
     }
-    configure_journal_connection(&conn, &mode)?;
+    conn.busy_timeout(JOURNAL_BUSY_TIMEOUT)?;
+    // The version gate must run before `configure_journal_connection`: the WAL
+    // conversion there is a persistent, file-mutating pragma, and a journal rejected
+    // as incompatible must be left byte-identical on disk (no mode flip, no orphaned
+    // -wal/-shm sidecars) for the newer tempo that owns it.
     check_journal_version(&conn, path)?;
+    configure_journal_connection(&conn, &mode)?;
     if let JournalOpenMode::ReadWriteCreate = mode {
         initialize_journal_schema(&conn)?;
         stamp_journal_version(&conn)?;
@@ -906,17 +953,34 @@ fn stamp_journal_version(conn: &Connection) -> Result<(), JournalError> {
     Ok(())
 }
 
+/// Apply the write-path pragmas. Only called after [`check_journal_version`] has
+/// accepted the file, because `journal_mode=WAL` is a persistent mutation and a
+/// rejected journal must be left untouched.
 fn configure_journal_connection(
     conn: &Connection,
     mode: &JournalOpenMode,
 ) -> Result<(), JournalError> {
-    conn.busy_timeout(JOURNAL_BUSY_TIMEOUT)?;
     // A read-only connection cannot (and must not) write these pragmas; doing so would
-    // require a write lock and defeat the lock-free read/resume contract.
+    // require a write lock and defeat the lock-free read/resume contract. WAL is a
+    // persistent database property, so read-only connections inherit it from the file.
     if let JournalOpenMode::ReadWriteCreate = mode {
+        // WAL + synchronous=NORMAL (#232): one WAL append per commit, no fsync on the
+        // step critical path, and readers that never block on the writer. Every
+        // committed append survives a process crash. On power loss SQLite may drop a
+        // suffix of the most recent commits, but it never corrupts the database and
+        // never keeps a later commit while losing an earlier one, so the
+        // contiguous-seq invariant that resume validates is preserved.
+        //
+        // `PRAGMA journal_mode=WAL` reports the resulting mode instead of erroring
+        // when it cannot switch, so the returned row is verified. This same pragma
+        // migrates a pre-#232 `DELETE`-mode journal in place on first writer open.
+        let journal_mode: String =
+            conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
+        if !journal_mode.eq_ignore_ascii_case("wal") {
+            return Err(JournalError::WalModeUnavailable { mode: journal_mode });
+        }
         conn.execute_batch(
-            "PRAGMA journal_mode=DELETE;
-             PRAGMA synchronous=FULL;
+            "PRAGMA synchronous=NORMAL;
              PRAGMA foreign_keys=ON;",
         )?;
     }
@@ -1968,6 +2032,181 @@ mod tests {
     }
 
     #[test]
+    fn journal_writer_uses_wal_mode_with_normal_synchronous() -> TestResult {
+        // #232: the dedicated writer connection must run WAL + synchronous=NORMAL
+        // instead of the previous DELETE + FULL configuration.
+        let path = unique_path("wal-pragmas")?;
+        remove_if_exists(&path)?;
+        let journal = SessionJournal::open(
+            &path,
+            RunId("run-wal".into()),
+            SessionId("session-wal".into()),
+        )?;
+
+        let journal_mode: String = journal
+            .conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+        let synchronous: i64 = journal
+            .conn
+            .query_row("PRAGMA synchronous", [], |row| row.get(0))?;
+        assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+        // 1 == NORMAL in SQLite's synchronous pragma encoding.
+        assert_eq!(synchronous, 1);
+
+        drop(journal);
+        remove_if_exists(&path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn readers_are_not_blocked_by_an_open_writer_transaction() -> TestResult {
+        // #232: WAL removes reader/writer contention. Under the previous
+        // rollback-journal DELETE mode, an open EXCLUSIVE write transaction makes
+        // readers wait out the 5s busy timeout and then fail with SQLITE_BUSY; in WAL
+        // the read-only resume/read paths must return the committed snapshot at once.
+        let path = unique_path("wal-concurrent")?;
+        remove_if_exists(&path)?;
+        let run_id = RunId("run-wal-concurrent".into());
+        let session_id = SessionId("session-wal-concurrent".into());
+
+        let mut journal = SessionJournal::open(&path, run_id.clone(), session_id.clone())?;
+        journal.append(JournalEvent::SessionStarted {
+            url: "https://example.com".into(),
+        })?;
+
+        // Hold the write lock with an uncommitted row, as an in-flight append would.
+        journal.conn.execute_batch("BEGIN EXCLUSIVE")?;
+        journal.conn.execute(
+            "INSERT INTO journal_entries(
+                 run_id, session_id, seq, schema_version, timestamp_ms, event_json
+             ) VALUES (?1, ?2, 1, ?3, '1', '{\"kind\":\"session_closed\"}')",
+            params![
+                run_id.0.as_str(),
+                session_id.0.as_str(),
+                tempo_schema::SCHEMA_VERSION,
+            ],
+        )?;
+
+        let started = std::time::Instant::now();
+        let resumed = SessionJournal::resume(&path, run_id.clone(), session_id.clone())?;
+        let entries = read_journal_entries(&path)?;
+        let elapsed = started.elapsed();
+
+        // Snapshot isolation: readers see only the committed entry.
+        assert_eq!(resumed.entries.len(), 1);
+        assert_eq!(resumed.next_seq, 1);
+        assert_eq!(entries.len(), 1);
+        // And they must not have waited out the writer via the busy timeout.
+        assert!(
+            elapsed < JOURNAL_BUSY_TIMEOUT,
+            "read-only snapshot stalled behind the writer for {elapsed:?}"
+        );
+
+        journal.conn.execute_batch("ROLLBACK")?;
+        drop(journal);
+        remove_if_exists(&path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_delete_mode_journal_migrates_to_wal_on_open() -> TestResult {
+        // Journals created before #232 are rollback-journal DELETE-mode databases.
+        // The first read-write open must migrate them to WAL in place and keep every
+        // existing entry readable.
+        let path = unique_path("legacy-delete-mode")?;
+        remove_if_exists(&path)?;
+        let run_id = RunId("run-delete-mode".into());
+        let session_id = SessionId("session-delete-mode".into());
+
+        {
+            // Build the journal exactly as the pre-#232 writer did.
+            let mut conn = Connection::open(&path)?;
+            conn.execute_batch(
+                "PRAGMA journal_mode=DELETE;
+                 PRAGMA synchronous=FULL;
+                 PRAGMA foreign_keys=ON;",
+            )?;
+            initialize_journal_schema(&conn)?;
+            stamp_journal_version(&conn)?;
+            insert_journal_entry(
+                &mut conn,
+                &JournalEntry {
+                    schema_version: tempo_schema::SCHEMA_VERSION.into(),
+                    run_id: run_id.clone(),
+                    session_id: session_id.clone(),
+                    seq: 0,
+                    timestamp_ms: 1,
+                    event: JournalEvent::SessionStarted {
+                        url: "https://example.com".into(),
+                    },
+                },
+                &DurableRetentionPolicy::PlaintextUnsafe,
+            )?;
+        }
+        // SQLite stamps header bytes 18/19 (write/read format version) with 1 for
+        // rollback-journal databases and 2 for WAL databases.
+        let header = fs::read(&path)?;
+        assert_eq!(&header[18..20], &[1, 1]);
+
+        let mut journal = SessionJournal::open(&path, run_id.clone(), session_id.clone())?;
+        let journal_mode: String = journal
+            .conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+        assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+        assert_eq!(journal.next_seq(), 1);
+        journal.append(JournalEvent::SessionClosed)?;
+        drop(journal);
+
+        // Clean close converts back to rollback mode, so the at-rest file stays
+        // openable everywhere; the next writer open migrates to WAL again.
+        let header = fs::read(&path)?;
+        assert_eq!(&header[18..20], &[1, 1]);
+        let resumed = SessionJournal::resume(&path, run_id, session_id)?;
+        assert_eq!(resumed.entries.len(), 2);
+        assert_eq!(resumed.next_seq, 2);
+
+        remove_if_exists(&path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn clean_close_checkpoints_wal_so_journal_file_is_self_contained() -> TestResult {
+        // #232 portability contract: journals move between hosts, so a cleanly closed
+        // journal must be complete without its -wal/-shm sidecars.
+        let path = unique_path("wal-checkpoint")?;
+        remove_if_exists(&path)?;
+        let run_id = RunId("run-checkpoint".into());
+        let session_id = SessionId("session-checkpoint".into());
+        let wal_path = sqlite_sidecar_path(&path, "-wal");
+        let events = crash_matrix_events();
+
+        {
+            let mut journal = SessionJournal::open(&path, run_id.clone(), session_id.clone())?;
+            for event in events.iter().cloned() {
+                journal.append(event)?;
+            }
+            // While the writer is live, recent commits reside in the WAL sidecar.
+            assert!(fs::metadata(&wal_path)?.len() > 0);
+        }
+
+        // After a clean close the WAL has been checkpointed into the main file, the
+        // -wal sidecar is gone (even on builds like macOS system SQLite that
+        // otherwise persist it), and the header is stamped back to rollback mode.
+        assert!(!wal_path.exists());
+        let header = fs::read(&path)?;
+        assert_eq!(&header[18..20], &[1, 1]);
+        // Simulate copying only the journal file to another host: without any
+        // sidecar (a stale -shm is ignored for a rollback-mode database), every
+        // committed entry must be readable through the read-only path.
+        remove_one_if_exists(&sqlite_sidecar_path(&path, "-shm"))?;
+        let entries = read_journal_entries(&path)?;
+        assert_eq!(entries.len(), events.len());
+
+        remove_if_exists(&path)?;
+        Ok(())
+    }
+
+    #[test]
     fn cassette_key_is_sha256_based_and_stable() {
         let a = CassetteKey::from_request("GET", "https://example.com/api", b"payload");
         let b = CassetteKey::from_request("GET", "https://example.com/api", b"payload");
@@ -2594,6 +2833,51 @@ mod tests {
     }
 
     #[test]
+    fn rejected_incompatible_version_open_leaves_file_byte_identical() -> TestResult {
+        // The IncompatibleVersion gate must run before the persistent WAL pragma:
+        // a journal owned by a newer tempo is rejected, so this version must not
+        // flip its journal mode, restamp its header, or leave -wal/-shm sidecars.
+        let path = unique_path("newer-version-untouched")?;
+        remove_if_exists(&path)?;
+        let run_id = RunId("run-ver-untouched".into());
+        let session_id = SessionId("session-ver-untouched".into());
+
+        {
+            let mut journal = SessionJournal::open(&path, run_id.clone(), session_id.clone())?;
+            journal.append(JournalEvent::SessionStarted {
+                url: "https://example.com".into(),
+            })?;
+        }
+        {
+            let conn = Connection::open(&path)?;
+            conn.execute_batch(&format!(
+                "PRAGMA user_version={};",
+                SUPPORTED_JOURNAL_VERSION + 1
+            ))?;
+        }
+        // Clear any stale sidecars left by builds that persist them past close, so
+        // the assertions below observe only what the rejected open itself creates.
+        remove_one_if_exists(&sqlite_sidecar_path(&path, "-wal"))?;
+        remove_one_if_exists(&sqlite_sidecar_path(&path, "-shm"))?;
+        let before = fs::read(&path)?;
+
+        assert!(matches!(
+            SessionJournal::open(&path, run_id, session_id),
+            Err(JournalError::IncompatibleVersion { .. })
+        ));
+
+        assert!(
+            fs::read(&path)? == before,
+            "rejected incompatible-version open mutated the journal file"
+        );
+        assert!(!sqlite_sidecar_path(&path, "-wal").exists());
+        assert!(!sqlite_sidecar_path(&path, "-shm").exists());
+
+        remove_if_exists(&path)?;
+        Ok(())
+    }
+
+    #[test]
     fn opening_legacy_non_sqlite_file_reports_distinct_error() -> TestResult {
         // #203: a pre-#193 JSONL (or any non-SQLite) file must produce an actionable
         // LegacyFormat error rather than a raw opaque SQLITE_NOTADB.
@@ -2643,7 +2927,15 @@ mod tests {
 
     fn remove_if_exists(path: &Path) -> Result<(), std::io::Error> {
         remove_one_if_exists(path)?;
-        remove_one_if_exists(&journal_lock_path(path))
+        remove_one_if_exists(&journal_lock_path(path))?;
+        remove_one_if_exists(&sqlite_sidecar_path(path, "-wal"))?;
+        remove_one_if_exists(&sqlite_sidecar_path(path, "-shm"))
+    }
+
+    fn sqlite_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+        let mut raw = path.as_os_str().to_os_string();
+        raw.push(suffix);
+        PathBuf::from(raw)
     }
 
     fn remove_one_if_exists(path: &Path) -> Result<(), std::io::Error> {
