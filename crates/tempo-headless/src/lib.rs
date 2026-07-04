@@ -70,6 +70,11 @@ const WS_OPCODE_CLOSE: u8 = 0x8;
 const WS_OPCODE_PING: u8 = 0x9;
 const WS_OPCODE_PONG: u8 = 0xA;
 pub const TEMPO_OTLP_JSONL_ENV: &str = "TEMPO_OTLP_JSONL";
+/// Constant marker written in place of any secret-bearing field in OTLP
+/// telemetry (issue #214 review). A constant — never a hash, length, or prefix
+/// of the secret — so low-entropy secrets (PINs, OTPs, common passwords/tokens)
+/// cannot be recovered by an offline dictionary search of the exported value.
+const REDACTED_MARKER: &str = "[redacted]";
 
 /// Stable tempod session id.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -982,9 +987,11 @@ impl Default for EngineSupervisor {
 ///   holds the pool lock — only the minimal write + flush stays on the hot path.
 /// * On unix the file is created with `0600` permissions so telemetry captured
 ///   from a browsing session is not world-readable.
-/// * Sensitive fields (typed action text, select values, skill inputs, and URL
-///   query strings) are redacted/hashed before serialization instead of being
-///   written verbatim. See [`redact_action`] / [`redact_step_outcome`].
+/// * Sensitive fields (typed action text, select values, skill inputs, node
+///   ids, and step-error reasons) are replaced with a constant redaction marker
+///   before serialization instead of being written verbatim or hashed, and URL
+///   secrets (userinfo, query, fragment) are stripped. See [`redact_action`] /
+///   [`redact_step_outcome`].
 #[derive(Clone)]
 pub struct OtlpJsonExporter {
     path: PathBuf,
@@ -1073,9 +1080,10 @@ impl OtlpJsonExporter {
 /// Build the redacted OTLP record written for a step (issue #214, weakness 3).
 ///
 /// We keep telemetry-useful, non-sensitive fields (idempotency key, seq, action
-/// kind, node ids, coordinates, observation-diff counts) and redact anything
-/// that can carry raw secrets: typed text, select values, skill inputs, and URL
-/// query strings.
+/// kind, coordinates, millis, skill name, observation-diff counts) and replace
+/// anything that can carry raw secrets with a constant marker: typed text,
+/// select values, skill inputs, node ids, and step-error reasons. URL secrets
+/// (userinfo, query, fragment) are stripped rather than marked.
 fn redacted_export_record(triple: &StepTriple) -> serde_json::Value {
     json!({
         "resource": {
@@ -1091,29 +1099,35 @@ fn redacted_export_record(triple: &StepTriple) -> serde_json::Value {
     })
 }
 
-/// Redact an [`Action`] for telemetry: preserve structural fields, hash or strip
-/// anything that can embed user/page secrets.
+/// Redact an [`Action`] for telemetry: preserve non-sensitive structural fields,
+/// replace anything that can embed user/page secrets with the constant marker,
+/// and strip URL secrets.
+///
+/// Node ids are redacted with the marker too: a [`NodeId`] can be selector-backed
+/// (e.g. `a[href="/reset?token=SECRET"]`) and thereby embed arbitrary page
+/// secrets in an attribute value, so neither the id nor a hash of it is exported.
 fn redact_action(action: &Action) -> serde_json::Value {
     match action {
         Action::Goto { url } => json!({ "kind": "goto", "url": strip_url_secrets(url) }),
-        Action::Click { node } => json!({ "kind": "click", "node": node }),
-        // Typed text frequently carries credentials — hash instead of logging.
-        Action::Type { node, text } => {
-            json!({ "kind": "type", "node": node, "text": hash_secret(text) })
+        Action::Click { node: _ } => json!({ "kind": "click", "node": REDACTED_MARKER }),
+        // Typed text frequently carries credentials; the node id can be a
+        // secret-bearing selector — mark both.
+        Action::Type { node: _, text: _ } => {
+            json!({ "kind": "type", "node": REDACTED_MARKER, "text": REDACTED_MARKER })
         }
-        // Select values can be sensitive (e.g. account numbers) — hash them.
-        Action::Select { node, value } => {
-            json!({ "kind": "select", "node": node, "value": hash_secret(value) })
+        // Select values can be sensitive (e.g. account numbers) — mark them.
+        Action::Select { node: _, value: _ } => {
+            json!({ "kind": "select", "node": REDACTED_MARKER, "value": REDACTED_MARKER })
         }
         Action::Scroll { x, y } => json!({ "kind": "scroll", "x": x, "y": y }),
         Action::Wait { millis } => json!({ "kind": "wait", "millis": millis }),
-        Action::Extract { node } => json!({ "kind": "extract", "node": node }),
-        // Skill input is arbitrary JSON that may contain secrets — keep the name,
-        // hash the serialized input.
-        Action::Skill { name, input } => json!({
+        Action::Extract { node: _ } => json!({ "kind": "extract", "node": REDACTED_MARKER }),
+        // Skill input is arbitrary JSON that may contain secrets — keep the name
+        // (a skill identifier, not page-derived), mark the input.
+        Action::Skill { name, input: _ } => json!({
             "kind": "skill",
             "name": name,
-            "input": hash_secret(&input.to_string()),
+            "input": REDACTED_MARKER,
         }),
     }
 }
@@ -1132,37 +1146,48 @@ fn redact_step_outcome(outcome: &StepTripleOutcome) -> serde_json::Value {
         }),
         // `reason` is free-form and can embed arbitrary remote/secret content
         // (e.g. a failed navigation echoing a URL with `?token=...`, or a remote
-        // error body), so hash it rather than logging it verbatim — consistent
-        // with how `Type.text`/`Select.value`/`Skill.input` are redacted.
-        StepTripleOutcome::StepError { reason } => json!({
+        // error body), so replace it with the constant marker — consistent with
+        // how `Type.text`/`Select.value`/`Skill.input` are redacted.
+        StepTripleOutcome::StepError { reason: _ } => json!({
             "kind": "step_error",
-            "reason": hash_secret(reason),
+            "reason": REDACTED_MARKER,
         }),
     }
 }
 
-/// Strip the query string and fragment from a URL so secrets carried in query
-/// parameters are not written verbatim, while keeping the scheme/host/path for
-/// telemetry.
-fn strip_url_secrets(url: &str) -> &str {
-    match url.find(['?', '#']) {
+/// Strip URL secrets for telemetry while keeping scheme/host/path:
+///
+/// * the query string and fragment (secrets carried in `?token=...` etc.), and
+/// * userinfo (`user:pass@` between `//` and the host — issue #214 review,
+///   medium finding).
+///
+/// Stripping (removing the secret parts) is not dictionary-searchable, so URLs
+/// stay as a stripped URL rather than being replaced with the constant marker.
+/// URLs without userinfo are returned unchanged apart from query/fragment.
+fn strip_url_secrets(url: &str) -> String {
+    // Strip query + fragment first so a `?`/`#` can never be mistaken for part
+    // of the authority below.
+    let without_query = match url.find(['?', '#']) {
         Some(index) => &url[..index],
         None => url,
+    };
+    // Locate the authority: the substring after `://` up to the next `/`.
+    let Some(scheme_end) = without_query.find("://") else {
+        return without_query.to_string();
+    };
+    let authority_start = scheme_end + 3;
+    let after_scheme = &without_query[authority_start..];
+    let authority_len = after_scheme.find('/').unwrap_or(after_scheme.len());
+    let authority = &after_scheme[..authority_len];
+    // Userinfo is everything up to the last `@` within the authority; drop it.
+    match authority.rfind('@') {
+        Some(at) => format!(
+            "{}{}",
+            &without_query[..authority_start],
+            &after_scheme[at + 1..]
+        ),
+        None => without_query.to_string(),
     }
-}
-
-/// Hash a sensitive value to `sha256:<hex>` so raw secrets are never persisted
-/// while still allowing equality/correlation across steps.
-fn hash_secret(value: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(value.as_bytes());
-    let mut hex = String::with_capacity(digest.len() * 2 + 7);
-    hex.push_str("sha256:");
-    for byte in digest {
-        use std::fmt::Write as _;
-        let _ = write!(hex, "{byte:02x}");
-    }
-    hex
 }
 
 /// Run tempod forever on an address such as `127.0.0.1:8787`.
@@ -4606,18 +4631,22 @@ mod tests {
 
     #[test]
     fn otlp_export_redacts_secrets_from_action() -> TestResult {
-        // Issue #214 (weakness 3): typed text and URL query strings must never be
-        // written verbatim, while non-sensitive fields remain for telemetry.
+        // Issue #214 review: secret-bearing fields (typed text, node ids) are
+        // replaced with a constant marker (never a hash), and URL secrets are
+        // stripped, while non-sensitive fields remain for telemetry.
         let root = unique_dir("otlp-redact")?;
         remove_dir_if_exists(&root)?;
 
         let typed_path = root.join("typed.jsonl");
         let secret = "hunter2-super-secret-password";
+        // A selector-backed node id that itself embeds a page secret (High
+        // finding): it must be redacted, not exported verbatim or hashed.
+        let node_selector = "a[href=\"/reset?token=SECRET123\"]";
         let typed = StepTriple {
             key: IdempotencyKey("step-type".into()),
             seq: 5,
             action: Action::Type {
-                node: NodeId("login-password".into()),
+                node: NodeId(node_selector.into()),
                 text: secret.into(),
             },
             outcome: StepTripleOutcome::Applied {
@@ -4636,10 +4665,18 @@ mod tests {
             !typed_text.contains(secret),
             "raw typed secret must not be written verbatim"
         );
-        assert!(typed_text.contains("sha256:"), "typed text must be hashed");
+        assert!(
+            !typed_text.contains("SECRET123"),
+            "secret embedded in a selector-backed node id must not leak"
+        );
+        assert!(
+            !typed_text.contains("sha256:"),
+            "no dictionary-searchable hash may be emitted"
+        );
         let typed_value: Value = serde_json::from_str(typed_text.trim_end())?;
         assert_eq!(typed_value["body"]["action"]["kind"], "type");
-        assert_eq!(typed_value["body"]["action"]["node"], "login-password");
+        assert_eq!(typed_value["body"]["action"]["text"], REDACTED_MARKER);
+        assert_eq!(typed_value["body"]["action"]["node"], REDACTED_MARKER);
         assert_eq!(typed_value["body"]["seq"], 5);
 
         let goto_path = root.join("goto.jsonl");
@@ -4647,7 +4684,7 @@ mod tests {
             key: IdempotencyKey("step-goto".into()),
             seq: 6,
             action: Action::Goto {
-                url: "https://ex.test/login?token=SECRETQUERY123".into(),
+                url: "https://user:SECRET123@example.test/p?token=T".into(),
             },
             outcome: StepTripleOutcome::StepError {
                 reason: "boom".into(),
@@ -4656,11 +4693,26 @@ mod tests {
         OtlpJsonExporter::new(&goto_path).export_step(&goto)?;
         let goto_text = String::from_utf8(std::fs::read(&goto_path)?)?;
         assert!(
-            !goto_text.contains("SECRETQUERY123"),
+            !goto_text.contains("SECRET123"),
+            "URL userinfo secret must be stripped"
+        );
+        assert!(
+            !goto_text.contains("user:"),
+            "URL userinfo must be stripped entirely"
+        );
+        assert!(
+            !goto_text.contains("token=T"),
             "URL query secret must be stripped"
         );
+        assert!(
+            !goto_text.contains("sha256:"),
+            "no dictionary-searchable hash may be emitted"
+        );
         let goto_value: Value = serde_json::from_str(goto_text.trim_end())?;
-        assert_eq!(goto_value["body"]["action"]["url"], "https://ex.test/login");
+        assert_eq!(
+            goto_value["body"]["action"]["url"],
+            "https://example.test/p"
+        );
         assert_eq!(goto_value["body"]["action"]["kind"], "goto");
 
         remove_dir_if_exists(&root)?;
@@ -4669,9 +4721,10 @@ mod tests {
 
     #[test]
     fn otlp_export_redacts_secrets_from_step_error_reason() -> TestResult {
-        // Issue #214 (review follow-up): a StepError reason is free-form and can
-        // echo remote/secret content (e.g. a failed navigation URL carrying a
-        // token). It must be hashed, not written verbatim.
+        // Issue #214 review: a StepError reason is free-form and can echo
+        // remote/secret content (e.g. a failed navigation URL carrying a token).
+        // It must be replaced with the constant marker — never hashed (a hash of
+        // a low-entropy secret is dictionary-searchable) or written verbatim.
         let root = unique_dir("otlp-redact-reason")?;
         remove_dir_if_exists(&root)?;
 
@@ -4697,13 +4750,13 @@ mod tests {
             !text.contains("token=SECRET123"),
             "URL query secret in StepError reason must not leak"
         );
-        assert!(text.contains("sha256:"), "StepError reason must be hashed");
+        assert!(
+            !text.contains("sha256:"),
+            "no dictionary-searchable hash may be emitted"
+        );
         let value: Value = serde_json::from_str(text.trim_end())?;
         assert_eq!(value["body"]["outcome"]["kind"], "step_error");
-        assert_eq!(
-            value["body"]["outcome"]["reason"],
-            Value::String(hash_secret(reason))
-        );
+        assert_eq!(value["body"]["outcome"]["reason"], REDACTED_MARKER);
 
         remove_dir_if_exists(&root)?;
         Ok(())
