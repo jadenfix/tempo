@@ -360,7 +360,7 @@ impl eframe::App for ShellApp {
                 ui.label(health);
                 // Always-visible taint badge: reflects contains_untrusted over the
                 // active session's latest observation (from the events stream).
-                let taint = model.journal.taint;
+                let taint = model.journal.taint();
                 let badge = egui::RichText::new(taint.label());
                 let badge = if taint.is_tainted() {
                     badge.color(egui::Color32::from_rgb(220, 50, 50)).strong()

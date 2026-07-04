@@ -11,12 +11,13 @@
 //! [`tempo_taint::contains_untrusted`] evaluated over the taint spans already
 //! carried on the step observation-diff those events emit.
 
+use std::collections::HashSet;
 #[cfg(test)]
 use tempo_headless::SessionStepKey;
 use tempo_headless::{
     SessionStepOutcome, SessionStepTriple, TempodSessionEvent, TempodSessionEventKind,
 };
-use tempo_schema::{Action, InteractiveElement, ObservationDiff, TaintSpan};
+use tempo_schema::{Action, InteractiveElement, NodeId, ObservationDiff, TaintSpan};
 
 /// The taint badge state, derived from the latest step's observation spans.
 /// Always visible in the chrome; `Unknown` until the first observation-bearing
@@ -47,8 +48,11 @@ impl TaintState {
         matches!(self, Self::Tainted)
     }
 
-    /// Derive from an observation diff: `Tainted` iff any added/changed element's
-    /// name/value spans cross the untrusted page boundary.
+    /// Whether a single observation diff *introduces* untrusted content: `Tainted`
+    /// iff any added/changed element's name/value spans cross the untrusted page
+    /// boundary. This is a per-step predicate (used for the journal line flag);
+    /// the always-visible session badge is [`JournalLog::taint`], which is sticky
+    /// across steps because a diff is a delta (see [`JournalLog`]).
     pub fn from_diff(diff: &ObservationDiff) -> Self {
         if tempo_taint::contains_untrusted(diff_spans(diff)) {
             Self::Tainted
@@ -69,6 +73,11 @@ fn element_spans(elements: &[InteractiveElement]) -> impl Iterator<Item = &Taint
     elements
         .iter()
         .flat_map(|element| element.name.iter().chain(element.value.iter()))
+}
+
+/// Whether a single element carries untrusted page-derived spans.
+fn element_is_tainted(element: &InteractiveElement) -> bool {
+    tempo_taint::contains_untrusted(element.name.iter().chain(element.value.iter()))
 }
 
 /// One rendered line in the journal log: the ordered, display-flattened form of a
@@ -137,13 +146,23 @@ fn action_kind(action: &Action) -> &'static str {
     }
 }
 
-/// The ordered, deduplicated journal-event log for one session, plus the taint
-/// state derived from its most recent observation-bearing event.
+/// The ordered, deduplicated journal-event log for one session, plus the session
+/// taint state accumulated across its observation-bearing events.
 ///
 /// The log is append-only within a session: [`Self::ingest`] takes a page of
 /// events fetched with `after_seq = cursor` and drops any it has already seen, so
 /// re-polling never duplicates a line. Switching the active session
 /// ([`Self::follow`]) resets the log and the cursor.
+///
+/// The taint badge is **sticky**, because an [`ObservationDiff`] is a delta: an
+/// untrusted element that stays on the page unchanged across steps appears in
+/// neither `added` nor `changed`, so recomputing per-step would flip the badge
+/// back to `Clean` while the threat is still present — a security false-negative.
+/// Instead we track the *identities* ([`NodeId`]) of currently-untrusted
+/// elements: each step adds newly-tainted added/changed nodes, drops nodes that
+/// became clean (re-observed in `changed`) or left the page (`removed`), and the
+/// badge reads [`TaintState::Tainted`] iff that set is non-empty. Persistence
+/// stays tainted; the badge clears only when the untrusted content actually goes.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct JournalLog {
     /// The session this log is currently following, if any.
@@ -152,11 +171,26 @@ pub struct JournalLog {
     pub entries: Vec<JournalEntry>,
     /// Highest seq ingested; the `after_seq` cursor for the next poll.
     pub cursor: Option<u64>,
-    /// Badge state from the most recent observation-bearing event.
-    pub taint: TaintState,
+    /// Node identities currently carrying untrusted page-derived spans.
+    tainted_nodes: HashSet<NodeId>,
+    /// Whether any observation-bearing step has been seen for this session.
+    observed: bool,
 }
 
 impl JournalLog {
+    /// The always-visible session taint badge: `Unknown` until the first
+    /// observation-bearing step, then `Tainted` while any untrusted element is
+    /// present on the page and `Clean` once they are all gone.
+    pub fn taint(&self) -> TaintState {
+        if !self.observed {
+            TaintState::Unknown
+        } else if self.tainted_nodes.is_empty() {
+            TaintState::Clean
+        } else {
+            TaintState::Tainted
+        }
+    }
+
     /// Point the log at `session_id`, clearing entries/cursor/taint if it changed.
     /// Returns the cursor the next poll should use (`None` on a fresh session).
     pub fn follow(&mut self, session_id: &str) -> Option<u64> {
@@ -164,13 +198,14 @@ impl JournalLog {
             self.session_id = Some(session_id.to_string());
             self.entries.clear();
             self.cursor = None;
-            self.taint = TaintState::Unknown;
+            self.tainted_nodes.clear();
+            self.observed = false;
         }
         self.cursor
     }
 
     /// Append a fetched page of events in seq order, skipping any at or below the
-    /// cursor, and refresh the taint badge from the newest step observation seen.
+    /// cursor, and fold each step's observation diff into the sticky taint set.
     pub fn ingest(&mut self, events: &[TempodSessionEvent]) {
         let mut fresh: Vec<&TempodSessionEvent> = events
             .iter()
@@ -181,13 +216,30 @@ impl JournalLog {
             if let TempodSessionEventKind::StepTriple { triple } = &event.event
                 && let SessionStepOutcome::Applied { diff } = &triple.outcome
             {
-                self.taint = TaintState::from_diff(diff);
+                self.accumulate_taint(diff);
             }
             self.cursor = Some(
                 self.cursor
                     .map_or(event.seq, |cursor| cursor.max(event.seq)),
             );
             self.entries.push(JournalEntry::from_event(event));
+        }
+    }
+
+    /// Fold one applied observation diff into the tainted-node set: add
+    /// newly-untrusted added/changed nodes, drop nodes that became clean or were
+    /// removed. `removed` is applied last so a removal always wins.
+    fn accumulate_taint(&mut self, diff: &ObservationDiff) {
+        self.observed = true;
+        for element in diff.added.iter().chain(diff.changed.iter()) {
+            if element_is_tainted(element) {
+                self.tainted_nodes.insert(element.node_id.clone());
+            } else {
+                self.tainted_nodes.remove(&element.node_id);
+            }
+        }
+        for node in &diff.removed {
+            self.tainted_nodes.remove(node);
         }
     }
 }
@@ -205,9 +257,9 @@ mod tests {
         }
     }
 
-    fn element(spans: Vec<TaintSpan>) -> InteractiveElement {
+    fn element(node_id: &str, spans: Vec<TaintSpan>) -> InteractiveElement {
         InteractiveElement {
-            node_id: NodeId("n0".to_string()),
+            node_id: NodeId(node_id.to_string()),
             role: "textbox".to_string(),
             name: spans,
             value: Vec::new(),
@@ -223,6 +275,20 @@ mod tests {
             added,
             removed: Vec::new(),
             changed: Vec::new(),
+        }
+    }
+
+    fn diff_added_changed_removed(
+        added: Vec<InteractiveElement>,
+        changed: Vec<InteractiveElement>,
+        removed: Vec<NodeId>,
+    ) -> ObservationDiff {
+        ObservationDiff {
+            since_seq: 0,
+            seq: 1,
+            added,
+            removed,
+            changed,
         }
     }
 
@@ -256,14 +322,17 @@ mod tests {
 
     #[test]
     fn taint_state_reflects_untrusted_page_spans() {
-        let clean = diff_with(vec![element(vec![span(Provenance::System, "ok")])]);
+        let clean = diff_with(vec![element("n0", vec![span(Provenance::System, "ok")])]);
         assert_eq!(TaintState::from_diff(&clean), TaintState::Clean);
         assert!(!TaintState::from_diff(&clean).is_tainted());
 
-        let tainted = diff_with(vec![element(vec![
-            span(Provenance::User, "typed"),
-            span(Provenance::Page, "attacker-controlled"),
-        ])]);
+        let tainted = diff_with(vec![element(
+            "n0",
+            vec![
+                span(Provenance::User, "typed"),
+                span(Provenance::Page, "attacker-controlled"),
+            ],
+        )]);
         assert_eq!(TaintState::from_diff(&tainted), TaintState::Tainted);
         assert!(TaintState::from_diff(&tainted).is_tainted());
     }
@@ -310,7 +379,7 @@ mod tests {
         assert_eq!(log.follow("session-1"), None);
         assert!(log.entries.is_empty());
         assert_eq!(log.cursor, None);
-        assert_eq!(log.taint, TaintState::Unknown);
+        assert_eq!(log.taint(), TaintState::Unknown);
     }
 
     #[test]
@@ -320,19 +389,84 @@ mod tests {
 
         log.ingest(&[step_event(
             0,
-            diff_with(vec![element(vec![span(Provenance::System, "safe")])]),
+            diff_with(vec![element("n0", vec![span(Provenance::System, "safe")])]),
         )]);
-        assert_eq!(log.taint, TaintState::Clean);
+        assert_eq!(log.taint(), TaintState::Clean);
         assert!(!log.entries[0].tainted);
 
-        // A later step with page-derived spans flips the badge on.
+        // A later step that adds a page-derived element flips the badge on.
         log.ingest(&[step_event(
             1,
-            diff_with(vec![element(vec![span(Provenance::Page, "evil")])]),
+            diff_with(vec![element("n1", vec![span(Provenance::Page, "evil")])]),
         )]);
-        assert_eq!(log.taint, TaintState::Tainted);
+        assert_eq!(log.taint(), TaintState::Tainted);
         assert!(log.entries[1].tainted);
         assert_eq!(log.entries[1].kind, "step");
         assert_eq!(log.entries[1].detail, "goto → applied");
+    }
+
+    #[test]
+    fn taint_badge_stays_sticky_while_untrusted_element_persists() {
+        let mut log = JournalLog::default();
+        log.follow("session-0");
+
+        // Step 0: an untrusted element `n1` appears on the page.
+        log.ingest(&[step_event(
+            0,
+            diff_with(vec![element("n1", vec![span(Provenance::Page, "evil")])]),
+        )]);
+        assert_eq!(log.taint(), TaintState::Tainted);
+
+        // Step 1: a diff that neither adds nor changes `n1` — it is still on the
+        // page, unchanged. A delta-only recompute would wrongly clear the badge;
+        // the sticky set keeps it Tainted.
+        log.ingest(&[step_event(
+            1,
+            diff_with(vec![element("n2", vec![span(Provenance::System, "safe")])]),
+        )]);
+        assert_eq!(
+            log.taint(),
+            TaintState::Tainted,
+            "untrusted content still present must keep the badge on"
+        );
+    }
+
+    #[test]
+    fn taint_badge_clears_when_untrusted_element_is_removed() {
+        let mut log = JournalLog::default();
+        log.follow("session-0");
+
+        log.ingest(&[step_event(
+            0,
+            diff_with(vec![element("n1", vec![span(Provenance::Page, "evil")])]),
+        )]);
+        assert_eq!(log.taint(), TaintState::Tainted);
+
+        // The untrusted element leaves the page (appears in `removed`).
+        log.ingest(&[step_event(
+            1,
+            diff_added_changed_removed(Vec::new(), Vec::new(), vec![NodeId("n1".to_string())]),
+        )]);
+        assert_eq!(
+            log.taint(),
+            TaintState::Clean,
+            "badge clears only when the untrusted element actually leaves"
+        );
+
+        // A `changed` re-observation that is now clean also clears its node.
+        log.ingest(&[step_event(
+            2,
+            diff_with(vec![element("n3", vec![span(Provenance::Page, "evil2")])]),
+        )]);
+        assert_eq!(log.taint(), TaintState::Tainted);
+        log.ingest(&[step_event(
+            3,
+            diff_added_changed_removed(
+                Vec::new(),
+                vec![element("n3", vec![span(Provenance::System, "sanitized")])],
+                Vec::new(),
+            ),
+        )]);
+        assert_eq!(log.taint(), TaintState::Clean);
     }
 }
