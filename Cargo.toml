@@ -18,6 +18,23 @@ thiserror = "2"
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 tempfile = "3"
 
+# Optimized shipping profile: thin LTO + a single codegen unit measurably help
+# the hot paths (observation compile, cassette replay, transport framing) at
+# acceptable build-time cost; release binaries ship stripped. Benches inherit
+# release but keep line tables so profilers stay useful.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+# "debuginfo", not "symbols": tempod is a long-running daemon and panic
+# backtraces from the field must keep symbol names; dropping debuginfo alone
+# captures most of the size win.
+strip = "debuginfo"
+
+[profile.bench]
+inherits = "release"
+strip = "none"
+debug = "line-tables-only"
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 
