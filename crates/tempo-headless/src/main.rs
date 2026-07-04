@@ -38,7 +38,6 @@ fn main() {
         .field("engine", format!("{:?}", options.engine))
         .field("attached_engine", options.engine_socket.is_some())
         .field("metrics_enabled", layered.telemetry.metrics_enabled)
-        .field("stealth_mode", layered.stealth_mode)
         .emit();
 
     let result = match options.engine_socket {

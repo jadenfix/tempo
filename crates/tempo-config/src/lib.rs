@@ -1,9 +1,10 @@
 //! tempo-config — layered, validated configuration for tempo binaries.
 //!
-//! Today tempod is configured through scattered positional args and ad-hoc
-//! environment variables; a fleet operator has no config file, no single
-//! documented surface, and no validation before bind time. This crate is the
-//! canonical configuration layer:
+//! Today tempod startup is configured through scattered positional args and
+//! ad-hoc environment variables; a fleet operator has no config file, no
+//! single documented surface for those startup knobs, and no validation before
+//! bind time. This crate is the layered configuration layer for the tempod
+//! fields it actually applies:
 //!
 //! **Precedence (lowest → highest):** built-in defaults → JSON config file →
 //! `TEMPO_*` environment variables. CLI flags, where a binary has them, apply
@@ -12,22 +13,22 @@
 //! The file format is JSON (the only serialization dependency this workspace
 //! carries) with strict unknown-key rejection, so a typo fails loudly at
 //! startup instead of silently running with defaults. Every environment
-//! variable is a documented `ENV_*` constant here — this crate is the
-//! registry, and the names match the strings the daemon already honors
-//! (`TEMPO_OTLP_JSONL`, `TEMPO_STEALTH_MODE`, `TEMPO_LOG`).
+//! variable layered by this crate is a documented `ENV_*` constant here. Env
+//! knobs owned by lower-level crates stay there until tempod consumes them
+//! through [`TempodConfig`].
 //!
 //! ```
 //! use tempo_config::TempodConfig;
 //!
 //! # fn main() -> Result<(), tempo_config::ConfigError> {
 //! let env = |key: &str| match key {
-//!     "TEMPO_MAX_SESSIONS" => Some("8".to_string()),
+//!     "TEMPO_METRICS" => Some("off".to_string()),
 //!     _ => None,
 //! };
 //! // Propagate errors — a misconfiguration should stop startup, not be
 //! // silently replaced with defaults.
 //! let config = TempodConfig::load_with(None, &env)?;
-//! assert_eq!(config.limits.max_sessions, 8);
+//! assert!(!config.telemetry.metrics_enabled);
 //! assert_eq!(config.bind_addr, "127.0.0.1:8787");
 //! # Ok(())
 //! # }
@@ -48,18 +49,8 @@ pub const ENV_BIND_ADDR: &str = "TEMPO_BIND_ADDR";
 pub const ENV_ENGINE: &str = "TEMPO_ENGINE";
 /// UDS path of a pre-started engine host.
 pub const ENV_ENGINE_SOCKET: &str = "TEMPO_ENGINE_SOCKET";
-/// JSONL file for OTLP step export (already honored by tempod).
-pub const ENV_OTLP_JSONL: &str = "TEMPO_OTLP_JSONL";
-/// Disables durable session events (already honored by tempod).
-pub const ENV_STEALTH_MODE: &str = "TEMPO_STEALTH_MODE";
 /// Minimum structured-log level (`trace|debug|info|warn|error`).
 pub const ENV_LOG_LEVEL: &str = "TEMPO_LOG";
-/// Maximum concurrent sessions the daemon admits.
-pub const ENV_MAX_SESSIONS: &str = "TEMPO_MAX_SESSIONS";
-/// Idle seconds after which a session is eligible for eviction.
-pub const ENV_SESSION_IDLE_TIMEOUT_SECS: &str = "TEMPO_SESSION_IDLE_TIMEOUT_SECS";
-/// Request/response body cap in bytes.
-pub const ENV_MAX_BODY_BYTES: &str = "TEMPO_MAX_BODY_BYTES";
 /// Enables/disables the Prometheus exposition endpoint.
 pub const ENV_METRICS_ENABLED: &str = "TEMPO_METRICS";
 
@@ -99,28 +90,6 @@ impl EngineKind {
     }
 }
 
-/// Admission and payload limits.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct LimitsConfig {
-    /// Maximum concurrent sessions admitted by the pool.
-    pub max_sessions: u32,
-    /// Seconds of inactivity before a session may be evicted.
-    pub session_idle_timeout_secs: u64,
-    /// HTTP request/response body cap in bytes (mirrors tempod's 64 KiB cap).
-    pub max_body_bytes: u64,
-}
-
-impl Default for LimitsConfig {
-    fn default() -> Self {
-        Self {
-            max_sessions: 64,
-            session_idle_timeout_secs: 900,
-            max_body_bytes: 64 * 1024,
-        }
-    }
-}
-
 /// Observability toggles.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -150,11 +119,6 @@ pub struct TempodConfig {
     pub engine: EngineKind,
     /// UDS path of a pre-started engine host, if any.
     pub engine_socket: Option<String>,
-    /// JSONL path for OTLP step export, if enabled.
-    pub otlp_jsonl_path: Option<String>,
-    /// Disable durable session events.
-    pub stealth_mode: bool,
-    pub limits: LimitsConfig,
     pub telemetry: TelemetryConfig,
 }
 
@@ -164,9 +128,6 @@ impl Default for TempodConfig {
             bind_addr: "127.0.0.1:8787".to_string(),
             engine: EngineKind::default(),
             engine_socket: None,
-            otlp_jsonl_path: None,
-            stealth_mode: false,
-            limits: LimitsConfig::default(),
             telemetry: TelemetryConfig::default(),
         }
     }
@@ -218,22 +179,6 @@ impl TempodConfig {
         if let Some(value) = env(ENV_ENGINE_SOCKET) {
             self.engine_socket = Some(value);
         }
-        if let Some(value) = env(ENV_OTLP_JSONL) {
-            self.otlp_jsonl_path = Some(value);
-        }
-        if let Some(value) = env(ENV_STEALTH_MODE) {
-            self.stealth_mode = parse_stealth_bool(&value)?;
-        }
-        if let Some(value) = env(ENV_MAX_SESSIONS) {
-            self.limits.max_sessions = parse_number(ENV_MAX_SESSIONS, &value)?;
-        }
-        if let Some(value) = env(ENV_SESSION_IDLE_TIMEOUT_SECS) {
-            self.limits.session_idle_timeout_secs =
-                parse_number(ENV_SESSION_IDLE_TIMEOUT_SECS, &value)?;
-        }
-        if let Some(value) = env(ENV_MAX_BODY_BYTES) {
-            self.limits.max_body_bytes = parse_number(ENV_MAX_BODY_BYTES, &value)?;
-        }
         if let Some(value) = env(ENV_METRICS_ENABLED) {
             self.telemetry.metrics_enabled = parse_bool(ENV_METRICS_ENABLED, &value)?;
         }
@@ -253,24 +198,6 @@ impl TempodConfig {
     /// Structural validation with actionable messages; run after layering.
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.bind_socket_addr()?;
-        if self.limits.max_sessions == 0 {
-            return Err(ConfigError::InvalidField {
-                field: "limits.max_sessions",
-                reason: "must be at least 1".to_string(),
-            });
-        }
-        if self.limits.session_idle_timeout_secs == 0 {
-            return Err(ConfigError::InvalidField {
-                field: "limits.session_idle_timeout_secs",
-                reason: "must be at least 1 second".to_string(),
-            });
-        }
-        if self.limits.max_body_bytes < 1024 {
-            return Err(ConfigError::InvalidField {
-                field: "limits.max_body_bytes",
-                reason: "must be at least 1024 bytes".to_string(),
-            });
-        }
         if !VALID_LOG_LEVELS.contains(&self.telemetry.log_level.as_str()) {
             return Err(ConfigError::InvalidField {
                 field: "telemetry.log_level",
@@ -324,12 +251,7 @@ impl TempodConfig {
             ENV_BIND_ADDR,
             ENV_ENGINE,
             ENV_ENGINE_SOCKET,
-            ENV_OTLP_JSONL,
-            ENV_STEALTH_MODE,
             ENV_LOG_LEVEL,
-            ENV_MAX_SESSIONS,
-            ENV_SESSION_IDLE_TIMEOUT_SECS,
-            ENV_MAX_BODY_BYTES,
             ENV_METRICS_ENABLED,
         ])
     }
@@ -345,28 +267,6 @@ fn parse_bool(var: &'static str, value: &str) -> Result<bool, ConfigError> {
             expected: "1|true|yes|on or 0|false|no|off",
         }),
     }
-}
-
-/// `TEMPO_STEALTH_MODE` matches the daemon's truthy set, which additionally
-/// accepts the literal `stealth` (see `tempo-session`). Unlike the daemon —
-/// which silently treats unrecognized values as false — an unrecognized value
-/// here is a startup error, so a typo cannot silently disable stealth.
-fn parse_stealth_bool(value: &str) -> Result<bool, ConfigError> {
-    if value.trim().eq_ignore_ascii_case("stealth") {
-        return Ok(true);
-    }
-    parse_bool(ENV_STEALTH_MODE, value)
-}
-
-fn parse_number<T: FromStr>(var: &'static str, value: &str) -> Result<T, ConfigError> {
-    value
-        .trim()
-        .parse()
-        .map_err(|_| ConfigError::InvalidEnvVar {
-            var,
-            value: value.to_string(),
-            expected: "a non-negative integer",
-        })
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -419,8 +319,6 @@ mod tests {
         let config = TempodConfig::load_with(None, &no_env)?;
         assert_eq!(config.bind_addr, "127.0.0.1:8787");
         assert_eq!(config.engine, EngineKind::Cdp);
-        assert_eq!(config.limits.max_sessions, 64);
-        assert_eq!(config.limits.max_body_bytes, 65536);
         assert!(config.telemetry.metrics_enabled);
         assert!(config.bind_socket_addr()?.ip().is_loopback());
         Ok(())
@@ -429,38 +327,35 @@ mod tests {
     #[test]
     fn partial_file_overlays_defaults() -> Result<(), Box<dyn std::error::Error>> {
         let file = write_config(
-            r#"{ "engine": "servo", "limits": { "max_sessions": 4 }, "stealth_mode": true }"#,
+            r#"{ "engine": "servo", "telemetry": { "metrics_enabled": false, "log_level": "debug" } }"#,
         )?;
         let config = TempodConfig::load_with(Some(file.path()), &no_env)?;
         assert_eq!(config.engine, EngineKind::Servo);
-        assert_eq!(config.limits.max_sessions, 4);
-        assert!(config.stealth_mode);
+        assert!(!config.telemetry.metrics_enabled);
+        assert_eq!(config.telemetry.log_level, "debug");
         // Untouched fields keep their defaults.
         assert_eq!(config.bind_addr, "127.0.0.1:8787");
-        assert_eq!(config.limits.session_idle_timeout_secs, 900);
         Ok(())
     }
 
     #[test]
     fn env_overrides_file() -> Result<(), Box<dyn std::error::Error>> {
-        let file = write_config(r#"{ "limits": { "max_sessions": 4 }, "engine": "servo" }"#)?;
+        let file = write_config(
+            r#"{ "engine": "servo", "engine_socket": "/tmp/file.sock", "telemetry": { "metrics_enabled": true, "log_level": "warn" } }"#,
+        )?;
         let env = env_of(&[
-            (ENV_MAX_SESSIONS, "9"),
             (ENV_ENGINE, "cdp"),
+            (ENV_ENGINE_SOCKET, "/tmp/env.sock"),
             (ENV_BIND_ADDR, "0.0.0.0:9000"),
-            (ENV_STEALTH_MODE, "on"),
             (ENV_METRICS_ENABLED, "off"),
             (ENV_LOG_LEVEL, "DEBUG"),
-            (ENV_OTLP_JSONL, "/tmp/otlp.jsonl"),
         ]);
         let config = TempodConfig::load_with(Some(file.path()), &env)?;
-        assert_eq!(config.limits.max_sessions, 9);
         assert_eq!(config.engine, EngineKind::Cdp);
+        assert_eq!(config.engine_socket.as_deref(), Some("/tmp/env.sock"));
         assert_eq!(config.bind_addr, "0.0.0.0:9000");
-        assert!(config.stealth_mode);
         assert!(!config.telemetry.metrics_enabled);
         assert_eq!(config.telemetry.log_level, "debug");
-        assert_eq!(config.otlp_jsonl_path.as_deref(), Some("/tmp/otlp.jsonl"));
         Ok(())
     }
 
@@ -475,15 +370,27 @@ mod tests {
     }
 
     #[test]
-    fn invalid_env_names_the_variable() {
-        let env = env_of(&[(ENV_MAX_SESSIONS, "lots")]);
-        match TempodConfig::load_with(None, &env) {
-            Err(ConfigError::InvalidEnvVar { var, .. }) => assert_eq!(var, ENV_MAX_SESSIONS),
-            other => panic!("expected InvalidEnvVar, got {other:?}"),
+    fn unsupported_operational_file_keys_are_rejected() -> Result<(), Box<dyn std::error::Error>> {
+        for json in [
+            r#"{ "limits": { "max_sessions": 4 } }"#,
+            r#"{ "stealth_mode": true }"#,
+            r#"{ "otlp_jsonl_path": "/tmp/otlp.jsonl" }"#,
+        ] {
+            let file = write_config(json)?;
+            let error = TempodConfig::load_with(Some(file.path()), &no_env);
+            match error {
+                Err(ConfigError::ParseFile { .. }) => {}
+                other => panic!("expected ParseFile error for {json}, got {other:?}"),
+            }
         }
-        let env = env_of(&[(ENV_STEALTH_MODE, "maybe")]);
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_env_names_the_variable() {
+        let env = env_of(&[(ENV_METRICS_ENABLED, "maybe")]);
         match TempodConfig::load_with(None, &env) {
-            Err(ConfigError::InvalidEnvVar { var, .. }) => assert_eq!(var, ENV_STEALTH_MODE),
+            Err(ConfigError::InvalidEnvVar { var, .. }) => assert_eq!(var, ENV_METRICS_ENABLED),
             other => panic!("expected InvalidEnvVar, got {other:?}"),
         }
         let env = env_of(&[(ENV_ENGINE, "chrome")]);
@@ -500,26 +407,12 @@ mod tests {
             Err(ConfigError::InvalidField { field, .. }) => assert_eq!(field, "bind_addr"),
             other => panic!("expected InvalidField(bind_addr), got {other:?}"),
         }
-        let env = env_of(&[(ENV_MAX_SESSIONS, "0")]);
-        match TempodConfig::load_with(None, &env) {
-            Err(ConfigError::InvalidField { field, .. }) => {
-                assert_eq!(field, "limits.max_sessions");
-            }
-            other => panic!("expected InvalidField(max_sessions), got {other:?}"),
-        }
         let env = env_of(&[(ENV_LOG_LEVEL, "loud")]);
         match TempodConfig::load_with(None, &env) {
             Err(ConfigError::InvalidField { field, .. }) => {
                 assert_eq!(field, "telemetry.log_level");
             }
             other => panic!("expected InvalidField(log_level), got {other:?}"),
-        }
-        let env = env_of(&[(ENV_MAX_BODY_BYTES, "10")]);
-        match TempodConfig::load_with(None, &env) {
-            Err(ConfigError::InvalidField { field, .. }) => {
-                assert_eq!(field, "limits.max_body_bytes");
-            }
-            other => panic!("expected InvalidField(max_body_bytes), got {other:?}"),
         }
     }
 
@@ -535,20 +428,8 @@ mod tests {
             ("NO", false),
             ("off", false),
         ] {
-            assert_eq!(parse_bool(ENV_STEALTH_MODE, spelling)?, expected);
+            assert_eq!(parse_bool(ENV_METRICS_ENABLED, spelling)?, expected);
         }
-        Ok(())
-    }
-
-    #[test]
-    fn stealth_parsing_matches_daemon_truthy_set() -> Result<(), ConfigError> {
-        // The daemon (tempo-session) additionally accepts the literal
-        // "stealth"; the config layer must agree.
-        assert!(parse_stealth_bool("stealth")?);
-        assert!(parse_stealth_bool("STEALTH")?);
-        assert!(parse_stealth_bool("1")?);
-        assert!(!parse_stealth_bool("off")?);
-        assert!(parse_stealth_bool("maybe").is_err());
         Ok(())
     }
 
@@ -583,9 +464,9 @@ mod tests {
     fn round_trips_through_pretty_json() -> Result<(), Box<dyn std::error::Error>> {
         let config = TempodConfig {
             engine: EngineKind::Servo,
-            limits: LimitsConfig {
-                max_sessions: 3,
-                ..LimitsConfig::default()
+            telemetry: TelemetryConfig {
+                metrics_enabled: false,
+                ..TelemetryConfig::default()
             },
             ..TempodConfig::default()
         };
@@ -599,8 +480,7 @@ mod tests {
     fn env_var_registry_is_complete() {
         let vars = TempodConfig::env_vars();
         assert!(vars.contains(ENV_CONFIG_PATH));
-        assert!(vars.contains(ENV_OTLP_JSONL));
-        assert!(vars.contains(ENV_STEALTH_MODE));
-        assert_eq!(vars.len(), 11);
+        assert!(vars.contains(ENV_METRICS_ENABLED));
+        assert_eq!(vars.len(), 6);
     }
 }
