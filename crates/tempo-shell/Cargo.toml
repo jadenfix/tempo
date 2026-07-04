@@ -29,6 +29,9 @@ window = ["dep:eframe", "dep:png", "dep:base64"]
 serde = { workspace = true }
 serde_json = { workspace = true }
 tempo-schema = { path = "../tempo-schema" }
+# Taint predicate for the agent-panel badge: `contains_untrusted` over the spans
+# already carried on the events stream's observations. No new taint backend.
+tempo-taint = { path = "../tempo-taint" }
 tempo-driver = { path = "../tempo-driver" }
 tempo-headless = { path = "../tempo-headless" }
 tempo-mcp = { path = "../tempo-mcp" }

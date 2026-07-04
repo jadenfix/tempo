@@ -11,9 +11,10 @@
 //! transport a single implementation (no reimplementation) and lets tests inject
 //! a mock without a network.
 
+use crate::agent::JournalLog;
 use crate::tab::{ScreenshotImage, Tab};
 use crate::{HealthResponse, ShellClient, ShellError};
-use tempo_headless::{TempodSession, TempodSessionState};
+use tempo_headless::{TempodSession, TempodSessionEvent, TempodSessionState};
 
 /// One session row as shown in the list: the id/state/url triple the DoD asks
 /// for, flattened to display strings so the render layer stays trivial.
@@ -54,8 +55,19 @@ pub trait SessionService {
     fn close(&self, session_id: &str) -> Result<TempodSession, ShellError>;
     /// Navigate a tab's driver to `url` (omnibox / back / forward).
     fn goto(&self, driver_id: Option<&str>, url: &str) -> Result<(), ShellError>;
-    /// Fetch a single-shot page snapshot for a tab's driver.
-    fn screenshot(&self, driver_id: Option<&str>) -> Result<ScreenshotImage, ShellError>;
+    /// Fetch a single-shot page snapshot for a tab's driver, optionally with the
+    /// set-of-marks overlay drawn on it.
+    fn screenshot(
+        &self,
+        driver_id: Option<&str>,
+        set_of_marks: bool,
+    ) -> Result<ScreenshotImage, ShellError>;
+    /// Poll the session's journal/event stream after `after_seq` (the agent panel).
+    fn events(
+        &self,
+        session_id: &str,
+        after_seq: Option<u64>,
+    ) -> Result<Vec<TempodSessionEvent>, ShellError>;
 }
 
 impl SessionService for ShellClient {
@@ -83,8 +95,20 @@ impl SessionService for ShellClient {
         ShellClient::goto(self, driver_id, url)
     }
 
-    fn screenshot(&self, driver_id: Option<&str>) -> Result<ScreenshotImage, ShellError> {
-        ShellClient::screenshot(self, driver_id)
+    fn screenshot(
+        &self,
+        driver_id: Option<&str>,
+        set_of_marks: bool,
+    ) -> Result<ScreenshotImage, ShellError> {
+        ShellClient::screenshot(self, driver_id, set_of_marks)
+    }
+
+    fn events(
+        &self,
+        session_id: &str,
+        after_seq: Option<u64>,
+    ) -> Result<Vec<TempodSessionEvent>, ShellError> {
+        ShellClient::events(self, session_id, after_seq)
     }
 }
 
@@ -115,6 +139,10 @@ pub enum UiAction {
     Forward,
     /// Refresh the active tab's page-state screenshot.
     RefreshScreenshot,
+    /// Poll the active tab's journal/event stream and append new events.
+    PollEvents,
+    /// Toggle the set-of-marks overlay for the page-state screenshot.
+    ToggleMarks,
 }
 
 /// Which way [`ShellUiModel::step_history`] walks the active tab's stack.
@@ -154,6 +182,12 @@ pub struct ShellUiModel {
     pub tabs: Vec<Tab>,
     /// Index into [`Self::tabs`] of the tab whose chrome is shown, if any.
     pub active_tab: Option<usize>,
+    /// The agent panel's live journal/event stream + taint badge for the active
+    /// session. Rebuilt when the active session changes.
+    pub journal: JournalLog,
+    /// Whether the page-state screenshot is requested with the set-of-marks
+    /// overlay. Flipped by [`UiAction::ToggleMarks`].
+    pub marks_overlay: bool,
 }
 
 impl Default for ShellUiModel {
@@ -166,6 +200,8 @@ impl Default for ShellUiModel {
             healthy: None,
             tabs: Vec::new(),
             active_tab: None,
+            journal: JournalLog::default(),
+            marks_overlay: false,
         }
     }
 }
@@ -195,6 +231,8 @@ impl ShellUiModel {
             UiAction::Back => self.step_history(service, HistoryStep::Back),
             UiAction::Forward => self.step_history(service, HistoryStep::Forward),
             UiAction::RefreshScreenshot => self.refresh_screenshot(service),
+            UiAction::PollEvents => self.poll_events(service),
+            UiAction::ToggleMarks => self.toggle_marks(),
         }
     }
 
@@ -338,7 +376,7 @@ impl ShellUiModel {
                 return;
             };
             let session_id = tab.session_id.clone();
-            match service.screenshot(tab.driver_id.as_deref()) {
+            match service.screenshot(tab.driver_id.as_deref(), self.marks_overlay) {
                 Ok(image) => {
                     tab.screenshot = Some(image);
                     tab.screenshot_seq += 1;
@@ -355,6 +393,32 @@ impl ShellUiModel {
             Ok(session_id) => self.status = format!("Screenshot refreshed for tab {session_id}"),
             Err(err) => self.set_error("screenshot", &err),
         }
+    }
+
+    /// Poll the active tab's `/sessions/{id}/events` stream and append the new
+    /// events to the journal log, refreshing the taint badge. A no-op when there
+    /// is no active tab. The journal resets itself when the active session
+    /// changes ([`JournalLog::follow`]).
+    fn poll_events(&mut self, service: &dyn SessionService) {
+        let Some(session_id) = self.active_tab().map(|tab| tab.session_id.clone()) else {
+            return;
+        };
+        let after_seq = self.journal.follow(&session_id);
+        match service.events(&session_id, after_seq) {
+            Ok(events) => self.journal.ingest(&events),
+            Err(err) => self.set_error("events", &err),
+        }
+    }
+
+    /// Flip the set-of-marks overlay flag. The next screenshot refresh requests
+    /// the overlaid image; this only touches request state (no I/O here).
+    fn toggle_marks(&mut self) {
+        self.marks_overlay = !self.marks_overlay;
+        self.status = if self.marks_overlay {
+            "Set-of-marks overlay ON — refresh page to apply.".to_string()
+        } else {
+            "Set-of-marks overlay OFF — refresh page to apply.".to_string()
+        };
     }
 
     fn refresh(&mut self, service: &dyn SessionService) {
@@ -441,9 +505,20 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
     use std::thread;
-    use tempo_headless::{serve_forever, SessionPool, TempodSessionId};
+    use tempo_headless::{serve_forever, SessionPool, TempodSessionEventKind, TempodSessionId};
 
     type TestResult = Result<(), Box<dyn Error>>;
+
+    fn created_event(session_id: &str, seq: u64, url: &str) -> TempodSessionEvent {
+        TempodSessionEvent {
+            session_id: TempodSessionId(session_id.to_string()),
+            seq,
+            timestamp_ms: 0,
+            event: TempodSessionEventKind::SessionCreated {
+                url: url.to_string(),
+            },
+        }
+    }
 
     fn session(id: &str, url: &str, state: TempodSessionState) -> TempodSession {
         TempodSession {
@@ -460,6 +535,7 @@ mod tests {
     struct MockService {
         calls: RefCell<Vec<String>>,
         canned_sessions: Vec<TempodSession>,
+        canned_events: Vec<TempodSessionEvent>,
         fail: Option<&'static str>,
     }
 
@@ -529,14 +605,40 @@ mod tests {
             Ok(())
         }
 
-        fn screenshot(&self, driver_id: Option<&str>) -> Result<ScreenshotImage, ShellError> {
-            self.record(format!("screenshot:{}", driver_id.unwrap_or("-")));
+        fn screenshot(
+            &self,
+            driver_id: Option<&str>,
+            set_of_marks: bool,
+        ) -> Result<ScreenshotImage, ShellError> {
+            self.record(format!(
+                "screenshot:{}:marks={set_of_marks}",
+                driver_id.unwrap_or("-")
+            ));
             self.maybe_fail("screenshot")?;
             Ok(ScreenshotImage {
                 mime_type: "image/png".to_string(),
                 encoding: "base64".to_string(),
+                set_of_marks,
                 data: "QUJD".to_string(),
             })
+        }
+
+        fn events(
+            &self,
+            session_id: &str,
+            after_seq: Option<u64>,
+        ) -> Result<Vec<TempodSessionEvent>, ShellError> {
+            self.record(format!(
+                "events:{session_id}:{}",
+                after_seq.map_or_else(|| "-".to_string(), |seq| seq.to_string())
+            ));
+            self.maybe_fail("events")?;
+            Ok(self
+                .canned_events
+                .iter()
+                .filter(|event| after_seq.is_none_or(|seq| event.seq > seq))
+                .cloned()
+                .collect())
         }
     }
 
@@ -837,7 +939,7 @@ mod tests {
 
         model.dispatch(UiAction::RefreshScreenshot, &service);
 
-        assert_eq!(service.calls(), vec!["screenshot:fork-2"]);
+        assert_eq!(service.calls(), vec!["screenshot:fork-2:marks=false"]);
         let shot = model.tabs[0].screenshot.as_ref();
         assert_eq!(
             shot.map(|image| image.mime_type.as_str()),
@@ -862,6 +964,108 @@ mod tests {
 
         assert!(model.tabs[0].screenshot.is_none());
         assert!(model.status.contains("screenshot failed"));
+    }
+
+    #[test]
+    fn toggle_marks_flips_screenshot_request_flag() {
+        let service = MockService::default();
+        let mut model = ShellUiModel {
+            tabs: vec![Tab::new("session-0", None, "https://a.test")],
+            active_tab: Some(0),
+            ..ShellUiModel::default()
+        };
+        assert!(!model.marks_overlay);
+
+        // Toggling flips the flag with no I/O.
+        model.dispatch(UiAction::ToggleMarks, &service);
+        assert!(model.marks_overlay);
+        assert!(service.calls().is_empty());
+
+        // The next screenshot refresh requests the set-of-marks overlay.
+        model.dispatch(UiAction::RefreshScreenshot, &service);
+        assert_eq!(service.calls(), vec!["screenshot:-:marks=true"]);
+        assert!(model.tabs[0]
+            .screenshot
+            .as_ref()
+            .is_some_and(|image| image.set_of_marks));
+
+        // Toggling back requests the plain image again.
+        model.dispatch(UiAction::ToggleMarks, &service);
+        assert!(!model.marks_overlay);
+        model.dispatch(UiAction::RefreshScreenshot, &service);
+        assert_eq!(
+            service.calls(),
+            vec!["screenshot:-:marks=true", "screenshot:-:marks=false",]
+        );
+    }
+
+    #[test]
+    fn poll_events_populates_ordered_journal_for_active_tab() {
+        let service = MockService {
+            canned_events: vec![
+                created_event("session-0", 0, "https://a.test"),
+                created_event("session-0", 1, "https://a.test"),
+            ],
+            ..MockService::default()
+        };
+        let mut model = ShellUiModel {
+            tabs: vec![Tab::new("session-0", None, "https://a.test")],
+            active_tab: Some(0),
+            ..ShellUiModel::default()
+        };
+
+        model.dispatch(UiAction::PollEvents, &service);
+
+        // First poll uses no cursor; the journal follows the active session.
+        assert_eq!(service.calls(), vec!["events:session-0:-"]);
+        assert_eq!(model.journal.session_id.as_deref(), Some("session-0"));
+        assert_eq!(
+            model
+                .journal
+                .entries
+                .iter()
+                .map(|entry| entry.seq)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(model.journal.cursor, Some(1));
+
+        // A second poll advances the cursor and appends only newer events.
+        model.dispatch(UiAction::PollEvents, &service);
+        assert_eq!(
+            service.calls(),
+            vec!["events:session-0:-", "events:session-0:1"]
+        );
+        assert_eq!(model.journal.entries.len(), 2);
+    }
+
+    #[test]
+    fn poll_events_without_active_tab_is_a_no_op() {
+        let service = MockService::default();
+        let mut model = ShellUiModel::default();
+
+        model.dispatch(UiAction::PollEvents, &service);
+
+        assert!(service.calls().is_empty());
+        assert!(model.journal.entries.is_empty());
+    }
+
+    #[test]
+    fn poll_events_error_surfaces_to_status_line() {
+        let service = MockService {
+            fail: Some("events"),
+            ..MockService::default()
+        };
+        let mut model = ShellUiModel {
+            tabs: vec![Tab::new("session-0", None, "https://a.test")],
+            active_tab: Some(0),
+            ..ShellUiModel::default()
+        };
+
+        model.dispatch(UiAction::PollEvents, &service);
+
+        assert!(model.journal.entries.is_empty());
+        assert!(model.status.contains("events failed"));
     }
 
     /// The reducer drives a real tempod over the existing ShellClient transport,

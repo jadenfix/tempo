@@ -114,6 +114,9 @@ impl History {
 pub struct ScreenshotImage {
     pub mime_type: String,
     pub encoding: String,
+    /// Whether this snapshot has the set-of-marks overlay drawn on it, as
+    /// reported by the tool. Lets the renderer label the overlaid image.
+    pub set_of_marks: bool,
     /// Base64-encoded image bytes, exactly as the MCP tool returned them. The
     /// window decodes this for display; the model never needs the raw pixels.
     pub data: String,
@@ -131,6 +134,11 @@ impl ScreenshotImage {
         Ok(Self {
             mime_type: field("mime_type")?.to_string(),
             encoding: field("encoding")?.to_string(),
+            // The tool always reports this; default false if an older peer omits it.
+            set_of_marks: value
+                .get("set_of_marks")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
             data: field("data")?.to_string(),
         })
     }
@@ -269,12 +277,13 @@ mod tests {
         let value = json!({
             "mime_type": "image/png",
             "encoding": "base64",
-            "set_of_marks": false,
+            "set_of_marks": true,
             "data": "QUJD",
         });
         let image = ScreenshotImage::from_structured(&value)?;
         assert_eq!(image.mime_type, "image/png");
         assert_eq!(image.encoding, "base64");
+        assert!(image.set_of_marks);
         assert_eq!(image.data, "QUJD");
         Ok(())
     }

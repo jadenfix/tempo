@@ -12,6 +12,7 @@ use std::time::Duration;
 use tempo_headless::{TempodSession, TempodSessionEvent, TempodSessionId};
 use thiserror::Error;
 
+pub mod agent;
 pub mod tab;
 pub mod ui;
 #[cfg(feature = "window")]
@@ -301,11 +302,20 @@ impl ShellClient {
 
     /// Fetch a single-shot page snapshot from `driver_id` (or the default
     /// attached driver) via the `screenshot` MCP tool. Not a live frame — the
-    /// caller refreshes it on an interval or a button.
-    pub fn screenshot(&self, driver_id: Option<&str>) -> Result<tab::ScreenshotImage, ShellError> {
+    /// caller refreshes it on an interval or a button. When `set_of_marks` is
+    /// set, the tool overlays the ranked set-of-marks labels on the image (the
+    /// agent-panel debug overlay).
+    pub fn screenshot(
+        &self,
+        driver_id: Option<&str>,
+        set_of_marks: bool,
+    ) -> Result<tab::ScreenshotImage, ShellError> {
         let mut arguments = json!({});
         if let Some(driver_id) = driver_id {
             arguments["driver_id"] = json!(driver_id);
+        }
+        if set_of_marks {
+            arguments["set_of_marks"] = json!(true);
         }
         let structured = self.mcp_tool("screenshot", arguments)?;
         tab::ScreenshotImage::from_structured(&structured)
