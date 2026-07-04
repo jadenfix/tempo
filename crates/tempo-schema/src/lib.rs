@@ -1009,6 +1009,110 @@ mod tests {
     }
 
     #[test]
+    fn defaulted_optional_fields_serialize_compactly() -> Result<(), serde_json::Error> {
+        let observation = CompiledObservation {
+            schema_version: SCHEMA_VERSION.into(),
+            url: "https://example.com".into(),
+            seq: 1,
+            elements: vec![InteractiveElement {
+                node_id: NodeId("n1".into()),
+                role: "button".into(),
+                name: vec![TaintSpan {
+                    provenance: Provenance::Page,
+                    text: "Buy".into(),
+                }],
+                value: vec![],
+                bounds: None,
+                rank: 0.9,
+            }],
+            marks: vec![],
+        };
+
+        let observation_wire = serde_json::to_value(&observation)?;
+        assert_eq!(
+            observation_wire["elements"]
+                .as_array()
+                .map(|elements| elements.len()),
+            Some(1)
+        );
+        assert!(observation_wire.get("marks").is_none());
+        assert!(observation_wire["elements"][0].get("value").is_none());
+        assert!(observation_wire["elements"][0].get("bounds").is_none());
+
+        let verbose_observation = json!({
+            "schema_version": SCHEMA_VERSION,
+            "url": "https://example.com",
+            "seq": 1,
+            "elements": [{
+                "node_id": "n1",
+                "role": "button",
+                "name": [{"provenance": "page", "text": "Buy"}],
+                "value": [],
+                "bounds": null,
+                "rank": 0.9
+            }],
+            "marks": []
+        });
+        let back: CompiledObservation = serde_json::from_value(verbose_observation.clone())?;
+        assert_eq!(observation, back);
+
+        let outcome = ActionOutcome {
+            status: StepStatus::Ok,
+            error: None,
+            grounding: Grounding {
+                node: None,
+                selector_existed: true,
+                matched_element: true,
+            },
+            observation: observation.clone(),
+            diff: None,
+        };
+        let step = StepTriple {
+            seq: 1,
+            observation_before: observation,
+            decision: None,
+            action: Action::Wait { millis: 1 },
+            outcome,
+        };
+
+        let step_wire = serde_json::to_value(&step)?;
+        assert!(step_wire.get("decision").is_none());
+        assert!(step_wire["outcome"].get("error").is_none());
+        assert!(step_wire["outcome"].get("diff").is_none());
+        assert!(step_wire["outcome"]["grounding"].get("node").is_none());
+
+        let verbose_step: StepTriple = serde_json::from_value(json!({
+            "seq": 1,
+            "observation_before": verbose_observation,
+            "decision": null,
+            "action": {"kind": "wait", "millis": 1},
+            "outcome": {
+                "status": "ok",
+                "error": null,
+                "grounding": {
+                    "node": null,
+                    "selector_existed": true,
+                    "matched_element": true
+                },
+                "observation": {
+                    "schema_version": SCHEMA_VERSION,
+                    "url": "https://example.com",
+                    "seq": 1,
+                    "elements": [],
+                    "marks": []
+                },
+                "diff": null
+            }
+        }))?;
+        assert!(verbose_step.decision.is_none());
+        assert!(verbose_step.outcome.error.is_none());
+        assert!(verbose_step.outcome.diff.is_none());
+        assert!(verbose_step.outcome.grounding.node.is_none());
+
+        Ok(())
+    }
+
+    #[test]
     fn schema_bundle_exports_all_contract_defs() -> Result<(), String> {
         let schema = schema_bundle_json_schema();
         assert_eq!(schema["$schema"], JSON_SCHEMA_DRAFT);
