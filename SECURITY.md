@@ -26,7 +26,8 @@ In rough priority order:
 3. **SSRF** — driving the engine or `tempo-net` to loopback, link-local, or
    private ranges past `UrlPolicy`.
 4. **Origin-guard / DNS-rebinding bypasses** — reaching tempod
-   session/control routes (including `/metrics`) from a hostile web origin.
+   session/control routes (including the metrics exposition, where present)
+   from a hostile web origin.
 5. **Secret leakage** — credentials or session material appearing in journals,
    cassettes, OTLP export, logs, or metrics.
 6. **Cross-session isolation failures** — cookie/storage/profile leakage

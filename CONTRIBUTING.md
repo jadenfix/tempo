@@ -32,13 +32,16 @@ Enforced by workspace lints and CI on every PR:
 `.github/workflows/ci.yml` runs, in order: fmt → check → clippy → servo API
 boundary → workspace tests → toolexec live tests → the fixture gates (eval
 budget, observe, compat lanes, injection, taint) → servo vanilla + fork build
-gates. A separate job runs the live-CDP conformance battery against real
-Chrome and fails if those tests are skipped. Security-relevant changes
-(observe / act / net / policy / taint / toolexec) are expected to extend the
-injection and SSRF corpora, not just pass them.
+gates. Separate jobs run the criterion bench smoke and the live-CDP
+conformance battery against real Chrome (which fails if those tests are
+skipped). Security-relevant changes (observe / act / net / policy / taint /
+toolexec) are expected to extend the injection and SSRF corpora, not just
+pass them.
 
 Supply-chain checks (`.github/workflows/audit.yml`) run `cargo deny` for
-advisories, bans, and source provenance on every PR touching dependencies.
+advisories, bans, source provenance, and license policy on every PR touching
+dependencies. `Cargo.lock` is committed: if your PR changes dependencies,
+commit the lockfile update with it.
 
 ## PR conventions
 

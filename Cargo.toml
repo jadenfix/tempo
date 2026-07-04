@@ -25,7 +25,10 @@ tempfile = "3"
 [profile.release]
 lto = "thin"
 codegen-units = 1
-strip = "symbols"
+# "debuginfo", not "symbols": tempod is a long-running daemon and panic
+# backtraces from the field must keep symbol names; dropping debuginfo alone
+# captures most of the size win.
+strip = "debuginfo"
 
 [profile.bench]
 inherits = "release"

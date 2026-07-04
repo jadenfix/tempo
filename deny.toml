@@ -41,5 +41,7 @@ unknown-registry = "deny"
 unknown-git = "deny"
 
 [sources.allow-org]
-# beater sibling crates are consumed as rev-pinned git dependencies.
-github = ["jadenfix", "servo"]
+# beater sibling crates (and the audited Servo fork lane) are consumed as
+# rev-pinned git dependencies from this org. Servo itself comes from
+# crates.io, so servo/* is deliberately not allowlisted.
+github = ["jadenfix"]

@@ -424,7 +424,7 @@ Team-shape risk (only E2/E3 deep in Servo) is mitigated structurally by contract
 
 The sections above describe the destination; this section tracks the *operational substrate* — the unglamorous infrastructure that decides whether tempo can actually be run as a fleet, forked by outsiders, and optimized with evidence instead of guesses. Updated as gaps close (last update: 2026-07-04).
 
-### 11.1 What the substrate now provides
+### 11.1 What the substrate provides (with the paired observability/config PR)
 
 - **Observability** (`tempo-telemetry`): Prometheus exposition at `GET /metrics` (origin-guarded, scraper-friendly), request/latency instrumentation at tempod's HTTP funnel with bounded-cardinality route labels, uptime/build/active-session/draining gauges, and structured JSON-lines logging with an in-memory ring. Histogram buckets are aligned with the §10 budget bars so budget regressions are readable straight off the exposition.
 - **Configuration** (`tempo-config`): one documented, validated, layered surface (defaults → JSON file → `TEMPO_*` env) replacing scattered env reads; strict unknown-key rejection so typos fail at startup, not silently.

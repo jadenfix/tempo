@@ -49,8 +49,9 @@ cargo test --workspace   # contracts, conformance, runtime, protocol, and shell 
 
 ## Operations & governance
 
-- `tempo-telemetry` / `tempo-config` are the observability and configuration
-  backbones; tempod serves Prometheus exposition at `GET /metrics`.
+- `tempo-telemetry` / `tempo-config` (paired observability PR) are the
+  observability and configuration backbones; tempod serves Prometheus
+  exposition at `GET /metrics`.
 - Supply-chain policy lives in [`deny.toml`](./deny.toml) (checked in CI);
   tagged `v*` releases build stripped, thin-LTO `tempod` + `tempo-cli`
   binaries for macOS and Linux.
