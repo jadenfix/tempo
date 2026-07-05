@@ -355,6 +355,7 @@ pub enum ManagerEvent {
     },
     ConfirmationGranted {
         confirmation_id: String,
+        grant: ConfirmationGrant,
     },
     RunStateChanged {
         run: AgentRun,
@@ -1484,10 +1485,11 @@ fn manager_event_json_schema() -> Value {
             {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["kind", "confirmation_id"],
+                "required": ["kind", "confirmation_id", "grant"],
                 "properties": {
                     "kind": { "const": "confirmation_granted" },
-                    "confirmation_id": { "type": "string" }
+                    "confirmation_id": { "type": "string" },
+                    "grant": { "$ref": "#/$defs/ConfirmationGrant" }
                 }
             },
             {
