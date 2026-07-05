@@ -1300,12 +1300,22 @@ pub fn sign_request(
             actual: params.key_id.clone(),
         });
     }
-    let base = signature_base(request, params)?;
+    // Build the `Signature-Input` value once and derive the `@signature-params`
+    // value from it (identical to `signature_params_value()`), mirroring the
+    // verify path's reuse via `signature_base_with_params_value`. This avoids
+    // building the same input string twice per signed request.
+    let signature_input = params.signature_input_value();
+    let params_prefix = format!("{}=", params.label);
+    let signature_params_value = signature_input
+        .strip_prefix(&params_prefix)
+        .unwrap_or(signature_input.as_str());
+    let base = signature_base_with_params_value(request, params, signature_params_value)?;
     let signature = key.signing_key.sign(base.as_bytes());
+    let signature = format!("{}=:{}:", params.label, BASE64.encode(signature.to_bytes()));
     Ok(SignatureHeaders {
         signature_agent: None,
-        signature_input: params.signature_input_value(),
-        signature: format!("{}=:{}:", params.label, BASE64.encode(signature.to_bytes())),
+        signature_input,
+        signature,
     })
 }
 
