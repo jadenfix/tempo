@@ -140,6 +140,11 @@ pub extern "C" fn tempo_ios_core_observation_script() -> *mut c_char {
     }
 }
 
+/// # Safety
+///
+/// `value` must be either null or a pointer previously returned by a
+/// Rust-to-NSString bridge allocation in this crate, and must not have been freed
+/// before this call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tempo_ios_core_string_free(value: *mut c_char) {
     if !value.is_null() {
