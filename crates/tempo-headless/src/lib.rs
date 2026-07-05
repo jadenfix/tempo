@@ -97,8 +97,12 @@ const ENGINE_IPC_TIMEOUT: Duration = Duration::from_secs(30);
 /// Name of the packaged CDP engine host binary expected next to `tempod`.
 pub const PACKAGED_CDP_ENGINE_BINARY: &str = "tempo-engined-cdp";
 const AUTO_CDP_ENGINE_MAX_RESTARTS: u32 = u32::MAX;
+const AUTO_CDP_ENGINE_MONITOR_MAX_RESTARTS: u32 = 10;
 const AUTO_CDP_ENGINE_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const AUTO_CDP_ENGINE_MONITOR_INTERVAL: Duration = Duration::from_millis(500);
+const AUTO_CDP_ENGINE_MONITOR_BASE_BACKOFF: Duration = Duration::from_millis(200);
+const AUTO_CDP_ENGINE_MONITOR_MAX_BACKOFF: Duration = Duration::from_secs(10);
+const AUTO_CDP_ENGINE_MONITOR_STABLE_WINDOW: Duration = Duration::from_secs(90);
 /// Upper bound on how long the whole engine-resource teardown (`drain` /
 /// `detach_engine_driver` / `Drop`) waits for blocking engine-IPC closes:
 /// forked BiDi contexts, MCP forks, session-owned contexts, and the root-driver
@@ -2674,7 +2678,7 @@ impl AutoCdpRuntimeDir {
                 std::process::id(),
                 current_time_ns()
             ));
-            match std::fs::create_dir(&path) {
+            match create_private_dir(&path) {
                 Ok(()) => {
                     set_private_dir_permissions(&path)?;
                     return Ok(Self { path });
@@ -2692,6 +2696,19 @@ impl AutoCdpRuntimeDir {
     fn socket_path(&self) -> PathBuf {
         self.path.join("engine.sock")
     }
+}
+
+#[cfg(unix)]
+fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    let mut builder = std::fs::DirBuilder::new();
+    builder.mode(0o700);
+    builder.create(path)
+}
+
+#[cfg(not(unix))]
+fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    std::fs::create_dir(path)
 }
 
 fn auto_cdp_runtime_base_dir() -> PathBuf {
@@ -2713,6 +2730,10 @@ fn set_private_dir_permissions(path: &Path) -> Result<(), TempodError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
+        let current = std::fs::metadata(path)?.permissions().mode() & 0o777;
+        if current == 0o700 {
+            return Ok(());
+        }
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
     }
     Ok(())
@@ -2753,30 +2774,68 @@ fn spawn_auto_cdp_engine_monitor(
     mut host: EngineHost,
     socket_path: PathBuf,
 ) {
+    let policy = EngineReconnectPolicy {
+        poll_interval: AUTO_CDP_ENGINE_MONITOR_INTERVAL,
+        base_backoff: AUTO_CDP_ENGINE_MONITOR_BASE_BACKOFF,
+        max_backoff: AUTO_CDP_ENGINE_MONITOR_MAX_BACKOFF,
+        max_attempts: Some(AUTO_CDP_ENGINE_MONITOR_MAX_RESTARTS),
+        stable_window: AUTO_CDP_ENGINE_MONITOR_STABLE_WINDOW,
+    };
+    let mut controller = ReconnectController::new(policy.clone(), Instant::now());
     thread::spawn(move || loop {
-        thread::sleep(AUTO_CDP_ENGINE_MONITOR_INTERVAL);
         if Arc::strong_count(&pool) <= 1 {
             return;
         }
-        match host.restart_if_exited() {
-            Ok(false) => {}
-            Ok(true) => {
-                tempo_telemetry::logger()
-                    .event(
-                        tempo_telemetry::Level::Warn,
-                        "tempod",
-                        "auto-started CDP engine child restarted",
-                    )
-                    .field("engine_socket", socket_path.display().to_string())
-                    .field("restarts", host.restart_count().to_string())
-                    .emit();
-            }
+        thread::sleep(policy.poll_interval);
+
+        let child_exited = match host.try_wait() {
+            Ok(Some(_)) => true,
+            Ok(None) => false,
             Err(error) => {
-                log_tempod_error("auto-started CDP engine child restart failed", error);
+                log_tempod_error("auto-started CDP engine status check failed", error);
                 if let Ok(mut guard) = pool.lock() {
                     guard.detach_engine_driver();
                 }
                 return;
+            }
+        };
+
+        match controller.on_sample(child_exited, Instant::now()) {
+            ReconnectAction::Idle => {}
+            ReconnectAction::GiveUp => {
+                log_tempod_warn(
+                    "auto-started CDP engine restart budget exhausted; leaving detached",
+                )
+                .field("issue", "#398")
+                .field("attempts", controller.attempts.to_string())
+                .emit();
+                if let Ok(mut guard) = pool.lock() {
+                    guard.detach_engine_driver();
+                }
+                return;
+            }
+            ReconnectAction::Reconnect { backoff } => {
+                let delay = jittered_backoff(backoff, policy.max_backoff, current_time_ns());
+                thread::sleep(delay);
+                match host.restart_if_exited() {
+                    Ok(false) => {}
+                    Ok(true) => {
+                        controller.record_reconnect(Instant::now());
+                        tempo_telemetry::logger()
+                            .event(
+                                tempo_telemetry::Level::Warn,
+                                "tempod",
+                                "auto-started CDP engine child restarted",
+                            )
+                            .field("engine_socket", socket_path.display().to_string())
+                            .field("restarts", host.restart_count().to_string())
+                            .emit();
+                    }
+                    Err(error) => {
+                        controller.record_failure();
+                        log_tempod_error("auto-started CDP engine child restart failed", error);
+                    }
+                }
             }
         }
     });
