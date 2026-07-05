@@ -726,10 +726,16 @@ impl ServoNetworkAdapter {
         network_request: &NetworkRequest,
         resolved_target: &ResolvedTarget,
     ) -> Result<AuditRecord, ServoNetworkError> {
+        // Keep Servo in parity with CDP and tempo-net: every DNS candidate must
+        // satisfy URL policy before reqwest receives the resolved set.
+        for socket in &resolved_target.sockets {
+            self.url_policy
+                .enforce_resolved_socket(&network_request.url, *socket)?;
+        }
         Ok(AuditRecord::from_request_with_resolved_socket(
             network_request,
             &self.url_policy,
-            resolved_target.socket,
+            resolved_target.primary_socket(),
         )?)
     }
 
@@ -782,7 +788,7 @@ impl ServoNetworkAdapter {
         let mut builder = reqwest::blocking::Client::builder()
             .timeout(self.timeout)
             .redirect(reqwest::redirect::Policy::none())
-            .resolve_to_addrs(&resolved_target.host, &[resolved_target.socket]);
+            .resolve_to_addrs(&resolved_target.host, &resolved_target.sockets);
         if let EgressDecision::Proxied { proxy, .. } = decision {
             let proxy_target = self.egress_policy.proxy_endpoint_target(proxy)?;
             let proxy_sockets = resolve_proxy(&proxy_target)?;
@@ -953,7 +959,7 @@ fn is_cross_origin_redirect_sensitive_header(name: &str) -> bool {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ResolvedTarget {
     host: String,
-    socket: SocketAddr,
+    sockets: Vec<SocketAddr>,
 }
 
 impl ResolvedTarget {
@@ -977,18 +983,32 @@ impl ResolvedTarget {
                     url: url.into(),
                     reason: "URL has no known default port".into(),
                 })?;
-        let socket = (host.as_str(), port)
+        let sockets = (host.as_str(), port)
             .to_socket_addrs()
             .map_err(|error| ServoNetworkError::ResolveTarget {
                 url: url.into(),
                 reason: error.to_string(),
             })?
-            .next()
-            .ok_or_else(|| ServoNetworkError::ResolveTarget {
+            .collect::<Vec<_>>();
+        if sockets.is_empty() {
+            return Err(ServoNetworkError::ResolveTarget {
                 url: url.into(),
                 reason: "host resolved to no socket addresses".into(),
-            })?;
-        Ok(Self { host, socket })
+            });
+        }
+        Ok(Self { host, sockets })
+    }
+
+    fn primary_socket(&self) -> SocketAddr {
+        self.sockets[0]
+    }
+
+    #[cfg(test)]
+    fn single(host: impl Into<String>, socket: SocketAddr) -> Self {
+        Self {
+            host: host.into(),
+            sockets: vec![socket],
+        }
     }
 }
 
@@ -1472,9 +1492,33 @@ mod tests {
             .fetch_with_resolved_target(
                 &request,
                 network_request,
-                ResolvedTarget {
+                ResolvedTarget::single(
+                    "public.example",
+                    SocketAddr::from(([169, 254, 169, 254], 443)),
+                ),
+            )
+            .err()
+            .ok_or_else(|| io::Error::other("expected resolved socket policy failure"))?;
+
+        assert!(matches!(error, ServoNetworkError::Url(_)));
+        Ok(())
+    }
+
+    #[test]
+    fn servo_network_adapter_blocks_any_private_socket_in_resolved_set() -> TestResult {
+        let adapter = ServoNetworkAdapter::new("profile-a", IdentityMode::AgentDeclared);
+        let request = ServoNetworkRequest::new("req-1", "GET", "https://public.example/data");
+        let network_request =
+            request.to_network_request(&adapter.profile_id, adapter.identity_mode)?;
+        let public = SocketAddr::from(([93, 184, 216, 34], 443));
+        let link_local = SocketAddr::from(([169, 254, 169, 254], 443));
+
+        let error = adapter
+            .audit_checked_target(
+                &network_request,
+                &ResolvedTarget {
                     host: "public.example".into(),
-                    socket: SocketAddr::from(([169, 254, 169, 254], 443)),
+                    sockets: vec![public, link_local],
                 },
             )
             .err()
@@ -1503,10 +1547,10 @@ mod tests {
         let error = adapter
             .audit_checked_target(
                 &network_request,
-                &ResolvedTarget {
-                    host: "redirect.example".into(),
-                    socket: SocketAddr::from(([169, 254, 169, 254], 443)),
-                },
+                &ResolvedTarget::single(
+                    "redirect.example",
+                    SocketAddr::from(([169, 254, 169, 254], 443)),
+                ),
             )
             .err()
             .ok_or_else(|| io::Error::other("expected resolved socket policy failure"))?;
@@ -1701,10 +1745,10 @@ mod tests {
         let decision = egress_policy
             .decide(&request)
             .map_err(|error| io::Error::other(format!("{error:?}")))?;
-        let resolved_target = ResolvedTarget {
-            host: "target.example".into(),
-            socket: SocketAddr::from(([93, 184, 216, 34], 443)),
-        };
+        let resolved_target = ResolvedTarget::single(
+            "target.example",
+            SocketAddr::from(([93, 184, 216, 34], 443)),
+        );
 
         let error = adapter
             .client_for_with_proxy_resolver(&decision, &resolved_target, |_| {
@@ -1738,10 +1782,8 @@ mod tests {
         let decision = egress_policy
             .decide(&request)
             .map_err(|error| io::Error::other(format!("{error:?}")))?;
-        let resolved_target = ResolvedTarget {
-            host: "target.example".into(),
-            socket: SocketAddr::from(([93, 184, 216, 34], 80)),
-        };
+        let resolved_target =
+            ResolvedTarget::single("target.example", SocketAddr::from(([93, 184, 216, 34], 80)));
 
         let error = adapter
             .client_for_with_proxy_resolver(&decision, &resolved_target, |_| Ok(Vec::new()))
@@ -1779,10 +1821,10 @@ mod tests {
         let decision = egress_policy
             .decide(&request)
             .map_err(|error| io::Error::other(format!("{error:?}")))?;
-        let resolved_target = ResolvedTarget {
-            host: "target.example".into(),
-            socket: SocketAddr::from(([93, 184, 216, 34], 443)),
-        };
+        let resolved_target = ResolvedTarget::single(
+            "target.example",
+            SocketAddr::from(([93, 184, 216, 34], 443)),
+        );
 
         adapter.client_for_with_proxy_resolver(&decision, &resolved_target, |_| {
             Ok(vec![SocketAddr::from(([127, 0, 0, 1], 8080))])
@@ -1831,10 +1873,8 @@ mod tests {
         let decision = egress_policy
             .decide(&network_request)
             .map_err(|error| io::Error::other(format!("{error:?}")))?;
-        let resolved_target = ResolvedTarget {
-            host: "target.example".into(),
-            socket: SocketAddr::from(([93, 184, 216, 34], 80)),
-        };
+        let resolved_target =
+            ResolvedTarget::single("target.example", SocketAddr::from(([93, 184, 216, 34], 80)));
         let client =
             adapter.client_for_with_proxy_resolver(&decision, &resolved_target, |target| {
                 assert_eq!(target.host, proxy_host);
