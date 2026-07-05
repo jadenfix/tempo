@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
-use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -616,7 +616,7 @@ where
             .get("name")
             .and_then(Value::as_str)
             .ok_or_else(|| JsonRpcError::invalid_params("tools/call requires params.name"))?;
-        if !tools().iter().any(|tool| tool.name == name) {
+        if !tool_descriptors().iter().any(|tool| tool.name == name) {
             return Err(JsonRpcError::invalid_params(format!(
                 "unknown tool: {name}"
             )));
@@ -928,7 +928,7 @@ pub fn agent_card(base_url: &str) -> Value {
         },
         "defaultInputModes": ["application/json"],
         "defaultOutputModes": ["application/json", "image/png"],
-        "skills": tools().into_iter().map(agent_card_skill_json).collect::<Vec<_>>(),
+        "skills": tool_descriptors().iter().cloned().map(agent_card_skill_json).collect::<Vec<_>>(),
     })
 }
 
@@ -1102,6 +1102,14 @@ pub fn tools() -> Vec<ToolDescriptor> {
             ),
         },
     ]
+}
+
+/// Memoized descriptor set — allocated once, reused on every request.
+static TOOL_DESCRIPTORS: LazyLock<Vec<ToolDescriptor>> = LazyLock::new(tools);
+
+/// Return a reference to the static descriptor slice without allocating.
+fn tool_descriptors() -> &'static [ToolDescriptor] {
+    &TOOL_DESCRIPTORS
 }
 
 pub fn describe() -> &'static str {
@@ -1628,7 +1636,7 @@ fn driverless_tools_call(
         .get("name")
         .and_then(Value::as_str)
         .ok_or_else(|| JsonRpcError::invalid_params("tools/call requires params.name"))?;
-    if !tools().iter().any(|tool| tool.name == name) {
+    if !tool_descriptors().iter().any(|tool| tool.name == name) {
         return Err(JsonRpcError::invalid_params(format!(
             "unknown tool: {name}"
         )));
@@ -1941,8 +1949,8 @@ fn truncate_summary(text: &str) -> String {
 }
 
 fn tool_descriptor_json() -> Vec<Value> {
-    tools()
-        .into_iter()
+    tool_descriptors()
+        .iter()
         .map(|tool| {
             json!({
                 "name": tool.name,
@@ -2398,6 +2406,24 @@ mod tests {
         assert!(skills.iter().any(|skill| skill["id"] == "observe_diff"));
         assert!(skills.iter().any(|skill| skill["id"] == "handshake"));
         Ok(())
+    }
+
+    #[test]
+    fn tool_descriptors_static_is_non_empty_and_stable() {
+        // Verify the memoized set is non-empty and that two accesses return the
+        // same slice address (i.e. it is truly allocated once).
+        let first = tool_descriptors();
+        let second = tool_descriptors();
+        assert!(!first.is_empty(), "TOOL_DESCRIPTORS must not be empty");
+        assert_eq!(
+            first.as_ptr(),
+            second.as_ptr(),
+            "tool_descriptors() must return a pointer to the same static allocation on each call"
+        );
+        // Names must match the public tools() output so the memoization is transparent.
+        let static_names: Vec<&str> = first.iter().map(|t| t.name).collect();
+        let fresh_names: Vec<&str> = tools().iter().map(|t| t.name).collect();
+        assert_eq!(static_names, fresh_names);
     }
 
     #[tokio::test]
