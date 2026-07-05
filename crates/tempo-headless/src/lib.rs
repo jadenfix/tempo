@@ -639,6 +639,27 @@ impl AttachedEngineDriver {
             .request_for(self.driver_id.as_deref(), command, ENGINE_IPC_TIMEOUT)?)
     }
 
+    /// Bounded liveness probe on the shared engine (#440): one root-context
+    /// `Observe` round-trip, capped at `timeout`. Returns `true` when the engine
+    /// answers within the bound (even with an engine-level error response —
+    /// that still proves the IPC connection is live and the child is serving),
+    /// and `false` when the shared IPC connection is already dead
+    /// (`SharedEngineIpcClient` fails fast via `pending.dead`) or the round-trip
+    /// times out (a genuinely wedged child). Used to decide whether a session
+    /// `Close` timeout should abandon the shared engine: a lone slow `Close`
+    /// must not, but an unreachable engine must. Bypasses the per-driver
+    /// [`OpGate`] on purpose — a read-only probe must not queue behind this
+    /// driver's own in-flight command, only reflect engine reachability.
+    fn probe_responsive(&self, timeout: Duration) -> bool {
+        self.client
+            .request_for(
+                self.driver_id.as_deref(),
+                HostDriverCommand::Observe,
+                timeout,
+            )
+            .is_ok()
+    }
+
     fn request_observation(
         &self,
         command: HostDriverCommand,
@@ -1165,7 +1186,39 @@ impl SessionPool {
         Ok(session.clone())
     }
 
+    /// Kill a session, closing its engine context. Retained for direct
+    /// (non-HTTP) callers; the HTTP `DELETE /sessions/{id}` path uses
+    /// [`route_session_kill`], which runs the `Close` OFF the pool lock (#440).
+    /// Both share [`close_detached_session_driver`], so neither abandons the
+    /// shared engine merely because one session's `Close` was slow.
     pub fn kill(&mut self, id: &TempodSessionId) -> Result<TempodSession, TempodError> {
+        let (session, detached, root) = self.begin_kill(id)?;
+        if let Some(driver) = detached
+            && close_detached_session_driver(id.0.clone(), driver, root)
+        {
+            self.abandon_attached_engine_after_teardown_timeout("session engine context Close");
+        }
+        Ok(session)
+    }
+
+    /// Locked phase of a session kill: flip the session to `Killed`, DETACH its
+    /// engine context from the map (so the session is immediately unreachable —
+    /// `session_driver` fails fast for it), and record the lifecycle change.
+    /// The detached driver's bounded `Close` and the abandon decision happen
+    /// afterwards on the returned handles, off the pool lock for the HTTP path
+    /// (#440, mirroring `create_session_shared` #230). Also returns a root
+    /// driver clone for the off-lock liveness probe.
+    fn begin_kill(
+        &mut self,
+        id: &TempodSessionId,
+    ) -> Result<
+        (
+            TempodSession,
+            Option<AttachedEngineDriver>,
+            Option<AttachedEngineDriver>,
+        ),
+        TempodError,
+    > {
         let session = {
             let session = self
                 .sessions
@@ -1174,11 +1227,12 @@ impl SessionPool {
             session.state = TempodSessionState::Killed;
             session.clone()
         };
-        self.close_session_driver(id);
+        let detached = self.session_drivers.remove(id);
+        let root = self.driver.clone();
         self.clear_session_idempotency(id);
         self.record_event(id, TempodSessionEventKind::SessionKilled);
         self.purge_terminal_session_if_stealth(id);
-        Ok(session.clone())
+        Ok((session, detached, root))
     }
 
     pub fn drain(&mut self) {
@@ -1374,38 +1428,6 @@ impl SessionPool {
         }
     }
 
-    /// Best-effort close of one session-owned engine context. Session lifecycle
-    /// state changes must still be recorded even if engine teardown races a
-    /// crashed child, so close errors are logged and swallowed.
-    fn close_session_driver(&mut self, id: &TempodSessionId) {
-        let Some(mut driver) = self.session_drivers.remove(id) else {
-            return;
-        };
-
-        let id = id.0.clone();
-        match run_teardown_bounded(
-            "session engine context Close",
-            ENGINE_TEARDOWN_TIMEOUT,
-            move || futures::executor::block_on(driver.close()),
-        ) {
-            Some(Ok(())) => {}
-            Some(Err(error)) => {
-                tempo_telemetry::logger()
-                    .event(
-                        tempo_telemetry::Level::Error,
-                        "tempod",
-                        "error closing engine driver for session",
-                    )
-                    .field("session_id", id)
-                    .field("error", error.to_string())
-                    .emit();
-            }
-            None => {
-                self.abandon_attached_engine_after_teardown_timeout("session engine context Close");
-            }
-        }
-    }
-
     /// Best-effort close of every forked BiDi context driver so engine-side
     /// resources are released instead of leaking when contexts/sessions end.
     fn close_forked_contexts(&mut self) {
@@ -1488,10 +1510,11 @@ impl SessionPool {
         //
         // Not re-entrant: `bounded_engine_teardown` never calls back into
         // `abandon_*`. Not a double-close of a caller-owned driver either --
-        // `close_session_driver` `remove`s its single driver before its own
-        // bounded attempt, and the create `on_orphan` path owns the freshly
-        // created context, so the map contents drained here are disjoint from
-        // those already-owned drivers.
+        // `begin_kill` `remove`s the killed session's single driver (closed
+        // off-lock by `close_detached_session_driver`) before this can run, and
+        // the create `on_orphan` path owns the freshly created context, so the
+        // map contents drained here are disjoint from those already-owned
+        // drivers.
         self.bounded_engine_teardown(true, ENGINE_TEARDOWN_TIMEOUT);
     }
 
@@ -3502,7 +3525,7 @@ async fn session_kill(
     run_blocking(move || -> Result<HttpResponse, TempodError> {
         Ok(HttpResponse::json(
             200,
-            lock_pool(&state.pool)?.kill(&TempodSessionId(id))?,
+            route_session_kill(&state.pool, &TempodSessionId(id))?,
         ))
     })
     .await
@@ -3733,6 +3756,78 @@ fn create_session_shared(
         return Err(TempodError::SessionLimit { max });
     }
     Ok(pool.finish_create(url, session_driver))
+}
+
+/// `DELETE /sessions/{id}` with the session's engine-context `Close` run OFF the
+/// pool lock (#440, mirroring `create_session_shared` #230):
+///
+/// 1. lock — [`SessionPool::begin_kill`] flips the session to `Killed`, removes
+///    its driver from the map (the session is instantly unreachable), records
+///    the lifecycle event, and hands back the detached driver plus a root-driver
+///    handle;
+/// 2. unlock — bounded `Close` of the detached driver and, only if that times
+///    out, a bounded liveness probe of the shared engine
+///    ([`close_detached_session_driver`]). Every other session and route
+///    proceeds meanwhile — a slow `Close` can no longer stall the pool mutex;
+/// 3. lock (rare) — abandon the shared engine ONLY when the probe found it
+///    genuinely unreachable (dead IPC or wedged child), never for a lone slow
+///    `Close`, so racing a `DELETE` against another session's in-flight
+///    navigation can no longer strand every surviving session.
+fn route_session_kill(
+    pool: &Arc<Mutex<SessionPool>>,
+    id: &TempodSessionId,
+) -> Result<TempodSession, TempodError> {
+    let (session, detached, root) = lock_pool(pool)?.begin_kill(id)?;
+    if let Some(driver) = detached
+        && close_detached_session_driver(id.0.clone(), driver, root)
+    {
+        lock_pool(pool)?
+            .abandon_attached_engine_after_teardown_timeout("session engine context Close");
+    }
+    Ok(session)
+}
+
+/// Bounded, off-lock `Close` of a killed session's detached engine context.
+/// Returns `true` when the caller should abandon the shared engine — i.e. the
+/// `Close` timed out AND a bounded liveness probe of the root driver found the
+/// engine unreachable (dead IPC or wedged child). Returns `false` otherwise,
+/// crucially including the case where the `Close` merely timed out but the
+/// engine is still responsive (busy serving another session): a lone slow
+/// `Close` must never abandon the shared engine and strand survivors (#440).
+/// Close errors are logged and swallowed; session lifecycle state was already
+/// recorded under the lock in [`SessionPool::begin_kill`].
+fn close_detached_session_driver(
+    session_id: String,
+    mut driver: AttachedEngineDriver,
+    root: Option<AttachedEngineDriver>,
+) -> bool {
+    match run_teardown_bounded(
+        "session engine context Close",
+        ENGINE_TEARDOWN_TIMEOUT,
+        move || futures::executor::block_on(driver.close()),
+    ) {
+        Some(Ok(())) => false,
+        Some(Err(error)) => {
+            tempo_telemetry::logger()
+                .event(
+                    tempo_telemetry::Level::Error,
+                    "tempod",
+                    "error closing engine driver for session",
+                )
+                .field("session_id", session_id)
+                .field("error", error.to_string())
+                .emit();
+            false
+        }
+        None => match root {
+            // Distinguish "this driver is slow" from "the engine is wedged"
+            // (#440): only abandon when the shared engine cannot answer a
+            // lightweight probe. The detached worker still owns and finishes
+            // the wedged `Close` once the engine responds or disconnects.
+            Some(root) => !root.probe_responsive(ENGINE_TEARDOWN_TIMEOUT),
+            None => false,
+        },
+    }
 }
 
 fn abandon_created_session_driver(
@@ -6824,6 +6919,139 @@ mod tests {
             "two ~300ms ops on different contexts did not run concurrently: {elapsed:?} \
              (serial would be >=600ms)"
         );
+        for server in servers {
+            server.join().map_err(|_| "server thread panicked")??;
+        }
+        Ok(())
+    }
+
+    /// (#440) A `DELETE /sessions/{id}` whose engine-context `Close` wedges,
+    /// racing a long in-flight command on ANOTHER session, must NOT: (a) detach
+    /// the shared engine, (b) make surviving sessions `DriverUnavailable`, or
+    /// (c) hold the pool lock across the teardown. Before the fix, the killed
+    /// session's `Close` timeout alone tripped `abandon_*`, which `mem::take`s
+    /// every session driver and the root driver under the lock — stranding all
+    /// survivors and holding the mutex for the whole bound.
+    #[test]
+    fn delete_with_wedged_close_does_not_strand_or_lock_out_survivors() -> TestResult {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Instant;
+
+        let context_ids = AtomicUsize::new(1);
+        let pool = shared_pool_with_fake_engine(move |request| match &request.command {
+            HostDriverCommand::CreateBrowsingContext { .. } => {
+                let n = context_ids.fetch_add(1, Ordering::SeqCst);
+                FakeEngineReply::Respond(DriverResponse::BrowsingContextCreated {
+                    driver_id: format!("session-context-{n}"),
+                })
+            }
+            HostDriverCommand::Goto { url } => {
+                FakeEngineReply::Respond(DriverResponse::Observation {
+                    observation: observation(url, 1),
+                })
+            }
+            // The survivor's own observe (its first session context is
+            // `session-context-1`) models a long in-flight command on another
+            // session. The daemon's liveness probe runs on the ROOT context
+            // (`driver_id: None`) and is answered promptly, so the engine reads
+            // as responsive-but-busy, not wedged.
+            HostDriverCommand::Observe => {
+                if request.driver_id.as_deref() == Some("session-context-1") {
+                    FakeEngineReply::RespondAfter(
+                        Duration::from_millis(400),
+                        DriverResponse::Observation {
+                            observation: observation("about:blank", 2),
+                        },
+                    )
+                } else {
+                    FakeEngineReply::Respond(DriverResponse::Observation {
+                        observation: observation("about:blank", 2),
+                    })
+                }
+            }
+            // The killed session's context Close never answers (in production it
+            // is stuck behind the other session's in-flight navigation).
+            HostDriverCommand::Close => FakeEngineReply::Wedge,
+            _ => FakeEngineReply::Respond(DriverResponse::Closed),
+        })?;
+
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let servers = spawn_servers(&listener, &pool, 5)?;
+
+        // Two live sessions: session-0 (survivor) and session-1 (to be killed).
+        let survivor = http_post(addr, "/sessions", r#"{"url":"https://survivor.test"}"#)?;
+        assert!(survivor.starts_with("HTTP/1.1 201"), "{survivor}");
+        let victim = http_post(addr, "/sessions", r#"{"url":"https://victim.test"}"#)?;
+        assert!(victim.starts_with("HTTP/1.1 201"), "{victim}");
+
+        // Kick off the survivor's long in-flight observe (~400ms).
+        let observe_survivor = thread::spawn(move || {
+            send_http(addr, "GET /sessions/session-0/observe HTTP/1.1\r\n\r\n")
+        });
+        // Ensure that observe has reached the engine before the DELETE races it.
+        thread::sleep(Duration::from_millis(40));
+
+        // DELETE the victim: its Close wedges, so the bounded Close times out.
+        let delete_victim =
+            thread::spawn(move || send_http(addr, "DELETE /sessions/session-1 HTTP/1.1\r\n\r\n"));
+
+        // (c) While the DELETE is inside its wedged-Close teardown window, a
+        // request that needs the pool lock must NOT block on it. Create a third
+        // session and time it: if the lock were held across teardown, this
+        // would stall for the whole ENGINE_TEARDOWN_TIMEOUT.
+        thread::sleep(Duration::from_millis(40));
+        let create_started = Instant::now();
+        let third = http_post(addr, "/sessions", r#"{"url":"https://third.test"}"#)?;
+        let create_elapsed = create_started.elapsed();
+        assert!(third.starts_with("HTTP/1.1 201"), "{third}");
+        assert!(
+            create_elapsed < Duration::from_millis(100),
+            "creating a session while a DELETE was tearing down a wedged Close took {create_elapsed:?}: \
+             the pool lock was held across the teardown"
+        );
+
+        let observe_survivor = observe_survivor
+            .join()
+            .map_err(|_| "survivor observe panicked")??;
+        let delete_victim = delete_victim
+            .join()
+            .map_err(|_| "delete victim panicked")??;
+
+        // (b) The survivor's request completed against the still-attached engine
+        // instead of failing DriverUnavailable.
+        assert!(
+            observe_survivor.starts_with("HTTP/1.1 200"),
+            "survivor was stranded by the racing DELETE: {observe_survivor}"
+        );
+        assert!(delete_victim.starts_with("HTTP/1.1 200"), "{delete_victim}");
+
+        // (a) The shared engine is still attached and every non-victim session
+        // still has its driver; only the killed session was detached.
+        {
+            let pool = pool.lock().map_err(|_| "pool poisoned")?;
+            assert!(
+                pool.driver.is_some(),
+                "a single wedged session Close abandoned the shared engine"
+            );
+            assert!(
+                pool.session_drivers
+                    .contains_key(&TempodSessionId("session-0".into())),
+                "survivor session lost its engine driver"
+            );
+            assert!(
+                pool.session_drivers
+                    .contains_key(&TempodSessionId("session-2".into())),
+                "session created during the teardown lost its engine driver"
+            );
+            assert!(
+                !pool
+                    .session_drivers
+                    .contains_key(&TempodSessionId("session-1".into())),
+                "killed session's driver should have been detached"
+            );
+        }
+
         for server in servers {
             server.join().map_err(|_| "server thread panicked")??;
         }
