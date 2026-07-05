@@ -68,6 +68,7 @@ Resource, lifecycle & availability:
 
 Security boundaries & auth:
 - [ ] Loopback, Host, and Origin checks are not authentication. Control planes that drive sessions, tools, or browser state require an unguessable same-user capability even on `127.0.0.1`.
+- [ ] Unauthenticated browser-control serving helpers are explicitly named test-only or unsafe; production-looking defaults, builders, or fixtures must not silently disable auth.
 - [ ] Health/readiness signals reflect real state (draining, dependency-down, at-capacity); cleanup and teardown run on every exit path including error and cancel.
 - [ ] Operational metadata routes that expose dependency health, capacity, policy, or topology are guarded like control-plane routes unless they intentionally return only static liveness.
 - [ ] Locks are narrow, consistently ordered, released on panic (poison recovered, not fatal), and never held across `.await`, navigation, or subprocess I/O — the pool lock especially, so `/health` and `/drain` stay responsive.

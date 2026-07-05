@@ -832,11 +832,12 @@ mod tests {
         serve_driver_connection, EngineHostError, EngineIpcClient, EngineIpcConnection,
     };
     use tempo_headless::{
-        serve_one, serve_one_with_auth, SessionPool, TempodAuth, TempodError,
-        TempodSessionEventKind, TempodSessionState,
+        serve_one_with_auth, SessionPool, TempodAuth, TempodError, TempodSessionEventKind,
+        TempodSessionState,
     };
 
     type TestResult = Result<(), Box<dyn Error>>;
+    const TEMPOD_FIXTURE_AUTH_TOKEN: &str = "fixture-token";
 
     #[test]
     fn version_flag_selects_version_command() -> TestResult {
@@ -987,29 +988,23 @@ mod tests {
     fn client_drives_real_tempod_session_lifecycle() -> TestResult {
         let pool = Arc::new(Mutex::new(SessionPool::default()));
 
-        let health = with_tempod(&pool, |addr| ShellClient::new(addr.to_string()).health())?;
+        let health = with_tempod(&pool, |_addr, client| client.health())?;
         assert!(health.ok);
 
-        let opened = with_tempod(&pool, |addr| {
-            ShellClient::new(addr.to_string()).open("https://tempo.test")
-        })?;
+        let opened = with_tempod(&pool, |_addr, client| client.open("https://tempo.test"))?;
         assert_eq!(opened.id.0, "session-0");
         assert_eq!(opened.url, "https://tempo.test");
 
-        let sessions = with_tempod(&pool, |addr| ShellClient::new(addr.to_string()).sessions())?;
+        let sessions = with_tempod(&pool, |_addr, client| client.sessions())?;
         assert_eq!(sessions.len(), 1);
 
-        let adopted = with_tempod(&pool, |addr| {
-            ShellClient::new(addr.to_string()).adopt("session-0")
-        })?;
+        let adopted = with_tempod(&pool, |_addr, client| client.adopt("session-0"))?;
         assert_eq!(adopted.state, TempodSessionState::Adopted);
 
-        let closed = with_tempod(&pool, |addr| {
-            ShellClient::new(addr.to_string()).close("session-0")
-        })?;
+        let closed = with_tempod(&pool, |_addr, client| client.close("session-0"))?;
         assert_eq!(closed.state, TempodSessionState::Killed);
 
-        let drained = with_tempod(&pool, |addr| ShellClient::new(addr.to_string()).drain())?;
+        let drained = with_tempod(&pool, |_addr, client| client.drain())?;
         assert!(drained.draining);
         assert_eq!(drained.sessions[0].state, TempodSessionState::Killed);
         Ok(())
@@ -1052,9 +1047,7 @@ mod tests {
     #[test]
     fn client_reads_real_tempod_agent_card() -> TestResult {
         let pool = Arc::new(Mutex::new(SessionPool::default()));
-        let card = with_tempod(&pool, |addr| {
-            ShellClient::new(addr.to_string()).agent_card()
-        })?;
+        let card = with_tempod(&pool, |_addr, client| client.agent_card())?;
 
         assert_eq!(card["name"], "tempo");
         assert_eq!(card["preferredTransport"], "MCP");
@@ -1068,13 +1061,9 @@ mod tests {
     #[test]
     fn client_reads_real_tempod_session_events_with_cursor() -> TestResult {
         let pool = Arc::new(Mutex::new(SessionPool::default()));
-        let opened = with_tempod(&pool, |addr| {
-            ShellClient::new(addr.to_string()).open("https://events.test")
-        })?;
+        let opened = with_tempod(&pool, |_addr, client| client.open("https://events.test"))?;
 
-        let initial = with_tempod(&pool, |addr| {
-            ShellClient::new(addr.to_string()).events(&opened.id.0, None)
-        })?;
+        let initial = with_tempod(&pool, |_addr, client| client.events(&opened.id.0, None))?;
         assert_eq!(initial.events.len(), 1);
         assert_eq!(initial.events[0].seq, 0);
         assert!(matches!(
@@ -1082,12 +1071,9 @@ mod tests {
             TempodSessionEventKind::SessionCreated { .. }
         ));
 
-        with_tempod(&pool, |addr| {
-            ShellClient::new(addr.to_string()).adopt(&opened.id.0)
-        })?;
-        let after_create = with_tempod(&pool, |addr| {
-            ShellClient::new(addr.to_string()).events(&opened.id.0, Some(0))
-        })?;
+        with_tempod(&pool, |_addr, client| client.adopt(&opened.id.0))?;
+        let after_create =
+            with_tempod(&pool, |_addr, client| client.events(&opened.id.0, Some(0)))?;
 
         assert_eq!(after_create.events.len(), 1);
         assert_eq!(after_create.events[0].seq, 1);
@@ -1101,8 +1087,8 @@ mod tests {
     #[test]
     fn client_runs_driverless_handshake_through_real_tempod_mcp() -> TestResult {
         let pool = Arc::new(Mutex::new(SessionPool::default()));
-        let result = with_tempod(&pool, |addr| {
-            ShellClient::new(addr.to_string()).mcp_tool(
+        let result = with_tempod(&pool, |_addr, client| {
+            client.mcp_tool(
                 "handshake",
                 json!({
                     "origin": "https://tempo.test",
@@ -1128,9 +1114,16 @@ mod tests {
         let driver_handle = attach_test_driver(&pool)?;
         let mut output = Vec::new();
 
-        with_tempod(&pool, |addr| {
+        with_tempod(&pool, |addr, _client| {
             run_cli(
-                ["--tempod", &addr.to_string(), "tool", "observe"],
+                [
+                    "--tempod",
+                    &addr.to_string(),
+                    "--auth-token",
+                    TEMPOD_FIXTURE_AUTH_TOKEN,
+                    "tool",
+                    "observe",
+                ],
                 &mut output,
             )
         })?;
@@ -1149,8 +1142,17 @@ mod tests {
     fn run_cli_writes_json_from_real_tempod() -> TestResult {
         let pool = Arc::new(Mutex::new(SessionPool::default()));
         let mut output = Vec::new();
-        with_tempod(&pool, |addr| {
-            run_cli(["--tempod", &addr.to_string(), "sessions"], &mut output)
+        with_tempod(&pool, |addr, _client| {
+            run_cli(
+                [
+                    "--tempod",
+                    &addr.to_string(),
+                    "--auth-token",
+                    TEMPOD_FIXTURE_AUTH_TOKEN,
+                    "sessions",
+                ],
+                &mut output,
+            )
         })?;
 
         assert_eq!(String::from_utf8(output)?, "[]\n");
@@ -1362,41 +1364,35 @@ mod tests {
     #[test]
     fn adopt_events_close_work_for_valid_session_id() -> TestResult {
         let pool = Arc::new(Mutex::new(SessionPool::default()));
-        let opened = with_tempod(&pool, |addr| {
-            ShellClient::new(addr.to_string()).open("https://valid.test")
-        })?;
+        let opened = with_tempod(&pool, |_addr, client| client.open("https://valid.test"))?;
         let session_id = opened.id.0.clone();
         assert!(matches!(
             safe_path_segment(&session_id),
             Ok(id) if id == session_id
         ));
 
-        let adopted = with_tempod(&pool, |addr| {
-            ShellClient::new(addr.to_string()).adopt(&session_id)
-        })?;
+        let adopted = with_tempod(&pool, |_addr, client| client.adopt(&session_id))?;
         assert_eq!(adopted.state, TempodSessionState::Adopted);
 
-        let events = with_tempod(&pool, |addr| {
-            ShellClient::new(addr.to_string()).events(&session_id, None)
-        })?;
+        let events = with_tempod(&pool, |_addr, client| client.events(&session_id, None))?;
         assert!(!events.events.is_empty());
 
-        let closed = with_tempod(&pool, |addr| {
-            ShellClient::new(addr.to_string()).close(&session_id)
-        })?;
+        let closed = with_tempod(&pool, |_addr, client| client.close(&session_id))?;
         assert_eq!(closed.state, TempodSessionState::Killed);
         Ok(())
     }
 
     fn with_tempod<T, F>(pool: &Arc<Mutex<SessionPool>>, call: F) -> Result<T, Box<dyn Error>>
     where
-        F: FnOnce(SocketAddr) -> Result<T, ShellError>,
+        F: FnOnce(SocketAddr, ShellClient) -> Result<T, ShellError>,
     {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let addr = listener.local_addr()?;
         let server_pool = Arc::clone(pool);
-        let handle = thread::spawn(move || serve_one(listener, server_pool));
-        let result = call(addr);
+        let auth = TempodAuth::bearer(TEMPOD_FIXTURE_AUTH_TOKEN)?;
+        let handle = thread::spawn(move || serve_one_with_auth(listener, server_pool, auth));
+        let client = ShellClient::new(addr.to_string()).with_auth_token(TEMPOD_FIXTURE_AUTH_TOKEN);
+        let result = call(addr, client);
         join_server(handle)?;
         Ok(result?)
     }
