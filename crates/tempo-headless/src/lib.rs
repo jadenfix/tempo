@@ -3573,7 +3573,7 @@ async fn bidi_post(
         return tempod_error_response(&TempodError::Forbidden("origin not allowed".into()))
             .into_response();
     }
-    run_blocking(move || route_bidi(&state.pool, body.to_vec())).await
+    run_blocking(move || route_bidi(&state.pool, body)).await
 }
 
 async fn sessions_list(State(state): State<TempodAppState>) -> Response {
@@ -3747,8 +3747,8 @@ async fn bidi_websocket_upgrade(
 async fn serve_bidi_websocket(mut socket: WebSocket, pool: Arc<Mutex<SessionPool>>) {
     while let Some(Ok(message)) = socket.recv().await {
         let payload = match message {
-            WsMessage::Text(text) => text.as_bytes().to_vec(),
-            WsMessage::Binary(bytes) => bytes.to_vec(),
+            WsMessage::Text(text) => Bytes::from(text),
+            WsMessage::Binary(bytes) => bytes,
             // The websocket protocol layer answers pings and echoes the
             // close handshake itself while the stream keeps being polled;
             // after a close completes, `recv` returns `None` and the loop
@@ -4748,11 +4748,11 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     diff == 0
 }
 
-fn route_bidi(pool: &Arc<Mutex<SessionPool>>, body: Vec<u8>) -> HttpResponse {
+fn route_bidi(pool: &Arc<Mutex<SessionPool>>, body: Bytes) -> HttpResponse {
     route_bidi_dispatch(pool, body).response
 }
 
-fn route_bidi_websocket(pool: &Arc<Mutex<SessionPool>>, body: Vec<u8>) -> Vec<BidiMessage> {
+fn route_bidi_websocket(pool: &Arc<Mutex<SessionPool>>, body: Bytes) -> Vec<BidiMessage> {
     let dispatch = route_bidi_dispatch(pool, body);
     let mut messages = Vec::with_capacity(1 + dispatch.events.len());
     messages.push(dispatch.message);
@@ -4772,7 +4772,7 @@ fn pool_lock_bidi_error(id: Option<tempo_bidi::CommandId>) -> BidiDispatchResult
 /// per-context handle with the lock released (issue #230), so commands on
 /// different browsing contexts run concurrently while the per-context
 /// [`OpGate`] keeps same-context commands ordered.
-fn route_bidi_dispatch(pool: &Arc<Mutex<SessionPool>>, body: Vec<u8>) -> BidiDispatchResult {
+fn route_bidi_dispatch(pool: &Arc<Mutex<SessionPool>>, body: Bytes) -> BidiDispatchResult {
     let (id, command) = {
         let Ok(mut pool) = pool.lock() else {
             return pool_lock_bidi_error(None);
@@ -5710,7 +5710,9 @@ mod tests {
     }
 
     fn route_bidi_dispatch(pool: &mut SessionPool, body: Vec<u8>) -> BidiDispatchResult {
-        with_shared_pool(pool, |shared| super::route_bidi_dispatch(shared, body))
+        with_shared_pool(pool, |shared| {
+            super::route_bidi_dispatch(shared, body.into())
+        })
     }
 
     fn route_bidi_driver(
