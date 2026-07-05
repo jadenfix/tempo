@@ -285,7 +285,13 @@ fn engine_name(engine: Engine) -> &'static str {
         Engine::Servo => "servo",
         #[cfg(any(test, feature = "test-driver"))]
         Engine::Test => "test",
+        // Unreachable in a plain build (Cdp and Servo are the only variants
+        // without tempo-driver's `test-driver` feature), but cargo builds
+        // that include dev targets feature-unify that feature on and with it
+        // the `Engine::Test` variant, which lands here when the cfg'd arm
+        // above is compiled out (e.g. the non-test bin unit of such a build).
         #[cfg(not(any(test, feature = "test-driver")))]
+        #[allow(unreachable_patterns)]
         _ => {
             debug_assert!(
                 false,
