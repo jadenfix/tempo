@@ -4,7 +4,7 @@
 //! touch untrusted page data is sent to the real beatbox client with a policy
 //! that removes network and secret access by construction.
 
-use std::path::PathBuf;
+use std::{net::IpAddr, path::PathBuf};
 
 pub use beatbox_client::{
     Client as BeatboxClient, ClientError as BeatboxClientError, CreateJobResponse, Determinism,
@@ -16,6 +16,7 @@ use tempo_driver::StepOutcome;
 use tempo_schema::ObservationDiff;
 use tempo_schema::TaintSpan;
 use thiserror::Error;
+use url::{Host, Url};
 
 /// Default wall-clock cap for transforms over tainted page content.
 pub const TAINTED_WALL_MS: u64 = 2_000;
@@ -39,25 +40,32 @@ pub const TAINTED_FUEL: u64 = 10_000_000;
 #[derive(Clone)]
 pub struct ToolExecClient {
     client: BeatboxClient,
+    endpoint: BeatboxEndpoint,
 }
 
 /// Compatibility alias for callers that prefer the executor naming.
 pub type ToolExecutor = ToolExecClient;
 
 impl ToolExecClient {
-    pub fn new(base_url: impl Into<String>) -> Self {
-        Self {
-            client: BeatboxClient::new(base_url),
-        }
+    pub fn new(base_url: impl Into<String>) -> Result<Self, ToolExecError> {
+        let endpoint = BeatboxEndpoint::parse(base_url)?;
+        Ok(Self {
+            client: BeatboxClient::new(endpoint.as_str()),
+            endpoint,
+        })
     }
 
-    pub fn with_api_key(mut self, api_key: impl Into<String>) -> Self {
+    pub fn with_api_key(mut self, api_key: impl Into<String>) -> Result<Self, ToolExecError> {
+        self.endpoint.ensure_api_key_allowed()?;
         self.client = self.client.with_api_key(api_key);
-        self
+        Ok(self)
     }
 
     pub fn from_client(client: BeatboxClient) -> Self {
-        Self { client }
+        Self {
+            client,
+            endpoint: BeatboxEndpoint::unknown(),
+        }
     }
 
     /// Execute a caller-built request whose policy has already been selected by
@@ -119,7 +127,124 @@ pub enum ToolExecError {
     #[error("tainted transform requires at least one page-derived C1 span")]
     UntaintedInput,
     #[error(transparent)]
+    Endpoint(#[from] BeatboxEndpointError),
+    #[error(transparent)]
     Beatbox(#[from] BeatboxClientError),
+}
+
+#[derive(Clone, Debug)]
+struct BeatboxEndpoint {
+    base_url: String,
+    scheme: EndpointScheme,
+    host: EndpointHost,
+    validated: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EndpointScheme {
+    Http,
+    Https,
+}
+
+#[derive(Clone, Debug)]
+enum EndpointHost {
+    Ip(IpAddr),
+    Domain(String),
+    Unknown,
+}
+
+impl BeatboxEndpoint {
+    fn parse(base_url: impl Into<String>) -> Result<Self, BeatboxEndpointError> {
+        let base_url = base_url.into();
+        let parsed = Url::parse(&base_url).map_err(|_| BeatboxEndpointError::InvalidBaseUrl)?;
+        let scheme = match parsed.scheme() {
+            "http" => EndpointScheme::Http,
+            "https" => EndpointScheme::Https,
+            _ => return Err(BeatboxEndpointError::UnsupportedScheme),
+        };
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            return Err(BeatboxEndpointError::ForbiddenUrlComponent("userinfo"));
+        }
+        if parsed.path() != "/" {
+            return Err(BeatboxEndpointError::ForbiddenUrlComponent("path"));
+        }
+        if parsed.query().is_some() {
+            return Err(BeatboxEndpointError::ForbiddenUrlComponent("query"));
+        }
+        if parsed.fragment().is_some() {
+            return Err(BeatboxEndpointError::ForbiddenUrlComponent("fragment"));
+        }
+        let host = parsed
+            .host()
+            .ok_or(BeatboxEndpointError::MissingAuthority)
+            .map(EndpointHost::from)?;
+
+        Ok(Self {
+            base_url,
+            scheme,
+            host,
+            validated: true,
+        })
+    }
+
+    fn unknown() -> Self {
+        Self {
+            base_url: String::new(),
+            scheme: EndpointScheme::Http,
+            host: EndpointHost::Unknown,
+            validated: false,
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        &self.base_url
+    }
+
+    fn ensure_api_key_allowed(&self) -> Result<(), BeatboxEndpointError> {
+        if !self.validated {
+            return Err(BeatboxEndpointError::UnvalidatedClient);
+        }
+        if self.scheme == EndpointScheme::Https || self.host.is_loopback() {
+            return Ok(());
+        }
+        Err(BeatboxEndpointError::PlaintextRemoteBearer)
+    }
+}
+
+impl EndpointHost {
+    fn is_loopback(&self) -> bool {
+        match self {
+            Self::Ip(ip) => ip.is_loopback(),
+            Self::Domain(domain) => domain.eq_ignore_ascii_case("localhost"),
+            Self::Unknown => false,
+        }
+    }
+}
+
+impl From<Host<&str>> for EndpointHost {
+    fn from(host: Host<&str>) -> Self {
+        match host {
+            Host::Domain(domain) => Self::Domain(domain.to_owned()),
+            Host::Ipv4(addr) => Self::Ip(IpAddr::V4(addr)),
+            Host::Ipv6(addr) => Self::Ip(IpAddr::V6(addr)),
+        }
+    }
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum BeatboxEndpointError {
+    #[error("beatbox base URL must be a valid absolute URL")]
+    InvalidBaseUrl,
+    #[error("beatbox base URL must use http or https")]
+    UnsupportedScheme,
+    #[error("beatbox base URL must include an authority")]
+    MissingAuthority,
+    #[error("beatbox base URL must not include {0}")]
+    ForbiddenUrlComponent(&'static str),
+    #[error("beatbox API keys require https or explicit loopback http")]
+    PlaintextRemoteBearer,
+    #[error("beatbox API keys require a Tempo-validated endpoint")]
+    UnvalidatedClient,
 }
 
 /// Tempo-facing execution result. It keeps the original beatbox result intact
@@ -623,6 +748,77 @@ mod tests {
     }
 
     #[test]
+    fn beatbox_endpoint_accepts_bare_https_and_loopback_http() -> Result<(), ToolExecError> {
+        let _https = ToolExecClient::new("https://beatbox.example")?;
+        let _https_port = ToolExecClient::new("https://beatbox.example:8443/")?;
+        let _loopback_v4 = ToolExecClient::new("http://127.0.0.1:8080")?;
+        let _loopback_v6 = ToolExecClient::new("http://[::1]:8080")?;
+        let _localhost = ToolExecClient::new("http://localhost:8080")?;
+        Ok(())
+    }
+
+    #[test]
+    fn beatbox_endpoint_rejects_ambiguous_base_urls() {
+        for (url, reason) in [
+            ("beatbox.example", BeatboxEndpointError::InvalidBaseUrl),
+            (
+                "ftp://beatbox.example",
+                BeatboxEndpointError::UnsupportedScheme,
+            ),
+            (
+                "https://user@beatbox.example",
+                BeatboxEndpointError::ForbiddenUrlComponent("userinfo"),
+            ),
+            (
+                "https://beatbox.example/api",
+                BeatboxEndpointError::ForbiddenUrlComponent("path"),
+            ),
+            (
+                "https://beatbox.example?token=1",
+                BeatboxEndpointError::ForbiddenUrlComponent("query"),
+            ),
+            (
+                "https://beatbox.example#frag",
+                BeatboxEndpointError::ForbiddenUrlComponent("fragment"),
+            ),
+        ] {
+            let result = ToolExecClient::new(url);
+            assert!(
+                matches!(result, Err(ToolExecError::Endpoint(error)) if error == reason),
+                "{url} should fail with {reason:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn beatbox_api_keys_require_https_or_loopback_http() -> Result<(), ToolExecError> {
+        let _https = ToolExecClient::new("https://beatbox.example")?.with_api_key("fixture-key")?;
+        let _loopback =
+            ToolExecClient::new("http://127.0.0.1:8080")?.with_api_key("fixture-key")?;
+        let _localhost =
+            ToolExecClient::new("http://localhost:8080")?.with_api_key("fixture-key")?;
+
+        let remote_plaintext =
+            ToolExecClient::new("http://beatbox.example")?.with_api_key("fixture-key");
+        assert!(matches!(
+            remote_plaintext,
+            Err(ToolExecError::Endpoint(
+                BeatboxEndpointError::PlaintextRemoteBearer
+            ))
+        ));
+
+        let injected = ToolExecClient::from_client(BeatboxClient::new("https://beatbox.example"))
+            .with_api_key("fixture-key");
+        assert!(matches!(
+            injected,
+            Err(ToolExecError::Endpoint(
+                BeatboxEndpointError::UnvalidatedClient
+            ))
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn denied_result_maps_to_step_error_and_preserves_audit() {
         let result = execution_result(
             ExecutionStatus::Denied,
@@ -744,8 +940,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tainted_transform_execution_rejects_untainted_input_before_dispatch() {
-        let executor = ToolExecClient::new("http://127.0.0.1:1");
+    async fn tainted_transform_execution_rejects_untainted_input_before_dispatch(
+    ) -> Result<(), ToolExecError> {
+        let executor = ToolExecClient::new("http://127.0.0.1:1")?;
         let result = executor
             .execute_tainted_transform(TaintedTransform {
                 lane: Lane::PythonWasi,
@@ -766,11 +963,13 @@ mod tests {
             .await;
 
         assert!(matches!(result, Err(ToolExecError::UntaintedInput)));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn tainted_transform_job_rejects_untainted_input_before_dispatch() {
-        let executor = ToolExecClient::new("http://127.0.0.1:1");
+    async fn tainted_transform_job_rejects_untainted_input_before_dispatch(
+    ) -> Result<(), ToolExecError> {
+        let executor = ToolExecClient::new("http://127.0.0.1:1")?;
         let result = executor
             .create_tainted_transform_job(TaintedTransform {
                 lane: Lane::PythonWasi,
@@ -791,6 +990,7 @@ mod tests {
             .await;
 
         assert!(matches!(result, Err(ToolExecError::UntaintedInput)));
+        Ok(())
     }
 
     #[test]
