@@ -410,7 +410,9 @@ impl BrowserSurface {
                     Some(PendingConfirmation::from_request(request.clone(), None));
                 self.run_state = SurfaceRunState::AwaitingConfirmation;
             }
-            ManagerEvent::ConfirmationGranted { confirmation_id } => {
+            ManagerEvent::ConfirmationGranted {
+                confirmation_id, ..
+            } => {
                 if self
                     .pending_confirmation
                     .as_ref()
@@ -608,6 +610,12 @@ mod tests {
                 TempodSessionEventKind::Manager {
                     event: ManagerEvent::ConfirmationGranted {
                         confirmation_id: request.confirmation_id.clone(),
+                        grant: tempo_schema::ConfirmationGrant {
+                            confirmation_id: request.confirmation_id.clone(),
+                            grant_token: "grant-token-test".to_string(),
+                            issued_ms: 11,
+                            expires_ms: 20,
+                        },
                     },
                 },
             )]

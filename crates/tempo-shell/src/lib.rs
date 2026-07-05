@@ -1422,6 +1422,51 @@ mod tests {
     }
 
     #[test]
+    fn session_goto_posts_to_confirmable_session_act_batch_route() -> TestResult {
+        let body = serde_json::to_vec(&json!({
+            "status": "applied",
+            "diff": {
+                "since_seq": 1,
+                "seq": 2,
+                "omitted": 0,
+                "added": [],
+                "removed": [],
+                "changed": []
+            },
+            "policy": {}
+        }))?;
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
+        let handle = thread::spawn(move || -> Result<(), std::io::Error> {
+            let (mut stream, _) = listener.accept()?;
+            let mut request = Vec::new();
+            stream.read_to_end(&mut request)?;
+            let _ = request_tx.send(String::from_utf8_lossy(&request).to_string());
+            let header = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            write_fixture_response(&mut stream, header.as_bytes())?;
+            write_fixture_response(&mut stream, &body)
+        });
+
+        ShellClient::new(addr.to_string()).goto_session("session-123", "https://pay.test")?;
+        let request = request_rx.recv_timeout(Duration::from_secs(1))?;
+
+        assert!(request.starts_with("POST /sessions/session-123/act_batch HTTP/1.1"));
+        assert!(request.contains("\"kind\":\"goto\""));
+        assert!(request.contains("\"url\":\"https://pay.test\""));
+        assert!(request.contains("\"input_tainted\":false"));
+        assert!(request.contains("\"idempotency_key\":\"shell-goto-"));
+        match handle.join() {
+            Ok(result) => result?,
+            Err(_) => return Err("server thread failed".into()),
+        }
+        Ok(())
+    }
+
+    #[test]
     fn mcp_client_rejects_oversized_content_length_before_body_read() -> TestResult {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let addr = listener.local_addr()?;
