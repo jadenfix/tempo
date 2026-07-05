@@ -6,11 +6,11 @@
 
 use std::{net::IpAddr, path::PathBuf};
 
+use beatbox_client::Client as RawBeatboxClient;
 pub use beatbox_client::{
-    Client as BeatboxClient, ClientError as BeatboxClientError, CreateJobResponse, Determinism,
-    EffectiveIsolation, EgressRecord, ErrorBody, ExecuteRequest, ExecutionResult, ExecutionStatus,
-    FsPolicy, JobRecord, JobStatus, Lane, Limits, Metrics, Mount, MountMode, NetPolicy, Policy,
-    Secret, Source,
+    ClientError as BeatboxClientError, CreateJobResponse, Determinism, EffectiveIsolation,
+    EgressRecord, ErrorBody, ExecuteRequest, ExecutionResult, ExecutionStatus, FsPolicy, JobRecord,
+    JobStatus, Lane, Limits, Metrics, Mount, MountMode, NetPolicy, Policy, Secret, Source,
 };
 use tempo_driver::StepOutcome;
 use tempo_schema::ObservationDiff;
@@ -39,7 +39,7 @@ pub const TAINTED_FUEL: u64 = 10_000_000;
 /// Thin typed bridge over beatbox's real HTTP client.
 #[derive(Clone)]
 pub struct ToolExecClient {
-    client: BeatboxClient,
+    client: RawBeatboxClient,
     endpoint: BeatboxEndpoint,
 }
 
@@ -50,7 +50,7 @@ impl ToolExecClient {
     pub fn new(base_url: impl Into<String>) -> Result<Self, ToolExecError> {
         let endpoint = BeatboxEndpoint::parse(base_url)?;
         Ok(Self {
-            client: BeatboxClient::new(endpoint.as_str()),
+            client: RawBeatboxClient::new(endpoint.as_str()),
             endpoint,
         })
     }
@@ -65,7 +65,8 @@ impl ToolExecClient {
     /// does not expose enough endpoint/auth metadata for Tempo to prove bearer
     /// tokens cannot leak, so clients built this way are quarantined and cannot
     /// dispatch HTTP requests.
-    pub fn from_client(client: BeatboxClient) -> Self {
+    #[cfg(test)]
+    pub(crate) fn from_client(client: RawBeatboxClient) -> Self {
         Self {
             client,
             endpoint: BeatboxEndpoint::unknown(),
@@ -158,6 +159,7 @@ enum EndpointScheme {
 enum EndpointHost {
     Ip(IpAddr),
     Domain(String),
+    #[cfg(test)]
     Unknown,
 }
 
@@ -195,6 +197,7 @@ impl BeatboxEndpoint {
         })
     }
 
+    #[cfg(test)]
     fn unknown() -> Self {
         Self {
             base_url: String::new(),
@@ -230,6 +233,7 @@ impl EndpointHost {
         match self {
             Self::Ip(ip) => ip.is_loopback(),
             Self::Domain(domain) => domain.eq_ignore_ascii_case("localhost"),
+            #[cfg(test)]
             Self::Unknown => false,
         }
     }
@@ -821,8 +825,9 @@ mod tests {
             ))
         ));
 
-        let injected = ToolExecClient::from_client(BeatboxClient::new("https://beatbox.example"))
-            .with_api_key("fixture-key");
+        let injected =
+            ToolExecClient::from_client(RawBeatboxClient::new("https://beatbox.example"))
+                .with_api_key("fixture-key");
         assert!(matches!(
             injected,
             Err(ToolExecError::Endpoint(
@@ -834,7 +839,7 @@ mod tests {
 
     #[tokio::test]
     async fn raw_injected_clients_reject_dispatch_before_network() {
-        let raw = BeatboxClient::new("http://203.0.113.1:9").with_api_key("fixture-key");
+        let raw = RawBeatboxClient::new("http://203.0.113.1:9").with_api_key("fixture-key");
         let executor = ToolExecClient::from_client(raw);
 
         let result = executor
