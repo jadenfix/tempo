@@ -47,7 +47,7 @@ Commands:
 
 Options:
   --tempod ADDR   tempod address, default 127.0.0.1:8787
-  --auth-token TOKEN
+  --auth-token TOKEN (default: TEMPO_TEMPOD_AUTH_TOKEN or tempod runtime token file)
 ";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -195,9 +195,22 @@ pub struct ShellClient {
 
 impl ShellClient {
     pub fn new(tempod_addr: impl Into<String>) -> Self {
+        Self::new_with_discovered_auth_token(
+            tempod_addr,
+            tempo_headless::load_tempod_runtime_auth_token()
+                .ok()
+                .flatten()
+                .map(|runtime| runtime.token),
+        )
+    }
+
+    fn new_with_discovered_auth_token(
+        tempod_addr: impl Into<String>,
+        auth_token: Option<String>,
+    ) -> Self {
         Self {
             tempod_addr: tempod_addr.into(),
-            auth_token: None,
+            auth_token,
             timeout: Duration::from_secs(5),
             max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
             max_mcp_response_bytes: DEFAULT_MAX_MCP_RESPONSE_BYTES,
@@ -210,7 +223,9 @@ impl ShellClient {
     }
 
     fn with_optional_auth_token(mut self, auth_token: Option<String>) -> Self {
-        self.auth_token = auth_token;
+        if let Some(auth_token) = auth_token {
+            self.auth_token = Some(auth_token);
+        }
         self
     }
 
@@ -977,6 +992,24 @@ mod tests {
 
         assert_eq!(opened.id.0, "session-0");
         assert_eq!(opened.url, "https://auth.test");
+        Ok(())
+    }
+
+    #[test]
+    fn client_uses_discovered_runtime_auth_token_to_real_tempod() -> TestResult {
+        let pool = Arc::new(Mutex::new(SessionPool::default()));
+        let auth = TempodAuth::bearer("runtime-token")?;
+
+        let opened = with_tempod_auth(&pool, auth, |addr| {
+            ShellClient::new_with_discovered_auth_token(
+                addr.to_string(),
+                Some("runtime-token".into()),
+            )
+            .open("https://runtime-auth.test")
+        })?;
+
+        assert_eq!(opened.id.0, "session-0");
+        assert_eq!(opened.url, "https://runtime-auth.test");
         Ok(())
     }
 

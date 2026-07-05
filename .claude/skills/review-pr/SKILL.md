@@ -53,6 +53,9 @@ Resource, lifecycle & availability:
 - [ ] Size caps are enforced before or during construction/serialization of remote-driven JSON, DOM, screenshot, log, and tool-result data. A check that rejects only after allocating the complete payload is not a memory bound.
 - [ ] Stateful protocol handlers enforce live-state quotas in addition to per-message size caps; repeated valid commands must not grow maps, vectors, or dispatch scans without bound.
 - [ ] Every engine/remote/subprocess round-trip has a timeout **and** a recovery path — a crash or hang is detected and healed (restart/reconnect, with backoff), not permanently terminal.
+
+Security boundaries & auth:
+- [ ] Loopback, Host, and Origin checks are not authentication. Control planes that drive sessions, tools, or browser state require an unguessable same-user capability even on `127.0.0.1`.
 - [ ] Health/readiness signals reflect real state (draining, dependency-down, at-capacity); cleanup and teardown run on every exit path including error and cancel.
 - [ ] Operational metadata routes that expose dependency health, capacity, policy, or topology are guarded like control-plane routes unless they intentionally return only static liveness.
 - [ ] Locks are narrow, consistently ordered, released on panic (poison recovered, not fatal), and never held across `.await`, navigation, or subprocess I/O — the pool lock especially, so `/health` and `/drain` stay responsive.

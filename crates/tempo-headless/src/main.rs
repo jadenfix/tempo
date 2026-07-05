@@ -233,16 +233,32 @@ impl TempodOptions {
     }
 
     fn server_config(&self) -> Result<tempo_headless::TempodServerConfig, String> {
+        self.server_config_with_runtime_auth(|| {
+            tempo_headless::load_or_create_tempod_runtime_auth_token().map(|runtime| runtime.token)
+        })
+    }
+
+    fn server_config_with_runtime_auth(
+        &self,
+        runtime_auth_token: impl FnOnce() -> Result<String, tempo_headless::TempodError>,
+    ) -> Result<tempo_headless::TempodServerConfig, String> {
         let mut config = tempo_headless::TempodServerConfig::new();
         if self.allow_remote {
             config = config.allow_remote_binds();
         }
-        if let Some(token) = &self.auth_token {
-            config = config.with_auth(
-                tempo_headless::TempodAuth::bearer(token.clone())
-                    .map_err(|error| format!("invalid tempod auth token: {error}\n{}", usage()))?,
-            );
-        }
+        let token = match &self.auth_token {
+            Some(token) => token.clone(),
+            None => runtime_auth_token().map_err(|error| {
+                format!(
+                    "failed to load tempod runtime auth token: {error}\n{}",
+                    usage()
+                )
+            })?,
+        };
+        config = config.with_auth(
+            tempo_headless::TempodAuth::bearer(token)
+                .map_err(|error| format!("invalid tempod auth token: {error}\n{}", usage()))?,
+        );
         Ok(config)
     }
 }
@@ -268,9 +284,11 @@ fn usage() -> String {
          [--allow-private-network]\n\
          \n\
          layered config: defaults < JSON file named by {config_env} < TEMPO_* env < flags\n\
-         non-loopback binds require --allow-remote plus --auth-token TOKEN or {env}",
+         tempod requires bearer auth even on loopback; without --auth-token or {env}, it creates/uses an owner-only runtime token file ({file_env})\n\
+         non-loopback binds require --allow-remote plus bearer auth",
         config_env = tempo_config::ENV_CONFIG_PATH,
         env = tempo_headless::TEMPO_TEMPOD_AUTH_TOKEN_ENV,
+        file_env = tempo_headless::TEMPO_TEMPOD_AUTH_TOKEN_FILE_ENV,
     )
 }
 
@@ -306,6 +324,42 @@ mod tests {
         )?;
 
         assert_eq!(options.auth_token.as_deref(), Some("env-token"));
+        Ok(())
+    }
+
+    #[test]
+    fn server_config_defaults_to_runtime_auth_token() -> Result<(), String> {
+        let options = TempodOptions {
+            addr: "127.0.0.1:8787".into(),
+            engine: Engine::Cdp,
+            engine_socket: None,
+            allow_remote: true,
+            allow_private_network: false,
+            auth_token: None,
+        };
+
+        let config = options.server_config_with_runtime_auth(|| Ok("runtime-token".into()))?;
+        assert!(config.auth_is_required());
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_auth_token_overrides_runtime_auth_token() -> Result<(), String> {
+        let options = TempodOptions {
+            addr: "127.0.0.1:8787".into(),
+            engine: Engine::Cdp,
+            engine_socket: None,
+            allow_remote: true,
+            allow_private_network: false,
+            auth_token: Some("cli-token".into()),
+        };
+
+        let config = options.server_config_with_runtime_auth(|| {
+            Err(tempo_headless::TempodError::BadRequest(
+                "runtime token should not be loaded".into(),
+            ))
+        })?;
+        assert!(config.auth_is_required());
         Ok(())
     }
 

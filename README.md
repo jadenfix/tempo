@@ -52,6 +52,11 @@ cargo test --workspace   # contracts, conformance, runtime, protocol, and shell 
 - `tempo-telemetry` / `tempo-config` (paired observability PR) are the
   observability and configuration backbones; tempod serves Prometheus
   exposition at `GET /metrics`.
+- `tempod` requires bearer auth on loopback and remote binds. Set
+  `TEMPO_TEMPOD_AUTH_TOKEN` or `--auth-token` explicitly, or let the daemon
+  create an owner-only runtime token file; shell clients read the same file by
+  default. Loopback, Host, and Origin checks defend binding/CSRF edges, but they
+  are not authentication on shared machines.
 - Supply-chain policy lives in [`deny.toml`](./deny.toml) (checked in CI);
   tagged `v*` releases build stripped, thin-LTO `tempod` + `tempo-cli`
   binaries for macOS and Linux.
