@@ -23,7 +23,7 @@ use chromiumoxide::cdp::browser_protocol::page::{
     CaptureScreenshotFormat, CreateIsolatedWorldParams, Viewport,
 };
 use chromiumoxide::cdp::browser_protocol::target::{
-    CreateBrowserContextParams, CreateTargetParams,
+    CloseTargetParams, CreateBrowserContextParams, CreateTargetParams,
 };
 use chromiumoxide::cdp::js_protocol::runtime::{EvaluateParams, ExecutionContextId};
 use chromiumoxide::error::CdpError;
@@ -86,11 +86,18 @@ const CDP_POLICY_PROXY_ARGS: [&str; 6] = [
     "--proxy-server",
 ];
 const CDP_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
-/// Keep navigation waits below tempod's 30s engine IPC bound so attached
-/// callers receive a typed transport error instead of waiting on Chromium's
-/// longer CDP request timeout.
+/// Bound on awaiting the `Page.navigate` command *response*. The response is
+/// advisory: on freshly created (especially child-context) targets Chrome's
+/// answer is sometimes lost while the navigation itself proceeds, so a short
+/// await here hands off to the readyState recovery poll below instead of
+/// burning the caller's deadline on a reply that will never come.
 const CDP_NAVIGATION_AWAIT_TIMEOUT: Duration = Duration::from_secs(5);
-const TIMED_OUT_NAVIGATION_RECOVERY_TIMEOUT: Duration = Duration::from_secs(5);
+/// Window for the readyState/URL recovery poll after a timed-out navigation
+/// await. 5s await + 20s poll keeps the whole bounded-navigation path under
+/// tempod's 30s engine IPC deadline (typed `NavTimeout` instead of an opaque
+/// IPC timeout) while still letting slow-but-loading pages finish — the
+/// values are derived from the caller's bound, not from test tuning.
+const TIMED_OUT_NAVIGATION_RECOVERY_TIMEOUT: Duration = Duration::from_secs(20);
 const TIMED_OUT_NAVIGATION_RECOVERY_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Explicit opt-out for Chromium sandboxing in constrained CI/container setups.
@@ -551,6 +558,18 @@ impl CdpTempoDriver {
         self.browser_context_id.is_some()
     }
 
+    /// Child-context navigation replaces the page with a fresh target created
+    /// *at* the destination URL. Driving `Page.navigate` on a freshly attached
+    /// child-context session deadlocks with per-page fetch interception (the
+    /// paused document request's events are not reliably delivered on such
+    /// sessions — verified empirically: police-then-navigate hangs the child
+    /// goto until the caller's deadline), so navigation rides target creation
+    /// and request policy is installed immediately after attach. The
+    /// pre-navigation URL policy check in `goto_recorded` still gates the
+    /// destination, and the policy proxy blocks disallowed sockets
+    /// browser-wide including this initial load; per-request interception for
+    /// that first document request is a documented limitation of the child
+    /// lane pending an upstream fix.
     async fn recreate_child_page_for_navigation(
         &mut self,
         url: &str,
@@ -572,11 +591,17 @@ impl CdpTempoDriver {
         .await
         {
             Ok(Ok(page)) => page,
+            // Dropping the create future is not cancellation: the target may
+            // already exist browser-side mid-load. Reap any page in this
+            // child context other than the current one so a retry loop
+            // against a hung destination cannot grow the browser unbounded.
             Ok(Err(CdpError::Timeout)) | Err(_) => {
+                self.reap_orphan_child_pages().await;
                 self.enforce_no_blocked_request_soon_since(cursor).await?;
                 return Err(TransportError::NavTimeout);
             }
             Ok(Err(error)) => {
+                self.reap_orphan_child_pages().await;
                 self.enforce_no_blocked_request_soon_since(cursor).await?;
                 return Err(map_cdp_error(error));
             }
@@ -591,7 +616,10 @@ impl CdpTempoDriver {
         {
             Ok(task) => task,
             Err(error) => {
-                let _ = new_page.close().await;
+                // Bounded teardown: this path defends the caller's IPC
+                // deadline, so cleanup must not reintroduce an unbounded
+                // await.
+                let _ = tokio::time::timeout(CDP_NAVIGATION_AWAIT_TIMEOUT, new_page.close()).await;
                 return Err(error);
             }
         };
@@ -605,9 +633,41 @@ impl CdpTempoDriver {
             *guard = None;
         }
         if let Some(old_page) = old_page {
-            let _ = old_page.close().await;
+            let _ = tokio::time::timeout(CDP_NAVIGATION_AWAIT_TIMEOUT, old_page.close()).await;
         }
         Ok(())
+    }
+
+    /// Close every target in this driver's child browser context except the
+    /// page currently held. Used after a timed-out/failed target create,
+    /// where the dropped future may have left a half-created page behind
+    /// (`Target.createTarget` succeeds browser-side before `new_page`
+    /// resolves). Best-effort and bounded: reaping must not add unbounded
+    /// awaits to the failure path it cleans up.
+    async fn reap_orphan_child_pages(&mut self) {
+        let Some(context_id) = self.browser_context_id.clone() else {
+            return;
+        };
+        let current_target = self.page.as_ref().map(|page| page.target_id().clone());
+        let Ok(Ok(targets)) =
+            tokio::time::timeout(CDP_NAVIGATION_AWAIT_TIMEOUT, self.browser.fetch_targets()).await
+        else {
+            return;
+        };
+        for target in targets {
+            if target.browser_context_id.as_ref() != Some(&context_id) {
+                continue;
+            }
+            if Some(&target.target_id) == current_target.as_ref() {
+                continue;
+            }
+            let _ = tokio::time::timeout(
+                CDP_NAVIGATION_AWAIT_TIMEOUT,
+                self.browser
+                    .execute(CloseTargetParams::new(target.target_id.clone())),
+            )
+            .await;
+        }
     }
 
     async fn enrich_observation_from_ax_tree(
@@ -3324,6 +3384,22 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpListener, TcpStream as StdTcpStream};
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Boundary test for the bounded-navigation budget: the whole timed-out
+    /// path (navigation await + readyState recovery) must resolve inside
+    /// tempod's 30s engine IPC deadline (`ENGINE_IPC_TIMEOUT` in
+    /// tempo-headless — restated here because the contract crate cannot
+    /// depend upward on the daemon crate), or attached callers get an opaque
+    /// IPC timeout instead of the typed `NavTimeout` this lane exists for.
+    #[test]
+    fn bounded_navigation_path_resolves_inside_engine_ipc_deadline() {
+        let engine_ipc_deadline = Duration::from_secs(30);
+        assert!(
+            CDP_NAVIGATION_AWAIT_TIMEOUT + TIMED_OUT_NAVIGATION_RECOVERY_TIMEOUT
+                < engine_ipc_deadline,
+            "navigation await + recovery must leave margin under the 30s engine IPC bound"
+        );
+    }
 
     #[test]
     fn navigation_url_match_accepts_chromium_normalization_only() {
