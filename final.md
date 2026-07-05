@@ -444,6 +444,98 @@ The 2026-07-04 wave merged: per-session concurrent dispatch in tempod (#305), re
 5. **Budget gates on live telemetry** — CI budget evaluators (§10) should consume `tempo-telemetry` JSON snapshots from eval runs, closing the loop between the exposition and the §8.2 milestone evidence.
 6. **Host-header validation on control routes** — the loopback-Origin guard alone does not stop a DNS-rebinding page issuing *same-origin* fetches (which carry no Origin header); control routes should also require a loopback/expected Host.
 
+## 12. Performance model & optimization roadmap (first-principles addendum)
+
+This section records the E2E optimization analysis (2026-07-04) so the plan is
+documented even where the work is filed as issues rather than shipped. It is the
+answer to "how does tempo become faster than browser-use *in all ways*."
+
+### 12.1 The limiting factor (know it before optimizing it)
+
+End-to-end task time is:
+
+```
+task_time ≈ Σ_steps [ prefill(input_tokens) + decode(output_tokens) + observe + act + settle ]
+```
+
+Measured reality (browser-use's own published numbers, and structurally identical
+for tempo since both call the same frontier models over the same APIs): **decode
+dominates** — output tokens cost ≈215× the wall-time of input tokens, a screenshot
+adds ≈0.8 s, a step ≈3 s, a task ≈68 s. Engine work (observe + act + settle) is
+≈0.05–0.25 s. **Amdahl's law is therefore the governing constraint:** shaving
+engine work 250 ms→50 ms is a ≈6 % per-step win, and the LLM call — the other
+≈90 % — is *identical across every browser*. No amount of Rust makes Claude decode
+faster.
+
+**Consequence.** The only levers an *engine* has on the dominant term:
+
+1. **Fewer tokens per step** — diffs that actually reach the model (#447), lean
+   projection (#446), no double-encoding (#444), `skip_serializing_if` (#468, merged).
+2. **Fewer LLM round-trips per task** — safe multi-action batches + zero-LLM helper
+   actions + stuck detection (#478). This attacks the `×steps` multiplier and is the
+   single highest-leverage engine lever.
+3. **Overlap** engine work under decode latency (speculative observe/settle of the
+   predicted next state).
+4. **Offload cheap cognition to a local model** (#480) — the only proposal that
+   touches the 90 %.
+
+Everything here is scored against this budget, not against microbenchmarks; making
+that budget measurable on the live lane (the Amdahl table) is itself filed as #481.
+
+### 12.2 Tech-stack verdict — where C / C++ / SIMD / GPU actually belong
+
+From first principles, most of the engine is string/tree/byte work where safe Rust
+already matches C throughput, so a C rewrite buys ≈0 and forfeits `unsafe`-forbid
+safety. The exceptions are specific and worth the complexity:
+
+| Subsystem | Verdict | Why (first principles) |
+|---|---|---|
+| DOM parse, diff, framing, hashing | **Stay Rust** | Safe Rust already ≈ C throughput; a C rewrite buys ~0 and loses `unsafe`-forbid safety. Use SIMD crates (`memchr`, `simd-json`) for the free wins. |
+| Screenshot encode + transport | **C / SIMD / hardware — real win (#479)** | ~0.8 s/step ≈ 27 % when vision is on. `mozjpeg`/`libjpeg-turbo` (SSE/AVX2/NEON) or VideoToolbox/NVENC, **downscale before encode**, kill base64. Genuine C territory. |
+| Local pre-filter / ranker model | **GPU/ANE + candle/ONNX/MLX/llama.cpp — highest lever (#480)** | The only proposal that attacks the 90 % (decode). A 1–3 B 4-bit model on Metal/ANE ranks elements (a single `[N×d]·[d]` matmul — numpy/JAX-shaped) and answers yes/no grounding with **zero frontier round-trips**. 1–2 orders of magnitude cheaper than a frontier call. |
+| HTML byte-scan, wire (de)serialize | **SIMD crates, Amdahl-bounded** | `memchr`/`simd-json` — clean "every trick" wins, but honestly µs–ms on a multi-second budget. |
+
+### 12.3 Honest standing vs browser-use (2026-07 competitive read)
+
+browser-use has converged on tempo's design (now raw-CDP, DOM-first structured
+observation, lean action space, KV-cache-friendly prompt ordering, fresh snapshot
+per step). The verified delta:
+
+- **tempo's real, shipped advantages:** stable NodeIds that survive relayout
+  (`StableIdMapper`); a tamper-resistant settle signal (MutationObserver in a CDP
+  isolated world); an API-first handshake fast path (`.well-known`/agent-card/
+  `llms.txt`/WebMCP) that skips pixels when a site speaks an agent protocol.
+- **Where tempo was behind and is being closed:** the live CDP observation
+  bypassed the compiler (unranked, unbudgeted, no marks, no visibility/`bounds`,
+  weak interactive recall, no shadow/iframe) — #477, first slice landed (ranked +
+  budgeted + mark labels via `finalize_observation`), remaining slices below.
+- **Claim-not-yet-delivery, to be repositioned honestly:** Servo primary (no
+  runnable binary — CDP *is* Chromium today, #453); speculation/forking (Unsupported
+  on the live engine, #457); observation diffs to the model (#447).
+
+### 12.4 Prioritized roadmap (issue-tracked; ship as PRs)
+
+1. **Observation quality — the make-or-break bet (#477).** Route through the
+   compiler (done); then real `bounds` + `visible` from `DOMSnapshot.captureSnapshot`,
+   visibility/occlusion culling, event-listener/`cursor:pointer` recall, shadow-DOM
+   pierce + iframe recursion. Precondition for the token-economy work.
+2. **Token economy — attacks the 90 %.** MCP double-encode (#444), lean projection
+   (#446), diffs-to-model (#447), `skip_serializing_if` (#468, merged).
+3. **Round-trips per task (#478)** — safe multi-action batches, zero-LLM helper
+   actions, stuck/loop fingerprinting.
+4. **Screenshot pipeline (#479)** — downscale + SIMD/hardware JPEG encode + kill
+   base64 (the concrete C/SIMD win).
+5. **Local model (#480)** — element ranking + zero-round-trip grounding behind the
+   `Decider` seam (the GPU/candle/ONNX/MLX lever on decode).
+6. **Measure it (#481)** — per-step token + latency breakdown on the live lane so
+   every optimization above is judged against the real E2E budget, not a bench.
+
+Engine-level latency/RAM work already merged or in flight (observe compile, cassette
+offset index, single-write framing, O(1) settle, `element_text` O(H), bounded
+`history`) is correct but Amdahl-capped at the ≈10 % the engine occupies; it is
+necessary hygiene, not the thing that beats browser-use on task time. The items
+above are.
+
 ## Appendix — key beater files reused
 
 - `beater-agents/crates/beater-browser/src/lib.rs` — DriverTrait v1, `Observation`/`StepTriple`/grounding contract (the base tempo-driver extends)
