@@ -520,6 +520,16 @@ struct CassetteIndex {
     /// Newline-terminated lines covered, for parity with whole-file scan
     /// error line numbers.
     indexed_lines: usize,
+    /// Set when catch-up hit an undecodable record that follows at least one
+    /// good record. Reads keep serving the good prefix (quarantine, never a
+    /// hard error); the next `record()` — which holds the exclusive append
+    /// lock — truncates the file back to `indexed_bytes` and fsyncs the
+    /// repair. WAL posture: recency can be lost, integrity and availability
+    /// are not. Re-derived by every catch-up rescan, never cached across
+    /// calls: another store instance can heal the file and re-append valid
+    /// records without changing its length, so nothing short of re-decoding
+    /// the tail proves the quarantined region is still corrupt.
+    corrupt_tail: bool,
 }
 
 impl CassetteStore {
@@ -577,10 +587,20 @@ impl CassetteStore {
             Err(TryLockError::Error(source)) => return Err(JournalError::Io(source)),
         }
 
-        let append_boundary = repair_cassette_tail_before_append(&file)?;
+        let mut append_boundary = repair_cassette_tail_before_append(&file)?;
 
         let mut index = self.lock_index();
         self.catch_up_index(&mut index)?;
+        if std::mem::take(&mut index.corrupt_tail) {
+            // Quarantined interior corruption (see CassetteIndex::corrupt_tail):
+            // under the exclusive append lock, truncate back to the last good
+            // record boundary and fsync the repair — the same discipline as the
+            // unterminated-tail repair above. The watermark always ends on a
+            // newline boundary (or 0), so the truncated file needs no separator.
+            file.set_len(index.indexed_bytes)?;
+            file.sync_all()?;
+            append_boundary = CassetteAppendBoundary::Ready;
+        }
         if index.by_key.contains_key(&cassette.key) {
             let existing = self.read_indexed_cassette(&index, &cassette.key)?;
             if existing.as_ref() == Some(cassette) {
@@ -604,7 +624,9 @@ impl CassetteStore {
         // One write_all per record, no per-record fsync: durability is the OS
         // page cache, the same posture as the journal's WAL
         // `synchronous=NORMAL` (fsync deferred to checkpoints). A torn append
-        // after a crash is repaired by `repair_cassette_tail_before_append`.
+        // after a crash is repaired by `repair_cassette_tail_before_append`;
+        // interior corruption from out-of-order writeback is quarantined by
+        // catch-up and truncated away above.
         file.write_all(&frame)?;
 
         // The append is visible to every subsequent read on this store: extend
@@ -659,6 +681,14 @@ impl CassetteStore {
         if file_len < index.indexed_bytes {
             *index = CassetteIndex::default();
         }
+        // Never trust a prior quarantine across calls: another store instance
+        // can heal the file (truncate to the watermark, re-append) without
+        // this one observing a length change — even back to the exact same
+        // length, since encoding is length-deterministic for identical
+        // payloads. Re-derive the marker by rescanning from the watermark; an
+        // unchanged corrupt tail simply re-quarantines, so the extra decode
+        // cost is bounded to the corrupt region and paid only while degraded.
+        index.corrupt_tail = false;
         if file_len == index.indexed_bytes {
             return Ok(());
         }
@@ -698,6 +728,20 @@ impl CassetteStore {
                             // re-examined on the next call.
                             break;
                         }
+                        if !index.by_key.is_empty() {
+                            // Undecodable record after at least one good one:
+                            // post-crash torn writeback can persist a later
+                            // page while an earlier region reads back as NULs
+                            // (a newline-terminated garbage line). Quarantine
+                            // the tail instead of poisoning the store; the
+                            // next record() truncates it under the lock.
+                            index.corrupt_tail = true;
+                            break;
+                        }
+                        // An undecodable FIRST record is indistinguishable
+                        // from a retention-policy/key misconfiguration; fail
+                        // loudly rather than heal-by-truncating a healthy
+                        // store opened with the wrong policy.
                         return Err(source);
                     }
                 };
@@ -705,6 +749,12 @@ impl CassetteStore {
                 Ok(record) => record,
                 Err(source) => {
                     if !terminated && is_incomplete_json_record(raw) {
+                        break;
+                    }
+                    if !index.by_key.is_empty() {
+                        // See the decode-error arm above: quarantine, do not
+                        // poison.
+                        index.corrupt_tail = true;
                         break;
                     }
                     return Err(JournalError::Corrupt {
@@ -2135,6 +2185,344 @@ mod tests {
 
         let bytes = fs::read(&path)?;
         assert_eq!(bytes.last(), Some(&b'\n'));
+
+        remove_if_exists(&path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn cassette_interior_corruption_is_quarantined_and_healed_on_record() -> TestResult {
+        // Post-crash torn writeback (#513): a later record's pages persist
+        // while an earlier region reads back as garbage — a newline-TERMINATED
+        // corrupt line mid-file, which the unterminated-tail repair cannot
+        // see. Reads must keep serving the good prefix (never a permanent
+        // error), and the next record() must truncate the corrupt tail away.
+        let path = unique_path("cassette-interior-corruption")?;
+        remove_if_exists(&path)?;
+        let first = ResponseCassette::new(
+            "GET",
+            "https://example.com/a",
+            200,
+            Vec::new(),
+            b"a".to_vec(),
+        );
+        let second = ResponseCassette::new(
+            "GET",
+            "https://example.com/b",
+            200,
+            Vec::new(),
+            b"b".to_vec(),
+        );
+        let third = ResponseCassette::new(
+            "GET",
+            "https://example.com/c",
+            200,
+            Vec::new(),
+            b"c".to_vec(),
+        );
+        let fourth = ResponseCassette::new(
+            "GET",
+            "https://example.com/d",
+            200,
+            Vec::new(),
+            b"d".to_vec(),
+        );
+
+        {
+            let store = CassetteStore::open(&path)?;
+            store.record(&first)?;
+            store.record(&second)?;
+        }
+        {
+            // Garbage terminated line, then a decodable record after it — the
+            // "later page persisted, earlier region zeroed" crash shape.
+            let mut file = OpenOptions::new().append(true).open(&path)?;
+            file.write_all(b"\x00\x00\x00torn-writeback\n")?;
+            let encoded = encode_durable_record_bytes(
+                &serde_json::to_vec(&third)?,
+                &DurableRetentionPolicy::PlaintextUnsafe,
+                cassette_aad(),
+            )?;
+            file.write_all(&encoded)?;
+            file.write_all(b"\n")?;
+        }
+
+        // Cold store instance: the index rebuild must quarantine, not poison.
+        let store = CassetteStore::open(&path)?;
+        let len_before = fs::metadata(&path)?.len();
+        assert_eq!(store.replay(&first.key)?, Some(first.clone()));
+        assert_eq!(store.replay(&second.key)?, Some(second.clone()));
+        // Records behind the corruption are quarantined: absent, not an error.
+        assert_eq!(store.replay(&third.key)?, None);
+        // The whole-file reader still fails loudly until the store is healed:
+        // replay-fork plan loading must not silently work from partial data.
+        assert!(store.all().is_err());
+        // Read paths never mutate the file.
+        assert_eq!(fs::metadata(&path)?.len(), len_before);
+
+        // The next record() heals under the exclusive append lock.
+        store.record(&fourth)?;
+        assert_eq!(store.replay(&first.key)?, Some(first.clone()));
+        assert_eq!(store.replay(&fourth.key)?, Some(fourth.clone()));
+        assert_eq!(store.replay(&third.key)?, None);
+        assert_eq!(store.all()?, vec![first, second, fourth]);
+        let bytes = fs::read(&path)?;
+        assert_eq!(bytes.last(), Some(&b'\n'));
+        assert!(!bytes.windows(14).any(|window| window == b"torn-writeback"));
+
+        remove_if_exists(&path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn cassette_stale_quarantine_never_survives_cross_instance_heal() -> TestResult {
+        // Two store instances on one path. A quarantines a corrupt tail; B
+        // heals (truncate + re-append the same payloads), returning the file
+        // to the exact length A saw when it quarantined. A must re-derive the
+        // marker from the bytes — serving B's healed records and appending
+        // after them — never truncate them away on a stale marker.
+        let path = unique_path("cassette-cross-instance-heal")?;
+        remove_if_exists(&path)?;
+        let first = ResponseCassette::new(
+            "GET",
+            "https://example.com/a",
+            200,
+            Vec::new(),
+            b"a".to_vec(),
+        );
+        let second = ResponseCassette::new(
+            "GET",
+            "https://example.com/b",
+            200,
+            Vec::new(),
+            b"b".to_vec(),
+        );
+        let third = ResponseCassette::new(
+            "GET",
+            "https://example.com/c",
+            200,
+            Vec::new(),
+            b"c".to_vec(),
+        );
+        let fourth = ResponseCassette::new(
+            "GET",
+            "https://example.com/d",
+            200,
+            Vec::new(),
+            b"d".to_vec(),
+        );
+
+        {
+            let store = CassetteStore::open(&path)?;
+            store.record(&first)?;
+        }
+        let prefix_len = fs::metadata(&path)?.len();
+        {
+            let store = CassetteStore::open(&path)?;
+            store.record(&second)?;
+            let second_end = fs::metadata(&path)?.len();
+            store.record(&third)?;
+            // Zero `second` in place, keeping its newline: torn writeback
+            // persisted `third`'s pages while `second`'s read back as NULs.
+            let mut file = OpenOptions::new().write(true).open(&path)?;
+            file.seek(SeekFrom::Start(prefix_len))?;
+            file.write_all(&vec![0u8; (second_end - prefix_len - 1) as usize])?;
+        }
+        let full_len = fs::metadata(&path)?.len();
+
+        // Instance A observes the corruption and quarantines.
+        let store_a = CassetteStore::open(&path)?;
+        assert_eq!(store_a.replay(&first.key)?, Some(first.clone()));
+        assert_eq!(store_a.replay(&second.key)?, None);
+
+        // Instance B heals under its own append lock and re-records the lost
+        // payloads. Length-deterministic encoding brings the file back to
+        // exactly the length A quarantined at.
+        let store_b = CassetteStore::open(&path)?;
+        store_b.record(&second)?;
+        store_b.record(&third)?;
+        assert_eq!(fs::metadata(&path)?.len(), full_len);
+
+        // A must see the healed records, not its stale quarantine...
+        assert_eq!(store_a.replay(&second.key)?, Some(second.clone()));
+        assert_eq!(store_a.replay(&third.key)?, Some(third.clone()));
+        // ...and A's next record() must append, never truncate B's records.
+        store_a.record(&fourth)?;
+        let verify = CassetteStore::open(&path)?;
+        assert_eq!(verify.all()?, vec![first, second, third, fourth]);
+
+        remove_if_exists(&path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn cassette_interior_corruption_is_quarantined_under_encrypted_policy() -> TestResult {
+        // The quarantine tests above run PlaintextUnsafe, which surfaces
+        // corruption at the serde arm. Under Encrypted retention a zeroed
+        // record fails at the decode arm instead; it must quarantine and heal
+        // the same way (the corrupt-FIRST-record guard still covers a healthy
+        // store opened with the wrong key, which also fails at decode).
+        let path = unique_path("cassette-encrypted-quarantine")?;
+        remove_if_exists(&path)?;
+        let policy = DurableRetentionPolicy::Encrypted {
+            key: test_key(0x11),
+        };
+        let first = ResponseCassette::new(
+            "GET",
+            "https://example.com/a",
+            200,
+            Vec::new(),
+            b"a".to_vec(),
+        );
+        let second = ResponseCassette::new(
+            "GET",
+            "https://example.com/b",
+            200,
+            Vec::new(),
+            b"b".to_vec(),
+        );
+        let third = ResponseCassette::new(
+            "GET",
+            "https://example.com/c",
+            200,
+            Vec::new(),
+            b"c".to_vec(),
+        );
+        let fourth = ResponseCassette::new(
+            "GET",
+            "https://example.com/d",
+            200,
+            Vec::new(),
+            b"d".to_vec(),
+        );
+
+        {
+            let store = CassetteStore::open_with_retention_policy(&path, policy.clone())?;
+            store.record(&first)?;
+        }
+        let prefix_len = fs::metadata(&path)?.len();
+        {
+            let store = CassetteStore::open_with_retention_policy(&path, policy.clone())?;
+            store.record(&second)?;
+            store.record(&third)?;
+        }
+        {
+            let mut file = OpenOptions::new().write(true).open(&path)?;
+            let second_line_end = prefix_len
+                + fs::read(&path)?[prefix_len as usize..]
+                    .iter()
+                    .position(|byte| *byte == b'\n')
+                    .ok_or("second record is not newline-terminated")? as u64;
+            file.seek(SeekFrom::Start(prefix_len))?;
+            file.write_all(&vec![0u8; (second_line_end - prefix_len) as usize])?;
+        }
+
+        let store = CassetteStore::open_with_retention_policy(&path, policy)?;
+        assert_eq!(store.replay(&first.key)?, Some(first.clone()));
+        assert_eq!(store.replay(&second.key)?, None);
+        assert_eq!(store.replay(&third.key)?, None);
+        assert!(store.all().is_err());
+
+        store.record(&fourth)?;
+        assert_eq!(store.all()?, vec![first, fourth]);
+
+        remove_if_exists(&path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn cassette_corrupt_first_record_still_fails_loudly() -> TestResult {
+        // An undecodable FIRST record is indistinguishable from opening a
+        // healthy store with the wrong retention policy/key; self-healing
+        // here would truncate the whole store. It must stay a hard error.
+        let path = unique_path("cassette-corrupt-first")?;
+        remove_if_exists(&path)?;
+        let good = ResponseCassette::new(
+            "GET",
+            "https://example.com/good",
+            200,
+            Vec::new(),
+            b"ok".to_vec(),
+        );
+        {
+            let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+            file.write_all(b"\x00not-a-record\n")?;
+            let encoded = encode_durable_record_bytes(
+                &serde_json::to_vec(&good)?,
+                &DurableRetentionPolicy::PlaintextUnsafe,
+                cassette_aad(),
+            )?;
+            file.write_all(&encoded)?;
+            file.write_all(b"\n")?;
+        }
+
+        let store = CassetteStore::open(&path)?;
+        let len_before = fs::metadata(&path)?.len();
+        assert!(store.replay(&good.key).is_err());
+        assert!(store.record(&good).is_err());
+        // Nothing was truncated or appended.
+        assert_eq!(fs::metadata(&path)?.len(), len_before);
+
+        remove_if_exists(&path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn cassette_tail_repair_scans_multi_chunk_unterminated_tails() -> TestResult {
+        // Boundary coverage for CASSETTE_TAIL_SCAN_CHUNK (#513 follow-up):
+        // torn tails at exactly one chunk (last newline lands on the chunk
+        // boundary) and beyond one chunk (backwards scan must accumulate
+        // across chunks) — both must be truncated by the next record().
+        let path = unique_path("cassette-multi-chunk-tail")?;
+        remove_if_exists(&path)?;
+        let first = ResponseCassette::new(
+            "GET",
+            "https://example.com/one",
+            200,
+            Vec::new(),
+            b"one".to_vec(),
+        );
+        let second = ResponseCassette::new(
+            "GET",
+            "https://example.com/two",
+            200,
+            Vec::new(),
+            b"two".to_vec(),
+        );
+        let third = ResponseCassette::new(
+            "GET",
+            "https://example.com/three",
+            200,
+            Vec::new(),
+            b"three".to_vec(),
+        );
+
+        let store = CassetteStore::open(&path)?;
+        store.record(&first)?;
+
+        let torn_exactly_one_chunk = {
+            let mut torn = vec![b'{'];
+            torn.resize(CASSETTE_TAIL_SCAN_CHUNK as usize, b'x');
+            torn
+        };
+        {
+            let mut file = OpenOptions::new().append(true).open(&path)?;
+            file.write_all(&torn_exactly_one_chunk)?;
+        }
+        store.record(&second)?;
+        assert_eq!(store.all()?, vec![first.clone(), second.clone()]);
+
+        let torn_past_one_chunk = {
+            let mut torn = vec![b'{'];
+            torn.resize(CASSETTE_TAIL_SCAN_CHUNK as usize + 100, b'x');
+            torn
+        };
+        {
+            let mut file = OpenOptions::new().append(true).open(&path)?;
+            file.write_all(&torn_past_one_chunk)?;
+        }
+        store.record(&third)?;
+        assert_eq!(store.all()?, vec![first, second, third]);
 
         remove_if_exists(&path)?;
         Ok(())
