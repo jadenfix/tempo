@@ -868,6 +868,13 @@ pub fn composite_set_of_marks_rgba(
     height: u32,
     observation: &CompiledObservation,
 ) -> Result<Vec<u8>, MarkCompositorError> {
+    let expected = rgba_len(width, height)?;
+    if screenshot_rgba.len() != expected {
+        return Err(MarkCompositorError::InvalidBufferLength {
+            expected,
+            actual: screenshot_rgba.len(),
+        });
+    }
     let mut output = screenshot_rgba.to_vec();
     composite_set_of_marks_rgba_in_place(&mut output, width, height, observation)?;
     Ok(output)
