@@ -132,6 +132,10 @@ Layer → crate → responsibility (beater reuse in italics).
 - `tempo-evals` — WebVoyager / WebArena / Mind2Web-Live adapters over *beater-eval / beater-judge*; latency & token budgets as evaluators; regression gates.
 - `tempo-compat` — nightly Tranco top-1k scorecard runner, per-origin lane table (Servo vs fallback), fallback-rate KPI, injection red-team corpus runner.
 
+**Deferred / facade crates (not milestone-gated today)**
+- `tempo-crawl` — SDK facade over `tempo-net` crawl primitives. Zero in-tree consumers; not part of M0–M4 gates. Treat as experimental — API may move into `tempo-net` or be removed.
+- `tempo-speculate` — specified above for k-branch replay-fork (WS9) but has zero in-tree consumers until replay-fork v1 lands. Do not depend on it from external SDKs yet.
+
 **Beater consumption strategy.** tempo lives at `~/Desktop/beater/tempo` — its own git repo (github.com/jadenfix/tempo), a **sibling of `beatbox`, `beater-agents`, `beater.js`, and `beater.js-connect`** (same pattern each of those follows: independent repo, colocated on disk). Because they are sibling directories, reuse is via **Cargo path dependencies** across repos — e.g. `beatbox-client = { path = "../beatbox/crates/beatbox-client" }`, `beater-browser = { path = "../beater-agents/crates/beater-browser" }`, `beater-connect = { path = "../beater.js-connect/crates/beater-connect" }`, and the beater-agent journal/anthropic modules from `../beater.js/crates/beater-agent`. For CI/release where the sibling checkout isn't guaranteed, pin the same crates by git URL + rev. tempo's release cycle stays independent of the beater repos.
 
 ### 3.3 Process model

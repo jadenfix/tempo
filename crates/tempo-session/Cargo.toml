@@ -29,3 +29,7 @@ workspace = true
 [[bench]]
 name = "cassettes"
 harness = false
+
+[[bench]]
+name = "journal"
+harness = false

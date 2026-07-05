@@ -23,7 +23,7 @@ use chromiumoxide::cdp::browser_protocol::page::{
     CaptureScreenshotFormat, CreateIsolatedWorldParams, Viewport,
 };
 use chromiumoxide::cdp::browser_protocol::target::{
-    CreateBrowserContextParams, CreateTargetParams,
+    CloseTargetParams, CreateBrowserContextParams, CreateTargetParams,
 };
 use chromiumoxide::cdp::js_protocol::runtime::{EvaluateParams, ExecutionContextId};
 use chromiumoxide::error::CdpError;
@@ -86,7 +86,26 @@ const CDP_POLICY_PROXY_ARGS: [&str; 6] = [
     "--proxy-server",
 ];
 const CDP_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
-const TIMED_OUT_NAVIGATION_RECOVERY_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const TEMPOD_ENGINE_IPC_TIMEOUT: Duration = Duration::from_secs(30);
+/// Bound on awaiting the `Page.navigate` command *response*. The response is
+/// advisory: on freshly created (especially child-context) targets Chrome's
+/// answer is sometimes lost while the navigation itself proceeds, so a short
+/// await here hands off to the readyState recovery poll below instead of
+/// burning the caller's deadline on a reply that will never come.
+const CDP_NAVIGATION_AWAIT_TIMEOUT: Duration = Duration::from_secs(5);
+const CDP_CHILD_TARGET_SETUP_TIMEOUT: Duration = Duration::from_secs(2);
+const CDP_CHILD_TARGET_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
+/// Window for the readyState/URL recovery poll after a timed-out navigation
+/// await. 5s await + 20s poll keeps the whole bounded-navigation path under
+/// tempod's 30s engine IPC deadline (typed `NavTimeout` instead of an opaque
+/// IPC timeout) while still letting slow-but-loading pages finish — the
+/// values are derived from the caller's bound, not from test tuning.
+const TIMED_OUT_NAVIGATION_RECOVERY_TIMEOUT: Duration = Duration::from_secs(20);
+/// Child-context navigation has extra target setup, Fetch policy install, and
+/// cleanup work inside the same tempod IPC call. Keep its recovery window below
+/// the root lane so the worst-case failure path still has cleanup margin.
+const CHILD_TIMED_OUT_NAVIGATION_RECOVERY_TIMEOUT: Duration = Duration::from_secs(17);
 const TIMED_OUT_NAVIGATION_RECOVERY_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Explicit opt-out for Chromium sandboxing in constrained CI/container setups.
@@ -378,21 +397,49 @@ impl CdpTempoDriver {
         cursor: u64,
         requested_url: &str,
     ) -> Result<(), TransportError> {
-        let deadline = Instant::now() + TIMED_OUT_NAVIGATION_RECOVERY_TIMEOUT;
+        self.recover_timed_out_navigation_since_with_timeout(
+            cursor,
+            requested_url,
+            TIMED_OUT_NAVIGATION_RECOVERY_TIMEOUT,
+        )
+        .await
+    }
+
+    async fn recover_timed_out_navigation_since_with_timeout(
+        &self,
+        cursor: u64,
+        requested_url: &str,
+        recovery_timeout: Duration,
+    ) -> Result<(), TransportError> {
+        let deadline = Instant::now() + recovery_timeout;
         loop {
             self.enforce_no_blocked_request_soon_since(cursor).await?;
-            let current_url = self.current_url().await?;
+            let current_url =
+                match tokio::time::timeout(remaining_until(deadline)?, self.current_url()).await {
+                    Ok(result) => result?,
+                    Err(_) => return Err(TransportError::NavTimeout),
+                };
             self.enforce_current_url_policy_value(&current_url)?;
             self.enforce_no_blocked_request_since(cursor)?;
-            if let Some(ready_state) = self.document_ready_state_since(cursor).await?
+            let ready_state = match tokio::time::timeout(
+                remaining_until(deadline)?,
+                self.document_ready_state_since(cursor),
+            )
+            .await
+            {
+                Ok(result) => result?,
+                Err(_) => return Err(TransportError::NavTimeout),
+            };
+            if let Some(ready_state) = ready_state
                 && timed_out_navigation_recovered(requested_url, &current_url, &ready_state)
             {
                 return Ok(());
             }
-            if Instant::now() >= deadline {
-                return Err(TransportError::NavTimeout);
-            }
-            tokio::time::sleep(TIMED_OUT_NAVIGATION_RECOVERY_INTERVAL).await;
+            tokio::time::sleep(std::cmp::min(
+                TIMED_OUT_NAVIGATION_RECOVERY_INTERVAL,
+                remaining_until(deadline)?,
+            ))
+            .await;
         }
     }
 
@@ -457,6 +504,7 @@ impl CdpTempoDriver {
         let (mut compiled, selectors_by_node) =
             compile_observation(&mut self.stable_id_mapper, url, dom_html, self.seq);
         self.selectors_by_node = selectors_by_node;
+        self.populate_live_layout_bounds(&mut compiled).await?;
         self.enrich_observation_from_ax_tree(&mut compiled).await?;
         // Finish the live observation the same way the fixture compiler does:
         // rank-sort, apply the byte/token budget, and populate set-of-marks labels.
@@ -513,14 +561,18 @@ impl CdpTempoDriver {
         self.enforce_url_policy(url)?;
         self.clear_blocked_request()?;
         let cursor = self.request_policy_cursor();
-        match self.page()?.goto(url).await {
-            Ok(_page) => {}
-            Err(CdpError::Timeout) => {
-                self.recover_timed_out_navigation_since(cursor, url).await?;
-            }
-            Err(error) => {
-                self.enforce_no_blocked_request_soon_since(cursor).await?;
-                return Err(map_cdp_error(error));
+        if self.should_recreate_child_page_for_navigation() {
+            self.recreate_child_page_for_navigation(url, cursor).await?;
+        } else {
+            match tokio::time::timeout(CDP_NAVIGATION_AWAIT_TIMEOUT, self.page()?.goto(url)).await {
+                Ok(Ok(_page)) => {}
+                Ok(Err(CdpError::Timeout)) | Err(_) => {
+                    self.recover_timed_out_navigation_since(cursor, url).await?;
+                }
+                Ok(Err(error)) => {
+                    self.enforce_no_blocked_request_soon_since(cursor).await?;
+                    return Err(map_cdp_error(error));
+                }
             }
         }
         self.enforce_no_blocked_request_soon_since(cursor).await?;
@@ -536,6 +588,157 @@ impl CdpTempoDriver {
         let (final_url, dom_html) = self.snapshot_since(cursor).await?;
         self.record_snapshot_since(cursor, final_url, dom_html)
             .await
+    }
+
+    fn should_recreate_child_page_for_navigation(&self) -> bool {
+        self.browser_context_id.is_some()
+    }
+
+    /// Child-context navigation replaces the page with a fresh `about:blank`
+    /// target, installs per-page request policy on that target, then drives the
+    /// destination navigation. Creating the target at the destination would let
+    /// chromiumoxide start loading before Fetch interception exists, and a
+    /// timed-out create future can leave the browser with an orphan target.
+    async fn recreate_child_page_for_navigation(
+        &mut self,
+        url: &str,
+        cursor: u64,
+    ) -> Result<(), TransportError> {
+        let browser_context_id = self
+            .browser_context_id
+            .clone()
+            .ok_or_else(|| TransportError::Other("missing CDP browser context".into()))?;
+        let page_params = CreateTargetParams::builder()
+            .url("about:blank")
+            .browser_context_id(browser_context_id)
+            .build()
+            .map_err(|error| TransportError::Other(error.to_string()))?;
+        let new_page = match tokio::time::timeout(
+            CDP_CHILD_TARGET_SETUP_TIMEOUT,
+            self.browser.new_page(page_params),
+        )
+        .await
+        {
+            Ok(Ok(page)) => page,
+            // Dropping the create future is not cancellation: the target may
+            // already exist browser-side mid-load. Reap any page in this
+            // child context other than the current one so a retry loop
+            // against a hung destination cannot grow the browser unbounded.
+            Ok(Err(CdpError::Timeout)) | Err(_) => {
+                self.reap_orphan_child_pages().await;
+                self.enforce_no_blocked_request_soon_since(cursor).await?;
+                return Err(TransportError::NavTimeout);
+            }
+            Ok(Err(error)) => {
+                self.reap_orphan_child_pages().await;
+                self.enforce_no_blocked_request_soon_since(cursor).await?;
+                return Err(map_cdp_error(error));
+            }
+        };
+        let new_policy_task = match install_request_policy_bounded(
+            &new_page,
+            self.url_policy.clone(),
+            self.blocked_request_url.clone(),
+            self.request_policy_tracker.clone(),
+            CDP_CHILD_TARGET_SETUP_TIMEOUT,
+        )
+        .await
+        {
+            Ok(task) => task,
+            Err(error) => {
+                close_child_page_bounded(new_page).await;
+                return Err(error);
+            }
+        };
+
+        let old_page = self.page.replace(new_page);
+        let navigation_error = match tokio::time::timeout(
+            CDP_NAVIGATION_AWAIT_TIMEOUT,
+            self.page()?.goto(url),
+        )
+        .await
+        {
+            Ok(Ok(_page)) => None,
+            Ok(Err(CdpError::Timeout)) | Err(_) => self
+                .recover_timed_out_navigation_since_with_timeout(
+                    cursor,
+                    url,
+                    CHILD_TIMED_OUT_NAVIGATION_RECOVERY_TIMEOUT,
+                )
+                .await
+                .err(),
+            Ok(Err(error)) => {
+                if let Err(blocked) = self.enforce_no_blocked_request_soon_since(cursor).await {
+                    Some(blocked)
+                } else {
+                    Some(map_cdp_error(error))
+                }
+            }
+        };
+
+        if let Some(error) = navigation_error {
+            new_policy_task.abort();
+            let failed_page = self.page.take();
+            self.page = old_page;
+            if let Some(failed_page) = failed_page {
+                close_child_page_bounded(failed_page).await;
+            }
+            return Err(error);
+        }
+
+        if let Some(task) = self.request_policy_task.take() {
+            task.abort();
+        }
+        self.request_policy_task = Some(new_policy_task);
+        if let Ok(mut guard) = self.probe_context.lock() {
+            *guard = None;
+        }
+        if let Some(old_page) = old_page {
+            close_child_page_bounded(old_page).await;
+        }
+        Ok(())
+    }
+
+    /// Close every target in this driver's child browser context except the
+    /// page currently held. Used after a timed-out/failed target create,
+    /// where the dropped future may have left a half-created page behind
+    /// (`Target.createTarget` succeeds browser-side before `new_page`
+    /// resolves). Best-effort and bounded: reaping must not add unbounded
+    /// awaits to the failure path it cleans up.
+    async fn reap_orphan_child_pages(&mut self) {
+        let Some(context_id) = self.browser_context_id.clone() else {
+            return;
+        };
+        let deadline = Instant::now() + CDP_CHILD_TARGET_CLEANUP_TIMEOUT;
+        let current_target = self.page.as_ref().map(|page| page.target_id().clone());
+        let Ok(Ok(targets)) = tokio::time::timeout(
+            match remaining_until(deadline) {
+                Ok(remaining) => remaining,
+                Err(_) => return,
+            },
+            self.browser.fetch_targets(),
+        )
+        .await
+        else {
+            return;
+        };
+        for target in targets {
+            if target.browser_context_id.as_ref() != Some(&context_id) {
+                continue;
+            }
+            if Some(&target.target_id) == current_target.as_ref() {
+                continue;
+            }
+            let Ok(remaining) = remaining_until(deadline) else {
+                return;
+            };
+            let _ = tokio::time::timeout(
+                remaining,
+                self.browser
+                    .execute(CloseTargetParams::new(target.target_id.clone())),
+            )
+            .await;
+        }
     }
 
     async fn enrich_observation_from_ax_tree(
@@ -570,6 +773,50 @@ impl CdpTempoDriver {
             },
         )
         .await
+    }
+
+    async fn populate_live_layout_bounds(
+        &self,
+        observation: &mut CompiledObservation,
+    ) -> Result<(), TransportError> {
+        if observation.elements.is_empty() {
+            return Ok(());
+        }
+
+        let candidates: Vec<_> = observation
+            .elements
+            .iter()
+            .filter_map(|element| {
+                self.selectors_by_node
+                    .get(&element.node_id)
+                    .map(|selector| LayoutCandidate {
+                        node_id: element.node_id.clone(),
+                        selector: selector.clone(),
+                    })
+            })
+            .collect();
+        if candidates.is_empty() {
+            observation.elements.clear();
+            return Ok(());
+        }
+
+        self.enforce_current_url_policy().await?;
+        let layouts = self.live_layouts_for_candidates(&candidates).await?;
+        apply_layout_bounds(&mut observation.elements, &layouts);
+        Ok(())
+    }
+
+    async fn live_layouts_for_candidates(
+        &self,
+        candidates: &[LayoutCandidate],
+    ) -> Result<BTreeMap<NodeId, [f32; 4]>, TransportError> {
+        self.page()?
+            .evaluate(layout_probe_script(candidates)?)
+            .await
+            .map_err(map_cdp_error)?
+            .into_value::<serde_json::Value>()
+            .map_err(|error| TransportError::Other(error.to_string()))
+            .map(parse_layout_probe_results)
     }
 
     /// URL policy is enforced once by `enrich_observation_from_ax_tree` before
@@ -1575,6 +1822,33 @@ async fn install_request_policy(
     )))
 }
 
+async fn install_request_policy_bounded(
+    page: &Page,
+    url_policy: Arc<Mutex<UrlPolicy>>,
+    blocked_request_url: Arc<Mutex<Option<String>>>,
+    request_policy_tracker: Arc<RequestPolicyTracker>,
+    timeout: Duration,
+) -> Result<JoinHandle<()>, TransportError> {
+    match tokio::time::timeout(
+        timeout,
+        install_request_policy(
+            page,
+            url_policy,
+            blocked_request_url,
+            request_policy_tracker,
+        ),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(TransportError::NavTimeout),
+    }
+}
+
+async fn close_child_page_bounded(page: Page) {
+    let _ = tokio::time::timeout(CDP_CHILD_TARGET_CLEANUP_TIMEOUT, page.close()).await;
+}
+
 /// Pumps `Fetch.requestPaused` events, resuming each with bounded concurrency.
 ///
 /// Two properties matter here (see #441):
@@ -2069,6 +2343,13 @@ fn timed_out_navigation_recovered(
     ready_state == "complete" && navigation_urls_match(requested_url, current_url)
 }
 
+fn remaining_until(deadline: Instant) -> Result<Duration, TransportError> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or(TransportError::NavTimeout)
+}
+
 fn env_flag_enabled(name: &str) -> bool {
     std::env::var(name)
         .map(|value| {
@@ -2511,6 +2792,159 @@ fn top_ranked_indices(elements: &[InteractiveElement], limit: usize) -> Vec<usiz
     // Enrich in document order for deterministic, natural traversal.
     indices.sort_unstable();
     indices
+}
+
+#[derive(Clone, Debug)]
+struct LayoutCandidate {
+    node_id: NodeId,
+    selector: String,
+}
+
+fn layout_probe_script(candidates: &[LayoutCandidate]) -> Result<String, TransportError> {
+    let encoded_candidates = serde_json::to_string(
+        &candidates
+            .iter()
+            .map(|candidate| {
+                serde_json::json!({
+                    "node": candidate.node_id.0.as_str(),
+                    "selector": candidate.selector.as_str(),
+                })
+            })
+            .collect::<Vec<_>>(),
+    )
+    .map_err(|error| TransportError::Other(error.to_string()))?;
+
+    Ok(format!(
+        r#"(() => {{
+  const candidates = {encoded_candidates};
+  const viewportWidth = Math.max(
+    document.documentElement ? document.documentElement.clientWidth : 0,
+    window.innerWidth || 0
+  );
+  const viewportHeight = Math.max(
+    document.documentElement ? document.documentElement.clientHeight : 0,
+    window.innerHeight || 0
+  );
+  const round = (value) => Math.round(value * 100) / 100;
+  const unionRects = (rects) => {{
+    let left = Infinity;
+    let top = Infinity;
+    let right = -Infinity;
+    let bottom = -Infinity;
+    for (const rect of rects) {{
+      // Skip only point-sized (0x0) boxes. A rect that is degenerate along one
+      // axis still occupies layout space — e.g. an empty container that a later
+      // action fills and the agent then extracts — and must stay observable.
+      if (rect.width <= 0 && rect.height <= 0) {{
+        continue;
+      }}
+      left = Math.min(left, rect.left);
+      top = Math.min(top, rect.top);
+      right = Math.max(right, rect.right);
+      bottom = Math.max(bottom, rect.bottom);
+    }}
+    if (!Number.isFinite(left) || !Number.isFinite(top) ||
+        !Number.isFinite(right) || !Number.isFinite(bottom)) {{
+      return null;
+    }}
+    return {{left, top, right, bottom}};
+  }};
+  const isTypeHidden = (element) =>
+    element.tagName && element.tagName.toLowerCase() === 'input' &&
+    String(element.getAttribute('type') || '').toLowerCase() === 'hidden';
+  const output = [];
+  for (const candidate of candidates) {{
+    let element = null;
+    try {{
+      element = document.querySelector(candidate.selector);
+    }} catch (_error) {{
+      continue;
+    }}
+    if (!element || isTypeHidden(element) || element.closest('[hidden]')) {{
+      continue;
+    }}
+    const style = window.getComputedStyle(element);
+    if (style.display === 'none' || style.visibility === 'hidden' ||
+        style.visibility === 'collapse' || Number(style.opacity) === 0) {{
+      continue;
+    }}
+    const rect = unionRects(Array.from(element.getClientRects()));
+    if (!rect) {{
+      continue;
+    }}
+    const left = Math.max(0, rect.left);
+    const top = Math.max(0, rect.top);
+    const right = Math.min(viewportWidth, rect.right);
+    const bottom = Math.min(viewportHeight, rect.bottom);
+    // Strict comparison: a box that is degenerate along one axis after the
+    // viewport clamp (zero-height container, edge-touching element) is kept
+    // with its degenerate bounds; only boxes wholly outside the viewport drop.
+    if (right < left || bottom < top) {{
+      continue;
+    }}
+    output.push({{
+      node: candidate.node,
+      bounds: [round(left), round(top), round(right - left), round(bottom - top)],
+    }});
+  }}
+  return output;
+}})()"#
+    ))
+}
+
+fn parse_layout_probe_results(value: serde_json::Value) -> BTreeMap<NodeId, [f32; 4]> {
+    let mut layouts = BTreeMap::new();
+    let Some(entries) = value.as_array() else {
+        return layouts;
+    };
+    for entry in entries {
+        let Some(node) = entry.get("node").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let Some(bounds) = parse_layout_bounds(entry.get("bounds")) else {
+            continue;
+        };
+        layouts.insert(NodeId(node.to_string()), bounds);
+    }
+    layouts
+}
+
+fn parse_layout_bounds(value: Option<&serde_json::Value>) -> Option<[f32; 4]> {
+    let values = value?.as_array()?;
+    if values.len() != 4 {
+        return None;
+    }
+    let mut bounds = [0.0_f32; 4];
+    for (index, value) in values.iter().enumerate() {
+        let number = value.as_f64()?;
+        if !number.is_finite() {
+            return None;
+        }
+        bounds[index] = number as f32;
+    }
+    // Mirror the probe's retention rule: negative extents are malformed and a
+    // point-sized (0x0) box is unobservable, but a box degenerate along one
+    // axis (zero-height container awaiting content) keeps its bounds.
+    if bounds[2] < 0.0 || bounds[3] < 0.0 {
+        return None;
+    }
+    if bounds[2] <= 0.0 && bounds[3] <= 0.0 {
+        return None;
+    }
+    Some(bounds)
+}
+
+fn apply_layout_bounds(
+    elements: &mut Vec<InteractiveElement>,
+    layouts: &BTreeMap<NodeId, [f32; 4]>,
+) {
+    elements.retain_mut(|element| {
+        let Some(bounds) = layouts.get(&element.node_id) else {
+            return false;
+        };
+        element.bounds = Some(*bounds);
+        true
+    });
 }
 
 fn page_taint(value: &str) -> Vec<TaintSpan> {
@@ -3056,6 +3490,34 @@ mod tests {
     use std::net::{SocketAddr, TcpListener, TcpStream as StdTcpStream};
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    /// Boundary test for the bounded-navigation budget: the whole timed-out
+    /// path (navigation await + readyState recovery) must resolve inside
+    /// tempod's 30s engine IPC deadline (`ENGINE_IPC_TIMEOUT` in
+    /// tempo-headless — restated here because the contract crate cannot
+    /// depend upward on the daemon crate), or attached callers get an opaque
+    /// IPC timeout instead of the typed `NavTimeout` this lane exists for.
+    #[test]
+    fn bounded_navigation_path_resolves_inside_engine_ipc_deadline() {
+        assert!(
+            CDP_NAVIGATION_AWAIT_TIMEOUT + TIMED_OUT_NAVIGATION_RECOVERY_TIMEOUT
+                < TEMPOD_ENGINE_IPC_TIMEOUT,
+            "navigation await + recovery must leave margin under the 30s engine IPC bound"
+        );
+        assert!(
+            CDP_CHILD_TARGET_SETUP_TIMEOUT
+                + CDP_CHILD_TARGET_SETUP_TIMEOUT
+                + CDP_NAVIGATION_AWAIT_TIMEOUT
+                + CHILD_TIMED_OUT_NAVIGATION_RECOVERY_TIMEOUT
+                + CDP_CHILD_TARGET_CLEANUP_TIMEOUT
+                < TEMPOD_ENGINE_IPC_TIMEOUT,
+            "child create + policy install + navigation recovery + cleanup must stay under the 30s engine IPC bound"
+        );
+        assert!(
+            CDP_CHILD_TARGET_CLEANUP_TIMEOUT < TEMPOD_ENGINE_IPC_TIMEOUT,
+            "child cleanup awaits must be individually bounded below the engine IPC deadline"
+        );
+    }
+
     #[test]
     fn navigation_url_match_accepts_chromium_normalization_only() {
         assert!(navigation_urls_match(
@@ -3212,6 +3674,90 @@ mod tests {
             encoded.len() <= tempo_observe::DEFAULT_MAX_BYTES,
             "encoded observation should stay under the default byte budget"
         );
+    }
+
+    #[test]
+    fn layout_probe_script_json_encodes_candidates_and_filters_visibility(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let script = layout_probe_script(&[LayoutCandidate {
+            node_id: NodeId("node:1".into()),
+            selector: r#"[id="save"]"#.into(),
+        }])?;
+        let encoded_selector = serde_json::to_string(r#"[id="save"]"#)?;
+
+        assert!(script.contains(&format!("\"selector\":{encoded_selector}")));
+        assert!(script.contains("document.querySelector(candidate.selector)"));
+        assert!(script.contains("element.getClientRects()"));
+        assert!(script.contains("element.closest('[hidden]')"));
+        assert!(script.contains("getAttribute('type')"));
+        assert!(script.contains("right < left || bottom < top"));
+        Ok(())
+    }
+
+    #[test]
+    fn layout_probe_result_parser_keeps_concrete_and_single_axis_degenerate_bounds() {
+        let parsed = parse_layout_probe_results(serde_json::json!([
+            {"node": "node:visible", "bounds": [10.5, 20.0, 30.25, 40.75]},
+            {"node": "node:zero-width", "bounds": [0.0, 0.0, 0.0, 10.0]},
+            {"node": "node:zero-height", "bounds": [0.0, 0.0, 10.0, 0.0]},
+            {"node": "node:point", "bounds": [5.0, 5.0, 0.0, 0.0]},
+            {"node": "node:negative", "bounds": [0.0, 0.0, -1.0, 10.0]},
+            {"node": "node:bad", "bounds": [0.0, 0.0, "wide", 10.0]},
+            {"node": "node:short", "bounds": [0.0, 0.0, 10.0]},
+            {"node": 7, "bounds": [0.0, 0.0, 10.0, 10.0]}
+        ]));
+
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(
+            parsed.get(&NodeId("node:visible".into())).copied(),
+            Some([10.5, 20.0, 30.25, 40.75])
+        );
+        // Degenerate along one axis stays observable (empty containers that a
+        // later action fills); point-sized and negative extents are dropped.
+        assert_eq!(
+            parsed.get(&NodeId("node:zero-width".into())).copied(),
+            Some([0.0, 0.0, 0.0, 10.0])
+        );
+        assert_eq!(
+            parsed.get(&NodeId("node:zero-height".into())).copied(),
+            Some([0.0, 0.0, 10.0, 0.0])
+        );
+    }
+
+    #[test]
+    fn layout_filter_drops_elements_without_live_bounds_before_marks(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut elements = vec![
+            sample_element("node:hidden", 1.0),
+            sample_element("node:visible", 0.9),
+            sample_element("node:missing", 0.8),
+        ];
+        let layouts = BTreeMap::from([(NodeId("node:visible".into()), [4.0, 8.0, 40.0, 20.0])]);
+
+        apply_layout_bounds(&mut elements, &layouts);
+        let observation = finalize_observation(
+            "https://example.test/".into(),
+            1,
+            elements,
+            CompileOptions::default(),
+        );
+
+        assert_eq!(observation.elements.len(), 1);
+        assert_eq!(observation.elements[0].node_id.0, "node:visible");
+        assert_eq!(observation.elements[0].bounds, Some([4.0, 8.0, 40.0, 20.0]));
+        assert_eq!(observation.marks, vec![(NodeId("node:visible".into()), 1)]);
+        for (node_id, _label) in &observation.marks {
+            let marked = observation
+                .elements
+                .iter()
+                .find(|element| element.node_id == *node_id)
+                .ok_or_else(|| std::io::Error::other("mark references missing element"))?;
+            assert!(
+                marked.bounds.is_some(),
+                "mark must reference bounded element"
+            );
+        }
+        Ok(())
     }
 
     #[test]
@@ -4449,6 +4995,115 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn live_cdp_layout_pass_bounds_marks_and_filters_hidden_controls(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(chrome) = std::env::var_os("TEMPO_CDP_CHROME") else {
+            eprintln!("skipping live CDP layout observation test; TEMPO_CDP_CHROME is unset");
+            return Ok(());
+        };
+        let config = CdpConfig::default()
+            .with_executable(chrome.to_string_lossy())
+            .with_no_sandbox_env_opt_in();
+        let mut driver = CdpTempoDriver::launch_with(config).await?;
+        driver
+            .evaluate_script(
+                r#"(() => {
+                    document.body.style.margin = '0';
+                    document.body.innerHTML = [
+                        '<button id="visible" style="position:absolute;left:20px;top:24px;width:96px;height:32px">Visible</button>',
+                        '<button id="display-none" style="display:none">Display none</button>',
+                        '<button id="visibility-hidden" style="visibility:hidden">Visibility hidden</button>',
+                        '<button id="zero" style="position:absolute;left:20px;top:80px;width:0;height:0;padding:0;border:0;overflow:hidden">Zero size</button>',
+                        '<button id="offscreen" style="position:absolute;left:-1000px;top:20px;width:80px;height:24px">Offscreen</button>',
+                        '<div id="pending" tabindex="0" aria-label="Pending" style="position:absolute;left:20px;top:120px;width:200px;height:0"></div>',
+                        '<input id="secret" type="hidden" value="secret-token">'
+                    ].join('');
+                    return true;
+                })()"#,
+                true,
+            )
+            .await?;
+
+        let observation = driver.observe().await?;
+
+        let visible = observation
+            .elements
+            .iter()
+            .find(|element| element.name.first().map(|span| span.text.as_str()) == Some("Visible"))
+            .ok_or_else(|| std::io::Error::other("missing visible button"))?;
+        let bounds = visible
+            .bounds
+            .ok_or_else(|| std::io::Error::other("visible button missing bounds"))?;
+        assert!(bounds[0] >= 0.0 && bounds[1] >= 0.0);
+        assert!(bounds[2] > 0.0 && bounds[3] > 0.0);
+
+        // A rendered container that is degenerate along one axis (zero height,
+        // positive width) stays observable with its degenerate bounds — agents
+        // extract from empty containers that later actions fill. Only 0x0 and
+        // offscreen boxes are pruned.
+        let pending = observation
+            .elements
+            .iter()
+            .find(|element| element.name.first().map(|span| span.text.as_str()) == Some("Pending"))
+            .ok_or_else(|| std::io::Error::other("zero-height container should stay observable"))?;
+        let pending_bounds = pending
+            .bounds
+            .ok_or_else(|| std::io::Error::other("zero-height container missing bounds"))?;
+        assert!(pending_bounds[2] > 0.0, "positive width preserved");
+        assert_eq!(pending_bounds[3], 0.0, "degenerate height preserved");
+
+        for hidden_text in [
+            "Display none",
+            "Visibility hidden",
+            "Zero size",
+            "Offscreen",
+            "secret-token",
+        ] {
+            assert!(
+                !observation.elements.iter().any(|element| {
+                    element
+                        .name
+                        .iter()
+                        .chain(element.value.iter())
+                        .any(|span| span.text == hidden_text)
+                }),
+                "{hidden_text:?} should be filtered before finalization"
+            );
+        }
+
+        assert!(!observation.marks.is_empty());
+        for (node_id, _label) in &observation.marks {
+            let marked = observation
+                .elements
+                .iter()
+                .find(|element| element.node_id == *node_id)
+                .ok_or_else(|| std::io::Error::other("mark references missing element"))?;
+            assert!(
+                marked.bounds.is_some(),
+                "live CDP marks must reference elements with concrete bounds"
+            );
+        }
+        let encoded = serde_json::to_vec(&observation)?;
+        assert!(
+            encoded.len() <= tempo_observe::DEFAULT_MAX_BYTES,
+            "live observation should stay within the default budget"
+        );
+
+        let raw_screenshot = driver.screenshot().await?;
+        let mut unmarked = observation.clone();
+        unmarked.marks.clear();
+        let baseline = tempo_observe::composite_set_of_marks_png(&raw_screenshot, &unmarked)?;
+        let marked = tempo_observe::composite_set_of_marks_png(&raw_screenshot, &observation)?;
+        assert_ne!(
+            marked, baseline,
+            "set-of-marks compositing should change screenshot pixels when live bounds exist"
+        );
+
+        driver.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn live_cdp_driver_blocks_script_triggered_private_request(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let Some(chrome) = std::env::var_os("TEMPO_CDP_CHROME") else {
@@ -4909,7 +5564,13 @@ mod tests {
             })
             .await
             .map_err(|error| std::io::Error::other(error.0))?;
-        goto_live_fixture_with_retry(child.as_mut(), &url).await?;
+        let child_initial = tokio::time::timeout(
+            Duration::from_secs(20),
+            goto_live_fixture_with_retry(child.as_mut(), &url),
+        )
+        .await
+        .map_err(|_| std::io::Error::other("child initial goto timed out"))??;
+        assert_eq!(child_initial.url, url);
         let child_value = child
             .evaluate_script(
                 "Promise.resolve(localStorage.getItem('tempoIsolation') === null ? '__missing__' : localStorage.getItem('tempoIsolation'))",
@@ -4922,6 +5583,28 @@ mod tests {
 
         assert_eq!(child_value, serde_json::json!("__missing__"));
         assert_eq!(child_cookie, serde_json::json!(""));
+        let child_observe = tokio::time::timeout(Duration::from_secs(20), child.observe())
+            .await
+            .map_err(|_| std::io::Error::other("child observe timed out"))??;
+        assert_eq!(child_observe.url, url);
+        let child_next_url = format!("{url}again");
+        let child_second_goto =
+            tokio::time::timeout(Duration::from_secs(20), child.goto(&child_next_url))
+                .await
+                .map_err(|_| std::io::Error::other("child second goto timed out"))??;
+        assert_eq!(child_second_goto.url, child_next_url);
+        let child_batch = tokio::time::timeout(
+            Duration::from_secs(20),
+            child.act_batch(&ActionBatch {
+                actions: vec![Action::Goto {
+                    url: format!("{url}batch"),
+                }],
+                quiescence: QuiescencePolicy::FixedMillis(0),
+            }),
+        )
+        .await
+        .map_err(|_| std::io::Error::other("child act_batch goto timed out"))??;
+        assert!(matches!(child_batch, StepOutcome::Applied { .. }));
 
         child.close().await?;
         driver.close().await?;

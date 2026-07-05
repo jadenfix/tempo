@@ -44,6 +44,8 @@ jobs:
         run: bash scripts/check-servo-public-api.sh
       - name: no CAPTCHA solving service (#244)
         run: bash scripts/check-no-solver.sh
+      - name: denial sentinel guard (#332)
+        run: bash scripts/check-denial-sentinels.sh
       - name: cargo test (contracts + conformance)
         run: cargo test --workspace
       - name: cargo test (toolexec live beatbox)
@@ -137,9 +139,9 @@ jobs:
           "$TEMPO_CDP_CHROME" --version
           export TMPDIR="$(mktemp -d)"
           trap 'rm -rf "$TMPDIR"' EXIT
-          cargo test -p tempo-engine-cdp live_cdp -- --nocapture --test-threads=1 2>&1 | tee live-cdp.log
-          cargo test -p tempo-engine-cdp --test uds_driver -- --nocapture --test-threads=1 2>&1 | tee -a live-cdp.log
-          cargo test -p tempo-agent live_cdp -- --nocapture --test-threads=1 2>&1 | tee -a live-cdp.log
+          timeout --foreground 10m cargo test -p tempo-engine-cdp live_cdp -- --nocapture --test-threads=1 2>&1 | tee live-cdp.log
+          timeout --foreground 10m cargo test -p tempo-engine-cdp --test uds_driver -- --nocapture --test-threads=1 2>&1 | tee -a live-cdp.log
+          timeout --foreground 10m cargo test -p tempo-agent live_cdp -- --nocapture --test-threads=1 2>&1 | tee -a live-cdp.log
           grep -F "test tests::live_cdp_driver_passes_conformance_v2 ... ok" live-cdp.log
           grep -F "test tests::live_cdp_driver_navigates_observes_acts_and_screenshots ... ok" live-cdp.log
           grep -F "test cdp_driver_serves_commands_over_engine_host_uds ... ok" live-cdp.log
