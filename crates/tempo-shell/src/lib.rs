@@ -14,6 +14,7 @@ use thiserror::Error;
 
 pub mod agent;
 pub mod tab;
+pub mod transport;
 pub mod ui;
 #[cfg(feature = "window")]
 pub mod window;
