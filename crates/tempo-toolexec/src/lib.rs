@@ -61,6 +61,23 @@ impl ToolExecClient {
         Ok(self)
     }
 
+    /// Wrap an already-built beatbox client after validating the caller's
+    /// endpoint metadata. Because the raw client may already carry credentials,
+    /// injected clients are only accepted for endpoints where bearer transport
+    /// is safe.
+    pub fn from_validated_client(
+        client: BeatboxClient,
+        base_url: impl Into<String>,
+    ) -> Result<Self, ToolExecError> {
+        let endpoint = BeatboxEndpoint::parse(base_url)?;
+        endpoint.ensure_api_key_allowed()?;
+        Ok(Self { client, endpoint })
+    }
+
+    /// Compatibility constructor for dependency injection. A raw beatbox client
+    /// does not expose enough endpoint/auth metadata for Tempo to prove bearer
+    /// tokens cannot leak, so clients built this way are quarantined and cannot
+    /// dispatch HTTP requests.
     pub fn from_client(client: BeatboxClient) -> Self {
         Self {
             client,
@@ -74,6 +91,7 @@ impl ToolExecClient {
         &self,
         request: &ExecuteRequest,
     ) -> Result<ToolExecution, ToolExecError> {
+        self.endpoint.ensure_request_allowed()?;
         let result = self.client.execute(request).await?;
         Ok(ToolExecution::from_result(result))
     }
@@ -93,6 +111,7 @@ impl ToolExecClient {
         &self,
         request: &ExecuteRequest,
     ) -> Result<CreateJobResponse, ToolExecError> {
+        self.endpoint.ensure_request_allowed()?;
         Ok(self.client.create_job(request).await?)
     }
 
@@ -107,6 +126,7 @@ impl ToolExecClient {
     }
 
     pub async fn get_job(&self, job_id: &str) -> Result<JobRecord, ToolExecError> {
+        self.endpoint.ensure_request_allowed()?;
         Ok(self.client.get_job(job_id).await?)
     }
 
@@ -118,6 +138,7 @@ impl ToolExecClient {
     }
 
     pub async fn cancel_job(&self, job_id: &str) -> Result<(), ToolExecError> {
+        self.endpoint.ensure_request_allowed()?;
         Ok(self.client.cancel_job(job_id).await?)
     }
 }
@@ -201,13 +222,19 @@ impl BeatboxEndpoint {
     }
 
     fn ensure_api_key_allowed(&self) -> Result<(), BeatboxEndpointError> {
-        if !self.validated {
-            return Err(BeatboxEndpointError::UnvalidatedClient);
-        }
+        self.ensure_request_allowed()?;
         if self.scheme == EndpointScheme::Https || self.host.is_loopback() {
             return Ok(());
         }
         Err(BeatboxEndpointError::PlaintextRemoteBearer)
+    }
+
+    fn ensure_request_allowed(&self) -> Result<(), BeatboxEndpointError> {
+        if self.validated {
+            Ok(())
+        } else {
+            Err(BeatboxEndpointError::UnvalidatedClient)
+        }
     }
 }
 
@@ -816,6 +843,48 @@ mod tests {
             ))
         ));
         Ok(())
+    }
+
+    #[test]
+    fn beatbox_validated_injected_clients_require_credential_safe_endpoint(
+    ) -> Result<(), ToolExecError> {
+        let _https = ToolExecClient::from_validated_client(
+            BeatboxClient::new("https://beatbox.example").with_api_key("fixture-key"),
+            "https://beatbox.example",
+        )?;
+        let _loopback = ToolExecClient::from_validated_client(
+            BeatboxClient::new("http://127.0.0.1:8080").with_api_key("fixture-key"),
+            "http://127.0.0.1:8080",
+        )?;
+
+        let remote_plaintext = ToolExecClient::from_validated_client(
+            BeatboxClient::new("http://beatbox.example").with_api_key("fixture-key"),
+            "http://beatbox.example",
+        );
+        assert!(matches!(
+            remote_plaintext,
+            Err(ToolExecError::Endpoint(
+                BeatboxEndpointError::PlaintextRemoteBearer
+            ))
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn raw_injected_clients_reject_dispatch_before_network() {
+        let raw = BeatboxClient::new("http://203.0.113.1:9").with_api_key("fixture-key");
+        let executor = ToolExecClient::from_client(raw);
+
+        let result = executor
+            .execute_trusted_request(&live_smoke_request("tempo-toolexec-raw-injected"))
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ToolExecError::Endpoint(
+                BeatboxEndpointError::UnvalidatedClient
+            ))
+        ));
     }
 
     #[test]
