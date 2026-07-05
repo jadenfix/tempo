@@ -600,11 +600,9 @@ fn compat_json_from<T: for<'de> Deserialize<'de>>(
 }
 
 fn flatten_spans(spans: &[TaintSpan]) -> String {
-    spans
-        .iter()
-        .map(|span| span.text.as_str())
-        .collect::<Vec<_>>()
-        .join("")
+    // `collect::<String>()` concatenates in a single pass; the intermediate
+    // `Vec<&str>` that `.join("")` needs is unnecessary here.
+    spans.iter().map(|span| span.text.as_str()).collect()
 }
 
 /// How the executor decides a page has settled after a batch (final.md §2.4).
