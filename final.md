@@ -458,8 +458,8 @@ End-to-end task time is:
 task_time ≈ Σ_steps [ prefill(input_tokens) + decode(output_tokens) + observe + act + settle ]
 ```
 
-Measured reality (browser-use's own published numbers, and structurally identical
-for tempo since both call the same frontier models over the same APIs): **decode
+Measured reality (browser-use's own published numbers, used here as an external
+latency shape rather than a controlled model-matched benchmark): **decode
 dominates** — output tokens cost ≈215× the wall-time of input tokens, a screenshot
 adds ≈0.8 s, a step ≈3 s, a task ≈68 s. Engine work (observe + act + settle) is
 ≈0.05–0.25 s. **Amdahl's law is therefore the governing constraint:** shaving
@@ -507,8 +507,9 @@ per step). The verified delta:
   `llms.txt`/WebMCP) that skips pixels when a site speaks an agent protocol.
 - **Where tempo was behind and is being closed:** the live CDP observation
   bypassed the compiler (unranked, unbudgeted, no marks, no visibility/`bounds`,
-  weak interactive recall, no shadow/iframe) — #477, first slice landed (ranked +
-  budgeted + mark labels via `finalize_observation`), remaining slices below.
+  weak interactive recall, no shadow/iframe) — #477. The first slice is in #486
+  (ranked + budgeted + mark labels via `finalize_observation`); until that PR
+  merges, `main` should still be treated as missing the live compiler tail.
 - **Claim-not-yet-delivery, to be repositioned honestly:** Servo primary (no
   runnable binary — CDP *is* Chromium today, #453); speculation/forking (Unsupported
   on the live engine, #457); observation diffs to the model (#447).
@@ -516,7 +517,7 @@ per step). The verified delta:
 ### 12.4 Prioritized roadmap (issue-tracked; ship as PRs)
 
 1. **Observation quality — the make-or-break bet (#477).** Route through the
-   compiler (done); then real `bounds` + `visible` from `DOMSnapshot.captureSnapshot`,
+   compiler (#486); then real `bounds` + `visible` from `DOMSnapshot.captureSnapshot`,
    visibility/occlusion culling, event-listener/`cursor:pointer` recall, shadow-DOM
    pierce + iframe recursion. Precondition for the token-economy work.
 2. **Token economy — attacks the 90 %.** MCP double-encode (#444), lean projection
