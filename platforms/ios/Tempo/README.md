@@ -12,6 +12,10 @@ WebView snapshot compilation from `tempo-ios-core` when built with
 `TEMPO_RUST_LINKED`. SwiftPM tests use the same payload shape with a source-level
 fallback so the shell can be checked without a linked staticlib.
 
+WKWebView storage is ephemeral by default: each tab is created with a
+non-persistent `WKWebsiteDataStore`. Persistent/shared profile support must be
+added only through an explicit Tempo storage-continuity mode.
+
 Validation from the repo root:
 
 ```sh

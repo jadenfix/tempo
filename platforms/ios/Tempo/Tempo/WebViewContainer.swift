@@ -16,7 +16,9 @@ struct WebViewContainer: UIViewRepresentable {
 
     func makeUIView(context: Context) -> WKWebView {
         let configuration = WKWebViewConfiguration()
-        configuration.websiteDataStore = .default()
+        // Default to per-tab ephemeral storage. Shared/persistent profiles must
+        // be opt-in through Tempo's session storage-continuity contract.
+        configuration.websiteDataStore = .nonPersistent()
         configuration.userContentController.addUserScript(WKUserScript(
             source: observationScript,
             injectionTime: .atDocumentEnd,
