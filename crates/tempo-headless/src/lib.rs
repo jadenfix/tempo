@@ -966,6 +966,7 @@ pub struct SessionPool {
     session_act_batch_idempotency:
         BTreeMap<TempodSessionId, BTreeMap<String, SessionActBatchIdempotencyEntry>>,
     events: BTreeMap<TempodSessionId, SessionEventLog>,
+    volatile_event_seq: BTreeMap<TempodSessionId, u64>,
     event_broadcast: broadcast::Sender<TempodSessionEvent>,
     owners: BTreeMap<TempodSessionId, ControlOwner>,
     attachments: BTreeMap<TempodSessionId, BTreeMap<ShellSurfaceId, SessionAttachment>>,
@@ -1003,6 +1004,7 @@ impl Default for SessionPool {
             session_drivers: BTreeMap::new(),
             session_act_batch_idempotency: BTreeMap::new(),
             events: BTreeMap::new(),
+            volatile_event_seq: BTreeMap::new(),
             event_broadcast,
             owners: BTreeMap::new(),
             attachments: BTreeMap::new(),
@@ -1049,6 +1051,10 @@ impl fmt::Debug for SessionPool {
                 &session_act_batch_idempotency_records,
             )
             .field("event_sessions", &self.events.len())
+            .field(
+                "volatile_event_seq_sessions",
+                &self.volatile_event_seq.len(),
+            )
             .field(
                 "event_stream_receivers",
                 &self.event_broadcast.receiver_count(),
@@ -1937,6 +1943,7 @@ impl SessionPool {
         };
         let detached = self.session_drivers.remove(id);
         let root = self.driver.clone();
+        self.volatile_event_seq.remove(id);
         self.owners.remove(id);
         self.attachments.remove(id);
         self.active_runs.remove(id);
@@ -2450,6 +2457,7 @@ impl SessionPool {
         let excess = terminal.len().saturating_sub(max_terminal);
         for id in terminal.into_iter().take(excess) {
             self.events.remove(&id);
+            self.volatile_event_seq.remove(&id);
             self.clear_session_idempotency(&id);
             self.owners.remove(&id);
             self.attachments.remove(&id);
@@ -2513,9 +2521,10 @@ impl SessionPool {
         event: TempodSessionEventKind,
     ) -> TempodSessionEvent {
         let record = if !self.privacy_mode.retains_history() {
+            let seq = self.next_volatile_event_seq(id);
             TempodSessionEvent {
                 session_id: id.clone(),
-                seq: 0,
+                seq,
                 timestamp_ms: current_time_ms(),
                 event,
             }
@@ -2524,6 +2533,13 @@ impl SessionPool {
         };
         let _ = self.event_broadcast.send(record.clone());
         record
+    }
+
+    fn next_volatile_event_seq(&mut self, id: &TempodSessionId) -> u64 {
+        let seq = self.volatile_event_seq.entry(id.clone()).or_default();
+        let current = *seq;
+        *seq = seq.saturating_add(1);
+        current
     }
 
     fn record_manager_event(&mut self, id: &TempodSessionId, event: ManagerEvent) {
@@ -10523,6 +10539,33 @@ mod tests {
             pool.events(&session.id, None),
             Err(TempodError::SessionNotFound(_))
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn stealth_mode_live_events_use_volatile_monotonic_sequence_ids() -> TestResult {
+        let mut pool = SessionPool::default().with_privacy_mode(PrivacyMode::Stealth);
+        let session = pool.create("https://stealth-live.test")?;
+        let (replay, mut receiver) = pool.subscribe_events(&session.id, None)?;
+
+        assert!(replay.events.is_empty());
+
+        pool.adopt(&session.id)?;
+        pool.record_step(&session.id, sample_step_triple(13))?;
+
+        let adopted = receiver
+            .try_recv()
+            .map_err(|error| TempodError::Driver(error.to_string()))?;
+        let step = receiver
+            .try_recv()
+            .map_err(|error| TempodError::Driver(error.to_string()))?;
+        assert_eq!(adopted.session_id, session.id);
+        assert_eq!(step.session_id, session.id);
+        assert!(
+            adopted.seq < step.seq,
+            "stealth live SSE ids must be usable for in-connection dedupe"
+        );
+        assert!(pool.events(&session.id, None)?.events.is_empty());
         Ok(())
     }
 
