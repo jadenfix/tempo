@@ -47,8 +47,9 @@ Commands:
   drain
 
 Options:
-  --tempod ADDR   tempod address, default 127.0.0.1:8787
-  --auth-token TOKEN (default: TEMPO_TEMPOD_AUTH_TOKEN or tempod runtime token file)
+  -V, --version
+  --tempod ADDR       tempod address, default 127.0.0.1:8787
+  --auth-token TOKEN  default: TEMPO_TEMPOD_AUTH_TOKEN or tempod runtime token file
 ";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -107,6 +108,13 @@ impl ShellOptions {
                         command: ShellCommand::Help,
                     });
                 }
+                "-V" | "--version" => {
+                    return Ok(Self {
+                        tempod_addr,
+                        auth_token,
+                        command: ShellCommand::Version,
+                    });
+                }
                 _ => break,
             }
         }
@@ -123,6 +131,7 @@ impl ShellOptions {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ShellCommand {
     Help,
+    Version,
     Health,
     Sessions,
     Open {
@@ -154,6 +163,10 @@ impl ShellCommand {
         match self {
             Self::Help => {
                 stdout.write_all(USAGE.as_bytes())?;
+                Ok(())
+            }
+            Self::Version => {
+                writeln!(stdout, "{}", env!("CARGO_PKG_VERSION"))?;
                 Ok(())
             }
             Self::Health => write_json(stdout, &client.health()?),
@@ -822,6 +835,26 @@ mod tests {
     };
 
     type TestResult = Result<(), Box<dyn Error>>;
+
+    #[test]
+    fn version_flag_selects_version_command() -> TestResult {
+        let options = ShellOptions::parse(["--version"])?;
+        assert!(matches!(options.command, ShellCommand::Version));
+        let mut stdout = Vec::new();
+        options
+            .command
+            .execute(&ShellClient::new(DEFAULT_TEMPOD_ADDR), &mut stdout)?;
+        assert_eq!(
+            String::from_utf8(stdout)?,
+            format!("{}\n", env!("CARGO_PKG_VERSION"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn help_advertises_version_flag() {
+        assert!(USAGE.contains("-V, --version"));
+    }
 
     #[test]
     fn parses_commands_with_tempod_option() -> TestResult {

@@ -9,6 +9,10 @@ fn main() {
         eprintln!("{}", usage());
         std::process::exit(0);
     }
+    if args.iter().any(|arg| arg == "-V" || arg == "--version") {
+        println!("{}", env!("CARGO_PKG_VERSION"));
+        std::process::exit(0);
+    }
     let config_overrides = match TempodOptions::config_overrides(&args) {
         Ok(overrides) => overrides,
         Err(err) => {
@@ -280,7 +284,7 @@ fn parse_engine(value: &str) -> Result<Engine, String> {
 
 fn usage() -> String {
     format!(
-        "usage: tempod [ADDR] [--engine cdp|servo] [--engine-socket PATH] [--allow-remote] [--auth-token TOKEN]\n\
+        "usage: tempod [ADDR] [-V, --version] [--engine cdp|servo] [--engine-socket PATH] [--allow-remote] [--auth-token TOKEN]\n\
          [--allow-private-network]\n\
          \n\
          layered config: defaults < JSON file named by {config_env} < TEMPO_* env < flags\n\
@@ -313,6 +317,11 @@ mod tests {
         assert!(options.allow_remote);
         assert_eq!(options.auth_token.as_deref(), Some("secret-token"));
         Ok(())
+    }
+
+    #[test]
+    fn help_advertises_version_flag() {
+        assert!(usage().contains("-V, --version"));
     }
 
     #[test]
