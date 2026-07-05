@@ -839,6 +839,15 @@ mod tests {
     fn version_flag_selects_version_command() -> TestResult {
         let options = ShellOptions::parse(["--version"])?;
         assert!(matches!(options.command, ShellCommand::Version));
+        let mut stdout = Vec::new();
+        options.command.execute(
+            &ShellClient::new(DEFAULT_TEMPOD_ADDR),
+            &mut stdout,
+        )?;
+        assert_eq!(
+            String::from_utf8(stdout)?,
+            format!("{}\n", env!("CARGO_PKG_VERSION"))
+        );
         Ok(())
     }
 
