@@ -388,7 +388,7 @@ mod tests {
     use crate::{HealthResponse, ShellError};
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
-    use tempo_headless::{TempodSession, TempodSessionEvent};
+    use tempo_headless::{TempodSession, TempodSessionEvents};
 
     /// A fake transport with no socket: records the calls it receives and returns
     /// canned health/sessions. `delay` lets a test hold a request "in flight" to
@@ -472,9 +472,12 @@ mod tests {
             &self,
             session_id: &str,
             _after_seq: Option<u64>,
-        ) -> Result<Vec<TempodSessionEvent>, ShellError> {
+        ) -> Result<TempodSessionEvents, ShellError> {
             self.record(&format!("events:{session_id}"));
-            Ok(Vec::new())
+            Ok(TempodSessionEvents {
+                events: Vec::new(),
+                truncated_before_seq: None,
+            })
         }
     }
 
