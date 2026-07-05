@@ -1,9 +1,9 @@
 //! SessionJournal append throughput under WAL + synchronous=NORMAL (#304).
 //!
 //! Satisfies the #232 / #314 acceptance bar: measure the post-WAL hot path that
-//! replay-fork and decided-run journaling depend on. Before/after numbers for the
-//! old DELETE+FULL config were captured in #304's test suite; this bench tracks
-//! regression on the current configuration only.
+//! replay-fork and decided-run journaling depend on. Capture before/after ratios
+//! against the legacy DELETE+FULL configuration via `scripts/bench.sh` baselines
+//! (see #304 for the WAL migration; throughput comparison is operator-run, not CI-gated).
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
@@ -39,7 +39,7 @@ fn bench_journal_append(c: &mut Criterion) {
                     }
                     black_box(journal.next_seq())
                 },
-                criterion::BatchSize::SmallInput,
+                criterion::BatchSize::PerIteration,
             );
         });
     }
