@@ -10,7 +10,7 @@ use std::sync::{Arc, Condvar, LazyLock, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tempo_driver::{
     output_cap_message, DriverTrait, Engine, StepOutcome, MAX_EXTRACT_JSON_BYTES,
@@ -1222,9 +1222,16 @@ impl ToolCall {
         }
     }
 
-    fn success_json_bounded(artifact: &'static str, value: Value, max_bytes: usize) -> Self {
+    fn success_json_bounded<T: Serialize>(
+        artifact: &'static str,
+        value: T,
+        max_bytes: usize,
+    ) -> Self {
         match serde_json::to_vec(&value) {
-            Ok(bytes) if bytes.len() <= max_bytes => Self::success(value),
+            Ok(bytes) if bytes.len() <= max_bytes => match serde_json::from_slice(&bytes) {
+                Ok(structured_content) => Self::success(structured_content),
+                Err(error) => Self::error(error.to_string()),
+            },
             Ok(bytes) => Self::cap_error(artifact, bytes.len(), max_bytes),
             Err(error) => Self::error(error.to_string()),
         }
@@ -2466,7 +2473,8 @@ mod tests {
         assert_eq!(batch["diff"]["seq"], 3);
 
         let extract = call_tool(&mut server, "extract", json!({"node": "button.primary"})).await?;
-        assert_eq!(extract["node"], "button.primary");
+        assert_eq!(extract["provenance"], "page");
+        assert_eq!(extract["value"]["node"], "button.primary");
 
         let screenshot = call_tool_envelope(&mut server, "screenshot", json!({})).await?;
         let screenshot_meta = &screenshot["result"]["structuredContent"];
@@ -3882,20 +3890,24 @@ mod tests {
             Ok(Box::new(self.clone()))
         }
 
-        async fn extract(&mut self, node: &NodeId) -> Result<Value, TransportError> {
-            Ok(self
-                .extract_value
-                .clone()
-                .unwrap_or_else(|| json!({"node": node.0, "text": "Continue"})))
+        async fn extract(
+            &mut self,
+            node: &NodeId,
+        ) -> Result<tempo_driver::TaintedValue, tempo_driver::TransportError> {
+            Ok(tempo_driver::TaintedValue::page(
+                self.extract_value
+                    .clone()
+                    .unwrap_or_else(|| json!({"node": node.0, "text": "Continue"})),
+            ))
         }
 
         async fn evaluate_script(
             &mut self,
             expression: &str,
             await_promise: bool,
-        ) -> Result<Value, TransportError> {
+        ) -> Result<tempo_driver::TaintedValue, tempo_driver::TransportError> {
             if expression == WEB_MCP_DETECTION_SCRIPT {
-                return Ok(json!({
+                return Ok(tempo_driver::TaintedValue::page(json!({
                     "available": self.web_mcp_available,
                     "type": if self.web_mcp_available { Some("object") } else { None },
                     "hasTools": self.web_mcp_has_tools,
@@ -3904,12 +3916,12 @@ mod tests {
                     } else {
                         Vec::<&str>::new()
                     },
-                }));
+                })));
             }
-            Ok(json!({
+            Ok(tempo_driver::TaintedValue::page(json!({
                 "expression": expression,
                 "awaitPromise": await_promise,
-            }))
+            })))
         }
 
         async fn screenshot(&mut self) -> Result<Vec<u8>, TransportError> {

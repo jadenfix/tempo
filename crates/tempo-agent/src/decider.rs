@@ -1815,16 +1815,19 @@ mod tests {
             Err(tempo_driver::Unsupported("challenge driver does not fork"))
         }
 
-        async fn extract(&mut self, _node: &NodeId) -> Result<serde_json::Value, TransportError> {
-            Ok(serde_json::Value::Null)
+        async fn extract(
+            &mut self,
+            _node: &NodeId,
+        ) -> Result<tempo_driver::TaintedValue, TransportError> {
+            Ok(tempo_driver::TaintedValue::page(serde_json::Value::Null))
         }
 
         async fn evaluate_script(
             &mut self,
             _expression: &str,
             _await_promise: bool,
-        ) -> Result<serde_json::Value, TransportError> {
-            Ok(serde_json::Value::Null)
+        ) -> Result<tempo_driver::TaintedValue, TransportError> {
+            Ok(tempo_driver::TaintedValue::page(serde_json::Value::Null))
         }
 
         async fn screenshot(&mut self) -> Result<Vec<u8>, TransportError> {
@@ -2817,16 +2820,19 @@ mod tests {
             Err(tempo_driver::Unsupported("diff driver does not fork"))
         }
 
-        async fn extract(&mut self, _node: &NodeId) -> Result<serde_json::Value, TransportError> {
-            Ok(serde_json::Value::Null)
+        async fn extract(
+            &mut self,
+            _node: &NodeId,
+        ) -> Result<tempo_driver::TaintedValue, TransportError> {
+            Ok(tempo_driver::TaintedValue::page(serde_json::Value::Null))
         }
 
         async fn evaluate_script(
             &mut self,
             _expression: &str,
             _await_promise: bool,
-        ) -> Result<serde_json::Value, TransportError> {
-            Ok(serde_json::Value::Null)
+        ) -> Result<tempo_driver::TaintedValue, TransportError> {
+            Ok(tempo_driver::TaintedValue::page(serde_json::Value::Null))
         }
 
         async fn screenshot(&mut self) -> Result<Vec<u8>, TransportError> {
