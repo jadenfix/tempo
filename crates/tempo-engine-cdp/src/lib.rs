@@ -1383,6 +1383,7 @@ struct RequestPolicyState {
     next_seq: u64,
     pending: BTreeSet<u64>,
     blocked: VecDeque<BlockedRequest>,
+    resume_failures: u64,
 }
 
 struct RequestPolicyTracker {
@@ -1440,8 +1441,18 @@ impl RequestPolicyTracker {
         self.lock().pending.range(cursor..).next().is_some()
     }
 
+    fn record_resume_failure(&self) {
+        let mut guard = self.lock();
+        guard.resume_failures = guard.resume_failures.saturating_add(1);
+    }
+
     async fn notified(&self) {
         self.notify.notified().await;
+    }
+
+    #[cfg(test)]
+    fn resume_failures(&self) -> u64 {
+        self.lock().resume_failures
     }
 
     #[cfg(test)]
@@ -1644,6 +1655,7 @@ async fn finish_paused_request_after_policy<Execute, Fut, Error>(
 ) where
     Execute: FnOnce(bool) -> Fut,
     Fut: std::future::Future<Output = Result<(), Error>>,
+    Error: std::fmt::Display,
 {
     let seq = request_policy_tracker.start_request();
     let blocked_url = if allowed {
@@ -1652,7 +1664,14 @@ async fn finish_paused_request_after_policy<Execute, Fut, Error>(
         mark_blocked_request_url(blocked_request_url, request_url);
         Some(request_url.to_string())
     };
-    let _resume_result = execute(allowed).await;
+    // Resume failures are non-fatal — Chrome routinely rejects continue/fail under
+    // races (e.g. "Invalid InterceptionId" on a request it cancelled mid-navigation)
+    // — so we swallow the error and keep pumping (#441). But log it: a systematic
+    // failure (every continue failing) should be diagnosable, not silent.
+    if let Err(error) = execute(allowed).await {
+        eprintln!("tempo-engine-cdp: failed to resume paused request {request_url}: {error}");
+        request_policy_tracker.record_resume_failure();
+    }
     request_policy_tracker.finish_request(seq, blocked_url);
 }
 
@@ -3983,6 +4002,11 @@ mod tests {
             "continueRequest errors must not leave pending request seqs"
         );
         assert_eq!(tracker.blocked_len(), 0);
+        assert_eq!(
+            tracker.resume_failures(),
+            1,
+            "swallowed continueRequest error must still be recorded as a resume failure"
+        );
     }
 
     #[tokio::test]
@@ -4009,6 +4033,11 @@ mod tests {
             Ok(guard) => assert_eq!(guard.as_deref(), Some(blocked_url)),
             Err(error) => panic!("blocked URL lock poisoned: {error}"),
         }
+        assert_eq!(
+            tracker.resume_failures(),
+            1,
+            "swallowed failRequest error must still be recorded as a resume failure"
+        );
     }
 
     #[test]
