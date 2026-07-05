@@ -72,11 +72,40 @@ jobs:
         run: >
           cargo run -p tempo-cli -- taint-gate
           --input fixtures/security/taint-redteam-pass.json
+      - name: detect servo-gated changes
+        id: servo-gates
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          HEAD_SHA="${{ github.sha }}"
+          if ! git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
+            echo "Could not resolve base SHA (${BASE_SHA}); running servo gates conservatively."
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          changed_files="$(git diff --name-only "${BASE_SHA}" "${HEAD_SHA}")"
+          servo_gate_pattern='^\.github/workflows/|^Cargo\.toml$|^crates/(tempo-engine-servo|tempo-headless|tempo-engine-host|tempo-driver|tempo-net|tempo-schema|tempo-mcp|tempo-session|tempo-shell|tempo-cli|tempo-observe|tempo-compat|tempo-policy|tempo-evals|tempo-config)/|^scripts/(check-servo-public-api|cargo-servo-tempo)\.sh$'
+          if printf '%s\n' "${changed_files}" | grep -Eq "${servo_gate_pattern}"; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
       - name: install Servo system deps
+        if: steps.servo-gates.outputs.run == 'true'
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libfontconfig1-dev llvm
       - name: servo vanilla build gate
+        if: steps.servo-gates.outputs.run == 'true'
         run: cargo check -p tempo-engine-servo --no-default-features --features servo-vanilla
       - name: servo tempo fork build gate
+        if: steps.servo-gates.outputs.run == 'true'
         run: bash scripts/cargo-servo-tempo.sh
 
   windows-core:
