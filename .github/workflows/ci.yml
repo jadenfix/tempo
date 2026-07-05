@@ -44,6 +44,8 @@ jobs:
         run: bash scripts/check-servo-public-api.sh
       - name: no CAPTCHA solving service (#244)
         run: bash scripts/check-no-solver.sh
+      - name: denial sentinel guard (#332)
+        run: bash scripts/check-denial-sentinels.sh
       - name: cargo test (contracts + conformance)
         run: cargo test --workspace
       - name: cargo test (toolexec live beatbox)
