@@ -4443,6 +4443,65 @@ mod tests {
         Ok(())
     }
 
+    /// Reverted-fix sentinel, driven through the real resume path: a
+    /// `StepError` journaled with `policy_denied: true` but reason prose that
+    /// does NOT match the legacy prefix heuristic must still resume as
+    /// `PolicyDenied` via `AgentRunner::run_driver_task` →
+    /// `apply_resume_terminal_status`. Unlike
+    /// `resume_cursor_policy_denial_tag_overrides_unmatched_prose` (which only
+    /// inspects the cursor), this test asserts the caller-visible
+    /// `AgentRunStatus` and fails if lib.rs reverts `apply_resume_terminal_status`
+    /// to prefix-only matching (`is_policy_denial_reason(reason)` without the
+    /// `*policy_denied ||` tag check).
+    #[tokio::test]
+    async fn runner_resume_policy_denial_tag_overrides_unmatched_prose() -> TestResult {
+        let root = unique_dir("resume-policy-tag-unmatched-prose")?;
+        remove_dir_if_exists(&root)?;
+        fs::create_dir_all(&root)?;
+        let journal_path = root.join("session.jsonl");
+        let action = Action::Click {
+            node: NodeId("submit".into()),
+        };
+        let ids = AgentRunIds::new(
+            "run-resume-policy-tag-unmatched-prose",
+            "session-resume-policy-tag-unmatched-prose",
+        );
+
+        let mut journal =
+            SessionJournal::open(&journal_path, ids.run_id.clone(), ids.session_id.clone())?;
+        journal.append(JournalEvent::SessionStarted {
+            url: "https://example.com".into(),
+        })?;
+        journal.append(JournalEvent::ActionPlanned {
+            action: action.clone(),
+        })?;
+        // Reason deliberately does not start with "policy requires" or
+        // "policy denied" — only the typed tag marks this a policy denial.
+        let reason = "some opaque upstream message".to_string();
+        assert!(!is_policy_denial_reason(&reason));
+        journal.append(JournalEvent::StepError {
+            action: action.clone(),
+            reason: reason.clone(),
+            policy_denied: true,
+        })?;
+        drop(journal);
+
+        let task = DriverTask::new("https://example.com", vec![action]);
+        let mut driver = TestDriver::new();
+        let runner = AgentRunner::new_plaintext_unsafe(&journal_path, ids);
+        let report = runner.run_driver_task(&mut driver, &task).await?;
+
+        match &report.status {
+            AgentRunStatus::PolicyDenied { reason: got, .. } => {
+                assert_eq!(got, &reason);
+            }
+            other => return Err(format!("expected PolicyDenied, got {other:?}").into()),
+        }
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum TransportFailurePoint {
         Goto,
