@@ -7156,7 +7156,7 @@ fn route_session_mcp(
         Ok(driver) => driver,
         Err(error) => return tempod_error_response(&error),
     };
-    let server = tempo_mcp::TempoMcpServer::new(driver);
+    let server = tempo_mcp::TempoMcpServer::new(driver).without_fork_tools();
     HttpResponse::from_mcp(futures::executor::block_on(
         server.handle_post(origin, body),
     ))
@@ -12508,6 +12508,71 @@ mod tests {
             "https://session-mcp.test"
         );
         assert_eq!(value["result"]["structuredContent"]["seq"], 11);
+        Ok(())
+    }
+
+    #[test]
+    fn session_scoped_mcp_is_forkless_because_server_state_is_request_scoped() -> TestResult {
+        let mut pool = SessionPool::default();
+        let handle = attach_driver_handler(&mut pool, |request| {
+            assert_eq!(request.command, HostDriverCommand::Observe);
+            DriverResponse::Observation {
+                observation: observation("https://session-mcp.test", 11),
+            }
+        })?;
+        let session_driver = pool
+            .driver
+            .clone()
+            .ok_or("attached engine driver should be present")?;
+        let session = pool.finish_create("https://session-mcp.test".into(), Some(session_driver));
+
+        let list = HttpRequest {
+            method: "POST".into(),
+            path: format!("/sessions/{}/mcp", session.id.0),
+            headers: BTreeMap::new(),
+            host: None,
+            origin: None,
+            body: br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#.to_vec(),
+        };
+        let response = route_http_request(&mut pool, list)?;
+        assert_eq!(response.status, 200);
+        let value: Value = serde_json::from_slice(&response.body)?;
+        let tool_names = value["result"]["tools"]
+            .as_array()
+            .ok_or("tools/list result must be an array")?
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect::<Vec<_>>();
+        assert!(!tool_names.contains(&"fork"));
+        assert!(!tool_names.contains(&"close_fork"));
+
+        let fork = HttpRequest {
+            method: "POST".into(),
+            path: format!("/sessions/{}/mcp", session.id.0),
+            headers: BTreeMap::new(),
+            host: None,
+            origin: None,
+            body: br#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"fork","arguments":{}}}"#.to_vec(),
+        };
+        let response = route_http_request(&mut pool, fork)?;
+        assert_eq!(response.status, 200);
+        let value: Value = serde_json::from_slice(&response.body)?;
+        assert_eq!(value["error"]["code"], -32602);
+        assert!(value["error"]["message"]
+            .as_str()
+            .ok_or("fork rejection should have message")?
+            .contains("unknown tool: fork"));
+
+        let mut observe = mcp_tool_request(3, "observe", json!({}))?;
+        observe.path = format!("/sessions/{}/mcp", session.id.0);
+        let response = route_http_request(&mut pool, observe)?;
+        join_driver_handler(handle)?;
+        assert_eq!(response.status, 200);
+        let value: Value = serde_json::from_slice(&response.body)?;
+        assert_eq!(
+            value["result"]["structuredContent"]["url"],
+            "https://session-mcp.test"
+        );
         Ok(())
     }
 

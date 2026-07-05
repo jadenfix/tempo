@@ -118,6 +118,7 @@ pub struct ToolDescriptor {
 pub struct TempoMcpServer<D> {
     root: DriverSlot<D>,
     forks: ForkSlots,
+    fork_tools_enabled: bool,
     handshake_report: ProbeReport,
     handshake_probe_config: HttpProbeConfig,
     handshake_probe_limiter: HandshakeProbeLimiter,
@@ -128,6 +129,7 @@ impl<D> TempoMcpServer<D> {
         Self {
             root: DriverSlot::new(driver),
             forks: ForkSlots::default(),
+            fork_tools_enabled: true,
             handshake_report: ProbeReport::new(),
             handshake_probe_config: HttpProbeConfig::default(),
             handshake_probe_limiter: HandshakeProbeLimiter::default(),
@@ -146,6 +148,16 @@ impl<D> TempoMcpServer<D> {
 
     pub fn with_handshake_probe_limit(mut self, max_concurrent: usize) -> Self {
         self.handshake_probe_limiter = HandshakeProbeLimiter::new(max_concurrent);
+        self
+    }
+
+    /// Disable MCP fork tools for callers whose server instance is intentionally
+    /// request-scoped. Session-scoped MCP binds directly to an existing tempod
+    /// session driver; without persistent server state, returning fork ids there
+    /// would be invalid on the next request and could drop forked contexts
+    /// without the normal close_fork/close_all_forks lifecycle.
+    pub fn without_fork_tools(mut self) -> Self {
+        self.fork_tools_enabled = false;
         self
     }
 }
@@ -603,7 +615,7 @@ where
                 "serverInfo": {"name": "tempo", "version": env!("CARGO_PKG_VERSION")},
             })),
             "ping" => Ok(json!({})),
-            "tools/list" => Ok(json!({"tools": tool_descriptor_json()})),
+            "tools/list" => Ok(json!({"tools": self.tool_descriptor_json()})),
             "tools/call" => self.tools_call(&params).await,
             other => Err(JsonRpcError::method_not_found(format!(
                 "method not found: {other}"
@@ -616,7 +628,7 @@ where
             .get("name")
             .and_then(Value::as_str)
             .ok_or_else(|| JsonRpcError::invalid_params("tools/call requires params.name"))?;
-        if !tool_descriptors().iter().any(|tool| tool.name == name) {
+        if !self.tool_enabled(name) {
             return Err(JsonRpcError::invalid_params(format!(
                 "unknown tool: {name}"
             )));
@@ -628,6 +640,19 @@ where
             .unwrap_or_else(|| json!({}));
         let call = self.call_tool(name, arguments).await?;
         tool_call_json(call)
+    }
+
+    fn tool_enabled(&self, name: &str) -> bool {
+        tool_descriptors().iter().any(|tool| tool.name == name)
+            && (self.fork_tools_enabled || !matches!(name, "fork" | "close_fork"))
+    }
+
+    fn tool_descriptor_json(&self) -> Vec<Value> {
+        tool_descriptors()
+            .iter()
+            .filter(|tool| self.fork_tools_enabled || !matches!(tool.name, "fork" | "close_fork"))
+            .map(tool_descriptor_value)
+            .collect()
     }
 
     async fn call_tool(&self, name: &str, arguments: Value) -> Result<ToolCall, JsonRpcError> {
@@ -1958,14 +1983,16 @@ fn truncate_summary(text: &str) -> String {
 fn tool_descriptor_json() -> Vec<Value> {
     tool_descriptors()
         .iter()
-        .map(|tool| {
-            json!({
-                "name": tool.name,
-                "description": tool.description,
-                "inputSchema": tool.input_schema,
-            })
-        })
+        .map(tool_descriptor_value)
         .collect()
+}
+
+fn tool_descriptor_value(tool: &ToolDescriptor) -> Value {
+    json!({
+        "name": tool.name,
+        "description": tool.description,
+        "inputSchema": tool.input_schema,
+    })
 }
 
 fn agent_card_skill_json(tool: ToolDescriptor) -> Value {
@@ -2331,6 +2358,41 @@ mod tests {
                 "handshake"
             ]
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn forkless_server_hides_and_rejects_fork_tools() -> Result<(), String> {
+        let server = TempoMcpServer::new(MemoryDriver::new()).without_fork_tools();
+
+        let tools = server
+            .handle_post(None, br#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#)
+            .await
+            .json_value()
+            .map_err(|error| error.to_string())?;
+        let names = tools["result"]["tools"]
+            .as_array()
+            .ok_or("tools/list result must be an array")?
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect::<Vec<_>>();
+        assert!(!names.contains(&"fork"));
+        assert!(!names.contains(&"close_fork"));
+        assert!(names.contains(&"observe"));
+
+        let fork = server
+            .handle_post(
+                None,
+                br#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"fork","arguments":{}}}"#,
+            )
+            .await
+            .json_value()
+            .map_err(|error| error.to_string())?;
+        assert_eq!(fork["error"]["code"], -32602);
+        assert!(fork["error"]["message"]
+            .as_str()
+            .ok_or("fork error should have message")?
+            .contains("unknown tool: fork"));
         Ok(())
     }
 
