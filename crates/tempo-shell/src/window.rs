@@ -254,6 +254,27 @@ impl ShellApp {
                 }
             });
     }
+
+    fn show_surface_status(&self, ui: &mut egui::Ui) {
+        let Some(tab) = self.transport.model.active_tab() else {
+            return;
+        };
+        let surface = &tab.surface;
+        ui.horizontal_wrapped(|ui| {
+            ui.label(format!(
+                "surface: {} / {}",
+                surface.mode.label(),
+                surface.engine.label()
+            ));
+            ui.label(format!("owner: {}", surface.owner.label()));
+            ui.label(format!("run: {}", surface.run_state.label()));
+            ui.label(format!("load: {}", surface.load_state.label()));
+            ui.label(format!(
+                "marks: {}",
+                if surface.marks_overlay { "on" } else { "off" }
+            ));
+        });
+    }
 }
 
 /// Decode a [`ScreenshotImage`] (base64 PNG) into an egui texture. Window-only:
@@ -421,6 +442,32 @@ impl eframe::App for ShellApp {
 
             ui.separator();
 
+            let session_rows = self.transport.model.sessions.clone();
+            if !session_rows.is_empty() {
+                ui.label("sessions:");
+                egui::Grid::new("tempo-session-list")
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.label("id");
+                        ui.label("state");
+                        ui.label("url");
+                        ui.end_row();
+                        for row in session_rows {
+                            ui.monospace(&row.id);
+                            ui.label(&row.state);
+                            ui.label(&row.url);
+                            if ui.button("Adopt").clicked() {
+                                pending = Some(UiAction::Adopt(row.id.clone()));
+                            }
+                            if ui.button("Close").clicked() {
+                                pending = Some(UiAction::Close(row.id));
+                            }
+                            ui.end_row();
+                        }
+                    });
+                ui.separator();
+            }
+
             // Tab strip: one selectable per tempod session, with a close button.
             ui.horizontal_wrapped(|ui| {
                 if self.transport.model.tabs.is_empty() {
@@ -476,7 +523,37 @@ impl eframe::App for ShellApp {
                             pending = Some(UiAction::ToggleMarks);
                         }
                     });
+                    self.show_surface_status(ui);
                     ui.label(tab_status);
+                    let confirmation = self
+                        .transport
+                        .model
+                        .tabs
+                        .get(active)
+                        .and_then(|tab| tab.surface.pending_confirmation.as_ref())
+                        .cloned();
+                    if let Some(confirmation) = confirmation {
+                        ui.group(|ui| {
+                            ui.label(
+                                egui::RichText::new("CONFIRMATION REQUIRED")
+                                    .heading()
+                                    .strong()
+                                    .color(egui::Color32::from_rgb(180, 80, 0)),
+                            );
+                            ui.label(format!("action: {}", confirmation.action_label));
+                            ui.label(format!("gate: {}", confirmation.gate));
+                            if let Some(input_tainted) = confirmation.input_tainted {
+                                ui.label(format!("tainted input: {input_tainted}"));
+                            }
+                            ui.label(&confirmation.reason);
+                            ui.horizontal(|ui| {
+                                ui.add_enabled(false, egui::Button::new("Confirm"));
+                                if ui.button("Dismiss").clicked() {
+                                    pending = Some(UiAction::DismissConfirmation);
+                                }
+                            });
+                        });
+                    }
                 }
             }
 

@@ -24,6 +24,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use crate::agent::JournalLog;
+use crate::tab::Tab;
 use crate::ui::{SessionService, ShellUiModel, UiAction};
 
 /// Builds a fresh [`SessionService`] for a tempod base URL. The worker rebuilds
@@ -66,6 +67,7 @@ struct LocalModelState {
     active_tab: Option<usize>,
     marks_overlay: bool,
     journal: JournalLog,
+    tabs: Vec<Tab>,
 }
 
 impl LocalModelState {
@@ -74,6 +76,7 @@ impl LocalModelState {
             active_tab: model.active_tab,
             marks_overlay: model.marks_overlay,
             journal: model.journal.clone(),
+            tabs: model.tabs.clone(),
         }
     }
 
@@ -81,6 +84,7 @@ impl LocalModelState {
         model.active_tab = self.active_tab;
         model.marks_overlay = self.marks_overlay;
         model.journal = self.journal;
+        model.tabs = self.tabs;
     }
 }
 
@@ -261,6 +265,7 @@ impl TransportClient {
             self.model.active_tab = local.active_tab;
             self.model.marks_overlay = local.marks_overlay;
             self.model.journal = local.journal;
+            self.model.tabs = local.tabs;
             self.model.status = local.status;
         }
         if resync && !stale {
@@ -587,6 +592,11 @@ mod tests {
             client.model.active_tab,
             Some(1),
             "stale worker results must not undo local tab selection"
+        );
+        assert_eq!(
+            client.model.tabs.len(),
+            2,
+            "stale worker results must not drop locally managed tabs"
         );
     }
 

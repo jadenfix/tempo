@@ -13,6 +13,7 @@ use tempo_headless::{TempodSession, TempodSessionEvents, TempodSessionId};
 use thiserror::Error;
 
 pub mod agent;
+pub mod surface;
 pub mod tab;
 pub mod transport;
 pub mod ui;

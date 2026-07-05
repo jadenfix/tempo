@@ -18,6 +18,7 @@
 
 use serde_json::Value;
 
+use crate::surface::BrowserSurface;
 use crate::ShellError;
 
 /// A client-tracked URL history stack with standard back/forward semantics.
@@ -168,6 +169,9 @@ pub struct Tab {
     pub screenshot_seq: u64,
     /// Per-tab status line (errors and progress; never a panic).
     pub status: String,
+    /// Engine-neutral foreground page state. Today this describes the screenshot
+    /// pane; the same state is what a live Servo/WebView surface will update.
+    pub surface: BrowserSurface,
 }
 
 impl Tab {
@@ -178,15 +182,19 @@ impl Tab {
         driver_id: Option<String>,
         initial_url: impl Into<String>,
     ) -> Self {
+        let session_id = session_id.into();
         let url = initial_url.into();
+        let surface =
+            BrowserSurface::human_snapshot(session_id.clone(), driver_id.as_deref(), url.clone());
         Self {
-            session_id: session_id.into(),
+            session_id,
             driver_id,
             omnibox: url.clone(),
             history: History::with_current(url),
             screenshot: None,
             screenshot_seq: 0,
             status: "New tab.".to_string(),
+            surface,
         }
     }
 
