@@ -116,11 +116,17 @@ impl SurfaceRunState {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PendingConfirmation {
     pub request: Option<ConfirmationRequest>,
+    pub replay: Option<PendingConfirmationReplay>,
     pub action_label: String,
     pub reason: String,
     pub gate: String,
     pub input_tainted: Option<bool>,
     pub grant_required: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PendingConfirmationReplay {
+    Navigate { session_id: String, url: String },
 }
 
 impl PendingConfirmation {
@@ -131,8 +137,14 @@ impl PendingConfirmation {
             gate: request.gate.clone(),
             input_tainted,
             grant_required: true,
+            replay: None,
             request: Some(request),
         }
+    }
+
+    pub fn with_replay(mut self, replay: PendingConfirmationReplay) -> Self {
+        self.replay = Some(replay);
+        self
     }
 
     pub fn from_error(action_label: impl Into<String>, error: &ShellError) -> Option<Self> {
@@ -193,6 +205,7 @@ impl PendingConfirmation {
 
         Some(Self {
             request: None,
+            replay: None,
             action_label: denied_action.to_string(),
             reason,
             gate,
@@ -204,6 +217,7 @@ impl PendingConfirmation {
     fn from_message(action_label: String, message: &str) -> Self {
         Self {
             request: None,
+            replay: None,
             action_label,
             reason: message.to_string(),
             gate: "confirm".to_string(),
@@ -282,9 +296,21 @@ impl BrowserSurface {
     }
 
     pub fn navigation_failed(&mut self, action_label: &str, error: &ShellError) {
+        self.navigation_failed_with_replay(action_label, error, None);
+    }
+
+    pub fn navigation_failed_with_replay(
+        &mut self,
+        action_label: &str,
+        error: &ShellError,
+        replay: Option<PendingConfirmationReplay>,
+    ) {
         self.load_state = SurfaceLoadState::Failed;
         if let Some(confirmation) = PendingConfirmation::from_error(action_label, error) {
-            self.pending_confirmation = Some(confirmation);
+            self.pending_confirmation = Some(match replay {
+                Some(replay) => confirmation.with_replay(replay),
+                None => confirmation,
+            });
             self.run_state = SurfaceRunState::AwaitingConfirmation;
         }
     }

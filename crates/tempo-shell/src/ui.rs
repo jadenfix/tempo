@@ -12,6 +12,7 @@
 //! a mock without a network.
 
 use crate::agent::JournalLog;
+use crate::surface::PendingConfirmationReplay;
 use crate::tab::{ScreenshotImage, Tab};
 use crate::{HealthResponse, ShellClient, ShellError};
 #[cfg(test)]
@@ -58,6 +59,13 @@ pub trait SessionService {
     fn close(&self, session_id: &str) -> Result<TempodSession, ShellError>;
     /// Navigate a tab's shared tempod session to `url` (omnibox / back / forward).
     fn goto(&self, session_id: &str, url: &str) -> Result<(), ShellError>;
+    /// Replay a previously gated foreground navigation with a server grant.
+    fn goto_confirmed(
+        &self,
+        session_id: &str,
+        url: &str,
+        grant: &ConfirmationGrant,
+    ) -> Result<(), ShellError>;
     /// Fetch a single-shot page snapshot for a tab's shared session, optionally
     /// with the set-of-marks overlay drawn on it.
     fn screenshot(
@@ -102,6 +110,15 @@ impl SessionService for ShellClient {
 
     fn goto(&self, session_id: &str, url: &str) -> Result<(), ShellError> {
         ShellClient::goto_session(self, session_id, url)
+    }
+
+    fn goto_confirmed(
+        &self,
+        session_id: &str,
+        url: &str,
+        grant: &ConfirmationGrant,
+    ) -> Result<(), ShellError> {
+        ShellClient::goto_session_confirmed(self, session_id, url, grant)
     }
 
     fn screenshot(
@@ -382,7 +399,14 @@ impl ShellUiModel {
                     Ok((session_id, url))
                 }
                 Err(err) => {
-                    tab.surface.navigation_failed("goto", &err);
+                    tab.surface.navigation_failed_with_replay(
+                        "goto",
+                        &err,
+                        Some(PendingConfirmationReplay::Navigate {
+                            session_id: session_id.clone(),
+                            url: url.clone(),
+                        }),
+                    );
                     tab.status = format!("goto failed: {err}");
                     Err(err)
                 }
@@ -421,7 +445,14 @@ impl ShellUiModel {
                     Ok(session_id)
                 }
                 Err(err) => {
-                    tab.surface.navigation_failed(step.label(), &err);
+                    tab.surface.navigation_failed_with_replay(
+                        step.label(),
+                        &err,
+                        Some(PendingConfirmationReplay::Navigate {
+                            session_id: session_id.clone(),
+                            url: url.clone(),
+                        }),
+                    );
                     tab.status = format!("goto failed: {err}");
                     Err(err)
                 }
@@ -538,6 +569,7 @@ impl ShellUiModel {
             self.status = "No pending confirmation.".to_string();
             return;
         };
+        let replay = confirmation.replay.clone();
         let Some(request) = confirmation.request else {
             self.status = "Pending confirmation has no server request.".to_string();
             return;
@@ -545,6 +577,31 @@ impl ShellUiModel {
 
         match service.confirm(&request.session_id, &request.confirmation_id) {
             Ok(grant) => {
+                if let Some(PendingConfirmationReplay::Navigate { session_id, url }) = replay {
+                    match service.goto_confirmed(&session_id, &url, &grant) {
+                        Ok(()) => {
+                            if let Some(tab) = self.tabs.get_mut(active) {
+                                tab.history.push(url.clone());
+                                tab.surface.navigation_applied(url.clone());
+                                tab.surface.dismiss_confirmation();
+                                tab.status =
+                                    format!("Confirmed {} and navigated", grant.confirmation_id);
+                            }
+                            self.status = format!(
+                                "Confirmed {} and replayed navigation",
+                                grant.confirmation_id
+                            );
+                        }
+                        Err(err) => {
+                            if let Some(tab) = self.tabs.get_mut(active) {
+                                tab.surface.dismiss_confirmation();
+                                tab.status = format!("confirmed replay failed: {err}");
+                            }
+                            self.set_error("confirmed replay", &err);
+                        }
+                    }
+                    return;
+                }
                 if let Some(tab) = self.tabs.get_mut(active) {
                     tab.surface.dismiss_confirmation();
                     tab.status = format!("Confirmed {}", grant.confirmation_id);
@@ -827,12 +884,49 @@ mod tests {
         fn goto(&self, session_id: &str, url: &str) -> Result<(), ShellError> {
             self.record(format!("goto:{session_id}:{url}"));
             if self.confirm_on_goto {
-                return Err(ShellError::Mcp(
-                    "requires server-attributable confirmation before execution; confirmed=true was ignored"
-                        .to_string(),
-                ));
+                return Err(ShellError::Http {
+                    status: 403,
+                    body: serde_json::json!({
+                        "error": "policy denied",
+                        "reason": "purchase requires native confirmation",
+                        "denied_action_index": 0,
+                        "denied_action_kind": "goto",
+                        "policy": {
+                            "confirmation_required": true,
+                            "confirmed_claim_ignored": true,
+                            "strongest_gate": "confirm_purchase",
+                            "input_tainted_effective": false
+                        },
+                        "confirmation_request": {
+                            "confirmation_id": "confirmation-1",
+                            "session_id": session_id,
+                            "side_effect": "purchase",
+                            "gate": "confirm_purchase",
+                            "action_index": 0,
+                            "action_kind": "goto",
+                            "reason": "purchase requires native confirmation",
+                            "created_ms": 10,
+                            "expires_ms": 20
+                        }
+                    })
+                    .to_string(),
+                });
             }
             self.maybe_fail("goto")?;
+            Ok(())
+        }
+
+        fn goto_confirmed(
+            &self,
+            session_id: &str,
+            url: &str,
+            grant: &ConfirmationGrant,
+        ) -> Result<(), ShellError> {
+            self.record(format!(
+                "goto_confirmed:{session_id}:{url}:{}",
+                grant.confirmation_id
+            ));
+            self.maybe_fail("goto_confirmed")?;
             Ok(())
         }
 
@@ -1175,7 +1269,16 @@ mod tests {
             model.tabs[0].surface.run_state,
             SurfaceRunState::AwaitingConfirmation
         );
-        assert!(model.tabs[0].surface.pending_confirmation.is_some());
+        let pending = model.tabs[0]
+            .surface
+            .pending_confirmation
+            .as_ref()
+            .expect("navigation gate should create pending confirmation");
+        assert!(matches!(
+            pending.replay,
+            Some(PendingConfirmationReplay::Navigate { ref session_id, ref url })
+                if session_id == "session-0" && url == "https://pay.test"
+        ));
 
         model.dispatch(UiAction::DismissConfirmation, &service);
 
@@ -1192,7 +1295,7 @@ mod tests {
     }
 
     #[test]
-    fn confirm_pending_confirmation_mints_server_grant_without_resubmitting_action() {
+    fn confirm_pending_confirmation_mints_grant_and_replays_blocked_navigation() {
         let service = MockService::default();
         let request = tempo_schema::ConfirmationRequest {
             confirmation_id: "confirmation-1".to_string(),
@@ -1206,10 +1309,13 @@ mod tests {
             expires_ms: 20,
         };
         let mut tab = Tab::new("session-0", None, "https://pay.test");
-        tab.surface.pending_confirmation = Some(crate::surface::PendingConfirmation::from_request(
-            request.clone(),
-            Some(false),
-        ));
+        tab.surface.pending_confirmation = Some(
+            crate::surface::PendingConfirmation::from_request(request.clone(), Some(false))
+                .with_replay(PendingConfirmationReplay::Navigate {
+                    session_id: "session-0".to_string(),
+                    url: "https://pay.test/confirmed".to_string(),
+                }),
+        );
         let mut model = ShellUiModel {
             tabs: vec![tab],
             active_tab: Some(0),
@@ -1220,11 +1326,18 @@ mod tests {
 
         assert_eq!(
             service.calls(),
-            vec!["confirm:session-0:confirmation-1"],
-            "confirm must mint a server grant and never replay the original action"
+            vec![
+                "confirm:session-0:confirmation-1",
+                "goto_confirmed:session-0:https://pay.test/confirmed:confirmation-1"
+            ],
+            "confirm must mint a server grant before replaying the original action"
         );
         assert!(model.tabs[0].surface.pending_confirmation.is_none());
-        assert!(model.status.contains("confirmation-1"));
+        assert_eq!(
+            model.tabs[0].surface.current_url,
+            "https://pay.test/confirmed"
+        );
+        assert!(model.status.contains("replayed navigation"));
     }
 
     #[test]

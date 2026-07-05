@@ -6,11 +6,13 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 use tempo_headless::{TempodSession, TempodSessionEvents, TempodSessionId};
-use tempo_schema::{AdoptionLease, ConfirmationGrant};
+use tempo_schema::{Action, ActionBatch, AdoptionLease, ConfirmationGrant, QuiescencePolicy};
 use thiserror::Error;
 
 pub mod agent;
@@ -335,12 +337,65 @@ impl ShellClient {
     /// Navigate one managed session. This is the foreground-shell primitive:
     /// humans and agents share the same tempod session object, so tab actions
     /// must be scoped by session id instead of a process-global MCP driver id.
+    /// Foreground navigation uses REST `act_batch`, not MCP, because `act_batch`
+    /// is the protocol route with server-minted confirmation grants.
     pub fn goto_session(&self, session_id: &str, url: &str) -> Result<(), ShellError> {
-        let action = serde_json::to_value(tempo_schema::Action::Goto {
-            url: url.to_string(),
-        })?;
-        self.session_mcp_tool(session_id, "act", json!({ "action": action }))?;
+        self.goto_session_with_confirmation_grant(session_id, url, None)
+    }
+
+    pub fn goto_session_confirmed(
+        &self,
+        session_id: &str,
+        url: &str,
+        grant: &ConfirmationGrant,
+    ) -> Result<(), ShellError> {
+        self.goto_session_with_confirmation_grant(session_id, url, Some(grant))
+    }
+
+    fn goto_session_with_confirmation_grant(
+        &self,
+        session_id: &str,
+        url: &str,
+        grant: Option<&ConfirmationGrant>,
+    ) -> Result<(), ShellError> {
+        let batch = ActionBatch {
+            actions: vec![Action::Goto {
+                url: url.to_string(),
+            }],
+            quiescence: QuiescencePolicy::Composite,
+        };
+        self.session_act_batch(
+            session_id,
+            &batch,
+            Some(false),
+            Some(&foreground_navigation_idempotency_key(session_id, url)),
+            grant,
+        )?;
         Ok(())
+    }
+
+    fn session_act_batch(
+        &self,
+        session_id: &str,
+        batch: &ActionBatch,
+        input_tainted: Option<bool>,
+        idempotency_key: Option<&str>,
+        confirmation_grant: Option<&ConfirmationGrant>,
+    ) -> Result<Value, ShellError> {
+        let mut body = json!({
+            "batch": batch,
+        });
+        if let Some(input_tainted) = input_tainted {
+            body["input_tainted"] = json!(input_tainted);
+        }
+        if let Some(idempotency_key) = idempotency_key {
+            body["idempotency_key"] = json!(idempotency_key);
+        }
+        if let Some(confirmation_grant) = confirmation_grant {
+            body["confirmation_grant"] = serde_json::to_value(confirmation_grant)?;
+        }
+        let path = format!("/sessions/{}/act_batch", safe_path_segment(session_id)?);
+        self.request_json("POST", &path, Some(body))
     }
 
     /// Fetch a single-shot page snapshot from `driver_id` (or the default
@@ -813,6 +868,14 @@ fn safe_path_segment(segment: &str) -> Result<&str, ShellError> {
     } else {
         Err(ShellError::Usage(format!("invalid session id: {segment}")))
     }
+}
+
+fn foreground_navigation_idempotency_key(session_id: &str, url: &str) -> String {
+    let mut hasher = DefaultHasher::new();
+    "tempo-shell-goto-v1".hash(&mut hasher);
+    session_id.hash(&mut hasher);
+    url.hash(&mut hasher);
+    format!("shell-goto-{:016x}", hasher.finish())
 }
 
 pub(crate) fn validate_auth_token(token: &str) -> Result<(), ShellError> {

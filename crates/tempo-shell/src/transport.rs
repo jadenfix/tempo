@@ -394,6 +394,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
     use tempo_headless::{TempodSession, TempodSessionEvents};
+    use tempo_schema::ConfirmationGrant;
 
     /// A fake transport with no socket: records the calls it receives and returns
     /// canned health/sessions. `delay` lets a test hold a request "in flight" to
@@ -456,6 +457,19 @@ mod tests {
 
         fn goto(&self, session_id: &str, url: &str) -> Result<(), ShellError> {
             self.record(&format!("goto:{session_id}:{url}"));
+            Ok(())
+        }
+
+        fn goto_confirmed(
+            &self,
+            session_id: &str,
+            url: &str,
+            grant: &ConfirmationGrant,
+        ) -> Result<(), ShellError> {
+            self.record(&format!(
+                "goto_confirmed:{session_id}:{url}:{}",
+                grant.confirmation_id
+            ));
             Ok(())
         }
 
