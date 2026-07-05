@@ -64,3 +64,11 @@ cargo test --workspace   # contracts, conformance, runtime, protocol, and shell 
   binaries for macOS and Linux.
 - See [`CONTRIBUTING.md`](./CONTRIBUTING.md) and [`SECURITY.md`](./SECURITY.md).
   Licensed [Apache-2.0](./LICENSE).
+
+## Ecosystem
+
+tempo is part of the [ecosystem](https://github.com/jadenfix/ecosystem) — a family of Rust-first, local-first agent-infrastructure projects. It is fully standalone: any agent can drive the web through its structured-observation and batched-action contract, no sibling project required. Within the family it can connect for:
+
+- sandboxing tool execution in [beatbox](https://github.com/jadenfix/beatbox) and rendering through the audited [servo fork](https://github.com/jadenfix/servo)
+- exporting session traces to [beater](https://github.com/jadenfix/beater) for observability, evals, and CI gates, with deep session replay via [ReplayKit](https://github.com/jadenfix/ReplayKit) (roadmap)
+- serving as the web-authority surface for agents governed by [beaterOS](https://github.com/jadenfix/beaterOS)
