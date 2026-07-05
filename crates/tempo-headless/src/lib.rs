@@ -1764,8 +1764,7 @@ impl SessionPool {
     /// doesn't match the "session-<n>" shape sorts as if it were the oldest
     /// (`0`) rather than panicking.
     fn session_creation_seq(id: &TempodSessionId) -> u64 {
-        id.0
-            .strip_prefix("session-")
+        id.0.strip_prefix("session-")
             .and_then(|suffix| suffix.parse::<u64>().ok())
             .unwrap_or(0)
     }
