@@ -12,6 +12,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use tempo_schema::{Action, ActionBatch, NodeId, QuiescencePolicy, SideEffect};
+use tempo_telemetry::{logger, Level};
 use thiserror::Error;
 
 /// Stored skill definition. The `(name, version)` pair is the stable key.
@@ -285,21 +286,17 @@ impl SkillStore {
     }
 
     pub fn catalog(&self) -> Result<Vec<SkillMetadata>, SkillError> {
-        let mut entries = Vec::new();
-        for entry in std::fs::read_dir(&self.root)? {
-            let entry = entry?;
-            let path = entry.path();
-            if !is_skill_json_file(&entry, &path)? {
-                continue;
-            }
-            match Self::load_metadata(&path) {
-                Ok(metadata) => entries.push(metadata),
-                Err(err @ (SkillError::Io(_) | SkillError::OpenSkill { .. })) => return Err(err),
+        let defs = self.all_definitions()?;
+        let mut entries = Vec::with_capacity(defs.len());
+        for (path, def) in defs {
+            match def.metadata() {
+                Ok(meta) => entries.push(meta),
                 Err(err) => {
-                    eprintln!(
-                        "tempo-skills: skipping malformed skill file {}: {err}",
-                        path.display()
-                    );
+                    logger()
+                        .event(Level::Warn, "tempo-skills", "skipping malformed skill file")
+                        .field("path", path.display().to_string())
+                        .field("error", err.to_string())
+                        .emit();
                 }
             }
         }
@@ -317,47 +314,56 @@ impl SkillStore {
     }
 
     pub fn list(&self) -> Result<Vec<SkillKey>, SkillError> {
-        let mut keys = Vec::new();
+        let mut keys: Vec<SkillKey> = self
+            .all_definitions()?
+            .into_iter()
+            .map(|(_, def)| def.key())
+            .collect();
+        keys.sort();
+        Ok(keys)
+    }
+
+    /// Walk the skills directory once, parse every `*.json` file into a
+    /// [`SkillDefinition`], and return the successful results.
+    ///
+    /// IO errors (e.g. permission denied on `File::open`) propagate immediately
+    /// because they indicate an environmental problem rather than a bad skill
+    /// file.  Parse and validation errors are logged as structured Warn events
+    /// and the offending file is skipped so one malformed entry never prevents
+    /// valid skills from being enumerated.
+    fn all_definitions(&self) -> Result<Vec<(PathBuf, SkillDefinition)>, SkillError> {
+        let mut defs = Vec::new();
         for entry in std::fs::read_dir(&self.root)? {
             let entry = entry?;
             let path = entry.path();
             if !is_skill_json_file(&entry, &path)? {
                 continue;
             }
-            // A single malformed or invalid skill file must not brick resolution of
-            // every other skill in the store; skip it (with a warning) and continue.
-            // IO errors (e.g. permission denied) are a real environmental problem, not
-            // a bad skill, so they still propagate.
-            match Self::load_key(&path) {
-                Ok(key) => keys.push(key),
+            match Self::load_definition(&path) {
+                Ok(def) => defs.push((path, def)),
                 Err(err @ (SkillError::Io(_) | SkillError::OpenSkill { .. })) => return Err(err),
                 Err(err) => {
-                    eprintln!(
-                        "tempo-skills: skipping malformed skill file {}: {err}",
-                        path.display()
-                    );
+                    logger()
+                        .event(Level::Warn, "tempo-skills", "skipping malformed skill file")
+                        .field("path", path.display().to_string())
+                        .field("error", err.to_string())
+                        .emit();
                 }
             }
         }
-        keys.sort();
-        Ok(keys)
+        Ok(defs)
     }
 
-    fn load_key(path: &Path) -> Result<SkillKey, SkillError> {
-        let mut file = File::open(path)?;
+    fn load_definition(path: &Path) -> Result<SkillDefinition, SkillError> {
+        let mut file = File::open(path).map_err(|source| SkillError::OpenSkill {
+            path: path.to_path_buf(),
+            source,
+        })?;
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)?;
         let definition: SkillDefinition = serde_json::from_slice(&bytes)?;
         validate_definition(&definition)?;
-        Ok(definition.key())
-    }
-
-    fn load_metadata(path: &Path) -> Result<SkillMetadata, SkillError> {
-        let mut file = File::open(path)?;
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)?;
-        let definition: SkillDefinition = serde_json::from_slice(&bytes)?;
-        definition.metadata()
+        Ok(definition)
     }
 
     pub fn root(&self) -> &Path {
