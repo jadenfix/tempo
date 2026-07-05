@@ -1400,6 +1400,7 @@ struct CanonicalWebOrigin {
 #[serde(deny_unknown_fields)]
 struct ProbeResponseInput {
     path: String,
+    #[serde(deserialize_with = "deserialize_http_status_code")]
     status: u16,
     #[serde(default)]
     content_type: Option<String>,
@@ -1414,6 +1415,20 @@ impl From<ProbeResponseInput> for ProbeResponse {
             Some(content_type) => response.with_content_type(content_type),
             None => response,
         }
+    }
+}
+
+fn deserialize_http_status_code<'de, D>(deserializer: D) -> Result<u16, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let status = u16::deserialize(deserializer)?;
+    if (100..=599).contains(&status) {
+        Ok(status)
+    } else {
+        Err(serde::de::Error::custom(
+            "status must be an HTTP status code between 100 and 599",
+        ))
     }
 }
 
@@ -2619,6 +2634,26 @@ mod tests {
             .as_str()
             .ok_or("nested error message must be a string")?
             .contains("unknown field `headers`"));
+
+        for status in [99, 600] {
+            let invalid_status = call_tool_envelope(
+                &mut server,
+                "handshake",
+                json!({
+                    "live_http": false,
+                    "responses": [{
+                        "path": "/openapi.json",
+                        "status": status
+                    }]
+                }),
+            )
+            .await?;
+            assert_eq!(invalid_status["error"]["code"], -32602);
+            assert!(invalid_status["error"]["message"]
+                .as_str()
+                .ok_or("status range error message must be a string")?
+                .contains("status must be an HTTP status code between 100 and 599"));
+        }
         Ok(())
     }
 
