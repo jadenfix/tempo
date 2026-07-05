@@ -64,6 +64,7 @@ Security boundaries & auth:
 - [ ] Locks are narrow, consistently ordered, released on panic (poison recovered, not fatal), and never held across `.await`, navigation, or subprocess I/O — the pool lock especially, so `/health` and `/drain` stay responsive.
 - [ ] Durable/journal writes use a batched single-writer path (e.g. WAL + a dedicated writer), not per-write open + full fsync; a crash or kill mid-write must be recoverable on restart with no torn or lost committed state.
 - [ ] Removing per-write fsync from a durable file comes with an integrity story, not just a recency argument: checksummed records, or detection-plus-self-heal for interior corruption (a well-terminated garbage line from out-of-order writeback), not only torn-tail repair. Heal-by-truncation is gated so a misconfigured key/policy on a healthy store can never trigger it.
+- [ ] A cached verdict about a shared mutable file (known-corrupt region, known-good prefix, parsed snapshot) is not revalidated by length or mtime equality once another writer can heal, truncate-and-re-append, or re-record in contract: identical payloads re-encode to identical lengths. The verdict is re-derived from content on use, or scoped to a single exclusive-lock hold.
 
 Trust boundaries & security:
 - [ ] Caller-supplied trust/policy/side-effect classifications (`taint`, `confirmed`, …) are recomputed server-side, never trusted.
