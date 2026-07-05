@@ -46,6 +46,7 @@ Correctness & honesty of the contract:
 - [ ] Handles/IDs the caller reuses across calls are stable, or their churn is handled rather than silently breaking multi-step callers.
 - [ ] Docs, comments, and declared schemas/types match what the code actually does — no present-tense claims for a stub, no `{"type":"object"}` standing in for a real schema.
 - [ ] Runtime-visible contract changes update every public description in the same slice: OpenAPI paths/statuses/schemas, agent cards, SDK-facing docs, and compatibility fixtures. A route or response field that exists at runtime but is absent from the contract is a blocker for SDK workflows.
+- [ ] When a caller starts trusting callee-embedded data it previously re-derived (a returned diff, status, or measurement), the callee's contract (trait docs, schema comments) is tightened in the same slice to require what the caller now assumes — otherwise a future implementation silently weakens the guarantee.
 - [ ] Public Rust schema struct changes update source callers too: `serde(default)` preserves old JSON compatibility, but it does not make existing struct literals compile. Scan/update workspace literals and downstream crates.
 - [ ] Compact wire-format changes that omit default, empty, or optional fields preserve both directions of compatibility: compact serialization, populated serialization, and default-filled deserialization all have reverted-fix-sensitive tests.
 - [ ] Borrowed serializers, budget probes, counting sinks, and other wire-shape proxies mirror every `serde` default/skip rule on the public type they approximate. A proxy that counts or emits bytes differently from the real payload can create false truncation or false fit decisions.
@@ -62,6 +63,7 @@ Security boundaries & auth:
 - [ ] Operational metadata routes that expose dependency health, capacity, policy, or topology are guarded like control-plane routes unless they intentionally return only static liveness.
 - [ ] Locks are narrow, consistently ordered, released on panic (poison recovered, not fatal), and never held across `.await`, navigation, or subprocess I/O — the pool lock especially, so `/health` and `/drain` stay responsive.
 - [ ] Durable/journal writes use a batched single-writer path (e.g. WAL + a dedicated writer), not per-write open + full fsync; a crash or kill mid-write must be recoverable on restart with no torn or lost committed state.
+- [ ] Removing per-write fsync from a durable file comes with an integrity story, not just a recency argument: checksummed records, or detection-plus-self-heal for interior corruption (a well-terminated garbage line from out-of-order writeback), not only torn-tail repair. Heal-by-truncation is gated so a misconfigured key/policy on a healthy store can never trigger it.
 
 Trust boundaries & security:
 - [ ] Caller-supplied trust/policy/side-effect classifications (`taint`, `confirmed`, …) are recomputed server-side, never trusted.
@@ -72,6 +74,7 @@ Trust boundaries & security:
 - [ ] Tests and docs that verify redaction do not commit realistic secret, token, password, API-key, or credential literals. Use scanner-safe inert fragments while still proving the sensitive value never appears in debug/display/error/export output.
 - [ ] Secret-bearing clients parse and validate configured base URLs before constructing requests: reject userinfo/query/fragment/path injection, require a pinned secure production origin, and make loopback/insecure fixtures use an explicitly named test opt-in.
 - [ ] A detector or guard runs on data that actually reaches it: check that upstream filtering/compilation didn't strip the very signal the check needs.
+- [ ] A change that removes or shortens a wait, grace window, or recheck on a trust-boundary path names the exact window losing coverage and cites the mechanism that still enforces the invariant inside that window — "already covered elsewhere" without the covering mechanism is not a justification.
 
 Performance on hot paths (a regression here is a correctness bug for this project):
 - [ ] Reused, not recreated: clients, sessions, connections, buffers, metric handles — no per-call handshake, allocation, or registration where it can be cached.
