@@ -158,6 +158,118 @@ fn tempo_engined_cdp_binary_binds_socket_for_tempod_style_connect(
     Ok(())
 }
 
+/// Reverted-fix-sensitive test for the auto-start teardown seam: a
+/// `tempo-engined-cdp` whose spawning daemon dies must exit on its own.
+///
+/// tempod owns the auto-started engine (#397), but a SIGTERM/SIGKILL to the
+/// daemon runs no drops, and a freshly (re)started engine sits blocked in
+/// `accept_unauthenticated` with no client ever coming back — before the
+/// parent-death watch, every daemon restart leaked one engine plus its whole
+/// Chrome tree. This test reproduces that exact state: an intermediate shell
+/// spawns the engine, waits for the socket to be bound (engine is now
+/// accept-blocked), and exits — reparenting the engine. Without the watch the
+/// engine blocks in accept forever and the liveness poll below hits its
+/// deadline; with it, the engine notices the reparenting and exits.
+#[test]
+fn tempo_engined_cdp_binary_exits_when_spawning_daemon_dies(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(chrome) = std::env::var_os("TEMPO_CDP_CHROME") else {
+        eprintln!("skipping live CDP parent-death test; TEMPO_CDP_CHROME is unset");
+        return Ok(());
+    };
+
+    let root = tempfile::tempdir()?;
+    let socket_path = root.path().join("host").join("engine.sock");
+    let pid_path = root.path().join("engine.pid");
+
+    // The intermediate parent: spawn the engine (stdio detached — an
+    // inherited pipe held open by the engine or its Chrome tree would block
+    // this test on the very leak it checks for), record its pid to a file,
+    // hold on until the engine has bound its socket (so it is parked in
+    // accept), then exit, reparenting the engine away from us. TMPDIR is
+    // pointed into the tempdir so the engine's Chrome profile — and thus its
+    // process tree — is uniquely attributable to this test.
+    let script = r#"
+        "$ENGINE_BIN" >/dev/null 2>&1 & pid=$!
+        printf '%s' "$pid" > "$ENGINE_PID_FILE"
+        i=0
+        while [ ! -S "$ENGINE_SOCK" ] && [ "$i" -lt 600 ]; do
+            sleep 0.1
+            i=$((i+1))
+        done
+        [ -S "$ENGINE_SOCK" ] || exit 70
+        exit 0
+    "#;
+    let status = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(script)
+        .env("ENGINE_BIN", env!("CARGO_BIN_EXE_tempo-engined-cdp"))
+        .env("ENGINE_SOCK", &socket_path)
+        .env("ENGINE_PID_FILE", &pid_path)
+        .env("TEMPO_ENGINE_HOST_SOCKET", &socket_path)
+        .env("TEMPO_CDP_CHROME", &chrome)
+        .env("TEMPO_CDP_NO_SANDBOX", "1")
+        .env("TMPDIR", root.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    let engine_pid: u32 = std::fs::read_to_string(&pid_path)?.trim().parse()?;
+    let engine_alive = || {
+        Command::new("kill")
+            .args(["-0", &engine_pid.to_string()])
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    };
+    if !status.success() {
+        // The engine never bound its socket; clean up before failing.
+        let _ = Command::new("kill").arg(engine_pid.to_string()).status();
+        return Err(format!(
+            "intermediate parent failed ({status}): engine never bound {}",
+            socket_path.display()
+        )
+        .into());
+    }
+
+    // Parent is gone; the watch polls every 2s, so well within this deadline
+    // the engine must notice the reparenting and exit.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while engine_alive() {
+        if Instant::now() >= deadline {
+            let _ = Command::new("kill").arg(engine_pid.to_string()).status();
+            return Err(
+                "engine outlived its dead parent: auto-started engine would leak on daemon restart"
+                    .into(),
+            );
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    // The watch must reap the Chrome tree too (its profile lives under this
+    // test's unique TMPDIR): a leak that merely moves from the engine to an
+    // orphaned browser is still a leak.
+    let profile_marker = root.path().display().to_string();
+    let chrome_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let leftovers = Command::new("pgrep")
+            .args(["-f", &profile_marker])
+            .stderr(Stdio::null())
+            .output()?;
+        if !leftovers.status.success() {
+            break;
+        }
+        if Instant::now() >= chrome_deadline {
+            let _ = Command::new("pkill").args(["-f", &profile_marker]).status();
+            return Err(
+                "Chrome tree outlived the reaped engine: browser leak on daemon restart".into(),
+            );
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    Ok(())
+}
+
 fn serve_fixture() -> Result<String, std::io::Error> {
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let addr = listener.local_addr()?;

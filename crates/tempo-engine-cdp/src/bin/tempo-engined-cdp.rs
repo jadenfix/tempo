@@ -35,6 +35,9 @@ async fn main() -> ExitCode {
 }
 
 async fn run() -> Result<(), String> {
+    let chrome_pid = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    spawn_parent_death_watch(std::sync::Arc::clone(&chrome_pid));
+
     let socket_path = std::env::var(ENGINE_HOST_SOCKET_ENV)
         .map_err(|_| format!("{ENGINE_HOST_SOCKET_ENV} is required"))?;
 
@@ -51,6 +54,10 @@ async fn run() -> Result<(), String> {
     let mut driver = CdpTempoDriver::launch_with(config)
         .await
         .map_err(|error| error.to_string())?;
+    chrome_pid.store(
+        driver.chrome_pid().unwrap_or_default(),
+        std::sync::atomic::Ordering::Relaxed,
+    );
 
     // The engine binds; the daemon's `connect_engine_ipc` connects. The socket is
     // hardened (0600, private parent, peer-uid checked) but tokenless because the
@@ -67,3 +74,41 @@ async fn run() -> Result<(), String> {
         .await
         .map_err(|error| error.to_string())
 }
+
+/// Exit when the spawning daemon dies. tempod's auto-start (#397) owns this
+/// process, but a SIGTERM/SIGKILL to the daemon runs no drops — without a
+/// parent watch, every daemon restart leaks one engine plus its Chrome tree,
+/// stuck in `accept_unauthenticated` with no client ever coming back.
+/// Reparenting (getppid changes) is the death signal; it also covers the
+/// window before the daemon connects and any launch hang.
+///
+/// `chrome_pid` carries the launched browser's pid once known (0 = not yet
+/// launched). `process::exit` runs no drops, so the watch must reap the
+/// browser tree itself before exiting or the leak just moves one level down;
+/// `/bin/kill` is used because std cannot signal an arbitrary pid and the
+/// driver's async `close` is unreachable from this thread.
+#[cfg(unix)]
+fn spawn_parent_death_watch(chrome_pid: std::sync::Arc<std::sync::atomic::AtomicU32>) {
+    let parent = std::os::unix::process::parent_id();
+    // Started detached (or via a launcher that already exited): there is no
+    // owning daemon to watch, and exiting would break deliberate manual runs.
+    if parent == 1 {
+        return;
+    }
+    std::thread::spawn(move || loop {
+        if std::os::unix::process::parent_id() != parent {
+            eprintln!("tempo-engined-cdp: spawning daemon exited; shutting down");
+            let pid = chrome_pid.load(std::sync::atomic::Ordering::Relaxed);
+            if pid != 0 {
+                let _ = std::process::Command::new("/bin/kill")
+                    .arg(pid.to_string())
+                    .status();
+            }
+            std::process::exit(0);
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    });
+}
+
+#[cfg(not(unix))]
+fn spawn_parent_death_watch(_chrome_pid: std::sync::Arc<std::sync::atomic::AtomicU32>) {}
