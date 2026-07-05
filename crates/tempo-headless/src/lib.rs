@@ -5966,12 +5966,14 @@ pub fn tempod_openapi(base_url: &str) -> JsonValue {
                         "goal": {"type": "string"},
                         "actions": {
                             "type": "array",
-                            "items": {"type": "object"}
+                            "items": {"$ref": "#/components/schemas/Action"}
                         },
                         "max_rounds": {"type": "integer", "minimum": 1},
                         "token_budget": {"type": "integer", "minimum": 0}
                     }
                 },
+                "Action": openapi_component_schema(tempo_schema::action_json_schema()),
+                "NodeId": {"type": "string"},
                 "TempodSessionId": {
                     "type": "string"
                 },
@@ -6349,6 +6351,32 @@ pub fn tempod_openapi(base_url: &str) -> JsonValue {
             }
         }
     })
+}
+
+fn openapi_component_schema(mut schema: JsonValue) -> JsonValue {
+    rewrite_json_schema_refs_for_openapi(&mut schema);
+    schema
+}
+
+fn rewrite_json_schema_refs_for_openapi(value: &mut JsonValue) {
+    match value {
+        JsonValue::Object(map) => {
+            if let Some(JsonValue::String(reference)) = map.get_mut("$ref") {
+                if let Some(definition) = reference.strip_prefix("#/$defs/") {
+                    *reference = format!("#/components/schemas/{definition}");
+                }
+            }
+            for value in map.values_mut() {
+                rewrite_json_schema_refs_for_openapi(value);
+            }
+        }
+        JsonValue::Array(items) => {
+            for value in items {
+                rewrite_json_schema_refs_for_openapi(value);
+            }
+        }
+        JsonValue::Null | JsonValue::Bool(_) | JsonValue::Number(_) | JsonValue::String(_) => {}
+    }
 }
 
 fn after_seq(query: Option<&str>) -> Result<Option<u64>, TempodError> {
@@ -7428,31 +7456,48 @@ fn route_session_run_create(
         pool.begin_agent_run(&session_id, Some(goal.clone()))?
     };
 
-    let journal_dir = tempod_runtime_dir().join("runs");
-    std::fs::create_dir_all(&journal_dir)?;
-    let journal_path = journal_dir.join(format!("{}.jsonl", run.run_id.0));
-    let ids = tempo_agent::AgentRunIds::new(run.run_id.0.clone(), session_id.0.clone());
-    let mut runner = tempo_agent::AgentRunner::new_plaintext_unsafe(&journal_path, ids);
-    if let Some(max_tokens) = request.token_budget {
-        runner = runner.with_token_budget(tempo_agent::TokenBudget::new(max_tokens));
-    }
-    let mut decider = tempo_agent::decider::ScriptedDecider::new(vec![request.actions, Vec::new()]);
-    let spec = tempo_agent::decider::DecidedTaskSpec::new(start_url, goal)
-        .with_max_rounds(request.max_rounds.unwrap_or(2));
-    let report =
-        futures::executor::block_on(runner.run_decided_task(&mut driver, &mut decider, &spec))
+    let run_result: Result<(AgentRunState, Option<String>, Option<HumanTakeover>), TempodError> =
+        (|| {
+            let journal_dir = tempod_runtime_dir().join("runs");
+            std::fs::create_dir_all(&journal_dir)?;
+            let journal_path = journal_dir.join(format!("{}.jsonl", run.run_id.0));
+            let ids = tempo_agent::AgentRunIds::new(run.run_id.0.clone(), session_id.0.clone());
+            let mut runner = tempo_agent::AgentRunner::new_plaintext_unsafe(&journal_path, ids);
+            if let Some(max_tokens) = request.token_budget {
+                runner = runner.with_token_budget(tempo_agent::TokenBudget::new(max_tokens));
+            }
+            let mut decider =
+                tempo_agent::decider::ScriptedDecider::new(vec![request.actions, Vec::new()]);
+            let spec = tempo_agent::decider::DecidedTaskSpec::new(start_url, goal)
+                .with_max_rounds(request.max_rounds.unwrap_or(2));
+            let report = futures::executor::block_on(runner.run_decided_task(
+                &mut driver,
+                &mut decider,
+                &spec,
+            ))
             .map_err(|error| TempodError::Driver(error.to_string()))?;
 
-    let (state, error, takeover) = match report.status {
-        tempo_agent::decider::DecidedRunStatus::Completed
-        | tempo_agent::decider::DecidedRunStatus::AlreadyComplete => {
-            (AgentRunState::Completed, None, None)
+            Ok(match report.status {
+                tempo_agent::decider::DecidedRunStatus::Completed
+                | tempo_agent::decider::DecidedRunStatus::AlreadyComplete => {
+                    (AgentRunState::Completed, None, None)
+                }
+                tempo_agent::decider::DecidedRunStatus::HumanTakeoverRequired { takeover } => {
+                    (AgentRunState::WaitingForHuman, None, Some(takeover))
+                }
+                other => (AgentRunState::Failed, Some(format!("{other:?}")), None),
+            })
+        })();
+
+    let (state, error, takeover) = match run_result {
+        Ok(result) => result,
+        Err(error) => {
+            let error_message = error.to_string();
+            finish_failed_session_run(pool, &run.run_id, error_message)?;
+            return Err(error);
         }
-        tempo_agent::decider::DecidedRunStatus::HumanTakeoverRequired { takeover } => {
-            (AgentRunState::WaitingForHuman, None, Some(takeover))
-        }
-        other => (AgentRunState::Failed, Some(format!("{other:?}")), None),
     };
+
     let finished = {
         let mut pool = lock_pool(pool)?;
         let finished = pool.finish_agent_run(&run.run_id, state, error)?;
@@ -7462,6 +7507,15 @@ fn route_session_run_create(
         finished
     };
     Ok(HttpResponse::json(201, finished))
+}
+
+fn finish_failed_session_run(
+    pool: &Arc<Mutex<SessionPool>>,
+    run_id: &AgentRunId,
+    error: String,
+) -> Result<AgentRun, TempodError> {
+    let mut pool = lock_pool(pool)?;
+    pool.finish_agent_run(run_id, AgentRunState::Failed, Some(error))
 }
 
 fn session_events_live_sse(
@@ -8399,6 +8453,36 @@ mod tests {
         assert_eq!(late_finish.state, AgentRunState::Cancelled);
         assert_eq!(pool.run(&run_id)?.state, AgentRunState::Cancelled);
         assert!(!pool.active_runs.contains_key(&session.id));
+        Ok(())
+    }
+
+    #[test]
+    fn failed_session_run_create_releases_active_writer() -> TestResult {
+        let mut pool = SessionPool::default();
+        let (client_stream, _server_stream) = UnixStream::pair()?;
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream))?;
+        let session_driver = pool
+            .driver
+            .clone()
+            .ok_or("attached engine driver should be present")?;
+        let session = pool.finish_create("https://runs.test".into(), Some(session_driver));
+        let (run, _driver, _url) =
+            pool.begin_agent_run(&session.id, Some("fail then release".into()))?;
+        assert_eq!(pool.active_runs.get(&session.id), Some(&run.run_id));
+
+        let failed = with_shared_pool(&mut pool, |shared| {
+            super::finish_failed_session_run(shared, &run.run_id, "injected run failure".into())
+        })?;
+
+        assert_eq!(failed.state, AgentRunState::Failed);
+        assert!(!pool.active_runs.contains_key(&session.id));
+        let runs = pool.list_runs(Some(&session.id));
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].state, AgentRunState::Failed);
+        assert!(runs[0]
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("injected run failure")));
         Ok(())
     }
 
@@ -11354,6 +11438,21 @@ mod tests {
             openapi["paths"]["/sessions/{session_id}/runs"]["post"]["responses"]["409"]
                 ["description"],
             "Session already has an active writer"
+        );
+        assert_eq!(
+            openapi["components"]["schemas"]["CreateRunRequest"]["properties"]["actions"]["items"]
+                ["$ref"],
+            "#/components/schemas/Action"
+        );
+        assert_eq!(
+            openapi["components"]["schemas"]["Action"]["oneOf"]
+                .as_array()
+                .map(Vec::len),
+            Some(8)
+        );
+        assert_eq!(
+            openapi["components"]["schemas"]["Action"]["oneOf"][1]["properties"]["node"]["$ref"],
+            "#/components/schemas/NodeId"
         );
         assert_eq!(
             openapi["paths"]["/sessions/{session_id}/mcp"]["post"]["operationId"],
