@@ -8745,6 +8745,7 @@ dependencies = [
  "serde_json",
  "tempo-driver",
  "tempo-schema",
+ "tempo-telemetry",
  "thiserror 2.0.18",
 ]
 
