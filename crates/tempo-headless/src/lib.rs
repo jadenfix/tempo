@@ -8245,9 +8245,10 @@ mod tests {
         let session = pool.finish_create("https://runs.test".into(), None);
         let run_id = insert_test_run(&mut pool, &session.id, AgentRunState::Completed, false);
 
-        let error = pool
-            .resume_run(&run_id)
-            .expect_err("completed run must not resume");
+        let error = match pool.resume_run(&run_id) {
+            Ok(_) => return Err("completed run must not resume".into()),
+            Err(error) => error,
+        };
 
         assert!(
             matches!(error, TempodError::Conflict(message) if message.contains("run_not_resumable"))
@@ -8277,9 +8278,10 @@ mod tests {
             }),
         )?;
 
-        let error = pool
-            .resume_run(&run_id)
-            .expect_err("human-owned waiting run must require handoff first");
+        let error = match pool.resume_run(&run_id) {
+            Ok(_) => return Err("human-owned waiting run must require handoff first".into()),
+            Err(error) => error,
+        };
 
         assert!(
             matches!(error, TempodError::Conflict(message) if message.contains("human currently owns"))
@@ -8321,9 +8323,10 @@ mod tests {
         let session = pool.finish_create("https://runs.test".into(), None);
         let run_id = insert_test_run(&mut pool, &session.id, AgentRunState::Failed, false);
 
-        let error = pool
-            .cancel_run(&run_id)
-            .expect_err("terminal run must not be cancellable");
+        let error = match pool.cancel_run(&run_id) {
+            Ok(_) => return Err("terminal run must not be cancellable".into()),
+            Err(error) => error,
+        };
 
         assert!(
             matches!(error, TempodError::Conflict(message) if message.contains("run_not_cancellable"))
