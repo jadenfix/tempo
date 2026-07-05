@@ -285,6 +285,14 @@ fn engine_name(engine: Engine) -> &'static str {
         Engine::Servo => "servo",
         #[cfg(any(test, feature = "test-driver"))]
         Engine::Test => "test",
+        #[cfg(not(any(test, feature = "test-driver")))]
+        _ => {
+            debug_assert!(
+                false,
+                "unexpected engine variant for this build configuration"
+            );
+            "unsupported"
+        }
     }
 }
 
