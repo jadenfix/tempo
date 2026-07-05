@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
-use std::sync::{Condvar, Mutex, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -41,10 +41,15 @@ const RESPONSE_TOO_LARGE_ERROR_CODE: i64 = -32003;
 /// and was not returned within [`DRIVER_LEASE_TIMEOUT`].
 const DRIVER_BUSY_ERROR_CODE: i64 = -32004;
 const TOOL_TEXT_SUMMARY_MAX_CHARS: usize = 240;
+const HANDSHAKE_PROBE_LIMIT_ERROR_CODE: &str = "handshake_probe_limit";
 /// Upper bound on concurrently live forked drivers per session. Forks each hold a
 /// live browser context/target for real engines, so refuse to accumulate beyond
 /// this cap and require the client to `close_fork` before creating more.
 const MAX_LIVE_FORKS: usize = 32;
+/// Process/default cap on simultaneous live HTTP handshake probe runs. Each run
+/// fans out to several blocking HTTP workers, so this bounds the inner thread
+/// multiplier instead of only bounding request body size.
+pub const MAX_CONCURRENT_HANDSHAKE_PROBES: usize = 4;
 /// Bound on how long a tool call waits for another in-flight call on the SAME
 /// driver (root or fork) before failing (issue #230). Tool calls on different
 /// drivers never wait on each other; this bound only serializes same-driver
@@ -115,6 +120,7 @@ pub struct TempoMcpServer<D> {
     forks: ForkSlots,
     handshake_report: ProbeReport,
     handshake_probe_config: HttpProbeConfig,
+    handshake_probe_limiter: HandshakeProbeLimiter,
 }
 
 impl<D> TempoMcpServer<D> {
@@ -124,6 +130,7 @@ impl<D> TempoMcpServer<D> {
             forks: ForkSlots::default(),
             handshake_report: ProbeReport::new(),
             handshake_probe_config: HttpProbeConfig::default(),
+            handshake_probe_limiter: HandshakeProbeLimiter::default(),
         }
     }
 
@@ -136,6 +143,79 @@ impl<D> TempoMcpServer<D> {
         self.handshake_probe_config = config;
         self
     }
+
+    pub fn with_handshake_probe_limit(mut self, max_concurrent: usize) -> Self {
+        self.handshake_probe_limiter = HandshakeProbeLimiter::new(max_concurrent);
+        self
+    }
+}
+
+#[derive(Clone)]
+struct HandshakeProbeLimiter {
+    max_concurrent: usize,
+    in_flight: Arc<Mutex<usize>>,
+}
+
+impl HandshakeProbeLimiter {
+    fn new(max_concurrent: usize) -> Self {
+        Self {
+            max_concurrent,
+            in_flight: Arc::new(Mutex::new(0)),
+        }
+    }
+
+    fn try_acquire(&self) -> Result<HandshakeProbePermit, HandshakeProbeLimitReached> {
+        let mut in_flight = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *in_flight >= self.max_concurrent {
+            return Err(HandshakeProbeLimitReached {
+                max_concurrent: self.max_concurrent,
+            });
+        }
+        *in_flight += 1;
+        Ok(HandshakeProbePermit {
+            in_flight: Arc::clone(&self.in_flight),
+        })
+    }
+}
+
+impl Default for HandshakeProbeLimiter {
+    fn default() -> Self {
+        Self::new(MAX_CONCURRENT_HANDSHAKE_PROBES)
+    }
+}
+
+struct HandshakeProbePermit {
+    in_flight: Arc<Mutex<usize>>,
+}
+
+impl Drop for HandshakeProbePermit {
+    fn drop(&mut self) {
+        let mut in_flight = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *in_flight = in_flight.saturating_sub(1);
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HandshakeProbeLimitReached {
+    max_concurrent: usize,
+}
+
+enum HandshakeProbeOutcome {
+    NotRequested,
+    Completed(Result<tempo_handshake::HttpProbeRun, String>),
+    LimitReached(HandshakeProbeLimitReached),
+}
+
+static DRIVERLESS_HANDSHAKE_PROBE_LIMITER: OnceLock<HandshakeProbeLimiter> = OnceLock::new();
+
+fn driverless_handshake_probe_limiter() -> &'static HandshakeProbeLimiter {
+    DRIVERLESS_HANDSHAKE_PROBE_LIMITER.get_or_init(HandshakeProbeLimiter::default)
 }
 
 /// Why a driver could not be leased for a tool call.
@@ -780,7 +860,19 @@ where
             }
             "handshake" => {
                 let args: HandshakeArgs = parse_args(arguments)?;
-                let probe = run_handshake_probe(&args, &self.handshake_probe_config).await;
+                let probe = match run_handshake_probe(
+                    &args,
+                    &self.handshake_probe_config,
+                    &self.handshake_probe_limiter,
+                )
+                .await
+                {
+                    HandshakeProbeOutcome::NotRequested => None,
+                    HandshakeProbeOutcome::Completed(result) => Some(result),
+                    HandshakeProbeOutcome::LimitReached(limit) => {
+                        return Ok(ToolCall::handshake_probe_limit(limit));
+                    }
+                };
                 let web_mcp = {
                     let mut lease = self.lease_driver(args.driver_id.as_deref())?;
                     let Some(driver) = lease.driver_mut() else {
@@ -1088,6 +1180,24 @@ impl ToolCall {
         }
     }
 
+    fn handshake_probe_limit(limit: HandshakeProbeLimitReached) -> Self {
+        let message = format!(
+            "live HTTP handshake probe limit reached (max {})",
+            limit.max_concurrent
+        );
+        Self {
+            is_error: true,
+            structured_content: json!({
+                "error": {
+                    "type": HANDSHAKE_PROBE_LIMIT_ERROR_CODE,
+                    "max_concurrent": limit.max_concurrent,
+                    "message": message.clone(),
+                }
+            }),
+            content: vec![text_content_block(format!("error: {message}"))],
+        }
+    }
+
     fn success_json_bounded(artifact: &'static str, value: Value, max_bytes: usize) -> Self {
         match serde_json::to_vec(&value) {
             Ok(bytes) if bytes.len() <= max_bytes => Self::success(value),
@@ -1340,8 +1450,9 @@ fn handshake_probe_target(args: &HandshakeArgs) -> Option<String> {
 async fn run_handshake_probe(
     args: &HandshakeArgs,
     config: &HttpProbeConfig,
-) -> Option<Result<tempo_handshake::HttpProbeRun, String>> {
-    run_handshake_probe_blocking(args, config)
+    limiter: &HandshakeProbeLimiter,
+) -> HandshakeProbeOutcome {
+    run_handshake_probe_blocking(args, config, limiter)
 }
 
 async fn run_web_mcp_detection(driver: &mut dyn DriverTrait) -> Result<WebMcpDetection, String> {
@@ -1446,6 +1557,7 @@ fn canonical_origin_label(origin: &Origin) -> String {
 fn run_handshake_probe_thread(
     origin: String,
     config: HttpProbeConfig,
+    _permit: HandshakeProbePermit,
 ) -> Result<tempo_handshake::HttpProbeRun, String> {
     match std::thread::spawn(move || probe_http_origin(&origin, config)).join() {
         Ok(result) => result.map_err(|error| error.to_string()),
@@ -1459,10 +1571,17 @@ fn run_handshake_probe_thread(
 fn run_handshake_probe_blocking(
     args: &HandshakeArgs,
     config: &HttpProbeConfig,
-) -> Option<Result<tempo_handshake::HttpProbeRun, String>> {
-    let origin = handshake_probe_target(args)?;
+    limiter: &HandshakeProbeLimiter,
+) -> HandshakeProbeOutcome {
+    let Some(origin) = handshake_probe_target(args) else {
+        return HandshakeProbeOutcome::NotRequested;
+    };
+    let permit = match limiter.try_acquire() {
+        Ok(permit) => permit,
+        Err(limit) => return HandshakeProbeOutcome::LimitReached(limit),
+    };
     let config = config.clone();
-    Some(run_handshake_probe_thread(origin, config))
+    HandshakeProbeOutcome::Completed(run_handshake_probe_thread(origin, config, permit))
 }
 
 fn handle_driverless_message(
@@ -1521,7 +1640,17 @@ fn driverless_tools_call(
     }
 
     let args: HandshakeArgs = parse_args(arguments)?;
-    let probe = run_handshake_probe_blocking(&args, &handshake_probe_config);
+    let probe = match run_handshake_probe_blocking(
+        &args,
+        &handshake_probe_config,
+        driverless_handshake_probe_limiter(),
+    ) {
+        HandshakeProbeOutcome::NotRequested => None,
+        HandshakeProbeOutcome::Completed(result) => Some(result),
+        HandshakeProbeOutcome::LimitReached(limit) => {
+            return tool_call_json(ToolCall::handshake_probe_limit(limit));
+        }
+    };
     tool_call_json(ToolCall::success(handshake_result_json(
         &ProbeReport::new(),
         args,
@@ -3191,6 +3320,43 @@ mod tests {
         );
         let long_result = long_call.join().map_err(|_| "long call panicked")??;
         assert!(long_result.get("error").is_none(), "{long_result}");
+        Ok(())
+    }
+
+    #[test]
+    fn handshake_live_probe_cap_returns_structured_tool_error() -> Result<(), String> {
+        let server =
+            Arc::new(TempoMcpServer::new(MemoryDriver::new()).with_handshake_probe_limit(1));
+        let permit = server
+            .handshake_probe_limiter
+            .try_acquire()
+            .map_err(|limit| format!("unexpected limiter rejection: {limit:?}"))?;
+
+        let value = blocking_tool_call(
+            &server,
+            42,
+            "handshake",
+            json!({"origin": "https://example.test"}),
+        )?;
+
+        assert!(value.get("error").is_none(), "{value}");
+        let result = &value["result"];
+        assert_eq!(result["isError"], true);
+        assert_eq!(
+            result["structuredContent"]["error"]["type"],
+            HANDSHAKE_PROBE_LIMIT_ERROR_CODE
+        );
+        assert_eq!(result["structuredContent"]["error"]["max_concurrent"], 1);
+        assert!(result["content"][0]["text"]
+            .as_str()
+            .ok_or("text content must be a string")?
+            .contains("live HTTP handshake probe limit reached"));
+
+        drop(permit);
+        assert!(
+            server.handshake_probe_limiter.try_acquire().is_ok(),
+            "permit drop must release limiter capacity"
+        );
         Ok(())
     }
 
