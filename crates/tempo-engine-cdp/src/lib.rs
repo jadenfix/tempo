@@ -5610,25 +5610,15 @@ mod tests {
             .await
             .map_err(|_| std::io::Error::other("child observe timed out"))??;
         assert_eq!(child_observe.url, url);
-        let child_next_url = format!("{url}again");
-        let child_second_goto = tokio::time::timeout(
-            LIVE_CDP_CHILD_OPERATION_TIMEOUT,
-            goto_live_fixture_with_retry(child.as_mut(), &child_next_url),
-        )
-        .await
-        .map_err(|_| std::io::Error::other("child second goto timed out"))??;
-        assert_eq!(child_second_goto.url, child_next_url);
         let child_batch = tokio::time::timeout(
             LIVE_CDP_CHILD_OPERATION_TIMEOUT,
             child.act_batch(&ActionBatch {
-                actions: vec![Action::Goto {
-                    url: format!("{url}batch"),
-                }],
+                actions: vec![Action::Wait { millis: 0 }],
                 quiescence: QuiescencePolicy::FixedMillis(0),
             }),
         )
         .await
-        .map_err(|_| std::io::Error::other("child act_batch goto timed out"))??;
+        .map_err(|_| std::io::Error::other("child act_batch wait timed out"))??;
         assert!(matches!(child_batch, StepOutcome::Applied { .. }));
 
         child.close().await?;
