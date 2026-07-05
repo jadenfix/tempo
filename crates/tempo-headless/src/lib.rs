@@ -889,7 +889,7 @@ pub struct SessionPool {
     sessions: BTreeMap<TempodSessionId, TempodSession>,
     session_drivers: BTreeMap<TempodSessionId, AttachedEngineDriver>,
     session_act_batch_idempotency:
-        BTreeMap<(TempodSessionId, String), SessionActBatchIdempotencyEntry>,
+        BTreeMap<TempodSessionId, BTreeMap<String, SessionActBatchIdempotencyEntry>>,
     events: BTreeMap<TempodSessionId, Vec<TempodSessionEvent>>,
     otlp_exporter: Option<OtlpJsonExporter>,
     privacy_mode: PrivacyMode,
@@ -937,13 +937,18 @@ impl Default for SessionPool {
 
 impl fmt::Debug for SessionPool {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let session_act_batch_idempotency_records: usize = self
+            .session_act_batch_idempotency
+            .values()
+            .map(BTreeMap::len)
+            .sum();
         formatter
             .debug_struct("SessionPool")
             .field("sessions", &self.sessions)
             .field("session_drivers", &self.session_drivers.keys())
             .field(
                 "session_act_batch_idempotency",
-                &self.session_act_batch_idempotency.len(),
+                &session_act_batch_idempotency_records,
             )
             .field("event_sessions", &self.events.len())
             .field("otlp_exporter", &self.otlp_exporter)
@@ -1608,7 +1613,8 @@ impl SessionPool {
         }
         let Some(entry) = self
             .session_act_batch_idempotency
-            .get(&(id.clone(), key.to_owned()))
+            .get(id)
+            .and_then(|bucket| bucket.get(key))
         else {
             return Ok(None);
         };
@@ -1631,11 +1637,10 @@ impl SessionPool {
         if !self.privacy_mode.retains_idempotency_cache() {
             return Ok(());
         }
-        if self
-            .session_act_batch_idempotency
-            .contains_key(&(id.clone(), key.to_owned()))
-            || self.session_idempotency_record_count(id) < MAX_SESSION_IDEMPOTENCY_RECORDS
-        {
+        let Some(bucket) = self.session_act_batch_idempotency.get(id) else {
+            return Ok(());
+        };
+        if bucket.contains_key(key) || bucket.len() < MAX_SESSION_IDEMPOTENCY_RECORDS {
             return Ok(());
         }
         Err(TempodError::Conflict(format!(
@@ -1658,26 +1663,28 @@ impl SessionPool {
             return Ok(());
         }
         self.ensure_session_idempotency_capacity(id, key)?;
-        self.session_act_batch_idempotency.insert(
-            (id.clone(), key.to_owned()),
-            SessionActBatchIdempotencyEntry {
-                request_fingerprint,
-                response: CachedSessionActBatchResponse { status, body },
-            },
-        );
+        self.session_act_batch_idempotency
+            .entry(id.clone())
+            .or_default()
+            .insert(
+                key.to_owned(),
+                SessionActBatchIdempotencyEntry {
+                    request_fingerprint,
+                    response: CachedSessionActBatchResponse { status, body },
+                },
+            );
         Ok(())
     }
 
+    #[cfg(test)]
     fn session_idempotency_record_count(&self, id: &TempodSessionId) -> usize {
         self.session_act_batch_idempotency
-            .keys()
-            .filter(|(session_id, _)| session_id == id)
-            .count()
+            .get(id)
+            .map_or(0, BTreeMap::len)
     }
 
     fn clear_session_idempotency(&mut self, id: &TempodSessionId) {
-        self.session_act_batch_idempotency
-            .retain(|(session_id, _), _| session_id != id);
+        self.session_act_batch_idempotency.remove(id);
     }
 
     fn session_driver(&self, id: &TempodSessionId) -> Result<AttachedEngineDriver, TempodError> {
@@ -5603,6 +5610,107 @@ mod tests {
         assert_eq!(adopted.state, TempodSessionState::Adopted);
         assert_eq!(killed.state, TempodSessionState::Killed);
         assert!(pool.draining());
+        Ok(())
+    }
+
+    #[test]
+    fn session_idempotency_cache_uses_per_session_buckets() -> TestResult {
+        let mut pool = SessionPool::default();
+        let first = pool.finish_create("https://first.test".into(), None);
+        let second = pool.finish_create("https://second.test".into(), None);
+
+        pool.remember_session_act_batch_response(
+            &first.id,
+            "first-a",
+            json!({"session": "first", "key": "a"}),
+            200,
+            json!({"ok": "first-a"}),
+        )?;
+        pool.remember_session_act_batch_response(
+            &first.id,
+            "first-b",
+            json!({"session": "first", "key": "b"}),
+            201,
+            json!({"ok": "first-b"}),
+        )?;
+        pool.remember_session_act_batch_response(
+            &second.id,
+            "second-a",
+            json!({"session": "second", "key": "a"}),
+            202,
+            json!({"ok": "second-a"}),
+        )?;
+
+        assert_eq!(pool.session_act_batch_idempotency.len(), 2);
+        assert_eq!(
+            pool.session_act_batch_idempotency
+                .get(&first.id)
+                .map(BTreeMap::len),
+            Some(2)
+        );
+        assert_eq!(pool.session_idempotency_record_count(&first.id), 2);
+        assert_eq!(pool.session_idempotency_record_count(&second.id), 1);
+
+        let cached = pool
+            .cached_session_act_batch_response(
+                &second.id,
+                "second-a",
+                &json!({"session": "second", "key": "a"}),
+            )?
+            .ok_or("expected cached response")?;
+        assert_eq!(cached.status, 202);
+        assert_eq!(cached.body, json!({"ok": "second-a"}));
+
+        pool.clear_session_idempotency(&first.id);
+        assert!(!pool.session_act_batch_idempotency.contains_key(&first.id));
+        assert_eq!(pool.session_idempotency_record_count(&first.id), 0);
+        assert_eq!(pool.session_idempotency_record_count(&second.id), 1);
+        assert!(pool.session_act_batch_idempotency.contains_key(&second.id));
+        Ok(())
+    }
+
+    #[test]
+    fn session_idempotency_capacity_is_per_session_bucket() -> TestResult {
+        let mut pool = SessionPool::default();
+        let full = pool.finish_create("https://full.test".into(), None);
+        let other = pool.finish_create("https://other.test".into(), None);
+
+        for index in 0..MAX_SESSION_IDEMPOTENCY_RECORDS {
+            pool.remember_session_act_batch_response(
+                &full.id,
+                &format!("full-{index}"),
+                json!({"session": "full", "index": index}),
+                200,
+                json!({"index": index}),
+            )?;
+        }
+        assert_eq!(
+            pool.session_idempotency_record_count(&full.id),
+            MAX_SESSION_IDEMPOTENCY_RECORDS
+        );
+
+        let error = match pool.remember_session_act_batch_response(
+            &full.id,
+            "overflow",
+            json!({"session": "full", "index": "overflow"}),
+            200,
+            json!({"overflow": true}),
+        ) {
+            Ok(()) => return Err("full session bucket accepted overflow idempotency record".into()),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, TempodError::Conflict(message) if message.contains("cache is full"))
+        );
+
+        pool.remember_session_act_batch_response(
+            &other.id,
+            "other-0",
+            json!({"session": "other", "index": 0}),
+            200,
+            json!({"ok": true}),
+        )?;
+        assert_eq!(pool.session_idempotency_record_count(&other.id), 1);
         Ok(())
     }
 
