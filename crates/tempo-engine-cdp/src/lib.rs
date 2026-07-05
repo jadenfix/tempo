@@ -40,7 +40,7 @@ use tempo_driver::{
     MAX_SCREENSHOT_BYTES, MAX_SCREENSHOT_HEIGHT, MAX_SCREENSHOT_WIDTH,
 };
 use tempo_net::UrlPolicy;
-use tempo_observe::{RawElement, StableIdMapper};
+use tempo_observe::{finalize_observation, CompileOptions, RawElement, StableIdMapper};
 use tempo_schema::{
     Action, ActionBatch, CompiledObservation, InteractiveElement, NodeId, ObservationDiff,
     Provenance, QuiescencePolicy, TaintSpan,
@@ -457,6 +457,17 @@ impl CdpTempoDriver {
             compile_observation(&mut self.stable_id_mapper, url, dom_html, self.seq);
         self.selectors_by_node = selectors_by_node;
         self.enrich_observation_from_ax_tree(&mut compiled).await?;
+        // Finish the live observation the same way the fixture compiler does:
+        // rank-sort, apply the byte/token budget, and populate set-of-marks labels.
+        // Run after enrichment so the budget accounts for enriched AX names/values.
+        // Without this the CDP lane shipped the full, unranked, unbudgeted
+        // document-order element dump with no marks (#477).
+        let compiled = finalize_observation(
+            compiled.url,
+            compiled.seq,
+            compiled.elements,
+            CompileOptions::default(),
+        );
         Ok(retain_observation_history(&mut self.history, compiled))
     }
 
@@ -2957,6 +2968,62 @@ mod tests {
         );
         // input/select never carry inner text.
         assert_eq!(element_text("<input>", 7, "input"), None);
+    }
+
+    #[test]
+    fn finalize_ranks_mark_labels_and_budget_caps_the_live_observation() {
+        // The live observe path is `compile_observation` + `finalize_observation`.
+        // Prove the composition delivers the three things the raw CDP extractor
+        // skipped: rank-sort, set-of-marks labels, and a byte budget (#477).
+        let mut mapper = StableIdMapper::new();
+        let html = r#"
+            <main>
+              <a href="/low">low priority link</a>
+              <button id="hi">Submit</button>
+              <input name="q">
+            </main>
+        "#;
+        let (raw, _) =
+            compile_observation(&mut mapper, "https://example.test/".into(), html.into(), 1);
+        // Raw extractor emits document order and no marks.
+        assert!(raw.marks.is_empty());
+        let finished =
+            finalize_observation(raw.url, raw.seq, raw.elements, CompileOptions::default());
+        // Rank-sorted: ranks are non-increasing.
+        assert!(finished
+            .elements
+            .windows(2)
+            .all(|pair| pair[0].rank >= pair[1].rank));
+        // Set-of-marks labels are now populated, numbered from 1.
+        assert!(!finished.marks.is_empty());
+        assert_eq!(finished.marks[0].1, 1);
+
+        // A large page is budget-capped, not dumped in full.
+        let big: String = (0..400)
+            .map(|i| format!("<button id=\"b{i}\">Button number {i}</button>"))
+            .collect();
+        let (raw_big, _) = compile_observation(&mut mapper, "https://example.test/".into(), big, 2);
+        let raw_count = raw_big.elements.len();
+        assert!(raw_count > 200, "fixture should extract all 400 buttons");
+        let finished_big = finalize_observation(
+            raw_big.url,
+            raw_big.seq,
+            raw_big.elements,
+            CompileOptions::default(),
+        );
+        assert!(
+            finished_big.elements.len() < raw_count,
+            "budget should truncate a 400-element page (kept {} of {raw_count})",
+            finished_big.elements.len()
+        );
+        let encoded = match serde_json::to_vec(&finished_big) {
+            Ok(bytes) => bytes,
+            Err(error) => panic!("serialize finalized observation: {error}"),
+        };
+        assert!(
+            encoded.len() <= tempo_observe::DEFAULT_MAX_BYTES,
+            "encoded observation should stay under the default byte budget"
+        );
     }
 
     #[test]

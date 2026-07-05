@@ -338,14 +338,7 @@ impl ObservationCompiler {
 
         self.mapper.evict_stale();
 
-        elements.sort_by(|left, right| {
-            right
-                .rank
-                .total_cmp(&left.rank)
-                .then_with(|| left.node_id.0.cmp(&right.node_id.0))
-        });
-
-        let observation = apply_budget(input.url, self.seq, elements, self.options);
+        let observation = finalize_observation(input.url, self.seq, elements, self.options);
         if track_identities {
             let emitted_ids: HashSet<&str> = observation
                 .elements
@@ -972,6 +965,30 @@ fn serialized_observations_equal(left: &CompiledObservation, right: &CompiledObs
 /// Stable crate summary used by smoke tests and binaries.
 pub fn describe() -> &'static str {
     "observation compiler: stable-ID mapper, interactive-element ranker, diff engine, set-of-marks compositor, token budgeter"
+}
+
+/// Turn an already-built interactive-element list into a finished
+/// [`CompiledObservation`]: rank-sort (highest first, `node_id` as a stable
+/// tiebreak), then apply the byte/token budget and set-of-marks labels.
+///
+/// This is the shared tail of the fixture compiler ([`ObservationCompiler::compile`]).
+/// Live engine adapters (CDP/Servo) that construct `InteractiveElement`s directly —
+/// e.g. after AX enrichment — call this so their observation is ranked, budget-capped,
+/// and mark-labeled exactly like the fixture path, instead of emitting a full,
+/// unranked, unbudgeted document-order dump.
+pub fn finalize_observation(
+    url: String,
+    seq: u64,
+    mut elements: Vec<InteractiveElement>,
+    options: CompileOptions,
+) -> CompiledObservation {
+    elements.sort_by(|left, right| {
+        right
+            .rank
+            .total_cmp(&left.rank)
+            .then_with(|| left.node_id.0.cmp(&right.node_id.0))
+    });
+    apply_budget(url, seq, elements, options)
 }
 
 fn apply_budget(
