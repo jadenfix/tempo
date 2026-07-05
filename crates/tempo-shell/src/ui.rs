@@ -150,6 +150,18 @@ pub enum UiAction {
     ResumeTakeover,
 }
 
+impl UiAction {
+    /// Whether this action is a pure chrome/model update that never needs the
+    /// tempod transport. The window transport applies these immediately so
+    /// local controls stay responsive while backend I/O is slow or unhealthy.
+    pub fn is_local(&self) -> bool {
+        matches!(
+            self,
+            Self::SelectTab(_) | Self::ToggleMarks | Self::ResumeTakeover
+        )
+    }
+}
+
 /// Which way [`ShellUiModel::step_history`] walks the active tab's stack.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HistoryStep {
@@ -240,6 +252,19 @@ impl ShellUiModel {
             UiAction::ToggleMarks => self.toggle_marks(),
             UiAction::ResumeTakeover => self.resume_takeover(),
         }
+    }
+
+    /// Apply a pure local action without requiring a [`SessionService`]. Returns
+    /// `false` for transport-backed actions so callers do not accidentally route
+    /// I/O through the local path.
+    pub fn dispatch_local(&mut self, action: UiAction) -> bool {
+        match action {
+            UiAction::SelectTab(index) => self.select_tab(index),
+            UiAction::ToggleMarks => self.toggle_marks(),
+            UiAction::ResumeTakeover => self.resume_takeover(),
+            _ => return false,
+        }
+        true
     }
 
     /// The active tab, if any.

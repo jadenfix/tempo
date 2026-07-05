@@ -23,6 +23,7 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use crate::agent::JournalLog;
 use crate::ui::{SessionService, ShellUiModel, UiAction};
 
 /// Builds a fresh [`SessionService`] for a tempod base URL. The worker rebuilds
@@ -47,13 +48,40 @@ where
 /// it (the reducer takes these fields from the model: `base_url` to build the
 /// client, `open_url` for open/new-tab, the active tab's `omnibox` for navigate).
 enum WorkerRequest {
-    Dispatch {
-        action: UiAction,
-        base_url: String,
-        open_url: String,
-        omnibox: String,
-    },
+    Dispatch(Box<WorkerDispatch>),
     Shutdown,
+}
+
+struct WorkerDispatch {
+    action: UiAction,
+    local_state: LocalModelState,
+    local_version: u64,
+    base_url: String,
+    open_url: String,
+    omnibox: String,
+}
+
+#[derive(Clone)]
+struct LocalModelState {
+    active_tab: Option<usize>,
+    marks_overlay: bool,
+    journal: JournalLog,
+}
+
+impl LocalModelState {
+    fn from_model(model: &ShellUiModel) -> Self {
+        Self {
+            active_tab: model.active_tab,
+            marks_overlay: model.marks_overlay,
+            journal: model.journal.clone(),
+        }
+    }
+
+    fn apply_to(self, model: &mut ShellUiModel) {
+        model.active_tab = self.active_tab;
+        model.marks_overlay = self.marks_overlay;
+        model.journal = self.journal;
+    }
 }
 
 /// The worker's reply after processing one request: the freshly-mutated model and
@@ -62,6 +90,7 @@ enum WorkerRequest {
 struct WorkerUpdate {
     model: ShellUiModel,
     completed: UiAction,
+    local_version: u64,
 }
 
 /// The three periodic poll actions. Only these are coalesced — user actions are
@@ -127,6 +156,7 @@ pub struct TransportClient {
     /// Editable omnibox of the active tab.
     pub omnibox: String,
     gate: PollGate,
+    local_version: u64,
     down: bool,
 }
 
@@ -156,6 +186,7 @@ impl TransportClient {
             open_url: String::new(),
             omnibox: String::new(),
             gate: PollGate::default(),
+            local_version: 0,
             down: false,
         }
     }
@@ -172,17 +203,23 @@ impl TransportClient {
         if self.down {
             return Enqueued::Disconnected;
         }
+        if action.is_local() {
+            self.apply_local(action);
+            return Enqueued::Sent;
+        }
         if let Some(flag) = self.gate.slot(&action)
             && *flag
         {
             return Enqueued::Coalesced;
         }
-        let request = WorkerRequest::Dispatch {
+        let request = WorkerRequest::Dispatch(Box::new(WorkerDispatch {
             action: action.clone(),
+            local_state: self.synced_local_state(),
+            local_version: self.local_version,
             base_url: self.base_url.clone(),
             open_url: self.open_url.clone(),
             omnibox: self.omnibox.clone(),
-        };
+        }));
         match self.tx.send(request) {
             Ok(()) => {
                 if let Some(flag) = self.gate.slot(&action) {
@@ -216,19 +253,53 @@ impl TransportClient {
         if let Some(flag) = self.gate.slot(&update.completed) {
             *flag = false;
         }
+        let stale = update.local_version < self.local_version;
+        let local = stale.then(|| self.model.clone());
         let resync = !is_poll(&update.completed);
         self.model = update.model;
-        if resync {
+        if let Some(local) = local {
+            self.model.active_tab = local.active_tab;
+            self.model.marks_overlay = local.marks_overlay;
+            self.model.journal = local.journal;
+            self.model.status = local.status;
+        }
+        if resync && !stale {
             // A user action may have cleared open_url (open/new-tab) or moved the
             // omnibox (back/forward, tab switch); adopt those. Poll results skip
             // this, so in-progress typing survives the refresh cadence.
-            self.open_url = self.model.open_url.clone();
-            self.omnibox = self
-                .model
-                .active_tab()
-                .map(|tab| tab.omnibox.clone())
-                .unwrap_or_default();
+            self.sync_inputs_from_model();
         }
+    }
+
+    fn apply_local(&mut self, action: UiAction) {
+        self.sync_inputs_into_model();
+        if self.model.dispatch_local(action) {
+            self.local_version = self.local_version.saturating_add(1);
+            self.sync_inputs_from_model();
+        }
+    }
+
+    fn synced_local_state(&self) -> LocalModelState {
+        LocalModelState::from_model(&self.model)
+    }
+
+    fn sync_inputs_into_model(&mut self) {
+        self.model.base_url = self.base_url.clone();
+        self.model.open_url = self.open_url.clone();
+        if let Some(active) = self.model.active_tab
+            && let Some(tab) = self.model.tabs.get_mut(active)
+        {
+            tab.omnibox = self.omnibox.clone();
+        }
+    }
+
+    fn sync_inputs_from_model(&mut self) {
+        self.open_url = self.model.open_url.clone();
+        self.omnibox = self
+            .model
+            .active_tab()
+            .map(|tab| tab.omnibox.clone())
+            .unwrap_or_default();
     }
 
     /// Block up to `timeout` for the next result and apply it, returning the
@@ -245,13 +316,13 @@ impl TransportClient {
         }
     }
 
-    /// Ask the worker to stop and wait for it. Idempotent; also run on drop. After
-    /// this, [`Self::enqueue`] reports [`Enqueued::Disconnected`].
+    /// Ask the worker to stop without waiting for in-flight blocking transport
+    /// work. Idempotent; also run on drop. After this, [`Self::enqueue`] reports
+    /// [`Enqueued::Disconnected`].
     pub fn shutdown(&mut self) {
+        self.down = true;
         let _ = self.tx.send(WorkerRequest::Shutdown);
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
+        let _ = self.worker.take();
     }
 }
 
@@ -271,20 +342,23 @@ fn run_worker(
     wake: Box<dyn Fn() + Send + 'static>,
 ) {
     while let Ok(request) = rx.recv() {
-        let WorkerRequest::Dispatch {
+        let WorkerRequest::Dispatch(dispatch) = request else {
+            break; // Shutdown.
+        };
+        let WorkerDispatch {
             action,
+            local_state,
+            local_version,
             base_url,
             open_url,
             omnibox,
-        } = request
-        else {
-            break; // Shutdown.
-        };
+        } = *dispatch;
 
         // Fold the UI thread's latest edits into the model before the reducer
         // reads them (it takes these straight off the model, as it always has).
         model.base_url = base_url;
         model.open_url = open_url;
+        local_state.apply_to(&mut model);
         if let Some(active) = model.active_tab
             && let Some(tab) = model.tabs.get_mut(active)
         {
@@ -297,6 +371,7 @@ fn run_worker(
         let update = WorkerUpdate {
             model: model.clone(),
             completed: action,
+            local_version,
         };
         if tx.send(update).is_err() {
             break; // UI hung up.
@@ -309,6 +384,7 @@ fn run_worker(
 mod tests {
     use super::*;
     use crate::tab::ScreenshotImage;
+    use crate::tab::Tab;
     use crate::{HealthResponse, ShellError};
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
@@ -475,6 +551,59 @@ mod tests {
             fake.calls(),
             vec!["health", "sessions", "health", "sessions"]
         );
+    }
+
+    #[test]
+    fn local_actions_apply_while_transport_request_is_in_flight() {
+        let fake = FakeService {
+            delay: Duration::from_millis(400),
+            ..FakeService::default()
+        };
+        let mut client = TransportClient::spawn("127.0.0.1:0", fake.factory(), || {});
+        client
+            .model
+            .tabs
+            .push(Tab::new("session-0", None, "https://one.test"));
+        client
+            .model
+            .tabs
+            .push(Tab::new("session-1", None, "https://two.test"));
+        client.model.active_tab = Some(0);
+        client.omnibox = "https://one.test".into();
+
+        assert_eq!(client.enqueue(UiAction::Refresh), Enqueued::Sent);
+        assert_eq!(client.enqueue(UiAction::SelectTab(1)), Enqueued::Sent);
+        assert_eq!(client.model.active_tab, Some(1));
+        assert_eq!(client.omnibox, "https://two.test");
+
+        assert_eq!(
+            client.wait_and_apply(Duration::from_secs(5)),
+            Some(UiAction::Refresh)
+        );
+        assert_eq!(
+            client.model.active_tab,
+            Some(1),
+            "stale worker results must not undo local tab selection"
+        );
+    }
+
+    #[test]
+    fn shutdown_does_not_wait_for_in_flight_transport_request() {
+        let fake = FakeService {
+            delay: Duration::from_millis(400),
+            ..FakeService::default()
+        };
+        let mut client = TransportClient::spawn("127.0.0.1:0", fake.factory(), || {});
+        assert_eq!(client.enqueue(UiAction::Refresh), Enqueued::Sent);
+
+        let started = Instant::now();
+        client.shutdown();
+        let shutdown_took = started.elapsed();
+        assert!(
+            shutdown_took < Duration::from_millis(200),
+            "shutdown must not join a worker blocked in transport, took {shutdown_took:?}"
+        );
+        assert_eq!(client.enqueue(UiAction::Refresh), Enqueued::Disconnected);
     }
 
     #[test]
