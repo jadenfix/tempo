@@ -92,7 +92,7 @@ jobs:
           fi
 
           changed_files="$(git diff --name-only "${BASE_SHA}" "${HEAD_SHA}")"
-          servo_gate_pattern='^\.github/workflows/|^Cargo\.toml$|^crates/(tempo-engine-servo|tempo-headless|tempo-engine-host|tempo-driver|tempo-net|tempo-schema|tempo-mcp|tempo-session|tempo-shell|tempo-cli|tempo-observe|tempo-compat|tempo-policy|tempo-evals|tempo-config)/|^scripts/(check-servo-public-api|cargo-servo-tempo)\.sh$'
+          servo_gate_pattern='^\.github/workflows/|^Cargo\.(toml|lock)$|^crates/(tempo-engine-servo|tempo-headless|tempo-engine-host|tempo-driver|tempo-net|tempo-schema|tempo-mcp|tempo-session|tempo-shell|tempo-cli|tempo-observe|tempo-compat|tempo-policy|tempo-evals|tempo-config)/|^scripts/(check-servo-public-api|cargo-servo-tempo)\.sh$'
           if printf '%s\n' "${changed_files}" | grep -Eq "${servo_gate_pattern}"; then
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
