@@ -2637,7 +2637,15 @@ fn discover_packaged_cdp_engine_binary() -> Result<PathBuf, TempodError> {
 fn discover_packaged_cdp_engine_binary_next_to(
     tempod_exe: impl AsRef<Path>,
 ) -> Result<PathBuf, TempodError> {
-    let binary = packaged_cdp_engine_binary_next_to(tempod_exe.as_ref())?;
+    let tempod_exe = tempod_exe.as_ref();
+    let binary = packaged_cdp_engine_binary_next_to(tempod_exe)?;
+    let parent = tempod_exe.parent().ok_or_else(|| {
+        TempodError::DriverUnavailable(format!(
+            "cannot locate packaged CDP engine binary because tempod path has no parent: {}; pass --engine-socket PATH",
+            tempod_exe.display()
+        ))
+    })?;
+    validate_packaged_cdp_engine_binary_parent(parent)?;
     if binary.is_file() {
         return Ok(binary);
     }
@@ -2656,6 +2664,34 @@ fn packaged_cdp_engine_binary_next_to(tempod_exe: &Path) -> Result<PathBuf, Temp
         ))
     })?;
     Ok(dir.join(packaged_cdp_engine_binary_file_name()))
+}
+
+#[cfg(unix)]
+fn validate_packaged_cdp_engine_binary_parent(parent: &Path) -> Result<(), TempodError> {
+    let metadata = std::fs::symlink_metadata(parent).map_err(TempodError::Io)?;
+    if metadata.file_type().is_symlink() {
+        return Err(TempodError::DriverUnavailable(
+            "packaged CDP engine parent path cannot be a symlink".into(),
+        ));
+    }
+    if !metadata.file_type().is_dir() {
+        return Err(TempodError::DriverUnavailable(
+            "packaged CDP engine parent path must be a directory".into(),
+        ));
+    }
+    use std::os::unix::fs::PermissionsExt;
+    if metadata.permissions().mode() & 0o022 != 0 {
+        return Err(TempodError::DriverUnavailable(format!(
+            "packaged CDP engine parent path is insecure: {} is writable by group/other",
+            parent.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_packaged_cdp_engine_binary_parent(_parent: &Path) -> Result<(), TempodError> {
+    Ok(())
 }
 
 fn packaged_cdp_engine_binary_file_name() -> String {
@@ -10822,6 +10858,61 @@ mod tests {
         assert!(error.contains(PACKAGED_CDP_ENGINE_BINARY), "{error}");
         assert!(error.contains("--engine-socket PATH"), "{error}");
         remove_dir_if_exists(&dir)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discover_packaged_cdp_binary_rejects_insecure_parent_directory() -> TestResult {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = unique_dir("insecure-cdp-binary-parent")?;
+        std::fs::create_dir_all(&dir)?;
+        let tempod = dir.join(format!("tempod{}", std::env::consts::EXE_SUFFIX));
+        std::fs::write(&tempod, b"")?;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777))?;
+
+        let error = match discover_packaged_cdp_engine_binary_next_to(&tempod) {
+            Ok(path) => return Err(format!("unexpectedly discovered {}", path.display()).into()),
+            Err(error) => error.to_string(),
+        };
+
+        assert!(error.contains("writable by group/other"), "{error}");
+
+        remove_dir_if_exists(&dir)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn connect_auto_started_engine_observes_child_exit_before_socket_bind() -> TestResult {
+        let dir = auto_cdp_runtime_base_dir().join(format!(
+            "tempo-headless-auto-cdp-child-exit-{}-{:x}",
+            std::process::id(),
+            current_time_ns()
+        ));
+        std::fs::create_dir_all(&dir)?;
+        let socket_path = dir.join("engine.sock");
+        let mut host = EngineHost::spawn(
+            EngineHostConfig::new("sh")
+                .arg("-c")
+                .arg("exit 1")
+                .control_socket(socket_path.clone())
+                .restart(tempo_engine_host::RestartPolicy::Never),
+        )?;
+
+        let result = connect_auto_started_engine(&socket_path, &mut host, Duration::from_secs(2));
+        let error = match result {
+            Ok(_) => panic!("expected auto-started CDP child to fail before bind"),
+            Err(error) => error.to_string(),
+        };
+
+        assert!(
+            error.contains("auto-started CDP engine exited before its socket became ready"),
+            "{error}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
         Ok(())
     }
 
