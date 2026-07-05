@@ -12,13 +12,15 @@ final class TempoBrowserModel: ObservableObject {
 
     private let bridge: TempoRustBridge
 
-    init(bridge: TempoRustBridge = TempoRustBridge()) {
+    init(bridge: TempoRustBridge = TempoRustBridge(), seedPreview: Bool = true) {
         let firstTab = TempoTab()
         self.tabs = [firstTab]
         self.selectedTabID = firstTab.id
         self.addressText = firstTab.url?.absoluteString ?? ""
         self.bridge = bridge
-        seedPreviewSessions()
+        if seedPreview {
+            seedPreviewSessions()
+        }
     }
 
     var selectedTab: TempoTab? {
@@ -39,6 +41,17 @@ final class TempoBrowserModel: ObservableObject {
 
     var observationScript: String {
         bridge.observationScript()
+    }
+
+    func webViewCommandBinding(for tabID: UUID) -> Binding<WebViewCommand?> {
+        Binding(
+            get: { self.selectedTabID == tabID ? self.webViewCommand : nil },
+            set: { command in
+                if self.selectedTabID == tabID {
+                    self.webViewCommand = command
+                }
+            }
+        )
     }
 
     func updateSelectedTab(_ mutate: (inout TempoTab) -> Void) {
@@ -111,11 +124,15 @@ final class TempoBrowserModel: ObservableObject {
     }
 
     func ingestObservationPayload(_ payload: Any?) {
+        ingestObservationPayload(payload, for: selectedTabID)
+    }
+
+    func ingestObservationPayload(_ payload: Any?, for tabID: UUID) {
         guard let payload,
               let summary = bridge.compileObservationPayload(payload) else {
             return
         }
-        updateSelectedTab { tab in
+        updateTab(tabID) { tab in
             if let observedURL = URL(string: summary.url) {
                 tab.url = observedURL
                 tab.title = tab.title.isEmpty ? observedURL.host() ?? "Tempo" : tab.title
@@ -129,6 +146,7 @@ final class TempoBrowserModel: ObservableObject {
     }
 
     func apply(_ event: ManagerEvent) {
+        manager.previewOnly = false
         manager.apply(event)
         syncTabsFromManager()
     }
@@ -145,6 +163,9 @@ final class TempoBrowserModel: ObservableObject {
     }
 
     func adopt(_ session: TempoSessionSummary) {
+        guard ensureManagerMutationAllowed("Adopt requires a live tempod session.") else {
+            return
+        }
         if let existing = tabs.first(where: { $0.sessionID == session.id }) {
             selectTab(existing.id)
             updateSelectedTab { tab in
@@ -166,6 +187,9 @@ final class TempoBrowserModel: ObservableObject {
     }
 
     func handoffSelectedSession() {
+        guard ensureManagerMutationAllowed("Handoff requires a live tempod session.") else {
+            return
+        }
         guard let sessionID = selectedTab?.sessionID ?? manager.selectedSessionID else {
             return
         }
@@ -183,6 +207,9 @@ final class TempoBrowserModel: ObservableObject {
     }
 
     func resolvePendingConfirmation(approved: Bool) {
+        guard ensureManagerMutationAllowed("Confirmation requires a server-minted tempod grant.") else {
+            return
+        }
         guard let confirmation = manager.pendingConfirmation else {
             return
         }
@@ -210,6 +237,24 @@ final class TempoBrowserModel: ObservableObject {
             return url
         }
         return URL(string: "https://\(trimmed)")
+    }
+
+    private func updateTab(_ tabID: UUID, mutate: (inout TempoTab) -> Void) {
+        guard let index = tabs.firstIndex(where: { $0.id == tabID }) else {
+            return
+        }
+        mutate(&tabs[index])
+        if tabID == selectedTabID {
+            addressText = tabs[index].url?.absoluteString ?? ""
+        }
+    }
+
+    private func ensureManagerMutationAllowed(_ message: String) -> Bool {
+        if manager.previewOnly {
+            lastError = "Preview manager data only. \(message)"
+            return false
+        }
+        return true
     }
 
     private func syncTabsFromManager() {
@@ -242,6 +287,7 @@ final class TempoBrowserModel: ObservableObject {
             )
         )
         manager.apply(.sessionSnapshot([session]))
+        manager.previewOnly = true
         if let confirmation = session.pendingConfirmation {
             manager.apply(.confirmationRequested(confirmation))
         }

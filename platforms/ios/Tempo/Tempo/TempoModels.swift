@@ -103,6 +103,7 @@ struct ManagerPanelState: Equatable {
     var journal: [AgentJournalEntry] = []
     var pendingConfirmation: PendingConfirmation?
     var takeoverSessionID: String?
+    var previewOnly: Bool = false
 
     var selectedSession: TempoSessionSummary? {
         sessions.first { $0.id == selectedSessionID }

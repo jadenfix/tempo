@@ -9,12 +9,19 @@ struct BrowserShellView: View {
             TabStripView(model: model)
             Divider()
             ZStack(alignment: .topTrailing) {
-                WebViewContainer(
-                    tab: model.selectedTabBinding,
-                    command: $model.webViewCommand,
-                    observationScript: model.observationScript,
-                    onObservation: model.ingestObservationPayload
-                )
+                ForEach($model.tabs) { $tab in
+                    WebViewContainer(
+                        tab: $tab,
+                        command: model.webViewCommandBinding(for: tab.id),
+                        observationScript: model.observationScript,
+                        onObservation: { payload in
+                            model.ingestObservationPayload(payload, for: tab.id)
+                        }
+                    )
+                    .opacity(tab.id == model.selectedTabID ? 1 : 0)
+                    .allowsHitTesting(tab.id == model.selectedTabID)
+                    .accessibilityHidden(tab.id != model.selectedTabID)
+                }
                 SurfaceBadges(tab: model.selectedTab)
                     .padding(10)
             }

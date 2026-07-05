@@ -29,17 +29,25 @@ private struct ManagerHeader: View {
             Label(model.manager.selectedSession?.runState.rawValue ?? "idle", systemImage: "waveform.path.ecg")
                 .font(.caption)
                 .lineLimit(1)
+            if model.manager.previewOnly {
+                Label("Preview", systemImage: "eye")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
             Spacer()
             Button(action: model.adoptSelectedSession) {
                 Image(systemName: "hand.raised")
             }
-            .disabled(model.manager.selectedSession == nil)
+            .disabled(model.manager.selectedSession == nil || model.manager.previewOnly)
             .accessibilityLabel("Adopt")
 
             Button(action: model.handoffSelectedSession) {
                 Image(systemName: "arrow.uturn.forward")
             }
-            .disabled(model.manager.selectedSession == nil && model.selectedTab?.sessionID == nil)
+            .disabled(
+                model.manager.previewOnly ||
+                    (model.manager.selectedSession == nil && model.selectedTab?.sessionID == nil)
+            )
             .accessibilityLabel("Handoff")
 
             Button(action: model.toggleMarksForSelectedTab) {
@@ -152,6 +160,7 @@ private struct ConfirmationView: View {
                     } label: {
                         Image(systemName: "xmark")
                     }
+                    .disabled(model.manager.previewOnly)
                     .accessibilityLabel("Deny")
 
                     Button {
@@ -160,6 +169,7 @@ private struct ConfirmationView: View {
                         Image(systemName: "checkmark")
                     }
                     .buttonStyle(.borderedProminent)
+                    .disabled(model.manager.previewOnly)
                     .accessibilityLabel("Approve")
                 }
             } else {
