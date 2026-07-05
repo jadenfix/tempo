@@ -27,7 +27,7 @@ use tempo_policy::trust::{
     ConfirmationRequired,
 };
 use tempo_policy::Origin;
-use tempo_schema::{Action, ActionBatch, NodeId};
+use tempo_schema::{action_json_schema, Action, ActionBatch, NodeId};
 use thiserror::Error;
 use url::{Host, Url};
 
@@ -711,14 +711,13 @@ where
                 }
             }
             "extract" => {
-                let args: NodeArgs = parse_args(arguments)?;
+                let args: ExtractArgs = parse_args(arguments)?;
                 let driver_id = args.driver_id.clone();
-                let node = args.node_id()?;
                 let mut lease = self.lease_driver(driver_id.as_deref())?;
                 let Some(driver) = lease.driver_mut() else {
                     return Err(JsonRpcError::invalid_request("driver lease was empty"));
                 };
-                match driver.extract(&node).await {
+                match driver.extract(&args.node).await {
                     Ok(value) => Ok(ToolCall::success_json_bounded(
                         "extract_json",
                         value,
@@ -920,29 +919,41 @@ pub fn tools() -> Vec<ToolDescriptor> {
         ToolDescriptor {
             name: "act",
             description: "Execute one tempo semantic action. input_tainted/confirmed are advisory: taint is recomputed server-side and can only be escalated by the caller.",
-            input_schema: object_schema(
+            input_schema: with_node_id_defs(object_schema(
                 vec![
-                    ("action", json!({"type": "object"})),
-                    ("input_tainted", json!({"type": "boolean"})),
-                    ("confirmed", json!({"type": "boolean"})),
-                    ("driver_id", json!({"type": "string"})),
+                    ("action", action_tool_schema()),
+                    ("input_tainted", input_tainted_tool_schema()),
+                    ("confirmed", confirmed_tool_schema()),
+                    (
+                        "driver_id",
+                        json!({
+                            "type": "string",
+                            "description": "Optional fork driver id returned by fork; omit to target the root driver."
+                        }),
+                    ),
                 ],
                 &["action", "input_tainted"],
-            ),
+            )),
         },
         ToolDescriptor {
             name: "act_batch",
             description:
                 "Execute a batch of tempo semantic actions. input_tainted/confirmed are advisory: taint is recomputed server-side and can only be escalated by the caller.",
-            input_schema: object_schema(
+            input_schema: with_node_id_defs(object_schema(
                 vec![
-                    ("batch", json!({"type": "object"})),
-                    ("input_tainted", json!({"type": "boolean"})),
-                    ("confirmed", json!({"type": "boolean"})),
-                    ("driver_id", json!({"type": "string"})),
+                    ("batch", action_batch_tool_schema()),
+                    ("input_tainted", input_tainted_tool_schema()),
+                    ("confirmed", confirmed_tool_schema()),
+                    (
+                        "driver_id",
+                        json!({
+                            "type": "string",
+                            "description": "Optional fork driver id returned by fork; omit to target the root driver."
+                        }),
+                    ),
                 ],
                 &["batch", "input_tainted"],
-            ),
+            )),
         },
         ToolDescriptor {
             name: "fork",
@@ -959,14 +970,19 @@ pub fn tools() -> Vec<ToolDescriptor> {
         },
         ToolDescriptor {
             name: "extract",
-            description: "Extract structured data rooted at a stable node id.",
+            description: "Extract structured data rooted at a stable node id from observe/observe_diff.",
             input_schema: object_schema(
                 vec![
-                    ("node_id", json!({"type": "string"})),
-                    ("node", json!({"type": "string"})),
+                    (
+                        "node",
+                        json!({
+                            "type": "string",
+                            "description": "Stable node id from observe/observe_diff, for example \"button.primary\"."
+                        }),
+                    ),
                     ("driver_id", json!({"type": "string"})),
                 ],
-                &[],
+                &["node"],
             ),
         },
         ToolDescriptor {
@@ -1190,21 +1206,10 @@ struct CloseForkArgs {
 }
 
 #[derive(Debug, Deserialize)]
-struct NodeArgs {
+struct ExtractArgs {
     #[serde(default)]
     driver_id: Option<String>,
-    #[serde(default)]
-    node_id: Option<String>,
-    #[serde(default)]
-    node: Option<NodeId>,
-}
-
-impl NodeArgs {
-    fn node_id(self) -> Result<NodeId, JsonRpcError> {
-        self.node
-            .or_else(|| self.node_id.map(NodeId))
-            .ok_or_else(|| JsonRpcError::invalid_params("extract requires node_id"))
-    }
+    node: NodeId,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1851,6 +1856,91 @@ fn object_schema(properties: Vec<(&'static str, Value)>, required: &[&'static st
     })
 }
 
+fn with_node_id_defs(mut schema: Value) -> Value {
+    if let Value::Object(map) = &mut schema {
+        map.insert(
+            "$defs".into(),
+            json!({
+                "NodeId": {
+                    "title": "NodeId",
+                    "type": "string",
+                    "description": "Stable node id emitted by observe/observe_diff."
+                }
+            }),
+        );
+    }
+    schema
+}
+
+fn action_tool_schema() -> Value {
+    let mut schema = action_json_schema();
+    if let Value::Object(map) = &mut schema {
+        map.insert(
+            "description".into(),
+            Value::String(
+                "One tempo semantic action. Select exactly one variant by its kind field.".into(),
+            ),
+        );
+    }
+    schema
+}
+
+fn action_batch_tool_schema() -> Value {
+    json!({
+        "title": "ActionBatch",
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["actions", "quiescence"],
+        "properties": {
+            "actions": {
+                "type": "array",
+                "items": action_tool_schema()
+            },
+            "quiescence": quiescence_tool_schema()
+        }
+    })
+}
+
+fn quiescence_tool_schema() -> Value {
+    json!({
+        "title": "QuiescencePolicy",
+        "description": "How tempo decides the page has settled after the batch.",
+        "oneOf": [
+            {
+                "type": "string",
+                "const": "composite",
+                "description": "Wait for network idle, layout stability, and JS/microtask quiescence."
+            },
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["fixed_millis"],
+                "properties": {
+                    "fixed_millis": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Fallback fixed wait in milliseconds."
+                    }
+                }
+            }
+        ]
+    })
+}
+
+fn input_tainted_tool_schema() -> Value {
+    json!({
+        "type": "boolean",
+        "description": "Set true when any action argument comes from page-derived, user-provided, or otherwise untrusted content. Use false only for caller-authored constants; the server recomputes live observation taint and may escalate this claim."
+    })
+}
+
+fn confirmed_tool_schema() -> Value {
+    json!({
+        "type": "boolean",
+        "description": "Set true only after an explicit human confirmation for a policy-gated action."
+    })
+}
+
 fn step_outcome_json(outcome: StepOutcome) -> Value {
     match outcome {
         StepOutcome::Applied { diff } => {
@@ -1979,6 +2069,14 @@ mod tests {
         b'E', b'N', b'D', 0xae, 0x42, 0x60, 0x82,
     ];
 
+    fn tool_input_schema(name: &str) -> Result<Value, String> {
+        tool_descriptor_json()
+            .into_iter()
+            .find(|tool| tool["name"] == name)
+            .map(|tool| tool["inputSchema"].clone())
+            .ok_or_else(|| format!("missing tool schema for {name}"))
+    }
+
     /// Poison a mutex by locking it on a thread that then panics; the guard's
     /// drop during unwind marks the mutex poisoned. Panic output is suppressed
     /// so the deliberate panic does not clutter the test log.
@@ -2093,6 +2191,64 @@ mod tests {
     }
 
     #[test]
+    fn tool_schemas_describe_action_batch_and_extract_inputs() -> Result<(), String> {
+        let act = tool_input_schema("act")?;
+        let action_variants = act["properties"]["action"]["oneOf"]
+            .as_array()
+            .ok_or("act action schema must enumerate action variants")?;
+        assert!(
+            action_variants
+                .iter()
+                .any(|variant| variant["properties"]["kind"]["const"] == "click"
+                    && variant["properties"]["node"]["$ref"] == "#/$defs/NodeId"),
+            "act action schema must expose click node shape"
+        );
+        assert_eq!(act["$defs"]["NodeId"]["type"], "string");
+        assert!(
+            act["properties"]["input_tainted"]["description"]
+                .as_str()
+                .map(|description| description.contains("caller-authored constants"))
+                .unwrap_or(false),
+            "input_tainted must tell callers how to compute the claim"
+        );
+
+        let batch = tool_input_schema("act_batch")?;
+        let batch_action_items = &batch["properties"]["batch"]["properties"]["actions"]["items"];
+        let batch_action_variants = batch_action_items["oneOf"]
+            .as_array()
+            .ok_or("act_batch actions.items schema must enumerate action variants")?;
+        assert!(
+            batch_action_variants
+                .iter()
+                .any(|variant| variant["properties"]["kind"]["const"] == "type"
+                    && variant["properties"]["node"]["$ref"] == "#/$defs/NodeId"
+                    && variant["properties"]["text"]["type"] == "string"),
+            "act_batch actions.items must inline the action schema"
+        );
+        assert_eq!(batch["$defs"]["NodeId"]["type"], "string");
+        assert_eq!(
+            batch["properties"]["batch"]["properties"]["quiescence"]["oneOf"][0]["const"],
+            "composite"
+        );
+
+        let extract = tool_input_schema("extract")?;
+        assert_eq!(extract["required"], json!(["node"]));
+        let extract_properties = extract["properties"]
+            .as_object()
+            .ok_or("extract properties must be an object")?;
+        assert!(extract_properties.contains_key("node"));
+        assert!(!extract_properties.contains_key("node_id"));
+        assert!(
+            extract["properties"]["node"]["description"]
+                .as_str()
+                .map(|description| description.contains("observe/observe_diff"))
+                .unwrap_or(false),
+            "extract node must explain where the id comes from"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn agent_card_advertises_real_mcp_interface_and_tools() -> Result<(), String> {
         let response = agent_card_response("http://127.0.0.1:8787/");
         let card = response.json_value().map_err(|error| error.to_string())?;
@@ -2154,8 +2310,7 @@ mod tests {
         assert_eq!(batch["status"], "applied");
         assert_eq!(batch["diff"]["seq"], 3);
 
-        let extract =
-            call_tool(&mut server, "extract", json!({"node_id": "button.primary"})).await?;
+        let extract = call_tool(&mut server, "extract", json!({"node": "button.primary"})).await?;
         assert_eq!(extract["node"], "button.primary");
 
         let screenshot = call_tool_envelope(&mut server, "screenshot", json!({})).await?;
@@ -2518,8 +2673,7 @@ mod tests {
             MemoryDriver::new().with_extract(json!({"blob": "x".repeat(MAX_EXTRACT_JSON_BYTES)})),
         );
 
-        let result =
-            call_tool(&mut server, "extract", json!({"node_id": "button.primary"})).await?;
+        let result = call_tool(&mut server, "extract", json!({"node": "button.primary"})).await?;
         assert_eq!(result["error"]["type"], "response_too_large");
         assert_eq!(result["error"]["artifact"], "extract_json");
         assert_eq!(result["error"]["max_bytes"], MAX_EXTRACT_JSON_BYTES);
