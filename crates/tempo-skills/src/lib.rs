@@ -412,11 +412,6 @@ pub enum SkillError {
     SkillNotFound(String),
 }
 
-/// Human-readable crate summary.
-pub fn describe() -> &'static str {
-    "persisted macro-actions with deterministic parameter expansion into ActionBatch"
-}
-
 fn validate_definition(definition: &SkillDefinition) -> Result<(), SkillError> {
     safe_segment(&definition.name)?;
     safe_segment(&definition.version)?;
