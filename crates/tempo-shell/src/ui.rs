@@ -427,7 +427,7 @@ impl ShellUiModel {
         if self.journal.takeover().is_blocking() {
             self.journal.resume_takeover();
             self.status =
-                "Takeover resumed — control handed back; the banner returns if the challenge persists."
+                "Challenge dismissed locally — this build has no resume signal to the agent yet (follow-up)."
                     .to_string();
         }
     }
@@ -1107,13 +1107,15 @@ mod tests {
         assert_eq!(pending.url, "https://a.test/verify");
         assert_eq!(banner.reason_label(), Some("captcha"));
 
-        // The human clicks Resume: the local block clears (control handed back).
+        // The human clicks Resume: the local block clears, and the status is
+        // truthful that the agent is not yet signalled (no resume RPC exists).
         model.dispatch(UiAction::ResumeTakeover, &service);
         assert!(
             !model.journal.takeover().is_blocking(),
-            "Resume hands control back"
+            "Resume clears the local block"
         );
-        assert!(model.status.contains("Takeover resumed"));
+        assert!(model.status.contains("dismissed locally"));
+        assert!(model.status.contains("no resume signal to the agent"));
     }
 
     #[test]
