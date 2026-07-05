@@ -6142,7 +6142,10 @@ pub fn tempod_openapi(base_url: &str) -> JsonValue {
                     "properties": {
                         "confirmation_id": {"type": "string"},
                         "session_id": {"type": "string"},
-                        "side_effect": {"type": "string", "enum": ["external_navigation", "send", "purchase", "delete"]},
+                        "side_effect": {
+                            "type": "string",
+                            "enum": ["read", "draft", "write", "send", "purchase", "delete"]
+                        },
                         "gate": {"type": "string"},
                         "action_index": {"type": "integer", "minimum": 0},
                         "action_kind": {"type": "string"},
@@ -11505,6 +11508,11 @@ mod tests {
             openapi["paths"]["/sessions/{session_id}/confirmations/{confirmation_id}"]["post"]
                 ["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
             "#/components/schemas/ConfirmationGrant"
+        );
+        assert_eq!(
+            openapi["components"]["schemas"]["ConfirmationRequest"]["properties"]["side_effect"]
+                ["enum"],
+            json!(["read", "draft", "write", "send", "purchase", "delete"])
         );
         assert_eq!(openapi["paths"]["/runs"]["get"]["operationId"], "listRuns");
         assert_eq!(
