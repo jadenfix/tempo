@@ -27,6 +27,7 @@ async-trait.workspace = true
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "ws"] }
 base64 = "0.22"
 futures = "0.3"
+getrandom = "0.3"
 # hyper/hyper-util are already in axum's dependency tree; direct deps only to
 # drive per-connection serving (serve_one semantics + accept-time connection caps).
 hyper = { version = "1", features = ["http1", "server"] }

@@ -26,7 +26,7 @@ use serde_json::{json, Value as JsonValue};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -132,17 +132,27 @@ pub const TEMPO_OTLP_JSONL_ENV: &str = "TEMPO_OTLP_JSONL";
 /// e.g. `http://collector.internal:4318`; `/v1/traces` is appended when absent.
 pub const TEMPO_OTLP_ENDPOINT_ENV: &str = "TEMPO_OTLP_ENDPOINT";
 pub const TEMPO_TEMPOD_AUTH_TOKEN_ENV: &str = "TEMPO_TEMPOD_AUTH_TOKEN";
+pub const TEMPO_TEMPOD_AUTH_TOKEN_FILE_ENV: &str = "TEMPO_TEMPOD_AUTH_TOKEN_FILE";
 /// Prometheus text exposition endpoint (`GET /metrics`).
 pub const TEMPOD_METRICS_PATH: &str = "/metrics";
 pub const TEMPO_STEALTH_MODE_ENV: &str = "TEMPO_STEALTH_MODE";
 /// Machine-readable REST contract used as the source of truth for generated SDKs.
 pub const TEMPOD_OPENAPI_PATH: &str = "/openapi.json";
 const TEMPOD_OPENAPI_CONTENT_TYPE: &str = "application/vnd.oai.openapi+json;version=3.1";
+const TEMPOD_AUTH_TOKEN_BYTES: usize = 32;
+const TEMPOD_RUNTIME_DIR_NAME: &str = "tempo";
+const TEMPOD_AUTH_TOKEN_FILE_NAME: &str = "tempod.token";
 /// Constant marker written in place of any secret-bearing field in OTLP
 /// telemetry (issue #214 review). A constant — never a hash, length, or prefix
 /// of the secret — so low-entropy secrets (PINs, OTPs, common passwords/tokens)
 /// cannot be recovered by an offline dictionary search of the exported value.
 const REDACTED_MARKER: &str = "[redacted]";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TempodRuntimeAuthToken {
+    pub token: String,
+    pub path: PathBuf,
+}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TempodAuth {
@@ -185,6 +195,156 @@ impl TempodAuth {
     }
 }
 
+pub fn tempod_runtime_auth_token_path() -> PathBuf {
+    if let Some(path) =
+        std::env::var_os(TEMPO_TEMPOD_AUTH_TOKEN_FILE_ENV).filter(|path| !path.is_empty())
+    {
+        return PathBuf::from(path);
+    }
+    tempod_runtime_dir().join(TEMPOD_AUTH_TOKEN_FILE_NAME)
+}
+
+pub fn load_tempod_runtime_auth_token() -> Result<Option<TempodRuntimeAuthToken>, TempodError> {
+    load_tempod_runtime_auth_token_at(tempod_runtime_auth_token_path())
+}
+
+pub fn load_tempod_runtime_auth_token_at(
+    path: impl Into<PathBuf>,
+) -> Result<Option<TempodRuntimeAuthToken>, TempodError> {
+    let path = path.into();
+    match read_runtime_auth_token_file(&path) {
+        Ok(token) => Ok(Some(TempodRuntimeAuthToken { token, path })),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub fn load_or_create_tempod_runtime_auth_token() -> Result<TempodRuntimeAuthToken, TempodError> {
+    load_or_create_tempod_runtime_auth_token_at(tempod_runtime_auth_token_path())
+}
+
+pub fn load_or_create_tempod_runtime_auth_token_at(
+    path: impl Into<PathBuf>,
+) -> Result<TempodRuntimeAuthToken, TempodError> {
+    let path = path.into();
+    if let Some(existing) = load_tempod_runtime_auth_token_at(&path)? {
+        return Ok(existing);
+    }
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        create_owner_only_dir(parent)?;
+    }
+    let token = generate_runtime_auth_token()?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    match options.open(&path) {
+        Ok(mut file) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            }
+            file.write_all(token.as_bytes())?;
+            file.write_all(b"\n")?;
+            Ok(TempodRuntimeAuthToken { token, path })
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            load_tempod_runtime_auth_token_at(path)?.ok_or_else(|| {
+                TempodError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "runtime auth token appeared and disappeared",
+                ))
+            })
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn tempod_runtime_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR").filter(|path| !path.is_empty()) {
+        return PathBuf::from(dir).join(TEMPOD_RUNTIME_DIR_NAME);
+    }
+    std::env::temp_dir().join(runtime_dir_leaf())
+}
+
+fn runtime_dir_leaf() -> String {
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_else(|_| "user".into());
+    let safe_user = user
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    format!("{TEMPOD_RUNTIME_DIR_NAME}-{safe_user}")
+}
+
+fn create_owner_only_dir(path: &Path) -> Result<(), TempodError> {
+    std::fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+fn read_runtime_auth_token_file(path: &Path) -> Result<String, std::io::Error> {
+    validate_runtime_auth_token_metadata(path)?;
+    let mut token = String::new();
+    File::open(path)?.read_to_string(&mut token)?;
+    let token = token.trim_end_matches(['\r', '\n']).to_string();
+    validate_bearer_token(&token)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))?;
+    Ok(token)
+}
+
+fn validate_runtime_auth_token_metadata(path: &Path) -> Result<(), std::io::Error> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "runtime auth token path must not be a symlink",
+        ));
+    }
+    if !metadata.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "runtime auth token path must be a regular file",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "runtime auth token file must be owner-only",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn generate_runtime_auth_token() -> Result<String, TempodError> {
+    let mut bytes = [0_u8; TEMPOD_AUTH_TOKEN_BYTES];
+    getrandom::fill(&mut bytes)
+        .map_err(|error| TempodError::Io(std::io::Error::other(error.to_string())))?;
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TempodServerConfig {
     allow_remote_binds: bool,
@@ -205,6 +365,10 @@ impl TempodServerConfig {
     pub fn with_auth(mut self, auth: TempodAuth) -> Self {
         self.auth = auth;
         self
+    }
+
+    pub fn auth_is_required(&self) -> bool {
+        self.auth.is_required()
     }
 
     fn with_bind_addr_host(mut self, addr: &str) -> Self {
@@ -3830,6 +3994,7 @@ pub fn tempod_openapi(base_url: &str) -> JsonValue {
             "/ready": {
                 "get": {
                     "operationId": "ready",
+                    "security": [{"TempodBearer": []}],
                     "responses": {
                         "200": {
                             "description": "tempod is ready for new sessions",
@@ -3851,10 +4016,12 @@ pub fn tempod_openapi(base_url: &str) -> JsonValue {
             "/sessions": {
                 "get": {
                     "operationId": "listSessions",
+                    "security": [{"TempodBearer": []}],
                     "responses": {"200": {"description": "List sessions"}}
                 },
                 "post": {
                     "operationId": "createSession",
+                    "security": [{"TempodBearer": []}],
                     "requestBody": {
                         "required": true,
                         "content": {"application/json": {"schema": {"$ref": "#/components/schemas/CreateSessionRequest"}}}
@@ -3868,6 +4035,7 @@ pub fn tempod_openapi(base_url: &str) -> JsonValue {
             "/sessions/{session_id}/observe": {
                 "get": {
                     "operationId": "observeSession",
+                    "security": [{"TempodBearer": []}],
                     "parameters": [{"$ref": "#/components/parameters/SessionId"}],
                     "responses": {"200": {"description": "Compiled observation"}}
                 }
@@ -3875,6 +4043,7 @@ pub fn tempod_openapi(base_url: &str) -> JsonValue {
             "/sessions/{session_id}/act_batch": {
                 "post": {
                     "operationId": "actBatchSession",
+                    "security": [{"TempodBearer": []}],
                     "parameters": [{"$ref": "#/components/parameters/SessionId"}],
                     "requestBody": {
                         "required": true,
@@ -3888,11 +4057,26 @@ pub fn tempod_openapi(base_url: &str) -> JsonValue {
                 }
             },
             "/mcp": {
-                "get": {"operationId": "mcpGet", "responses": {"200": {"description": "MCP metadata"}}},
-                "post": {"operationId": "mcpPost", "responses": {"200": {"description": "MCP JSON-RPC response"}}}
+                "get": {
+                    "operationId": "mcpGet",
+                    "security": [{"TempodBearer": []}],
+                    "responses": {"200": {"description": "MCP metadata"}}
+                },
+                "post": {
+                    "operationId": "mcpPost",
+                    "security": [{"TempodBearer": []}],
+                    "responses": {"200": {"description": "MCP JSON-RPC response"}}
+                }
             }
         },
         "components": {
+            "securitySchemes": {
+                "TempodBearer": {
+                    "type": "http",
+                    "scheme": "bearer",
+                    "description": "Bearer token from TEMPO_TEMPOD_AUTH_TOKEN, --auth-token, or the owner-only tempod runtime token file."
+                }
+            },
             "parameters": {
                 "SessionId": {
                     "name": "session_id",
@@ -7341,6 +7525,22 @@ mod tests {
 
         assert_eq!(openapi["paths"]["/ready"]["get"]["operationId"], "ready");
         assert_eq!(
+            openapi["components"]["securitySchemes"]["TempodBearer"]["scheme"],
+            "bearer"
+        );
+        assert_eq!(
+            openapi["paths"]["/ready"]["get"]["security"],
+            json!([{"TempodBearer": []}])
+        );
+        assert_eq!(
+            openapi["paths"]["/sessions"]["post"]["security"],
+            json!([{"TempodBearer": []}])
+        );
+        assert_eq!(
+            openapi["paths"]["/mcp"]["post"]["security"],
+            json!([{"TempodBearer": []}])
+        );
+        assert_eq!(
             openapi["paths"]["/ready"]["get"]["responses"]["503"]["content"]["application/json"]
                 ["schema"]["$ref"],
             "#/components/schemas/ReadinessResponse"
@@ -9657,6 +9857,54 @@ mod tests {
         assert_eq!(metrics_route_class("GET", "/favicon.ico"), "other");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn runtime_auth_token_file_is_owner_only_and_reused() -> TestResult {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = unique_dir("runtime-auth")?;
+        remove_dir_if_exists(&root)?;
+        let path = root.join("tempod.token");
+
+        let created = load_or_create_tempod_runtime_auth_token_at(&path)?;
+        let loaded = load_or_create_tempod_runtime_auth_token_at(&path)?;
+
+        assert_eq!(created, loaded);
+        assert!(created.token.len() >= 40);
+        assert_eq!(
+            std::fs::metadata(&path)?.permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(&root)?.permissions().mode() & 0o777,
+            0o700
+        );
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_auth_token_rejects_world_readable_file() -> TestResult {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = unique_dir("runtime-auth-loose")?;
+        remove_dir_if_exists(&root)?;
+        std::fs::create_dir_all(&root)?;
+        let path = root.join("tempod.token");
+        std::fs::write(&path, "loose-token\n")?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))?;
+
+        assert!(matches!(
+            load_tempod_runtime_auth_token_at(&path),
+            Err(TempodError::Io(error)) if error.kind() == std::io::ErrorKind::PermissionDenied
+        ));
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
     #[test]
     fn control_routes_reject_cross_origin_requests() -> TestResult {
         // #83 follow-up: session/control-plane routes must share the loopback
@@ -9793,6 +10041,44 @@ mod tests {
     }
 
     // ---- Issue #256: capability auth for non-loopback tempod binds ----
+
+    #[test]
+    fn loopback_control_routes_require_runtime_capability_when_auth_is_enabled() -> TestResult {
+        let auth = TempodAuth::bearer("runtime-token")?;
+        let create_body = br#"{"url":"https://loopback.test"}"#;
+        let mut pool = SessionPool::default();
+
+        let missing = handle_http_request_with_auth(
+            &mut pool,
+            control_request("POST", "/sessions", None, create_body),
+            &auth,
+        );
+        assert_eq!(missing.status, 401);
+        assert!(pool.list().is_empty());
+
+        let wrong = handle_http_request_with_auth(
+            &mut pool,
+            with_bearer(
+                control_request("POST", "/sessions", None, create_body),
+                "wrong-token",
+            ),
+            &auth,
+        );
+        assert_eq!(wrong.status, 401);
+        assert!(pool.list().is_empty());
+
+        let allowed = handle_http_request_with_auth(
+            &mut pool,
+            with_bearer(
+                control_request("POST", "/sessions", None, create_body),
+                "runtime-token",
+            ),
+            &auth,
+        );
+        assert_eq!(allowed.status, 201);
+        assert_eq!(pool.list().len(), 1);
+        Ok(())
+    }
 
     #[test]
     fn non_loopback_bind_requires_remote_flag_and_auth_token() -> TestResult {
