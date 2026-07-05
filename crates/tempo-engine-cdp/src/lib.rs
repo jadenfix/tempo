@@ -86,6 +86,10 @@ const CDP_POLICY_PROXY_ARGS: [&str; 6] = [
     "--proxy-server",
 ];
 const CDP_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// Keep navigation waits below tempod's 30s engine IPC bound so attached
+/// callers receive a typed transport error instead of waiting on Chromium's
+/// longer CDP request timeout.
+const CDP_NAVIGATION_AWAIT_TIMEOUT: Duration = Duration::from_secs(5);
 const TIMED_OUT_NAVIGATION_RECOVERY_TIMEOUT: Duration = Duration::from_secs(5);
 const TIMED_OUT_NAVIGATION_RECOVERY_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -514,14 +518,18 @@ impl CdpTempoDriver {
         self.enforce_url_policy(url)?;
         self.clear_blocked_request()?;
         let cursor = self.request_policy_cursor();
-        match self.page()?.goto(url).await {
-            Ok(_page) => {}
-            Err(CdpError::Timeout) => {
-                self.recover_timed_out_navigation_since(cursor, url).await?;
-            }
-            Err(error) => {
-                self.enforce_no_blocked_request_soon_since(cursor).await?;
-                return Err(map_cdp_error(error));
+        if self.should_recreate_child_page_for_navigation() {
+            self.recreate_child_page_for_navigation(url, cursor).await?;
+        } else {
+            match tokio::time::timeout(CDP_NAVIGATION_AWAIT_TIMEOUT, self.page()?.goto(url)).await {
+                Ok(Ok(_page)) => {}
+                Ok(Err(CdpError::Timeout)) | Err(_) => {
+                    self.recover_timed_out_navigation_since(cursor, url).await?;
+                }
+                Ok(Err(error)) => {
+                    self.enforce_no_blocked_request_soon_since(cursor).await?;
+                    return Err(map_cdp_error(error));
+                }
             }
         }
         self.enforce_no_blocked_request_soon_since(cursor).await?;
@@ -537,6 +545,69 @@ impl CdpTempoDriver {
         let (final_url, dom_html) = self.snapshot_since(cursor).await?;
         self.record_snapshot_since(cursor, final_url, dom_html)
             .await
+    }
+
+    fn should_recreate_child_page_for_navigation(&self) -> bool {
+        self.browser_context_id.is_some()
+    }
+
+    async fn recreate_child_page_for_navigation(
+        &mut self,
+        url: &str,
+        cursor: u64,
+    ) -> Result<(), TransportError> {
+        let browser_context_id = self
+            .browser_context_id
+            .clone()
+            .ok_or_else(|| TransportError::Other("missing CDP browser context".into()))?;
+        let page_params = CreateTargetParams::builder()
+            .url(url)
+            .browser_context_id(browser_context_id)
+            .build()
+            .map_err(|error| TransportError::Other(error.to_string()))?;
+        let new_page = match tokio::time::timeout(
+            CDP_NAVIGATION_AWAIT_TIMEOUT,
+            self.browser.new_page(page_params),
+        )
+        .await
+        {
+            Ok(Ok(page)) => page,
+            Ok(Err(CdpError::Timeout)) | Err(_) => {
+                self.enforce_no_blocked_request_soon_since(cursor).await?;
+                return Err(TransportError::NavTimeout);
+            }
+            Ok(Err(error)) => {
+                self.enforce_no_blocked_request_soon_since(cursor).await?;
+                return Err(map_cdp_error(error));
+            }
+        };
+        let new_policy_task = match install_request_policy(
+            &new_page,
+            self.url_policy.clone(),
+            self.blocked_request_url.clone(),
+            self.request_policy_tracker.clone(),
+        )
+        .await
+        {
+            Ok(task) => task,
+            Err(error) => {
+                let _ = new_page.close().await;
+                return Err(error);
+            }
+        };
+
+        if let Some(task) = self.request_policy_task.take() {
+            task.abort();
+        }
+        let old_page = self.page.replace(new_page);
+        self.request_policy_task = Some(new_policy_task);
+        if let Ok(mut guard) = self.probe_context.lock() {
+            *guard = None;
+        }
+        if let Some(old_page) = old_page {
+            let _ = old_page.close().await;
+        }
+        Ok(())
     }
 
     async fn enrich_observation_from_ax_tree(
@@ -5282,7 +5353,10 @@ mod tests {
             })
             .await
             .map_err(|error| std::io::Error::other(error.0))?;
-        child.goto(&url).await?;
+        let child_initial = tokio::time::timeout(Duration::from_secs(20), child.goto(&url))
+            .await
+            .map_err(|_| std::io::Error::other("child initial goto timed out"))??;
+        assert_eq!(child_initial.url, url);
         let child_value = child
             .evaluate_script(
                 "Promise.resolve(localStorage.getItem('tempoIsolation') === null ? '__missing__' : localStorage.getItem('tempoIsolation'))",
@@ -5295,6 +5369,28 @@ mod tests {
 
         assert_eq!(child_value, serde_json::json!("__missing__"));
         assert_eq!(child_cookie, serde_json::json!(""));
+        let child_observe = tokio::time::timeout(Duration::from_secs(20), child.observe())
+            .await
+            .map_err(|_| std::io::Error::other("child observe timed out"))??;
+        assert_eq!(child_observe.url, url);
+        let child_next_url = format!("{url}again");
+        let child_second_goto =
+            tokio::time::timeout(Duration::from_secs(20), child.goto(&child_next_url))
+                .await
+                .map_err(|_| std::io::Error::other("child second goto timed out"))??;
+        assert_eq!(child_second_goto.url, child_next_url);
+        let child_batch = tokio::time::timeout(
+            Duration::from_secs(20),
+            child.act_batch(&ActionBatch {
+                actions: vec![Action::Goto {
+                    url: format!("{url}batch"),
+                }],
+                quiescence: QuiescencePolicy::FixedMillis(0),
+            }),
+        )
+        .await
+        .map_err(|_| std::io::Error::other("child act_batch goto timed out"))??;
+        assert!(matches!(child_batch, StepOutcome::Applied { .. }));
 
         child.close().await?;
         driver.close().await?;
