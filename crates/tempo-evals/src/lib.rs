@@ -457,11 +457,6 @@ fn eval_record_from_journal_entries(
     })
 }
 
-/// Human-readable crate summary.
-pub fn describe() -> &'static str {
-    "scorecard regression gates over persisted eval records and tempo session journals"
-}
-
 fn suite_table(records: &[EvalRecord]) -> Vec<SuiteScore> {
     let mut by_suite: BTreeMap<&str, SuiteAccumulator> = BTreeMap::new();
     for record in records {
