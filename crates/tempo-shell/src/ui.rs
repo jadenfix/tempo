@@ -554,9 +554,48 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
     use std::thread;
+    #[cfg(unix)]
+    use std::os::unix::net::UnixStream;
+    use tempo_net::UrlPolicy;
     use tempo_headless::{serve_forever, SessionPool, TempodSessionEventKind, TempodSessionId};
+    #[cfg(unix)]
+    use tempo_driver::{Engine, TestDriver};
+    #[cfg(unix)]
+    use tempo_engine_host::{serve_driver_connection, EngineIpcClient, EngineIpcConnection};
 
     type TestResult = Result<(), Box<dyn Error>>;
+
+    #[cfg(unix)]
+    fn attach_test_driver(
+        pool: &Arc<Mutex<SessionPool>>,
+    ) -> Result<
+        std::thread::JoinHandle<Result<(), tempo_engine_host::EngineHostError>>,
+        Box<dyn Error>,
+    > {
+        let (client_stream, server_stream) = UnixStream::pair()?;
+        pool.lock()
+            .map_err(|_| "session pool lock failed")?
+            .attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream))?;
+        Ok(thread::spawn(move || {
+            let mut connection = EngineIpcConnection::from_stream(server_stream);
+            let mut driver = TestDriver::new().allow_private_network_access();
+            futures::executor::block_on(serve_driver_connection(&mut connection, &mut driver))
+        }))
+    }
+
+    #[cfg(unix)]
+    fn detach_test_driver(
+        pool: &Arc<Mutex<SessionPool>>,
+        handle: std::thread::JoinHandle<Result<(), tempo_engine_host::EngineHostError>>,
+    ) -> Result<(), Box<dyn Error>> {
+        pool.lock()
+            .map_err(|_| "session pool lock failed")?
+            .detach_engine_driver();
+        match handle.join() {
+            Ok(result) => Ok(result?),
+            Err(_) => Err("driver thread failed".into()),
+        }
+    }
 
     fn created_event(session_id: &str, seq: u64, url: &str) -> TempodSessionEvent {
         TempodSessionEvent {
@@ -1214,9 +1253,13 @@ mod tests {
 
     /// The reducer drives a real tempod over the existing ShellClient transport,
     /// mirroring `client_drives_real_tempod_session_lifecycle`.
+    #[cfg(unix)]
     #[test]
     fn model_drives_real_tempod_lifecycle() -> TestResult {
-        let pool = Arc::new(Mutex::new(SessionPool::default()));
+        let pool = Arc::new(Mutex::new(
+            SessionPool::default().with_navigation_url_policy(UrlPolicy::allow_all()),
+        ));
+        let driver_handle = attach_test_driver(&pool)?;
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let addr = listener.local_addr()?;
         let server_pool = Arc::clone(&pool);
@@ -1243,6 +1286,14 @@ mod tests {
 
         model.dispatch(UiAction::Close(session_id), &client);
         assert_eq!(model.sessions[0].state, "killed");
+        detach_test_driver(&pool, driver_handle)?;
         Ok(())
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn model_drives_real_tempod_lifecycle() {
+        // Non-unix targets cannot execute this loopback driver transport test; the
+        // unit-level transport-path coverage is maintained via mocks in this module.
     }
 }
