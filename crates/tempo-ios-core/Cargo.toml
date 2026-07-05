@@ -1,0 +1,26 @@
+[package]
+name = "tempo-ios-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+bench = false
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tempo-driver = { path = "../tempo-driver" }
+tempo-engine-webview = { path = "../tempo-engine-webview" }
+tempo-net = { path = "../tempo-net" }
+tempo-observe = { path = "../tempo-observe" }
+tempo-policy = { path = "../tempo-policy" }
+tempo-schema = { path = "../tempo-schema" }
+tempo-taint = { path = "../tempo-taint" }
+
+[lints]
+workspace = true

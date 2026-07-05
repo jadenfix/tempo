@@ -2151,13 +2151,13 @@ fn handshake_lane_name(lane: HandshakeLane) -> &'static str {
     }
 }
 
+#[allow(unreachable_patterns)]
 fn engine_name(engine: Engine) -> &'static str {
-    if engine == Engine::Servo {
-        "servo"
-    } else if engine == Engine::Cdp {
-        "cdp"
-    } else {
-        "test"
+    match engine {
+        Engine::Servo => "servo",
+        Engine::Cdp => "cdp",
+        Engine::WebView => "webview",
+        _ => "test",
     }
 }
 
