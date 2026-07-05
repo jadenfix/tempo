@@ -2589,7 +2589,10 @@ fn layout_probe_script(candidates: &[LayoutCandidate]) -> Result<String, Transpo
     let right = -Infinity;
     let bottom = -Infinity;
     for (const rect of rects) {{
-      if (rect.width <= 0 || rect.height <= 0) {{
+      // Skip only point-sized (0x0) boxes. A rect that is degenerate along one
+      // axis still occupies layout space — e.g. an empty container that a later
+      // action fills and the agent then extracts — and must stay observable.
+      if (rect.width <= 0 && rect.height <= 0) {{
         continue;
       }}
       left = Math.min(left, rect.left);
@@ -2630,7 +2633,10 @@ fn layout_probe_script(candidates: &[LayoutCandidate]) -> Result<String, Transpo
     const top = Math.max(0, rect.top);
     const right = Math.min(viewportWidth, rect.right);
     const bottom = Math.min(viewportHeight, rect.bottom);
-    if (right <= left || bottom <= top) {{
+    // Strict comparison: a box that is degenerate along one axis after the
+    // viewport clamp (zero-height container, edge-touching element) is kept
+    // with its degenerate bounds; only boxes wholly outside the viewport drop.
+    if (right < left || bottom < top) {{
       continue;
     }}
     output.push({{
@@ -2673,7 +2679,13 @@ fn parse_layout_bounds(value: Option<&serde_json::Value>) -> Option<[f32; 4]> {
         }
         bounds[index] = number as f32;
     }
-    if bounds[2] <= 0.0 || bounds[3] <= 0.0 {
+    // Mirror the probe's retention rule: negative extents are malformed and a
+    // point-sized (0x0) box is unobservable, but a box degenerate along one
+    // axis (zero-height container awaiting content) keeps its bounds.
+    if bounds[2] < 0.0 || bounds[3] < 0.0 {
+        return None;
+    }
+    if bounds[2] <= 0.0 && bounds[3] <= 0.0 {
         return None;
     }
     Some(bounds)
@@ -3407,24 +3419,37 @@ mod tests {
         assert!(script.contains("element.getClientRects()"));
         assert!(script.contains("element.closest('[hidden]')"));
         assert!(script.contains("getAttribute('type')"));
-        assert!(script.contains("right <= left || bottom <= top"));
+        assert!(script.contains("right < left || bottom < top"));
         Ok(())
     }
 
     #[test]
-    fn layout_probe_result_parser_keeps_only_concrete_positive_bounds() {
+    fn layout_probe_result_parser_keeps_concrete_and_single_axis_degenerate_bounds() {
         let parsed = parse_layout_probe_results(serde_json::json!([
             {"node": "node:visible", "bounds": [10.5, 20.0, 30.25, 40.75]},
-            {"node": "node:zero", "bounds": [0.0, 0.0, 0.0, 10.0]},
+            {"node": "node:zero-width", "bounds": [0.0, 0.0, 0.0, 10.0]},
+            {"node": "node:zero-height", "bounds": [0.0, 0.0, 10.0, 0.0]},
+            {"node": "node:point", "bounds": [5.0, 5.0, 0.0, 0.0]},
+            {"node": "node:negative", "bounds": [0.0, 0.0, -1.0, 10.0]},
             {"node": "node:bad", "bounds": [0.0, 0.0, "wide", 10.0]},
             {"node": "node:short", "bounds": [0.0, 0.0, 10.0]},
             {"node": 7, "bounds": [0.0, 0.0, 10.0, 10.0]}
         ]));
 
-        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed.len(), 3);
         assert_eq!(
             parsed.get(&NodeId("node:visible".into())).copied(),
             Some([10.5, 20.0, 30.25, 40.75])
+        );
+        // Degenerate along one axis stays observable (empty containers that a
+        // later action fills); point-sized and negative extents are dropped.
+        assert_eq!(
+            parsed.get(&NodeId("node:zero-width".into())).copied(),
+            Some([0.0, 0.0, 0.0, 10.0])
+        );
+        assert_eq!(
+            parsed.get(&NodeId("node:zero-height".into())).copied(),
+            Some([0.0, 0.0, 10.0, 0.0])
         );
     }
 
@@ -4719,6 +4744,7 @@ mod tests {
                         '<button id="visibility-hidden" style="visibility:hidden">Visibility hidden</button>',
                         '<button id="zero" style="position:absolute;left:20px;top:80px;width:0;height:0;padding:0;border:0;overflow:hidden">Zero size</button>',
                         '<button id="offscreen" style="position:absolute;left:-1000px;top:20px;width:80px;height:24px">Offscreen</button>',
+                        '<div id="pending" tabindex="0" aria-label="Pending" style="position:absolute;left:20px;top:120px;width:200px;height:0"></div>',
                         '<input id="secret" type="hidden" value="secret-token">'
                     ].join('');
                     return true;
@@ -4739,6 +4765,21 @@ mod tests {
             .ok_or_else(|| std::io::Error::other("visible button missing bounds"))?;
         assert!(bounds[0] >= 0.0 && bounds[1] >= 0.0);
         assert!(bounds[2] > 0.0 && bounds[3] > 0.0);
+
+        // A rendered container that is degenerate along one axis (zero height,
+        // positive width) stays observable with its degenerate bounds — agents
+        // extract from empty containers that later actions fill. Only 0x0 and
+        // offscreen boxes are pruned.
+        let pending = observation
+            .elements
+            .iter()
+            .find(|element| element.name.first().map(|span| span.text.as_str()) == Some("Pending"))
+            .ok_or_else(|| std::io::Error::other("zero-height container should stay observable"))?;
+        let pending_bounds = pending
+            .bounds
+            .ok_or_else(|| std::io::Error::other("zero-height container missing bounds"))?;
+        assert!(pending_bounds[2] > 0.0, "positive width preserved");
+        assert_eq!(pending_bounds[3], 0.0, "degenerate height preserved");
 
         for hidden_text in [
             "Display none",
