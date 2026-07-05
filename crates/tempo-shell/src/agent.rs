@@ -101,8 +101,10 @@ impl JournalEntry {
                 ("session_created", url.clone(), false)
             }
             TempodSessionEventKind::SessionAdopted => ("session_adopted", String::new(), false),
+            TempodSessionEventKind::SessionHandoff => ("session_handoff", String::new(), false),
             TempodSessionEventKind::SessionKilled => ("session_killed", String::new(), false),
             TempodSessionEventKind::SessionDrained => ("session_drained", String::new(), false),
+            TempodSessionEventKind::Manager { event } => ("manager", format!("{event:?}"), false),
             TempodSessionEventKind::StepTriple { triple } => {
                 ("step", step_detail(triple), step_is_tainted(triple))
             }
@@ -314,6 +316,11 @@ impl JournalLog {
                     }
                 }
                 TempodSessionEventKind::HumanTakeoverRequired { takeover } => {
+                    self.takeover.raise(takeover.clone());
+                }
+                TempodSessionEventKind::Manager {
+                    event: tempo_schema::ManagerEvent::HumanTakeover { takeover },
+                } => {
                     self.takeover.raise(takeover.clone());
                 }
                 _ => {}

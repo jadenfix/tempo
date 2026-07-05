@@ -53,6 +53,7 @@ base64 = { version = "0.22", optional = true }
 futures = "0.3"
 tempo-driver = { path = "../tempo-driver", features = ["test-driver"] }
 tempo-engine-host = { path = "../tempo-engine-host" }
+tempo-net = { path = "../tempo-net" }
 
 [lints]
 workspace = true

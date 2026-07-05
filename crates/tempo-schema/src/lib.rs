@@ -253,7 +253,7 @@ pub struct SessionAttachment {
     pub profile_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_continuity: Option<StorageContinuityMode>,
-    pub attached_ms: u128,
+    pub attached_ms: u64,
 }
 
 /// Lease returned when a human shell adopts a shared session.
@@ -262,7 +262,7 @@ pub struct AdoptionLease {
     pub lease_id: String,
     pub session_id: String,
     pub owner: ControlOwner,
-    pub adopted_ms: u128,
+    pub adopted_ms: u64,
 }
 
 /// Server-side request for a native confirmation UI.
@@ -275,8 +275,8 @@ pub struct ConfirmationRequest {
     pub action_index: usize,
     pub action_kind: String,
     pub reason: String,
-    pub created_ms: u128,
-    pub expires_ms: u128,
+    pub created_ms: u64,
+    pub expires_ms: u64,
 }
 
 /// Server-minted proof that a native shell confirmed one pending request.
@@ -284,8 +284,8 @@ pub struct ConfirmationRequest {
 pub struct ConfirmationGrant {
     pub confirmation_id: String,
     pub grant_token: String,
-    pub issued_ms: u128,
-    pub expires_ms: u128,
+    pub issued_ms: u64,
+    pub expires_ms: u64,
 }
 
 /// Prompt that must be completed by a native shell/human, not by page JS or an agent.
@@ -300,9 +300,9 @@ pub struct NativePromptRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
     pub reason: String,
-    pub created_ms: u128,
+    pub created_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expires_ms: Option<u128>,
+    pub expires_ms: Option<u64>,
 }
 
 /// Public run record returned by the manager/run APIs.
@@ -313,10 +313,10 @@ pub struct AgentRun {
     pub state: AgentRunState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub goal: Option<String>,
-    pub created_ms: u128,
-    pub updated_ms: u128,
+    pub created_ms: u64,
+    pub updated_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub completed_ms: Option<u128>,
+    pub completed_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
 }

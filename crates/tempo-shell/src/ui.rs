@@ -17,6 +17,7 @@ use crate::{HealthResponse, ShellClient, ShellError};
 #[cfg(test)]
 use tempo_headless::TempodSessionEvent;
 use tempo_headless::{TempodSession, TempodSessionEvents, TempodSessionState};
+use tempo_schema::ConfirmationGrant;
 
 /// One session row as shown in the list: the id/state/url triple the DoD asks
 /// for, flattened to display strings so the render layer stays trivial.
@@ -55,13 +56,13 @@ pub trait SessionService {
     fn open(&self, url: &str) -> Result<TempodSession, ShellError>;
     fn adopt(&self, session_id: &str) -> Result<TempodSession, ShellError>;
     fn close(&self, session_id: &str) -> Result<TempodSession, ShellError>;
-    /// Navigate a tab's driver to `url` (omnibox / back / forward).
-    fn goto(&self, driver_id: Option<&str>, url: &str) -> Result<(), ShellError>;
-    /// Fetch a single-shot page snapshot for a tab's driver, optionally with the
-    /// set-of-marks overlay drawn on it.
+    /// Navigate a tab's shared tempod session to `url` (omnibox / back / forward).
+    fn goto(&self, session_id: &str, url: &str) -> Result<(), ShellError>;
+    /// Fetch a single-shot page snapshot for a tab's shared session, optionally
+    /// with the set-of-marks overlay drawn on it.
     fn screenshot(
         &self,
-        driver_id: Option<&str>,
+        session_id: &str,
         set_of_marks: bool,
     ) -> Result<ScreenshotImage, ShellError>;
     /// Poll the session's journal/event stream after `after_seq` (the agent panel).
@@ -70,6 +71,12 @@ pub trait SessionService {
         session_id: &str,
         after_seq: Option<u64>,
     ) -> Result<TempodSessionEvents, ShellError>;
+    /// Mint a server-side grant for a native confirmation request.
+    fn confirm(
+        &self,
+        session_id: &str,
+        confirmation_id: &str,
+    ) -> Result<ConfirmationGrant, ShellError>;
 }
 
 impl SessionService for ShellClient {
@@ -93,16 +100,16 @@ impl SessionService for ShellClient {
         ShellClient::close(self, session_id)
     }
 
-    fn goto(&self, driver_id: Option<&str>, url: &str) -> Result<(), ShellError> {
-        ShellClient::goto(self, driver_id, url)
+    fn goto(&self, session_id: &str, url: &str) -> Result<(), ShellError> {
+        ShellClient::goto_session(self, session_id, url)
     }
 
     fn screenshot(
         &self,
-        driver_id: Option<&str>,
+        session_id: &str,
         set_of_marks: bool,
     ) -> Result<ScreenshotImage, ShellError> {
-        ShellClient::screenshot(self, driver_id, set_of_marks)
+        ShellClient::screenshot_session(self, session_id, set_of_marks)
     }
 
     fn events(
@@ -111,6 +118,14 @@ impl SessionService for ShellClient {
         after_seq: Option<u64>,
     ) -> Result<TempodSessionEvents, ShellError> {
         ShellClient::events(self, session_id, after_seq)
+    }
+
+    fn confirm(
+        &self,
+        session_id: &str,
+        confirmation_id: &str,
+    ) -> Result<ConfirmationGrant, ShellError> {
+        ShellClient::confirm(self, session_id, confirmation_id)
     }
 }
 
@@ -150,9 +165,9 @@ pub enum UiAction {
     /// run-resume wire call is a documented follow-up (no tempod resume endpoint /
     /// `ShellClient::resume` yet).
     ResumeTakeover,
-    /// Dismiss the native confirmation panel without resubmitting the action.
-    /// Until server-minted grants exist, the shell must not turn this into
-    /// advisory `confirmed=true`.
+    /// Mint a server-side grant for the active native confirmation request.
+    ConfirmPendingConfirmation,
+    /// Dismiss the native confirmation panel without minting a grant.
     DismissConfirmation,
 }
 
@@ -260,6 +275,7 @@ impl ShellUiModel {
             UiAction::PollEvents => self.poll_events(service),
             UiAction::ToggleMarks => self.toggle_marks(),
             UiAction::ResumeTakeover => self.resume_takeover(),
+            UiAction::ConfirmPendingConfirmation => self.confirm_pending_confirmation(service),
             UiAction::DismissConfirmation => self.dismiss_confirmation(),
         }
     }
@@ -292,8 +308,8 @@ impl ShellUiModel {
         match service.open(&url) {
             Ok(session) => {
                 let row = SessionRow::from(&session);
-                // A new tab targets the default attached driver (`None`);
-                // per-tab drivers are the shared-session work deferred to #246.
+                // A new tab targets its tempod session; root MCP is reserved for
+                // CLI/legacy attached-driver calls.
                 let tab = Tab::new(row.id.clone(), None, session.url.clone());
                 self.status = format!("Opened tab {} → {}", row.id, row.url);
                 self.upsert(row);
@@ -358,7 +374,7 @@ impl ShellUiModel {
             }
             let session_id = tab.session_id.clone();
             tab.surface.begin_navigation(url.clone());
-            match service.goto(tab.driver_id.as_deref(), &url) {
+            match service.goto(&session_id, &url) {
                 Ok(()) => {
                     tab.history.push(url.clone());
                     tab.surface.navigation_applied(url.clone());
@@ -398,7 +414,7 @@ impl ShellUiModel {
             let session_id = tab.session_id.clone();
             tab.omnibox = url.clone();
             tab.surface.begin_navigation(url.clone());
-            match service.goto(tab.driver_id.as_deref(), &url) {
+            match service.goto(&session_id, &url) {
                 Ok(()) => {
                     tab.surface.navigation_applied(url.clone());
                     tab.status = format!("{} to {url}", step.label_capitalized());
@@ -429,7 +445,7 @@ impl ShellUiModel {
                 return;
             };
             let session_id = tab.session_id.clone();
-            match service.screenshot(tab.driver_id.as_deref(), self.marks_overlay) {
+            match service.screenshot(&session_id, self.marks_overlay) {
                 Ok(image) => {
                     tab.screenshot = Some(image);
                     tab.screenshot_seq += 1;
@@ -506,6 +522,36 @@ impl ShellUiModel {
             tab.surface.dismiss_confirmation();
             tab.status = "Confirmation dismissed; action was not resubmitted.".to_string();
             self.status = "Confirmation dismissed; no advisory confirmation was sent.".to_string();
+        }
+    }
+
+    fn confirm_pending_confirmation(&mut self, service: &dyn SessionService) {
+        let Some(active) = self.active_tab else {
+            self.status = "No active tab.".to_string();
+            return;
+        };
+        let Some(tab) = self.tabs.get(active) else {
+            self.status = "No active tab.".to_string();
+            return;
+        };
+        let Some(confirmation) = tab.surface.pending_confirmation.clone() else {
+            self.status = "No pending confirmation.".to_string();
+            return;
+        };
+        let Some(request) = confirmation.request else {
+            self.status = "Pending confirmation has no server request.".to_string();
+            return;
+        };
+
+        match service.confirm(&request.session_id, &request.confirmation_id) {
+            Ok(grant) => {
+                if let Some(tab) = self.tabs.get_mut(active) {
+                    tab.surface.dismiss_confirmation();
+                    tab.status = format!("Confirmed {}", grant.confirmation_id);
+                }
+                self.status = format!("Confirmed {}", grant.confirmation_id);
+            }
+            Err(err) => self.set_error("confirm", &err),
         }
     }
 
@@ -660,8 +706,13 @@ mod tests {
     use std::cell::RefCell;
     use std::error::Error;
     use std::net::TcpListener;
+    use std::os::unix::net::UnixStream;
     use std::sync::{Arc, Mutex};
     use std::thread;
+    use tempo_driver::{Engine, TestDriver};
+    use tempo_engine_host::{
+        serve_driver_connection, EngineHostError, EngineIpcClient, EngineIpcConnection,
+    };
     use tempo_headless::{serve_forever, SessionPool, TempodSessionEventKind, TempodSessionId};
 
     type TestResult = Result<(), Box<dyn Error>>;
@@ -773,8 +824,8 @@ mod tests {
             ))
         }
 
-        fn goto(&self, driver_id: Option<&str>, url: &str) -> Result<(), ShellError> {
-            self.record(format!("goto:{}:{url}", driver_id.unwrap_or("-")));
+        fn goto(&self, session_id: &str, url: &str) -> Result<(), ShellError> {
+            self.record(format!("goto:{session_id}:{url}"));
             if self.confirm_on_goto {
                 return Err(ShellError::Mcp(
                     "requires server-attributable confirmation before execution; confirmed=true was ignored"
@@ -787,13 +838,10 @@ mod tests {
 
         fn screenshot(
             &self,
-            driver_id: Option<&str>,
+            session_id: &str,
             set_of_marks: bool,
         ) -> Result<ScreenshotImage, ShellError> {
-            self.record(format!(
-                "screenshot:{}:marks={set_of_marks}",
-                driver_id.unwrap_or("-")
-            ));
+            self.record(format!("screenshot:{session_id}:marks={set_of_marks}"));
             self.maybe_fail("screenshot")?;
             Ok(ScreenshotImage {
                 mime_type: "image/png".to_string(),
@@ -821,6 +869,21 @@ mod tests {
                     .cloned()
                     .collect(),
                 truncated_before_seq: None,
+            })
+        }
+
+        fn confirm(
+            &self,
+            session_id: &str,
+            confirmation_id: &str,
+        ) -> Result<ConfirmationGrant, ShellError> {
+            self.record(format!("confirm:{session_id}:{confirmation_id}"));
+            self.maybe_fail("confirm")?;
+            Ok(ConfirmationGrant {
+                confirmation_id: confirmation_id.to_string(),
+                grant_token: "grant-token-test".to_string(),
+                issued_ms: 1,
+                expires_ms: 2,
             })
         }
     }
@@ -1080,7 +1143,7 @@ mod tests {
 
         model.dispatch(UiAction::Navigate, &service);
 
-        assert_eq!(service.calls(), vec!["goto:-:https://b.test"]);
+        assert_eq!(service.calls(), vec!["goto:session-0:https://b.test"]);
         assert_eq!(model.tabs[0].current_url(), Some("https://b.test"));
         assert_eq!(model.tabs[0].surface.current_url, "https://b.test");
         assert_eq!(
@@ -1107,7 +1170,7 @@ mod tests {
 
         model.dispatch(UiAction::Navigate, &service);
 
-        assert_eq!(service.calls(), vec!["goto:-:https://pay.test"]);
+        assert_eq!(service.calls(), vec!["goto:session-0:https://pay.test"]);
         assert_eq!(
             model.tabs[0].surface.run_state,
             SurfaceRunState::AwaitingConfirmation
@@ -1122,27 +1185,66 @@ mod tests {
         );
         assert_eq!(
             service.calls(),
-            vec!["goto:-:https://pay.test"],
+            vec!["goto:session-0:https://pay.test"],
             "dismiss must not resubmit with advisory confirmation"
         );
         assert!(model.status.contains("no advisory confirmation"));
     }
 
     #[test]
-    fn navigate_targets_each_tabs_own_driver() {
+    fn confirm_pending_confirmation_mints_server_grant_without_resubmitting_action() {
         let service = MockService::default();
-        let mut tab = Tab::new("session-1", Some("fork-7".into()), "https://a.test");
-        tab.omnibox = "https://c.test".into();
+        let request = tempo_schema::ConfirmationRequest {
+            confirmation_id: "confirmation-1".to_string(),
+            session_id: "session-0".to_string(),
+            side_effect: tempo_schema::SideEffect::Purchase,
+            gate: "confirm_purchase".to_string(),
+            action_index: 0,
+            action_kind: "click".to_string(),
+            reason: "purchase requires native confirmation".to_string(),
+            created_ms: 10,
+            expires_ms: 20,
+        };
+        let mut tab = Tab::new("session-0", None, "https://pay.test");
+        tab.surface.pending_confirmation = Some(crate::surface::PendingConfirmation::from_request(
+            request.clone(),
+            Some(false),
+        ));
         let mut model = ShellUiModel {
             tabs: vec![tab],
             active_tab: Some(0),
             ..ShellUiModel::default()
         };
 
+        model.dispatch(UiAction::ConfirmPendingConfirmation, &service);
+
+        assert_eq!(
+            service.calls(),
+            vec!["confirm:session-0:confirmation-1"],
+            "confirm must mint a server grant and never replay the original action"
+        );
+        assert!(model.tabs[0].surface.pending_confirmation.is_none());
+        assert!(model.status.contains("confirmation-1"));
+    }
+
+    #[test]
+    fn navigate_targets_each_tabs_own_session() {
+        let service = MockService::default();
+        let mut first = Tab::new("session-0", Some("fork-0".into()), "https://a.test");
+        first.omnibox = "https://wrong.test".into();
+        let mut second = Tab::new("session-1", Some("fork-7".into()), "https://b.test");
+        second.omnibox = "https://c.test".into();
+        let mut model = ShellUiModel {
+            tabs: vec![first, second],
+            active_tab: Some(1),
+            ..ShellUiModel::default()
+        };
+
         model.dispatch(UiAction::Navigate, &service);
 
-        // The tab's driver_id is forwarded, so goto hits the right session.
-        assert_eq!(service.calls(), vec!["goto:fork-7:https://c.test"]);
+        // The active tab's session id is forwarded, so foreground browsing does
+        // not escape to root MCP or another tab's attached driver.
+        assert_eq!(service.calls(), vec!["goto:session-1:https://c.test"]);
     }
 
     #[test]
@@ -1169,10 +1271,10 @@ mod tests {
         assert_eq!(
             service.calls(),
             vec![
-                "goto:-:https://b.test", // navigate to b
-                "goto:-:https://c.test", // navigate to c
-                "goto:-:https://b.test", // back to b
-                "goto:-:https://c.test", // forward to c
+                "goto:session-0:https://b.test", // navigate to b
+                "goto:session-0:https://c.test", // navigate to c
+                "goto:session-0:https://b.test", // back to b
+                "goto:session-0:https://c.test", // forward to c
             ]
         );
     }
@@ -1196,7 +1298,7 @@ mod tests {
     }
 
     #[test]
-    fn refresh_screenshot_requests_active_tabs_driver_and_stores_image() {
+    fn refresh_screenshot_requests_active_tabs_session_and_stores_image() {
         let service = MockService::default();
         let mut model = ShellUiModel {
             tabs: vec![Tab::new(
@@ -1210,7 +1312,7 @@ mod tests {
 
         model.dispatch(UiAction::RefreshScreenshot, &service);
 
-        assert_eq!(service.calls(), vec!["screenshot:fork-2:marks=false"]);
+        assert_eq!(service.calls(), vec!["screenshot:session-9:marks=false"]);
         let shot = model.tabs[0].screenshot.as_ref();
         assert_eq!(
             shot.map(|image| image.mime_type.as_str()),
@@ -1256,7 +1358,7 @@ mod tests {
 
         // The next screenshot refresh requests the set-of-marks overlay.
         model.dispatch(UiAction::RefreshScreenshot, &service);
-        assert_eq!(service.calls(), vec!["screenshot:-:marks=true"]);
+        assert_eq!(service.calls(), vec!["screenshot:session-0:marks=true"]);
         assert!(model.tabs[0]
             .screenshot
             .as_ref()
@@ -1269,7 +1371,10 @@ mod tests {
         model.dispatch(UiAction::RefreshScreenshot, &service);
         assert_eq!(
             service.calls(),
-            vec!["screenshot:-:marks=true", "screenshot:-:marks=false",]
+            vec![
+                "screenshot:session-0:marks=true",
+                "screenshot:session-0:marks=false",
+            ]
         );
     }
 
@@ -1450,6 +1555,7 @@ mod tests {
     #[test]
     fn model_drives_real_tempod_lifecycle() -> TestResult {
         let pool = Arc::new(Mutex::new(SessionPool::default()));
+        let driver_handle = attach_test_driver(&pool)?;
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let addr = listener.local_addr()?;
         let server_pool = Arc::clone(&pool);
@@ -1465,17 +1571,51 @@ mod tests {
         assert_eq!(model.healthy, Some(true));
         assert!(model.sessions.is_empty());
 
-        model.open_url = "https://tempo.test".into();
+        model.open_url = "https://example.com/tempo".into();
         model.dispatch(UiAction::Open, &client);
         assert_eq!(model.sessions.len(), 1);
         let session_id = model.sessions[0].id.clone();
-        assert_eq!(model.sessions[0].url, "https://tempo.test");
+        assert_eq!(model.sessions[0].url, "https://example.com/tempo");
 
         model.dispatch(UiAction::Adopt(session_id.clone()), &client);
         assert_eq!(model.sessions[0].state, "adopted");
 
         model.dispatch(UiAction::Close(session_id), &client);
         assert_eq!(model.sessions[0].state, "killed");
+        detach_test_driver(&pool, driver_handle)?;
         Ok(())
+    }
+
+    fn attach_test_driver(
+        pool: &Arc<Mutex<SessionPool>>,
+    ) -> Result<thread::JoinHandle<Result<(), EngineHostError>>, Box<dyn Error>> {
+        let (client_stream, server_stream) = UnixStream::pair()?;
+        pool.lock()
+            .map_err(|_| "session pool lock failed")?
+            .attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream))?;
+        Ok(thread::spawn(move || {
+            let mut connection = EngineIpcConnection::from_stream(server_stream);
+            let mut driver = TestDriver::new().allow_private_network_access();
+            futures::executor::block_on(serve_driver_connection(&mut connection, &mut driver))
+        }))
+    }
+
+    fn join_driver(
+        handle: thread::JoinHandle<Result<(), EngineHostError>>,
+    ) -> Result<(), Box<dyn Error>> {
+        match handle.join() {
+            Ok(result) => Ok(result?),
+            Err(_) => Err("driver thread failed".into()),
+        }
+    }
+
+    fn detach_test_driver(
+        pool: &Arc<Mutex<SessionPool>>,
+        handle: thread::JoinHandle<Result<(), EngineHostError>>,
+    ) -> Result<(), Box<dyn Error>> {
+        pool.lock()
+            .map_err(|_| "session pool lock failed")?
+            .detach_engine_driver();
+        join_driver(handle)
     }
 }

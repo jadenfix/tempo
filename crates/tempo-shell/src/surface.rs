@@ -9,7 +9,10 @@
 
 use serde_json::Value;
 use tempo_headless::{TempodSessionEvent, TempodSessionEventKind};
-use tempo_schema::HumanTakeover;
+use tempo_schema::{
+    AgentRunState, ConfirmationRequest, ControlOwner as SchemaControlOwner, HumanTakeover,
+    ManagerEvent,
+};
 
 use crate::ShellError;
 
@@ -110,12 +113,9 @@ impl SurfaceRunState {
 }
 
 /// Native-shell representation of a server policy gate.
-///
-/// This is intentionally not a bypass token. Until Terminal 1 lands server-
-/// minted grants, confirming in the shell can only acknowledge/dismiss this
-/// local state; it must not resubmit an action with advisory `confirmed=true`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PendingConfirmation {
+    pub request: Option<ConfirmationRequest>,
     pub action_label: String,
     pub reason: String,
     pub gate: String,
@@ -124,6 +124,17 @@ pub struct PendingConfirmation {
 }
 
 impl PendingConfirmation {
+    pub fn from_request(request: ConfirmationRequest, input_tainted: Option<bool>) -> Self {
+        Self {
+            action_label: request.action_kind.clone(),
+            reason: request.reason.clone(),
+            gate: request.gate.clone(),
+            input_tainted,
+            grant_required: true,
+            request: Some(request),
+        }
+    }
+
     pub fn from_error(action_label: impl Into<String>, error: &ShellError) -> Option<Self> {
         let action_label = action_label.into();
         match error {
@@ -173,8 +184,15 @@ impl PendingConfirmation {
         let input_tainted = policy
             .get("input_tainted_effective")
             .and_then(Value::as_bool);
+        if let Some(request) = value
+            .get("confirmation_request")
+            .and_then(|request| serde_json::from_value::<ConfirmationRequest>(request.clone()).ok())
+        {
+            return Some(Self::from_request(request, input_tainted));
+        }
 
         Some(Self {
+            request: None,
             action_label: denied_action.to_string(),
             reason,
             gate,
@@ -185,6 +203,7 @@ impl PendingConfirmation {
 
     fn from_message(action_label: String, message: &str) -> Self {
         Self {
+            request: None,
             action_label,
             reason: message.to_string(),
             gate: "confirm".to_string(),
@@ -326,10 +345,16 @@ impl BrowserSurface {
                 self.load_state = SurfaceLoadState::Ready;
             }
             TempodSessionEventKind::SessionAdopted => self.adopted_by_human(),
+            TempodSessionEventKind::SessionHandoff => {
+                self.owner = ControlOwner::Agent;
+                self.run_state = SurfaceRunState::AgentControl;
+                self.pending_takeover = None;
+            }
             TempodSessionEventKind::SessionKilled => self.killed(),
             TempodSessionEventKind::SessionDrained => {
                 self.run_state = SurfaceRunState::Idle;
             }
+            TempodSessionEventKind::Manager { event } => self.ingest_manager_event(event),
             TempodSessionEventKind::StepTriple { .. } => {
                 if self.owner != ControlOwner::Human {
                     self.owner = ControlOwner::Agent;
@@ -343,6 +368,66 @@ impl BrowserSurface {
             }
         }
     }
+
+    fn ingest_manager_event(&mut self, event: &ManagerEvent) {
+        match event {
+            ManagerEvent::OwnerChanged { owner } => {
+                self.owner = surface_owner(owner);
+                self.run_state = match self.owner {
+                    ControlOwner::Agent => SurfaceRunState::AgentControl,
+                    ControlOwner::Human => SurfaceRunState::HumanControl,
+                    ControlOwner::None | ControlOwner::Unknown => SurfaceRunState::Idle,
+                };
+            }
+            ManagerEvent::ConfirmationRequested { request } => {
+                self.pending_confirmation =
+                    Some(PendingConfirmation::from_request(request.clone(), None));
+                self.run_state = SurfaceRunState::AwaitingConfirmation;
+            }
+            ManagerEvent::ConfirmationGranted { confirmation_id } => {
+                if self
+                    .pending_confirmation
+                    .as_ref()
+                    .and_then(|pending| pending.request.as_ref())
+                    .is_some_and(|request| request.confirmation_id == *confirmation_id)
+                {
+                    self.dismiss_confirmation();
+                }
+            }
+            ManagerEvent::RunStateChanged { run } => {
+                self.run_state = run_state(run.state);
+            }
+            ManagerEvent::HumanTakeover { takeover } => {
+                self.owner = ControlOwner::Agent;
+                self.run_state = SurfaceRunState::HumanTakeoverRequired;
+                self.pending_takeover = Some(takeover.clone());
+            }
+            ManagerEvent::NativePromptRequested { .. } => {
+                self.run_state = SurfaceRunState::AwaitingConfirmation;
+            }
+            ManagerEvent::SurfaceRegistered { .. }
+            | ManagerEvent::SurfaceRemoved { .. }
+            | ManagerEvent::NativePromptResolved { .. } => {}
+        }
+    }
+}
+
+fn surface_owner(owner: &SchemaControlOwner) -> ControlOwner {
+    match owner {
+        SchemaControlOwner::Agent { .. } => ControlOwner::Agent,
+        SchemaControlOwner::Human { .. } => ControlOwner::Human,
+        SchemaControlOwner::Unowned => ControlOwner::None,
+    }
+}
+
+fn run_state(state: AgentRunState) -> SurfaceRunState {
+    match state {
+        AgentRunState::Queued | AgentRunState::Running => SurfaceRunState::AgentControl,
+        AgentRunState::WaitingForHuman => SurfaceRunState::HumanTakeoverRequired,
+        AgentRunState::Completed | AgentRunState::Failed | AgentRunState::Cancelled => {
+            SurfaceRunState::Idle
+        }
+    }
 }
 
 #[cfg(test)]
@@ -350,7 +435,7 @@ mod tests {
     use super::*;
     use serde_json::json;
     use tempo_headless::{TempodSessionEvent, TempodSessionId};
-    use tempo_schema::{HumanTakeover, TakeoverKind};
+    use tempo_schema::{ConfirmationRequest, HumanTakeover, SideEffect, TakeoverKind};
 
     fn event(seq: u64, kind: TempodSessionEventKind) -> TempodSessionEvent {
         TempodSessionEvent {
@@ -410,6 +495,17 @@ mod tests {
         let body = json!({
             "reason": "requires server-attributable confirmation before execution; confirmed=true was ignored",
             "denied_action_kind": "click",
+            "confirmation_request": {
+                "confirmation_id": "confirmation-1",
+                "session_id": "session-0",
+                "side_effect": "purchase",
+                "gate": "confirm_with_taint_review",
+                "action_index": 0,
+                "action_kind": "click",
+                "reason": "requires server-attributable confirmation before execution",
+                "created_ms": 10,
+                "expires_ms": 20
+            },
             "policy": {
                 "strongest_gate": "confirm_with_taint_review",
                 "confirmation_required": true,
@@ -431,8 +527,67 @@ mod tests {
         assert_eq!(confirmation.gate, "confirm_with_taint_review");
         assert_eq!(confirmation.input_tainted, Some(true));
         assert!(confirmation.grant_required);
+        assert_eq!(
+            confirmation
+                .request
+                .as_ref()
+                .map(|request| request.confirmation_id.as_str()),
+            Some("confirmation-1")
+        );
 
         surface.dismiss_confirmation();
+        assert!(surface.pending_confirmation.is_none());
+        assert_eq!(surface.run_state, SurfaceRunState::HumanControl);
+    }
+
+    #[test]
+    fn manager_confirmation_events_drive_native_confirmation_state() {
+        let request = ConfirmationRequest {
+            confirmation_id: "confirmation-7".to_string(),
+            session_id: "session-0".to_string(),
+            side_effect: SideEffect::Send,
+            gate: "confirm_send".to_string(),
+            action_index: 0,
+            action_kind: "click".to_string(),
+            reason: "send message".to_string(),
+            created_ms: 10,
+            expires_ms: 20,
+        };
+        let mut surface = BrowserSurface::human_snapshot("session-0", None, "https://a.test");
+
+        surface.ingest_events(
+            [event(
+                1,
+                TempodSessionEventKind::Manager {
+                    event: ManagerEvent::ConfirmationRequested {
+                        request: request.clone(),
+                    },
+                },
+            )]
+            .iter(),
+        );
+
+        assert_eq!(surface.run_state, SurfaceRunState::AwaitingConfirmation);
+        assert_eq!(
+            surface
+                .pending_confirmation
+                .as_ref()
+                .and_then(|pending| pending.request.as_ref()),
+            Some(&request)
+        );
+
+        surface.ingest_events(
+            [event(
+                2,
+                TempodSessionEventKind::Manager {
+                    event: ManagerEvent::ConfirmationGranted {
+                        confirmation_id: request.confirmation_id.clone(),
+                    },
+                },
+            )]
+            .iter(),
+        );
+
         assert!(surface.pending_confirmation.is_none());
         assert_eq!(surface.run_state, SurfaceRunState::HumanControl);
     }

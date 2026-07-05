@@ -547,7 +547,15 @@ impl eframe::App for ShellApp {
                             }
                             ui.label(&confirmation.reason);
                             ui.horizontal(|ui| {
-                                ui.add_enabled(false, egui::Button::new("Confirm"));
+                                if ui
+                                    .add_enabled(
+                                        confirmation.request.is_some(),
+                                        egui::Button::new("Confirm"),
+                                    )
+                                    .clicked()
+                                {
+                                    pending = Some(UiAction::ConfirmPendingConfirmation);
+                                }
                                 if ui.button("Dismiss").clicked() {
                                     pending = Some(UiAction::DismissConfirmation);
                                 }

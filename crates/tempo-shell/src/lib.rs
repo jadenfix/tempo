@@ -10,6 +10,7 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 use tempo_headless::{TempodSession, TempodSessionEvents, TempodSessionId};
+use tempo_schema::{AdoptionLease, ConfirmationGrant};
 use thiserror::Error;
 
 pub mod agent;
@@ -261,7 +262,8 @@ impl ShellClient {
 
     pub fn adopt(&self, session_id: &str) -> Result<TempodSession, ShellError> {
         let path = format!("/sessions/{}/adopt", safe_path_segment(session_id)?);
-        self.request_json("POST", &path, None::<serde_json::Value>)
+        let lease: AdoptionLease = self.request_json("POST", &path, None::<serde_json::Value>)?;
+        self.session_by_id(&lease.session_id)
     }
 
     pub fn events(
@@ -275,6 +277,19 @@ impl ShellClient {
             path.push_str(&after_seq.to_string());
         }
         self.request_json("GET", &path, None::<serde_json::Value>)
+    }
+
+    pub fn confirm(
+        &self,
+        session_id: &str,
+        confirmation_id: &str,
+    ) -> Result<ConfirmationGrant, ShellError> {
+        let path = format!(
+            "/sessions/{}/confirmations/{}",
+            safe_path_segment(session_id)?,
+            safe_path_segment(confirmation_id)?
+        );
+        self.request_json("POST", &path, None::<serde_json::Value>)
     }
 
     pub fn close(&self, session_id: &str) -> Result<TempodSession, ShellError> {
@@ -302,9 +317,9 @@ impl ShellClient {
     }
 
     /// Navigate `driver_id` (or the default attached driver) to `url` via the
-    /// `act` MCP tool with an [`Action::Goto`]. This is the omnibox/back/forward
-    /// primitive: there is no native history in `DriverTrait`, so the shell
-    /// re-issues a `goto` for every navigation.
+    /// root `act` MCP tool. This remains for the CLI/legacy attached-driver
+    /// path; foreground browser tabs should use [`Self::goto_session`] so they
+    /// are isolated to their shared tempod session.
     pub fn goto(&self, driver_id: Option<&str>, url: &str) -> Result<(), ShellError> {
         let action = serde_json::to_value(tempo_schema::Action::Goto {
             url: url.to_string(),
@@ -314,6 +329,17 @@ impl ShellClient {
             arguments["driver_id"] = json!(driver_id);
         }
         self.mcp_tool("act", arguments)?;
+        Ok(())
+    }
+
+    /// Navigate one managed session. This is the foreground-shell primitive:
+    /// humans and agents share the same tempod session object, so tab actions
+    /// must be scoped by session id instead of a process-global MCP driver id.
+    pub fn goto_session(&self, session_id: &str, url: &str) -> Result<(), ShellError> {
+        let action = serde_json::to_value(tempo_schema::Action::Goto {
+            url: url.to_string(),
+        })?;
+        self.session_mcp_tool(session_id, "act", json!({ "action": action }))?;
         Ok(())
     }
 
@@ -338,10 +364,43 @@ impl ShellClient {
         tab::ScreenshotImage::from_structured(&structured)
     }
 
+    /// Fetch a screenshot for one managed session via session-scoped MCP.
+    pub fn screenshot_session(
+        &self,
+        session_id: &str,
+        set_of_marks: bool,
+    ) -> Result<tab::ScreenshotImage, ShellError> {
+        let mut arguments = json!({});
+        if set_of_marks {
+            arguments["set_of_marks"] = json!(true);
+        }
+        let structured = self.session_mcp_tool(session_id, "screenshot", arguments)?;
+        tab::ScreenshotImage::from_structured(&structured)
+    }
+
     pub fn mcp_tool(&self, name: &str, arguments: Value) -> Result<Value, ShellError> {
+        self.mcp_tool_at_path("/mcp", name, arguments)
+    }
+
+    pub fn session_mcp_tool(
+        &self,
+        session_id: &str,
+        name: &str,
+        arguments: Value,
+    ) -> Result<Value, ShellError> {
+        let path = format!("/sessions/{}/mcp", safe_path_segment(session_id)?);
+        self.mcp_tool_at_path(&path, name, arguments)
+    }
+
+    fn mcp_tool_at_path(
+        &self,
+        path: &str,
+        name: &str,
+        arguments: Value,
+    ) -> Result<Value, ShellError> {
         let envelope: Value = self.request_json_with_max_response_bytes(
             "POST",
-            "/mcp",
+            path,
             Some(json!({
                 "jsonrpc": "2.0",
                 "id": "tempo-shell",
@@ -393,6 +452,17 @@ impl ShellClient {
             });
         }
         Ok(serde_json::from_slice(&response.body)?)
+    }
+
+    fn session_by_id(&self, session_id: &str) -> Result<TempodSession, ShellError> {
+        self.sessions()?
+            .into_iter()
+            .find(|session| session.id.0 == session_id)
+            .ok_or_else(|| {
+                ShellError::Protocol(format!(
+                    "adopted session {session_id} was not present in /sessions"
+                ))
+            })
     }
 
     fn request(
@@ -818,7 +888,7 @@ mod tests {
         serve_driver_connection, EngineHostError, EngineIpcClient, EngineIpcConnection,
     };
     use tempo_headless::{
-        serve_one, serve_one_with_auth, SessionPool, TempodAuth, TempodError,
+        serve_forever, serve_one, serve_one_with_auth, SessionPool, TempodAuth, TempodError,
         TempodSessionEventKind, TempodSessionState,
     };
 
@@ -951,55 +1021,56 @@ mod tests {
 
     #[test]
     fn client_drives_real_tempod_session_lifecycle() -> TestResult {
-        let pool = Arc::new(Mutex::new(SessionPool::default()));
+        let pool = test_session_pool();
+        let driver_handle = attach_test_driver(&pool)?;
+        let addr = spawn_tempod(&pool)?;
+        let client = ShellClient::new(addr.to_string());
 
-        let health = with_tempod(&pool, |addr| ShellClient::new(addr.to_string()).health())?;
+        let health = client.health()?;
         assert!(health.ok);
 
-        let opened = with_tempod(&pool, |addr| {
-            ShellClient::new(addr.to_string()).open("https://tempo.test")
-        })?;
+        let opened = client.open("https://example.com/tempo")?;
         assert_eq!(opened.id.0, "session-0");
-        assert_eq!(opened.url, "https://tempo.test");
+        assert_eq!(opened.url, "https://example.com/tempo");
 
-        let sessions = with_tempod(&pool, |addr| ShellClient::new(addr.to_string()).sessions())?;
+        let sessions = client.sessions()?;
         assert_eq!(sessions.len(), 1);
 
-        let adopted = with_tempod(&pool, |addr| {
-            ShellClient::new(addr.to_string()).adopt("session-0")
-        })?;
+        let adopted = client.adopt("session-0")?;
         assert_eq!(adopted.state, TempodSessionState::Adopted);
 
-        let closed = with_tempod(&pool, |addr| {
-            ShellClient::new(addr.to_string()).close("session-0")
-        })?;
+        let closed = client.close("session-0")?;
         assert_eq!(closed.state, TempodSessionState::Killed);
 
-        let drained = with_tempod(&pool, |addr| ShellClient::new(addr.to_string()).drain())?;
+        let drained = client.drain()?;
         assert!(drained.draining);
         assert_eq!(drained.sessions[0].state, TempodSessionState::Killed);
+        detach_test_driver(&pool, driver_handle)?;
         Ok(())
     }
 
     #[test]
     fn client_sends_auth_token_to_real_tempod() -> TestResult {
-        let pool = Arc::new(Mutex::new(SessionPool::default()));
+        let pool = test_session_pool();
+        let driver_handle = attach_test_driver(&pool)?;
         let auth = TempodAuth::bearer("secret-token")?;
 
         let opened = with_tempod_auth(&pool, auth, |addr| {
             ShellClient::new(addr.to_string())
                 .with_auth_token("secret-token")
-                .open("https://auth.test")
+                .open("https://example.com/auth")
         })?;
 
         assert_eq!(opened.id.0, "session-0");
-        assert_eq!(opened.url, "https://auth.test");
+        assert_eq!(opened.url, "https://example.com/auth");
+        detach_test_driver(&pool, driver_handle)?;
         Ok(())
     }
 
     #[test]
     fn client_uses_discovered_runtime_auth_token_to_real_tempod() -> TestResult {
-        let pool = Arc::new(Mutex::new(SessionPool::default()));
+        let pool = test_session_pool();
+        let driver_handle = attach_test_driver(&pool)?;
         let auth = TempodAuth::bearer("runtime-token")?;
 
         let opened = with_tempod_auth(&pool, auth, |addr| {
@@ -1007,17 +1078,18 @@ mod tests {
                 addr.to_string(),
                 Some("runtime-token".into()),
             )
-            .open("https://runtime-auth.test")
+            .open("https://example.com/runtime-auth")
         })?;
 
         assert_eq!(opened.id.0, "session-0");
-        assert_eq!(opened.url, "https://runtime-auth.test");
+        assert_eq!(opened.url, "https://example.com/runtime-auth");
+        detach_test_driver(&pool, driver_handle)?;
         Ok(())
     }
 
     #[test]
     fn client_reads_real_tempod_agent_card() -> TestResult {
-        let pool = Arc::new(Mutex::new(SessionPool::default()));
+        let pool = test_session_pool();
         let card = with_tempod(&pool, |addr| {
             ShellClient::new(addr.to_string()).agent_card()
         })?;
@@ -1033,14 +1105,14 @@ mod tests {
 
     #[test]
     fn client_reads_real_tempod_session_events_with_cursor() -> TestResult {
-        let pool = Arc::new(Mutex::new(SessionPool::default()));
-        let opened = with_tempod(&pool, |addr| {
-            ShellClient::new(addr.to_string()).open("https://events.test")
-        })?;
+        let pool = test_session_pool();
+        let driver_handle = attach_test_driver(&pool)?;
+        let addr = spawn_tempod(&pool)?;
+        let client = ShellClient::new(addr.to_string());
 
-        let initial = with_tempod(&pool, |addr| {
-            ShellClient::new(addr.to_string()).events(&opened.id.0, None)
-        })?;
+        let opened = client.open("https://example.com/events")?;
+
+        let initial = client.events(&opened.id.0, None)?;
         assert_eq!(initial.events.len(), 1);
         assert_eq!(initial.events[0].seq, 0);
         assert!(matches!(
@@ -1048,25 +1120,28 @@ mod tests {
             TempodSessionEventKind::SessionCreated { .. }
         ));
 
-        with_tempod(&pool, |addr| {
-            ShellClient::new(addr.to_string()).adopt(&opened.id.0)
-        })?;
-        let after_create = with_tempod(&pool, |addr| {
-            ShellClient::new(addr.to_string()).events(&opened.id.0, Some(0))
-        })?;
+        client.adopt(&opened.id.0)?;
+        let after_create = client.events(&opened.id.0, Some(0))?;
 
-        assert_eq!(after_create.events.len(), 1);
-        assert_eq!(after_create.events[0].seq, 1);
-        assert!(matches!(
-            after_create.events[0].event,
-            TempodSessionEventKind::SessionAdopted
-        ));
+        assert!(
+            after_create.events.iter().all(|event| event.seq > 0),
+            "cursor should exclude the initial SessionCreated event"
+        );
+        assert!(after_create
+            .events
+            .iter()
+            .any(|event| matches!(event.event, TempodSessionEventKind::SessionAdopted)));
+        assert!(after_create
+            .events
+            .iter()
+            .any(|event| matches!(event.event, TempodSessionEventKind::Manager { .. })));
+        detach_test_driver(&pool, driver_handle)?;
         Ok(())
     }
 
     #[test]
     fn client_runs_driverless_handshake_through_real_tempod_mcp() -> TestResult {
-        let pool = Arc::new(Mutex::new(SessionPool::default()));
+        let pool = test_session_pool();
         let result = with_tempod(&pool, |addr| {
             ShellClient::new(addr.to_string()).mcp_tool(
                 "handshake",
@@ -1240,6 +1315,50 @@ mod tests {
     }
 
     #[test]
+    fn session_screenshot_posts_to_session_scoped_mcp_route() -> TestResult {
+        let body = serde_json::to_vec(&json!({
+            "jsonrpc": "2.0",
+            "id": "tempo-shell",
+            "result": {
+                "structuredContent": {
+                    "mime_type": "image/png",
+                    "encoding": "base64",
+                    "set_of_marks": true,
+                    "data": "QUJD",
+                }
+            }
+        }))?;
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
+        let handle = thread::spawn(move || -> Result<(), std::io::Error> {
+            let (mut stream, _) = listener.accept()?;
+            let mut request = Vec::new();
+            stream.read_to_end(&mut request)?;
+            let _ = request_tx.send(String::from_utf8_lossy(&request).to_string());
+            let header = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            write_fixture_response(&mut stream, header.as_bytes())?;
+            write_fixture_response(&mut stream, &body)
+        });
+
+        let image = ShellClient::new(addr.to_string()).screenshot_session("session-123", true)?;
+        let request = request_rx.recv_timeout(Duration::from_secs(1))?;
+
+        assert!(request.starts_with("POST /sessions/session-123/mcp HTTP/1.1"));
+        assert!(request.contains("\"name\":\"screenshot\""));
+        assert!(request.contains("\"set_of_marks\":true"));
+        assert!(image.set_of_marks);
+        match handle.join() {
+            Ok(result) => result?,
+            Err(_) => return Err("server thread failed".into()),
+        }
+        Ok(())
+    }
+
+    #[test]
     fn mcp_client_rejects_oversized_content_length_before_body_read() -> TestResult {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let addr = listener.local_addr()?;
@@ -1327,30 +1446,27 @@ mod tests {
 
     #[test]
     fn adopt_events_close_work_for_valid_session_id() -> TestResult {
-        let pool = Arc::new(Mutex::new(SessionPool::default()));
-        let opened = with_tempod(&pool, |addr| {
-            ShellClient::new(addr.to_string()).open("https://valid.test")
-        })?;
+        let pool = test_session_pool();
+        let driver_handle = attach_test_driver(&pool)?;
+        let addr = spawn_tempod(&pool)?;
+        let client = ShellClient::new(addr.to_string());
+
+        let opened = client.open("https://example.com/valid")?;
         let session_id = opened.id.0.clone();
         assert!(matches!(
             safe_path_segment(&session_id),
             Ok(id) if id == session_id
         ));
 
-        let adopted = with_tempod(&pool, |addr| {
-            ShellClient::new(addr.to_string()).adopt(&session_id)
-        })?;
+        let adopted = client.adopt(&session_id)?;
         assert_eq!(adopted.state, TempodSessionState::Adopted);
 
-        let events = with_tempod(&pool, |addr| {
-            ShellClient::new(addr.to_string()).events(&session_id, None)
-        })?;
+        let events = client.events(&session_id, None)?;
         assert!(!events.events.is_empty());
 
-        let closed = with_tempod(&pool, |addr| {
-            ShellClient::new(addr.to_string()).close(&session_id)
-        })?;
+        let closed = client.close(&session_id)?;
         assert_eq!(closed.state, TempodSessionState::Killed);
+        detach_test_driver(&pool, driver_handle)?;
         Ok(())
     }
 
@@ -1384,6 +1500,20 @@ mod tests {
         Ok(result?)
     }
 
+    fn test_session_pool() -> Arc<Mutex<SessionPool>> {
+        Arc::new(Mutex::new(SessionPool::default()))
+    }
+
+    fn spawn_tempod(pool: &Arc<Mutex<SessionPool>>) -> Result<SocketAddr, Box<dyn Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let server_pool = Arc::clone(pool);
+        thread::spawn(move || {
+            let _ = serve_forever(listener, server_pool);
+        });
+        Ok(addr)
+    }
+
     fn join_server(
         handle: thread::JoinHandle<Result<(), TempodError>>,
     ) -> Result<(), Box<dyn Error>> {
@@ -1402,7 +1532,7 @@ mod tests {
             .attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream))?;
         Ok(thread::spawn(move || {
             let mut connection = EngineIpcConnection::from_stream(server_stream);
-            let mut driver = TestDriver::new();
+            let mut driver = TestDriver::new().allow_private_network_access();
             futures::executor::block_on(serve_driver_connection(&mut connection, &mut driver))
         }))
     }
@@ -1414,5 +1544,15 @@ mod tests {
             Ok(result) => Ok(result?),
             Err(_) => Err("driver thread failed".into()),
         }
+    }
+
+    fn detach_test_driver(
+        pool: &Arc<Mutex<SessionPool>>,
+        handle: thread::JoinHandle<Result<(), EngineHostError>>,
+    ) -> Result<(), Box<dyn Error>> {
+        pool.lock()
+            .map_err(|_| "session pool lock failed")?
+            .detach_engine_driver();
+        join_driver(handle)
     }
 }

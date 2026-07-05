@@ -454,20 +454,17 @@ mod tests {
             Err(ShellError::Usage("close unused in transport tests".into()))
         }
 
-        fn goto(&self, driver_id: Option<&str>, url: &str) -> Result<(), ShellError> {
-            self.record(&format!("goto:{}:{url}", driver_id.unwrap_or("-")));
+        fn goto(&self, session_id: &str, url: &str) -> Result<(), ShellError> {
+            self.record(&format!("goto:{session_id}:{url}"));
             Ok(())
         }
 
         fn screenshot(
             &self,
-            driver_id: Option<&str>,
+            session_id: &str,
             set_of_marks: bool,
         ) -> Result<ScreenshotImage, ShellError> {
-            self.record(&format!(
-                "screenshot:{}:marks={set_of_marks}",
-                driver_id.unwrap_or("-")
-            ));
+            self.record(&format!("screenshot:{session_id}:marks={set_of_marks}"));
             Err(ShellError::Usage(
                 "screenshot unused in transport tests".into(),
             ))
@@ -482,6 +479,20 @@ mod tests {
             Ok(TempodSessionEvents {
                 events: Vec::new(),
                 truncated_before_seq: None,
+            })
+        }
+
+        fn confirm(
+            &self,
+            session_id: &str,
+            confirmation_id: &str,
+        ) -> Result<tempo_schema::ConfirmationGrant, ShellError> {
+            self.record(&format!("confirm:{session_id}:{confirmation_id}"));
+            Ok(tempo_schema::ConfirmationGrant {
+                confirmation_id: confirmation_id.to_string(),
+                grant_token: "grant-token-test".to_string(),
+                issued_ms: 1,
+                expires_ms: 2,
             })
         }
     }

@@ -84,7 +84,7 @@ const MAX_SESSION_IDEMPOTENCY_RECORDS: usize = 1024;
 const MAX_SESSION_EVENTS_PER_SESSION: usize = 1024;
 const MAX_SESSION_EVENT_STREAM_BACKLOG: usize = MAX_SESSION_EVENTS_PER_SESSION;
 const MAX_TERMINAL_SESSIONS: usize = 256;
-const CONFIRMATION_TTL_MS: u128 = 5 * 60 * 1000;
+const CONFIRMATION_TTL_MS: u64 = 5 * 60 * 1000;
 const CONFIRMATION_ID_BYTES: usize = 16;
 const CONFIRMATION_TOKEN_BYTES: usize = 32;
 const MAX_WS_PAYLOAD_BYTES: usize = MAX_HTTP_BYTES;
@@ -436,7 +436,7 @@ pub struct TempodSession {
     pub id: TempodSessionId,
     pub url: String,
     pub state: TempodSessionState,
-    pub created_ms: u128,
+    pub created_ms: u64,
 }
 
 /// One event in tempod's per-session control-plane log.
@@ -444,7 +444,7 @@ pub struct TempodSession {
 pub struct TempodSessionEvent {
     pub session_id: TempodSessionId,
     pub seq: u64,
-    pub timestamp_ms: u128,
+    pub timestamp_ms: u64,
     pub event: TempodSessionEventKind,
 }
 
@@ -1670,7 +1670,7 @@ impl SessionPool {
         Ok(true)
     }
 
-    fn prune_expired_confirmations(&mut self, now: u128) {
+    fn prune_expired_confirmations(&mut self, now: u64) {
         self.pending_confirmations
             .retain(|_, stored| stored.request.expires_ms >= now);
         self.confirmation_grants
@@ -7638,10 +7638,10 @@ impl TempodError {
     }
 }
 
-fn current_time_ms() -> u128 {
+fn current_time_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis())
+        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
         .unwrap_or(0)
 }
 
