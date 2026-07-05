@@ -40,6 +40,9 @@ use thiserror::Error;
 const USAGE: &str = "\
 tempo-cli
 
+Options:
+  -V, --version
+
 Commands:
   schema [--output PATH]
   scorecard --input PATH [--output PATH] [--allow-missing-speculation]
@@ -1290,6 +1293,11 @@ mod tests {
             format!("{}\n", env!("CARGO_PKG_VERSION"))
         );
         Ok(())
+    }
+
+    #[test]
+    fn help_advertises_version_flag() {
+        assert!(USAGE.contains("-V, --version"));
     }
 
     #[test]

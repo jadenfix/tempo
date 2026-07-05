@@ -47,8 +47,9 @@ Commands:
   drain
 
 Options:
-  --tempod ADDR   tempod address, default 127.0.0.1:8787
-  --auth-token TOKEN (default: TEMPO_TEMPOD_AUTH_TOKEN or tempod runtime token file)
+  -V, --version
+  --tempod ADDR       tempod address, default 127.0.0.1:8787
+  --auth-token TOKEN  default: TEMPO_TEMPOD_AUTH_TOKEN or tempod runtime token file
 ";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -848,6 +849,11 @@ mod tests {
             format!("{}\n", env!("CARGO_PKG_VERSION"))
         );
         Ok(())
+    }
+
+    #[test]
+    fn help_advertises_version_flag() {
+        assert!(USAGE.contains("-V, --version"));
     }
 
     #[test]
