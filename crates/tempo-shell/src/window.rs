@@ -17,7 +17,8 @@ use tempo_headless::TEMPO_TEMPOD_AUTH_TOKEN_ENV;
 use thiserror::Error;
 
 use crate::tab::ScreenshotImage;
-use crate::ui::{ShellUiModel, UiAction};
+use crate::transport::TransportClient;
+use crate::ui::{SessionService, UiAction};
 use crate::{validate_auth_token, ShellClient, ShellError, DEFAULT_TEMPOD_ADDR};
 
 const DEFAULT_POLL_SECONDS: u64 = 3;
@@ -121,16 +122,20 @@ pub fn run(config: WindowConfig) -> Result<(), WindowError> {
     eframe::run_native(
         "tempo-shell",
         options,
-        Box::new(|_cc| Ok(Box::new(ShellApp::new(config)) as Box<dyn eframe::App>)),
+        Box::new(|cc| {
+            Ok(Box::new(ShellApp::new(config, cc.egui_ctx.clone())) as Box<dyn eframe::App>)
+        }),
     )
     .map_err(|err| WindowError::Backend(err.to_string()))
 }
 
-/// The winit/egui application: owns the tested [`ShellUiModel`] and forwards
-/// user actions and the poll timer into its reducer.
+/// The winit/egui application. It owns no transport of its own: all tempod
+/// round-trips run on the [`TransportClient`] worker thread, so a slow or
+/// unreachable tempod never blocks the render thread (#404). Each frame it drains
+/// completed results into the last-known model and renders that, forwarding user
+/// actions and the poll timer to the worker.
 struct ShellApp {
-    model: ShellUiModel,
-    auth_token: Option<String>,
+    transport: TransportClient,
     poll_interval: Duration,
     last_poll: Option<Instant>,
     /// Decoded texture for the active tab's latest snapshot, plus the
@@ -141,26 +146,29 @@ struct ShellApp {
 }
 
 impl ShellApp {
-    fn new(config: WindowConfig) -> Self {
+    fn new(config: WindowConfig, ctx: egui::Context) -> Self {
+        // The worker rebuilds the transport from the (editable) base URL on every
+        // dispatch, exactly as the old inline path did; the auth token is folded
+        // in here. Injected as a factory so the worker owns no egui/window types.
+        let auth_token = config.auth_token;
+        let factory = move |base_url: &str| -> Box<dyn SessionService> {
+            let mut client = ShellClient::new(base_url.to_string());
+            if let Some(token) = &auth_token {
+                client = client.with_auth_token(token.clone());
+            }
+            Box::new(client)
+        };
+        // Wake the UI thread when a result lands so it repaints promptly instead of
+        // waiting out the poll timer.
+        let transport =
+            TransportClient::spawn(config.base_url, factory, move || ctx.request_repaint());
         Self {
-            model: ShellUiModel::new(config.base_url),
-            auth_token: config.auth_token,
+            transport,
             poll_interval: config.poll_interval,
             last_poll: None,
             screenshot_texture: None,
             rendered_snapshot: None,
         }
-    }
-
-    /// Build the transport from the current base-url field and run one action
-    /// through the reducer. All error handling lives in the reducer (status
-    /// line); nothing here can panic.
-    fn dispatch(&mut self, action: UiAction) {
-        let mut client = ShellClient::new(self.model.base_url.clone());
-        if let Some(token) = &self.auth_token {
-            client = client.with_auth_token(token.clone());
-        }
-        self.model.dispatch(action, &client);
     }
 
     fn due_for_poll(&self) -> bool {
@@ -175,7 +183,7 @@ impl ShellApp {
     /// is forwarded into the image (the live viewport is deferred to #349/#246).
     /// Decode failures surface as a label; nothing here panics.
     fn show_page_state(&mut self, ui: &mut egui::Ui) {
-        let snapshot = self.model.active_tab().and_then(|tab| {
+        let snapshot = self.transport.model.active_tab().and_then(|tab| {
             tab.screenshot
                 .as_ref()
                 .map(|image| (tab.session_id.clone(), tab.screenshot_seq, image.clone()))
@@ -201,6 +209,7 @@ impl ShellApp {
 
         if let Some(texture) = &self.screenshot_texture {
             let marked = self
+                .transport
                 .model
                 .active_tab()
                 .and_then(|tab| tab.screenshot.as_ref())
@@ -222,7 +231,7 @@ impl ShellApp {
     fn show_agent_journal(&self, ui: &mut egui::Ui) {
         ui.separator();
         ui.label("agent journal (session events):");
-        if self.model.journal.entries.is_empty() {
+        if self.transport.model.journal.entries.is_empty() {
             ui.label("(no events yet)");
             return;
         }
@@ -230,7 +239,7 @@ impl ShellApp {
             .max_height(200.0)
             .stick_to_bottom(true)
             .show(ui, |ui| {
-                for entry in &self.model.journal.entries {
+                for entry in &self.transport.model.journal.entries {
                     let mut line = format!("#{} {}", entry.seq, entry.kind);
                     if !entry.detail.is_empty() {
                         line.push_str(&format!(" — {}", entry.detail));
@@ -330,28 +339,33 @@ impl eframe::App for ShellApp {
     // egui 0.35: `ui` receives the root `Ui` (the central area) directly; the
     // `Context` is reached via `ui.ctx()`.
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Apply everything the worker finished since the last frame, then render
+        // the last-known model. This never blocks on the socket (#404).
+        self.transport.drain();
+
         if self.due_for_poll() {
-            self.dispatch(UiAction::Refresh);
+            self.transport.enqueue(UiAction::Refresh);
             // Keep the active tab's page-state snapshot and journal/event stream
             // fresh on the same cadence (the DoD's "refreshed on an interval"; the
-            // buttons below are the manual paths). Cheap no-ops with no active tab.
-            if self.model.active_tab().is_some() {
-                self.dispatch(UiAction::RefreshScreenshot);
-                self.dispatch(UiAction::PollEvents);
+            // buttons below are the manual paths). The worker coalesces a poll of a
+            // kind already in flight so a slow tempod can't make them pile up.
+            if self.transport.model.active_tab().is_some() {
+                self.transport.enqueue(UiAction::RefreshScreenshot);
+                self.transport.enqueue(UiAction::PollEvents);
             }
             self.last_poll = Some(Instant::now());
         }
 
         let mut pending: Option<UiAction> = None;
         {
-            let model = &mut self.model;
             ui.heading("tempo-shell");
 
             // Blocking human-takeover banner (#354): when the session event stream
             // surfaces a HumanTakeoverRequired, the agent is paused and this banner
             // stays up until the human clicks Resume. It never auto-continues — see
             // `TakeoverBanner`. Rendered first, above the rest of the chrome.
-            if let Some(line) = model.journal.takeover().banner_line() {
+            let banner_line = self.transport.model.journal.takeover().banner_line();
+            if let Some(line) = banner_line {
                 ui.group(|ui| {
                     ui.label(
                         egui::RichText::new("⚠ HUMAN TAKEOVER REQUIRED")
@@ -371,21 +385,24 @@ impl eframe::App for ShellApp {
                 ui.separator();
             }
 
+            // Read-only display values are pulled off the last-known model before
+            // the row so the editable buffers (base_url/open_url/omnibox) are the
+            // only fields borrowed mutably inside the closures.
+            let health = match self.transport.model.healthy {
+                Some(true) => "health: ok",
+                Some(false) => "health: DOWN",
+                None => "health: unknown",
+            };
+            // Always-visible taint badge: reflects contains_untrusted over the
+            // active session's latest observation (from the events stream).
+            let taint = self.transport.model.journal.taint();
             ui.horizontal(|ui| {
                 ui.label("tempod:");
-                ui.text_edit_singleline(&mut model.base_url);
+                ui.text_edit_singleline(&mut self.transport.base_url);
                 if ui.button("Refresh").clicked() {
                     pending = Some(UiAction::Refresh);
                 }
-                let health = match model.healthy {
-                    Some(true) => "health: ok",
-                    Some(false) => "health: DOWN",
-                    None => "health: unknown",
-                };
                 ui.label(health);
-                // Always-visible taint badge: reflects contains_untrusted over the
-                // active session's latest observation (from the events stream).
-                let taint = model.journal.taint();
                 let badge = egui::RichText::new(taint.label());
                 let badge = if taint.is_tainted() {
                     badge.color(egui::Color32::from_rgb(220, 50, 50)).strong()
@@ -396,7 +413,7 @@ impl eframe::App for ShellApp {
             });
             ui.horizontal(|ui| {
                 ui.label("new tab URL:");
-                ui.text_edit_singleline(&mut model.open_url);
+                ui.text_edit_singleline(&mut self.transport.open_url);
                 if ui.button("New Tab").clicked() {
                     pending = Some(UiAction::NewTab);
                 }
@@ -406,11 +423,11 @@ impl eframe::App for ShellApp {
 
             // Tab strip: one selectable per tempod session, with a close button.
             ui.horizontal_wrapped(|ui| {
-                if model.tabs.is_empty() {
+                if self.transport.model.tabs.is_empty() {
                     ui.label("(no tabs — open one above)");
                 }
-                for (index, tab) in model.tabs.iter().enumerate() {
-                    let is_active = model.active_tab == Some(index);
+                for (index, tab) in self.transport.model.tabs.iter().enumerate() {
+                    let is_active = self.transport.model.active_tab == Some(index);
                     let title = tab.current_url().unwrap_or(&tab.session_id);
                     if ui.selectable_label(is_active, title).clicked() {
                         pending = Some(UiAction::SelectTab(index));
@@ -422,46 +439,59 @@ impl eframe::App for ShellApp {
             });
 
             // Active-tab chrome: omnibox + back/forward + refresh, then the
-            // periodically-refreshed page-state image (NOT a live viewport).
-            if let Some(active) = model.active_tab
-                && let Some(tab) = model.tabs.get_mut(active)
-            {
-                ui.horizontal(|ui| {
-                    if ui
-                        .add_enabled(tab.history.can_back(), egui::Button::new("←"))
-                        .clicked()
-                    {
-                        pending = Some(UiAction::Back);
-                    }
-                    if ui
-                        .add_enabled(tab.history.can_forward(), egui::Button::new("→"))
-                        .clicked()
-                    {
-                        pending = Some(UiAction::Forward);
-                    }
-                    ui.text_edit_singleline(&mut tab.omnibox);
-                    if ui.button("Go").clicked() {
-                        pending = Some(UiAction::Navigate);
-                    }
-                    if ui.button("Refresh page").clicked() {
-                        pending = Some(UiAction::RefreshScreenshot);
-                    }
-                    // Set-of-marks overlay toggle; the flip re-requests the image
-                    // on the next screenshot refresh (marks_overlay is on the model).
-                    let mut marks = model.marks_overlay;
-                    if ui.checkbox(&mut marks, "set-of-marks").changed() {
-                        pending = Some(UiAction::ToggleMarks);
-                    }
+            // periodically-refreshed page-state image (NOT a live viewport). The
+            // omnibox binds to the UI-thread buffer; read-only history/status come
+            // off the snapshot (last-known while a request is in flight).
+            if let Some(active) = self.transport.model.active_tab {
+                let chrome = self.transport.model.tabs.get(active).map(|tab| {
+                    (
+                        tab.history.can_back(),
+                        tab.history.can_forward(),
+                        tab.status.clone(),
+                    )
                 });
-                ui.label(&tab.status);
+                if let Some((can_back, can_forward, tab_status)) = chrome {
+                    let marks_overlay = self.transport.model.marks_overlay;
+                    ui.horizontal(|ui| {
+                        if ui.add_enabled(can_back, egui::Button::new("←")).clicked() {
+                            pending = Some(UiAction::Back);
+                        }
+                        if ui
+                            .add_enabled(can_forward, egui::Button::new("→"))
+                            .clicked()
+                        {
+                            pending = Some(UiAction::Forward);
+                        }
+                        ui.text_edit_singleline(&mut self.transport.omnibox);
+                        if ui.button("Go").clicked() {
+                            pending = Some(UiAction::Navigate);
+                        }
+                        if ui.button("Refresh page").clicked() {
+                            pending = Some(UiAction::RefreshScreenshot);
+                        }
+                        // Set-of-marks overlay toggle; the flip re-requests the
+                        // image on the next screenshot refresh.
+                        let mut marks = marks_overlay;
+                        if ui.checkbox(&mut marks, "set-of-marks").changed() {
+                            pending = Some(UiAction::ToggleMarks);
+                        }
+                    });
+                    ui.label(tab_status);
+                }
             }
 
             ui.separator();
-            ui.label(&model.status);
+            ui.label(&self.transport.model.status);
+            if self.transport.is_down() {
+                ui.label(
+                    egui::RichText::new("transport worker stopped — showing last-known state")
+                        .color(egui::Color32::from_rgb(220, 50, 50)),
+                );
+            }
         }
 
         if let Some(action) = pending {
-            self.dispatch(action);
+            self.transport.enqueue(action);
         }
 
         self.show_page_state(ui);
@@ -495,11 +525,13 @@ mod tests {
     }
 
     /// Smoke test: the window module compiles and the app constructs from a
-    /// config without opening a window (no display required in CI).
+    /// config without opening a window (no display required in CI). The transport
+    /// worker is spawned but idle until an action is enqueued.
     #[test]
     fn shell_app_constructs_from_config() {
-        let app = ShellApp::new(WindowConfig::default());
-        assert_eq!(app.model.base_url, DEFAULT_TEMPOD_ADDR);
+        let app = ShellApp::new(WindowConfig::default(), egui::Context::default());
+        assert_eq!(app.transport.model.base_url, DEFAULT_TEMPOD_ADDR);
+        assert_eq!(app.transport.base_url, DEFAULT_TEMPOD_ADDR);
         assert!(app.last_poll.is_none());
         assert!(app.due_for_poll());
         assert!(app.screenshot_texture.is_none());
