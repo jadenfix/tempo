@@ -15,9 +15,6 @@ let package = Package(
             exclude: [
                 "Info.plist",
                 "TempoApp.swift",
-                "BrowserShellView.swift",
-                "ManagerPanelView.swift",
-                "WebViewContainer.swift",
             ],
             resources: [
                 .process("Resources"),

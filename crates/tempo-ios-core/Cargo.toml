@@ -22,5 +22,9 @@ tempo-policy = { path = "../tempo-policy" }
 tempo-schema = { path = "../tempo-schema" }
 tempo-taint = { path = "../tempo-taint" }
 
-[lints]
-workspace = true
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"

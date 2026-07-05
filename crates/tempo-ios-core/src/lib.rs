@@ -7,6 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::ffi::{c_char, CString};
 use tempo_observe::{CompileOptions, ObservationCompiler, ObservationInput};
 use tempo_schema::CompiledObservation;
 use thiserror::Error;
@@ -120,6 +121,32 @@ pub fn parse_bridge_json(value: &str) -> Result<Value, IosCoreError> {
     serde_json::from_str(value).map_err(IosCoreError::InvalidObservationInput)
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn tempo_ios_core_capabilities_json() -> *mut c_char {
+    match capabilities_json()
+        .ok()
+        .and_then(|json| CString::new(json).ok())
+    {
+        Some(json) => json.into_raw(),
+        None => std::ptr::null_mut(),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn tempo_ios_core_observation_script() -> *mut c_char {
+    match CString::new(observation_script()) {
+        Ok(script) => script.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tempo_ios_core_string_free(value: *mut c_char) {
+    if !value.is_null() {
+        drop(unsafe { CString::from_raw(value) });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -179,5 +206,29 @@ mod tests {
     #[test]
     fn bundled_observation_script_has_collector_entrypoint() {
         assert!(observation_script().contains("__tempoCollectObservation"));
+    }
+
+    #[test]
+    fn c_abi_exports_capabilities_json_string() -> Result<(), Box<dyn std::error::Error>> {
+        let ptr = tempo_ios_core_capabilities_json();
+        assert!(!ptr.is_null());
+        let text = unsafe { std::ffi::CStr::from_ptr(ptr) }
+            .to_str()?
+            .to_string();
+        unsafe { tempo_ios_core_string_free(ptr) };
+
+        let value: serde_json::Value = serde_json::from_str(&text)?;
+        assert_eq!(value["engine_lane"], IOS_ENGINE_LANE);
+        Ok(())
+    }
+
+    #[test]
+    fn c_abi_exports_observation_script_string() -> Result<(), Box<dyn std::error::Error>> {
+        let ptr = tempo_ios_core_observation_script();
+        assert!(!ptr.is_null());
+        let text = unsafe { std::ffi::CStr::from_ptr(ptr) }.to_str()?;
+        assert!(text.contains("__tempoCollectObservation"));
+        unsafe { tempo_ios_core_string_free(ptr) };
+        Ok(())
     }
 }

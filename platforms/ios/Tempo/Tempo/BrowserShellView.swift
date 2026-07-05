@@ -21,7 +21,7 @@ struct BrowserShellView: View {
             ManagerPanelView(model: model)
                 .frame(maxHeight: 260)
         }
-        .background(Color(.systemBackground))
+        .background(Color.tempoSystemBackground)
     }
 }
 
@@ -43,14 +43,11 @@ private struct BrowserToolbar: View {
             .accessibilityLabel("Forward")
 
             TextField("Search or URL", text: $model.addressText)
-                .textInputAutocapitalization(.never)
-                .autocorrectionDisabled()
-                .keyboardType(.URL)
-                .submitLabel(.go)
+                .tempoURLInputTraits()
                 .onSubmit(model.navigateToAddress)
                 .padding(.horizontal, 10)
                 .frame(height: 36)
-                .background(Color(.secondarySystemBackground))
+                .background(Color.tempoSecondarySystemBackground)
                 .clipShape(RoundedRectangle(cornerRadius: 8))
 
             Button(action: model.selectedTab?.isLoading == true ? model.stopLoading : model.reload) {
@@ -93,7 +90,7 @@ private struct TabStripView: View {
                         }
                         .padding(.horizontal, 10)
                         .frame(height: 32)
-                        .background(tab.id == model.selectedTabID ? Color(.tertiarySystemFill) : Color.clear)
+                        .background(tab.id == model.selectedTabID ? Color.tempoTertiarySystemFill : Color.clear)
                         .clipShape(RoundedRectangle(cornerRadius: 8))
                     }
                     .buttonStyle(.plain)

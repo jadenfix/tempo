@@ -1,4 +1,6 @@
 import SwiftUI
+
+#if os(iOS)
 import WebKit
 
 struct WebViewContainer: UIViewRepresentable {
@@ -106,3 +108,22 @@ struct WebViewContainer: UIViewRepresentable {
         }
     }
 }
+#else
+struct WebViewContainer: View {
+    @Binding var tab: TempoTab
+    @Binding var command: WebViewCommand?
+
+    let observationScript: String
+
+    var body: some View {
+        Color.clear
+            .onAppear {
+                tab.isLoading = false
+                _ = observationScript
+            }
+            .onChange(of: command) { _, _ in
+                command = nil
+            }
+    }
+}
+#endif

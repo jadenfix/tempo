@@ -17,7 +17,7 @@ struct ManagerPanelView: View {
                     .frame(width: 190)
             }
         }
-        .background(Color(.secondarySystemBackground))
+        .background(Color.tempoSecondarySystemBackground)
     }
 }
 
@@ -88,7 +88,7 @@ private struct SessionList: View {
                         }
                         .padding(8)
                         .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(session.id == model.manager.selectedSessionID ? Color(.tertiarySystemFill) : Color.clear)
+                        .background(session.id == model.manager.selectedSessionID ? Color.tempoTertiarySystemFill : Color.clear)
                         .clipShape(RoundedRectangle(cornerRadius: 8))
                     }
                     .buttonStyle(.plain)
