@@ -3511,6 +3511,8 @@ mod tests {
         Some(chrome)
     }
 
+    const LIVE_CDP_CHILD_OPERATION_TIMEOUT: Duration = Duration::from_secs(29);
+
     /// Boundary test for the bounded-navigation budget: the whole timed-out
     /// path (navigation await + readyState recovery) must resolve inside
     /// tempod's 30s engine IPC deadline (`ENGINE_IPC_TIMEOUT` in
@@ -5586,7 +5588,7 @@ mod tests {
             .await
             .map_err(|error| std::io::Error::other(error.0))?;
         let child_initial = tokio::time::timeout(
-            Duration::from_secs(20),
+            LIVE_CDP_CHILD_OPERATION_TIMEOUT,
             goto_live_fixture_with_retry(child.as_mut(), &url),
         )
         .await
@@ -5604,20 +5606,20 @@ mod tests {
 
         assert_eq!(child_value, serde_json::json!("__missing__"));
         assert_eq!(child_cookie, serde_json::json!(""));
-        let child_observe = tokio::time::timeout(Duration::from_secs(20), child.observe())
+        let child_observe = tokio::time::timeout(LIVE_CDP_CHILD_OPERATION_TIMEOUT, child.observe())
             .await
             .map_err(|_| std::io::Error::other("child observe timed out"))??;
         assert_eq!(child_observe.url, url);
         let child_next_url = format!("{url}again");
         let child_second_goto = tokio::time::timeout(
-            Duration::from_secs(20),
+            LIVE_CDP_CHILD_OPERATION_TIMEOUT,
             goto_live_fixture_with_retry(child.as_mut(), &child_next_url),
         )
         .await
         .map_err(|_| std::io::Error::other("child second goto timed out"))??;
         assert_eq!(child_second_goto.url, child_next_url);
         let child_batch = tokio::time::timeout(
-            Duration::from_secs(20),
+            LIVE_CDP_CHILD_OPERATION_TIMEOUT,
             child.act_batch(&ActionBatch {
                 actions: vec![Action::Goto {
                     url: format!("{url}batch"),

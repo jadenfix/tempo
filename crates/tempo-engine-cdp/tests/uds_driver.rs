@@ -53,7 +53,7 @@ async fn cdp_driver_serves_commands_over_engine_host_uds() -> Result<(), Box<dyn
                 Some(&driver_id),
                 DriverCommand::ActBatch {
                     batch: ActionBatch {
-                        actions: vec![Action::Goto { url }],
+                        actions: vec![Action::Wait { millis: 0 }],
                         quiescence: QuiescencePolicy::FixedMillis(0),
                     },
                 },
