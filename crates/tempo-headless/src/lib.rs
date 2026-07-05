@@ -10766,12 +10766,13 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn auto_started_cdp_engine_waits_for_socket_and_attaches() -> TestResult {
         use std::os::unix::net::UnixListener;
 
-        let dir = PathBuf::from(format!(
-            "/tmp/tempo-headless-auto-cdp-child-{}-{:x}",
+        let dir = auto_cdp_runtime_base_dir().join(format!(
+            "tempo-headless-auto-cdp-child-{}-{:x}",
             std::process::id(),
             current_time_ns()
         ));
@@ -10801,6 +10802,12 @@ mod tests {
             .map_err(|error| format!("fake engine socket failed: {error}"))?;
         let _ = host.kill();
         remove_dir_if_exists(&dir)?;
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn auto_started_cdp_engine_waits_for_socket_and_attaches() -> TestResult {
         Ok(())
     }
 
