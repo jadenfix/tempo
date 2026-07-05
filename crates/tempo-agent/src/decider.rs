@@ -28,8 +28,11 @@ use std::path::PathBuf;
 use std::time::Duration;
 use tempo_act::{detect_human_takeover, execute_action, ExecutionStatus};
 use tempo_driver::{DriverTrait, TransportError};
-use tempo_policy::Origin;
-use tempo_schema::{Action, CompiledObservation, HumanTakeover, ObservationDiff};
+use tempo_policy::{
+    trust::{action_caller_texts, observation_text_taint},
+    InputTaint, Origin,
+};
+use tempo_schema::{Action, CompiledObservation, HumanTakeover, ObservationDiff, SideEffect};
 use tempo_session::{read_journal_entries, JournalEntry, JournalEvent, SessionJournal};
 use tempo_taint::serialize_observation_for_model;
 use thiserror::Error;
@@ -1013,7 +1016,7 @@ impl AgentRunner {
                 return Ok(Some(DecidedRunStatus::Interrupted { reason }));
             }
 
-            let step = DriverStep::clean(action.clone());
+            let step = Self::model_decided_driver_step(observation, action);
             let key = IdempotencyKey::for_action(state.steps_executed, action)?;
             let policy_origin = self.origin_for_step(&step, state.current_origin.as_ref())?;
             let policy =
@@ -1078,6 +1081,19 @@ impl AgentRunner {
             }
         }
         Ok(None)
+    }
+
+    fn model_decided_driver_step(observation: &CompiledObservation, action: &Action) -> DriverStep {
+        DriverStep {
+            action: action.clone(),
+            input_taint: Self::model_decided_input_taint(observation, action),
+            estimated_tokens: 1,
+        }
+    }
+
+    fn model_decided_input_taint(observation: &CompiledObservation, action: &Action) -> InputTaint {
+        let observed = observation_text_taint(observation, &action_caller_texts(action));
+        InputTaint::new(observed.is_tainted() || action.side_effect() >= SideEffect::Write)
     }
 
     /// Hard-pause if the observation is a CAPTCHA / auth-wall / login state
@@ -1467,7 +1483,7 @@ mod tests {
     use crate::tests::{
         button, http_fixture_response, read_http_request, remove_dir_if_exists, unique_dir,
     };
-    use crate::{AgentRunIds, TokenBudget};
+    use crate::{AgentRunIds, ConfirmationMode, TokenBudget};
     use std::error::Error;
     use std::fs;
     use std::io::Write;
@@ -1672,6 +1688,93 @@ mod tests {
         }
     }
 
+    struct CountingDriver {
+        inner: TestDriver,
+        goto_calls: usize,
+        observe_calls: usize,
+        observe_diff_calls: usize,
+        act_calls: usize,
+        act_batch_calls: usize,
+    }
+
+    impl CountingDriver {
+        fn new(elements: Vec<tempo_schema::InteractiveElement>) -> Self {
+            Self {
+                inner: TestDriver::new().with_elements(elements),
+                goto_calls: 0,
+                observe_calls: 0,
+                observe_diff_calls: 0,
+                act_calls: 0,
+                act_batch_calls: 0,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl DriverTrait for CountingDriver {
+        fn engine(&self) -> tempo_driver::Engine {
+            self.inner.engine()
+        }
+
+        async fn goto(&mut self, url: &str) -> Result<CompiledObservation, TransportError> {
+            self.goto_calls += 1;
+            self.inner.goto(url).await
+        }
+
+        async fn observe(&mut self) -> Result<CompiledObservation, TransportError> {
+            self.observe_calls += 1;
+            self.inner.observe().await
+        }
+
+        async fn observe_diff(
+            &mut self,
+            since_seq: u64,
+        ) -> Result<ObservationDiff, TransportError> {
+            self.observe_diff_calls += 1;
+            self.inner.observe_diff(since_seq).await
+        }
+
+        async fn act(
+            &mut self,
+            action: &Action,
+        ) -> Result<tempo_driver::StepOutcome, TransportError> {
+            self.act_calls += 1;
+            self.inner.act(action).await
+        }
+
+        async fn act_batch(
+            &mut self,
+            batch: &tempo_schema::ActionBatch,
+        ) -> Result<tempo_driver::StepOutcome, TransportError> {
+            self.act_batch_calls += 1;
+            self.inner.act_batch(batch).await
+        }
+
+        async fn fork(&mut self) -> Result<Box<dyn DriverTrait>, tempo_driver::Unsupported> {
+            self.inner.fork().await
+        }
+
+        async fn extract(&mut self, node: &NodeId) -> Result<serde_json::Value, TransportError> {
+            self.inner.extract(node).await
+        }
+
+        async fn evaluate_script(
+            &mut self,
+            expression: &str,
+            await_promise: bool,
+        ) -> Result<serde_json::Value, TransportError> {
+            self.inner.evaluate_script(expression, await_promise).await
+        }
+
+        async fn screenshot(&mut self) -> Result<Vec<u8>, TransportError> {
+            self.inner.screenshot().await
+        }
+
+        async fn close(&mut self) -> Result<(), TransportError> {
+            self.inner.close().await
+        }
+    }
+
     #[tokio::test]
     async fn scripted_decider_drives_hermetic_decided_run() -> TestResult {
         let (root, journal_path) = journal_root("decided-scripted")?;
@@ -1679,7 +1782,8 @@ mod tests {
         let runner = AgentRunner::new(
             &journal_path,
             AgentRunIds::new("run-decided-scripted", "session-decided-scripted"),
-        );
+        )
+        .with_confirmation_mode(ConfirmationMode::AutoConfirmClean);
         let mut decider = ScriptedDecider::new(vec![vec![click("submit")]]);
         let spec = DecidedTaskSpec::new("https://example.com", "click submit");
 
@@ -1703,6 +1807,62 @@ mod tests {
             entries.last().map(|entry| &entry.event),
             Some(JournalEvent::SessionClosed)
         ));
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn decided_goto_recomputes_page_text_taint_and_denies_before_driver_execution(
+    ) -> TestResult {
+        let (root, journal_path) = journal_root("decided-goto-taint-deny")?;
+        let action = Action::Goto {
+            url: "https://example.com/search?q=Submit".into(),
+        };
+        let mut driver = CountingDriver::new(vec![button("submit")]);
+        let runner = AgentRunner::new(
+            &journal_path,
+            AgentRunIds::new("run-decided-goto-taint", "session-decided-goto-taint"),
+        )
+        .with_token_budget(TokenBudget::new(100));
+        let mut decider = FixedUsageDecider {
+            actions: vec![action.clone()],
+            usage: DecisionUsage::default(),
+            calls: 0,
+        };
+        let spec = DecidedTaskSpec::new("https://example.com", "open submit search result");
+
+        let report = runner
+            .run_decided_task(&mut driver, &mut decider, &spec)
+            .await?;
+
+        assert!(matches!(
+            report.status,
+            DecidedRunStatus::PolicyDenied { ref reason }
+                if reason == "policy requires Confirm for Read"
+        ));
+        assert_eq!(report.actions_completed, 1);
+        assert_eq!(decider.calls, 1);
+        assert_eq!(driver.goto_calls, 1);
+        assert_eq!(driver.observe_calls, 0);
+        assert_eq!(driver.observe_diff_calls, 0);
+        assert_eq!(driver.act_calls, 0);
+        assert_eq!(driver.act_batch_calls, 0);
+
+        let entries = read_journal_entries(&journal_path)?;
+        assert!(entries
+            .iter()
+            .any(|entry| matches!(entry.event, JournalEvent::ActionPlanned { .. })));
+        assert!(entries.iter().any(|entry| matches!(
+            entry.event,
+            JournalEvent::StepError {
+                policy_denied: true,
+                ..
+            }
+        )));
+        assert!(!entries
+            .iter()
+            .any(|entry| matches!(entry.event, JournalEvent::StepApplied { .. })));
+
         remove_dir_if_exists(&root)?;
         Ok(())
     }
@@ -1847,7 +2007,8 @@ mod tests {
         let runner = AgentRunner::new(
             &journal_path,
             AgentRunIds::new("run-captcha", "session-captcha"),
-        );
+        )
+        .with_confirmation_mode(ConfirmationMode::AutoConfirmClean);
         // Two actions queued in one batch. The CAPTCHA appears after the first,
         // so the second must NEVER execute.
         let mut decider = ScriptedDecider::new(vec![vec![click("submit"), click("submit")]]);
@@ -1925,6 +2086,7 @@ mod tests {
             &journal_path,
             AgentRunIds::new("run-decided-anthropic", "session-decided-anthropic"),
         )
+        .with_confirmation_mode(ConfirmationMode::AutoConfirmClean)
         .with_token_budget(TokenBudget::new(1_000));
         let mut decider = AnthropicDecider::new(fixture_config(&origin))?;
         let spec = DecidedTaskSpec::new("https://example.com", "click the submit button");
@@ -2268,7 +2430,9 @@ mod tests {
         let mut driver = TestDriver::new().with_elements(vec![button("submit")]);
         // Force a real navigation so the driver has page state to observe.
         driver.goto("https://example.com").await?;
-        let runner = AgentRunner::new(&journal_path, ids).with_token_budget(TokenBudget::new(100));
+        let runner = AgentRunner::new(&journal_path, ids)
+            .with_confirmation_mode(ConfirmationMode::AutoConfirmClean)
+            .with_token_budget(TokenBudget::new(100));
         let mut decider = FixedUsageDecider {
             actions: Vec::new(),
             usage: DecisionUsage::default(),
@@ -2426,6 +2590,7 @@ mod tests {
             &journal_path,
             AgentRunIds::new("run-decided-rounds", "session-decided-rounds"),
         )
+        .with_confirmation_mode(ConfirmationMode::AutoConfirmClean)
         .with_token_budget(TokenBudget::new(1_000));
         // Never reports done, so only the configured ceiling can stop the run.
         let mut decider = FixedUsageDecider {
@@ -3000,6 +3165,7 @@ mod tests {
         let spec = DecidedTaskSpec::new("https://example.com", "select a jump menu");
 
         AgentRunner::new(&journal, AgentRunIds::new("run-nav", "session-nav"))
+            .with_confirmation_mode(ConfirmationMode::AutoConfirmClean)
             .run_decided_task(&mut driver, &mut decider, &spec)
             .await?;
 
