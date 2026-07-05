@@ -1528,6 +1528,37 @@ impl SessionPool {
         Ok(())
     }
 
+    fn ensure_foreground_writer_available(&self, id: &TempodSessionId) -> Result<(), TempodError> {
+        if let Some(run_id) = self.active_runs.get(id) {
+            let waiting_for_human = matches!(
+                self.runs.get(run_id).map(|run| run.state),
+                Some(AgentRunState::WaitingForHuman)
+            );
+            if waiting_for_human && matches!(self.owners.get(id), Some(ControlOwner::Human { .. }))
+            {
+                return Ok(());
+            }
+            return Err(TempodError::Conflict(format!(
+                "session_busy: active run {} owns the session",
+                run_id.0
+            )));
+        }
+        if matches!(
+            self.owners.get(id),
+            Some(ControlOwner::Agent {
+                run_id: Some(active_run)
+            }) if self
+                .runs
+                .get(active_run)
+                .is_some_and(|run| run.state != AgentRunState::WaitingForHuman)
+        ) {
+            return Err(TempodError::Conflict(
+                "session_busy: agent run currently owns the session".into(),
+            ));
+        }
+        Ok(())
+    }
+
     fn create_confirmation_request(
         &mut self,
         id: &TempodSessionId,
@@ -4972,7 +5003,7 @@ fn route_session_act_batch(
     let request_fingerprint = session_act_batch_idempotency_fingerprint(&body);
     {
         let pool = lock_pool(pool)?;
-        pool.ensure_agent_writer_available(&id)?;
+        pool.ensure_foreground_writer_available(&id)?;
         if let Some(key) = body.idempotency_key.as_deref()
             && let Some(response) =
                 pool.cached_session_act_batch_response(&id, key, &request_fingerprint)?
@@ -4990,7 +5021,7 @@ fn route_session_act_batch(
 
     let (mut driver, idempotency_key, policy, consume_grant) = {
         let mut pool = lock_pool(pool)?;
-        pool.ensure_agent_writer_available(&id)?;
+        pool.ensure_foreground_writer_available(&id)?;
         let server_confirmed = pool.validate_confirmation_grant(
             &id,
             body.confirmation_grant.as_ref(),
@@ -7073,7 +7104,7 @@ fn route_session_mcp(
     body: &[u8],
 ) -> HttpResponse {
     let driver = match lock_pool(pool).and_then(|pool| {
-        pool.ensure_agent_writer_available(id)?;
+        pool.ensure_foreground_writer_available(id)?;
         pool.session_driver(id)
     }) {
         Ok(driver) => driver,
@@ -7127,7 +7158,7 @@ fn session_bidi_driver_handle(
     id: &TempodSessionId,
 ) -> Result<AttachedEngineDriver, TempodError> {
     let pool = lock_pool(pool)?;
-    pool.ensure_agent_writer_available(id)?;
+    pool.ensure_foreground_writer_available(id)?;
     pool.session_driver(id)
 }
 
@@ -8350,6 +8381,111 @@ mod tests {
         assert_eq!(late_finish.state, AgentRunState::Cancelled);
         assert_eq!(pool.run(&run_id)?.state, AgentRunState::Cancelled);
         assert!(!pool.active_runs.contains_key(&session.id));
+        Ok(())
+    }
+
+    #[test]
+    fn adopted_waiting_run_allows_foreground_session_act_batch() -> TestResult {
+        let mut pool = SessionPool::default();
+        let handle = attach_driver_handler(&mut pool, |request| match request.command {
+            HostDriverCommand::ActBatch { batch } => {
+                assert_eq!(
+                    batch,
+                    ActionBatch {
+                        actions: vec![Action::Scroll { x: 0.0, y: 4.0 }],
+                        quiescence: QuiescencePolicy::Composite,
+                    }
+                );
+                DriverResponse::Step {
+                    outcome: StepOutcome::Applied {
+                        diff: ObservationDiff {
+                            since_seq: 1,
+                            seq: 2,
+                            omitted: 0,
+                            added: Vec::new(),
+                            removed: Vec::new(),
+                            changed: Vec::new(),
+                        },
+                    }
+                    .into(),
+                }
+            }
+            _ => DriverResponse::Closed,
+        })?;
+        let session_driver = pool
+            .driver
+            .clone()
+            .ok_or("attached engine driver should be present")?;
+        let session = pool.finish_create("https://runs.test".into(), Some(session_driver));
+        insert_test_run(&mut pool, &session.id, AgentRunState::WaitingForHuman, true);
+        pool.adopt_with_surface(&session.id, None)?;
+
+        let body = serde_json::to_vec(&json!({
+            "batch": {
+                "actions": [{"kind": "scroll", "x": 0.0, "y": 4.0}],
+                "quiescence": "composite"
+            },
+            "input_tainted": false
+        }))?;
+        let response = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: format!("/sessions/{}/act_batch", session.id.0),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body,
+            },
+        )?;
+        join_driver_handler(handle)?;
+
+        assert_eq!(response.status, 200);
+        let value: Value = serde_json::from_slice(&response.body)?;
+        assert_eq!(value["status"], "applied");
+        assert!(matches!(
+            pool.session_owner(&session.id),
+            ControlOwner::Human { .. }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn active_agent_run_blocks_foreground_session_act_batch() -> TestResult {
+        let mut pool = SessionPool::default();
+        let session = pool.finish_create("https://runs.test".into(), None);
+        let run_id = insert_test_run(&mut pool, &session.id, AgentRunState::Running, true);
+
+        let body = serde_json::to_vec(&json!({
+            "batch": {
+                "actions": [{"kind": "scroll", "x": 0.0, "y": 4.0}],
+                "quiescence": "composite"
+            },
+            "input_tainted": false
+        }))?;
+        let response = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: format!("/sessions/{}/act_batch", session.id.0),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body,
+            },
+        )?;
+
+        assert_eq!(response.status, 409);
+        let value: Value = serde_json::from_slice(&response.body)?;
+        assert!(value["error"]
+            .as_str()
+            .is_some_and(|error| error.contains(&run_id.0)));
+        assert_eq!(
+            pool.session_owner(&session.id),
+            ControlOwner::Agent {
+                run_id: Some(run_id)
+            }
+        );
         Ok(())
     }
 
@@ -12212,6 +12348,113 @@ mod tests {
             "https://session-mcp.test"
         );
         assert_eq!(value["result"]["structuredContent"]["seq"], 11);
+        Ok(())
+    }
+
+    #[test]
+    fn adopted_waiting_run_allows_foreground_session_mcp_write() -> TestResult {
+        let mut pool = SessionPool::default();
+        let handle = attach_driver_handler(&mut pool, |request| {
+            assert_eq!(
+                request.command,
+                HostDriverCommand::ActBatch {
+                    batch: ActionBatch {
+                        actions: vec![Action::Scroll { x: 0.0, y: 12.0 }],
+                        quiescence: QuiescencePolicy::Composite,
+                    },
+                }
+            );
+            DriverResponse::Step {
+                outcome: StepOutcome::Applied {
+                    diff: ObservationDiff {
+                        since_seq: 1,
+                        seq: 2,
+                        omitted: 0,
+                        added: Vec::new(),
+                        removed: Vec::new(),
+                        changed: Vec::new(),
+                    },
+                }
+                .into(),
+            }
+        })?;
+        let session_driver = pool
+            .driver
+            .clone()
+            .ok_or("attached engine driver should be present")?;
+        let session = pool.finish_create("https://session-human.test".into(), Some(session_driver));
+        insert_test_run(&mut pool, &session.id, AgentRunState::WaitingForHuman, true);
+        pool.adopt_with_surface(
+            &session.id,
+            Some(RegisterSurfaceRequest {
+                surface_id: Some(ShellSurfaceId("desk-human".into())),
+                platform: Some("macos".into()),
+                label: None,
+                engine_tier: Some(BrowserEngineTier::T1),
+                profile_id: None,
+                storage_continuity: Some(StorageContinuityMode::SharedProfile),
+            }),
+        )?;
+
+        let mut request = mcp_tool_request(
+            22,
+            "act_batch",
+            json!({
+                "batch": {
+                    "actions": [{"kind": "scroll", "x": 0.0, "y": 12.0}],
+                    "quiescence": "composite",
+                },
+                "input_tainted": false
+            }),
+        )?;
+        request.path = format!("/sessions/{}/mcp", session.id.0);
+        let response = route_http_request(&mut pool, request)?;
+        join_driver_handler(handle)?;
+
+        assert_eq!(response.status, 200);
+        let value: Value = serde_json::from_slice(&response.body)?;
+        assert_eq!(value["id"], 22);
+        assert_eq!(value["result"]["structuredContent"]["status"], "applied");
+        assert_eq!(
+            pool.session_owner(&session.id),
+            ControlOwner::Human {
+                surface_id: ShellSurfaceId("desk-human".into())
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn waiting_run_without_adoption_blocks_foreground_session_mcp_write() -> TestResult {
+        let mut pool = SessionPool::default();
+        let session = pool.finish_create("https://session-agent.test".into(), None);
+        let run_id = insert_test_run(&mut pool, &session.id, AgentRunState::WaitingForHuman, true);
+
+        let mut request = mcp_tool_request(
+            23,
+            "act_batch",
+            json!({
+                "batch": {
+                    "actions": [{"kind": "scroll", "x": 0.0, "y": 12.0}],
+                    "quiescence": "composite",
+                },
+                "input_tainted": false
+            }),
+        )?;
+        request.path = format!("/sessions/{}/mcp", session.id.0);
+        let response = route_http_request(&mut pool, request)?;
+
+        assert_eq!(response.status, 409);
+        let value: Value = serde_json::from_slice(&response.body)?;
+        assert!(value["error"]
+            .as_str()
+            .is_some_and(|error| error.contains(&run_id.0)));
+        assert_eq!(
+            pool.session_owner(&session.id),
+            ControlOwner::Agent {
+                run_id: Some(run_id)
+            }
+        );
         Ok(())
     }
 
