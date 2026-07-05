@@ -33,7 +33,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::TrySendError;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tempo_agent::{StepTriple, StepTripleOutcome};
 // Re-exported so consumers of `TempodSessionEventKind::StepTriple` (e.g. the
 // shell agent panel) can name the event payload without a direct tempo-agent dep.
@@ -450,6 +450,16 @@ impl AttachedEngineDriver {
     pub fn with_navigation_url_policy(mut self, url_policy: UrlPolicy) -> Self {
         self.url_policy = url_policy;
         self
+    }
+
+    /// Whether the underlying multiplexed IPC connection has been marked dead by
+    /// its reader thread (engine child exited or socket disconnected). A dead
+    /// driver returns [`EngineHostError::IpcClosed`] promptly for every request
+    /// rather than timing out, so it never trips the teardown circuit breaker
+    /// (which fires only on `None`/timeout); the liveness monitor watches this
+    /// flag to reconnect + re-attach instead (#398).
+    fn is_dead(&self) -> bool {
+        self.client.is_dead()
     }
 
     fn request(&self, command: HostDriverCommand) -> Result<DriverResponse, DriverClientError> {
@@ -955,6 +965,24 @@ impl SessionPool {
 
     fn engine_attached(&self) -> bool {
         self.driver.is_some()
+    }
+
+    /// A root engine driver is attached but its IPC connection has been marked
+    /// dead (engine child exited / socket disconnected). This is the terminal
+    /// state #398 fixes: the dead driver fast-fails every request with
+    /// `IpcClosed` yet is never swapped out, so the node zombifies. The liveness
+    /// monitor polls this to trigger reconnect + re-attach; readiness reports it.
+    fn engine_driver_dead(&self) -> bool {
+        self.driver
+            .as_ref()
+            .is_some_and(AttachedEngineDriver::is_dead)
+    }
+
+    /// An engine driver is attached AND its IPC connection is still live. This is
+    /// the condition readiness cares about: a dead-but-attached driver is not a
+    /// serviceable engine.
+    fn engine_live(&self) -> bool {
+        self.driver.as_ref().is_some_and(|driver| !driver.is_dead())
     }
 
     pub fn adopt(&mut self, id: &TempodSessionId) -> Result<TempodSession, TempodError> {
@@ -2317,9 +2345,17 @@ pub fn run_tempod_with_attached_driver_config_and_navigation_url_policy(
     let config = config.with_bind_addr_host(addr);
     config.validate_bind_addr(addr)?;
     let listener = TcpListener::bind(addr)?;
+    let socket_path = socket_path.as_ref().to_path_buf();
     let mut pool = SessionPool::from_env().with_navigation_url_policy(url_policy);
-    pool.attach_engine_driver(engine, connect_engine_ipc(socket_path)?)?;
-    serve_forever_with_config(listener, Arc::new(Mutex::new(pool)), config)
+    pool.attach_engine_driver(engine, connect_engine_ipc(&socket_path)?)?;
+    let pool = Arc::new(Mutex::new(pool));
+    spawn_engine_liveness_monitor(
+        Arc::clone(&pool),
+        engine,
+        socket_path,
+        EngineReconnectPolicy::default(),
+    );
+    serve_forever_with_config(listener, pool, config)
 }
 
 /// Connect to the engine host UDS with a bounded write timeout. Read bounding
@@ -2330,6 +2366,234 @@ fn connect_engine_ipc(socket_path: impl AsRef<Path>) -> Result<EngineIpcClient, 
     let stream = std::os::unix::net::UnixStream::connect(socket_path)?;
     stream.set_write_timeout(Some(ENGINE_IPC_TIMEOUT))?;
     Ok(EngineIpcClient::from_stream(stream))
+}
+
+/// Reconnect behaviour for the engine-liveness monitor (#398).
+///
+/// tempod attaches to an engine over a UDS socket and, before this fix, never
+/// re-attached: when the engine child died the multiplexed IPC client marked
+/// itself dead and every request failed fast with `IpcClosed` forever, while the
+/// dead driver stayed in `pool.driver` (the teardown circuit breaker only fires
+/// on `None`/timeout, never on a prompt `Err`). The node zombified.
+///
+/// The monitor polls driver liveness and, on death, reconnects to the same
+/// socket and re-attaches with exponential backoff + jitter. `max_attempts`
+/// bounds churn so an engine that crashes on startup cannot hot-spin; a
+/// reconnected engine that stays live for `stable_window` resets the counter so
+/// a long-running node is never permanently capped by old, forgiven flaps.
+#[derive(Clone, Debug)]
+pub struct EngineReconnectPolicy {
+    /// How often the monitor samples driver liveness.
+    pub poll_interval: Duration,
+    /// Backoff before the first reconnect attempt of an episode.
+    pub base_backoff: Duration,
+    /// Upper bound on any single backoff (before jitter).
+    pub max_backoff: Duration,
+    /// Maximum reconnect attempts (failed reconnects + unstable restarts) before
+    /// giving up and leaving the engine detached (readiness then reports
+    /// `engine_detached` so an orchestrator sheds the node). `None` retries
+    /// forever with capped backoff.
+    pub max_attempts: Option<u32>,
+    /// Continuous liveness after a reconnect that resets the attempt counter.
+    pub stable_window: Duration,
+}
+
+impl Default for EngineReconnectPolicy {
+    fn default() -> Self {
+        // Bounded-restart is the production default (not "never re-attach").
+        Self {
+            poll_interval: Duration::from_millis(500),
+            base_backoff: Duration::from_millis(200),
+            max_backoff: Duration::from_secs(30),
+            max_attempts: Some(10),
+            stable_window: Duration::from_secs(60),
+        }
+    }
+}
+
+/// Deterministic exponential backoff for the `attempts`-th reconnect: `base <<
+/// attempts`, saturated and capped at `max_backoff`. The shift is clamped so a
+/// large attempt count cannot overflow the multiply.
+fn engine_reconnect_backoff(policy: &EngineReconnectPolicy, attempts: u32) -> Duration {
+    let shift = attempts.min(16);
+    policy
+        .base_backoff
+        .saturating_mul(1_u32 << shift)
+        .min(policy.max_backoff)
+}
+
+/// Add up to (but not including) half the backoff as jitter, capped at
+/// `max_backoff`, so many nodes reconnecting to the same restarted engine do not
+/// thunder in lockstep. Seeded from wall-clock nanos — the crate carries no RNG
+/// dependency and reconnect timing has no determinism contract, so this reuses
+/// the existing `current_time_ns` source rather than adding one (#398).
+fn jittered_backoff(backoff: Duration, max_backoff: Duration, seed: u128) -> Duration {
+    let span = backoff.as_nanos() / 2;
+    if span == 0 {
+        return backoff;
+    }
+    let extra = (seed % span) as u64;
+    backoff
+        .saturating_add(Duration::from_nanos(extra))
+        .min(max_backoff)
+}
+
+/// What the liveness monitor should do on one sample of driver state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReconnectAction {
+    /// Driver is live; nothing to do.
+    Idle,
+    /// Driver is dead; attempt a reconnect after `backoff` (jitter applied by
+    /// the caller so this stays a pure, testable decision).
+    Reconnect { backoff: Duration },
+    /// The attempt budget is exhausted; detach and stop reconnecting.
+    GiveUp,
+}
+
+/// Pure decision core of the liveness monitor, split out so backoff growth,
+/// the give-up bound, and the stable-uptime reset are unit-testable without
+/// sockets or sleeps.
+struct ReconnectController {
+    policy: EngineReconnectPolicy,
+    /// Reconnect attempts since the last stable window: failed reconnects and
+    /// successful-but-unstable restarts both count, so a crash loop is bounded.
+    attempts: u32,
+    /// When the currently-attached driver was last (re)attached, used to detect
+    /// a stable window has elapsed.
+    stable_since: Instant,
+}
+
+impl ReconnectController {
+    fn new(policy: EngineReconnectPolicy, now: Instant) -> Self {
+        Self {
+            policy,
+            attempts: 0,
+            stable_since: now,
+        }
+    }
+
+    /// Decide the action for one liveness sample.
+    fn on_sample(&mut self, driver_dead: bool, now: Instant) -> ReconnectAction {
+        if !driver_dead {
+            if self.attempts > 0
+                && now.saturating_duration_since(self.stable_since) >= self.policy.stable_window
+            {
+                // The engine has been live for a full stable window: forgive
+                // prior churn so old flaps never permanently cap a healthy node.
+                self.attempts = 0;
+                self.stable_since = now;
+            }
+            return ReconnectAction::Idle;
+        }
+        if self
+            .policy
+            .max_attempts
+            .is_some_and(|max| self.attempts >= max)
+        {
+            return ReconnectAction::GiveUp;
+        }
+        ReconnectAction::Reconnect {
+            backoff: engine_reconnect_backoff(&self.policy, self.attempts),
+        }
+    }
+
+    /// Record a successful reconnect: count it toward the churn budget (so a
+    /// hot crash loop is bounded) and restart the stable-uptime clock.
+    fn record_reconnect(&mut self, now: Instant) {
+        self.attempts = self.attempts.saturating_add(1);
+        self.stable_since = now;
+    }
+
+    /// Record a failed reconnect attempt; the next sample backs off further.
+    fn record_failure(&mut self) {
+        self.attempts = self.attempts.saturating_add(1);
+    }
+}
+
+/// Spawn the background engine-liveness monitor for the socket-attached serve
+/// path (#398). It runs for the life of the daemon on its own thread; the serve
+/// loop owns the main thread, so this is a detached daemon that dies with the
+/// process.
+fn spawn_engine_liveness_monitor(
+    pool: Arc<Mutex<SessionPool>>,
+    engine: Engine,
+    socket_path: PathBuf,
+    policy: EngineReconnectPolicy,
+) {
+    thread::spawn(move || run_engine_liveness_monitor(&pool, engine, &socket_path, policy));
+}
+
+/// The monitor loop: sample liveness every `poll_interval`, and on a dead driver
+/// reconnect + re-attach with backoff. Returns when the attempt budget is
+/// exhausted (driver left detached, readiness reports it) or the pool `Arc` is
+/// the last reference (daemon shutting down).
+fn run_engine_liveness_monitor(
+    pool: &Arc<Mutex<SessionPool>>,
+    engine: Engine,
+    socket_path: &Path,
+    policy: EngineReconnectPolicy,
+) {
+    let mut controller = ReconnectController::new(policy.clone(), Instant::now());
+    loop {
+        thread::sleep(policy.poll_interval);
+        // If the daemon has dropped its pool handle, only ours remains: stop.
+        if Arc::strong_count(pool) <= 1 {
+            return;
+        }
+        let dead = match pool.lock() {
+            Ok(guard) => guard.engine_driver_dead(),
+            Err(_) => return,
+        };
+        match controller.on_sample(dead, Instant::now()) {
+            ReconnectAction::Idle => {}
+            ReconnectAction::GiveUp => {
+                log_tempod_warn("engine reconnect budget exhausted; leaving engine detached")
+                    .field("issue", "#398")
+                    .field("attempts", controller.attempts.to_string())
+                    .emit();
+                if let Ok(mut guard) = pool.lock() {
+                    guard.detach_engine_driver();
+                }
+                return;
+            }
+            ReconnectAction::Reconnect { backoff } => {
+                let delay = jittered_backoff(backoff, policy.max_backoff, current_time_ns());
+                thread::sleep(delay);
+                match reconnect_engine(pool, engine, socket_path) {
+                    Ok(()) => {
+                        controller.record_reconnect(Instant::now());
+                        tempo_telemetry::logger()
+                            .event(
+                                tempo_telemetry::Level::Info,
+                                "tempod",
+                                "reconnected to engine after disconnect",
+                            )
+                            .field("issue", "#398")
+                            .field("attempts", controller.attempts.to_string())
+                            .emit();
+                    }
+                    Err(error) => {
+                        controller.record_failure();
+                        log_tempod_error("engine reconnect attempt failed", error);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Connect a fresh IPC client and re-attach it as the pool's root driver. The
+/// re-attach swaps in a live driver: `attach_engine_driver` first tears down the
+/// stale (dead) driver and its forks, then installs the new client, so in-flight
+/// sessions holding a clone of the old dead driver still fast-fail while new
+/// operations resolve `pool.driver` to the live client.
+fn reconnect_engine(
+    pool: &Arc<Mutex<SessionPool>>,
+    engine: Engine,
+    socket_path: &Path,
+) -> Result<(), TempodError> {
+    let client = connect_engine_ipc(socket_path)?;
+    lock_pool(pool)?.attach_engine_driver(engine, client)
 }
 
 /// Connection caps from issue #295, mapped onto tokio semaphores: `try_acquire`
@@ -2972,6 +3236,11 @@ fn readiness_response(pool: &SessionPool) -> HttpResponse {
     }
     if !pool.engine_attached() {
         reasons.push("engine_detached");
+    } else if !pool.engine_live() {
+        // Attached but the IPC connection is dead (engine child exited): the node
+        // cannot service engine-backed work until the liveness monitor reconnects
+        // (#398). Surface it so an orchestrator's readiness probe sheds this node.
+        reasons.push("engine_dead");
     }
     if pool.session_limit_reached() {
         reasons.push("session_limit_reached");
@@ -2984,6 +3253,7 @@ fn readiness_response(pool: &SessionPool) -> HttpResponse {
             "ready": ready,
             "draining": pool.draining(),
             "engine_attached": pool.engine_attached(),
+            "engine_live": pool.engine_live(),
             "sessions": pool.active_session_count(),
             "max_sessions": pool.max_sessions,
             "reasons": reasons,
@@ -9417,6 +9687,245 @@ mod tests {
         assert!(restarted);
         assert_ne!(first_pid, second_pid);
         supervisor.kill("engine-a")?;
+        Ok(())
+    }
+
+    // ---- Issue #398: engine restart + re-attach with backoff ----
+
+    #[test]
+    fn engine_reconnect_backoff_grows_and_caps() {
+        let policy = EngineReconnectPolicy {
+            poll_interval: Duration::from_millis(1),
+            base_backoff: Duration::from_millis(100),
+            max_backoff: Duration::from_millis(800),
+            max_attempts: Some(5),
+            stable_window: Duration::from_secs(10),
+        };
+        assert_eq!(
+            engine_reconnect_backoff(&policy, 0),
+            Duration::from_millis(100)
+        );
+        assert_eq!(
+            engine_reconnect_backoff(&policy, 1),
+            Duration::from_millis(200)
+        );
+        assert_eq!(
+            engine_reconnect_backoff(&policy, 2),
+            Duration::from_millis(400)
+        );
+        assert_eq!(
+            engine_reconnect_backoff(&policy, 3),
+            Duration::from_millis(800)
+        );
+        // Capped at max_backoff, and a large attempt count cannot overflow.
+        assert_eq!(
+            engine_reconnect_backoff(&policy, 4),
+            Duration::from_millis(800)
+        );
+        assert_eq!(
+            engine_reconnect_backoff(&policy, 100),
+            Duration::from_millis(800)
+        );
+    }
+
+    #[test]
+    fn jittered_backoff_stays_within_half_and_caps_at_max() {
+        let base = Duration::from_millis(200);
+        let max = Duration::from_secs(30);
+        for seed in [0_u128, 1, 99, 12_345, u128::MAX / 3] {
+            let jittered = jittered_backoff(base, max, seed);
+            assert!(jittered >= base, "jitter dipped below base: {jittered:?}");
+            assert!(
+                jittered < base + base / 2,
+                "jitter exceeded half the backoff: {jittered:?}"
+            );
+        }
+        // A backoff already above max is clamped regardless of jitter.
+        assert_eq!(
+            jittered_backoff(Duration::from_secs(40), Duration::from_secs(30), 7),
+            Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn reconnect_controller_backs_off_then_gives_up_at_budget() {
+        let policy = EngineReconnectPolicy {
+            poll_interval: Duration::from_millis(1),
+            base_backoff: Duration::from_millis(100),
+            max_backoff: Duration::from_secs(10),
+            max_attempts: Some(3),
+            stable_window: Duration::from_secs(60),
+        };
+        let now = Instant::now();
+        let mut controller = ReconnectController::new(policy, now);
+
+        // Live driver: no action.
+        assert_eq!(controller.on_sample(false, now), ReconnectAction::Idle);
+
+        // Each failed reconnect grows the backoff.
+        assert_eq!(
+            controller.on_sample(true, now),
+            ReconnectAction::Reconnect {
+                backoff: Duration::from_millis(100)
+            }
+        );
+        controller.record_failure();
+        assert_eq!(
+            controller.on_sample(true, now),
+            ReconnectAction::Reconnect {
+                backoff: Duration::from_millis(200)
+            }
+        );
+        controller.record_failure();
+        assert_eq!(
+            controller.on_sample(true, now),
+            ReconnectAction::Reconnect {
+                backoff: Duration::from_millis(400)
+            }
+        );
+        controller.record_failure();
+        // Budget (3) exhausted: give up rather than hot-spin forever.
+        assert_eq!(controller.on_sample(true, now), ReconnectAction::GiveUp);
+    }
+
+    #[test]
+    fn reconnect_controller_resets_after_stable_window() {
+        let policy = EngineReconnectPolicy {
+            poll_interval: Duration::from_millis(1),
+            base_backoff: Duration::from_millis(100),
+            max_backoff: Duration::from_secs(10),
+            max_attempts: Some(3),
+            stable_window: Duration::from_secs(60),
+        };
+        let start = Instant::now();
+        let mut controller = ReconnectController::new(policy, start);
+
+        // Two restarts accrue churn.
+        controller.record_reconnect(start);
+        controller.record_reconnect(start);
+        assert_eq!(controller.attempts, 2);
+
+        // Brief liveness (< stable_window) does not forgive the churn.
+        let soon = start + Duration::from_secs(1);
+        assert_eq!(controller.on_sample(false, soon), ReconnectAction::Idle);
+        assert_eq!(controller.attempts, 2);
+
+        // A full stable window of continuous liveness resets the counter.
+        let stable = start + Duration::from_secs(61);
+        assert_eq!(controller.on_sample(false, stable), ReconnectAction::Idle);
+        assert_eq!(controller.attempts, 0);
+
+        // A later death backs off from base again, not from the forgiven count.
+        assert_eq!(
+            controller.on_sample(true, stable),
+            ReconnectAction::Reconnect {
+                backoff: Duration::from_millis(100)
+            }
+        );
+    }
+
+    /// End-to-end recovery: a simulated engine-child death marks the driver dead
+    /// (so readiness reports it), and a reconnect + re-attach swaps in a live
+    /// driver so operations succeed again instead of returning `IpcClosed`
+    /// forever (#398).
+    #[test]
+    fn engine_liveness_reconnect_recovers_after_engine_death() -> TestResult {
+        use std::os::unix::net::UnixListener;
+
+        let dir = std::env::temp_dir().join(format!("tempo-398-{}", current_time_ns()));
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("engine.sock");
+
+        let server_path = path.clone();
+        let engine = thread::spawn(move || -> Result<(), Box<dyn Error + Send + Sync>> {
+            let listener = UnixListener::bind(&server_path)?;
+            // Connection 1: answer exactly one Observe, then drop the socket
+            // (the engine child "dies").
+            let (stream, _) = listener.accept()?;
+            {
+                let mut conn = EngineIpcConnection::from_stream(stream);
+                let request = conn.read_driver_request()?;
+                conn.write_driver_response(
+                    request.id,
+                    DriverResponse::Observation {
+                        observation: observation("https://before.test", 1),
+                    },
+                )?;
+            }
+            // Connection 2 (the reconnect): answer one Observe and stay up.
+            let (stream, _) = listener.accept()?;
+            let mut conn = EngineIpcConnection::from_stream(stream);
+            let request = conn.read_driver_request()?;
+            conn.write_driver_response(
+                request.id,
+                DriverResponse::Observation {
+                    observation: observation("https://after.test", 2),
+                },
+            )?;
+            Ok(())
+        });
+
+        // Wait for the listener to bind, then attach.
+        let mut client = None;
+        for _ in 0..500 {
+            match connect_engine_ipc(&path) {
+                Ok(connected) => {
+                    client = Some(connected);
+                    break;
+                }
+                Err(_) => thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        let client = client.ok_or("engine socket never became connectable")?;
+        let pool = Arc::new(Mutex::new(SessionPool::default()));
+        lock_pool(&pool)?.attach_engine_driver(Engine::Cdp, client)?;
+
+        // Pre-death op succeeds on connection 1.
+        let driver = lock_pool(&pool)?
+            .driver
+            .clone()
+            .ok_or("driver missing after attach")?;
+        assert!(matches!(
+            driver.request(HostDriverCommand::Observe)?,
+            DriverResponse::Observation { .. }
+        ));
+
+        // The engine dropped connection 1: the driver's reader marks it dead.
+        let mut dead = false;
+        for _ in 0..500 {
+            if lock_pool(&pool)?.engine_driver_dead() {
+                dead = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(dead, "driver never observed the engine death");
+        assert!(!lock_pool(&pool)?.engine_live());
+        // The stale driver clone fast-fails (in-flight sessions see IpcClosed
+        // until the pool re-attaches a fresh driver).
+        assert!(driver.request(HostDriverCommand::Observe).is_err());
+
+        // Reconnect + re-attach installs a live driver.
+        reconnect_engine(&pool, Engine::Cdp, &path)?;
+        assert!(lock_pool(&pool)?.engine_live());
+        assert!(!lock_pool(&pool)?.engine_driver_dead());
+
+        // A fresh op resolves the live driver and succeeds on connection 2 —
+        // recovered, not IpcClosed forever.
+        let driver = lock_pool(&pool)?
+            .driver
+            .clone()
+            .ok_or("driver missing after reconnect")?;
+        assert!(matches!(
+            driver.request(HostDriverCommand::Observe)?,
+            DriverResponse::Observation { .. }
+        ));
+
+        engine
+            .join()
+            .map_err(|_| "engine thread panicked")?
+            .map_err(|error| error.to_string())?;
+        let _ = std::fs::remove_dir_all(&dir);
         Ok(())
     }
 

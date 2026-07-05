@@ -829,6 +829,20 @@ impl SharedEngineIpcClient {
             pending.waiters.remove(&id);
         }
     }
+
+    /// Whether the reader thread has observed a fatal disconnect and marked the
+    /// connection dead. Once dead, every [`Self::request_for`] fails fast with
+    /// [`EngineHostError::IpcClosed`] rather than blocking on a stream that will
+    /// never answer, so a liveness monitor can use this to trigger reconnect +
+    /// re-attach instead of leaving the engine terminally wedged (#398). A
+    /// poisoned lock is reported as dead: the connection is unusable either way.
+    pub fn is_dead(&self) -> bool {
+        self.inner
+            .pending
+            .lock()
+            .map(|pending| pending.dead.is_some())
+            .unwrap_or(true)
+    }
 }
 
 impl std::fmt::Debug for SharedEngineIpcClient {
