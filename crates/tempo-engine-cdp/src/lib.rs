@@ -102,6 +102,10 @@ const CDP_CHILD_TARGET_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 /// IPC timeout) while still letting slow-but-loading pages finish — the
 /// values are derived from the caller's bound, not from test tuning.
 const TIMED_OUT_NAVIGATION_RECOVERY_TIMEOUT: Duration = Duration::from_secs(20);
+/// Child-context navigation has extra target setup, Fetch policy install, and
+/// cleanup work inside the same tempod IPC call. Keep its recovery window below
+/// the root lane so the worst-case failure path still has cleanup margin.
+const CHILD_TIMED_OUT_NAVIGATION_RECOVERY_TIMEOUT: Duration = Duration::from_secs(17);
 const TIMED_OUT_NAVIGATION_RECOVERY_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Explicit opt-out for Chromium sandboxing in constrained CI/container setups.
@@ -659,7 +663,7 @@ impl CdpTempoDriver {
                 .recover_timed_out_navigation_since_with_timeout(
                     cursor,
                     url,
-                    TIMED_OUT_NAVIGATION_RECOVERY_TIMEOUT,
+                    CHILD_TIMED_OUT_NAVIGATION_RECOVERY_TIMEOUT,
                 )
                 .await
                 .err(),
@@ -705,9 +709,13 @@ impl CdpTempoDriver {
         let Some(context_id) = self.browser_context_id.clone() else {
             return;
         };
+        let deadline = Instant::now() + CDP_CHILD_TARGET_CLEANUP_TIMEOUT;
         let current_target = self.page.as_ref().map(|page| page.target_id().clone());
         let Ok(Ok(targets)) = tokio::time::timeout(
-            CDP_CHILD_TARGET_CLEANUP_TIMEOUT,
+            match remaining_until(deadline) {
+                Ok(remaining) => remaining,
+                Err(_) => return,
+            },
             self.browser.fetch_targets(),
         )
         .await
@@ -721,8 +729,11 @@ impl CdpTempoDriver {
             if Some(&target.target_id) == current_target.as_ref() {
                 continue;
             }
+            let Ok(remaining) = remaining_until(deadline) else {
+                return;
+            };
             let _ = tokio::time::timeout(
-                CDP_CHILD_TARGET_CLEANUP_TIMEOUT,
+                remaining,
                 self.browser
                     .execute(CloseTargetParams::new(target.target_id.clone())),
             )
@@ -3496,9 +3507,10 @@ mod tests {
             CDP_CHILD_TARGET_SETUP_TIMEOUT
                 + CDP_CHILD_TARGET_SETUP_TIMEOUT
                 + CDP_NAVIGATION_AWAIT_TIMEOUT
-                + TIMED_OUT_NAVIGATION_RECOVERY_TIMEOUT
+                + CHILD_TIMED_OUT_NAVIGATION_RECOVERY_TIMEOUT
+                + CDP_CHILD_TARGET_CLEANUP_TIMEOUT
                 < TEMPOD_ENGINE_IPC_TIMEOUT,
-            "child create + policy install + navigation recovery must stay under the 30s engine IPC bound"
+            "child create + policy install + navigation recovery + cleanup must stay under the 30s engine IPC bound"
         );
         assert!(
             CDP_CHILD_TARGET_CLEANUP_TIMEOUT < TEMPOD_ENGINE_IPC_TIMEOUT,
