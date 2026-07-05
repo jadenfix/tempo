@@ -5077,7 +5077,10 @@ mod tests {
             self.inner.fork().await
         }
 
-        async fn extract(&mut self, node: &NodeId) -> Result<serde_json::Value, TransportError> {
+        async fn extract(
+            &mut self,
+            node: &NodeId,
+        ) -> Result<tempo_driver::TaintedValue, TransportError> {
             self.inner.extract(node).await
         }
 
@@ -5085,7 +5088,7 @@ mod tests {
             &mut self,
             expression: &str,
             await_promise: bool,
-        ) -> Result<serde_json::Value, TransportError> {
+        ) -> Result<tempo_driver::TaintedValue, TransportError> {
             self.inner.evaluate_script(expression, await_promise).await
         }
 

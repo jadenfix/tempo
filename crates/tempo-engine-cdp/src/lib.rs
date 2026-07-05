@@ -36,8 +36,8 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tempo_driver::{
-    BrowsingContextCreateOptions, DriverTrait, Engine, StepOutcome, TransportError, Unsupported,
-    MAX_SCREENSHOT_BYTES, MAX_SCREENSHOT_HEIGHT, MAX_SCREENSHOT_WIDTH,
+    BrowsingContextCreateOptions, DriverTrait, Engine, StepOutcome, TaintedValue, TransportError,
+    Unsupported, MAX_SCREENSHOT_BYTES, MAX_SCREENSHOT_HEIGHT, MAX_SCREENSHOT_WIDTH,
 };
 use tempo_net::UrlPolicy;
 use tempo_observe::{finalize_observation, CompileOptions, RawElement, StableIdMapper};
@@ -1283,33 +1283,39 @@ impl DriverTrait for CdpTempoDriver {
         }))
     }
 
-    async fn extract(&mut self, node: &NodeId) -> Result<serde_json::Value, TransportError> {
+    async fn extract(&mut self, node: &NodeId) -> Result<TaintedValue, TransportError> {
         let Some(selector) = self.selector_for_node(node) else {
             let Some(refreshed) = self.refresh_selector_for_node(node).await? else {
-                return Ok(node_not_found_extraction(node));
+                return Ok(TaintedValue::page(node_not_found_extraction(node)));
             };
-            return self.extract_with_selector(&refreshed).await;
+            return self
+                .extract_with_selector(&refreshed)
+                .await
+                .map(TaintedValue::page);
         };
 
         let extracted = self.extract_with_selector(&selector).await?;
         if extraction_found(&extracted) {
-            return Ok(extracted);
+            return Ok(TaintedValue::page(extracted));
         }
 
         if let Some(refreshed) = self.refresh_selector_for_node(node).await?
             && refreshed != selector
         {
-            return self.extract_with_selector(&refreshed).await;
+            return self
+                .extract_with_selector(&refreshed)
+                .await
+                .map(TaintedValue::page);
         }
 
-        Ok(extracted)
+        Ok(TaintedValue::page(extracted))
     }
 
     async fn evaluate_script(
         &mut self,
         expression: &str,
         await_promise: bool,
-    ) -> Result<serde_json::Value, TransportError> {
+    ) -> Result<TaintedValue, TransportError> {
         let params = EvaluateParams::builder()
             .expression(expression)
             .return_by_value(true)
@@ -1321,9 +1327,10 @@ impl DriverTrait for CdpTempoDriver {
         let evaluate_result = self.page()?.evaluate(params).await;
         let remote_object = self.map_cdp_result_since(cursor, evaluate_result).await?;
         self.enforce_no_blocked_request_soon_since(cursor).await?;
-        remote_object
+        let value = remote_object
             .into_value::<serde_json::Value>()
-            .map_err(|error| TransportError::Other(error.to_string()))
+            .map_err(|error| TransportError::Other(error.to_string()))?;
+        Ok(TaintedValue::page(value))
     }
 
     async fn screenshot(&mut self) -> Result<Vec<u8>, TransportError> {

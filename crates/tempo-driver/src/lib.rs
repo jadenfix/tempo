@@ -10,9 +10,10 @@
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::ops::Deref;
 #[cfg(any(test, feature = "test-driver"))]
 use tempo_net::UrlPolicy;
-use tempo_schema::{Action, ActionBatch, CompiledObservation, NodeId, ObservationDiff};
+use tempo_schema::{Action, ActionBatch, CompiledObservation, NodeId, ObservationDiff, Provenance};
 use thiserror::Error;
 
 const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
@@ -29,6 +30,51 @@ pub const MAX_PROTOCOL_RESPONSE_BYTES: usize = 6 * 1024 * 1024;
 
 pub fn output_cap_message(artifact: &str, bytes: usize, max_bytes: usize) -> String {
     format!("{artifact} exceeded output cap: {bytes} bytes > {max_bytes} bytes")
+}
+
+/// Page-data payload returned by driver primitives that read DOM/script content.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TaintedValue {
+    pub value: serde_json::Value,
+    pub provenance: Provenance,
+}
+
+impl TaintedValue {
+    pub fn new(value: serde_json::Value, provenance: Provenance) -> Self {
+        Self { value, provenance }
+    }
+
+    pub fn page(value: serde_json::Value) -> Self {
+        Self::new(value, Provenance::Page)
+    }
+
+    pub const fn is_page_derived(&self) -> bool {
+        matches!(self.provenance, Provenance::Page)
+    }
+
+    pub fn into_value(self) -> serde_json::Value {
+        self.value
+    }
+}
+
+impl Deref for TaintedValue {
+    type Target = serde_json::Value;
+
+    fn deref(&self) -> &Self::Target {
+        &self.value
+    }
+}
+
+impl PartialEq<serde_json::Value> for TaintedValue {
+    fn eq(&self, other: &serde_json::Value) -> bool {
+        self.value == *other
+    }
+}
+
+impl PartialEq<TaintedValue> for serde_json::Value {
+    fn eq(&self, other: &TaintedValue) -> bool {
+        *self == other.value
+    }
 }
 
 /// Transport / backend failures: crashed engine, navigation timeout, SSRF block.
@@ -126,14 +172,14 @@ pub trait DriverTrait: Send + Sync {
     }
 
     /// Typed extraction of a subtree rooted at `node`.
-    async fn extract(&mut self, node: &NodeId) -> Result<serde_json::Value, TransportError>;
+    async fn extract(&mut self, node: &NodeId) -> Result<TaintedValue, TransportError>;
 
     /// Evaluate a JavaScript expression in the active browsing context.
     async fn evaluate_script(
         &mut self,
         expression: &str,
         await_promise: bool,
-    ) -> Result<serde_json::Value, TransportError>;
+    ) -> Result<TaintedValue, TransportError>;
 
     async fn screenshot(&mut self) -> Result<Vec<u8>, TransportError>;
 
@@ -323,22 +369,22 @@ impl DriverTrait for TestDriver {
         }))
     }
 
-    async fn extract(&mut self, node: &NodeId) -> Result<serde_json::Value, TransportError> {
+    async fn extract(&mut self, node: &NodeId) -> Result<TaintedValue, TransportError> {
         if !self.has_node(node) {
-            return Ok(serde_json::Value::Null);
+            return Ok(TaintedValue::page(serde_json::Value::Null));
         }
-        Ok(serde_json::json!({ "node": node.0 }))
+        Ok(TaintedValue::page(serde_json::json!({ "node": node.0 })))
     }
 
     async fn evaluate_script(
         &mut self,
         expression: &str,
         await_promise: bool,
-    ) -> Result<serde_json::Value, TransportError> {
-        Ok(serde_json::json!({
+    ) -> Result<TaintedValue, TransportError> {
+        Ok(TaintedValue::page(serde_json::json!({
             "expression": expression,
             "awaitPromise": await_promise,
-        }))
+        })))
     }
 
     async fn screenshot(&mut self) -> Result<Vec<u8>, TransportError> {
@@ -455,6 +501,9 @@ pub mod conformance {
         if evaluated.is_null() {
             return Err("evaluate_script returned null".into());
         }
+        if !evaluated.is_page_derived() {
+            return Err("evaluate_script returned unlabeled page data".into());
+        }
 
         // 5. Typed extraction must work for at least one grounded node on the
         // fixture page. Engines should pass an explicit node when their fixture
@@ -470,6 +519,9 @@ pub mod conformance {
             .map_err(|e| format!("extract failed: {e}"))?;
         if extracted.is_null() || extracted.get("found") == Some(&serde_json::Value::Bool(false)) {
             return Err("extract did not return a grounded value".into());
+        }
+        if !extracted.is_page_derived() {
+            return Err("extract returned unlabeled page data".into());
         }
 
         // 6. Successful batched actions must apply as a unit and return a normal
@@ -723,7 +775,7 @@ mod tests {
             Err(Unsupported("native fork intentionally unsupported"))
         }
 
-        async fn extract(&mut self, node: &NodeId) -> Result<serde_json::Value, TransportError> {
+        async fn extract(&mut self, node: &NodeId) -> Result<TaintedValue, TransportError> {
             self.0.extract(node).await
         }
 
@@ -731,7 +783,7 @@ mod tests {
             &mut self,
             expression: &str,
             await_promise: bool,
-        ) -> Result<serde_json::Value, TransportError> {
+        ) -> Result<TaintedValue, TransportError> {
             self.0.evaluate_script(expression, await_promise).await
         }
 
