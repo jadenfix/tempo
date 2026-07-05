@@ -586,4 +586,51 @@ mod tests {
         );
         assert_eq!(detect_human_takeover(&o), None);
     }
+
+    // ---- #402: cases the live-CDP extractor previously made invisible ----
+
+    /// Build an element carrying a value span (e.g. an iframe's `src` origin), as
+    /// the CDP extractor now emits for carried non-interactive frame nodes.
+    fn element_with_value(role: &str, name: &str, value: &str) -> InteractiveElement {
+        let mut e = element(role, name);
+        e.value = vec![TaintSpan {
+            provenance: Provenance::Page,
+            text: value.into(),
+        }];
+        e
+    }
+
+    #[test]
+    fn carried_forbidden_heading_and_signin_link_fire_auth_wall() -> Result<(), String> {
+        // Shape now produced by the live CDP extractor for a 403 page: a carried
+        // (non-interactive) heading plus the interactive sign-in link. Before #402
+        // the heading was filtered out and this could never fire.
+        let o = obs(
+            "https://api.example/private",
+            vec![
+                element("heading", "403 Forbidden"),
+                element("link", "Sign in"),
+            ],
+        );
+        assert!(is_wall_role("heading"));
+        assert_eq!(detect_kind(&o)?, TakeoverKind::AuthWall);
+        Ok(())
+    }
+
+    #[test]
+    fn carried_recaptcha_iframe_by_src_origin_fires_captcha() -> Result<(), String> {
+        // A reCAPTCHA iframe with no title: the vendor token only appears in the
+        // carried `src` origin. The detector must still recognise the widget.
+        let o = obs(
+            "https://shop.example/checkout",
+            vec![element_with_value(
+                "iframe",
+                "",
+                "https://www.google.com/recaptcha/api2/anchor?k=abc",
+            )],
+        );
+        assert!(is_embedding_role("iframe"));
+        assert_eq!(detect_kind(&o)?, TakeoverKind::Captcha);
+        Ok(())
+    }
 }
