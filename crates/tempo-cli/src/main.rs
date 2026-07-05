@@ -64,6 +64,8 @@ Commands:
             [--confirmation-mode deny|auto-clean|auto-all]
 ";
 
+const USAGE_HINT: &str = "Run with --help for usage.";
+
 fn main() -> ExitCode {
     let mut stdout = io::stdout().lock();
     let mut stderr = io::stderr().lock();
@@ -175,7 +177,7 @@ impl Command {
             "replay" => parse_replay(options),
             "run-cdp-task" => parse_run_cdp_task(options),
             other => Err(CliError::Usage(format!(
-                "unknown command: {other}\n\n{USAGE}"
+                "unknown command: {other}\n{USAGE_HINT}"
             ))),
         }
     }
@@ -659,7 +661,7 @@ fn required_value<T>(flag: &'static str, value: Option<T>) -> Result<T, CliError
 }
 
 fn unknown_flag(flag: &str) -> CliError {
-    CliError::Usage(format!("unknown flag: {flag}\n\n{USAGE}"))
+    CliError::Usage(format!("unknown flag: {flag}\n{USAGE_HINT}"))
 }
 
 fn parse_bool(flag: &'static str, value: String) -> Result<bool, CliError> {
@@ -2077,7 +2079,11 @@ mod tests {
         let result = run_with_writer(["schema", "--bad"], &mut Vec::new());
 
         match result {
-            Err(CliError::Usage(message)) => assert!(message.contains("unknown flag")),
+            Err(CliError::Usage(message)) => {
+                assert!(message.contains("unknown flag"));
+                assert!(message.contains("--help"));
+                assert!(!message.contains("Commands:"));
+            }
             other => return Err(unexpected_result(other)),
         }
         Ok(())
