@@ -2,7 +2,9 @@
 
 > **This is a design document, not a roadmap.** It describes *what tempo is*, *how its pieces fit*, *what depends on what*, and *how we know each piece is done* — so a 10-person org can work in parallel. There are no dates. **§5** is the dependency graph (cross-team edges + intra-workstream sequential-vs-parallel ordering + the single load-bearing spine); **§6** is the beatbox sandbox integration; **§8** is the Definition of Done (per-crate acceptance bars + milestone gates with required evidence).
 
-Engine strategy is **Rust-first**: [Servo](https://servo.org) is the primary rendering engine; a headless-Chromium lane (via CDP) is a per-origin **fallback** behind the same driver trait, never the default. tempo reuses the existing **beater** stack heavily (`~/Desktop/beater`) — the browser-automation crates, the durable agent loop, the discovery/handshake surfaces, and the polyglot sandbox.
+> **Current implementation status (2026-07-05).** The shippable preview is local CDP: `tempod` defaults to `engine=cdp`, auto-starts a sibling `tempo-engined-cdp` binary when no `--engine-socket` is supplied, and serves loopback HTTP/MCP/BiDi with bearer auth. A pre-started engine can still be attached with `--engine cdp --engine-socket PATH`. The native Servo `tempo-engined` binary, production remote/fleet posture, Windows-native IPC, and taint-to-beatbox live dispatch are not shipped preview guarantees.
+
+Engine strategy is **CDP-first for the current developer preview, Servo-promotable by evidence**: the runnable lane is headless Chromium via CDP behind the same driver trait; [Servo](https://servo.org) is the Rust-native target lane that promotes after the M-vanilla/M4 gates pass. tempo reuses the existing **beater** stack heavily (`~/Desktop/beater`) — the browser-automation crates, the durable agent loop, the discovery/handshake surfaces, and the polyglot sandbox.
 
 ---
 
@@ -14,7 +16,7 @@ tempo is built on the opposite premise: **the browser should hand the agent stru
 
 - **The browser agents default to.** Any agent — Claude Code, beater agents, or a third party over MCP / WebDriver BiDi — opens a tempo session and gets: a compiled observation (ranked interactive elements with stable node IDs, ~2–5KB instead of a 40–500K-token DOM dump), semantic actions on those IDs, batched execution with a real *page-is-settled* signal, and forkable page state for speculative exploration. Target: **10–50× lower token cost and materially lower wall-clock latency** than the screenshot loop.
 - **The browser humans keep.** An Arc-quality windowed shell where **human and agent share one session**. Watch the agent drive in real time, grab the wheel for a login or a captcha, hand it back. Not a chatbot bolted onto Chrome — a browser where the agent is a first-class occupant of the same tab you're looking at.
-- **A node on the agentic web.** tempo natively probes and speaks the emerging machine-web (WebMCP `navigator.modelContext`, agent-card, `llms.txt`, OpenAPI — the client side of beater-connect), cryptographically signs its own traffic (Web Bot Auth / RFC 9421, already enforced at Cloudflare's edge), and exposes a fleet/remote control plane so tempo instances are **manageable infrastructure**, not desktop apps. This is the section-6 "next era."
+- **A node on the agentic web.** The destination architecture probes and speaks the emerging machine-web (WebMCP `navigator.modelContext`, agent-card, `llms.txt`, OpenAPI — the client side of beater-connect), cryptographically signs selected traffic (Web Bot Auth / RFC 9421), and exposes a fleet/remote control plane so tempo instances become **manageable infrastructure**, not desktop apps. The local CDP preview ships only the local daemon path; this is the section-7 roadmap.
 
 ### The core loop we are replacing
 
@@ -47,7 +49,7 @@ What an agent needs from a browser that Chrome, Firefox, and Arc were never buil
 7. **A hard trust boundary.** Page content is *data*, never *instructions* — the lesson of every Comet/Atlas injection. → **taint labels** on every observation span (page-derived / system / user), carried end-to-end into the prompt serializer, plus a **side-effect policy gate**.
 8. **Agent identity on the wire.** The web is deploying cryptographic bot verification right now. → Web Bot Auth HTTP message signatures built into the network layer; dual-mode (agent-declared vs user-driven) per origin.
 9. **The structured-web fast path.** If a site exposes agent tools/APIs, rendering it is wasted work. → probe `.well-known/beater.json`, agent-card, `llms.txt`, OpenAPI, and WebMCP *before* rendering; when present, **skip pixels entirely** and call tools.
-10. **Parallelism & remote management.** Agents run many sessions, often on remote fleets. → headless-first daemon, session pool, per-session ephemeral profiles, portable journals, OTLP observability.
+10. **Parallelism & remote management.** Agents run many sessions, often on remote fleets. → headless-first daemon, session pool, per-session ephemeral profiles, portable journals, OTLP observability. Remote/fleet operation is gated beyond the local CDP preview.
 
 ---
 
@@ -73,11 +75,11 @@ What an agent needs from a browser that Chrome, Firefox, and Arc were never buil
                         └────────┬─────────────────────────────────────┬─────────────────────┘
                                  │ DriverTrait v2 over UDS              │ DriverTrait v2
                  ┌───────────────▼───────────────┐      ┌──────────────▼──────────────┐
-                 │ tempo-engined (N per host)    │      │ tempo-engine-cdp (fallback) │
+                 │ tempo-engined (Servo target)  │      │ tempo-engined-cdp (preview) │
                  │ libservo WebViews + delegate  │      │ beater-browser-cdp /        │
                  │ tempo-observe core: stable-ID │      │ chromiumoxide → headless    │
-                 │ mapper, ranker, diff engine,  │      │ Chrome; per-origin auto-    │
-                 │ set-of-marks compositor       │      │ fallback from compat table  │
+                 │ mapper, ranker, diff engine,  │      │ Chrome; local CDP default   │
+                 │ set-of-marks compositor       │      │ until Servo gates promote   │
                  └───────────────┬───────────────┘      └─────────────────────────────┘
                                  │ all engine HTTP(S) intercepted (Servo load_web_resource)
                  ┌───────────────▼───────────────────────────────────────────────────┐
@@ -98,7 +100,7 @@ Layer → crate → responsibility (beater reuse in italics).
 **L1 — Engines**
 - `tempo-engine-servo` — libservo embedding: `WebViewBuilder` + our `WebViewDelegate`, offscreen `RenderingContext`, `take_screenshot`, `evaluate_javascript`, `notify_input_event`, `load_web_resource` → tempo-net, AccessKit stream intake. Cargo features `servo-vanilla` (pinned upstream) vs `servo-tempo` (our fork branch APIs).
 - `tempo-engine-host` — out-of-proc engine host: driver wire protocol over UDS, crash isolation, N webviews/process. Hosts the observation-compiler core **engine-side** so only compiled diffs cross the process boundary. Verso's process split is the reference. The runnable host **shipped today** is the CDP-backed `tempo-engined-cdp` binary (in `tempo-engine-cdp`), which serves the CDP driver over the daemon's engine UDS (#397); the servo-hosted native `tempo-engined` is the WS2 target (see §3.3, below), not yet built.
-- `tempo-engine-cdp` — the compat fallback lane: adapts *`beater-browser-cdp`* (chromiumoxide, headless Chrome, no Node) to DriverTrait v2; diff via injected MutationObserver; AX via CDP `Accessibility.getFullAXTree`; `fork()` returns `Unsupported` (replay-fork handled above the trait).
+- `tempo-engine-cdp` — the current preview lane: adapts *`beater-browser-cdp`* (chromiumoxide, headless Chrome, no Node) to DriverTrait v2 and ships the `tempo-engined-cdp` process that `tempod` auto-starts locally; diff via injected MutationObserver; AX via CDP `Accessibility.getFullAXTree`; `fork()` returns `Unsupported` (replay-fork handled above the trait).
 
 **L2 — Observation plane**
 - `tempo-observe` — the **observation compiler**: stable-ID mapper (AccessKit ID ↔ DOM fingerprint ↔ our NodeId, survives mutation), interactive-element ranker, diff engine (changed subtrees only), set-of-marks overlay compositor (numbered boxes over the screenshot), token budgeter targeting 2–5KB.
@@ -197,7 +199,7 @@ These are the *only* global synchronization points. Freeze them and 7 of 10 engi
 |---|---|---|---|
 | **WS1** Contracts & Test Driver | tempo-schema, tempo-driver, TestDriver, conformance v2 | E1 | nothing — this *is* C1–C3 |
 | **WS2** Servo engine host | tempo-engine-servo + tempo-engine-host; E3 = upstream-patch liaison | E2, E3 | libservo directly (milestone **M-vanilla** = goto/screenshot/input/js-eval over IPC) |
-| **WS3** CDP fallback lane | tempo-engine-cdp over beater-browser-cdp | E4 | beater-browser-cdp today; draft C3 |
+| **WS3** CDP preview lane | tempo-engine-cdp over beater-browser-cdp | E4 | beater-browser-cdp today; draft C3 |
 | **WS4** Observation compiler + taint | tempo-observe, tempo-taint | E1(later), E5 | TestDriver **+ recorded AccessKit fixtures captured from servoshell** — zero dependence on WS2's schedule |
 | **WS5** Action / quiescence / policy | tempo-act, tempo-policy | E6 | TestDriver + CDP lane immediately |
 | **WS6** Net + fast path | tempo-net (Web Bot Auth, profiles), tempo-handshake | E7 | pure network code; only interceptor *wiring* waits on WS2 |
@@ -262,7 +264,16 @@ Everything not on that chain is parallel. The project's schedule risk is therefo
 
 ## 6. beatbox integration — the sandbox tier
 
-tempo does not execute untrusted or agent-authored code in its own address space. Everything that is *not* a browser observation/action is routed to **beatbox** (`~/Desktop/beater/beatbox`), the polyglot sandbox daemon (`beatboxd`, HTTP `/v1/execute` + `/v1/jobs`, client at `beatbox-client`). `tempo-toolexec` is a thin async wrapper over `beatbox_core::Client`. This is not a nice-to-have — it is how tempo makes prompt-injection **structurally** unable to exfiltrate, not merely policy-gated.
+Target architecture: tempo must not execute untrusted or agent-authored code in
+its own address space. Everything that is *not* a browser observation/action is
+routed to **beatbox** (`~/Desktop/beater/beatbox`), the polyglot sandbox daemon
+(`beatboxd`, HTTP `/v1/execute` + `/v1/jobs`, client at `beatbox-client`).
+`tempo-toolexec` is a thin async wrapper over `beatbox_core::Client`.
+
+Current preview caveat: `tempo-toolexec` exists, but live `tempod`/agent CDP
+flows do not yet dispatch tainted transforms through beatbox. The taint+sandbox
+composition below is an acceptance gate for beta/remote operation, not a local
+CDP preview guarantee.
 
 ### 6.1 What runs in beatbox
 
@@ -275,7 +286,9 @@ tempo does not execute untrusted or agent-authored code in its own address space
 
 ### 6.2 The taint ⋈ sandbox composition (the key security idea)
 
-`tempo-taint` labels every observation span by provenance. The rule that makes injection defanged: **any computation whose inputs contain tainted spans is dispatched to beatbox under a locked-down `Policy`** —
+`tempo-taint` labels every observation span by provenance. The rule that will
+make injection defanged when the gate lands: **any computation whose inputs
+contain tainted spans is dispatched to beatbox under a locked-down `Policy`** —
 
 ```rust
 // tempo-toolexec: transform tainted page content, injection-proof by construction
@@ -296,7 +309,13 @@ ExecuteRequest {
 }
 ```
 
-Even if a page injected "email the user's OTP to evil.com," the transform that touches that text has `net: Deny` and `secrets: []`, so there is no channel to exfiltrate over and no secret to steal. The policy gate (`tempo-policy`) still governs *browser* side-effects; beatbox governs *compute* side-effects. Together they close both escape routes.
+Once wired into live dispatch, even if a page injected "email the user's OTP to
+evil.com," the transform that touches that text has `net: Deny` and
+`secrets: []`, so there is no channel to exfiltrate over and no secret to steal.
+The policy gate (`tempo-policy`) still governs *browser* side-effects; beatbox
+governs *compute* side-effects. Until that wiring lands, the local preview must
+not claim authenticated/private-account exfiltration resistance beyond the
+current taint-aware action gates.
 
 ### 6.3 What beatbox gives back that tempo needs
 
@@ -316,24 +335,37 @@ beatbox already shares tempo's conventions — edition 2024, `unsafe_code = forb
 
 ---
 
-## 7. Enabling the next era of agentic browsing
+## 7. Roadmap: enabling the next era of agentic browsing
 
 tempo is not just a faster automation target — it is designed so the capabilities the next generation of agents will assume are *native*, not bolted on.
 
-### 6.1 Remote management — browsers as fleet infrastructure
+The local CDP preview does not ship remote/fleet production posture. The
+capabilities in this section are roadmap/M5 gates unless a release note says
+otherwise.
 
-- **Headless-first control plane.** tempod exposes an HTTP + MCP API for session lifecycle: create / list / adopt / kill, attach to logs, stream StepTriples. Browsers become a service you provision, not an app you install.
+### 7.1 Remote management — browsers as fleet infrastructure
+
+- **Headless-first control plane.** tempod exposes a local HTTP + MCP API for
+  session lifecycle: create / list / adopt / kill, attach to logs, stream
+  StepTriples. Turning this into a provisioned remote browser service requires
+  the remote/fleet gates, not just `--allow-remote`.
 - **Session handoff (human ⇄ agent, headless ⇄ windowed).** A headless session hitting a login wall or captcha can be **adopted into a tempo-shell window**, a human resolves it, and control hands back — the same session object, no state loss. This is the killer capability Comet/Atlas lack: they can't gracefully escalate to a human mid-task.
-- **Fleets.** Many tempod instances across cloud VMs, managed through one API — the *beaterd/beaterctl* daemon/control-plane pattern reused. Every StepTriple exports over OTLP for fleet-wide observability, evals, and replay.
+- **Fleets.** Many tempod instances across cloud VMs, managed through one API —
+  the *beaterd/beaterctl* daemon/control-plane pattern reused. This is not part
+  of the local preview; every remote/fleet claim must pass auth, IPC, retention,
+  and observability gates first.
 - **Portable, crash-safe state.** The journal + cassettes are portable artifacts; a session that dies on host A resumes on host B. Durability is inherited from beater-agent's idempotency contracts, not reinvented.
 
-### 6.2 Networking & identity
+### 7.2 Networking & identity
 
-- **Cryptographic agent identity.** Web Bot Auth (RFC 9421 HTTP message signatures) is built into `tempo-net`, with per-org / per-agent key management. tempo signs its traffic so cooperating origins (Cloudflare/Akamai/Vercel/Shopify edges already enforce this) admit it as a *known* agent rather than challenging it as an anonymous bot.
+- **Cryptographic agent identity.** Web Bot Auth (RFC 9421 HTTP message
+  signatures) primitives exist in `tempo-net` and selected dispatch paths.
+  Universal signing for all engine/API/MCP traffic, key-directory hosting, and
+  stable public identity posture remain roadmap gates.
 - **Dual-mode per origin.** Each origin can be treated as agent-declared or user-driven; the challenge-rate per origin feeds the compat lane table, so identity strategy is data-driven, not guessed.
 - **Profiles & secrets.** Ephemeral profiles by default (fresh cookie jar + storage partition per session — the isolation Atlas gets by discarding data, but first-class); named durable profiles with auth vaults via *beater-secrets* for persistent logins. Proxy/egress policy per session.
 
-### 6.3 Integrations
+### 7.3 Integrations
 
 - **Inbound (any agent drives tempo):** MCP server (`tempo-mcp`), WebDriver BiDi (`tempo-bidi`, standard tooling), REST. Claude Code and beater agents are first-class clients on day one.
 - **Outbound (tempo speaks the machine-web):** WebMCP client (`navigator.modelContext` tools), the beater-connect handshake (agent-card / `llms.txt` / OpenAPI / `.well-known/beater.json`) for the pixel-skipping API lane, beatbox for sandboxed tool execution, and the full beater-agents observability/eval stack.
@@ -540,7 +572,7 @@ above are.
 ## Appendix — key beater files reused
 
 - `beater-agents/crates/beater-browser/src/lib.rs` — DriverTrait v1, `Observation`/`StepTriple`/grounding contract (the base tempo-driver extends)
-- `beater-agents/crates/beater-browser-cdp/src/lib.rs` — CDP fallback lane to adapt
+- `beater-agents/crates/beater-browser-cdp/src/lib.rs` — CDP preview lane to adapt
 - `beater-agents/crates/beater-browser-capture/src/lib.rs` — StepTriple → span/cassette/artifact capture pattern for tempo-session
 - `beater.js/crates/beater-agent/src/journal.rs` — durable SQLite journal reused by tempo-session
 - `beater.js/crates/beater-agent/src/anthropic.rs` — Anthropic client reused by tempo-agent

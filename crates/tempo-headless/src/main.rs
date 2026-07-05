@@ -70,11 +70,20 @@ fn main() {
                 navigation_url_policy,
             )
         }
-        None => tempo_headless::run_tempod_with_config_and_navigation_url_policy(
-            &options.addr,
-            config,
-            navigation_url_policy,
-        ),
+        None => match options.engine {
+            Engine::Cdp => {
+                tempo_headless::run_tempod_with_packaged_cdp_engine_config_and_navigation_url_policy(
+                    &options.addr,
+                    config,
+                    navigation_url_policy,
+                )
+            }
+            _ => tempo_headless::run_tempod_with_config_and_navigation_url_policy(
+                &options.addr,
+                config,
+                navigation_url_policy,
+            ),
+        },
     };
 
     if let Err(err) = result {
@@ -153,7 +162,6 @@ impl TempodOptions {
     ) -> Result<Self, String> {
         let mut addr = None;
         let mut engine = engine_from_config(defaults.engine);
-        let mut engine_was_set = false;
         let mut engine_socket = defaults.engine_socket.clone().map(PathBuf::from);
         let mut allow_remote = false;
         let mut allow_private_network = false;
@@ -167,7 +175,6 @@ impl TempodOptions {
                         .next()
                         .ok_or_else(|| "--engine requires cdp or servo".to_string())?;
                     engine = parse_engine(&value)?;
-                    engine_was_set = true;
                 }
                 "--engine-socket" => {
                     let value = args
@@ -199,16 +206,10 @@ impl TempodOptions {
             }
         }
 
-        if engine_socket.is_none() && engine_was_set {
-            return Err(format!(
-                "--engine only applies with --engine-socket; otherwise tempod starts without an attached engine\n{}",
-                usage()
-            ));
-        }
         if engine_socket.is_none() && engine != Engine::Cdp {
             return Err(format!(
                 "configured engine {} requires --engine-socket or {}\n{}",
-                defaults.engine.as_str(),
+                engine_name(engine),
                 tempo_config::ENV_ENGINE_SOCKET,
                 usage()
             ));
@@ -275,6 +276,14 @@ fn parse_engine(value: &str) -> Result<Engine, String> {
         "cdp" => Ok(Engine::Cdp),
         "servo" => Ok(Engine::Servo),
         _ => Err(format!("unknown engine: {value}\n{}", usage())),
+    }
+}
+
+fn engine_name(engine: Engine) -> &'static str {
+    match engine {
+        Engine::Cdp => "cdp",
+        Engine::Servo => "servo",
+        _ => "non-cdp",
     }
 }
 
@@ -439,17 +448,30 @@ mod tests {
     }
 
     #[test]
-    fn explicit_engine_requires_engine_socket() {
+    fn explicit_cdp_without_engine_socket_uses_packaged_default() -> Result<(), String> {
+        let options = TempodOptions::parse_with_env(
+            ["--engine".to_string(), "cdp".to_string()],
+            None,
+            &TempodConfig::default(),
+        )?;
+
+        assert_eq!(options.engine, Engine::Cdp);
+        assert!(options.engine_socket.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_servo_requires_engine_socket() {
         let error = match TempodOptions::parse_with_env(
             ["--engine".to_string(), "servo".to_string()],
             None,
             &TempodConfig::default(),
         ) {
-            Ok(_) => panic!("--engine without --engine-socket should be rejected"),
+            Ok(_) => panic!("servo without engine_socket should be rejected"),
             Err(error) => error,
         };
 
-        assert!(error.contains("--engine only applies with --engine-socket"));
+        assert!(error.contains("configured engine servo requires"));
     }
 
     #[test]
