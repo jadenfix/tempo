@@ -283,7 +283,6 @@ fn engine_name(engine: Engine) -> &'static str {
     match engine {
         Engine::Cdp => "cdp",
         Engine::Servo => "servo",
-        _ => "non-cdp",
     }
 }
 
