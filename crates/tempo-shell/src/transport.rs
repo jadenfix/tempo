@@ -265,7 +265,6 @@ impl TransportClient {
             self.model.active_tab = local.active_tab;
             self.model.marks_overlay = local.marks_overlay;
             self.model.journal = local.journal;
-            self.model.tabs = local.tabs;
             self.model.status = local.status;
         }
         if resync && !stale {
@@ -616,14 +615,16 @@ mod tests {
         client.model.active_tab = Some(0);
         client.omnibox = "https://one.test".into();
 
-        assert_eq!(client.enqueue(UiAction::Refresh), Enqueued::Sent);
+        client.omnibox = "https://navigated.test".into();
+
+        assert_eq!(client.enqueue(UiAction::Navigate), Enqueued::Sent);
         assert_eq!(client.enqueue(UiAction::SelectTab(1)), Enqueued::Sent);
         assert_eq!(client.model.active_tab, Some(1));
         assert_eq!(client.omnibox, "https://two.test");
 
         assert_eq!(
             client.wait_and_apply(Duration::from_secs(5)),
-            Some(UiAction::Refresh)
+            Some(UiAction::Navigate)
         );
         assert_eq!(
             client.model.active_tab,
@@ -634,6 +635,11 @@ mod tests {
             client.model.tabs.len(),
             2,
             "stale worker results must not drop locally managed tabs"
+        );
+        assert_eq!(
+            client.model.tabs[0].current_url(),
+            Some("https://navigated.test"),
+            "stale worker results must keep completed remote tab mutations"
         );
     }
 
