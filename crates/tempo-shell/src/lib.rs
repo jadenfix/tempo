@@ -1501,7 +1501,9 @@ mod tests {
     }
 
     fn test_session_pool() -> Arc<Mutex<SessionPool>> {
-        Arc::new(Mutex::new(SessionPool::default()))
+        Arc::new(Mutex::new(
+            SessionPool::default().with_navigation_url_policy(tempo_net::UrlPolicy::allow_all()),
+        ))
     }
 
     fn spawn_tempod(pool: &Arc<Mutex<SessionPool>>) -> Result<SocketAddr, Box<dyn Error>> {

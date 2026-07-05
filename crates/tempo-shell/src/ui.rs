@@ -1554,7 +1554,9 @@ mod tests {
     /// mirroring `client_drives_real_tempod_session_lifecycle`.
     #[test]
     fn model_drives_real_tempod_lifecycle() -> TestResult {
-        let pool = Arc::new(Mutex::new(SessionPool::default()));
+        let pool = Arc::new(Mutex::new(
+            SessionPool::default().with_navigation_url_policy(tempo_net::UrlPolicy::allow_all()),
+        ));
         let driver_handle = attach_test_driver(&pool)?;
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let addr = listener.local_addr()?;

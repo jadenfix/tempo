@@ -1444,25 +1444,90 @@ fn manager_session_state_json_schema() -> Value {
 fn manager_event_json_schema() -> Value {
     json!({
         "title": "ManagerEvent",
-        "type": "object",
-        "additionalProperties": true,
-        "required": ["kind"],
-        "properties": {
-            "kind": {
-                "type": "string",
-                "enum": [
-                    "owner_changed",
-                    "surface_registered",
-                    "surface_removed",
-                    "confirmation_requested",
-                    "confirmation_granted",
-                    "run_state_changed",
-                    "human_takeover",
-                    "native_prompt_requested",
-                    "native_prompt_resolved"
-                ]
+        "oneOf": [
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["kind", "owner"],
+                "properties": {
+                    "kind": { "const": "owner_changed" },
+                    "owner": { "$ref": "#/$defs/ControlOwner" }
+                }
+            },
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["kind", "attachment"],
+                "properties": {
+                    "kind": { "const": "surface_registered" },
+                    "attachment": { "$ref": "#/$defs/SessionAttachment" }
+                }
+            },
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["kind", "surface_id"],
+                "properties": {
+                    "kind": { "const": "surface_removed" },
+                    "surface_id": { "$ref": "#/$defs/ShellSurfaceId" }
+                }
+            },
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["kind", "request"],
+                "properties": {
+                    "kind": { "const": "confirmation_requested" },
+                    "request": { "$ref": "#/$defs/ConfirmationRequest" }
+                }
+            },
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["kind", "confirmation_id"],
+                "properties": {
+                    "kind": { "const": "confirmation_granted" },
+                    "confirmation_id": { "type": "string" }
+                }
+            },
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["kind", "run"],
+                "properties": {
+                    "kind": { "const": "run_state_changed" },
+                    "run": { "$ref": "#/$defs/AgentRun" }
+                }
+            },
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["kind", "takeover"],
+                "properties": {
+                    "kind": { "const": "human_takeover" },
+                    "takeover": { "$ref": "#/$defs/HumanTakeover" }
+                }
+            },
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["kind", "request"],
+                "properties": {
+                    "kind": { "const": "native_prompt_requested" },
+                    "request": { "$ref": "#/$defs/NativePromptRequest" }
+                }
+            },
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["kind", "prompt_id", "state"],
+                "properties": {
+                    "kind": { "const": "native_prompt_resolved" },
+                    "prompt_id": { "type": "string" },
+                    "state": { "$ref": "#/$defs/NativePromptState" }
+                }
             }
-        }
+        ]
     })
 }
 
@@ -1727,6 +1792,18 @@ mod tests {
         ] {
             assert!(defs.contains_key(name), "missing {name}");
         }
+        assert_eq!(
+            defs["ManagerEvent"]["oneOf"].as_array().map(Vec::len),
+            Some(9)
+        );
+        assert_eq!(
+            defs["ManagerEvent"]["oneOf"][0]["properties"]["kind"]["const"],
+            "owner_changed"
+        );
+        assert_eq!(
+            defs["ManagerEvent"]["oneOf"][0]["properties"]["owner"]["$ref"],
+            "#/$defs/ControlOwner"
+        );
         Ok(())
     }
 

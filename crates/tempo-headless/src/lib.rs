@@ -6151,25 +6151,90 @@ pub fn tempod_openapi(base_url: &str) -> JsonValue {
                     }
                 },
                 "ManagerEvent": {
-                    "type": "object",
-                    "additionalProperties": true,
-                    "required": ["kind"],
-                    "properties": {
-                        "kind": {
-                            "type": "string",
-                            "enum": [
-                                "owner_changed",
-                                "surface_registered",
-                                "surface_removed",
-                                "confirmation_requested",
-                                "confirmation_granted",
-                                "run_state_changed",
-                                "human_takeover",
-                                "native_prompt_requested",
-                                "native_prompt_resolved"
-                            ]
+                    "oneOf": [
+                        {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["kind", "owner"],
+                            "properties": {
+                                "kind": {"const": "owner_changed"},
+                                "owner": {"$ref": "#/components/schemas/ControlOwner"}
+                            }
+                        },
+                        {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["kind", "attachment"],
+                            "properties": {
+                                "kind": {"const": "surface_registered"},
+                                "attachment": {"$ref": "#/components/schemas/SessionAttachment"}
+                            }
+                        },
+                        {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["kind", "surface_id"],
+                            "properties": {
+                                "kind": {"const": "surface_removed"},
+                                "surface_id": {"$ref": "#/components/schemas/ShellSurfaceId"}
+                            }
+                        },
+                        {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["kind", "request"],
+                            "properties": {
+                                "kind": {"const": "confirmation_requested"},
+                                "request": {"$ref": "#/components/schemas/ConfirmationRequest"}
+                            }
+                        },
+                        {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["kind", "confirmation_id"],
+                            "properties": {
+                                "kind": {"const": "confirmation_granted"},
+                                "confirmation_id": {"type": "string"}
+                            }
+                        },
+                        {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["kind", "run"],
+                            "properties": {
+                                "kind": {"const": "run_state_changed"},
+                                "run": {"$ref": "#/components/schemas/AgentRun"}
+                            }
+                        },
+                        {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["kind", "takeover"],
+                            "properties": {
+                                "kind": {"const": "human_takeover"},
+                                "takeover": {"$ref": "#/components/schemas/HumanTakeover"}
+                            }
+                        },
+                        {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["kind", "request"],
+                            "properties": {
+                                "kind": {"const": "native_prompt_requested"},
+                                "request": {"$ref": "#/components/schemas/NativePromptRequest"}
+                            }
+                        },
+                        {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["kind", "prompt_id", "state"],
+                            "properties": {
+                                "kind": {"const": "native_prompt_resolved"},
+                                "prompt_id": {"type": "string"},
+                                "state": {"$ref": "#/components/schemas/NativePromptState"}
+                            }
                         }
-                    }
+                    ]
                 },
                 "ManagerSessionState": {
                     "type": "object",
@@ -8268,6 +8333,24 @@ mod tests {
     }
 
     #[test]
+    fn run_cancelled_by_manager_is_not_overwritten_by_late_runner_finish() -> TestResult {
+        let mut pool = SessionPool::default();
+        let session = pool.finish_create("https://runs.test".into(), None);
+        let run_id = insert_test_run(&mut pool, &session.id, AgentRunState::Running, true);
+
+        let cancelled = pool.cancel_run(&run_id)?;
+        assert_eq!(cancelled.state, AgentRunState::Cancelled);
+        assert!(!pool.active_runs.contains_key(&session.id));
+
+        let late_finish = pool.finish_agent_run(&run_id, AgentRunState::Completed, None)?;
+
+        assert_eq!(late_finish.state, AgentRunState::Cancelled);
+        assert_eq!(pool.run(&run_id)?.state, AgentRunState::Cancelled);
+        assert!(!pool.active_runs.contains_key(&session.id));
+        Ok(())
+    }
+
+    #[test]
     fn session_act_batch_requires_server_minted_confirmation_grant() -> TestResult {
         let mut pool = SessionPool::default();
         let handle = attach_driver_handler(&mut pool, |request| match request.command {
@@ -8313,7 +8396,7 @@ mod tests {
                 headers: BTreeMap::new(),
                 host: None,
                 origin: None,
-                body: first_body,
+                body: first_body.clone(),
             },
         )?;
         assert_eq!(denied.status, 403);
@@ -8331,6 +8414,28 @@ mod tests {
         let manager = pool.manager_state(&session.id)?;
         assert_eq!(manager.pending_confirmations.len(), 1);
 
+        let duplicate_denied = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: format!("/sessions/{}/act_batch", session.id.0),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: first_body,
+            },
+        )?;
+        assert_eq!(duplicate_denied.status, 403);
+        let duplicate_denied: Value = serde_json::from_slice(&duplicate_denied.body)?;
+        assert_eq!(
+            duplicate_denied["confirmation_request"]["confirmation_id"],
+            confirmation_id
+        );
+        assert_eq!(
+            pool.manager_state(&session.id)?.pending_confirmations.len(),
+            1
+        );
+
         let grant_response = route_http_request(
             &mut pool,
             HttpRequest {
@@ -8344,6 +8449,19 @@ mod tests {
         )?;
         assert_eq!(grant_response.status, 200);
         let grant: ConfirmationGrant = serde_json::from_slice(&grant_response.body)?;
+
+        let duplicate_grant = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: format!("/sessions/{}/confirmations/{confirmation_id}", session.id.0),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: Vec::new(),
+            },
+        )?;
+        assert_eq!(duplicate_grant.status, 409);
 
         let mismatched_body = serde_json::to_vec(&json!({
             "batch": {
@@ -8376,7 +8494,7 @@ mod tests {
             "batch": batch,
             "input_tainted": false,
             "idempotency_key": "purchase-1",
-            "confirmation_grant": grant
+            "confirmation_grant": grant.clone()
         }))?;
         let executed = route_http_request(
             &mut pool,
@@ -8397,6 +8515,30 @@ mod tests {
 
         let manager = pool.manager_state(&session.id)?;
         assert!(manager.pending_confirmations.is_empty());
+
+        let replay_body = serde_json::to_vec(&json!({
+            "batch": batch,
+            "input_tainted": false,
+            "idempotency_key": "purchase-replay",
+            "confirmation_grant": grant
+        }))?;
+        let replay = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: format!("/sessions/{}/act_batch", session.id.0),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: replay_body,
+            },
+        )?;
+        assert_eq!(replay.status, 403);
+        let replay: Value = serde_json::from_slice(&replay.body)?;
+        assert!(replay["error"]
+            .as_str()
+            .ok_or("replay should include an error string")?
+            .contains("already used"));
         Ok(())
     }
 
@@ -11086,18 +11228,20 @@ mod tests {
             "#/components/schemas/NativePromptRequest"
         );
         assert_eq!(
-            openapi["components"]["schemas"]["ManagerEvent"]["properties"]["kind"]["enum"],
-            json!([
-                "owner_changed",
-                "surface_registered",
-                "surface_removed",
-                "confirmation_requested",
-                "confirmation_granted",
-                "run_state_changed",
-                "human_takeover",
-                "native_prompt_requested",
-                "native_prompt_resolved"
-            ])
+            openapi["components"]["schemas"]["ManagerEvent"]["oneOf"]
+                .as_array()
+                .map(Vec::len),
+            Some(9)
+        );
+        assert_eq!(
+            openapi["components"]["schemas"]["ManagerEvent"]["oneOf"][0]["properties"]["kind"]
+                ["const"],
+            "owner_changed"
+        );
+        assert_eq!(
+            openapi["components"]["schemas"]["ManagerEvent"]["oneOf"][0]["properties"]["owner"]
+                ["$ref"],
+            "#/components/schemas/ControlOwner"
         );
     }
 
