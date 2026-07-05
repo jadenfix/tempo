@@ -17,11 +17,13 @@ You are an independent, non-author reviewer for `jadenfix/tempo`. The argument i
 ## Procedure
 
 1. `gh pr view <N> -R jadenfix/tempo --json title,body,author,files,mergeStateStatus,statusCheckRollup`
+   - Confirm the PR body begins with the `1.) agent <number>` and `2.) purpose:` metadata required by `pr-scope`; if it was fixed by body edit only, require a push or close/reopen-triggered rerun before treating the check as fresh.
 2. `gh pr diff <N> -R jadenfix/tempo` — all of it.
 3. `gh issue view <issue> -R jadenfix/tempo` for every referenced issue; the issue defines the intended scope (did the PR do more or less than it needs?).
 4. **Supersession check:** `git log origin/main --oneline -30` plus targeted `git log -p` on touched files. Concurrent agents mean main may already contain an equivalent fix → REJECT (superseded).
 5. **Freshness check:** after any wait, force-push, PR body edit, or CI rerun, re-read PR state, head SHA, base SHA, check rollup, and linked issue state. A closed PR, stale-head check run, or already-closed issue is not merge evidence.
 6. **Overlap check:** `gh pr list -R jadenfix/tempo --state open` — flag open PRs touching the same paths and whether merge order matters.
+   - Green per-PR CI is not combined-tree proof when main or overlapping PRs moved since branching; call out local current-main merge/test evidence needed before merge-ready claims.
 7. Hunt for bugs using the method below.
 8. Post the review (format at the bottom) and return a structured verdict.
 
@@ -59,6 +61,10 @@ Resource, lifecycle & availability:
 - [ ] Stateful protocol handlers enforce live-state quotas in addition to per-message size caps; repeated valid commands must not grow maps, vectors, or dispatch scans without bound.
 - [ ] Moving blocking work onto std threads or blocking pools is not itself a bound; client-triggered thread fan-out needs a shared in-flight cap and an immediate structured rejection path.
 - [ ] Every engine/remote/subprocess round-trip has a timeout **and** a recovery path — a crash or hang is detected and healed (restart/reconnect, with backoff), not permanently terminal.
+- [ ] `timeout` around a create-style browser/remote call is not cancellation; dropped futures can still create remote resources, so timeout paths need a reap, track, or cleanup strategy.
+- [ ] Deadline fixes bound the whole path, including setup and cleanup awaits introduced by the fix; timeout values are derived from the caller's deadline with recovery margin, not just from test silence.
+- [ ] Auto-started child processes cannot outlive the daemon on signal death or abrupt exit; daemon-side drops are insufficient without a child-side parent-death watch or equivalent owner check.
+- [ ] Daemons that own both a child supervisor and an IPC reconnect loop document and test who restarts, who re-attaches, and how either side gives up without stranding the other.
 
 Security boundaries & auth:
 - [ ] Loopback, Host, and Origin checks are not authentication. Control planes that drive sessions, tools, or browser state require an unguessable same-user capability even on `127.0.0.1`.
@@ -73,6 +79,7 @@ Security boundaries & auth:
 Trust boundaries & security:
 - [ ] Caller-supplied trust/policy/side-effect classifications (`taint`, `confirmed`, …) are recomputed server-side, never trusted.
 - [ ] Untrusted data is size-checked, provenance-tracked, and cannot cause side effects or leak secret headers; a policy (URL, egress, redaction) is enforced across the whole path — redirects, retries, interception — not just the entrypoint.
+- [ ] Per-resource policy hooks are installed before the resource's first navigation or use, and block attribution stays with the resource that caused it.
 - [ ] Egress and proxy policy is bound to the concrete endpoint actually used after DNS, proxy resolution, redirects, and retries; validating a hostname, URL string, or only one candidate address is not enough when another resolved socket can be selected later.
 - [ ] Untrusted remote tool descriptors without trusted side-effect metadata are classified at the strongest supported side effect before threshold origin rules run; never flatten unknown remote tools to a weaker class.
 - [ ] Security or taint gates assert the production call path, not only the helper intended to be safe; model-facing page metadata is provenance-framed, not left as escaped-but-bare prompt attributes.
@@ -81,6 +88,8 @@ Trust boundaries & security:
 - [ ] Tests and docs that verify redaction do not commit realistic secret, token, password, API-key, or credential literals. Use scanner-safe inert fragments while still proving the sensitive value never appears in debug/display/error/export output.
 - [ ] Secret-bearing clients parse and validate configured base URLs before constructing requests: reject userinfo/query/fragment/path injection, require a pinned secure production origin, and make loopback/insecure fixtures use an explicitly named test opt-in.
 - [ ] A detector or guard runs on data that actually reaches it: check that upstream filtering/compilation didn't strip the very signal the check needs.
+- [ ] Observation filters explicitly preserve or reject earlier detector carve-outs; visibility/layout pruning distinguishes "not rendered" from single-axis or fill-later geometry that remains an action/extract target.
+- [ ] Rules enforced in injected page JavaScript are mirrored in the host-side parser as the trust backstop, with reverted-fix-sensitive tests on both sides.
 - [ ] A change that removes or shortens a wait, grace window, or recheck on a trust-boundary path names the exact window losing coverage and cites the mechanism that still enforces the invariant inside that window — "already covered elsewhere" without the covering mechanism is not a justification.
 
 Performance on hot paths (a regression here is a correctness bug for this project):
@@ -95,6 +104,7 @@ Tests:
 - [ ] A test exercises the actual failure mode (survives the reverted-fix question above); new caps/timeouts/limits are tested at the boundary — at, below, above.
 - [ ] Local verification ran in an isolated worktree/target. If multiple Cargo commands share one fresh `CARGO_TARGET_DIR` concurrently, missing rlibs/object files/temp dirs are local harness races until reproduced sequentially.
 - [ ] CI filters that skip expensive security or engine build gates are conservative: workflow files, lockfiles, manifests, gate scripts, the gated crate, and direct local dependency crates still trigger the gate unless the PR documents a narrower proof.
+- [ ] Curated security-sentinel test lists are append-only; guards that pin test presence do not replace human review of trust-boundary or `*_denies_*` / `*_blocks_*` assertion changes.
 
 ## tempo hard rules (standing invariants — treat a violation as a blocker)
 
