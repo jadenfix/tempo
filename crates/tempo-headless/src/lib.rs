@@ -10865,7 +10865,10 @@ mod tests {
 
         let poison_target = Arc::clone(&shared);
         let outcome = thread::spawn(move || {
-            let _guard = poison_target.lock().expect("acquire pool lock");
+            let _guard = match poison_target.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
             panic!("poison the pool mutex while the guard is held");
         })
         .join();
