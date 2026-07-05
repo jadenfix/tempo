@@ -1181,18 +1181,20 @@ impl ToolCall {
     }
 
     fn handshake_probe_limit(limit: HandshakeProbeLimitReached) -> Self {
+        let message = format!(
+            "live HTTP handshake probe limit reached (max {})",
+            limit.max_concurrent
+        );
         Self {
             is_error: true,
             structured_content: json!({
                 "error": {
                     "type": HANDSHAKE_PROBE_LIMIT_ERROR_CODE,
                     "max_concurrent": limit.max_concurrent,
-                    "message": format!(
-                        "live HTTP handshake probe limit reached (max {})",
-                        limit.max_concurrent
-                    ),
+                    "message": message.clone(),
                 }
             }),
+            content: vec![text_content_block(format!("error: {message}"))],
         }
     }
 
