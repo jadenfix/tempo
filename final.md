@@ -97,7 +97,7 @@ Layer → crate → responsibility (beater reuse in italics).
 
 **L1 — Engines**
 - `tempo-engine-servo` — libservo embedding: `WebViewBuilder` + our `WebViewDelegate`, offscreen `RenderingContext`, `take_screenshot`, `evaluate_javascript`, `notify_input_event`, `load_web_resource` → tempo-net, AccessKit stream intake. Cargo features `servo-vanilla` (pinned upstream) vs `servo-tempo` (our fork branch APIs).
-- `tempo-engine-host` — out-of-proc engine daemon (`tempo-engined`): N webviews/process, driver wire protocol over UDS, crash isolation. Hosts the observation-compiler core **engine-side** so only compiled diffs cross the process boundary. Verso's process split is the reference.
+- `tempo-engine-host` — out-of-proc engine host: driver wire protocol over UDS, crash isolation, N webviews/process. Hosts the observation-compiler core **engine-side** so only compiled diffs cross the process boundary. Verso's process split is the reference. The runnable host **shipped today** is the CDP-backed `tempo-engined-cdp` binary (in `tempo-engine-cdp`), which serves the CDP driver over the daemon's engine UDS (#397); the servo-hosted native `tempo-engined` is the WS2 target (see §3.3, below), not yet built.
 - `tempo-engine-cdp` — the compat fallback lane: adapts *`beater-browser-cdp`* (chromiumoxide, headless Chrome, no Node) to DriverTrait v2; diff via injected MutationObserver; AX via CDP `Accessibility.getFullAXTree`; `fork()` returns `Unsupported` (replay-fork handled above the trait).
 
 **L2 — Observation plane**
@@ -137,7 +137,7 @@ Layer → crate → responsibility (beater reuse in italics).
 ### 3.3 Process model
 
 - **tempod** (one per host): agent loop, policy gate, taint, session manager, MCP/BiDi/HTTP servers, journal. In-proc: `tempo-agent`, `tempo-policy`, `tempo-session`, `tempo-handshake`, and the CDP adapter (the Chromium *process* itself is external, launched by chromiumoxide as beater does today).
-- **tempo-engined** (N per host, supervised by tempod): libservo + M webviews each; the observation-compiler *core* runs here, so only compiled observations/diffs cross the UDS boundary, never raw AX trees after the first snapshot. A crash kills only that engined's sessions; the journal enables resume.
+- **tempo-engined** (WS2 target, N per host, tempod-supervised): libservo + M webviews each; the observation-compiler *core* runs here, so only compiled observations/diffs cross the UDS boundary, never raw AX trees after the first snapshot. A crash kills only that engined's sessions; the journal enables resume. **Shipped today** the runnable host is `tempo-engined-cdp`, started as a peer process rather than auto-supervised: run it with `TEMPO_ENGINE_HOST_SOCKET=<path>` (optionally `TEMPO_CDP_CHROME=<chrome>`) so it binds the driver UDS, then attach the daemon with `tempod --engine cdp --engine-socket <path>`. Auto-spawn/supervision via `EngineSupervisor` is the follow-up (#397).
 - **beatbox** sandboxes: separate double-jailed processes.
 - **tempo-shell**: separate app process; embeds its own in-proc WebViews for the human's foreground tabs and connects to tempod over loopback, so agent sessions can drive shell-visible tabs and headless sessions can be *adopted* into a window.
 
