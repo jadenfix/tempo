@@ -4860,6 +4860,24 @@ mod tests {
         );
     }
 
+    async fn goto_live_fixture_with_retry(
+        driver: &mut dyn DriverTrait,
+        url: &str,
+    ) -> Result<CompiledObservation, TransportError> {
+        match driver.goto(url).await {
+            Ok(observation) => Ok(observation),
+            Err(TransportError::NavTimeout) => {
+                if let Ok(observation) = driver.observe().await
+                    && observation.url == url
+                {
+                    return Ok(observation);
+                }
+                driver.goto(url).await
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     #[tokio::test]
     async fn live_cdp_child_browsing_context_isolates_storage(
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -4875,7 +4893,7 @@ mod tests {
             .await?
             .allow_private_network_access();
 
-        driver.goto(&url).await?;
+        goto_live_fixture_with_retry(&mut driver, &url).await?;
         let root_value = driver
             .evaluate_script(
                 "Promise.resolve((() => { localStorage.setItem('tempoIsolation', 'root'); document.cookie = 'tempoIsolation=root; SameSite=Lax'; return localStorage.getItem('tempoIsolation'); })())",
@@ -4891,7 +4909,7 @@ mod tests {
             })
             .await
             .map_err(|error| std::io::Error::other(error.0))?;
-        child.goto(&url).await?;
+        goto_live_fixture_with_retry(child.as_mut(), &url).await?;
         let child_value = child
             .evaluate_script(
                 "Promise.resolve(localStorage.getItem('tempoIsolation') === null ? '__missing__' : localStorage.getItem('tempoIsolation'))",
