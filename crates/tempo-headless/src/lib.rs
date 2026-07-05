@@ -5966,12 +5966,14 @@ pub fn tempod_openapi(base_url: &str) -> JsonValue {
                         "goal": {"type": "string"},
                         "actions": {
                             "type": "array",
-                            "items": {"type": "object"}
+                            "items": {"$ref": "#/components/schemas/Action"}
                         },
                         "max_rounds": {"type": "integer", "minimum": 1},
                         "token_budget": {"type": "integer", "minimum": 0}
                     }
                 },
+                "Action": openapi_component_schema(tempo_schema::action_json_schema()),
+                "NodeId": {"type": "string"},
                 "TempodSessionId": {
                     "type": "string"
                 },
@@ -6349,6 +6351,32 @@ pub fn tempod_openapi(base_url: &str) -> JsonValue {
             }
         }
     })
+}
+
+fn openapi_component_schema(mut schema: JsonValue) -> JsonValue {
+    rewrite_json_schema_refs_for_openapi(&mut schema);
+    schema
+}
+
+fn rewrite_json_schema_refs_for_openapi(value: &mut JsonValue) {
+    match value {
+        JsonValue::Object(map) => {
+            if let Some(JsonValue::String(reference)) = map.get_mut("$ref") {
+                if let Some(definition) = reference.strip_prefix("#/$defs/") {
+                    *reference = format!("#/components/schemas/{definition}");
+                }
+            }
+            for value in map.values_mut() {
+                rewrite_json_schema_refs_for_openapi(value);
+            }
+        }
+        JsonValue::Array(items) => {
+            for value in items {
+                rewrite_json_schema_refs_for_openapi(value);
+            }
+        }
+        JsonValue::Null | JsonValue::Bool(_) | JsonValue::Number(_) | JsonValue::String(_) => {}
+    }
 }
 
 fn after_seq(query: Option<&str>) -> Result<Option<u64>, TempodError> {
@@ -7128,7 +7156,7 @@ fn route_session_mcp(
         Ok(driver) => driver,
         Err(error) => return tempod_error_response(&error),
     };
-    let server = tempo_mcp::TempoMcpServer::new(driver);
+    let server = tempo_mcp::TempoMcpServer::new(driver).without_fork_tools();
     HttpResponse::from_mcp(futures::executor::block_on(
         server.handle_post(origin, body),
     ))
@@ -7428,31 +7456,48 @@ fn route_session_run_create(
         pool.begin_agent_run(&session_id, Some(goal.clone()))?
     };
 
-    let journal_dir = tempod_runtime_dir().join("runs");
-    std::fs::create_dir_all(&journal_dir)?;
-    let journal_path = journal_dir.join(format!("{}.jsonl", run.run_id.0));
-    let ids = tempo_agent::AgentRunIds::new(run.run_id.0.clone(), session_id.0.clone());
-    let mut runner = tempo_agent::AgentRunner::new_plaintext_unsafe(&journal_path, ids);
-    if let Some(max_tokens) = request.token_budget {
-        runner = runner.with_token_budget(tempo_agent::TokenBudget::new(max_tokens));
-    }
-    let mut decider = tempo_agent::decider::ScriptedDecider::new(vec![request.actions, Vec::new()]);
-    let spec = tempo_agent::decider::DecidedTaskSpec::new(start_url, goal)
-        .with_max_rounds(request.max_rounds.unwrap_or(2));
-    let report =
-        futures::executor::block_on(runner.run_decided_task(&mut driver, &mut decider, &spec))
+    let run_result: Result<(AgentRunState, Option<String>, Option<HumanTakeover>), TempodError> =
+        (|| {
+            let journal_dir = tempod_runtime_dir().join("runs");
+            std::fs::create_dir_all(&journal_dir)?;
+            let journal_path = journal_dir.join(format!("{}.jsonl", run.run_id.0));
+            let ids = tempo_agent::AgentRunIds::new(run.run_id.0.clone(), session_id.0.clone());
+            let mut runner = tempo_agent::AgentRunner::new_plaintext_unsafe(&journal_path, ids);
+            if let Some(max_tokens) = request.token_budget {
+                runner = runner.with_token_budget(tempo_agent::TokenBudget::new(max_tokens));
+            }
+            let mut decider =
+                tempo_agent::decider::ScriptedDecider::new(vec![request.actions, Vec::new()]);
+            let spec = tempo_agent::decider::DecidedTaskSpec::new(start_url, goal)
+                .with_max_rounds(request.max_rounds.unwrap_or(2));
+            let report = futures::executor::block_on(runner.run_decided_task(
+                &mut driver,
+                &mut decider,
+                &spec,
+            ))
             .map_err(|error| TempodError::Driver(error.to_string()))?;
 
-    let (state, error, takeover) = match report.status {
-        tempo_agent::decider::DecidedRunStatus::Completed
-        | tempo_agent::decider::DecidedRunStatus::AlreadyComplete => {
-            (AgentRunState::Completed, None, None)
+            Ok(match report.status {
+                tempo_agent::decider::DecidedRunStatus::Completed
+                | tempo_agent::decider::DecidedRunStatus::AlreadyComplete => {
+                    (AgentRunState::Completed, None, None)
+                }
+                tempo_agent::decider::DecidedRunStatus::HumanTakeoverRequired { takeover } => {
+                    (AgentRunState::WaitingForHuman, None, Some(takeover))
+                }
+                other => (AgentRunState::Failed, Some(format!("{other:?}")), None),
+            })
+        })();
+
+    let (state, error, takeover) = match run_result {
+        Ok(result) => result,
+        Err(error) => {
+            let error_message = error.to_string();
+            finish_failed_session_run(pool, &run.run_id, error_message)?;
+            return Err(error);
         }
-        tempo_agent::decider::DecidedRunStatus::HumanTakeoverRequired { takeover } => {
-            (AgentRunState::WaitingForHuman, None, Some(takeover))
-        }
-        other => (AgentRunState::Failed, Some(format!("{other:?}")), None),
     };
+
     let finished = {
         let mut pool = lock_pool(pool)?;
         let finished = pool.finish_agent_run(&run.run_id, state, error)?;
@@ -7462,6 +7507,15 @@ fn route_session_run_create(
         finished
     };
     Ok(HttpResponse::json(201, finished))
+}
+
+fn finish_failed_session_run(
+    pool: &Arc<Mutex<SessionPool>>,
+    run_id: &AgentRunId,
+    error: String,
+) -> Result<AgentRun, TempodError> {
+    let mut pool = lock_pool(pool)?;
+    pool.finish_agent_run(run_id, AgentRunState::Failed, Some(error))
 }
 
 fn session_events_live_sse(
@@ -8396,6 +8450,36 @@ mod tests {
         assert_eq!(late_finish.state, AgentRunState::Cancelled);
         assert_eq!(pool.run(&run_id)?.state, AgentRunState::Cancelled);
         assert!(!pool.active_runs.contains_key(&session.id));
+        Ok(())
+    }
+
+    #[test]
+    fn failed_session_run_create_releases_active_writer() -> TestResult {
+        let mut pool = SessionPool::default();
+        let (client_stream, _server_stream) = UnixStream::pair()?;
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream))?;
+        let session_driver = pool
+            .driver
+            .clone()
+            .ok_or("attached engine driver should be present")?;
+        let session = pool.finish_create("https://runs.test".into(), Some(session_driver));
+        let (run, _driver, _url) =
+            pool.begin_agent_run(&session.id, Some("fail then release".into()))?;
+        assert_eq!(pool.active_runs.get(&session.id), Some(&run.run_id));
+
+        let failed = with_shared_pool(&mut pool, |shared| {
+            super::finish_failed_session_run(shared, &run.run_id, "injected run failure".into())
+        })?;
+
+        assert_eq!(failed.state, AgentRunState::Failed);
+        assert!(!pool.active_runs.contains_key(&session.id));
+        let runs = pool.list_runs(Some(&session.id));
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].state, AgentRunState::Failed);
+        assert!(runs[0]
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("injected run failure")));
         Ok(())
     }
 
@@ -11353,6 +11437,21 @@ mod tests {
             "Session already has an active writer"
         );
         assert_eq!(
+            openapi["components"]["schemas"]["CreateRunRequest"]["properties"]["actions"]["items"]
+                ["$ref"],
+            "#/components/schemas/Action"
+        );
+        assert_eq!(
+            openapi["components"]["schemas"]["Action"]["oneOf"]
+                .as_array()
+                .map(Vec::len),
+            Some(8)
+        );
+        assert_eq!(
+            openapi["components"]["schemas"]["Action"]["oneOf"][1]["properties"]["node"]["$ref"],
+            "#/components/schemas/NodeId"
+        );
+        assert_eq!(
             openapi["paths"]["/sessions/{session_id}/mcp"]["post"]["operationId"],
             "mcpPostSession"
         );
@@ -12406,6 +12505,71 @@ mod tests {
             "https://session-mcp.test"
         );
         assert_eq!(value["result"]["structuredContent"]["seq"], 11);
+        Ok(())
+    }
+
+    #[test]
+    fn session_scoped_mcp_is_forkless_because_server_state_is_request_scoped() -> TestResult {
+        let mut pool = SessionPool::default();
+        let handle = attach_driver_handler(&mut pool, |request| {
+            assert_eq!(request.command, HostDriverCommand::Observe);
+            DriverResponse::Observation {
+                observation: observation("https://session-mcp.test", 11),
+            }
+        })?;
+        let session_driver = pool
+            .driver
+            .clone()
+            .ok_or("attached engine driver should be present")?;
+        let session = pool.finish_create("https://session-mcp.test".into(), Some(session_driver));
+
+        let list = HttpRequest {
+            method: "POST".into(),
+            path: format!("/sessions/{}/mcp", session.id.0),
+            headers: BTreeMap::new(),
+            host: None,
+            origin: None,
+            body: br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#.to_vec(),
+        };
+        let response = route_http_request(&mut pool, list)?;
+        assert_eq!(response.status, 200);
+        let value: Value = serde_json::from_slice(&response.body)?;
+        let tool_names = value["result"]["tools"]
+            .as_array()
+            .ok_or("tools/list result must be an array")?
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect::<Vec<_>>();
+        assert!(!tool_names.contains(&"fork"));
+        assert!(!tool_names.contains(&"close_fork"));
+
+        let fork = HttpRequest {
+            method: "POST".into(),
+            path: format!("/sessions/{}/mcp", session.id.0),
+            headers: BTreeMap::new(),
+            host: None,
+            origin: None,
+            body: br#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"fork","arguments":{}}}"#.to_vec(),
+        };
+        let response = route_http_request(&mut pool, fork)?;
+        assert_eq!(response.status, 200);
+        let value: Value = serde_json::from_slice(&response.body)?;
+        assert_eq!(value["error"]["code"], -32602);
+        assert!(value["error"]["message"]
+            .as_str()
+            .ok_or("fork rejection should have message")?
+            .contains("unknown tool: fork"));
+
+        let mut observe = mcp_tool_request(3, "observe", json!({}))?;
+        observe.path = format!("/sessions/{}/mcp", session.id.0);
+        let response = route_http_request(&mut pool, observe)?;
+        join_driver_handler(handle)?;
+        assert_eq!(response.status, 200);
+        let value: Value = serde_json::from_slice(&response.body)?;
+        assert_eq!(
+            value["result"]["structuredContent"]["url"],
+            "https://session-mcp.test"
+        );
         Ok(())
     }
 
