@@ -15,6 +15,7 @@ use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::{DefaultBodyLimit, Path as UrlPath, RawQuery, Request as AxumRequest, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
+use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Extension, Router};
@@ -24,6 +25,7 @@ use hyper_util::service::TowerToHyperService;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as JsonValue};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::convert::Infallible;
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
@@ -37,6 +39,7 @@ use std::time::{Duration, Instant};
 use tempo_agent::{StepTriple, StepTripleOutcome};
 // Re-exported so consumers of `TempodSessionEventKind::StepTriple` (e.g. the
 // shell agent panel) can name the event payload without a direct tempo-agent dep.
+use futures::StreamExt;
 pub use tempo_agent::{
     IdempotencyKey as SessionStepKey, StepTriple as SessionStepTriple,
     StepTripleOutcome as SessionStepOutcome,
@@ -64,10 +67,13 @@ use tempo_policy::trust::{
 };
 use tempo_policy::ConfirmationGate;
 use tempo_schema::{
-    Action, ActionBatch, CompiledObservation, HumanTakeover, NodeId, ObservationDiff, SideEffect,
+    Action, ActionBatch, AdoptionLease, AgentRun, AgentRunId, AgentRunState, BrowserEngineTier,
+    CompiledObservation, ConfirmationGrant, ConfirmationRequest, ControlOwner, HumanTakeover,
+    ManagerEvent, ManagerSessionState, NodeId, ObservationDiff, SessionAttachment, ShellSurfaceId,
+    SideEffect, StorageContinuityMode,
 };
 use thiserror::Error;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{broadcast, OwnedSemaphorePermit, Semaphore};
 use url::Url;
 
 /// Maximum accepted HTTP body size; hyper's per-connection read buffer is
@@ -76,7 +82,11 @@ const MAX_HTTP_BYTES: usize = 64 * 1024;
 const MAX_IDEMPOTENCY_KEY_BYTES: usize = 256;
 const MAX_SESSION_IDEMPOTENCY_RECORDS: usize = 1024;
 const MAX_SESSION_EVENTS_PER_SESSION: usize = 1024;
+const MAX_SESSION_EVENT_STREAM_BACKLOG: usize = MAX_SESSION_EVENTS_PER_SESSION;
 const MAX_TERMINAL_SESSIONS: usize = 256;
+const CONFIRMATION_TTL_MS: u64 = 5 * 60 * 1000;
+const CONFIRMATION_ID_BYTES: usize = 16;
+const CONFIRMATION_TOKEN_BYTES: usize = 32;
 const MAX_WS_PAYLOAD_BYTES: usize = MAX_HTTP_BYTES;
 /// Maximum accepted TCP control-plane connections handled concurrently.
 const MAX_HTTP_CONNECTIONS: usize = 128;
@@ -435,7 +445,7 @@ pub struct TempodSession {
     pub id: TempodSessionId,
     pub url: String,
     pub state: TempodSessionState,
-    pub created_ms: u128,
+    pub created_ms: u64,
 }
 
 /// One event in tempod's per-session control-plane log.
@@ -443,7 +453,7 @@ pub struct TempodSession {
 pub struct TempodSessionEvent {
     pub session_id: TempodSessionId,
     pub seq: u64,
-    pub timestamp_ms: u128,
+    pub timestamp_ms: u64,
     pub event: TempodSessionEventKind,
 }
 
@@ -464,8 +474,12 @@ pub enum TempodSessionEventKind {
         url: String,
     },
     SessionAdopted,
+    SessionHandoff,
     SessionKilled,
     SessionDrained,
+    Manager {
+        event: ManagerEvent,
+    },
     StepTriple {
         triple: StepTriple,
     },
@@ -961,6 +975,15 @@ pub struct SessionPool {
     session_act_batch_idempotency:
         BTreeMap<TempodSessionId, BTreeMap<String, SessionActBatchIdempotencyEntry>>,
     events: BTreeMap<TempodSessionId, SessionEventLog>,
+    volatile_event_seq: BTreeMap<TempodSessionId, u64>,
+    event_broadcast: broadcast::Sender<TempodSessionEvent>,
+    owners: BTreeMap<TempodSessionId, ControlOwner>,
+    attachments: BTreeMap<TempodSessionId, BTreeMap<ShellSurfaceId, SessionAttachment>>,
+    runs: BTreeMap<AgentRunId, AgentRun>,
+    session_runs: BTreeMap<TempodSessionId, Vec<AgentRunId>>,
+    active_runs: BTreeMap<TempodSessionId, AgentRunId>,
+    pending_confirmations: BTreeMap<String, StoredConfirmationRequest>,
+    confirmation_grants: BTreeMap<String, StoredConfirmationGrant>,
     otlp_exporter: Option<OtlpJsonExporter>,
     privacy_mode: PrivacyMode,
     otlp_http_exporter: Option<OtlpHttpExporter>,
@@ -975,17 +998,30 @@ pub struct SessionPool {
     url_policy: UrlPolicy,
     next_bidi_context_id: u64,
     next_id: u64,
+    next_run_id: u64,
+    next_surface_id: u64,
+    next_lease_id: u64,
     max_sessions: usize,
     draining: bool,
 }
 
 impl Default for SessionPool {
     fn default() -> Self {
+        let (event_broadcast, _) = broadcast::channel(MAX_SESSION_EVENT_STREAM_BACKLOG);
         Self {
             sessions: BTreeMap::new(),
             session_drivers: BTreeMap::new(),
             session_act_batch_idempotency: BTreeMap::new(),
             events: BTreeMap::new(),
+            volatile_event_seq: BTreeMap::new(),
+            event_broadcast,
+            owners: BTreeMap::new(),
+            attachments: BTreeMap::new(),
+            runs: BTreeMap::new(),
+            session_runs: BTreeMap::new(),
+            active_runs: BTreeMap::new(),
+            pending_confirmations: BTreeMap::new(),
+            confirmation_grants: BTreeMap::new(),
             otlp_exporter: None,
             privacy_mode: PrivacyMode::default(),
             otlp_http_exporter: None,
@@ -999,6 +1035,9 @@ impl Default for SessionPool {
             url_policy: UrlPolicy::allow_all(),
             next_bidi_context_id: 0,
             next_id: 0,
+            next_run_id: 0,
+            next_surface_id: 0,
+            next_lease_id: 0,
             max_sessions: MAX_TEMPOD_SESSIONS,
             draining: false,
         }
@@ -1021,6 +1060,19 @@ impl fmt::Debug for SessionPool {
                 &session_act_batch_idempotency_records,
             )
             .field("event_sessions", &self.events.len())
+            .field(
+                "volatile_event_seq_sessions",
+                &self.volatile_event_seq.len(),
+            )
+            .field(
+                "event_stream_receivers",
+                &self.event_broadcast.receiver_count(),
+            )
+            .field("owners", &self.owners)
+            .field("attachments", &self.attachments.len())
+            .field("runs", &self.runs.len())
+            .field("active_runs", &self.active_runs)
+            .field("pending_confirmations", &self.pending_confirmations.len())
             .field("otlp_exporter", &self.otlp_exporter)
             .field("privacy_mode", &self.privacy_mode)
             .field("otlp_http_exporter", &self.otlp_http_exporter)
@@ -1029,6 +1081,8 @@ impl fmt::Debug for SessionPool {
             .field("mcp_attached", &self.mcp.is_some())
             .field("url_policy", &self.url_policy)
             .field("next_id", &self.next_id)
+            .field("next_run_id", &self.next_run_id)
+            .field("next_surface_id", &self.next_surface_id)
             .field("max_sessions", &self.max_sessions)
             .field("draining", &self.draining)
             .finish()
@@ -1045,6 +1099,21 @@ struct SessionActBatchIdempotencyEntry {
 struct CachedSessionActBatchResponse {
     status: u16,
     body: JsonValue,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct StoredConfirmationRequest {
+    request: ConfirmationRequest,
+    request_fingerprint: JsonValue,
+    grant_issued: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct StoredConfirmationGrant {
+    grant: ConfirmationGrant,
+    request_fingerprint: JsonValue,
+    session_id: TempodSessionId,
+    used: bool,
 }
 
 impl SessionPool {
@@ -1188,6 +1257,12 @@ impl SessionPool {
             created_ms: current_time_ms(),
         };
         self.sessions.insert(id, session.clone());
+        self.owners.insert(
+            session.id.clone(),
+            ControlOwner::Agent {
+                run_id: self.active_runs.get(&session.id).cloned(),
+            },
+        );
         if let Some(driver) = session_driver {
             self.session_drivers.insert(session.id.clone(), driver);
         }
@@ -1247,6 +1322,60 @@ impl SessionPool {
     }
 
     pub fn adopt(&mut self, id: &TempodSessionId) -> Result<TempodSession, TempodError> {
+        let lease = self.adopt_with_surface(id, None)?;
+        self.sessions
+            .get(id)
+            .cloned()
+            .ok_or_else(|| TempodError::SessionNotFound(TempodSessionId(lease.session_id)))
+    }
+
+    pub fn adopt_with_surface(
+        &mut self,
+        id: &TempodSessionId,
+        surface: Option<RegisterSurfaceRequest>,
+    ) -> Result<AdoptionLease, TempodError> {
+        if self.draining {
+            return Err(TempodError::Draining);
+        }
+        if let Some(active_run) = self.active_runs.get(id)
+            && !matches!(
+                self.runs.get(active_run).map(|run| run.state),
+                Some(AgentRunState::WaitingForHuman)
+            )
+        {
+            return Err(TempodError::Conflict(
+                "session_busy: active run owns the session".into(),
+            ));
+        }
+        {
+            let session = self
+                .sessions
+                .get_mut(id)
+                .ok_or_else(|| TempodError::SessionNotFound(id.clone()))?;
+            session.state = TempodSessionState::Adopted;
+        }
+        let attachment = self.register_surface(id, surface.unwrap_or_default())?;
+        let owner = ControlOwner::Human {
+            surface_id: attachment.surface_id.clone(),
+        };
+        self.owners.insert(id.clone(), owner.clone());
+        self.record_event(id, TempodSessionEventKind::SessionAdopted);
+        self.record_manager_event(
+            id,
+            ManagerEvent::OwnerChanged {
+                owner: owner.clone(),
+            },
+        );
+        let lease = AdoptionLease {
+            lease_id: self.next_lease_id(),
+            session_id: id.0.clone(),
+            owner,
+            adopted_ms: current_time_ms(),
+        };
+        Ok(lease)
+    }
+
+    pub fn handoff(&mut self, id: &TempodSessionId) -> Result<TempodSession, TempodError> {
         if self.draining {
             return Err(TempodError::Draining);
         }
@@ -1255,11 +1384,529 @@ impl SessionPool {
                 .sessions
                 .get_mut(id)
                 .ok_or_else(|| TempodError::SessionNotFound(id.clone()))?;
-            session.state = TempodSessionState::Adopted;
+            session.state = TempodSessionState::Running;
             session.clone()
         };
-        self.record_event(id, TempodSessionEventKind::SessionAdopted);
-        Ok(session.clone())
+        let owner = ControlOwner::Agent {
+            run_id: self.active_runs.get(id).cloned(),
+        };
+        self.owners.insert(id.clone(), owner.clone());
+        self.record_event(id, TempodSessionEventKind::SessionHandoff);
+        self.record_manager_event(id, ManagerEvent::OwnerChanged { owner });
+        Ok(session)
+    }
+
+    pub fn register_surface(
+        &mut self,
+        id: &TempodSessionId,
+        request: RegisterSurfaceRequest,
+    ) -> Result<SessionAttachment, TempodError> {
+        if !self.sessions.contains_key(id) {
+            return Err(TempodError::SessionNotFound(id.clone()));
+        }
+        let surface_id = request
+            .surface_id
+            .unwrap_or_else(|| self.next_generated_surface_id());
+        let attachment = SessionAttachment {
+            surface_id,
+            platform: request.platform,
+            label: request.label,
+            engine_tier: request.engine_tier,
+            profile_id: request.profile_id,
+            storage_continuity: request.storage_continuity,
+            attached_ms: current_time_ms(),
+        };
+        self.attachments
+            .entry(id.clone())
+            .or_default()
+            .insert(attachment.surface_id.clone(), attachment.clone());
+        self.record_manager_event(
+            id,
+            ManagerEvent::SurfaceRegistered {
+                attachment: attachment.clone(),
+            },
+        );
+        Ok(attachment)
+    }
+
+    pub fn remove_surface(
+        &mut self,
+        id: &TempodSessionId,
+        surface_id: &ShellSurfaceId,
+    ) -> Result<(), TempodError> {
+        if !self.sessions.contains_key(id) {
+            return Err(TempodError::SessionNotFound(id.clone()));
+        }
+        let removed = self
+            .attachments
+            .get_mut(id)
+            .and_then(|surfaces| surfaces.remove(surface_id));
+        if removed.is_none() {
+            return Err(TempodError::SessionNotFound(TempodSessionId(format!(
+                "{} surface {}",
+                id.0, surface_id.0
+            ))));
+        }
+        if matches!(
+            self.owners.get(id),
+            Some(ControlOwner::Human { surface_id: current }) if current == surface_id
+        ) {
+            let owner = ControlOwner::Agent {
+                run_id: self.active_runs.get(id).cloned(),
+            };
+            self.owners.insert(id.clone(), owner.clone());
+            self.record_manager_event(id, ManagerEvent::OwnerChanged { owner });
+        }
+        self.record_manager_event(
+            id,
+            ManagerEvent::SurfaceRemoved {
+                surface_id: surface_id.clone(),
+            },
+        );
+        Ok(())
+    }
+
+    fn session_owner(&self, id: &TempodSessionId) -> ControlOwner {
+        self.owners
+            .get(id)
+            .cloned()
+            .unwrap_or(ControlOwner::Unowned)
+    }
+
+    fn next_generated_surface_id(&mut self) -> ShellSurfaceId {
+        let id = ShellSurfaceId(format!("surface-{}", self.next_surface_id));
+        self.next_surface_id = self.next_surface_id.saturating_add(1);
+        id
+    }
+
+    fn next_lease_id(&mut self) -> String {
+        let id = format!("lease-{}", self.next_lease_id);
+        self.next_lease_id = self.next_lease_id.saturating_add(1);
+        id
+    }
+
+    pub fn manager_state(
+        &mut self,
+        id: &TempodSessionId,
+    ) -> Result<ManagerSessionState, TempodError> {
+        if !self.sessions.contains_key(id) {
+            return Err(TempodError::SessionNotFound(id.clone()));
+        }
+        let now = current_time_ms();
+        self.prune_expired_confirmations(now);
+        let attachments = self
+            .attachments
+            .get(id)
+            .map(|surfaces| surfaces.values().cloned().collect())
+            .unwrap_or_default();
+        let runs = self
+            .session_runs
+            .get(id)
+            .into_iter()
+            .flatten()
+            .filter_map(|run_id| self.runs.get(run_id).cloned())
+            .collect();
+        let pending_confirmations = self
+            .pending_confirmations
+            .values()
+            .filter(|stored| stored.request.session_id == id.0)
+            .map(|stored| stored.request.clone())
+            .collect();
+        let last_event_seq = self
+            .events
+            .get(id)
+            .and_then(|events| events.events.back().map(|event| event.seq));
+        Ok(ManagerSessionState {
+            session_id: id.0.clone(),
+            owner: self.session_owner(id),
+            active_run: self.active_runs.get(id).cloned(),
+            attachments,
+            runs,
+            pending_confirmations,
+            pending_native_prompts: Vec::new(),
+            last_event_seq,
+        })
+    }
+
+    fn ensure_agent_writer_available(&self, id: &TempodSessionId) -> Result<(), TempodError> {
+        if let Some(run_id) = self.active_runs.get(id) {
+            return Err(TempodError::Conflict(format!(
+                "session_busy: active run {} owns the session",
+                run_id.0
+            )));
+        }
+        if matches!(self.owners.get(id), Some(ControlOwner::Human { .. })) {
+            return Err(TempodError::Conflict(
+                "session_busy: human currently owns the session".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn ensure_foreground_writer_available(&self, id: &TempodSessionId) -> Result<(), TempodError> {
+        if let Some(run_id) = self.active_runs.get(id) {
+            let waiting_for_human = matches!(
+                self.runs.get(run_id).map(|run| run.state),
+                Some(AgentRunState::WaitingForHuman)
+            );
+            if waiting_for_human && matches!(self.owners.get(id), Some(ControlOwner::Human { .. }))
+            {
+                return Ok(());
+            }
+            return Err(TempodError::Conflict(format!(
+                "session_busy: active run {} owns the session",
+                run_id.0
+            )));
+        }
+        if matches!(
+            self.owners.get(id),
+            Some(ControlOwner::Agent {
+                run_id: Some(active_run)
+            }) if self
+                .runs
+                .get(active_run)
+                .is_some_and(|run| run.state != AgentRunState::WaitingForHuman)
+        ) {
+            return Err(TempodError::Conflict(
+                "session_busy: agent run currently owns the session".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn create_confirmation_request(
+        &mut self,
+        id: &TempodSessionId,
+        request_fingerprint: JsonValue,
+        report: &SessionBatchPolicyReport,
+        denied_action_index: usize,
+        denied_action_kind: &'static str,
+        reason: &str,
+    ) -> Result<ConfirmationRequest, TempodError> {
+        if !self.sessions.contains_key(id) {
+            return Err(TempodError::SessionNotFound(id.clone()));
+        }
+        let now = current_time_ms();
+        self.prune_expired_confirmations(now);
+        if let Some(existing) = self.pending_confirmations.values().find(|stored| {
+            stored.request.session_id == id.0 && stored.request_fingerprint == request_fingerprint
+        }) {
+            return Ok(existing.request.clone());
+        }
+        let confirmation_id = format!("confirmation-{}", random_hex(CONFIRMATION_ID_BYTES)?);
+        let request = ConfirmationRequest {
+            confirmation_id: confirmation_id.clone(),
+            session_id: id.0.clone(),
+            side_effect: report.max_side_effect,
+            gate: confirmation_gate_name(report.strongest_gate).to_string(),
+            action_index: denied_action_index,
+            action_kind: denied_action_kind.to_string(),
+            reason: reason.to_string(),
+            created_ms: now,
+            expires_ms: now.saturating_add(CONFIRMATION_TTL_MS),
+        };
+        self.pending_confirmations.insert(
+            confirmation_id,
+            StoredConfirmationRequest {
+                request: request.clone(),
+                request_fingerprint,
+                grant_issued: false,
+            },
+        );
+        self.record_manager_event(
+            id,
+            ManagerEvent::ConfirmationRequested {
+                request: request.clone(),
+            },
+        );
+        Ok(request)
+    }
+
+    fn issue_confirmation_grant(
+        &mut self,
+        id: &TempodSessionId,
+        confirmation_id: &str,
+    ) -> Result<ConfirmationGrant, TempodError> {
+        if !self.sessions.contains_key(id) {
+            return Err(TempodError::SessionNotFound(id.clone()));
+        }
+        let now = current_time_ms();
+        self.prune_expired_confirmations(now);
+        let stored = self
+            .pending_confirmations
+            .get_mut(confirmation_id)
+            .ok_or_else(|| TempodError::SessionNotFound(TempodSessionId(confirmation_id.into())))?;
+        if stored.request.session_id != id.0 {
+            return Err(TempodError::Conflict(
+                "confirmation request belongs to a different session".into(),
+            ));
+        }
+        if stored.grant_issued {
+            return Err(TempodError::Conflict(
+                "confirmation request already has a minted grant".into(),
+            ));
+        }
+        let grant = ConfirmationGrant {
+            confirmation_id: confirmation_id.to_string(),
+            grant_token: random_hex(CONFIRMATION_TOKEN_BYTES)?,
+            issued_ms: now,
+            expires_ms: stored.request.expires_ms,
+        };
+        stored.grant_issued = true;
+        self.confirmation_grants.insert(
+            grant.grant_token.clone(),
+            StoredConfirmationGrant {
+                grant: grant.clone(),
+                request_fingerprint: stored.request_fingerprint.clone(),
+                session_id: id.clone(),
+                used: false,
+            },
+        );
+        self.record_manager_event(
+            id,
+            ManagerEvent::ConfirmationGranted {
+                confirmation_id: confirmation_id.to_string(),
+                grant: grant.clone(),
+            },
+        );
+        Ok(grant)
+    }
+
+    fn validate_confirmation_grant(
+        &mut self,
+        id: &TempodSessionId,
+        grant: Option<&ConfirmationGrant>,
+        request_fingerprint: &JsonValue,
+        consume: bool,
+    ) -> Result<bool, TempodError> {
+        let Some(grant) = grant else {
+            return Ok(false);
+        };
+        let now = current_time_ms();
+        self.prune_expired_confirmations(now);
+        let stored = self
+            .confirmation_grants
+            .get_mut(&grant.grant_token)
+            .ok_or_else(|| {
+                TempodError::Forbidden("confirmation grant is unknown or expired".into())
+            })?;
+        if stored.used {
+            return Err(TempodError::Forbidden(
+                "confirmation grant was already used".into(),
+            ));
+        }
+        if stored.session_id != *id
+            || stored.grant.confirmation_id != grant.confirmation_id
+            || stored.grant.expires_ms != grant.expires_ms
+            || stored.request_fingerprint != *request_fingerprint
+        {
+            return Err(TempodError::Forbidden(
+                "confirmation grant does not match this session request".into(),
+            ));
+        }
+        if now > stored.grant.expires_ms {
+            return Err(TempodError::Forbidden(
+                "confirmation grant has expired".into(),
+            ));
+        }
+        if consume {
+            let confirmation_id = stored.grant.confirmation_id.clone();
+            stored.used = true;
+            self.pending_confirmations.remove(&confirmation_id);
+        }
+        Ok(true)
+    }
+
+    fn prune_expired_confirmations(&mut self, now: u64) {
+        self.pending_confirmations
+            .retain(|_, stored| stored.request.expires_ms >= now);
+        self.confirmation_grants
+            .retain(|_, stored| stored.grant.expires_ms >= now);
+    }
+
+    fn begin_agent_run(
+        &mut self,
+        id: &TempodSessionId,
+        goal: Option<String>,
+    ) -> Result<(AgentRun, AttachedEngineDriver, String), TempodError> {
+        if self.draining {
+            return Err(TempodError::Draining);
+        }
+        self.ensure_agent_writer_available(id)?;
+        let session = self
+            .sessions
+            .get(id)
+            .ok_or_else(|| TempodError::SessionNotFound(id.clone()))?
+            .clone();
+        let driver = self.session_driver(id)?;
+        let now = current_time_ms();
+        let run_id = AgentRunId(format!("run-{}", self.next_run_id));
+        self.next_run_id = self.next_run_id.saturating_add(1);
+        let run = AgentRun {
+            run_id: run_id.clone(),
+            session_id: id.0.clone(),
+            state: AgentRunState::Running,
+            goal,
+            created_ms: now,
+            updated_ms: now,
+            completed_ms: None,
+            last_error: None,
+        };
+        self.runs.insert(run_id.clone(), run.clone());
+        self.session_runs
+            .entry(id.clone())
+            .or_default()
+            .push(run_id.clone());
+        self.active_runs.insert(id.clone(), run_id.clone());
+        let owner = ControlOwner::Agent {
+            run_id: Some(run_id),
+        };
+        self.owners.insert(id.clone(), owner.clone());
+        self.record_manager_event(id, ManagerEvent::OwnerChanged { owner });
+        self.record_manager_event(id, ManagerEvent::RunStateChanged { run: run.clone() });
+        Ok((run, driver, session.url))
+    }
+
+    fn finish_agent_run(
+        &mut self,
+        run_id: &AgentRunId,
+        state: AgentRunState,
+        last_error: Option<String>,
+    ) -> Result<AgentRun, TempodError> {
+        let now = current_time_ms();
+        let (session_id, run) = {
+            let run = self
+                .runs
+                .get_mut(run_id)
+                .ok_or_else(|| TempodError::SessionNotFound(TempodSessionId(run_id.0.clone())))?;
+            if run.state == AgentRunState::Cancelled && state != AgentRunState::Cancelled {
+                return Ok(run.clone());
+            }
+            run.state = state;
+            run.updated_ms = now;
+            run.completed_ms = match state {
+                AgentRunState::Completed | AgentRunState::Failed | AgentRunState::Cancelled => {
+                    Some(now)
+                }
+                AgentRunState::Queued | AgentRunState::Running | AgentRunState::WaitingForHuman => {
+                    None
+                }
+            };
+            run.last_error = last_error;
+            (TempodSessionId(run.session_id.clone()), run.clone())
+        };
+        if !matches!(
+            run.state,
+            AgentRunState::Running | AgentRunState::WaitingForHuman
+        ) {
+            self.active_runs.remove(&session_id);
+            self.owners.insert(
+                session_id.clone(),
+                ControlOwner::Agent {
+                    run_id: self.active_runs.get(&session_id).cloned(),
+                },
+            );
+        }
+        self.record_manager_event(
+            &session_id,
+            ManagerEvent::RunStateChanged { run: run.clone() },
+        );
+        Ok(run)
+    }
+
+    fn run(&self, run_id: &AgentRunId) -> Result<AgentRun, TempodError> {
+        self.runs
+            .get(run_id)
+            .cloned()
+            .ok_or_else(|| TempodError::SessionNotFound(TempodSessionId(run_id.0.clone())))
+    }
+
+    fn list_runs(&self, session_id: Option<&TempodSessionId>) -> Vec<AgentRun> {
+        match session_id {
+            Some(id) => self
+                .session_runs
+                .get(id)
+                .into_iter()
+                .flatten()
+                .filter_map(|run_id| self.runs.get(run_id).cloned())
+                .collect(),
+            None => self.runs.values().cloned().collect(),
+        }
+    }
+
+    fn cancel_run(&mut self, run_id: &AgentRunId) -> Result<AgentRun, TempodError> {
+        let run = self.run(run_id)?;
+        if matches!(
+            run.state,
+            AgentRunState::Completed | AgentRunState::Failed | AgentRunState::Cancelled
+        ) {
+            return Err(TempodError::Conflict(format!(
+                "run_not_cancellable: run {} is already {:?}",
+                run_id.0, run.state
+            )));
+        }
+        self.finish_agent_run(run_id, AgentRunState::Cancelled, None)
+    }
+
+    fn resume_run(&mut self, run_id: &AgentRunId) -> Result<AgentRun, TempodError> {
+        let now = current_time_ms();
+        let session_id = self
+            .runs
+            .get(run_id)
+            .map(|run| TempodSessionId(run.session_id.clone()))
+            .ok_or_else(|| TempodError::SessionNotFound(TempodSessionId(run_id.0.clone())))?;
+        match self.owners.get(&session_id) {
+            Some(ControlOwner::Human { .. }) => {
+                return Err(TempodError::Conflict(
+                    "session_busy: human currently owns the session".into(),
+                ));
+            }
+            Some(ControlOwner::Agent {
+                run_id: Some(active_run),
+            }) if active_run != run_id => {
+                return Err(TempodError::Conflict(format!(
+                    "session_busy: active run {} owns the session",
+                    active_run.0
+                )));
+            }
+            _ => {}
+        }
+        if let Some(active_run) = self.active_runs.get(&session_id)
+            && active_run != run_id
+        {
+            return Err(TempodError::Conflict(format!(
+                "session_busy: active run {} owns the session",
+                active_run.0
+            )));
+        }
+        let run = {
+            let run = self
+                .runs
+                .get_mut(run_id)
+                .ok_or_else(|| TempodError::SessionNotFound(TempodSessionId(run_id.0.clone())))?;
+            if !matches!(run.state, AgentRunState::WaitingForHuman) {
+                return Err(TempodError::Conflict(format!(
+                    "run_not_resumable: run {} is {:?}, expected WaitingForHuman",
+                    run_id.0, run.state
+                )));
+            }
+            run.state = AgentRunState::Running;
+            run.updated_ms = now;
+            run.completed_ms = None;
+            run.last_error = None;
+            run.clone()
+        };
+        self.active_runs.insert(session_id.clone(), run_id.clone());
+        let owner = ControlOwner::Agent {
+            run_id: Some(run_id.clone()),
+        };
+        self.owners.insert(session_id.clone(), owner.clone());
+        self.record_manager_event(&session_id, ManagerEvent::OwnerChanged { owner });
+        self.record_manager_event(
+            &session_id,
+            ManagerEvent::RunStateChanged { run: run.clone() },
+        );
+        Ok(run)
     }
 
     /// Kill a session, closing its engine context. Retained for direct
@@ -1305,6 +1952,15 @@ impl SessionPool {
         };
         let detached = self.session_drivers.remove(id);
         let root = self.driver.clone();
+        self.volatile_event_seq.remove(id);
+        self.owners.remove(id);
+        self.attachments.remove(id);
+        self.active_runs.remove(id);
+        self.session_runs.remove(id);
+        self.pending_confirmations
+            .retain(|_, stored| stored.request.session_id != id.0);
+        self.confirmation_grants
+            .retain(|_, stored| stored.session_id != *id);
         self.clear_session_idempotency(id);
         self.record_event(id, TempodSessionEventKind::SessionKilled);
         self.enforce_terminal_session_retention();
@@ -1322,6 +1978,8 @@ impl SessionPool {
             }
         }
         for id in drained {
+            self.owners.remove(&id);
+            self.active_runs.remove(&id);
             self.record_event(&id, TempodSessionEventKind::SessionDrained);
         }
         self.session_act_batch_idempotency.clear();
@@ -1808,7 +2466,20 @@ impl SessionPool {
         let excess = terminal.len().saturating_sub(max_terminal);
         for id in terminal.into_iter().take(excess) {
             self.events.remove(&id);
+            self.volatile_event_seq.remove(&id);
             self.clear_session_idempotency(&id);
+            self.owners.remove(&id);
+            self.attachments.remove(&id);
+            self.active_runs.remove(&id);
+            if let Some(run_ids) = self.session_runs.remove(&id) {
+                for run_id in run_ids {
+                    self.runs.remove(&run_id);
+                }
+            }
+            self.pending_confirmations
+                .retain(|_, stored| stored.request.session_id != id.0);
+            self.confirmation_grants
+                .retain(|_, stored| stored.session_id != id);
             self.sessions.remove(&id);
         }
     }
@@ -1836,20 +2507,52 @@ impl SessionPool {
             .unwrap_or_default())
     }
 
+    fn subscribe_events(
+        &self,
+        id: &TempodSessionId,
+        after_seq: Option<u64>,
+    ) -> Result<(TempodSessionEvents, broadcast::Receiver<TempodSessionEvent>), TempodError> {
+        if !self.sessions.contains_key(id) {
+            return Err(TempodError::SessionNotFound(id.clone()));
+        }
+        let receiver = self.event_broadcast.subscribe();
+        let replay = self
+            .events
+            .get(id)
+            .map(|events| events.window_after(after_seq))
+            .unwrap_or_default();
+        Ok((replay, receiver))
+    }
+
     fn record_event(
         &mut self,
         id: &TempodSessionId,
         event: TempodSessionEventKind,
     ) -> TempodSessionEvent {
-        if !self.privacy_mode.retains_history() {
-            return TempodSessionEvent {
+        let record = if !self.privacy_mode.retains_history() {
+            let seq = self.next_volatile_event_seq(id);
+            TempodSessionEvent {
                 session_id: id.clone(),
-                seq: 0,
+                seq,
                 timestamp_ms: current_time_ms(),
                 event,
-            };
-        }
-        self.events.entry(id.clone()).or_default().push(id, event)
+            }
+        } else {
+            self.events.entry(id.clone()).or_default().push(id, event)
+        };
+        let _ = self.event_broadcast.send(record.clone());
+        record
+    }
+
+    fn next_volatile_event_seq(&mut self, id: &TempodSessionId) -> u64 {
+        let seq = self.volatile_event_seq.entry(id.clone()).or_default();
+        let current = *seq;
+        *seq = seq.saturating_add(1);
+        current
+    }
+
+    fn record_manager_event(&mut self, id: &TempodSessionId, event: ManagerEvent) {
+        self.record_event(id, TempodSessionEventKind::Manager { event });
     }
 }
 
@@ -3550,9 +4253,33 @@ fn tempod_router(state: TempodAppState) -> Router {
         .route("/sessions", get(sessions_list).post(sessions_create))
         .route("/sessions/{id}", delete(session_kill))
         .route("/sessions/{id}/adopt", post(session_adopt))
+        .route("/sessions/{id}/handoff", post(session_handoff))
+        .route("/sessions/{id}/manager", get(session_manager))
+        .route("/sessions/{id}/surfaces", post(session_surface_register))
+        .route(
+            "/sessions/{id}/surfaces/{surface_id}",
+            delete(session_surface_remove),
+        )
         .route("/sessions/{id}/observe", get(session_observe))
         .route("/sessions/{id}/act_batch", post(session_act_batch))
+        .route("/sessions/{id}/mcp", post(session_mcp_post))
+        .route(
+            "/sessions/{id}/bidi",
+            get(session_bidi_websocket_upgrade).post(session_bidi_post),
+        )
+        .route("/sessions/{id}/screenshot", get(session_screenshot))
         .route("/sessions/{id}/events", get(session_events))
+        .route("/sessions/{id}/events/stream", get(session_events_stream))
+        .route("/sessions/{id}/runs", post(session_run_create))
+        .route(
+            "/sessions/{id}/confirmations/{confirmation_id}",
+            post(session_confirmation_grant),
+        )
+        .route("/runs", get(runs_list))
+        .route("/runs/{run_id}", get(run_get))
+        .route("/runs/{run_id}/events", get(run_events))
+        .route("/runs/{run_id}/cancel", post(run_cancel))
+        .route("/runs/{run_id}/resume", post(run_resume))
         .route("/drain", post(drain))
         .route(TEMPOD_METRICS_PATH, get(metrics))
         .fallback(unsupported_route)
@@ -3681,8 +4408,10 @@ fn metrics_route_class(method: &str, path: &str) -> &'static str {
         (_, "/mcp") => "mcp",
         (_, "/bidi") => "bidi",
         (_, "/sessions") => "sessions",
+        (_, "/runs") => "runs",
         (_, "/drain") => "drain",
         _ if path.starts_with("/sessions/") => "session",
+        _ if path.starts_with("/runs/") => "run",
         ("GET", path)
             if path == tempo_mcp::A2A_AGENT_CARD_PATH || path == tempo_mcp::A2A_AGENT_JSON_PATH =>
         {
@@ -3916,7 +4645,7 @@ async fn sessions_create(State(state): State<TempodAppState>, body: Bytes) -> Re
         if request.url.trim().is_empty() {
             return Err(TempodError::BadRequest("session url is required".into()));
         }
-        let created = create_session_shared(&state.pool, request.url)?;
+        let created = create_session_shared(&state.pool, request.url, request.driverless)?;
         tempo_telemetry::global()
             .counter(
                 "tempod_sessions_created_total",
@@ -3945,12 +4674,67 @@ async fn session_kill(
 async fn session_adopt(
     State(state): State<TempodAppState>,
     UrlPath(id): UrlPath<String>,
+    body: Bytes,
+) -> Response {
+    run_blocking(move || -> Result<HttpResponse, TempodError> {
+        let request: RegisterSurfaceRequest = parse_optional_json_request(&body)?;
+        Ok(HttpResponse::json(
+            200,
+            lock_pool(&state.pool)?.adopt_with_surface(&TempodSessionId(id), Some(request))?,
+        ))
+    })
+    .await
+}
+
+async fn session_handoff(
+    State(state): State<TempodAppState>,
+    UrlPath(id): UrlPath<String>,
 ) -> Response {
     run_blocking(move || -> Result<HttpResponse, TempodError> {
         Ok(HttpResponse::json(
             200,
-            lock_pool(&state.pool)?.adopt(&TempodSessionId(id))?,
+            lock_pool(&state.pool)?.handoff(&TempodSessionId(id))?,
         ))
+    })
+    .await
+}
+
+async fn session_manager(
+    State(state): State<TempodAppState>,
+    UrlPath(id): UrlPath<String>,
+) -> Response {
+    run_blocking(move || -> Result<HttpResponse, TempodError> {
+        Ok(HttpResponse::json(
+            200,
+            lock_pool(&state.pool)?.manager_state(&TempodSessionId(id))?,
+        ))
+    })
+    .await
+}
+
+async fn session_surface_register(
+    State(state): State<TempodAppState>,
+    UrlPath(id): UrlPath<String>,
+    body: Bytes,
+) -> Response {
+    run_blocking(move || -> Result<HttpResponse, TempodError> {
+        let request: RegisterSurfaceRequest = parse_optional_json_request(&body)?;
+        Ok(HttpResponse::json(
+            201,
+            lock_pool(&state.pool)?.register_surface(&TempodSessionId(id), request)?,
+        ))
+    })
+    .await
+}
+
+async fn session_surface_remove(
+    State(state): State<TempodAppState>,
+    UrlPath((id, surface_id)): UrlPath<(String, String)>,
+) -> Response {
+    run_blocking(move || -> Result<HttpResponse, TempodError> {
+        lock_pool(&state.pool)?
+            .remove_surface(&TempodSessionId(id), &ShellSurfaceId(surface_id))?;
+        Ok(HttpResponse::json(200, json!({"removed": true})))
     })
     .await
 }
@@ -3970,6 +4754,37 @@ async fn session_events(
     .await
 }
 
+async fn session_events_stream(
+    State(state): State<TempodAppState>,
+    headers: HeaderMap,
+    UrlPath(id): UrlPath<String>,
+    RawQuery(query): RawQuery,
+) -> Response {
+    let after_seq = match after_seq_or_last_event_id(
+        query.as_deref(),
+        header_str(&headers, header::HeaderName::from_static("last-event-id")),
+    ) {
+        Ok(after_seq) => after_seq,
+        Err(error) => return tempod_error_response(&error).into_response(),
+    };
+    let session_id = TempodSessionId(id);
+    let stream_session_id = session_id.clone();
+    let pool = Arc::clone(&state.pool);
+    let subscribed = match tokio::task::spawn_blocking(move || {
+        lock_pool(&pool)?.subscribe_events(&session_id, after_seq)
+    })
+    .await
+    {
+        Ok(Ok(subscribed)) => subscribed,
+        Ok(Err(error)) => return tempod_error_response(&error).into_response(),
+        Err(_) => {
+            return HttpResponse::json(500, json!({"error": "tempod worker task failed"}))
+                .into_response();
+        }
+    };
+    session_events_live_sse(stream_session_id, subscribed.0, subscribed.1).into_response()
+}
+
 async fn session_observe(
     State(state): State<TempodAppState>,
     UrlPath(id): UrlPath<String>,
@@ -3978,6 +4793,138 @@ async fn session_observe(
         Ok(HttpResponse::json(
             200,
             route_session_observe(&state.pool, &TempodSessionId(id))?,
+        ))
+    })
+    .await
+}
+
+async fn session_mcp_post(
+    State(state): State<TempodAppState>,
+    headers: HeaderMap,
+    UrlPath(id): UrlPath<String>,
+    body: Bytes,
+) -> Response {
+    let origin = header_str(&headers, header::ORIGIN).map(str::to_owned);
+    run_blocking(move || {
+        route_session_mcp(&state.pool, &TempodSessionId(id), origin.as_deref(), &body)
+    })
+    .await
+}
+
+async fn session_bidi_post(
+    State(state): State<TempodAppState>,
+    headers: HeaderMap,
+    UrlPath(id): UrlPath<String>,
+    body: Bytes,
+) -> Response {
+    if !tempo_mcp::origin_allowed(header_str(&headers, header::ORIGIN)) {
+        return tempod_error_response(&TempodError::Forbidden("origin not allowed".into()))
+            .into_response();
+    }
+    run_blocking(move || route_session_bidi(&state.pool, &TempodSessionId(id), body)).await
+}
+
+async fn session_screenshot(
+    State(state): State<TempodAppState>,
+    UrlPath(id): UrlPath<String>,
+    RawQuery(query): RawQuery,
+) -> Response {
+    run_blocking(move || -> Result<HttpResponse, TempodError> {
+        let set_of_marks = set_of_marks(query.as_deref())?;
+        route_session_screenshot(&state.pool, &TempodSessionId(id), set_of_marks)
+    })
+    .await
+}
+
+async fn session_run_create(
+    State(state): State<TempodAppState>,
+    UrlPath(id): UrlPath<String>,
+    body: Bytes,
+) -> Response {
+    run_blocking(move || -> Result<HttpResponse, TempodError> {
+        let request: CreateRunRequest = serde_json::from_slice(&body)
+            .map_err(|err| TempodError::BadRequest(format!("invalid run request: {err}")))?;
+        route_session_run_create(&state.pool, TempodSessionId(id), request)
+    })
+    .await
+}
+
+async fn session_confirmation_grant(
+    State(state): State<TempodAppState>,
+    UrlPath((id, confirmation_id)): UrlPath<(String, String)>,
+) -> Response {
+    run_blocking(move || -> Result<HttpResponse, TempodError> {
+        Ok(HttpResponse::json(
+            200,
+            lock_pool(&state.pool)?
+                .issue_confirmation_grant(&TempodSessionId(id), &confirmation_id)?,
+        ))
+    })
+    .await
+}
+
+async fn runs_list(State(state): State<TempodAppState>, RawQuery(query): RawQuery) -> Response {
+    run_blocking(move || -> Result<HttpResponse, TempodError> {
+        let session_id = session_id_query(query.as_deref())?.map(TempodSessionId);
+        Ok(HttpResponse::json(
+            200,
+            lock_pool(&state.pool)?.list_runs(session_id.as_ref()),
+        ))
+    })
+    .await
+}
+
+async fn run_get(
+    State(state): State<TempodAppState>,
+    UrlPath(run_id): UrlPath<String>,
+) -> Response {
+    run_blocking(move || -> Result<HttpResponse, TempodError> {
+        Ok(HttpResponse::json(
+            200,
+            lock_pool(&state.pool)?.run(&AgentRunId(run_id))?,
+        ))
+    })
+    .await
+}
+
+async fn run_events(
+    State(state): State<TempodAppState>,
+    UrlPath(run_id): UrlPath<String>,
+    RawQuery(query): RawQuery,
+) -> Response {
+    run_blocking(move || -> Result<HttpResponse, TempodError> {
+        let after_seq = after_seq(query.as_deref())?;
+        let pool = lock_pool(&state.pool)?;
+        let run = pool.run(&AgentRunId(run_id))?;
+        Ok(HttpResponse::json(
+            200,
+            pool.events(&TempodSessionId(run.session_id), after_seq)?,
+        ))
+    })
+    .await
+}
+
+async fn run_cancel(
+    State(state): State<TempodAppState>,
+    UrlPath(run_id): UrlPath<String>,
+) -> Response {
+    run_blocking(move || -> Result<HttpResponse, TempodError> {
+        Ok(HttpResponse::json(
+            200,
+            lock_pool(&state.pool)?.cancel_run(&AgentRunId(run_id))?,
+        ))
+    })
+    .await
+}
+
+async fn run_resume(
+    State(state): State<TempodAppState>,
+    UrlPath(run_id): UrlPath<String>,
+) -> Response {
+    run_blocking(move || -> Result<HttpResponse, TempodError> {
+        Ok(HttpResponse::json(
+            200,
+            lock_pool(&state.pool)?.resume_run(&AgentRunId(run_id))?,
         ))
     })
     .await
@@ -4100,6 +5047,73 @@ async fn serve_bidi_websocket(mut socket: WebSocket, pool: Arc<Mutex<SessionPool
     }
 }
 
+async fn session_bidi_websocket_upgrade(
+    State(state): State<TempodAppState>,
+    headers: HeaderMap,
+    UrlPath(id): UrlPath<String>,
+    permit_slot: Option<Extension<HttpPermitSlot>>,
+    ws: WebSocketUpgrade,
+) -> Response {
+    if !tempo_mcp::origin_allowed(header_str(&headers, header::ORIGIN)) {
+        return tempod_error_response(&TempodError::Forbidden(
+            "WebSocket origin not allowed".into(),
+        ))
+        .into_response();
+    }
+    let Some(websocket_permit) = state.limiter.try_acquire_websocket() else {
+        return tempod_error_response(&TempodError::ConnectionLimit(
+            WEBSOCKET_CONNECTION_LIMIT_MESSAGE.into(),
+        ))
+        .into_response();
+    };
+    let pool = Arc::clone(&state.pool);
+    let session_id = TempodSessionId(id);
+    ws.max_message_size(MAX_WS_PAYLOAD_BYTES)
+        .on_upgrade(move |socket| async move {
+            if let Some(Extension(slot)) = permit_slot
+                && let Ok(mut slot) = slot.lock()
+            {
+                slot.take();
+            }
+            let _websocket_permit = websocket_permit;
+            serve_session_bidi_websocket(socket, pool, session_id).await;
+        })
+}
+
+async fn serve_session_bidi_websocket(
+    mut socket: WebSocket,
+    pool: Arc<Mutex<SessionPool>>,
+    session_id: TempodSessionId,
+) {
+    while let Some(Ok(message)) = socket.recv().await {
+        let payload = match message {
+            WsMessage::Text(text) => Bytes::from(text),
+            WsMessage::Binary(bytes) => bytes,
+            WsMessage::Ping(_) | WsMessage::Pong(_) | WsMessage::Close(_) => continue,
+        };
+        let dispatch_pool = Arc::clone(&pool);
+        let id = session_id.clone();
+        let Ok(messages) = tokio::task::spawn_blocking(move || {
+            route_session_bidi_websocket(&dispatch_pool, &id, payload)
+        })
+        .await
+        else {
+            return;
+        };
+        for message in messages {
+            let Ok(payload) = bidi_message_payload(&message) else {
+                return;
+            };
+            let Ok(text) = String::from_utf8(payload) else {
+                return;
+            };
+            if socket.send(WsMessage::Text(text.into())).await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
 /// Lock the pool for a SHORT, engine-IPC-free critical section. Routes must
 /// never hold this guard across an engine round-trip (issue #230): engine work
 /// happens on cloned per-session driver handles after the guard is dropped.
@@ -4125,12 +5139,18 @@ fn lock_pool(pool: &Arc<Mutex<SessionPool>>) -> Result<MutexGuard<'_, SessionPoo
 fn create_session_shared(
     pool: &Arc<Mutex<SessionPool>>,
     url: String,
+    driverless: bool,
 ) -> Result<TempodSession, TempodError> {
     let root_driver = {
         let mut pool = lock_pool(pool)?;
         pool.enforce_terminal_session_retention();
         pool.ensure_accepting_session()?;
         enforce_tempod_navigation_url(&pool.url_policy, &url)?;
+        if !driverless && pool.driver.is_none() {
+            return Err(TempodError::DriverUnavailable(
+                "session creation requires an attached engine driver; pass driverless=true for an explicit metadata-only session".into(),
+            ));
+        }
         pool.driver.clone()
     };
 
@@ -4305,6 +5325,18 @@ fn route_session_act_batch(
     id: TempodSessionId,
     body: SessionActBatchRequest,
 ) -> Result<HttpResponse, TempodError> {
+    let request_fingerprint = session_act_batch_idempotency_fingerprint(&body);
+    {
+        let pool = lock_pool(pool)?;
+        pool.ensure_foreground_writer_available(&id)?;
+        if let Some(key) = body.idempotency_key.as_deref()
+            && let Some(response) =
+                pool.cached_session_act_batch_response(&id, key, &request_fingerprint)?
+        {
+            return Ok(HttpResponse::json(response.status, response.body));
+        }
+    }
+
     // Recompute taint from the session's live observation the same bounded way
     // the BiDi seam does (#342): fetch one observation only when page evidence
     // could change a gate outcome, and do it with NO pool lock held (engine
@@ -4312,21 +5344,39 @@ fn route_session_act_batch(
     // idempotency lease.
     let observation = session_batch_policy_observation(pool, &id, &body)?;
 
-    let (mut driver, request_fingerprint, idempotency_key, policy) = {
+    let (mut driver, idempotency_key, policy, consume_grant) = {
         let mut pool = lock_pool(pool)?;
-        let policy = enforce_session_batch_policy(
+        pool.ensure_foreground_writer_available(&id)?;
+        let server_confirmed = pool.validate_confirmation_grant(
+            &id,
+            body.confirmation_grant.as_ref(),
+            &request_fingerprint,
+            false,
+        )?;
+        let policy = match enforce_session_batch_policy(
             &pool.url_policy,
             pool.privacy_mode,
             &body,
             observation.as_ref(),
-        )?;
-        let request_fingerprint = session_act_batch_idempotency_fingerprint(&body);
-        if let Some(key) = body.idempotency_key.as_deref()
-            && let Some(response) =
-                pool.cached_session_act_batch_response(&id, key, &request_fingerprint)?
-        {
-            return Ok(HttpResponse::json(response.status, response.body));
-        }
+            server_confirmed,
+        ) {
+            Ok(policy) => policy,
+            Err(TempodError::PolicyDenied(mut error)) => {
+                if error.policy.confirmation_required && !server_confirmed {
+                    let request = pool.create_confirmation_request(
+                        &id,
+                        request_fingerprint.clone(),
+                        &error.policy,
+                        error.denied_action_index,
+                        error.denied_action_kind,
+                        &error.reason,
+                    )?;
+                    error.confirmation_request = Some(request);
+                }
+                return Err(TempodError::PolicyDenied(error));
+            }
+            Err(error) => return Err(error),
+        };
         let driver = pool.session_driver(&id)?;
         let idempotency_key = body.idempotency_key.clone();
         if let Some(key) = idempotency_key.as_deref() {
@@ -4338,7 +5388,15 @@ fn route_session_act_batch(
                 session_act_batch_unknown_outcome_response(&policy),
             )?;
         }
-        (driver, request_fingerprint, idempotency_key, policy)
+        if server_confirmed {
+            pool.validate_confirmation_grant(
+                &id,
+                body.confirmation_grant.as_ref(),
+                &request_fingerprint,
+                true,
+            )?;
+        }
+        (driver, idempotency_key, policy, server_confirmed)
     };
 
     let response = match futures::executor::block_on(driver.act_batch(&body.batch)) {
@@ -4354,6 +5412,9 @@ fn route_session_act_batch(
 
     if let Some(key) = idempotency_key {
         let mut pool = lock_pool(pool)?;
+        if consume_grant {
+            pool.prune_expired_confirmations(current_time_ms());
+        }
         pool.remember_session_act_batch_response(
             &id,
             &key,
@@ -4390,6 +5451,7 @@ fn enforce_session_batch_policy(
     privacy_mode: PrivacyMode,
     body: &SessionActBatchRequest,
     observation: Option<&CompiledObservation>,
+    server_confirmed: bool,
 ) -> Result<SessionBatchPolicyReport, TempodError> {
     if let Some(key) = body.idempotency_key.as_deref() {
         if key.is_empty() {
@@ -4419,7 +5481,7 @@ fn enforce_session_batch_policy(
         strongest_gate: ConfirmationGate::None,
         confirmation_required: false,
         confirmed: body.confirmed,
-        confirmed_effective: body.confirmed,
+        confirmed_effective: server_confirmed,
         confirmed_claim_ignored: false,
         idempotency_required: false,
         idempotency_key_provided: body.idempotency_key.is_some(),
@@ -4453,7 +5515,7 @@ fn enforce_session_batch_policy(
         }
     }
     report.confirmed_claim_ignored = report.confirmation_required && body.confirmed;
-    report.confirmed_effective = body.confirmed && !report.confirmed_claim_ignored;
+    report.confirmed_effective = server_confirmed;
     let missing_confirmation = report.confirmation_required && !report.confirmed_effective;
     let missing_idempotency_key = report.idempotency_required && body.idempotency_key.is_none();
     let idempotency_unavailable = report.idempotency_required && !report.idempotency_cache_retained;
@@ -4528,6 +5590,7 @@ fn deny_session_batch_policy(
         denied_action_index,
         denied_action_kind,
         policy: report,
+        confirmation_request: None,
     }))
 }
 
@@ -4651,7 +5714,6 @@ fn session_act_batch_idempotency_fingerprint(body: &SessionActBatchRequest) -> J
     json!({
         "batch": &body.batch,
         "input_tainted": body.input_tainted,
-        "confirmed": body.confirmed,
     })
 }
 
@@ -4677,6 +5739,7 @@ pub struct PolicyDeniedError {
     denied_action_index: usize,
     denied_action_kind: &'static str,
     policy: SessionBatchPolicyReport,
+    confirmation_request: Option<ConfirmationRequest>,
 }
 
 impl fmt::Display for PolicyDeniedError {
@@ -4725,6 +5788,7 @@ fn policy_denied_error_json(error: &PolicyDeniedError) -> JsonValue {
         "denied_action_index": error.denied_action_index,
         "denied_action_kind": error.denied_action_kind,
         "policy": session_batch_policy_json(&error.policy),
+        "confirmation_request": &error.confirmation_request,
     })
 }
 
@@ -4810,6 +5874,97 @@ pub fn tempod_openapi(base_url: &str) -> JsonValue {
                     }
                 }
             },
+            "/sessions/{session_id}": {
+                "delete": {
+                    "operationId": "closeSession",
+                    "security": [{"TempodBearer": []}],
+                    "parameters": [{"$ref": "#/components/parameters/SessionId"}],
+                    "responses": {
+                        "200": {"description": "Closed session"}
+                    }
+                }
+            },
+            "/sessions/{session_id}/adopt": {
+                "post": {
+                    "operationId": "adoptSession",
+                    "security": [{"TempodBearer": []}],
+                    "parameters": [{"$ref": "#/components/parameters/SessionId"}],
+                    "requestBody": {
+                        "required": false,
+                        "content": {"application/json": {"schema": {"$ref": "#/components/schemas/RegisterSurfaceRequest"}}}
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Human surface owns the shared session",
+                            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AdoptionLease"}}}
+                        },
+                        "409": {"description": "Session has an active writer"}
+                    }
+                }
+            },
+            "/sessions/{session_id}/handoff": {
+                "post": {
+                    "operationId": "handoffSession",
+                    "security": [{"TempodBearer": []}],
+                    "parameters": [{"$ref": "#/components/parameters/SessionId"}],
+                    "responses": {
+                        "200": {
+                            "description": "Session write ownership returned to the agent plane",
+                            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/TempodSession"}}}
+                        }
+                    }
+                }
+            },
+            "/sessions/{session_id}/manager": {
+                "get": {
+                    "operationId": "managerSession",
+                    "security": [{"TempodBearer": []}],
+                    "parameters": [{"$ref": "#/components/parameters/SessionId"}],
+                    "responses": {
+                        "200": {
+                            "description": "Manager snapshot for one shared session",
+                            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ManagerSessionState"}}}
+                        }
+                    }
+                }
+            },
+            "/sessions/{session_id}/surfaces": {
+                "post": {
+                    "operationId": "registerSessionSurface",
+                    "security": [{"TempodBearer": []}],
+                    "parameters": [{"$ref": "#/components/parameters/SessionId"}],
+                    "requestBody": {
+                        "required": false,
+                        "content": {"application/json": {"schema": {"$ref": "#/components/schemas/RegisterSurfaceRequest"}}}
+                    },
+                    "responses": {
+                        "201": {
+                            "description": "Registered native shell/WebView surface",
+                            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/SessionAttachment"}}}
+                        }
+                    }
+                }
+            },
+            "/sessions/{session_id}/surfaces/{surface_id}": {
+                "delete": {
+                    "operationId": "removeSessionSurface",
+                    "security": [{"TempodBearer": []}],
+                    "parameters": [
+                        {"$ref": "#/components/parameters/SessionId"},
+                        {"$ref": "#/components/parameters/SurfaceId"}
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "Removed native shell/WebView surface",
+                            "content": {"application/json": {"schema": {
+                                "type": "object",
+                                "required": ["removed"],
+                                "properties": {"removed": {"type": "boolean"}}
+                            }}}
+                        }
+                    }
+                }
+            },
             "/sessions/{session_id}/observe": {
                 "get": {
                     "operationId": "observeSession",
@@ -4834,6 +5989,44 @@ pub fn tempod_openapi(base_url: &str) -> JsonValue {
                     }
                 }
             },
+            "/sessions/{session_id}/mcp": {
+                "post": {
+                    "operationId": "mcpPostSession",
+                    "security": [{"TempodBearer": []}],
+                    "parameters": [{"$ref": "#/components/parameters/SessionId"}],
+                    "responses": {"200": {"description": "MCP JSON-RPC response bound to this session driver"}}
+                }
+            },
+            "/sessions/{session_id}/bidi": {
+                "get": {
+                    "operationId": "bidiWebSocketSession",
+                    "security": [{"TempodBearer": []}],
+                    "parameters": [{"$ref": "#/components/parameters/SessionId"}],
+                    "responses": {"101": {"description": "BiDi WebSocket bound to this session driver"}}
+                },
+                "post": {
+                    "operationId": "bidiPostSession",
+                    "security": [{"TempodBearer": []}],
+                    "parameters": [{"$ref": "#/components/parameters/SessionId"}],
+                    "responses": {"200": {"description": "BiDi command response bound to this session driver"}}
+                }
+            },
+            "/sessions/{session_id}/screenshot": {
+                "get": {
+                    "operationId": "screenshotSession",
+                    "security": [{"TempodBearer": []}],
+                    "parameters": [
+                        {"$ref": "#/components/parameters/SessionId"},
+                        {
+                            "name": "set_of_marks",
+                            "in": "query",
+                            "required": false,
+                            "schema": {"type": "boolean", "default": false}
+                        }
+                    ],
+                    "responses": {"200": {"description": "PNG screenshot for the shared session surface"}}
+                }
+            },
             "/sessions/{session_id}/events": {
                 "get": {
                     "operationId": "sessionEvents",
@@ -4855,6 +6048,56 @@ pub fn tempod_openapi(base_url: &str) -> JsonValue {
                     }
                 }
             },
+            "/sessions/{session_id}/events/stream": {
+                "get": {
+                    "operationId": "streamSessionEvents",
+                    "security": [{"TempodBearer": []}],
+                    "parameters": [
+                        {"$ref": "#/components/parameters/SessionId"},
+                        {
+                            "name": "after_seq",
+                            "in": "query",
+                            "required": false,
+                            "schema": {"type": "integer", "minimum": 0}
+                        }
+                    ],
+                    "responses": {"200": {"description": "Server-sent session event stream"}}
+                }
+            },
+            "/sessions/{session_id}/runs": {
+                "post": {
+                    "operationId": "createSessionRun",
+                    "security": [{"TempodBearer": []}],
+                    "parameters": [{"$ref": "#/components/parameters/SessionId"}],
+                    "requestBody": {
+                        "required": true,
+                        "content": {"application/json": {"schema": {"$ref": "#/components/schemas/CreateRunRequest"}}}
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Created and executed an agent run",
+                            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AgentRun"}}}
+                        },
+                        "409": {"description": "Session already has an active writer"}
+                    }
+                }
+            },
+            "/sessions/{session_id}/confirmations/{confirmation_id}": {
+                "post": {
+                    "operationId": "grantSessionConfirmation",
+                    "security": [{"TempodBearer": []}],
+                    "parameters": [
+                        {"$ref": "#/components/parameters/SessionId"},
+                        {"$ref": "#/components/parameters/ConfirmationId"}
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "Server-minted confirmation grant for one pending native confirmation",
+                            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ConfirmationGrant"}}}
+                        }
+                    }
+                }
+            },
             "/mcp": {
                 "get": {
                     "operationId": "mcpGet",
@@ -4865,6 +6108,102 @@ pub fn tempod_openapi(base_url: &str) -> JsonValue {
                     "operationId": "mcpPost",
                     "security": [{"TempodBearer": []}],
                     "responses": {"200": {"description": "MCP JSON-RPC response"}}
+                }
+            },
+            "/bidi": {
+                "get": {
+                    "operationId": "bidiWebSocket",
+                    "security": [{"TempodBearer": []}],
+                    "responses": {"101": {"description": "Root BiDi WebSocket"}}
+                },
+                "post": {
+                    "operationId": "bidiPost",
+                    "security": [{"TempodBearer": []}],
+                    "responses": {"200": {"description": "Root BiDi command response"}}
+                }
+            },
+            "/runs": {
+                "get": {
+                    "operationId": "listRuns",
+                    "security": [{"TempodBearer": []}],
+                    "parameters": [
+                        {
+                            "name": "session_id",
+                            "in": "query",
+                            "required": false,
+                            "schema": {"type": "string"}
+                        }
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "List agent runs",
+                            "content": {"application/json": {"schema": {
+                                "type": "array",
+                                "items": {"$ref": "#/components/schemas/AgentRun"}
+                            }}}
+                        }
+                    }
+                }
+            },
+            "/runs/{run_id}": {
+                "get": {
+                    "operationId": "getRun",
+                    "security": [{"TempodBearer": []}],
+                    "parameters": [{"$ref": "#/components/parameters/RunId"}],
+                    "responses": {
+                        "200": {
+                            "description": "Agent run",
+                            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AgentRun"}}}
+                        }
+                    }
+                }
+            },
+            "/runs/{run_id}/events": {
+                "get": {
+                    "operationId": "runEvents",
+                    "security": [{"TempodBearer": []}],
+                    "parameters": [
+                        {"$ref": "#/components/parameters/RunId"},
+                        {
+                            "name": "after_seq",
+                            "in": "query",
+                            "required": false,
+                            "schema": {"type": "integer", "minimum": 0}
+                        }
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "Session event window for the run's session",
+                            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/TempodSessionEvents"}}}
+                        }
+                    }
+                }
+            },
+            "/runs/{run_id}/cancel": {
+                "post": {
+                    "operationId": "cancelRun",
+                    "security": [{"TempodBearer": []}],
+                    "parameters": [{"$ref": "#/components/parameters/RunId"}],
+                    "responses": {
+                        "200": {
+                            "description": "Cancelled agent run",
+                            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AgentRun"}}}
+                        }
+                    }
+                }
+            },
+            "/runs/{run_id}/resume": {
+                "post": {
+                    "operationId": "resumeRun",
+                    "security": [{"TempodBearer": []}],
+                    "parameters": [{"$ref": "#/components/parameters/RunId"}],
+                    "responses": {
+                        "200": {
+                            "description": "Resumed agent run after human handoff",
+                            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AgentRun"}}}
+                        },
+                        "409": {"description": "Session is owned by a human surface"}
+                    }
                 }
             }
         },
@@ -4882,6 +6221,24 @@ pub fn tempod_openapi(base_url: &str) -> JsonValue {
                     "in": "path",
                     "required": true,
                     "schema": {"type": "string"}
+                },
+                "RunId": {
+                    "name": "run_id",
+                    "in": "path",
+                    "required": true,
+                    "schema": {"type": "string"}
+                },
+                "SurfaceId": {
+                    "name": "surface_id",
+                    "in": "path",
+                    "required": true,
+                    "schema": {"type": "string"}
+                },
+                "ConfirmationId": {
+                    "name": "confirmation_id",
+                    "in": "path",
+                    "required": true,
+                    "schema": {"type": "string"}
                 }
             },
             "schemas": {
@@ -4889,7 +6246,53 @@ pub fn tempod_openapi(base_url: &str) -> JsonValue {
                     "type": "object",
                     "additionalProperties": false,
                     "required": ["url"],
-                    "properties": {"url": {"type": "string", "format": "uri"}}
+                    "properties": {
+                        "url": {"type": "string", "format": "uri"},
+                        "driverless": {
+                            "type": "boolean",
+                            "default": false,
+                            "description": "Explicitly permit metadata-only session creation when no engine is attached."
+                        }
+                    }
+                },
+                "RegisterSurfaceRequest": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "surface_id": {"$ref": "#/components/schemas/ShellSurfaceId"},
+                        "platform": {"type": "string"},
+                        "label": {"type": "string"},
+                        "engine_tier": {"$ref": "#/components/schemas/BrowserEngineTier"},
+                        "profile_id": {"type": "string"},
+                        "storage_continuity": {"$ref": "#/components/schemas/StorageContinuityMode"}
+                    }
+                },
+                "CreateRunRequest": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "goal": {"type": "string"},
+                        "actions": {
+                            "type": "array",
+                            "items": {"type": "object"}
+                        },
+                        "max_rounds": {"type": "integer", "minimum": 1},
+                        "token_budget": {"type": "integer", "minimum": 0}
+                    }
+                },
+                "TempodSessionId": {
+                    "type": "string"
+                },
+                "TempodSession": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["id", "url", "state", "created_ms"],
+                    "properties": {
+                        "id": {"$ref": "#/components/schemas/TempodSessionId"},
+                        "url": {"type": "string"},
+                        "state": {"type": "string", "enum": ["running", "adopted", "killed"]},
+                        "created_ms": {"type": "integer", "minimum": 0}
+                    }
                 },
                 "ReadinessResponse": {
                     "type": "object",
@@ -4899,6 +6302,7 @@ pub fn tempod_openapi(base_url: &str) -> JsonValue {
                         "ready",
                         "draining",
                         "engine_attached",
+                        "engine_live",
                         "sessions",
                         "max_sessions",
                         "reasons"
@@ -4908,13 +6312,19 @@ pub fn tempod_openapi(base_url: &str) -> JsonValue {
                         "ready": {"type": "boolean"},
                         "draining": {"type": "boolean"},
                         "engine_attached": {"type": "boolean"},
+                        "engine_live": {"type": "boolean"},
                         "sessions": {"type": "integer", "minimum": 0},
                         "max_sessions": {"type": "integer", "minimum": 0},
                         "reasons": {
                             "type": "array",
                             "items": {
                                 "type": "string",
-                                "enum": ["draining", "engine_detached", "session_limit_reached"]
+                                "enum": [
+                                    "draining",
+                                    "engine_detached",
+                                    "engine_dead",
+                                    "session_limit_reached"
+                                ]
                             }
                         }
                     }
@@ -4931,7 +6341,289 @@ pub fn tempod_openapi(base_url: &str) -> JsonValue {
                             "type": "string",
                             "minLength": 1,
                             "maxLength": MAX_IDEMPOTENCY_KEY_BYTES
+                        },
+                        "confirmation_grant": {"$ref": "#/components/schemas/ConfirmationGrant"}
+                    }
+                },
+                "ShellSurfaceId": {
+                    "type": "string",
+                    "description": "Stable identifier for a native shell or WebView surface."
+                },
+                "AgentRunId": {
+                    "type": "string",
+                    "description": "Stable identifier for a tempod-managed agent run."
+                },
+                "AgentRunState": {
+                    "type": "string",
+                    "enum": ["queued", "running", "waiting_for_human", "completed", "failed", "cancelled"]
+                },
+                "BrowserEngineTier": {
+                    "type": "string",
+                    "enum": ["t1", "t2", "t3", "structured"]
+                },
+                "StorageContinuityMode": {
+                    "type": "string",
+                    "enum": ["shared_profile", "imported_profile", "ephemeral", "unsupported"]
+                },
+                "NativePromptKind": {
+                    "type": "string",
+                    "enum": [
+                        "fed_cm",
+                        "web_authn_passkey",
+                        "password_autofill",
+                        "captcha",
+                        "login",
+                        "permission",
+                        "other"
+                    ]
+                },
+                "NativePromptState": {
+                    "type": "string",
+                    "enum": ["pending", "resolved", "cancelled"]
+                },
+                "ControlOwner": {
+                    "oneOf": [
+                        {
+                            "type": "object",
+                            "required": ["kind"],
+                            "properties": {
+                                "kind": {"const": "agent"},
+                                "run_id": {"$ref": "#/components/schemas/AgentRunId"}
+                            }
+                        },
+                        {
+                            "type": "object",
+                            "required": ["kind", "surface_id"],
+                            "properties": {
+                                "kind": {"const": "human"},
+                                "surface_id": {"$ref": "#/components/schemas/ShellSurfaceId"}
+                            }
+                        },
+                        {
+                            "type": "object",
+                            "required": ["kind"],
+                            "properties": {"kind": {"const": "unowned"}}
                         }
+                    ]
+                },
+                "SessionAttachment": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["surface_id", "attached_ms"],
+                    "properties": {
+                        "surface_id": {"$ref": "#/components/schemas/ShellSurfaceId"},
+                        "platform": {"type": "string"},
+                        "label": {"type": "string"},
+                        "engine_tier": {"$ref": "#/components/schemas/BrowserEngineTier"},
+                        "profile_id": {"type": "string"},
+                        "storage_continuity": {"$ref": "#/components/schemas/StorageContinuityMode"},
+                        "attached_ms": {"type": "integer", "minimum": 0}
+                    }
+                },
+                "AdoptionLease": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["lease_id", "session_id", "owner", "adopted_ms"],
+                    "properties": {
+                        "lease_id": {"type": "string"},
+                        "session_id": {"type": "string"},
+                        "owner": {"$ref": "#/components/schemas/ControlOwner"},
+                        "adopted_ms": {"type": "integer", "minimum": 0}
+                    }
+                },
+                "ConfirmationRequest": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                        "confirmation_id",
+                        "session_id",
+                        "side_effect",
+                        "gate",
+                        "action_index",
+                        "action_kind",
+                        "reason",
+                        "created_ms",
+                        "expires_ms"
+                    ],
+                    "properties": {
+                        "confirmation_id": {"type": "string"},
+                        "session_id": {"type": "string"},
+                        "side_effect": {"type": "string", "enum": ["external_navigation", "send", "purchase", "delete"]},
+                        "gate": {"type": "string"},
+                        "action_index": {"type": "integer", "minimum": 0},
+                        "action_kind": {"type": "string"},
+                        "reason": {"type": "string"},
+                        "created_ms": {"type": "integer", "minimum": 0},
+                        "expires_ms": {"type": "integer", "minimum": 0}
+                    }
+                },
+                "ConfirmationGrant": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["confirmation_id", "grant_token", "issued_ms", "expires_ms"],
+                    "properties": {
+                        "confirmation_id": {"type": "string"},
+                        "grant_token": {"type": "string"},
+                        "issued_ms": {"type": "integer", "minimum": 0},
+                        "expires_ms": {"type": "integer", "minimum": 0}
+                    }
+                },
+                "NativePromptRequest": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                        "prompt_id",
+                        "session_id",
+                        "kind",
+                        "state",
+                        "reason",
+                        "created_ms"
+                    ],
+                    "properties": {
+                        "prompt_id": {"type": "string"},
+                        "session_id": {"type": "string"},
+                        "kind": {"$ref": "#/components/schemas/NativePromptKind"},
+                        "state": {"$ref": "#/components/schemas/NativePromptState"},
+                        "surface_id": {"$ref": "#/components/schemas/ShellSurfaceId"},
+                        "origin": {"type": "string"},
+                        "reason": {"type": "string"},
+                        "created_ms": {"type": "integer", "minimum": 0},
+                        "expires_ms": {"type": "integer", "minimum": 0}
+                    }
+                },
+                "AgentRun": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["run_id", "session_id", "state", "created_ms", "updated_ms"],
+                    "properties": {
+                        "run_id": {"$ref": "#/components/schemas/AgentRunId"},
+                        "session_id": {"type": "string"},
+                        "state": {"$ref": "#/components/schemas/AgentRunState"},
+                        "goal": {"type": "string"},
+                        "created_ms": {"type": "integer", "minimum": 0},
+                        "updated_ms": {"type": "integer", "minimum": 0},
+                        "completed_ms": {"type": "integer", "minimum": 0},
+                        "last_error": {"type": "string"}
+                    }
+                },
+                "ManagerEvent": {
+                    "oneOf": [
+                        {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["kind", "owner"],
+                            "properties": {
+                                "kind": {"const": "owner_changed"},
+                                "owner": {"$ref": "#/components/schemas/ControlOwner"}
+                            }
+                        },
+                        {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["kind", "attachment"],
+                            "properties": {
+                                "kind": {"const": "surface_registered"},
+                                "attachment": {"$ref": "#/components/schemas/SessionAttachment"}
+                            }
+                        },
+                        {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["kind", "surface_id"],
+                            "properties": {
+                                "kind": {"const": "surface_removed"},
+                                "surface_id": {"$ref": "#/components/schemas/ShellSurfaceId"}
+                            }
+                        },
+                        {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["kind", "request"],
+                            "properties": {
+                                "kind": {"const": "confirmation_requested"},
+                                "request": {"$ref": "#/components/schemas/ConfirmationRequest"}
+                            }
+                        },
+                        {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["kind", "confirmation_id", "grant"],
+                            "properties": {
+                                "kind": {"const": "confirmation_granted"},
+                                "confirmation_id": {"type": "string"},
+                                "grant": {"$ref": "#/components/schemas/ConfirmationGrant"}
+                            }
+                        },
+                        {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["kind", "run"],
+                            "properties": {
+                                "kind": {"const": "run_state_changed"},
+                                "run": {"$ref": "#/components/schemas/AgentRun"}
+                            }
+                        },
+                        {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["kind", "takeover"],
+                            "properties": {
+                                "kind": {"const": "human_takeover"},
+                                "takeover": {"$ref": "#/components/schemas/HumanTakeover"}
+                            }
+                        },
+                        {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["kind", "request"],
+                            "properties": {
+                                "kind": {"const": "native_prompt_requested"},
+                                "request": {"$ref": "#/components/schemas/NativePromptRequest"}
+                            }
+                        },
+                        {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["kind", "prompt_id", "state"],
+                            "properties": {
+                                "kind": {"const": "native_prompt_resolved"},
+                                "prompt_id": {"type": "string"},
+                                "state": {"$ref": "#/components/schemas/NativePromptState"}
+                            }
+                        }
+                    ]
+                },
+                "ManagerSessionState": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                        "session_id",
+                        "owner",
+                        "attachments",
+                        "runs",
+                        "pending_confirmations"
+                    ],
+                    "properties": {
+                        "session_id": {"type": "string"},
+                        "owner": {"$ref": "#/components/schemas/ControlOwner"},
+                        "active_run": {"$ref": "#/components/schemas/AgentRunId"},
+                        "attachments": {
+                            "type": "array",
+                            "items": {"$ref": "#/components/schemas/SessionAttachment"}
+                        },
+                        "runs": {
+                            "type": "array",
+                            "items": {"$ref": "#/components/schemas/AgentRun"}
+                        },
+                        "pending_confirmations": {
+                            "type": "array",
+                            "items": {"$ref": "#/components/schemas/ConfirmationRequest"}
+                        },
+                        "pending_native_prompts": {
+                            "type": "array",
+                            "items": {"$ref": "#/components/schemas/NativePromptRequest"}
+                        },
+                        "last_event_seq": {"type": "integer", "minimum": 0}
                     }
                 },
                 "TempodSessionEvent": {
@@ -4980,6 +6672,66 @@ fn after_seq(query: Option<&str>) -> Result<Option<u64>, TempodError> {
                 TempodError::BadRequest(format!("invalid after_seq cursor: {error}"))
             })?;
             return Ok(Some(parsed));
+        }
+    }
+    Ok(None)
+}
+
+fn after_seq_or_last_event_id(
+    query: Option<&str>,
+    last_event_id: Option<&str>,
+) -> Result<Option<u64>, TempodError> {
+    if let Some(after_seq) = after_seq(query)? {
+        return Ok(Some(after_seq));
+    }
+    let Some(last_event_id) = last_event_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    last_event_id
+        .parse::<u64>()
+        .map(Some)
+        .map_err(|error| TempodError::BadRequest(format!("invalid Last-Event-ID cursor: {error}")))
+}
+
+fn set_of_marks(query: Option<&str>) -> Result<bool, TempodError> {
+    let Some(query) = query else {
+        return Ok(false);
+    };
+    for pair in query.split('&') {
+        let Some((name, value)) = pair.split_once('=') else {
+            continue;
+        };
+        if name == "set_of_marks" {
+            return match value {
+                "1" | "true" | "yes" | "on" => Ok(true),
+                "0" | "false" | "no" | "off" => Ok(false),
+                _ => Err(TempodError::BadRequest(
+                    "invalid set_of_marks value; expected true or false".into(),
+                )),
+            };
+        }
+    }
+    Ok(false)
+}
+
+fn session_id_query(query: Option<&str>) -> Result<Option<String>, TempodError> {
+    let Some(query) = query else {
+        return Ok(None);
+    };
+    for pair in query.split('&') {
+        let Some((name, value)) = pair.split_once('=') else {
+            continue;
+        };
+        if name == "session_id" {
+            if value.trim().is_empty() {
+                return Err(TempodError::BadRequest(
+                    "session_id query parameter must not be empty".into(),
+                ));
+            }
+            return Ok(Some(value.to_string()));
         }
     }
     Ok(None)
@@ -5671,6 +7423,400 @@ fn route_mcp(pool: &Arc<Mutex<SessionPool>>, origin: Option<&str>, body: &[u8]) 
     HttpResponse::from_mcp(tempo_mcp::handle_post_driverless(origin, body))
 }
 
+fn route_session_mcp(
+    pool: &Arc<Mutex<SessionPool>>,
+    id: &TempodSessionId,
+    origin: Option<&str>,
+    body: &[u8],
+) -> HttpResponse {
+    let driver = match lock_pool(pool).and_then(|pool| {
+        pool.ensure_foreground_writer_available(id)?;
+        pool.session_driver(id)
+    }) {
+        Ok(driver) => driver,
+        Err(error) => return tempod_error_response(&error),
+    };
+    let server = tempo_mcp::TempoMcpServer::new(driver);
+    HttpResponse::from_mcp(futures::executor::block_on(
+        server.handle_post(origin, body),
+    ))
+}
+
+fn route_session_bidi(
+    pool: &Arc<Mutex<SessionPool>>,
+    id: &TempodSessionId,
+    body: Bytes,
+) -> HttpResponse {
+    route_session_bidi_dispatch(pool, id, body).response
+}
+
+fn route_session_bidi_websocket(
+    pool: &Arc<Mutex<SessionPool>>,
+    id: &TempodSessionId,
+    body: Bytes,
+) -> Vec<BidiMessage> {
+    let dispatch = route_session_bidi_dispatch(pool, id, body);
+    vec![dispatch.message]
+}
+
+fn route_session_bidi_dispatch(
+    pool: &Arc<Mutex<SessionPool>>,
+    session_id: &TempodSessionId,
+    body: Bytes,
+) -> BidiDispatchResult {
+    let mut router = BidiRouter::default();
+    match router.route_json(&body) {
+        Ok(RoutedCommand::Immediate(message))
+        | Ok(RoutedCommand::SessionStarted(message))
+        | Ok(RoutedCommand::SessionEnded(message)) => BidiDispatchResult::new(200, message),
+        Ok(RoutedCommand::Driver { id, command }) => {
+            route_session_bidi_driver(pool, session_id, id, command)
+        }
+        Err(error) => BidiDispatchResult::new(
+            400,
+            BidiMessage::error(None, BidiErrorCode::InvalidArgument, error.to_string()),
+        ),
+    }
+}
+
+fn session_bidi_driver_handle(
+    pool: &Arc<Mutex<SessionPool>>,
+    id: &TempodSessionId,
+) -> Result<AttachedEngineDriver, TempodError> {
+    let pool = lock_pool(pool)?;
+    pool.ensure_foreground_writer_available(id)?;
+    pool.session_driver(id)
+}
+
+fn route_session_bidi_driver(
+    pool: &Arc<Mutex<SessionPool>>,
+    session_id: &TempodSessionId,
+    id: tempo_bidi::CommandId,
+    command: BidiDriverCommand,
+) -> BidiDispatchResult {
+    match command {
+        BidiDriverCommand::Navigate(command) => {
+            if command.context != default_context_id() {
+                return unknown_browsing_context_result(id);
+            }
+            let Some(input_tainted) = command.input_tainted else {
+                return missing_bidi_input_taint_result(id);
+            };
+            let mut driver = match session_bidi_driver_handle(pool, session_id) {
+                Ok(driver) => driver,
+                Err(error) => {
+                    return BidiDispatchResult::new(
+                        error.status(),
+                        BidiMessage::error(
+                            Some(id),
+                            BidiErrorCode::UnknownError,
+                            error.to_string(),
+                        ),
+                    )
+                }
+            };
+            let claims = CallerPolicyClaims::new(Some(input_tainted), command.confirmed);
+            if let Some(denied) = gate_bidi_command(
+                &mut driver,
+                id,
+                command.action.side_effect(),
+                &action_caller_texts(&command.action),
+                claims,
+            ) {
+                return denied;
+            }
+            let url = command.url.clone();
+            match futures::executor::block_on(driver.goto(&url)) {
+                Ok(_) => BidiDispatchResult::new(
+                    200,
+                    bidi_success_or_error(
+                        id,
+                        NavigateResult {
+                            navigation: Some(format!("tempo-session-navigation-{id}")),
+                            url,
+                        },
+                    ),
+                ),
+                Err(error) => BidiDispatchResult::new(
+                    200,
+                    BidiMessage::error(Some(id), BidiErrorCode::UnknownError, error.to_string()),
+                ),
+            }
+        }
+        BidiDriverCommand::GetTree(command) => {
+            let root = command.root.unwrap_or_else(default_context_id);
+            if root != default_context_id() {
+                return unknown_browsing_context_result(id);
+            }
+            let mut driver = match session_bidi_driver_handle(pool, session_id) {
+                Ok(driver) => driver,
+                Err(error) => {
+                    return BidiDispatchResult::new(
+                        error.status(),
+                        BidiMessage::error(
+                            Some(id),
+                            BidiErrorCode::UnknownError,
+                            error.to_string(),
+                        ),
+                    )
+                }
+            };
+            match futures::executor::block_on(driver.observe()) {
+                Ok(observation) => BidiDispatchResult::new(
+                    200,
+                    bidi_success_or_error(
+                        id,
+                        GetTreeResult {
+                            contexts: vec![BrowsingContextInfo {
+                                context: default_context_id(),
+                                url: observation.url,
+                                children: Vec::new(),
+                            }],
+                        },
+                    ),
+                ),
+                Err(error) => BidiDispatchResult::new(
+                    200,
+                    BidiMessage::error(Some(id), BidiErrorCode::UnknownError, error.to_string()),
+                ),
+            }
+        }
+        BidiDriverCommand::CaptureScreenshot(command) => {
+            if command.context != default_context_id() {
+                return unknown_browsing_context_result(id);
+            }
+            let mut driver = match session_bidi_driver_handle(pool, session_id) {
+                Ok(driver) => driver,
+                Err(error) => {
+                    return BidiDispatchResult::new(
+                        error.status(),
+                        BidiMessage::error(
+                            Some(id),
+                            BidiErrorCode::UnknownError,
+                            error.to_string(),
+                        ),
+                    )
+                }
+            };
+            match futures::executor::block_on(driver.screenshot()) {
+                Ok(bytes) if bytes.len() <= MAX_SCREENSHOT_BYTES => BidiDispatchResult::new(
+                    200,
+                    bidi_success_or_error(
+                        id,
+                        CaptureScreenshotResult {
+                            data: base64::engine::general_purpose::STANDARD.encode(bytes),
+                        },
+                    ),
+                ),
+                Ok(bytes) => BidiDispatchResult::new(
+                    200,
+                    BidiMessage::error(
+                        Some(id),
+                        BidiErrorCode::UnknownError,
+                        output_cap_message("screenshot", bytes.len(), MAX_SCREENSHOT_BYTES),
+                    ),
+                ),
+                Err(error) => BidiDispatchResult::new(
+                    200,
+                    BidiMessage::error(Some(id), BidiErrorCode::UnknownError, error.to_string()),
+                ),
+            }
+        }
+        BidiDriverCommand::EvaluateScript(command) => {
+            if command.target.context != default_context_id() {
+                return unknown_browsing_context_result(id);
+            }
+            let Some(input_tainted) = command.input_tainted else {
+                return missing_bidi_input_taint_result(id);
+            };
+            let mut driver = match session_bidi_driver_handle(pool, session_id) {
+                Ok(driver) => driver,
+                Err(error) => {
+                    return BidiDispatchResult::new(
+                        error.status(),
+                        BidiMessage::error(
+                            Some(id),
+                            BidiErrorCode::UnknownError,
+                            error.to_string(),
+                        ),
+                    )
+                }
+            };
+            let claims = CallerPolicyClaims::new(Some(input_tainted), command.confirmed);
+            if let Some(denied) = gate_bidi_command(
+                &mut driver,
+                id,
+                SideEffect::Write,
+                &[command.expression.as_str()],
+                claims,
+            ) {
+                return denied;
+            }
+            let context = command.target.context.clone();
+            match futures::executor::block_on(
+                driver.evaluate_script(&command.expression, command.await_promise),
+            ) {
+                Ok(value) => BidiDispatchResult::new(
+                    200,
+                    bidi_success_or_error(
+                        id,
+                        ScriptEvaluateResult {
+                            result: value.into_value(),
+                            realm: Some(context.0),
+                        },
+                    ),
+                ),
+                Err(error) => BidiDispatchResult::new(
+                    200,
+                    BidiMessage::error(Some(id), BidiErrorCode::UnknownError, error.to_string()),
+                ),
+            }
+        }
+        BidiDriverCommand::CreateContext(_) | BidiDriverCommand::Close(_) => {
+            BidiDispatchResult::new(
+                200,
+                BidiMessage::error(
+                    Some(id),
+                    BidiErrorCode::UnknownError,
+                    "session-scoped BiDi v1 drives the shared session context only",
+                ),
+            )
+        }
+    }
+}
+
+fn route_session_screenshot(
+    pool: &Arc<Mutex<SessionPool>>,
+    id: &TempodSessionId,
+    set_of_marks: bool,
+) -> Result<HttpResponse, TempodError> {
+    let mut driver = lock_pool(pool)?.session_driver(id)?;
+    let observation = if set_of_marks {
+        Some(
+            futures::executor::block_on(driver.observe())
+                .map_err(|error| TempodError::Driver(error.to_string()))?,
+        )
+    } else {
+        None
+    };
+    let mut bytes = futures::executor::block_on(driver.screenshot())
+        .map_err(|error| TempodError::Driver(error.to_string()))?;
+    if bytes.len() > MAX_SCREENSHOT_BYTES {
+        return Err(TempodError::Driver(output_cap_message(
+            "screenshot",
+            bytes.len(),
+            MAX_SCREENSHOT_BYTES,
+        )));
+    }
+    if let Some(observation) = observation {
+        bytes = tempo_observe::composite_set_of_marks_png(&bytes, &observation)
+            .map_err(|error| TempodError::Driver(error.to_string()))?;
+        if bytes.len() > MAX_SCREENSHOT_BYTES {
+            return Err(TempodError::Driver(output_cap_message(
+                "screenshot",
+                bytes.len(),
+                MAX_SCREENSHOT_BYTES,
+            )));
+        }
+    }
+    Ok(HttpResponse::new(200, "image/png", bytes))
+}
+
+fn route_session_run_create(
+    pool: &Arc<Mutex<SessionPool>>,
+    session_id: TempodSessionId,
+    request: CreateRunRequest,
+) -> Result<HttpResponse, TempodError> {
+    let goal = request
+        .goal
+        .clone()
+        .unwrap_or_else(|| "scripted tempo run".to_string());
+    let (run, mut driver, start_url) = {
+        let mut pool = lock_pool(pool)?;
+        pool.begin_agent_run(&session_id, Some(goal.clone()))?
+    };
+
+    let journal_dir = tempod_runtime_dir().join("runs");
+    std::fs::create_dir_all(&journal_dir)?;
+    let journal_path = journal_dir.join(format!("{}.jsonl", run.run_id.0));
+    let ids = tempo_agent::AgentRunIds::new(run.run_id.0.clone(), session_id.0.clone());
+    let mut runner = tempo_agent::AgentRunner::new_plaintext_unsafe(&journal_path, ids);
+    if let Some(max_tokens) = request.token_budget {
+        runner = runner.with_token_budget(tempo_agent::TokenBudget::new(max_tokens));
+    }
+    let mut decider = tempo_agent::decider::ScriptedDecider::new(vec![request.actions, Vec::new()]);
+    let spec = tempo_agent::decider::DecidedTaskSpec::new(start_url, goal)
+        .with_max_rounds(request.max_rounds.unwrap_or(2));
+    let report =
+        futures::executor::block_on(runner.run_decided_task(&mut driver, &mut decider, &spec))
+            .map_err(|error| TempodError::Driver(error.to_string()))?;
+
+    let (state, error, takeover) = match report.status {
+        tempo_agent::decider::DecidedRunStatus::Completed
+        | tempo_agent::decider::DecidedRunStatus::AlreadyComplete => {
+            (AgentRunState::Completed, None, None)
+        }
+        tempo_agent::decider::DecidedRunStatus::HumanTakeoverRequired { takeover } => {
+            (AgentRunState::WaitingForHuman, None, Some(takeover))
+        }
+        other => (AgentRunState::Failed, Some(format!("{other:?}")), None),
+    };
+    let finished = {
+        let mut pool = lock_pool(pool)?;
+        let finished = pool.finish_agent_run(&run.run_id, state, error)?;
+        if let Some(takeover) = takeover {
+            pool.record_human_takeover(&session_id, takeover)?;
+        }
+        finished
+    };
+    Ok(HttpResponse::json(201, finished))
+}
+
+fn session_events_live_sse(
+    id: TempodSessionId,
+    replay: TempodSessionEvents,
+    receiver: broadcast::Receiver<TempodSessionEvent>,
+) -> Sse<impl futures::Stream<Item = Result<SseEvent, Infallible>> + Send + 'static> {
+    let replay = replay.events.into_iter().map(sse_session_event);
+    let live = futures::stream::unfold((id, receiver), |(id, mut receiver)| async move {
+        loop {
+            match receiver.recv().await {
+                Ok(event) if event.session_id == id => {
+                    return Some((sse_session_event(event), (id, receiver)));
+                }
+                Ok(_) => {}
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    return Some((sse_lagged_event(skipped), (id, receiver)));
+                }
+                Err(broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    });
+    Sse::new(futures::stream::iter(replay).chain(live)).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("tempo keepalive"),
+    )
+}
+
+fn sse_session_event(event: TempodSessionEvent) -> Result<SseEvent, Infallible> {
+    let id = event.seq.to_string();
+    let data = serde_json::to_string(&event)
+        .unwrap_or_else(|error| json!({"error": error.to_string()}).to_string());
+    Ok(SseEvent::default()
+        .event("session")
+        .id(id)
+        .retry(Duration::from_secs(2))
+        .data(data))
+}
+
+fn sse_lagged_event(skipped: u64) -> Result<SseEvent, Infallible> {
+    Ok(SseEvent::default()
+        .event("events_lagged")
+        .retry(Duration::from_secs(2))
+        .data(json!({"skipped": skipped}).to_string()))
+}
+
 fn valid_host_header(host: &str) -> bool {
     !host.is_empty()
         && host
@@ -5748,6 +7894,38 @@ fn canonical_ip_host(ip: std::net::IpAddr) -> String {
 #[serde(deny_unknown_fields)]
 struct CreateSessionRequest {
     url: String,
+    #[serde(default)]
+    driverless: bool,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegisterSurfaceRequest {
+    #[serde(default)]
+    pub surface_id: Option<ShellSurfaceId>,
+    #[serde(default)]
+    pub platform: Option<String>,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub engine_tier: Option<BrowserEngineTier>,
+    #[serde(default)]
+    pub profile_id: Option<String>,
+    #[serde(default)]
+    pub storage_continuity: Option<StorageContinuityMode>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateRunRequest {
+    #[serde(default)]
+    goal: Option<String>,
+    #[serde(default)]
+    actions: Vec<Action>,
+    #[serde(default)]
+    max_rounds: Option<usize>,
+    #[serde(default)]
+    token_budget: Option<u64>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -5759,6 +7937,8 @@ struct SessionActBatchRequest {
     confirmed: bool,
     #[serde(default)]
     idempotency_key: Option<String>,
+    #[serde(default)]
+    confirmation_grant: Option<ConfirmationGrant>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -5806,6 +7986,17 @@ impl IntoResponse for TempodError {
     fn into_response(self) -> Response {
         tempod_error_response(&self).into_response()
     }
+}
+
+fn parse_optional_json_request<T>(body: &[u8]) -> Result<T, TempodError>
+where
+    T: for<'de> Deserialize<'de> + Default,
+{
+    if body.iter().all(u8::is_ascii_whitespace) {
+        return Ok(T::default());
+    }
+    serde_json::from_slice(body)
+        .map_err(|err| TempodError::BadRequest(format!("invalid JSON request: {err}")))
 }
 
 #[derive(Debug, Error)]
@@ -5869,11 +8060,23 @@ impl TempodError {
     }
 }
 
-fn current_time_ms() -> u128 {
+fn current_time_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis())
+        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
         .unwrap_or(0)
+}
+
+fn random_hex(bytes: usize) -> Result<String, TempodError> {
+    let mut raw = vec![0_u8; bytes];
+    getrandom::fill(&mut raw)
+        .map_err(|error| TempodError::Driver(format!("random generation failed: {error}")))?;
+    let mut out = String::with_capacity(bytes * 2);
+    for byte in raw {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -5898,6 +8101,46 @@ mod tests {
     // RFC 6455 opcodes used by the raw-socket WebSocket test client.
     const WS_OPCODE_TEXT: u8 = 0x1;
     const WS_OPCODE_CLOSE: u8 = 0x8;
+
+    fn insert_test_run(
+        pool: &mut SessionPool,
+        session_id: &TempodSessionId,
+        state: AgentRunState,
+        active: bool,
+    ) -> AgentRunId {
+        let run_id = AgentRunId(format!("test-run-{}", pool.next_run_id));
+        pool.next_run_id = pool.next_run_id.saturating_add(1);
+        let now = current_time_ms();
+        let run = AgentRun {
+            run_id: run_id.clone(),
+            session_id: session_id.0.clone(),
+            state,
+            goal: Some("test goal".into()),
+            created_ms: now,
+            updated_ms: now,
+            completed_ms: matches!(
+                state,
+                AgentRunState::Completed | AgentRunState::Failed | AgentRunState::Cancelled
+            )
+            .then_some(now),
+            last_error: None,
+        };
+        pool.runs.insert(run_id.clone(), run);
+        pool.session_runs
+            .entry(session_id.clone())
+            .or_default()
+            .push(run_id.clone());
+        if active {
+            pool.active_runs.insert(session_id.clone(), run_id.clone());
+            pool.owners.insert(
+                session_id.clone(),
+                ControlOwner::Agent {
+                    run_id: Some(run_id.clone()),
+                },
+            );
+        }
+        run_id
+    }
 
     fn header_end(bytes: &[u8]) -> Option<usize> {
         bytes.windows(4).position(|window| window == b"\r\n\r\n")
@@ -6071,6 +8314,40 @@ mod tests {
     }
 
     #[test]
+    fn http_create_requires_engine_unless_driverless_is_explicit() -> TestResult {
+        let mut pool = SessionPool::default();
+        let rejected = handle_http_request(
+            &mut pool,
+            control_request(
+                "POST",
+                "/sessions",
+                None,
+                br#"{"url":"https://needs-engine.test"}"#,
+            ),
+        );
+        assert_eq!(rejected.status, 503);
+        let body: Value = serde_json::from_slice(&rejected.body)?;
+        assert!(body["error"]
+            .as_str()
+            .ok_or("error body should contain a string")?
+            .contains("requires an attached engine driver"));
+        assert!(pool.list().is_empty());
+
+        let created = handle_http_request(
+            &mut pool,
+            control_request(
+                "POST",
+                "/sessions",
+                None,
+                br#"{"url":"https://driverless.test","driverless":true}"#,
+            ),
+        );
+        assert_eq!(created.status, 201);
+        assert_eq!(pool.list().len(), 1);
+        Ok(())
+    }
+
+    #[test]
     fn session_idempotency_cache_uses_per_session_buckets() -> TestResult {
         let mut pool = SessionPool::default();
         let first = pool.finish_create("https://first.test".into(), None);
@@ -6214,6 +8491,535 @@ mod tests {
             .contains("confirmed=true was ignored"));
         assert_no_driver_ipc(&mut server_stream)?;
         discard_unserved_attached_engine(&mut pool);
+        Ok(())
+    }
+
+    #[test]
+    fn manager_snapshot_tracks_surface_adopt_and_handoff() -> TestResult {
+        let mut pool = SessionPool::default();
+        let session = pool.finish_create("https://manager.test".into(), None);
+
+        let adopted = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: format!("/sessions/{}/adopt", session.id.0),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: br#"{
+                    "surface_id":"desk-1",
+                    "platform":"macos",
+                    "label":"main",
+                    "engine_tier":"t2",
+                    "profile_id":"profile-main",
+                    "storage_continuity":"shared_profile"
+                }"#
+                .to_vec(),
+            },
+        )?;
+        assert_eq!(adopted.status, 200);
+        let lease: AdoptionLease = serde_json::from_slice(&adopted.body)?;
+        assert_eq!(
+            lease.owner,
+            ControlOwner::Human {
+                surface_id: ShellSurfaceId("desk-1".into())
+            }
+        );
+
+        let manager = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "GET".into(),
+                path: format!("/sessions/{}/manager", session.id.0),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: Vec::new(),
+            },
+        )?;
+        assert_eq!(manager.status, 200);
+        let manager: ManagerSessionState = serde_json::from_slice(&manager.body)?;
+        assert_eq!(manager.session_id, session.id.0);
+        assert_eq!(
+            manager.owner,
+            ControlOwner::Human {
+                surface_id: ShellSurfaceId("desk-1".into())
+            }
+        );
+        assert_eq!(manager.attachments.len(), 1);
+        assert_eq!(manager.attachments[0].platform.as_deref(), Some("macos"));
+        assert_eq!(
+            manager.attachments[0].engine_tier,
+            Some(BrowserEngineTier::T2)
+        );
+        assert_eq!(
+            manager.attachments[0].profile_id.as_deref(),
+            Some("profile-main")
+        );
+        assert_eq!(
+            manager.attachments[0].storage_continuity,
+            Some(StorageContinuityMode::SharedProfile)
+        );
+        assert!(manager.pending_native_prompts.is_empty());
+
+        let handed_off = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: format!("/sessions/{}/handoff", session.id.0),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: Vec::new(),
+            },
+        )?;
+        assert_eq!(handed_off.status, 200);
+
+        let manager = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "GET".into(),
+                path: format!("/sessions/{}/manager", session.id.0),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: Vec::new(),
+            },
+        )?;
+        let manager: ManagerSessionState = serde_json::from_slice(&manager.body)?;
+        assert_eq!(manager.owner, ControlOwner::Agent { run_id: None });
+        assert!(manager
+            .attachments
+            .iter()
+            .any(|attachment| attachment.surface_id == ShellSurfaceId("desk-1".into())));
+        Ok(())
+    }
+
+    #[test]
+    fn run_resume_requires_waiting_for_human_state() -> TestResult {
+        let mut pool = SessionPool::default();
+        let session = pool.finish_create("https://runs.test".into(), None);
+        let run_id = insert_test_run(&mut pool, &session.id, AgentRunState::Completed, false);
+
+        let error = match pool.resume_run(&run_id) {
+            Ok(_) => return Err("completed run must not resume".into()),
+            Err(error) => error,
+        };
+
+        assert!(
+            matches!(error, TempodError::Conflict(message) if message.contains("run_not_resumable"))
+        );
+        assert_eq!(pool.run(&run_id)?.state, AgentRunState::Completed);
+        assert_eq!(
+            pool.session_owner(&session.id),
+            ControlOwner::Agent { run_id: None }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn run_resume_rejects_human_owned_waiting_run() -> TestResult {
+        let mut pool = SessionPool::default();
+        let session = pool.finish_create("https://runs.test".into(), None);
+        let run_id = insert_test_run(&mut pool, &session.id, AgentRunState::WaitingForHuman, true);
+        pool.adopt_with_surface(
+            &session.id,
+            Some(RegisterSurfaceRequest {
+                surface_id: Some(ShellSurfaceId("desk-human".into())),
+                platform: Some("macos".into()),
+                label: None,
+                engine_tier: Some(BrowserEngineTier::T1),
+                profile_id: None,
+                storage_continuity: Some(StorageContinuityMode::SharedProfile),
+            }),
+        )?;
+
+        let error = match pool.resume_run(&run_id) {
+            Ok(_) => return Err("human-owned waiting run must require handoff first".into()),
+            Err(error) => error,
+        };
+
+        assert!(
+            matches!(error, TempodError::Conflict(message) if message.contains("human currently owns"))
+        );
+        assert_eq!(pool.run(&run_id)?.state, AgentRunState::WaitingForHuman);
+        assert_eq!(
+            pool.session_owner(&session.id),
+            ControlOwner::Human {
+                surface_id: ShellSurfaceId("desk-human".into())
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn run_resume_succeeds_after_handoff() -> TestResult {
+        let mut pool = SessionPool::default();
+        let session = pool.finish_create("https://runs.test".into(), None);
+        let run_id = insert_test_run(&mut pool, &session.id, AgentRunState::WaitingForHuman, true);
+        pool.adopt_with_surface(&session.id, None)?;
+        pool.handoff(&session.id)?;
+
+        let resumed = pool.resume_run(&run_id)?;
+
+        assert_eq!(resumed.state, AgentRunState::Running);
+        assert_eq!(
+            pool.session_owner(&session.id),
+            ControlOwner::Agent {
+                run_id: Some(run_id.clone())
+            }
+        );
+        assert_eq!(pool.active_runs.get(&session.id), Some(&run_id));
+        Ok(())
+    }
+
+    #[test]
+    fn run_cancel_rejects_terminal_run() -> TestResult {
+        let mut pool = SessionPool::default();
+        let session = pool.finish_create("https://runs.test".into(), None);
+        let run_id = insert_test_run(&mut pool, &session.id, AgentRunState::Failed, false);
+
+        let error = match pool.cancel_run(&run_id) {
+            Ok(_) => return Err("terminal run must not be cancellable".into()),
+            Err(error) => error,
+        };
+
+        assert!(
+            matches!(error, TempodError::Conflict(message) if message.contains("run_not_cancellable"))
+        );
+        assert_eq!(pool.run(&run_id)?.state, AgentRunState::Failed);
+        Ok(())
+    }
+
+    #[test]
+    fn run_cancelled_by_manager_is_not_overwritten_by_late_runner_finish() -> TestResult {
+        let mut pool = SessionPool::default();
+        let session = pool.finish_create("https://runs.test".into(), None);
+        let run_id = insert_test_run(&mut pool, &session.id, AgentRunState::Running, true);
+
+        let cancelled = pool.cancel_run(&run_id)?;
+        assert_eq!(cancelled.state, AgentRunState::Cancelled);
+        assert!(!pool.active_runs.contains_key(&session.id));
+
+        let late_finish = pool.finish_agent_run(&run_id, AgentRunState::Completed, None)?;
+
+        assert_eq!(late_finish.state, AgentRunState::Cancelled);
+        assert_eq!(pool.run(&run_id)?.state, AgentRunState::Cancelled);
+        assert!(!pool.active_runs.contains_key(&session.id));
+        Ok(())
+    }
+
+    #[test]
+    fn adopted_waiting_run_allows_foreground_session_act_batch() -> TestResult {
+        let mut pool = SessionPool::default();
+        let handle = attach_driver_handler(&mut pool, |request| match request.command {
+            HostDriverCommand::ActBatch { batch } => {
+                assert_eq!(
+                    batch,
+                    ActionBatch {
+                        actions: vec![Action::Scroll { x: 0.0, y: 4.0 }],
+                        quiescence: QuiescencePolicy::Composite,
+                    }
+                );
+                DriverResponse::Step {
+                    outcome: StepOutcome::Applied {
+                        diff: ObservationDiff {
+                            since_seq: 1,
+                            seq: 2,
+                            omitted: 0,
+                            added: Vec::new(),
+                            removed: Vec::new(),
+                            changed: Vec::new(),
+                        },
+                    }
+                    .into(),
+                }
+            }
+            _ => DriverResponse::Closed,
+        })?;
+        let session_driver = pool
+            .driver
+            .clone()
+            .ok_or("attached engine driver should be present")?;
+        let session = pool.finish_create("https://runs.test".into(), Some(session_driver));
+        insert_test_run(&mut pool, &session.id, AgentRunState::WaitingForHuman, true);
+        pool.adopt_with_surface(&session.id, None)?;
+
+        let body = serde_json::to_vec(&json!({
+            "batch": {
+                "actions": [{"kind": "scroll", "x": 0.0, "y": 4.0}],
+                "quiescence": "composite"
+            },
+            "input_tainted": false
+        }))?;
+        let response = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: format!("/sessions/{}/act_batch", session.id.0),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body,
+            },
+        )?;
+        join_driver_handler(handle)?;
+
+        assert_eq!(response.status, 200);
+        let value: Value = serde_json::from_slice(&response.body)?;
+        assert_eq!(value["status"], "applied");
+        assert!(matches!(
+            pool.session_owner(&session.id),
+            ControlOwner::Human { .. }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn active_agent_run_blocks_foreground_session_act_batch() -> TestResult {
+        let mut pool = SessionPool::default();
+        let session = pool.finish_create("https://runs.test".into(), None);
+        let run_id = insert_test_run(&mut pool, &session.id, AgentRunState::Running, true);
+
+        let body = serde_json::to_vec(&json!({
+            "batch": {
+                "actions": [{"kind": "scroll", "x": 0.0, "y": 4.0}],
+                "quiescence": "composite"
+            },
+            "input_tainted": false
+        }))?;
+        let response = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: format!("/sessions/{}/act_batch", session.id.0),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body,
+            },
+        )?;
+
+        assert_eq!(response.status, 409);
+        let value: Value = serde_json::from_slice(&response.body)?;
+        assert!(value["error"]
+            .as_str()
+            .is_some_and(|error| error.contains(&run_id.0)));
+        assert_eq!(
+            pool.session_owner(&session.id),
+            ControlOwner::Agent {
+                run_id: Some(run_id)
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn session_act_batch_requires_server_minted_confirmation_grant() -> TestResult {
+        let mut pool = SessionPool::default();
+        let handle = attach_driver_handler(&mut pool, |request| match request.command {
+            HostDriverCommand::ActBatch { batch } => {
+                assert_eq!(batch.actions.len(), 1);
+                DriverResponse::Step {
+                    outcome: StepOutcome::Applied {
+                        diff: ObservationDiff {
+                            since_seq: 1,
+                            seq: 2,
+                            omitted: 0,
+                            added: Vec::new(),
+                            removed: Vec::new(),
+                            changed: Vec::new(),
+                        },
+                    }
+                    .into(),
+                }
+            }
+            _ => DriverResponse::Closed,
+        })?;
+        let session_driver = pool
+            .driver
+            .clone()
+            .ok_or("attached engine driver should be present")?;
+        let session = pool.finish_create("https://confirm.test".into(), Some(session_driver));
+        let batch = json!({
+            "actions": [{"kind": "click", "node": "purchase"}],
+            "quiescence": "composite"
+        });
+        let first_body = serde_json::to_vec(&json!({
+            "batch": batch,
+            "input_tainted": false,
+            "confirmed": true,
+            "idempotency_key": "purchase-1"
+        }))?;
+
+        let denied = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: format!("/sessions/{}/act_batch", session.id.0),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: first_body.clone(),
+            },
+        )?;
+        assert_eq!(denied.status, 403);
+        let denied: Value = serde_json::from_slice(&denied.body)?;
+        assert_eq!(denied["policy"]["confirmed"], true);
+        assert_eq!(denied["policy"]["confirmed_effective"], false);
+        assert_eq!(
+            denied["confirmation_request"]["session_id"],
+            session.id.0.as_str()
+        );
+        let confirmation_id = denied["confirmation_request"]["confirmation_id"]
+            .as_str()
+            .ok_or("denial should include confirmation id")?;
+
+        let manager = pool.manager_state(&session.id)?;
+        assert_eq!(manager.pending_confirmations.len(), 1);
+
+        let duplicate_denied = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: format!("/sessions/{}/act_batch", session.id.0),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: first_body,
+            },
+        )?;
+        assert_eq!(duplicate_denied.status, 403);
+        let duplicate_denied: Value = serde_json::from_slice(&duplicate_denied.body)?;
+        assert_eq!(
+            duplicate_denied["confirmation_request"]["confirmation_id"],
+            confirmation_id
+        );
+        assert_eq!(
+            pool.manager_state(&session.id)?.pending_confirmations.len(),
+            1
+        );
+
+        let grant_response = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: format!("/sessions/{}/confirmations/{confirmation_id}", session.id.0),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: Vec::new(),
+            },
+        )?;
+        assert_eq!(grant_response.status, 200);
+        let grant: ConfirmationGrant = serde_json::from_slice(&grant_response.body)?;
+        let confirmation_event = pool
+            .events(&session.id, None)?
+            .events
+            .into_iter()
+            .find_map(|event| match event.event {
+                TempodSessionEventKind::Manager {
+                    event:
+                        ManagerEvent::ConfirmationGranted {
+                            confirmation_id: event_confirmation_id,
+                            grant: event_grant,
+                        },
+                } if event_confirmation_id == confirmation_id => Some(event_grant),
+                _ => None,
+            })
+            .ok_or("confirmation grant event should be recorded")?;
+        assert_eq!(confirmation_event, grant);
+
+        let duplicate_grant = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: format!("/sessions/{}/confirmations/{confirmation_id}", session.id.0),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: Vec::new(),
+            },
+        )?;
+        assert_eq!(duplicate_grant.status, 409);
+
+        let mismatched_body = serde_json::to_vec(&json!({
+            "batch": {
+                "actions": [{"kind": "click", "node": "other-purchase"}],
+                "quiescence": "composite"
+            },
+            "input_tainted": false,
+            "idempotency_key": "purchase-mismatch",
+            "confirmation_grant": grant.clone()
+        }))?;
+        let mismatched = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: format!("/sessions/{}/act_batch", session.id.0),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: mismatched_body,
+            },
+        )?;
+        assert_eq!(mismatched.status, 403);
+        let mismatched: Value = serde_json::from_slice(&mismatched.body)?;
+        assert!(mismatched["error"]
+            .as_str()
+            .ok_or("mismatch should include an error string")?
+            .contains("does not match this session request"));
+
+        let granted_body = serde_json::to_vec(&json!({
+            "batch": batch,
+            "input_tainted": false,
+            "idempotency_key": "purchase-1",
+            "confirmation_grant": grant.clone()
+        }))?;
+        let executed = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: format!("/sessions/{}/act_batch", session.id.0),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: granted_body,
+            },
+        )?;
+        join_driver_handler(handle)?;
+        assert_eq!(executed.status, 200);
+        let executed: Value = serde_json::from_slice(&executed.body)?;
+        assert_eq!(executed["status"], "applied");
+        assert_eq!(executed["policy"]["confirmed_effective"], true);
+
+        let manager = pool.manager_state(&session.id)?;
+        assert!(manager.pending_confirmations.is_empty());
+
+        let replay_body = serde_json::to_vec(&json!({
+            "batch": batch,
+            "input_tainted": false,
+            "idempotency_key": "purchase-replay",
+            "confirmation_grant": grant
+        }))?;
+        let replay = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: format!("/sessions/{}/act_batch", session.id.0),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: replay_body,
+            },
+        )?;
+        assert_eq!(replay.status, 403);
+        let replay: Value = serde_json::from_slice(&replay.body)?;
+        assert!(replay["error"]
+            .as_str()
+            .ok_or("replay should include an error string")?
+            .contains("already used"));
         Ok(())
     }
 
@@ -7957,28 +10763,33 @@ mod tests {
         let step_event = pool.record_step(&session.id, step.clone())?;
         pool.kill(&session.id)?;
 
-        assert_eq!(step_event.seq, 2);
+        assert_eq!(step_event.seq, 4);
         assert_eq!(
             step_event.event,
             TempodSessionEventKind::StepTriple { triple: step }
         );
 
         let events = pool.events(&session.id, None)?.events;
-        assert_eq!(events.len(), 4);
+        assert_eq!(events.len(), 6);
+        let lifecycle = events
+            .iter()
+            .filter(|event| !matches!(event.event, TempodSessionEventKind::Manager { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(lifecycle.len(), 4);
         assert!(matches!(
-            events[0].event,
+            lifecycle[0].event,
             TempodSessionEventKind::SessionCreated { .. }
         ));
-        assert_eq!(events[1].event, TempodSessionEventKind::SessionAdopted);
+        assert_eq!(lifecycle[1].event, TempodSessionEventKind::SessionAdopted);
         assert!(matches!(
-            events[2].event,
+            lifecycle[2].event,
             TempodSessionEventKind::StepTriple { .. }
         ));
-        assert_eq!(events[3].event, TempodSessionEventKind::SessionKilled);
+        assert_eq!(lifecycle[3].event, TempodSessionEventKind::SessionKilled);
 
-        let after_adopt = pool.events(&session.id, Some(1))?.events;
+        let after_adopt = pool.events(&session.id, Some(3))?.events;
         assert_eq!(after_adopt.len(), 2);
-        assert_eq!(after_adopt[0].seq, 2);
+        assert_eq!(after_adopt[0].seq, 4);
         Ok(())
     }
 
@@ -8039,6 +10850,33 @@ mod tests {
             pool.events(&session.id, None),
             Err(TempodError::SessionNotFound(_))
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn stealth_mode_live_events_use_volatile_monotonic_sequence_ids() -> TestResult {
+        let mut pool = SessionPool::default().with_privacy_mode(PrivacyMode::Stealth);
+        let session = pool.create("https://stealth-live.test")?;
+        let (replay, mut receiver) = pool.subscribe_events(&session.id, None)?;
+
+        assert!(replay.events.is_empty());
+
+        pool.adopt(&session.id)?;
+        pool.record_step(&session.id, sample_step_triple(13))?;
+
+        let adopted = receiver
+            .try_recv()
+            .map_err(|error| TempodError::Driver(error.to_string()))?;
+        let step = receiver
+            .try_recv()
+            .map_err(|error| TempodError::Driver(error.to_string()))?;
+        assert_eq!(adopted.session_id, session.id);
+        assert_eq!(step.session_id, session.id);
+        assert!(
+            adopted.seq < step.seq,
+            "stealth live SSE ids must be usable for in-connection dedupe"
+        );
+        assert!(pool.events(&session.id, None)?.events.is_empty());
         Ok(())
     }
 
@@ -8252,7 +11090,11 @@ mod tests {
             Some(TempodSessionEventKind::SessionDrained)
         );
         assert_eq!(
-            adopted_events.last().map(|event| event.event.clone()),
+            adopted_events
+                .iter()
+                .rev()
+                .find(|event| !matches!(event.event, TempodSessionEventKind::Manager { .. }))
+                .map(|event| event.event.clone()),
             Some(TempodSessionEventKind::SessionAdopted)
         );
         Ok(())
@@ -8344,9 +11186,13 @@ mod tests {
         let server_pool = Arc::clone(&pool);
         let handle = thread::spawn(move || serve_one(listener, server_pool));
 
+        let body = r#"{"url":"https://one.test","driverless":true}"#;
         let response = send_http(
             addr,
-            "POST /sessions HTTP/1.1\r\ncontent-length: 26\r\n\r\n{\"url\":\"https://one.test\"}",
+            &format!(
+                "POST /sessions HTTP/1.1\r\ncontent-length: {}\r\n\r\n{body}",
+                body.len()
+            ),
         )?;
         join_server(handle)?;
 
@@ -8442,6 +11288,41 @@ mod tests {
 
         assert_eq!(bad_cursor.status, 400);
         assert_eq!(missing_session.status, 404);
+        Ok(())
+    }
+
+    #[test]
+    fn session_event_subscription_replays_then_receives_live_events() -> TestResult {
+        let mut pool = SessionPool::default();
+        let session = pool.create("https://events.test")?;
+        let (replay, mut receiver) = pool.subscribe_events(&session.id, None)?;
+
+        assert_eq!(replay.events.len(), 1);
+        assert_eq!(replay.events[0].seq, 0);
+        assert!(receiver.try_recv().is_err());
+
+        pool.record_step(&session.id, sample_step_triple(2))?;
+        let live = receiver
+            .try_recv()
+            .map_err(|error| TempodError::Driver(error.to_string()))?;
+        assert_eq!(live.session_id, session.id);
+        assert_eq!(live.seq, 1);
+        assert!(matches!(
+            live.event,
+            TempodSessionEventKind::StepTriple { .. }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn event_stream_cursor_accepts_query_or_last_event_id() -> TestResult {
+        assert_eq!(
+            after_seq_or_last_event_id(Some("after_seq=7"), Some("3"))?,
+            Some(7)
+        );
+        assert_eq!(after_seq_or_last_event_id(None, Some("3"))?, Some(3));
+        assert_eq!(after_seq_or_last_event_id(None, Some("  "))?, None);
+        assert!(after_seq_or_last_event_id(None, Some("bad")).is_err());
         Ok(())
     }
 
@@ -8546,7 +11427,7 @@ mod tests {
                 headers: BTreeMap::new(),
                 host: None,
                 origin: None,
-                body: br#"{"url":"https://first.test"}"#.to_vec(),
+                body: br#"{"url":"https://first.test","driverless":true}"#.to_vec(),
             },
         );
         assert_eq!(created.status, 201);
@@ -8559,7 +11440,7 @@ mod tests {
                 headers: BTreeMap::new(),
                 host: None,
                 origin: None,
-                body: br#"{"url":"https://second.test"}"#.to_vec(),
+                body: br#"{"url":"https://second.test","driverless":true}"#.to_vec(),
             },
         );
         assert_eq!(rejected.status, 429);
@@ -8733,7 +11614,12 @@ mod tests {
         assert_eq!(
             openapi["components"]["schemas"]["ReadinessResponse"]["properties"]["reasons"]["items"]
                 ["enum"],
-            json!(["draining", "engine_detached", "session_limit_reached"])
+            json!([
+                "draining",
+                "engine_detached",
+                "engine_dead",
+                "session_limit_reached"
+            ])
         );
         assert_eq!(
             openapi["paths"]["/sessions/{session_id}/events"]["get"]["operationId"],
@@ -8748,6 +11634,122 @@ mod tests {
             openapi["components"]["schemas"]["TempodSessionEvents"]["properties"]
                 ["truncated_before_seq"]["anyOf"][1]["type"],
             "null"
+        );
+        assert_eq!(
+            openapi["components"]["schemas"]["CreateSessionRequest"]["properties"]["driverless"]
+                ["default"],
+            false
+        );
+        assert_eq!(
+            openapi["components"]["schemas"]["SessionActBatchRequest"]["properties"]
+                ["confirmation_grant"]["$ref"],
+            "#/components/schemas/ConfirmationGrant"
+        );
+        assert_eq!(
+            openapi["paths"]["/sessions/{session_id}/manager"]["get"]["operationId"],
+            "managerSession"
+        );
+        assert_eq!(
+            openapi["paths"]["/sessions/{session_id}/events/stream"]["get"]["operationId"],
+            "streamSessionEvents"
+        );
+        assert_eq!(
+            openapi["paths"]["/sessions/{session_id}/events/stream"]["get"]["parameters"][1]
+                ["name"],
+            "after_seq"
+        );
+        assert_eq!(
+            openapi["paths"]["/sessions/{session_id}/runs"]["post"]["responses"]["409"]
+                ["description"],
+            "Session already has an active writer"
+        );
+        assert_eq!(
+            openapi["paths"]["/sessions/{session_id}/mcp"]["post"]["operationId"],
+            "mcpPostSession"
+        );
+        assert_eq!(
+            openapi["paths"]["/sessions/{session_id}/bidi"]["post"]["operationId"],
+            "bidiPostSession"
+        );
+        assert_eq!(
+            openapi["paths"]["/sessions/{session_id}/screenshot"]["get"]["parameters"][1]["name"],
+            "set_of_marks"
+        );
+        assert_eq!(
+            openapi["paths"]["/sessions/{session_id}/surfaces/{surface_id}"]["delete"]
+                ["parameters"][1]["$ref"],
+            "#/components/parameters/SurfaceId"
+        );
+        assert_eq!(
+            openapi["paths"]["/sessions/{session_id}/surfaces"]["post"]["responses"]["201"]
+                ["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/SessionAttachment"
+        );
+        assert_eq!(
+            openapi["components"]["schemas"]["RegisterSurfaceRequest"]["properties"]["engine_tier"]
+                ["$ref"],
+            "#/components/schemas/BrowserEngineTier"
+        );
+        assert_eq!(
+            openapi["components"]["schemas"]["SessionAttachment"]["properties"]
+                ["storage_continuity"]["$ref"],
+            "#/components/schemas/StorageContinuityMode"
+        );
+        assert_eq!(
+            openapi["paths"]["/sessions/{session_id}/surfaces/{surface_id}"]["delete"]["responses"]
+                ["200"]["content"]["application/json"]["schema"]["properties"]["removed"]["type"],
+            "boolean"
+        );
+        assert_eq!(
+            openapi["paths"]["/sessions/{session_id}/handoff"]["post"]["responses"]["200"]
+                ["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/TempodSession"
+        );
+        assert_eq!(
+            openapi["paths"]["/sessions/{session_id}/confirmations/{confirmation_id}"]["post"]
+                ["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/ConfirmationGrant"
+        );
+        assert_eq!(openapi["paths"]["/runs"]["get"]["operationId"], "listRuns");
+        assert_eq!(
+            openapi["paths"]["/runs/{run_id}/resume"]["post"]["responses"]["409"]["description"],
+            "Session is owned by a human surface"
+        );
+        assert_eq!(
+            openapi["components"]["schemas"]["AgentRunState"]["enum"],
+            json!([
+                "queued",
+                "running",
+                "waiting_for_human",
+                "completed",
+                "failed",
+                "cancelled"
+            ])
+        );
+        assert_eq!(
+            openapi["components"]["schemas"]["ManagerSessionState"]["properties"]["owner"]["$ref"],
+            "#/components/schemas/ControlOwner"
+        );
+        assert_eq!(
+            openapi["components"]["schemas"]["ManagerSessionState"]["properties"]
+                ["pending_native_prompts"]["items"]["$ref"],
+            "#/components/schemas/NativePromptRequest"
+        );
+        assert_eq!(
+            openapi["components"]["schemas"]["ManagerEvent"]["oneOf"]
+                .as_array()
+                .map(Vec::len),
+            Some(9)
+        );
+        assert_eq!(
+            openapi["components"]["schemas"]["ManagerEvent"]["oneOf"][0]["properties"]["kind"]
+                ["const"],
+            "owner_changed"
+        );
+        assert_eq!(
+            openapi["components"]["schemas"]["ManagerEvent"]["oneOf"][0]["properties"]["owner"]
+                ["$ref"],
+            "#/components/schemas/ControlOwner"
         );
     }
 
@@ -9684,6 +12686,144 @@ mod tests {
         assert_eq!(value["id"], 12);
         assert_eq!(value["result"]["structuredContent"]["status"], "applied");
         assert_eq!(value["result"]["structuredContent"]["diff"]["seq"], 2);
+        Ok(())
+    }
+
+    #[test]
+    fn session_scoped_mcp_routes_to_session_driver() -> TestResult {
+        let mut pool = SessionPool::default();
+        let handle = attach_driver_handler(&mut pool, |request| {
+            assert_eq!(request.command, HostDriverCommand::Observe);
+            DriverResponse::Observation {
+                observation: observation("https://session-mcp.test", 11),
+            }
+        })?;
+        let session_driver = pool
+            .driver
+            .clone()
+            .ok_or("attached engine driver should be present")?;
+        let session = pool.finish_create("https://session-mcp.test".into(), Some(session_driver));
+
+        let mut request = mcp_tool_request(21, "observe", json!({}))?;
+        request.path = format!("/sessions/{}/mcp", session.id.0);
+        let response = route_http_request(&mut pool, request)?;
+        join_driver_handler(handle)?;
+
+        assert_eq!(response.status, 200);
+        let value: Value = serde_json::from_slice(&response.body)?;
+        assert_eq!(value["id"], 21);
+        assert_eq!(
+            value["result"]["structuredContent"]["url"],
+            "https://session-mcp.test"
+        );
+        assert_eq!(value["result"]["structuredContent"]["seq"], 11);
+        Ok(())
+    }
+
+    #[test]
+    fn adopted_waiting_run_allows_foreground_session_mcp_write() -> TestResult {
+        let mut pool = SessionPool::default();
+        let handle = attach_driver_handler(&mut pool, |request| {
+            assert_eq!(
+                request.command,
+                HostDriverCommand::ActBatch {
+                    batch: ActionBatch {
+                        actions: vec![Action::Scroll { x: 0.0, y: 12.0 }],
+                        quiescence: QuiescencePolicy::Composite,
+                    },
+                }
+            );
+            DriverResponse::Step {
+                outcome: StepOutcome::Applied {
+                    diff: ObservationDiff {
+                        since_seq: 1,
+                        seq: 2,
+                        omitted: 0,
+                        added: Vec::new(),
+                        removed: Vec::new(),
+                        changed: Vec::new(),
+                    },
+                }
+                .into(),
+            }
+        })?;
+        let session_driver = pool
+            .driver
+            .clone()
+            .ok_or("attached engine driver should be present")?;
+        let session = pool.finish_create("https://session-human.test".into(), Some(session_driver));
+        insert_test_run(&mut pool, &session.id, AgentRunState::WaitingForHuman, true);
+        pool.adopt_with_surface(
+            &session.id,
+            Some(RegisterSurfaceRequest {
+                surface_id: Some(ShellSurfaceId("desk-human".into())),
+                platform: Some("macos".into()),
+                label: None,
+                engine_tier: Some(BrowserEngineTier::T1),
+                profile_id: None,
+                storage_continuity: Some(StorageContinuityMode::SharedProfile),
+            }),
+        )?;
+
+        let mut request = mcp_tool_request(
+            22,
+            "act_batch",
+            json!({
+                "batch": {
+                    "actions": [{"kind": "scroll", "x": 0.0, "y": 12.0}],
+                    "quiescence": "composite",
+                },
+                "input_tainted": false
+            }),
+        )?;
+        request.path = format!("/sessions/{}/mcp", session.id.0);
+        let response = route_http_request(&mut pool, request)?;
+        join_driver_handler(handle)?;
+
+        assert_eq!(response.status, 200);
+        let value: Value = serde_json::from_slice(&response.body)?;
+        assert_eq!(value["id"], 22);
+        assert_eq!(value["result"]["structuredContent"]["status"], "applied");
+        assert_eq!(
+            pool.session_owner(&session.id),
+            ControlOwner::Human {
+                surface_id: ShellSurfaceId("desk-human".into())
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn waiting_run_without_adoption_blocks_foreground_session_mcp_write() -> TestResult {
+        let mut pool = SessionPool::default();
+        let session = pool.finish_create("https://session-agent.test".into(), None);
+        let run_id = insert_test_run(&mut pool, &session.id, AgentRunState::WaitingForHuman, true);
+
+        let mut request = mcp_tool_request(
+            23,
+            "act_batch",
+            json!({
+                "batch": {
+                    "actions": [{"kind": "scroll", "x": 0.0, "y": 12.0}],
+                    "quiescence": "composite",
+                },
+                "input_tainted": false
+            }),
+        )?;
+        request.path = format!("/sessions/{}/mcp", session.id.0);
+        let response = route_http_request(&mut pool, request)?;
+
+        assert_eq!(response.status, 409);
+        let value: Value = serde_json::from_slice(&response.body)?;
+        assert!(value["error"]
+            .as_str()
+            .is_some_and(|error| error.contains(&run_id.0)));
+        assert_eq!(
+            pool.session_owner(&session.id),
+            ControlOwner::Agent {
+                run_id: Some(run_id)
+            }
+        );
         Ok(())
     }
 
@@ -10772,7 +13912,7 @@ mod tests {
         let server_pool = Arc::clone(&pool);
         let handle = thread::spawn(move || serve_one(listener, server_pool));
 
-        let body = r#"{"url":"https://chunked.test"}"#;
+        let body = r#"{"url":"https://chunked.test","driverless":true}"#;
         let request = format!(
             "POST /sessions HTTP/1.1\r\nhost: 127.0.0.1\r\ntransfer-encoding: chunked\r\n\r\n{len:x}\r\n{body}\r\n0\r\n\r\n",
             len = body.len(),
@@ -11458,7 +14598,7 @@ mod tests {
                 "POST",
                 "/sessions",
                 None,
-                br#"{"url":"https://example.test"}"#,
+                br#"{"url":"https://example.test","driverless":true}"#,
             ),
         );
         assert_eq!(created.status, 201);
@@ -11597,7 +14737,7 @@ mod tests {
     fn control_routes_reject_cross_origin_requests() -> TestResult {
         // #83 follow-up: session/control-plane routes must share the loopback
         // Origin guard so a DNS-rebinding page cannot create/drive sessions.
-        let create_body = br#"{"url":"https://example.test"}"#;
+        let create_body = br#"{"url":"https://example.test","driverless":true}"#;
 
         // Cross-origin POST /sessions is blocked before the handler runs (no
         // session is created).
@@ -11660,7 +14800,7 @@ mod tests {
     fn control_routes_reject_untrusted_host_without_origin() -> TestResult {
         // #375: after DNS rebinding, browser fetches can be same-origin and
         // omit Origin, but the Host header remains attacker-controlled.
-        let create_body = br#"{"url":"https://example.test"}"#;
+        let create_body = br#"{"url":"https://example.test","driverless":true}"#;
         let mut pool = SessionPool::default();
         let blocked = handle_http_request(
             &mut pool,
@@ -11733,7 +14873,7 @@ mod tests {
     #[test]
     fn loopback_control_routes_require_runtime_capability_when_auth_is_enabled() -> TestResult {
         let auth = TempodAuth::bearer("runtime-token")?;
-        let create_body = br#"{"url":"https://loopback.test"}"#;
+        let create_body = br#"{"url":"https://loopback.test","driverless":true}"#;
         let mut pool = SessionPool::default();
 
         let missing = handle_http_request_with_auth(
@@ -11846,7 +14986,7 @@ mod tests {
             .allow_remote_binds()
             .with_auth(TempodAuth::bearer("secret-token")?);
         let handle = thread::spawn(move || serve_one_with_config(listener, pool, config));
-        let body = r#"{"url":"https://one.test"}"#;
+        let body = r#"{"url":"https://one.test","driverless":true}"#;
 
         let response = send_http(
             connect_addr,
@@ -11866,7 +15006,7 @@ mod tests {
     fn auth_config_requires_bearer_for_rest_control_and_allows_missing_origin_with_token(
     ) -> TestResult {
         let auth = TempodAuth::bearer("secret-token")?;
-        let create_body = br#"{"url":"https://example.test"}"#;
+        let create_body = br#"{"url":"https://example.test","driverless":true}"#;
         let mut pool = SessionPool::default();
 
         let missing = handle_http_request_with_auth(
@@ -12029,9 +15169,13 @@ mod tests {
 
         // A subsequent well-formed request must still be served, proving the
         // listener survived the faulty connection.
+        let body = r#"{"url":"https://two.test","driverless":true}"#;
         let response = send_http(
             addr,
-            "POST /sessions HTTP/1.1\r\ncontent-length: 26\r\n\r\n{\"url\":\"https://two.test\"}",
+            &format!(
+                "POST /sessions HTTP/1.1\r\ncontent-length: {}\r\n\r\n{body}",
+                body.len()
+            ),
         )?;
         assert!(response.starts_with("HTTP/1.1 201 Created"));
 

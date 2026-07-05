@@ -552,8 +552,13 @@ mod tests {
     use std::cell::RefCell;
     use std::error::Error;
     use std::net::TcpListener;
+    use std::os::unix::net::UnixStream;
     use std::sync::{Arc, Mutex};
     use std::thread;
+    use tempo_driver::{Engine, TestDriver};
+    use tempo_engine_host::{
+        serve_driver_connection, EngineHostError, EngineIpcClient, EngineIpcConnection,
+    };
     use tempo_headless::{serve_forever, SessionPool, TempodSessionEventKind, TempodSessionId};
 
     type TestResult = Result<(), Box<dyn Error>>;
@@ -1216,7 +1221,10 @@ mod tests {
     /// mirroring `client_drives_real_tempod_session_lifecycle`.
     #[test]
     fn model_drives_real_tempod_lifecycle() -> TestResult {
-        let pool = Arc::new(Mutex::new(SessionPool::default()));
+        let pool = Arc::new(Mutex::new(
+            SessionPool::default().with_navigation_url_policy(tempo_net::UrlPolicy::allow_all()),
+        ));
+        let driver_handle = attach_test_driver(&pool)?;
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let addr = listener.local_addr()?;
         let server_pool = Arc::clone(&pool);
@@ -1243,6 +1251,34 @@ mod tests {
 
         model.dispatch(UiAction::Close(session_id), &client);
         assert_eq!(model.sessions[0].state, "killed");
+        detach_test_driver(&pool, driver_handle)?;
         Ok(())
+    }
+
+    fn attach_test_driver(
+        pool: &Arc<Mutex<SessionPool>>,
+    ) -> Result<thread::JoinHandle<Result<(), EngineHostError>>, Box<dyn Error>> {
+        let (client_stream, server_stream) = UnixStream::pair()?;
+        pool.lock()
+            .map_err(|_| "session pool lock failed")?
+            .attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream))?;
+        Ok(thread::spawn(move || {
+            let mut connection = EngineIpcConnection::from_stream(server_stream);
+            let mut driver = TestDriver::new().allow_private_network_access();
+            futures::executor::block_on(serve_driver_connection(&mut connection, &mut driver))
+        }))
+    }
+
+    fn detach_test_driver(
+        pool: &Arc<Mutex<SessionPool>>,
+        handle: thread::JoinHandle<Result<(), EngineHostError>>,
+    ) -> Result<(), Box<dyn Error>> {
+        pool.lock()
+            .map_err(|_| "session pool lock failed")?
+            .detach_engine_driver();
+        match handle.join() {
+            Ok(result) => Ok(result?),
+            Err(_) => Err("driver thread failed".into()),
+        }
     }
 }
