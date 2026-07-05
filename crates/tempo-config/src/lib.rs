@@ -340,7 +340,7 @@ pub fn documented_env_registry() -> &'static [(&'static str, &'static str, &'sta
         ),
         (
             "TEMPO_STEALTH_MODE",
-            "tempo-headless",
+            "tempo-headless / tempo-session",
             "privacy mode; suppresses durable state",
         ),
         (
@@ -457,6 +457,12 @@ mod tests {
         for var in TempodConfig::env_vars() {
             assert!(names.contains(var), "registry missing {var}");
         }
+        assert!(
+            documented_env_registry().len() >= 17,
+            "registry should list tempo-config plus cross-crate runtime vars"
+        );
+        assert!(names.contains("TEMPO_TEMPOD_AUTH_TOKEN"));
+        assert!(names.contains("TEMPO_CDP_CHROME"));
     }
 
     #[test]
