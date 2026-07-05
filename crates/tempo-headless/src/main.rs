@@ -283,6 +283,8 @@ fn engine_name(engine: Engine) -> &'static str {
     match engine {
         Engine::Cdp => "cdp",
         Engine::Servo => "servo",
+        #[cfg(any(test, feature = "test-driver"))]
+        Engine::Test => "test",
     }
 }
 

@@ -46,5 +46,8 @@ tempo-driver = { path = "../tempo-driver", features = ["test-driver"] }
 # In-process router tests drive the axum Router directly via ServiceExt::oneshot.
 tower = { version = "0.5", features = ["util"] }
 
+[features]
+test-driver = ["tempo-driver/test-driver"]
+
 [lints]
 workspace = true
