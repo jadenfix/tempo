@@ -18,7 +18,7 @@ use crate::{HealthResponse, ShellClient, ShellError};
 #[cfg(test)]
 use tempo_headless::TempodSessionEvent;
 use tempo_headless::{TempodSession, TempodSessionEvents, TempodSessionState};
-use tempo_schema::ConfirmationGrant;
+use tempo_schema::{AgentRun, ConfirmationGrant};
 
 /// One session row as shown in the list: the id/state/url triple the DoD asks
 /// for, flattened to display strings so the render layer stays trivial.
@@ -56,6 +56,8 @@ pub trait SessionService {
     fn sessions(&self) -> Result<Vec<TempodSession>, ShellError>;
     fn open(&self, url: &str) -> Result<TempodSession, ShellError>;
     fn adopt(&self, session_id: &str) -> Result<TempodSession, ShellError>;
+    fn handoff(&self, session_id: &str) -> Result<TempodSession, ShellError>;
+    fn resume_run(&self, run_id: &str) -> Result<AgentRun, ShellError>;
     fn close(&self, session_id: &str) -> Result<TempodSession, ShellError>;
     /// Navigate a tab's shared tempod session to `url` (omnibox / back / forward).
     fn goto(&self, session_id: &str, url: &str) -> Result<(), ShellError>;
@@ -102,6 +104,14 @@ impl SessionService for ShellClient {
 
     fn adopt(&self, session_id: &str) -> Result<TempodSession, ShellError> {
         ShellClient::adopt(self, session_id)
+    }
+
+    fn handoff(&self, session_id: &str) -> Result<TempodSession, ShellError> {
+        ShellClient::handoff(self, session_id)
+    }
+
+    fn resume_run(&self, run_id: &str) -> Result<AgentRun, ShellError> {
+        ShellClient::resume_run(self, run_id)
     }
 
     fn close(&self, session_id: &str) -> Result<TempodSession, ShellError> {
@@ -177,10 +187,9 @@ pub enum UiAction {
     PollEvents,
     /// Toggle the set-of-marks overlay for the page-state screenshot.
     ToggleMarks,
-    /// Human clicked Resume on the blocking takeover banner (#354): clear the
-    /// local block. Never auto-continues past an unresolved challenge; the actual
-    /// run-resume wire call is a documented follow-up (no tempod resume endpoint /
-    /// `ShellClient::resume` yet).
+    /// Human clicked Resume on the blocking takeover banner (#354): hand control
+    /// back to the agent and resume the paused run. If the challenge persists,
+    /// the agent's next observation re-journals takeover and the banner returns.
     ResumeTakeover,
     /// Mint a server-side grant for the active native confirmation request.
     ConfirmPendingConfirmation,
@@ -195,10 +204,7 @@ impl UiAction {
     pub fn is_local(&self) -> bool {
         matches!(
             self,
-            Self::SelectTab(_)
-                | Self::ToggleMarks
-                | Self::ResumeTakeover
-                | Self::DismissConfirmation
+            Self::SelectTab(_) | Self::ToggleMarks | Self::DismissConfirmation
         )
     }
 }
@@ -291,7 +297,7 @@ impl ShellUiModel {
             UiAction::RefreshScreenshot => self.refresh_screenshot(service),
             UiAction::PollEvents => self.poll_events(service),
             UiAction::ToggleMarks => self.toggle_marks(),
-            UiAction::ResumeTakeover => self.resume_takeover(),
+            UiAction::ResumeTakeover => self.resume_takeover(service),
             UiAction::ConfirmPendingConfirmation => self.confirm_pending_confirmation(service),
             UiAction::DismissConfirmation => self.dismiss_confirmation(),
         }
@@ -304,7 +310,6 @@ impl ShellUiModel {
         match action {
             UiAction::SelectTab(index) => self.select_tab(index),
             UiAction::ToggleMarks => self.toggle_marks(),
-            UiAction::ResumeTakeover => self.resume_takeover(),
             UiAction::DismissConfirmation => self.dismiss_confirmation(),
             _ => return false,
         }
@@ -521,24 +526,44 @@ impl ShellUiModel {
         }
     }
 
-    /// Resume from the blocking human-takeover banner (#354). Clears the local
-    /// block only; because takeover detection is pure over the observation, a
-    /// resumed run that re-observes an unresolved challenge re-journals the
-    /// takeover, which re-raises the banner on the next poll — it never
-    /// auto-continues past an unresolved CAPTCHA/auth-wall. The actual run-resume
-    /// wire call is a documented follow-up: there is no tempod resume endpoint or
-    /// `ShellClient::resume` today, so there is nothing to POST yet.
-    fn resume_takeover(&mut self) {
-        if self.journal.takeover().is_blocking() {
-            self.journal.resume_takeover();
-            if let Some(active) = self.active_tab
-                && let Some(tab) = self.tabs.get_mut(active)
-            {
-                tab.surface.clear_takeover();
+    /// Resume from the blocking human-takeover banner (#354). The runtime owns
+    /// the actual safety check: resume rejects human-owned sessions, so the shell
+    /// first hands the session back, then resumes the same waiting run. If the
+    /// challenge is still present, the agent loop will re-observe it and emit a
+    /// fresh takeover event; the UI must not auto-suppress that next event.
+    fn resume_takeover(&mut self, service: &dyn SessionService) {
+        if !self.journal.takeover().is_blocking() {
+            return;
+        }
+        let Some(active) = self.active_tab else {
+            self.status = "No active tab to resume.".to_string();
+            return;
+        };
+        let Some(tab) = self.tabs.get(active) else {
+            self.status = "No active tab to resume.".to_string();
+            return;
+        };
+        let session_id = tab.session_id.clone();
+        let Some(run_id) = tab.surface.active_run_id.clone() else {
+            self.status = "Cannot resume: active agent run id is unknown.".to_string();
+            return;
+        };
+
+        if let Err(err) = service.handoff(&session_id) {
+            self.set_error("handoff", &err);
+            return;
+        }
+        match service.resume_run(&run_id) {
+            Ok(run) => {
+                self.journal.resume_takeover();
+                if let Some(tab) = self.tabs.get_mut(active) {
+                    tab.surface.handed_off_to_agent();
+                    tab.surface.active_run_id = Some(run.run_id.0.clone());
+                    tab.status = format!("Handed off and resumed {}", run.run_id.0);
+                }
+                self.status = format!("Handed off {session_id} and resumed {}", run.run_id.0);
             }
-            self.status =
-                "Challenge dismissed locally — this build has no resume signal to the agent yet (follow-up)."
-                    .to_string();
+            Err(err) => self.set_error("resume", &err),
         }
     }
 
@@ -801,6 +826,33 @@ mod tests {
         }
     }
 
+    fn run_state_event(
+        session_id: &str,
+        seq: u64,
+        run_id: &str,
+        state: tempo_schema::AgentRunState,
+    ) -> TempodSessionEvent {
+        TempodSessionEvent {
+            session_id: TempodSessionId(session_id.to_string()),
+            seq,
+            timestamp_ms: 0,
+            event: TempodSessionEventKind::Manager {
+                event: tempo_schema::ManagerEvent::RunStateChanged {
+                    run: AgentRun {
+                        run_id: tempo_schema::AgentRunId(run_id.to_string()),
+                        session_id: session_id.to_string(),
+                        state,
+                        goal: None,
+                        created_ms: 0,
+                        updated_ms: seq,
+                        completed_ms: None,
+                        last_error: None,
+                    },
+                },
+            },
+        }
+    }
+
     fn session(id: &str, url: &str, state: TempodSessionState) -> TempodSession {
         TempodSession {
             id: TempodSessionId(id.to_string()),
@@ -869,6 +921,31 @@ mod tests {
                 "https://adopted.test",
                 TempodSessionState::Adopted,
             ))
+        }
+
+        fn handoff(&self, session_id: &str) -> Result<TempodSession, ShellError> {
+            self.record(format!("handoff:{session_id}"));
+            self.maybe_fail("handoff")?;
+            Ok(session(
+                session_id,
+                "https://handoff.test",
+                TempodSessionState::Running,
+            ))
+        }
+
+        fn resume_run(&self, run_id: &str) -> Result<AgentRun, ShellError> {
+            self.record(format!("resume:{run_id}"));
+            self.maybe_fail("resume")?;
+            Ok(AgentRun {
+                run_id: tempo_schema::AgentRunId(run_id.to_string()),
+                session_id: "session-0".to_string(),
+                state: tempo_schema::AgentRunState::Running,
+                goal: None,
+                created_ms: 1,
+                updated_ms: 2,
+                completed_ms: None,
+                last_error: None,
+            })
         }
 
         fn close(&self, session_id: &str) -> Result<TempodSession, ShellError> {
@@ -1558,7 +1635,13 @@ mod tests {
         let service = MockService {
             canned_events: vec![
                 created_event("session-0", 0, "https://a.test"),
-                takeover_event("session-0", 1),
+                run_state_event(
+                    "session-0",
+                    1,
+                    "run-0",
+                    tempo_schema::AgentRunState::WaitingForHuman,
+                ),
+                takeover_event("session-0", 2),
             ],
             ..MockService::default()
         };
@@ -1580,22 +1663,58 @@ mod tests {
         assert_eq!(pending.url, "https://a.test/verify");
         assert_eq!(banner.reason_label(), Some("captcha"));
         assert_eq!(
+            model.tabs[0].surface.active_run_id.as_deref(),
+            Some("run-0")
+        );
+        assert_eq!(
             model.tabs[0].surface.run_state,
             SurfaceRunState::HumanTakeoverRequired
         );
         assert_eq!(model.tabs[0].surface.owner, ControlOwner::Agent);
         assert!(model.tabs[0].surface.pending_takeover.is_some());
 
-        // The human clicks Resume: the local block clears, and the status is
-        // truthful that the agent is not yet signalled (no resume RPC exists).
+        // The human clicks Resume: the shell hands the session back to the
+        // agent and resumes the same paused run. If the page is still blocked,
+        // the next agent observation will journal another takeover event.
         model.dispatch(UiAction::ResumeTakeover, &service);
+        assert_eq!(
+            service.calls(),
+            vec!["events:session-0:-", "handoff:session-0", "resume:run-0"]
+        );
         assert!(
             !model.journal.takeover().is_blocking(),
             "Resume clears the local block"
         );
         assert!(model.tabs[0].surface.pending_takeover.is_none());
-        assert!(model.status.contains("dismissed locally"));
-        assert!(model.status.contains("no resume signal to the agent"));
+        assert_eq!(model.tabs[0].surface.owner, ControlOwner::Agent);
+        assert_eq!(
+            model.tabs[0].surface.run_state,
+            SurfaceRunState::AgentControl
+        );
+        assert!(model.status.contains("resumed run-0"));
+    }
+
+    #[test]
+    fn resume_takeover_without_run_id_keeps_banner_and_does_not_handoff() {
+        let service = MockService {
+            canned_events: vec![
+                created_event("session-0", 0, "https://a.test"),
+                takeover_event("session-0", 1),
+            ],
+            ..MockService::default()
+        };
+        let mut model = ShellUiModel {
+            tabs: vec![Tab::new("session-0", None, "https://a.test")],
+            active_tab: Some(0),
+            ..ShellUiModel::default()
+        };
+
+        model.dispatch(UiAction::PollEvents, &service);
+        model.dispatch(UiAction::ResumeTakeover, &service);
+
+        assert_eq!(service.calls(), vec!["events:session-0:-"]);
+        assert!(model.journal.takeover().is_blocking());
+        assert!(model.status.contains("run id is unknown"));
     }
 
     #[test]

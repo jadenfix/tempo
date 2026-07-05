@@ -241,6 +241,7 @@ pub struct BrowserSurface {
     pub load_state: SurfaceLoadState,
     pub owner: ControlOwner,
     pub run_state: SurfaceRunState,
+    pub active_run_id: Option<String>,
     pub pending_takeover: Option<HumanTakeover>,
     pub pending_confirmation: Option<PendingConfirmation>,
     pub marks_overlay: bool,
@@ -264,6 +265,7 @@ impl BrowserSurface {
             load_state: SurfaceLoadState::Idle,
             owner: ControlOwner::Human,
             run_state: SurfaceRunState::HumanControl,
+            active_run_id: None,
             pending_takeover: None,
             pending_confirmation: None,
             marks_overlay: false,
@@ -332,9 +334,16 @@ impl BrowserSurface {
         self.run_state = SurfaceRunState::HumanControl;
     }
 
+    pub fn handed_off_to_agent(&mut self) {
+        self.owner = ControlOwner::Agent;
+        self.run_state = SurfaceRunState::AgentControl;
+        self.pending_takeover = None;
+    }
+
     pub fn killed(&mut self) {
         self.owner = ControlOwner::None;
         self.run_state = SurfaceRunState::Killed;
+        self.active_run_id = None;
         self.load_state = SurfaceLoadState::Idle;
         self.pending_takeover = None;
         self.pending_confirmation = None;
@@ -372,9 +381,7 @@ impl BrowserSurface {
             }
             TempodSessionEventKind::SessionAdopted => self.adopted_by_human(),
             TempodSessionEventKind::SessionHandoff => {
-                self.owner = ControlOwner::Agent;
-                self.run_state = SurfaceRunState::AgentControl;
-                self.pending_takeover = None;
+                self.handed_off_to_agent();
             }
             TempodSessionEventKind::SessionKilled => self.killed(),
             TempodSessionEventKind::SessionDrained => {
@@ -399,6 +406,15 @@ impl BrowserSurface {
         match event {
             ManagerEvent::OwnerChanged { owner } => {
                 self.owner = surface_owner(owner);
+                match owner {
+                    SchemaControlOwner::Agent { run_id } => {
+                        self.active_run_id = run_id.as_ref().map(|run_id| run_id.0.clone());
+                    }
+                    SchemaControlOwner::Unowned => {
+                        self.active_run_id = None;
+                    }
+                    SchemaControlOwner::Human { .. } => {}
+                }
                 self.run_state = match self.owner {
                     ControlOwner::Agent => SurfaceRunState::AgentControl,
                     ControlOwner::Human => SurfaceRunState::HumanControl,
@@ -423,7 +439,18 @@ impl BrowserSurface {
                 }
             }
             ManagerEvent::RunStateChanged { run } => {
+                let run_id = run.run_id.0.clone();
                 self.run_state = run_state(run.state);
+                if matches!(
+                    run.state,
+                    AgentRunState::Completed | AgentRunState::Failed | AgentRunState::Cancelled
+                ) {
+                    if self.active_run_id.as_deref() == Some(run_id.as_str()) {
+                        self.active_run_id = None;
+                    }
+                } else {
+                    self.active_run_id = Some(run_id);
+                }
             }
             ManagerEvent::HumanTakeover { takeover } => {
                 self.owner = ControlOwner::Agent;

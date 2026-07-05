@@ -10,9 +10,12 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tempo_headless::{TempodSession, TempodSessionEvents, TempodSessionId};
-use tempo_schema::{Action, ActionBatch, AdoptionLease, ConfirmationGrant, QuiescencePolicy};
+use tempo_schema::{
+    Action, ActionBatch, AdoptionLease, AgentRun, ConfirmationGrant, QuiescencePolicy,
+};
 use thiserror::Error;
 
 pub mod agent;
@@ -34,6 +37,7 @@ const MCP_SCREENSHOT_RESPONSE_OVERHEAD_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_MAX_MCP_RESPONSE_BYTES: usize =
     ENGINE_HOST_MAX_SCREENSHOT_BYTES.div_ceil(3) * 4 + MCP_SCREENSHOT_RESPONSE_OVERHEAD_BYTES;
 const MAX_RESPONSE_HEADER_BYTES: usize = 64 * 1024;
+static NEXT_NAVIGATION_ATTEMPT: AtomicU64 = AtomicU64::new(1);
 
 const USAGE: &str = "\
 tempo-shell
@@ -43,6 +47,8 @@ Commands:
   sessions
   open URL
   adopt SESSION_ID
+  handoff SESSION_ID
+  resume RUN_ID
   events SESSION_ID [AFTER_SEQ]
   close SESSION_ID
   agent-card
@@ -146,6 +152,12 @@ pub enum ShellCommand {
     Adopt {
         session_id: String,
     },
+    Handoff {
+        session_id: String,
+    },
+    Resume {
+        run_id: String,
+    },
     Events {
         session_id: String,
         after_seq: Option<u64>,
@@ -179,6 +191,8 @@ impl ShellCommand {
             Self::Sessions => write_json(stdout, &client.sessions()?),
             Self::Open { url } => write_json(stdout, &client.open(url)?),
             Self::Adopt { session_id } => write_json(stdout, &client.adopt(session_id)?),
+            Self::Handoff { session_id } => write_json(stdout, &client.handoff(session_id)?),
+            Self::Resume { run_id } => write_json(stdout, &client.resume_run(run_id)?),
             Self::Events {
                 session_id,
                 after_seq,
@@ -281,6 +295,16 @@ impl ShellClient {
         let path = format!("/sessions/{}/adopt", safe_path_segment(session_id)?);
         let lease: AdoptionLease = self.request_json("POST", &path, None::<serde_json::Value>)?;
         self.session_by_id(&lease.session_id)
+    }
+
+    pub fn handoff(&self, session_id: &str) -> Result<TempodSession, ShellError> {
+        let path = format!("/sessions/{}/handoff", safe_path_segment(session_id)?);
+        self.request_json("POST", &path, None::<serde_json::Value>)
+    }
+
+    pub fn resume_run(&self, run_id: &str) -> Result<AgentRun, ShellError> {
+        let path = format!("/runs/{}/resume", safe_path_segment(run_id)?);
+        self.request_json("POST", &path, None::<serde_json::Value>)
     }
 
     pub fn events(
@@ -603,6 +627,12 @@ fn parse_command(args: &[String]) -> Result<ShellCommand, ShellError> {
         "adopt" => one_arg(rest, "adopt SESSION_ID", |session_id| ShellCommand::Adopt {
             session_id,
         }),
+        "handoff" => one_arg(rest, "handoff SESSION_ID", |session_id| {
+            ShellCommand::Handoff { session_id }
+        }),
+        "resume" => one_arg(rest, "resume RUN_ID", |run_id| ShellCommand::Resume {
+            run_id,
+        }),
         "events" => parse_events_command(rest),
         "close" => one_arg(rest, "close SESSION_ID", |session_id| ShellCommand::Close {
             session_id,
@@ -886,11 +916,23 @@ fn safe_path_segment(segment: &str) -> Result<&str, ShellError> {
 }
 
 fn foreground_navigation_idempotency_key(session_id: &str, url: &str) -> String {
+    let attempt = NEXT_NAVIGATION_ATTEMPT.fetch_add(1, Ordering::Relaxed);
+    let now_nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
     let mut hasher = DefaultHasher::new();
-    "tempo-shell-goto-v1".hash(&mut hasher);
+    "tempo-shell-goto-v2".hash(&mut hasher);
     session_id.hash(&mut hasher);
     url.hash(&mut hasher);
-    format!("shell-goto-{:016x}", hasher.finish())
+    std::process::id().hash(&mut hasher);
+    now_nanos.hash(&mut hasher);
+    attempt.hash(&mut hasher);
+    format!(
+        "shell-goto-{}-{now_nanos:x}-{attempt:x}-{:016x}",
+        std::process::id(),
+        hasher.finish()
+    )
 }
 
 pub(crate) fn validate_auth_token(token: &str) -> Result<(), ShellError> {
@@ -1499,6 +1541,18 @@ mod tests {
             Err(_) => return Err("server thread failed".into()),
         }
         Ok(())
+    }
+
+    #[test]
+    fn foreground_navigation_idempotency_key_is_per_attempt() {
+        let first = foreground_navigation_idempotency_key("session-123", "https://pay.test");
+        let second = foreground_navigation_idempotency_key("session-123", "https://pay.test");
+
+        assert!(first.starts_with("shell-goto-"));
+        assert!(second.starts_with("shell-goto-"));
+        assert_ne!(first, second);
+        assert!(first.len() <= 256);
+        assert!(second.len() <= 256);
     }
 
     #[test]

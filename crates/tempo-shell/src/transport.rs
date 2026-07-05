@@ -450,6 +450,18 @@ mod tests {
             Err(ShellError::Usage("adopt unused in transport tests".into()))
         }
 
+        fn handoff(&self, session_id: &str) -> Result<TempodSession, ShellError> {
+            self.record(&format!("handoff:{session_id}"));
+            Err(ShellError::Usage(
+                "handoff unused in transport tests".into(),
+            ))
+        }
+
+        fn resume_run(&self, run_id: &str) -> Result<tempo_schema::AgentRun, ShellError> {
+            self.record(&format!("resume:{run_id}"));
+            Err(ShellError::Usage("resume unused in transport tests".into()))
+        }
+
         fn close(&self, session_id: &str) -> Result<TempodSession, ShellError> {
             self.record(&format!("close:{session_id}"));
             Err(ShellError::Usage("close unused in transport tests".into()))
