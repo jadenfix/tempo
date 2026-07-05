@@ -110,6 +110,20 @@ final class TempoBrowserModel: ObservableObject {
         }
     }
 
+    func ingestObservationPayload(_ payload: Any?) {
+        guard let payload,
+              let summary = bridge.compileObservationPayload(payload) else {
+            return
+        }
+        updateSelectedTab { tab in
+            if let observedURL = URL(string: summary.url) {
+                tab.url = observedURL
+                tab.title = tab.title.isEmpty ? observedURL.host() ?? "Tempo" : tab.title
+            }
+            tab.lastObservationElementCount = summary.elementCount
+        }
+    }
+
     func pageDidStart() {
         updateSelectedTab { $0.isLoading = true }
     }

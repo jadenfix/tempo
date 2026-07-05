@@ -68,6 +68,7 @@ struct TempoTab: Identifiable, Equatable {
     var canGoForward: Bool
     var marksVisible: Bool
     var tainted: Bool
+    var lastObservationElementCount: Int
 
     init(url: URL? = URL(string: "https://example.com")) {
         self.id = UUID()
@@ -81,6 +82,7 @@ struct TempoTab: Identifiable, Equatable {
         self.canGoForward = false
         self.marksVisible = false
         self.tainted = false
+        self.lastObservationElementCount = 0
     }
 }
 

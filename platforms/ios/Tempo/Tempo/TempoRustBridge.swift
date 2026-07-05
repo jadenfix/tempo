@@ -7,6 +7,9 @@ private func tempo_ios_core_capabilities_json() -> UnsafeMutablePointer<CChar>?
 @_silgen_name("tempo_ios_core_observation_script")
 private func tempo_ios_core_observation_script() -> UnsafeMutablePointer<CChar>?
 
+@_silgen_name("tempo_ios_core_compile_webview_snapshot_json")
+private func tempo_ios_core_compile_webview_snapshot_json(_ input: UnsafePointer<CChar>?) -> UnsafeMutablePointer<CChar>?
+
 @_silgen_name("tempo_ios_core_string_free")
 private func tempo_ios_core_string_free(_ value: UnsafeMutablePointer<CChar>?)
 #endif
@@ -16,6 +19,11 @@ struct TempoCoreCapabilities: Codable, Equatable {
     let engineLane: String
     let staticLibrary: Bool
     let nativeFork: Bool
+}
+
+struct TempoObservationSummary: Equatable {
+    let url: String
+    let elementCount: Int
 }
 
 struct TempoRustBridge {
@@ -52,6 +60,34 @@ struct TempoRustBridge {
         }
         #endif
         return "window.__tempoCollectObservation = window.__tempoCollectObservation || function(){ return { url: window.location.href, elements: [] }; };"
+    }
+
+    func compileObservationPayload(_ payload: Any) -> TempoObservationSummary? {
+        guard JSONSerialization.isValidJSONObject(payload),
+              let data = try? JSONSerialization.data(withJSONObject: payload),
+              let input = String(data: data, encoding: .utf8) else {
+            return nil
+        }
+
+        #if TEMPO_RUST_LINKED
+        if let compiled = input.withCString({ tempo_ios_core_compile_webview_snapshot_json($0) }),
+           let output = rustString(compiled),
+           let summary = observationSummary(fromJSON: output) {
+            return summary
+        }
+        #endif
+
+        return observationSummary(fromJSON: input)
+    }
+
+    private func observationSummary(fromJSON json: String) -> TempoObservationSummary? {
+        guard let data = json.data(using: .utf8),
+              let value = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let url = value["url"] as? String else {
+            return nil
+        }
+        let elements = value["elements"] as? [Any] ?? []
+        return TempoObservationSummary(url: url, elementCount: elements.count)
     }
 
     #if TEMPO_RUST_LINKED

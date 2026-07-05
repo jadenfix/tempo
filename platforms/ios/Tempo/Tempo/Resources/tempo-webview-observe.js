@@ -39,6 +39,12 @@
     ).trim();
   };
 
+  const pageSpans = (text) => {
+    const normalized = (text || "").trim();
+    if (!normalized) return [];
+    return [{ provenance: "page", text: normalized }];
+  };
+
   const stableHint = (element) => {
     const parts = [
       element.getAttribute("data-tempo-id"),
@@ -86,8 +92,8 @@
           source_id: element.getAttribute("data-tempo-source") || null,
           stable_hint: stableHint(element),
           role: roleFor(element),
-          name: accessibleName(element),
-          value: element.value || "",
+          name: pageSpans(accessibleName(element)),
+          value: pageSpans(element.value || ""),
           bounds: [rect.x, rect.y, rect.width, rect.height],
           visible,
           enabled: !element.disabled,

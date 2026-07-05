@@ -64,4 +64,28 @@ final class TempoBrowserModelTests: XCTestCase {
         XCTAssertNil(model.manager.pendingConfirmation)
         XCTAssertTrue(model.manager.journal.contains { $0.message == "confirmed send" })
     }
+
+    func testObservationPayloadUpdatesSelectedTabSummary() {
+        let model = TempoBrowserModel()
+        let payload: [String: Any] = [
+            "url": "https://example.com/form",
+            "elements": [[
+                "locator": "#email",
+                "source_id": "email-source",
+                "stable_hint": "email|textbox|Email",
+                "role": "textbox",
+                "name": [["provenance": "page", "text": "Email"]],
+                "value": [["provenance": "page", "text": "person@example.com"]],
+                "bounds": [0.0, 0.0, 120.0, 24.0],
+                "visible": true,
+                "enabled": true,
+                "interactive": true,
+            ]],
+        ]
+
+        model.ingestObservationPayload(payload)
+
+        XCTAssertEqual(model.selectedTab?.url?.absoluteString, "https://example.com/form")
+        XCTAssertEqual(model.selectedTab?.lastObservationElementCount, 1)
+    }
 }

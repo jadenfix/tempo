@@ -316,6 +316,7 @@ impl WebViewDriver {
         &mut self,
         snapshot: WebViewSnapshot,
     ) -> Result<Arc<CompiledObservation>, TransportError> {
+        enforce_snapshot_url(&self.url_policy, &snapshot.url)?;
         let raw_elements: Vec<RawElement> = snapshot
             .elements
             .iter()
@@ -573,6 +574,15 @@ fn map_host_error(error: WebViewHostError) -> TransportError {
     error.into_transport_error()
 }
 
+fn enforce_snapshot_url(policy: &UrlPolicy, url: &str) -> Result<(), TransportError> {
+    if url == "about:blank" {
+        return Ok(());
+    }
+    policy
+        .enforce(url)
+        .map_err(|_error| TransportError::UrlBlocked)
+}
+
 fn full_snapshot_diff(since_seq: u64, current: &CompiledObservation) -> ObservationDiff {
     ObservationDiff {
         since_seq,
@@ -816,6 +826,54 @@ mod tests {
 
         assert_eq!(observation.url, "about:blank");
         assert_eq!(observation.seq, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn host_returned_private_snapshot_is_blocked_without_mutating_observation() -> Result<(), String>
+    {
+        let first = WebViewSnapshot::new(
+            "https://example.com",
+            vec![button("native-submit", "source-submit", "submit")],
+        );
+        let private = WebViewSnapshot::new(
+            "http://127.0.0.1/admin",
+            vec![button("native-submit", "source-submit", "submit")],
+        );
+        let mut driver = scripted_driver(vec![first, private]);
+
+        let observation =
+            futures::executor::block_on(driver.observe()).map_err(|error| error.to_string())?;
+        let result = futures::executor::block_on(driver.observe());
+
+        assert!(matches!(result, Err(TransportError::UrlBlocked)));
+        assert_eq!(driver.latest_seq(), observation.seq);
+        assert_eq!(driver.history.len(), 1);
+        assert_eq!(observation.url, "https://example.com");
+        Ok(())
+    }
+
+    #[test]
+    fn webview_snapshot_deserializes_injected_runtime_taint_span_payload(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let snapshot: WebViewSnapshot = serde_json::from_value(json!({
+            "url": "https://example.com/form",
+            "elements": [{
+                "locator": "#email",
+                "source_id": "email-source",
+                "stable_hint": "email|textbox|Email",
+                "role": "textbox",
+                "name": [{ "provenance": "page", "text": "Email" }],
+                "value": [{ "provenance": "page", "text": "person@example.com" }],
+                "bounds": [0.0, 0.0, 120.0, 24.0],
+                "visible": true,
+                "enabled": true,
+                "interactive": true
+            }]
+        }))?;
+
+        assert_eq!(snapshot.elements[0].name[0].provenance, Provenance::Page);
+        assert_eq!(snapshot.elements[0].value[0].text, "person@example.com");
         Ok(())
     }
 

@@ -7,8 +7,10 @@ This scaffold keeps WKWebView owned by Swift and uses Rust for Tempo contracts.
 - Swift shell source: `Tempo/`
 - App resource copy of the injected observer: `Tempo/Resources/tempo-webview-observe.js`
 
-The current bridge is intentionally source-level only. C/Swift ABI exports need
-a dedicated FFI slice because the workspace forbids unsafe code.
+The Swift bridge can load capabilities, the injected observation runtime, and
+WebView snapshot compilation from `tempo-ios-core` when built with
+`TEMPO_RUST_LINKED`. SwiftPM tests use the same payload shape with a source-level
+fallback so the shell can be checked without a linked staticlib.
 
 Validation from the repo root:
 
@@ -23,6 +25,6 @@ Native shell status:
 - `project.yml` is an XcodeGen manifest for a signed iOS app target.
 - `Package.swift` exposes the app source as a Swift package target for reducer
   tests and source browsing.
-- `Tempo/TempoRustBridge.swift` is a placeholder bridge facade. C ABI exports
-  are intentionally not generated in this slice because the Rust workspace
-  forbids unsafe code and the bridge needs its own contract review.
+- `Tempo/TempoRustBridge.swift` owns the Swift/Rust bridge facade. The C ABI
+  currently exports capabilities, the observation script, and WebView snapshot
+  compilation; session/control-plane APIs remain a follow-up bridge surface.

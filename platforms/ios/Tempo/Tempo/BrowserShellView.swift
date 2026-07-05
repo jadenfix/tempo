@@ -12,7 +12,8 @@ struct BrowserShellView: View {
                 WebViewContainer(
                     tab: model.selectedTabBinding,
                     command: $model.webViewCommand,
-                    observationScript: model.observationScript
+                    observationScript: model.observationScript,
+                    onObservation: model.ingestObservationPayload
                 )
                 SurfaceBadges(tab: model.selectedTab)
                     .padding(10)

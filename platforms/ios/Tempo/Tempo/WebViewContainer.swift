@@ -8,6 +8,7 @@ struct WebViewContainer: UIViewRepresentable {
     @Binding var command: WebViewCommand?
 
     let observationScript: String
+    let onObservation: (Any?) -> Void
 
     func makeCoordinator() -> Coordinator {
         Coordinator(parent: self)
@@ -86,7 +87,11 @@ struct WebViewContainer: UIViewRepresentable {
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
             updateTab(from: webView, isLoading: false)
-            webView.evaluateJavaScript("window.__tempoCollectObservation && window.__tempoCollectObservation()") { _, _ in }
+            webView.evaluateJavaScript("window.__tempoCollectObservation && window.__tempoCollectObservation()") { result, _ in
+                DispatchQueue.main.async {
+                    self.parent.onObservation(result)
+                }
+            }
         }
 
         func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
@@ -114,12 +119,14 @@ struct WebViewContainer: View {
     @Binding var command: WebViewCommand?
 
     let observationScript: String
+    let onObservation: (Any?) -> Void
 
     var body: some View {
         Color.clear
             .onAppear {
                 tab.isLoading = false
                 _ = observationScript
+                onObservation(nil)
             }
             .onChange(of: command) { _, _ in
                 command = nil

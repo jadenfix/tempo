@@ -7,8 +7,8 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::ffi::{c_char, CString};
-use tempo_observe::{CompileOptions, ObservationCompiler, ObservationInput};
+use std::ffi::{c_char, CStr, CString};
+use tempo_observe::{CompileOptions, ObservationCompiler, ObservationInput, RawElement};
 use tempo_schema::CompiledObservation;
 use thiserror::Error;
 
@@ -110,6 +110,32 @@ pub fn compile_observation_json(input_json: &str) -> Result<String, IosCoreError
     IosObservationSession::new().compile_json(input_json)
 }
 
+pub fn compile_webview_snapshot_json(input_json: &str) -> Result<String, IosCoreError> {
+    let snapshot: WebViewSnapshot =
+        serde_json::from_str(input_json).map_err(IosCoreError::InvalidObservationInput)?;
+    let input = ObservationInput::new(
+        snapshot.url,
+        snapshot
+            .elements
+            .into_iter()
+            .map(|element| RawElement {
+                source_id: element.source_id,
+                stable_hint: element.stable_hint,
+                role: element.role,
+                name: element.name,
+                value: element.value,
+                bounds: element.bounds,
+                visible: element.visible,
+                enabled: element.enabled,
+                interactive: element.interactive,
+            })
+            .collect(),
+    );
+    compile_observation_json(
+        &serde_json::to_string(&input).map_err(IosCoreError::SerializeObservation)?,
+    )
+}
+
 pub fn describe() -> &'static str {
     "iOS staticlib core for WKWebView T2: schema, observation compiler, policy-safe provenance, and WebView adapter types"
 }
@@ -146,6 +172,41 @@ pub extern "C" fn tempo_ios_core_observation_script() -> *mut c_char {
 /// Rust-to-NSString bridge allocation in this crate, and must not have been freed
 /// before this call.
 #[unsafe(no_mangle)]
+/// Compile one WKWebView observation snapshot JSON payload through the Rust
+/// observation compiler and return an owned C string.
+///
+/// # Safety
+///
+/// `input` must either be null or point to a valid, NUL-terminated UTF-8 string
+/// for the duration of the call. The returned pointer must be released with
+/// [`tempo_ios_core_string_free`] exactly once.
+pub unsafe extern "C" fn tempo_ios_core_compile_webview_snapshot_json(
+    input: *const c_char,
+) -> *mut c_char {
+    if input.is_null() {
+        return std::ptr::null_mut();
+    }
+    let input = match unsafe { CStr::from_ptr(input) }.to_str() {
+        Ok(input) => input,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    match compile_webview_snapshot_json(input)
+        .ok()
+        .and_then(|json| CString::new(json).ok())
+    {
+        Some(json) => json.into_raw(),
+        None => std::ptr::null_mut(),
+    }
+}
+
+#[unsafe(no_mangle)]
+/// Free a C string returned by a `tempo_ios_core_*` FFI function.
+///
+/// # Safety
+///
+/// `value` must be null or a pointer previously returned by this library via
+/// `CString::into_raw`. Passing any other pointer, or freeing the same pointer
+/// more than once, is undefined behavior.
 pub unsafe extern "C" fn tempo_ios_core_string_free(value: *mut c_char) {
     if !value.is_null() {
         drop(unsafe { CString::from_raw(value) });
@@ -184,6 +245,34 @@ mod tests {
         let observation: CompiledObservation = serde_json::from_str(&output)?;
 
         assert_eq!(observation.schema_version, tempo_schema::SCHEMA_VERSION);
+        assert_eq!(observation.elements.len(), 1);
+        assert_eq!(observation.elements[0].name[0].provenance, Provenance::Page);
+        Ok(())
+    }
+
+    #[test]
+    fn compile_webview_snapshot_json_accepts_injected_runtime_shape(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let snapshot = serde_json::json!({
+            "url": "https://example.com/form",
+            "elements": [{
+                "locator": "#email",
+                "source_id": "email-source",
+                "stable_hint": "email|textbox|Email",
+                "role": "textbox",
+                "name": [{ "provenance": "page", "text": "Email" }],
+                "value": [{ "provenance": "page", "text": "person@example.com" }],
+                "bounds": [0.0, 0.0, 120.0, 24.0],
+                "visible": true,
+                "enabled": true,
+                "interactive": true
+            }]
+        });
+
+        let output = compile_webview_snapshot_json(&snapshot.to_string())?;
+        let observation: CompiledObservation = serde_json::from_str(&output)?;
+
+        assert_eq!(observation.url, "https://example.com/form");
         assert_eq!(observation.elements.len(), 1);
         assert_eq!(observation.elements[0].name[0].provenance, Provenance::Page);
         Ok(())
@@ -234,6 +323,35 @@ mod tests {
         let text = unsafe { std::ffi::CStr::from_ptr(ptr) }.to_str()?;
         assert!(text.contains("__tempoCollectObservation"));
         unsafe { tempo_ios_core_string_free(ptr) };
+        Ok(())
+    }
+
+    #[test]
+    fn c_abi_compiles_webview_snapshot_json() -> Result<(), Box<dyn std::error::Error>> {
+        let input = CString::new(
+            serde_json::json!({
+                "url": "https://example.com/form",
+                "elements": [{
+                    "locator": "#submit",
+                    "role": "button",
+                    "name": [{ "provenance": "page", "text": "Submit" }],
+                    "visible": true,
+                    "enabled": true,
+                    "interactive": true
+                }]
+            })
+            .to_string(),
+        )?;
+        let ptr = unsafe { tempo_ios_core_compile_webview_snapshot_json(input.as_ptr()) };
+        assert!(!ptr.is_null());
+        let text = unsafe { std::ffi::CStr::from_ptr(ptr) }
+            .to_str()?
+            .to_string();
+        unsafe { tempo_ios_core_string_free(ptr) };
+
+        let observation: CompiledObservation = serde_json::from_str(&text)?;
+        assert_eq!(observation.elements.len(), 1);
+        assert_eq!(observation.elements[0].role, "button");
         Ok(())
     }
 }
