@@ -2609,20 +2609,23 @@ fn engine_reconnect_backoff(policy: &EngineReconnectPolicy, attempts: u32) -> Du
         .min(policy.max_backoff)
 }
 
-/// Add up to (but not including) half the backoff as jitter, capped at
-/// `max_backoff`, so many nodes reconnecting to the same restarted engine do not
-/// thunder in lockstep. Seeded from wall-clock nanos — the crate carries no RNG
-/// dependency and reconnect timing has no determinism contract, so this reuses
-/// the existing `current_time_ns` source rather than adding one (#398).
+/// Cap the backoff at `max_backoff`, then subtract up to (but not including)
+/// half of it as jitter, so many nodes reconnecting to the same restarted engine
+/// do not thunder in lockstep. Jittering *downward* from the (capped) ceiling
+/// keeps the jitter alive even when every node is pinned at `max_backoff` —
+/// adding upward and re-clamping at the cap would collapse jitter to zero
+/// exactly where thundering-herd protection matters most. Seeded from wall-clock
+/// nanos — the crate carries no RNG dependency and reconnect timing has no
+/// determinism contract, so this reuses the existing `current_time_ns` source
+/// rather than adding one (#398).
 fn jittered_backoff(backoff: Duration, max_backoff: Duration, seed: u128) -> Duration {
-    let span = backoff.as_nanos() / 2;
+    let capped = backoff.min(max_backoff);
+    let span = capped.as_nanos() / 2;
     if span == 0 {
-        return backoff;
+        return capped;
     }
-    let extra = (seed % span) as u64;
-    backoff
-        .saturating_add(Duration::from_nanos(extra))
-        .min(max_backoff)
+    let reduction = (seed % span) as u64;
+    capped.saturating_sub(Duration::from_nanos(reduction))
 }
 
 /// What the liveness monitor should do on one sample of driver state.
@@ -2727,6 +2730,14 @@ fn run_engine_liveness_monitor(
         if Arc::strong_count(pool) <= 1 {
             return;
         }
+        // Boundary (#398): this recovers true socket-death — the driver is still
+        // `Some` but its IPC connection was marked dead, so `engine_driver_dead`
+        // is true and we reconnect + re-attach. It does NOT cover the #213
+        // unresponsive-detach path, where a wedged (not disconnected) engine trips
+        // `abandon_*` and leaves `driver = None`: that reads as `dead == false`
+        // here and the monitor stays Idle. Reviving a `None`-detached engine
+        // (distinguishing "never attached" from "hung and detached") is out of
+        // #398 scope and left as a follow-up.
         let dead = match pool.lock() {
             Ok(guard) => guard.engine_driver_dead(),
             Err(_) => return,
@@ -10190,21 +10201,35 @@ mod tests {
     }
 
     #[test]
-    fn jittered_backoff_stays_within_half_and_caps_at_max() {
+    fn jittered_backoff_reduces_within_half_and_jitters_at_the_cap() {
         let base = Duration::from_millis(200);
         let max = Duration::from_secs(30);
         for seed in [0_u128, 1, 99, 12_345, u128::MAX / 3] {
             let jittered = jittered_backoff(base, max, seed);
-            assert!(jittered >= base, "jitter dipped below base: {jittered:?}");
+            // Jitter reduces downward from the (capped) backoff, never above it,
+            // and never below half of it.
             assert!(
-                jittered < base + base / 2,
-                "jitter exceeded half the backoff: {jittered:?}"
+                jittered <= base,
+                "jitter exceeded the backoff: {jittered:?}"
+            );
+            assert!(
+                jittered > base / 2,
+                "jitter cut more than half the backoff: {jittered:?}"
             );
         }
-        // A backoff already above max is clamped regardless of jitter.
-        assert_eq!(
-            jittered_backoff(Duration::from_secs(40), Duration::from_secs(30), 7),
-            Duration::from_secs(30)
+        // A backoff at/above the ceiling is clamped to max_backoff, but jitter
+        // stays alive there (the whole point of jittering downward): it never
+        // collapses to exactly max_backoff for a non-trivial seed.
+        let at_cap = jittered_backoff(Duration::from_secs(40), Duration::from_secs(30), 7);
+        assert!(at_cap <= Duration::from_secs(30), "above cap: {at_cap:?}");
+        assert!(
+            at_cap > Duration::from_secs(15),
+            "below half cap: {at_cap:?}"
+        );
+        assert_ne!(
+            at_cap,
+            Duration::from_secs(30),
+            "jitter collapsed to the cap — thundering-herd protection lost"
         );
     }
 
@@ -10382,6 +10407,128 @@ mod tests {
             DriverResponse::Observation { .. }
         ));
 
+        engine
+            .join()
+            .map_err(|_| "engine thread panicked")?
+            .map_err(|error| error.to_string())?;
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// End-to-end through the REAL background monitor thread (no manual
+    /// `reconnect_engine`): a UDS engine dies, then re-listens on the same path,
+    /// and `spawn_engine_liveness_monitor` must reconnect + re-attach so readiness
+    /// flips 503 -> 200 on its own (#398). This exercises the thread glue,
+    /// poll/backoff loop, and `strong_count` guard that the unit tests skip.
+    #[test]
+    fn engine_liveness_monitor_thread_recovers_readiness_503_to_200() -> TestResult {
+        use std::os::unix::net::UnixListener;
+        use std::sync::mpsc;
+
+        let dir = std::env::temp_dir().join(format!("tempo-398-mon-{}", current_time_ns()));
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("engine.sock");
+
+        // Channels sequence the fake engine so the test controls the death window
+        // and observes the readiness flip driven purely by the monitor thread.
+        let (bound_tx, bound_rx) = mpsc::channel::<()>();
+        let (conn1_tx, conn1_rx) = mpsc::channel::<()>();
+        let (kill_tx, kill_rx) = mpsc::channel::<()>();
+        let (rebind_tx, rebind_rx) = mpsc::channel::<()>();
+        let (stop_tx, stop_rx) = mpsc::channel::<()>();
+
+        let server_path = path.clone();
+        let engine = thread::spawn(move || -> Result<(), Box<dyn Error + Send + Sync>> {
+            let listener = UnixListener::bind(&server_path)?;
+            bound_tx.send(())?;
+            let (conn1, _) = listener.accept()?;
+            conn1_tx.send(())?;
+            // Hold connection 1 open until the test asks for the death, then drop
+            // the socket and unbind so reconnect attempts fail during the window.
+            kill_rx.recv()?;
+            drop(conn1);
+            drop(listener);
+            let _ = std::fs::remove_file(&server_path);
+            // The engine comes back only when the test says so; until then the
+            // monitor's reconnects fail and back off.
+            rebind_rx.recv()?;
+            let listener = UnixListener::bind(&server_path)?;
+            let (conn2, _) = listener.accept()?;
+            // Hold connection 2 open (keeping the driver live) until the test is
+            // done asserting recovery.
+            stop_rx.recv()?;
+            drop(conn2);
+            Ok(())
+        });
+
+        bound_rx
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(|_| "engine never bound its socket")?;
+        let client = connect_engine_ipc(&path)?;
+        let pool = Arc::new(Mutex::new(SessionPool::default()));
+        lock_pool(&pool)?.attach_engine_driver(Engine::Cdp, client)?;
+        conn1_rx
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(|_| "engine never accepted connection 1")?;
+
+        // Read the readiness status code under a brief pool lock.
+        let ready_status = |pool: &Arc<Mutex<SessionPool>>| -> Result<u16, TempodError> {
+            let guard = lock_pool(pool)?;
+            Ok(readiness_response(&guard).status)
+        };
+
+        // Healthy to start: readiness 200.
+        assert_eq!(ready_status(&pool)?, 200);
+
+        // Spawn the REAL monitor with a short poll/backoff policy.
+        spawn_engine_liveness_monitor(
+            Arc::clone(&pool),
+            Engine::Cdp,
+            path.clone(),
+            EngineReconnectPolicy {
+                poll_interval: Duration::from_millis(20),
+                base_backoff: Duration::from_millis(20),
+                max_backoff: Duration::from_millis(200),
+                // Generous so a slow CI's reconnect window never exhausts it.
+                max_attempts: Some(500),
+                stable_window: Duration::from_millis(100),
+            },
+        );
+
+        // Kill connection 1; readiness must drop to 503 (attached-but-dead).
+        kill_tx.send(())?;
+        let mut dropped = false;
+        for _ in 0..500 {
+            if ready_status(&pool)? == 503 {
+                dropped = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(dropped, "readiness never reported 503 after engine death");
+
+        // Bring the engine back; the monitor thread must reconnect + re-attach on
+        // its own and readiness must recover to 200.
+        rebind_tx.send(())?;
+        let mut recovered = false;
+        for _ in 0..500 {
+            if ready_status(&pool)? == 200 {
+                recovered = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            recovered,
+            "monitor never re-attached; readiness stuck below 200"
+        );
+        {
+            let pool = lock_pool(&pool)?;
+            assert!(pool.engine_live());
+            assert!(!pool.engine_driver_dead());
+        }
+
+        stop_tx.send(())?;
         engine
             .join()
             .map_err(|_| "engine thread panicked")?
