@@ -2388,6 +2388,27 @@ mod tests {
 
     type TestResult = Result<(), Box<dyn Error>>;
 
+    fn normalize_tempo_cdp_chrome(path: impl AsRef<str>) -> String {
+        path.as_ref()
+            .trim()
+            .trim_matches(|c| c == '\'' || c == '"')
+            .replace("\\ ", " ")
+    }
+
+    fn live_cdp_chrome_executable() -> Option<String> {
+        let raw = std::env::var("TEMPO_CDP_CHROME").ok()?;
+        let chrome = normalize_tempo_cdp_chrome(raw);
+
+        if chrome.trim().is_empty() {
+            return None;
+        }
+        assert!(
+            std::path::Path::new(&chrome).exists(),
+            "TEMPO_CDP_CHROME path does not exist: {chrome:?}"
+        );
+        Some(chrome)
+    }
+
     fn is_lower_hex(value: &str) -> bool {
         value
             .bytes()
@@ -3749,7 +3770,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn live_cdp_runner_completes_scripted_task_and_journals_it() -> TestResult {
-        let Some(chrome) = std::env::var("TEMPO_CDP_CHROME").ok() else {
+        let Some(chrome) = live_cdp_chrome_executable() else {
             eprintln!("skipping live CDP agent smoke; TEMPO_CDP_CHROME is not set");
             return Ok(());
         };

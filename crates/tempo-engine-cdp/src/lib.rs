@@ -3056,6 +3056,27 @@ mod tests {
     use std::net::{SocketAddr, TcpListener, TcpStream as StdTcpStream};
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    fn normalize_tempo_cdp_chrome(path: impl AsRef<str>) -> String {
+        path.as_ref()
+            .trim()
+            .trim_matches(|c| c == '\'' || c == '"')
+            .replace("\\ ", " ")
+    }
+
+    fn live_cdp_chrome_executable() -> Option<String> {
+        let raw = std::env::var_os("TEMPO_CDP_CHROME")?;
+        let chrome = normalize_tempo_cdp_chrome(raw.to_string_lossy());
+
+        if chrome.trim().is_empty() {
+            return None;
+        }
+        assert!(
+            Path::new(&chrome).exists(),
+            "TEMPO_CDP_CHROME path does not exist: {chrome:?}"
+        );
+        Some(chrome)
+    }
+
     #[test]
     fn navigation_url_match_accepts_chromium_normalization_only() {
         assert!(navigation_urls_match(
@@ -4266,7 +4287,7 @@ mod tests {
     #[tokio::test]
     async fn live_cdp_default_blocks_private_fixture_before_origin_socket(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let Some(chrome) = std::env::var_os("TEMPO_CDP_CHROME") else {
+        let Some(chrome) = live_cdp_chrome_executable() else {
             eprintln!("skipping live CDP default private block test; TEMPO_CDP_CHROME is unset");
             return Ok(());
         };
@@ -4283,7 +4304,7 @@ mod tests {
         });
 
         let config = CdpConfig::default()
-            .with_executable(chrome.to_string_lossy())
+            .with_executable(chrome)
             .with_no_sandbox_env_opt_in();
         let mut driver = CdpTempoDriver::launch_with(config).await?;
         let result = driver.goto(&url).await;
@@ -4298,13 +4319,13 @@ mod tests {
     #[tokio::test]
     async fn live_cdp_driver_blocks_page_triggered_private_navigation(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let Some(chrome) = std::env::var_os("TEMPO_CDP_CHROME") else {
+        let Some(chrome) = live_cdp_chrome_executable() else {
             eprintln!("skipping live CDP page navigation policy test; TEMPO_CDP_CHROME is unset");
             return Ok(());
         };
         let fixture = serve_policy_fixture()?;
         let config = CdpConfig::default()
-            .with_executable(chrome.to_string_lossy())
+            .with_executable(chrome)
             .with_no_sandbox_env_opt_in();
         let mut driver = CdpTempoDriver::launch_with(config)
             .await?
@@ -4339,12 +4360,12 @@ mod tests {
     #[tokio::test]
     async fn live_cdp_click_prevent_default_does_not_preblock_private_href(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let Some(chrome) = std::env::var_os("TEMPO_CDP_CHROME") else {
+        let Some(chrome) = live_cdp_chrome_executable() else {
             eprintln!("skipping live CDP preventDefault policy test; TEMPO_CDP_CHROME is unset");
             return Ok(());
         };
         let config = CdpConfig::default()
-            .with_executable(chrome.to_string_lossy())
+            .with_executable(chrome)
             .with_no_sandbox_env_opt_in();
         let mut driver = CdpTempoDriver::launch_with(config).await?;
         driver
@@ -4390,12 +4411,12 @@ mod tests {
     #[tokio::test]
     async fn live_cdp_ax_enrichment_survives_describe_node_drop(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let Some(chrome) = std::env::var_os("TEMPO_CDP_CHROME") else {
+        let Some(chrome) = live_cdp_chrome_executable() else {
             eprintln!("skipping live CDP AX enrichment test; TEMPO_CDP_CHROME is unset");
             return Ok(());
         };
         let config = CdpConfig::default()
-            .with_executable(chrome.to_string_lossy())
+            .with_executable(chrome)
             .with_no_sandbox_env_opt_in();
         let mut driver = CdpTempoDriver::launch_with(config).await?;
         driver
@@ -4451,14 +4472,14 @@ mod tests {
     #[tokio::test]
     async fn live_cdp_driver_blocks_script_triggered_private_request(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let Some(chrome) = std::env::var_os("TEMPO_CDP_CHROME") else {
+        let Some(chrome) = live_cdp_chrome_executable() else {
             eprintln!("skipping live CDP script request policy test; TEMPO_CDP_CHROME is unset");
             return Ok(());
         };
         let fixture = serve_policy_fixture()?;
         let private_url = serde_json::to_string(&fixture.private_url)?;
         let config = CdpConfig::default()
-            .with_executable(chrome.to_string_lossy())
+            .with_executable(chrome)
             .with_no_sandbox_env_opt_in();
         let mut driver = CdpTempoDriver::launch_with(config).await?;
 
@@ -4481,14 +4502,14 @@ mod tests {
     #[tokio::test]
     async fn live_cdp_driver_blocks_private_requests_during_wait_windows(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let Some(chrome) = std::env::var_os("TEMPO_CDP_CHROME") else {
+        let Some(chrome) = live_cdp_chrome_executable() else {
             eprintln!("skipping live CDP wait-window policy test; TEMPO_CDP_CHROME is unset");
             return Ok(());
         };
         let fixture = serve_policy_fixture()?;
         let private_url = serde_json::to_string(&fixture.private_url)?;
         let config = CdpConfig::default()
-            .with_executable(chrome.to_string_lossy())
+            .with_executable(chrome)
             .with_no_sandbox_env_opt_in();
         let mut driver = CdpTempoDriver::launch_with(config).await?;
 
@@ -4515,7 +4536,7 @@ mod tests {
     #[tokio::test]
     async fn live_cdp_current_url_guard_rejects_redirected_private_url_before_snapshot(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let Some(chrome) = std::env::var_os("TEMPO_CDP_CHROME") else {
+        let Some(chrome) = live_cdp_chrome_executable() else {
             eprintln!(
                 "skipping live CDP redirected current URL guard test; TEMPO_CDP_CHROME is unset"
             );
@@ -4523,7 +4544,7 @@ mod tests {
         };
         let fixture = serve_policy_fixture()?;
         let config = CdpConfig::default()
-            .with_executable(chrome.to_string_lossy())
+            .with_executable(chrome)
             .with_no_sandbox_env_opt_in();
         let mut driver = CdpTempoDriver::launch_with(config)
             .await?
@@ -4584,13 +4605,13 @@ mod tests {
     #[tokio::test]
     async fn live_cdp_current_url_guard_prevents_click_and_scroll_side_effects(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let Some(chrome) = std::env::var_os("TEMPO_CDP_CHROME") else {
+        let Some(chrome) = live_cdp_chrome_executable() else {
             eprintln!("skipping live CDP guard side-effect test; TEMPO_CDP_CHROME is unset");
             return Ok(());
         };
         let url = serve_click_scroll_probe_fixture()?;
         let config = CdpConfig::default()
-            .with_executable(chrome.to_string_lossy())
+            .with_executable(chrome)
             .with_no_sandbox_env_opt_in();
         let mut driver = CdpTempoDriver::launch_with(config)
             .await?
@@ -4698,13 +4719,13 @@ mod tests {
     #[tokio::test]
     async fn live_cdp_driver_navigates_observes_acts_and_screenshots(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let Some(chrome) = std::env::var_os("TEMPO_CDP_CHROME") else {
+        let Some(chrome) = live_cdp_chrome_executable() else {
             eprintln!("skipping live CDP test; TEMPO_CDP_CHROME is unset");
             return Ok(());
         };
         let url = serve_fixture()?;
         let config = CdpConfig::default()
-            .with_executable(chrome.to_string_lossy())
+            .with_executable(chrome)
             .with_no_sandbox_env_opt_in();
         let mut driver = CdpTempoDriver::launch_with(config)
             .await?
@@ -4765,13 +4786,13 @@ mod tests {
     #[tokio::test]
     async fn live_cdp_stable_node_id_survives_selector_mutation(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let Some(chrome) = std::env::var_os("TEMPO_CDP_CHROME") else {
+        let Some(chrome) = live_cdp_chrome_executable() else {
             eprintln!("skipping live CDP stable NodeId test; TEMPO_CDP_CHROME is unset");
             return Ok(());
         };
         let url = serve_fixture()?;
         let config = CdpConfig::default()
-            .with_executable(chrome.to_string_lossy())
+            .with_executable(chrome)
             .with_no_sandbox_env_opt_in();
         let mut driver = CdpTempoDriver::launch_with(config)
             .await?
@@ -4809,13 +4830,13 @@ mod tests {
     #[tokio::test]
     async fn live_cdp_invalid_legacy_node_ids_are_step_errors(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let Some(chrome) = std::env::var_os("TEMPO_CDP_CHROME") else {
+        let Some(chrome) = live_cdp_chrome_executable() else {
             eprintln!("skipping live CDP invalid legacy NodeId test; TEMPO_CDP_CHROME is unset");
             return Ok(());
         };
         let url = serve_fixture()?;
         let config = CdpConfig::default()
-            .with_executable(chrome.to_string_lossy())
+            .with_executable(chrome)
             .with_no_sandbox_env_opt_in();
         let mut driver = CdpTempoDriver::launch_with(config)
             .await?
@@ -4881,13 +4902,13 @@ mod tests {
     #[tokio::test]
     async fn live_cdp_child_browsing_context_isolates_storage(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let Some(chrome) = std::env::var_os("TEMPO_CDP_CHROME") else {
+        let Some(chrome) = live_cdp_chrome_executable() else {
             eprintln!("skipping live CDP context isolation test; TEMPO_CDP_CHROME is unset");
             return Ok(());
         };
         let url = serve_fixture()?;
         let config = CdpConfig::default()
-            .with_executable(chrome.to_string_lossy())
+            .with_executable(chrome)
             .with_no_sandbox_env_opt_in();
         let mut driver = CdpTempoDriver::launch_with(config)
             .await?
@@ -4930,13 +4951,13 @@ mod tests {
 
     #[tokio::test]
     async fn live_cdp_driver_passes_conformance_v2() -> Result<(), Box<dyn std::error::Error>> {
-        let Some(chrome) = std::env::var_os("TEMPO_CDP_CHROME") else {
+        let Some(chrome) = live_cdp_chrome_executable() else {
             eprintln!("skipping live CDP conformance test; TEMPO_CDP_CHROME is unset");
             return Ok(());
         };
         let url = serve_fixture()?;
         let config = CdpConfig::default()
-            .with_executable(chrome.to_string_lossy())
+            .with_executable(chrome)
             .with_no_sandbox_env_opt_in();
         let mut driver = CdpTempoDriver::launch_with(config)
             .await?

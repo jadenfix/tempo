@@ -12,7 +12,7 @@ use tempo_engine_host::{
 #[tokio::test]
 async fn cdp_driver_serves_commands_over_engine_host_uds() -> Result<(), Box<dyn std::error::Error>>
 {
-    let Some(chrome) = std::env::var_os("TEMPO_CDP_CHROME") else {
+    let Some(chrome) = live_cdp_chrome_executable() else {
         eprintln!("skipping live CDP UDS test; TEMPO_CDP_CHROME is unset");
         return Ok(());
     };
@@ -49,7 +49,7 @@ async fn cdp_driver_serves_commands_over_engine_host_uds() -> Result<(), Box<dyn
     );
 
     let config = CdpConfig::default()
-        .with_executable(chrome.to_string_lossy())
+        .with_executable(chrome)
         .with_no_sandbox_env_opt_in();
     let mut driver = CdpTempoDriver::launch_with(config)
         .await?
@@ -105,7 +105,7 @@ async fn cdp_driver_serves_commands_over_engine_host_uds() -> Result<(), Box<dyn
 #[test]
 fn tempo_engined_cdp_binary_binds_socket_for_tempod_style_connect(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let Some(chrome) = std::env::var_os("TEMPO_CDP_CHROME") else {
+    let Some(chrome) = live_cdp_chrome_executable() else {
         eprintln!("skipping live CDP UDS test; TEMPO_CDP_CHROME is unset");
         return Ok(());
     };
@@ -184,4 +184,25 @@ fn serve_fixture() -> Result<String, std::io::Error> {
     });
 
     Ok(format!("http://{addr}/"))
+}
+
+fn normalize_tempo_cdp_chrome(path: impl AsRef<str>) -> String {
+    path.as_ref()
+        .trim()
+        .trim_matches(|c| c == '\'' || c == '"')
+        .replace("\\ ", " ")
+}
+
+fn live_cdp_chrome_executable() -> Option<String> {
+    let raw = std::env::var_os("TEMPO_CDP_CHROME")?;
+    let chrome = normalize_tempo_cdp_chrome(raw.to_string_lossy());
+
+    if chrome.trim().is_empty() {
+        return None;
+    }
+    if !std::path::Path::new(&chrome).exists() {
+        panic!("TEMPO_CDP_CHROME path does not exist: {chrome:?}");
+    }
+
+    Some(chrome)
 }
