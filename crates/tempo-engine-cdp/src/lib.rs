@@ -194,7 +194,7 @@ pub struct CdpTempoDriver {
     profile_dir: Option<tempfile::TempDir>,
     owns_browser: bool,
     seq: u64,
-    history: BTreeMap<u64, CompiledObservation>,
+    history: BTreeMap<u64, Arc<CompiledObservation>>,
     stable_id_mapper: StableIdMapper,
     selectors_by_node: BTreeMap<NodeId, String>,
     url_policy: Arc<Mutex<UrlPolicy>>,
@@ -451,15 +451,13 @@ impl CdpTempoDriver {
         &mut self,
         url: String,
         dom_html: String,
-    ) -> Result<CompiledObservation, TransportError> {
+    ) -> Result<Arc<CompiledObservation>, TransportError> {
         self.seq += 1;
         let (mut compiled, selectors_by_node) =
             compile_observation(&mut self.stable_id_mapper, url, dom_html, self.seq);
         self.selectors_by_node = selectors_by_node;
         self.enrich_observation_from_ax_tree(&mut compiled).await?;
-        self.history.insert(compiled.seq, compiled.clone());
-        prune_observation_history(&mut self.history, compiled.seq);
-        Ok(compiled)
+        Ok(retain_observation_history(&mut self.history, compiled))
     }
 
     async fn record_snapshot_since(
@@ -467,7 +465,7 @@ impl CdpTempoDriver {
         cursor: u64,
         url: String,
         dom_html: String,
-    ) -> Result<CompiledObservation, TransportError> {
+    ) -> Result<Arc<CompiledObservation>, TransportError> {
         let compiled = self.record_snapshot(url, dom_html).await?;
         // Every `_since` caller has already served the full 25ms event grace
         // for this same cursor immediately after its action command returned
@@ -478,7 +476,9 @@ impl CdpTempoDriver {
         Ok(compiled)
     }
 
-    async fn record_current_observation(&mut self) -> Result<CompiledObservation, TransportError> {
+    async fn record_current_observation(
+        &mut self,
+    ) -> Result<Arc<CompiledObservation>, TransportError> {
         let cursor = self.request_policy_cursor();
         // Bare observes (no preceding action wait) keep the full event grace as
         // the policy watchdog before the snapshot is trusted.
@@ -489,9 +489,41 @@ impl CdpTempoDriver {
     async fn record_current_observation_since(
         &mut self,
         cursor: u64,
-    ) -> Result<CompiledObservation, TransportError> {
+    ) -> Result<Arc<CompiledObservation>, TransportError> {
         let (url, dom_html) = self.snapshot_since(cursor).await?;
         self.record_snapshot_since(cursor, url, dom_html).await
+    }
+
+    async fn goto_recorded(
+        &mut self,
+        url: &str,
+    ) -> Result<Arc<CompiledObservation>, TransportError> {
+        self.enforce_url_policy(url)?;
+        self.clear_blocked_request()?;
+        let cursor = self.request_policy_cursor();
+        match self.page()?.goto(url).await {
+            Ok(_page) => {}
+            Err(CdpError::Timeout) => {
+                self.recover_timed_out_navigation_since(cursor, url).await?;
+            }
+            Err(error) => {
+                self.enforce_no_blocked_request_soon_since(cursor).await?;
+                return Err(map_cdp_error(error));
+            }
+        }
+        self.enforce_no_blocked_request_soon_since(cursor).await?;
+        if self.take_blocked_request()?.is_some() {
+            return Err(TransportError::UrlBlocked);
+        }
+        // Pre-warm the stability-probe isolated world for the destination
+        // document. Without this, the first composite-quiescence sample after
+        // navigation pays the stale-context miss (failed evaluate + mainframe
+        // + createIsolatedWorld) inside the settle loop itself. Best-effort:
+        // the sampler still recreates on demand if this fails.
+        let _ = self.probe_context_id(true, cursor).await;
+        let (final_url, dom_html) = self.snapshot_since(cursor).await?;
+        self.record_snapshot_since(cursor, final_url, dom_html)
+            .await
     }
 
     async fn enrich_observation_from_ax_tree(
@@ -689,7 +721,11 @@ impl CdpTempoDriver {
         let compiled = self.record_current_observation_since(cursor).await?;
         if grounded {
             Ok(StepOutcome::Applied {
-                diff: diff_from_base(self.history.get(&previous_seq), &compiled, previous_seq),
+                diff: diff_from_base(
+                    history_base(&self.history, previous_seq),
+                    compiled.as_ref(),
+                    previous_seq,
+                ),
             })
         } else {
             Ok(StepOutcome::StepError {
@@ -702,9 +738,13 @@ impl CdpTempoDriver {
         let previous_seq = self.seq;
         match action {
             Action::Goto { url } => {
-                let compiled = self.goto(url).await?;
+                let compiled = self.goto_recorded(url).await?;
                 Ok(StepOutcome::Applied {
-                    diff: diff_from_base(self.history.get(&previous_seq), &compiled, previous_seq),
+                    diff: diff_from_base(
+                        history_base(&self.history, previous_seq),
+                        compiled.as_ref(),
+                        previous_seq,
+                    ),
                 })
             }
             Action::Click { node } => {
@@ -770,7 +810,11 @@ impl CdpTempoDriver {
                 self.enforce_no_blocked_request_soon_since(cursor).await?;
                 let compiled = self.record_current_observation_since(cursor).await?;
                 Ok(StepOutcome::Applied {
-                    diff: diff_from_base(self.history.get(&previous_seq), &compiled, previous_seq),
+                    diff: diff_from_base(
+                        history_base(&self.history, previous_seq),
+                        compiled.as_ref(),
+                        previous_seq,
+                    ),
                 })
             }
             Action::Wait { millis } => {
@@ -779,7 +823,11 @@ impl CdpTempoDriver {
                 self.enforce_no_blocked_request_soon_since(cursor).await?;
                 let compiled = self.record_current_observation_since(cursor).await?;
                 Ok(StepOutcome::Applied {
-                    diff: diff_from_base(self.history.get(&previous_seq), &compiled, previous_seq),
+                    diff: diff_from_base(
+                        history_base(&self.history, previous_seq),
+                        compiled.as_ref(),
+                        previous_seq,
+                    ),
                 })
             }
             Action::Extract { node } => {
@@ -1066,43 +1114,18 @@ impl DriverTrait for CdpTempoDriver {
     }
 
     async fn goto(&mut self, url: &str) -> Result<CompiledObservation, TransportError> {
-        self.enforce_url_policy(url)?;
-        self.clear_blocked_request()?;
-        let cursor = self.request_policy_cursor();
-        match self.page()?.goto(url).await {
-            Ok(_page) => {}
-            Err(CdpError::Timeout) => {
-                self.recover_timed_out_navigation_since(cursor, url).await?;
-            }
-            Err(error) => {
-                self.enforce_no_blocked_request_soon_since(cursor).await?;
-                return Err(map_cdp_error(error));
-            }
-        }
-        self.enforce_no_blocked_request_soon_since(cursor).await?;
-        if self.take_blocked_request()?.is_some() {
-            return Err(TransportError::UrlBlocked);
-        }
-        // Pre-warm the stability-probe isolated world for the destination
-        // document. Without this, the first composite-quiescence sample after
-        // navigation pays the stale-context miss (failed evaluate + mainframe
-        // + createIsolatedWorld) inside the settle loop itself. Best-effort:
-        // the sampler still recreates on demand if this fails.
-        let _ = self.probe_context_id(true, cursor).await;
-        let (final_url, dom_html) = self.snapshot_since(cursor).await?;
-        self.record_snapshot_since(cursor, final_url, dom_html)
-            .await
+        Ok(self.goto_recorded(url).await?.as_ref().clone())
     }
 
     async fn observe(&mut self) -> Result<CompiledObservation, TransportError> {
-        self.record_current_observation().await
+        Ok(self.record_current_observation().await?.as_ref().clone())
     }
 
     async fn observe_diff(&mut self, since_seq: u64) -> Result<ObservationDiff, TransportError> {
-        let observation = self.observe().await?;
+        let observation = self.record_current_observation().await?;
         Ok(diff_from_base(
-            self.history.get(&since_seq),
-            &observation,
+            history_base(&self.history, since_seq),
+            observation.as_ref(),
             since_seq,
         ))
     }
@@ -1128,8 +1151,8 @@ impl DriverTrait for CdpTempoDriver {
                 let compiled = self.record_current_observation_since(cursor).await?;
                 Ok(StepOutcome::Applied {
                     diff: diff_from_base(
-                        self.history.get(&batch_base_seq),
-                        &compiled,
+                        history_base(&self.history, batch_base_seq),
+                        compiled.as_ref(),
                         batch_base_seq,
                     ),
                 })
@@ -1139,8 +1162,8 @@ impl DriverTrait for CdpTempoDriver {
                 let compiled = self.record_current_observation().await?;
                 Ok(StepOutcome::Applied {
                     diff: diff_from_base(
-                        self.history.get(&batch_base_seq),
-                        &compiled,
+                        history_base(&self.history, batch_base_seq),
+                        compiled.as_ref(),
                         batch_base_seq,
                     ),
                 })
@@ -2757,7 +2780,27 @@ fn find_close_tag(haystack: &[u8], tag: &[u8]) -> Option<usize> {
 /// Evict compiled observations older than the retention window, keeping the most
 /// recent `HISTORY_RETENTION_SNAPSHOTS` seqs (those up to and including `newest_seq`).
 /// Pure and O(retained) — the map never exceeds the window after the first prune.
-fn prune_observation_history(history: &mut BTreeMap<u64, CompiledObservation>, newest_seq: u64) {
+fn history_base(
+    history: &BTreeMap<u64, Arc<CompiledObservation>>,
+    seq: u64,
+) -> Option<&CompiledObservation> {
+    history.get(&seq).map(Arc::as_ref)
+}
+
+fn retain_observation_history(
+    history: &mut BTreeMap<u64, Arc<CompiledObservation>>,
+    compiled: CompiledObservation,
+) -> Arc<CompiledObservation> {
+    let retained = Arc::new(compiled);
+    history.insert(retained.seq, Arc::clone(&retained));
+    prune_observation_history(history, retained.seq);
+    retained
+}
+
+fn prune_observation_history(
+    history: &mut BTreeMap<u64, Arc<CompiledObservation>>,
+    newest_seq: u64,
+) {
     let cutoff = newest_seq.saturating_sub(HISTORY_RETENTION_SNAPSHOTS - 1);
     if cutoff == 0 {
         return; // still within the first window; nothing to evict
@@ -2928,10 +2971,9 @@ mod tests {
                 omitted: 0,
             }
         }
-        let mut history: BTreeMap<u64, CompiledObservation> = BTreeMap::new();
+        let mut history: BTreeMap<u64, Arc<CompiledObservation>> = BTreeMap::new();
         for seq in 1..=100 {
-            history.insert(seq, obs(seq));
-            prune_observation_history(&mut history, seq);
+            retain_observation_history(&mut history, obs(seq));
             assert!(history.len() as u64 <= HISTORY_RETENTION_SNAPSHOTS);
         }
         // Never exceeds the window, and keeps exactly the most-recent K seqs.
@@ -2942,12 +2984,36 @@ mod tests {
         );
         assert_eq!(history.keys().next_back().copied(), Some(100));
         // Early seqs (before the window fills) are all retained.
-        let mut early: BTreeMap<u64, CompiledObservation> = BTreeMap::new();
+        let mut early: BTreeMap<u64, Arc<CompiledObservation>> = BTreeMap::new();
         for seq in 1..=3 {
-            early.insert(seq, obs(seq));
-            prune_observation_history(&mut early, seq);
+            retain_observation_history(&mut early, obs(seq));
         }
         assert_eq!(early.len(), 3);
+    }
+
+    #[test]
+    fn observation_history_retains_shared_snapshots_without_deep_clone() {
+        let mut history = BTreeMap::new();
+        let retained = retain_observation_history(
+            &mut history,
+            CompiledObservation {
+                schema_version: tempo_schema::SCHEMA_VERSION.to_string(),
+                url: "https://example.test/".to_string(),
+                seq: 1,
+                elements: Vec::new(),
+                marks: Vec::new(),
+                omitted: 0,
+            },
+        );
+
+        let Some(stored) = history.get(&1) else {
+            panic!("retained observation must be stored in history");
+        };
+        assert!(Arc::ptr_eq(&retained, stored));
+        assert_eq!(
+            history_base(&history, 1).map(|observation| observation.seq),
+            Some(1)
+        );
     }
 
     #[test]
