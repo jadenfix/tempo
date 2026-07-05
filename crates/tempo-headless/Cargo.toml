@@ -17,7 +17,6 @@ tempo-driver = { path = "../tempo-driver" }
 tempo-engine-host = { path = "../tempo-engine-host" }
 tempo-mcp = { path = "../tempo-mcp" }
 tempo-net = { path = "../tempo-net" }
-tempo-observe = { path = "../tempo-observe" }
 tempo-config = { path = "../tempo-config" }
 tempo-policy = { path = "../tempo-policy" }
 tempo-telemetry = { path = "../tempo-telemetry" }

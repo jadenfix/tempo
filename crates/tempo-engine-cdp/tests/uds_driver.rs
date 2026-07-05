@@ -10,8 +10,6 @@ use tempo_engine_host::{
 };
 use tempo_schema::{Action, ActionBatch, QuiescencePolicy};
 
-const LIVE_CDP_IPC_CLIENT_TIMEOUT: Duration = Duration::from_secs(60);
-
 #[tokio::test]
 async fn cdp_driver_serves_commands_over_engine_host_uds() -> Result<(), Box<dyn std::error::Error>>
 {
@@ -33,8 +31,8 @@ async fn cdp_driver_serves_commands_over_engine_host_uds() -> Result<(), Box<dyn
             tempo_engine_host::EngineHostError,
         > {
             let client_stream = client_stream;
-            client_stream.set_read_timeout(Some(LIVE_CDP_IPC_CLIENT_TIMEOUT))?;
-            client_stream.set_write_timeout(Some(LIVE_CDP_IPC_CLIENT_TIMEOUT))?;
+            client_stream.set_read_timeout(Some(Duration::from_secs(20)))?;
+            client_stream.set_write_timeout(Some(Duration::from_secs(20)))?;
             let mut client = EngineIpcClient::from_stream(client_stream);
             let observed = client.request(DriverCommand::Goto { url: url.clone() })?;
             let created = client.request(DriverCommand::CreateBrowsingContext {
@@ -53,7 +51,7 @@ async fn cdp_driver_serves_commands_over_engine_host_uds() -> Result<(), Box<dyn
                 Some(&driver_id),
                 DriverCommand::ActBatch {
                     batch: ActionBatch {
-                        actions: vec![Action::Wait { millis: 0 }],
+                        actions: vec![Action::Goto { url }],
                         quiescence: QuiescencePolicy::FixedMillis(0),
                     },
                 },
