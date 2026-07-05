@@ -33,11 +33,12 @@ fn bench_journal_append(c: &mut Criterion) {
                     .unwrap();
                     (dir, journal)
                 },
-                |(_dir, mut journal)| {
+                |(dir, mut journal)| {
                     for seq in 0..count {
                         journal.append(append_event(seq as u64)).unwrap();
                     }
-                    black_box(journal.next_seq())
+                    black_box(journal.next_seq());
+                    (dir, journal)
                 },
                 criterion::BatchSize::PerIteration,
             );
