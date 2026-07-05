@@ -22,6 +22,7 @@ BENCHES=(
   "tempo-act quiescence"
   "tempo-policy policy"
   "tempo-session cassettes"
+  "tempo-session journal"
 )
 
 ARGS=(--save-baseline "$BASELINE")
