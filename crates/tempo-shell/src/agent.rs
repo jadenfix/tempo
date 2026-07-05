@@ -100,11 +100,13 @@ impl JournalEntry {
             TempodSessionEventKind::SessionCreated { url } => {
                 ("session_created", url.clone(), false)
             }
-            TempodSessionEventKind::SessionAdopted => ("session_adopted", String::new(), false),
             TempodSessionEventKind::SessionHandoff => ("session_handoff", String::new(), false),
+            TempodSessionEventKind::SessionAdopted => ("session_adopted", String::new(), false),
             TempodSessionEventKind::SessionKilled => ("session_killed", String::new(), false),
             TempodSessionEventKind::SessionDrained => ("session_drained", String::new(), false),
-            TempodSessionEventKind::Manager { event } => ("manager", format!("{event:?}"), false),
+            TempodSessionEventKind::Manager { event } => {
+                ("manager", format!("manager event: {event:?}"), false)
+            }
             TempodSessionEventKind::StepTriple { triple } => {
                 ("step", step_detail(triple), step_is_tainted(triple))
             }
