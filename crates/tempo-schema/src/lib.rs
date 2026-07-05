@@ -163,6 +163,214 @@ pub struct HumanTakeover {
     pub url: String,
 }
 
+/// Stable identifier for an agent-managed run.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct AgentRunId(pub String);
+
+/// Stable identifier for a native shell or WebView surface attached to a session.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ShellSurfaceId(pub String);
+
+/// Lifecycle state for a tempod-managed agent run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentRunState {
+    Queued,
+    Running,
+    WaitingForHuman,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+/// Which actor currently owns write control for one shared session.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ControlOwner {
+    Agent {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_id: Option<AgentRunId>,
+    },
+    Human {
+        surface_id: ShellSurfaceId,
+    },
+    Unowned,
+}
+
+/// Browser-engine capability tier for a shell surface.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserEngineTier {
+    T1,
+    T2,
+    T3,
+    Structured,
+}
+
+/// How much browser storage continuity a surface can preserve for a session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageContinuityMode {
+    SharedProfile,
+    ImportedProfile,
+    Ephemeral,
+    Unsupported,
+}
+
+/// Browser-mediated native prompt types that automation must hand to a human.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativePromptKind {
+    FedCm,
+    WebAuthnPasskey,
+    PasswordAutofill,
+    Captcha,
+    Login,
+    Permission,
+    Other,
+}
+
+/// Native prompt lifecycle state surfaced to manager UIs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativePromptState {
+    Pending,
+    Resolved,
+    Cancelled,
+}
+
+/// One native shell surface registered against a tempod session.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionAttachment {
+    pub surface_id: ShellSurfaceId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_tier: Option<BrowserEngineTier>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_continuity: Option<StorageContinuityMode>,
+    pub attached_ms: u128,
+}
+
+/// Lease returned when a human shell adopts a shared session.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdoptionLease {
+    pub lease_id: String,
+    pub session_id: String,
+    pub owner: ControlOwner,
+    pub adopted_ms: u128,
+}
+
+/// Server-side request for a native confirmation UI.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfirmationRequest {
+    pub confirmation_id: String,
+    pub session_id: String,
+    pub side_effect: SideEffect,
+    pub gate: String,
+    pub action_index: usize,
+    pub action_kind: String,
+    pub reason: String,
+    pub created_ms: u128,
+    pub expires_ms: u128,
+}
+
+/// Server-minted proof that a native shell confirmed one pending request.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfirmationGrant {
+    pub confirmation_id: String,
+    pub grant_token: String,
+    pub issued_ms: u128,
+    pub expires_ms: u128,
+}
+
+/// Prompt that must be completed by a native shell/human, not by page JS or an agent.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativePromptRequest {
+    pub prompt_id: String,
+    pub session_id: String,
+    pub kind: NativePromptKind,
+    pub state: NativePromptState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub surface_id: Option<ShellSurfaceId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    pub reason: String,
+    pub created_ms: u128,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_ms: Option<u128>,
+}
+
+/// Public run record returned by the manager/run APIs.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AgentRun {
+    pub run_id: AgentRunId,
+    pub session_id: String,
+    pub state: AgentRunState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal: Option<String>,
+    pub created_ms: u128,
+    pub updated_ms: u128,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_ms: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+/// Cross-shell manager snapshot for one shared session.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ManagerSessionState {
+    pub session_id: String,
+    pub owner: ControlOwner,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_run: Option<AgentRunId>,
+    pub attachments: Vec<SessionAttachment>,
+    pub runs: Vec<AgentRun>,
+    pub pending_confirmations: Vec<ConfirmationRequest>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_native_prompts: Vec<NativePromptRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_event_seq: Option<u64>,
+}
+
+/// Event variants native shells consume to keep manager UI state in sync.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ManagerEvent {
+    OwnerChanged {
+        owner: ControlOwner,
+    },
+    SurfaceRegistered {
+        attachment: SessionAttachment,
+    },
+    SurfaceRemoved {
+        surface_id: ShellSurfaceId,
+    },
+    ConfirmationRequested {
+        request: ConfirmationRequest,
+    },
+    ConfirmationGranted {
+        confirmation_id: String,
+    },
+    RunStateChanged {
+        run: AgentRun,
+    },
+    HumanTakeover {
+        takeover: HumanTakeover,
+    },
+    NativePromptRequested {
+        request: NativePromptRequest,
+    },
+    NativePromptResolved {
+        prompt_id: String,
+        state: NativePromptState,
+    },
+}
+
 /// The semantic action space (C2). Actions target stable `NodeId`s, not coordinates.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -641,6 +849,46 @@ pub fn schema_bundle_json_schema() -> Value {
     );
     defs.insert("ObservationDiff".into(), observation_diff_json_schema());
     defs.insert("SideEffect".into(), side_effect_json_schema());
+    defs.insert(
+        "AgentRunId".into(),
+        newtype_string_json_schema("AgentRunId"),
+    );
+    defs.insert(
+        "ShellSurfaceId".into(),
+        newtype_string_json_schema("ShellSurfaceId"),
+    );
+    defs.insert("AgentRunState".into(), agent_run_state_json_schema());
+    defs.insert("ControlOwner".into(), control_owner_json_schema());
+    defs.insert(
+        "BrowserEngineTier".into(),
+        browser_engine_tier_json_schema(),
+    );
+    defs.insert(
+        "StorageContinuityMode".into(),
+        storage_continuity_mode_json_schema(),
+    );
+    defs.insert("NativePromptKind".into(), native_prompt_kind_json_schema());
+    defs.insert(
+        "NativePromptState".into(),
+        native_prompt_state_json_schema(),
+    );
+    defs.insert("SessionAttachment".into(), session_attachment_json_schema());
+    defs.insert("AdoptionLease".into(), adoption_lease_json_schema());
+    defs.insert(
+        "ConfirmationRequest".into(),
+        confirmation_request_json_schema(),
+    );
+    defs.insert("ConfirmationGrant".into(), confirmation_grant_json_schema());
+    defs.insert(
+        "NativePromptRequest".into(),
+        native_prompt_request_json_schema(),
+    );
+    defs.insert("AgentRun".into(), agent_run_json_schema());
+    defs.insert(
+        "ManagerSessionState".into(),
+        manager_session_state_json_schema(),
+    );
+    defs.insert("ManagerEvent".into(), manager_event_json_schema());
     defs.insert("Action".into(), action_json_schema());
     defs.insert("QuiescencePolicy".into(), quiescence_policy_json_schema());
     defs.insert("ActionBatch".into(), action_batch_json_schema());
@@ -660,7 +908,10 @@ pub fn schema_bundle_json_schema() -> Value {
             "observation_diff": { "$ref": "#/$defs/ObservationDiff" },
             "action": { "$ref": "#/$defs/Action" },
             "action_batch": { "$ref": "#/$defs/ActionBatch" },
-            "step_triple": { "$ref": "#/$defs/StepTriple" }
+            "step_triple": { "$ref": "#/$defs/StepTriple" },
+            "agent_run": { "$ref": "#/$defs/AgentRun" },
+            "manager_session_state": { "$ref": "#/$defs/ManagerSessionState" },
+            "manager_event": { "$ref": "#/$defs/ManagerEvent" }
         },
         "$defs": defs
     })
@@ -927,6 +1178,294 @@ fn side_effect_json_schema() -> Value {
     })
 }
 
+fn newtype_string_json_schema(title: &'static str) -> Value {
+    json!({
+        "title": title,
+        "type": "string"
+    })
+}
+
+fn agent_run_state_json_schema() -> Value {
+    json!({
+        "title": "AgentRunState",
+        "type": "string",
+        "enum": ["queued", "running", "waiting_for_human", "completed", "failed", "cancelled"]
+    })
+}
+
+fn control_owner_json_schema() -> Value {
+    json!({
+        "title": "ControlOwner",
+        "oneOf": [
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["kind"],
+                "properties": {
+                    "kind": { "const": "agent" },
+                    "run_id": {
+                        "anyOf": [
+                            { "$ref": "#/$defs/AgentRunId" },
+                            { "type": "null" }
+                        ]
+                    }
+                }
+            },
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["kind", "surface_id"],
+                "properties": {
+                    "kind": { "const": "human" },
+                    "surface_id": { "$ref": "#/$defs/ShellSurfaceId" }
+                }
+            },
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["kind"],
+                "properties": { "kind": { "const": "unowned" } }
+            }
+        ]
+    })
+}
+
+fn browser_engine_tier_json_schema() -> Value {
+    json!({
+        "title": "BrowserEngineTier",
+        "type": "string",
+        "enum": ["t1", "t2", "t3", "structured"]
+    })
+}
+
+fn storage_continuity_mode_json_schema() -> Value {
+    json!({
+        "title": "StorageContinuityMode",
+        "type": "string",
+        "enum": ["shared_profile", "imported_profile", "ephemeral", "unsupported"]
+    })
+}
+
+fn native_prompt_kind_json_schema() -> Value {
+    json!({
+        "title": "NativePromptKind",
+        "type": "string",
+        "enum": [
+            "fed_cm",
+            "web_authn_passkey",
+            "password_autofill",
+            "captcha",
+            "login",
+            "permission",
+            "other"
+        ]
+    })
+}
+
+fn native_prompt_state_json_schema() -> Value {
+    json!({
+        "title": "NativePromptState",
+        "type": "string",
+        "enum": ["pending", "resolved", "cancelled"]
+    })
+}
+
+fn session_attachment_json_schema() -> Value {
+    json!({
+        "title": "SessionAttachment",
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["surface_id", "attached_ms"],
+        "properties": {
+            "surface_id": { "$ref": "#/$defs/ShellSurfaceId" },
+            "platform": { "type": "string" },
+            "label": { "type": "string" },
+            "engine_tier": { "$ref": "#/$defs/BrowserEngineTier" },
+            "profile_id": { "type": "string" },
+            "storage_continuity": { "$ref": "#/$defs/StorageContinuityMode" },
+            "attached_ms": { "type": "integer", "minimum": 0 }
+        }
+    })
+}
+
+fn adoption_lease_json_schema() -> Value {
+    json!({
+        "title": "AdoptionLease",
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["lease_id", "session_id", "owner", "adopted_ms"],
+        "properties": {
+            "lease_id": { "type": "string" },
+            "session_id": { "type": "string" },
+            "owner": { "$ref": "#/$defs/ControlOwner" },
+            "adopted_ms": { "type": "integer", "minimum": 0 }
+        }
+    })
+}
+
+fn confirmation_request_json_schema() -> Value {
+    json!({
+        "title": "ConfirmationRequest",
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "confirmation_id",
+            "session_id",
+            "side_effect",
+            "gate",
+            "action_index",
+            "action_kind",
+            "reason",
+            "created_ms",
+            "expires_ms"
+        ],
+        "properties": {
+            "confirmation_id": { "type": "string" },
+            "session_id": { "type": "string" },
+            "side_effect": { "$ref": "#/$defs/SideEffect" },
+            "gate": { "type": "string" },
+            "action_index": { "type": "integer", "minimum": 0 },
+            "action_kind": { "type": "string" },
+            "reason": { "type": "string" },
+            "created_ms": { "type": "integer", "minimum": 0 },
+            "expires_ms": { "type": "integer", "minimum": 0 }
+        }
+    })
+}
+
+fn confirmation_grant_json_schema() -> Value {
+    json!({
+        "title": "ConfirmationGrant",
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["confirmation_id", "grant_token", "issued_ms", "expires_ms"],
+        "properties": {
+            "confirmation_id": { "type": "string" },
+            "grant_token": { "type": "string" },
+            "issued_ms": { "type": "integer", "minimum": 0 },
+            "expires_ms": { "type": "integer", "minimum": 0 }
+        }
+    })
+}
+
+fn native_prompt_request_json_schema() -> Value {
+    json!({
+        "title": "NativePromptRequest",
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "prompt_id",
+            "session_id",
+            "kind",
+            "state",
+            "reason",
+            "created_ms"
+        ],
+        "properties": {
+            "prompt_id": { "type": "string" },
+            "session_id": { "type": "string" },
+            "kind": { "$ref": "#/$defs/NativePromptKind" },
+            "state": { "$ref": "#/$defs/NativePromptState" },
+            "surface_id": { "$ref": "#/$defs/ShellSurfaceId" },
+            "origin": { "type": "string" },
+            "reason": { "type": "string" },
+            "created_ms": { "type": "integer", "minimum": 0 },
+            "expires_ms": { "type": "integer", "minimum": 0 }
+        }
+    })
+}
+
+fn agent_run_json_schema() -> Value {
+    json!({
+        "title": "AgentRun",
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["run_id", "session_id", "state", "created_ms", "updated_ms"],
+        "properties": {
+            "run_id": { "$ref": "#/$defs/AgentRunId" },
+            "session_id": { "type": "string" },
+            "state": { "$ref": "#/$defs/AgentRunState" },
+            "goal": { "type": "string" },
+            "created_ms": { "type": "integer", "minimum": 0 },
+            "updated_ms": { "type": "integer", "minimum": 0 },
+            "completed_ms": { "type": "integer", "minimum": 0 },
+            "last_error": { "type": "string" }
+        }
+    })
+}
+
+fn manager_session_state_json_schema() -> Value {
+    json!({
+        "title": "ManagerSessionState",
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "session_id",
+            "owner",
+            "attachments",
+            "runs",
+            "pending_confirmations"
+        ],
+        "properties": {
+            "session_id": { "type": "string" },
+            "owner": { "$ref": "#/$defs/ControlOwner" },
+            "active_run": {
+                "anyOf": [
+                    { "$ref": "#/$defs/AgentRunId" },
+                    { "type": "null" }
+                ]
+            },
+            "attachments": {
+                "type": "array",
+                "items": { "$ref": "#/$defs/SessionAttachment" }
+            },
+            "runs": {
+                "type": "array",
+                "items": { "$ref": "#/$defs/AgentRun" }
+            },
+            "pending_confirmations": {
+                "type": "array",
+                "items": { "$ref": "#/$defs/ConfirmationRequest" }
+            },
+            "pending_native_prompts": {
+                "type": "array",
+                "items": { "$ref": "#/$defs/NativePromptRequest" }
+            },
+            "last_event_seq": {
+                "anyOf": [
+                    { "type": "integer", "minimum": 0 },
+                    { "type": "null" }
+                ]
+            }
+        }
+    })
+}
+
+fn manager_event_json_schema() -> Value {
+    json!({
+        "title": "ManagerEvent",
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["kind"],
+        "properties": {
+            "kind": {
+                "type": "string",
+                "enum": [
+                    "owner_changed",
+                    "surface_registered",
+                    "surface_removed",
+                    "confirmation_requested",
+                    "confirmation_granted",
+                    "run_state_changed",
+                    "human_takeover",
+                    "native_prompt_requested",
+                    "native_prompt_resolved"
+                ]
+            }
+        }
+    })
+}
+
 fn quiescence_policy_json_schema() -> Value {
     json!({
         "title": "QuiescencePolicy",
@@ -1162,6 +1701,22 @@ mod tests {
             "CompiledObservation",
             "ObservationDiff",
             "SideEffect",
+            "AgentRunId",
+            "ShellSurfaceId",
+            "AgentRunState",
+            "ControlOwner",
+            "BrowserEngineTier",
+            "StorageContinuityMode",
+            "NativePromptKind",
+            "NativePromptState",
+            "SessionAttachment",
+            "AdoptionLease",
+            "ConfirmationRequest",
+            "ConfirmationGrant",
+            "NativePromptRequest",
+            "AgentRun",
+            "ManagerSessionState",
+            "ManagerEvent",
             "Action",
             "QuiescencePolicy",
             "ActionBatch",
