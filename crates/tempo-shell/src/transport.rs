@@ -24,6 +24,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use crate::agent::JournalLog;
+use crate::tab::Tab;
 use crate::ui::{SessionService, ShellUiModel, UiAction};
 
 /// Builds a fresh [`SessionService`] for a tempod base URL. The worker rebuilds
@@ -66,6 +67,7 @@ struct LocalModelState {
     active_tab: Option<usize>,
     marks_overlay: bool,
     journal: JournalLog,
+    tabs: Vec<Tab>,
 }
 
 impl LocalModelState {
@@ -74,6 +76,7 @@ impl LocalModelState {
             active_tab: model.active_tab,
             marks_overlay: model.marks_overlay,
             journal: model.journal.clone(),
+            tabs: model.tabs.clone(),
         }
     }
 
@@ -81,6 +84,7 @@ impl LocalModelState {
         model.active_tab = self.active_tab;
         model.marks_overlay = self.marks_overlay;
         model.journal = self.journal;
+        model.tabs = self.tabs;
     }
 }
 
@@ -261,6 +265,7 @@ impl TransportClient {
             self.model.active_tab = local.active_tab;
             self.model.marks_overlay = local.marks_overlay;
             self.model.journal = local.journal;
+            self.model.tabs = local.tabs;
             self.model.status = local.status;
         }
         if resync && !stale {
@@ -389,6 +394,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
     use tempo_headless::{TempodSession, TempodSessionEvents};
+    use tempo_schema::ConfirmationGrant;
 
     /// A fake transport with no socket: records the calls it receives and returns
     /// canned health/sessions. `delay` lets a test hold a request "in flight" to
@@ -444,25 +450,47 @@ mod tests {
             Err(ShellError::Usage("adopt unused in transport tests".into()))
         }
 
+        fn handoff(&self, session_id: &str) -> Result<TempodSession, ShellError> {
+            self.record(&format!("handoff:{session_id}"));
+            Err(ShellError::Usage(
+                "handoff unused in transport tests".into(),
+            ))
+        }
+
+        fn resume_run(&self, run_id: &str) -> Result<tempo_schema::AgentRun, ShellError> {
+            self.record(&format!("resume:{run_id}"));
+            Err(ShellError::Usage("resume unused in transport tests".into()))
+        }
+
         fn close(&self, session_id: &str) -> Result<TempodSession, ShellError> {
             self.record(&format!("close:{session_id}"));
             Err(ShellError::Usage("close unused in transport tests".into()))
         }
 
-        fn goto(&self, driver_id: Option<&str>, url: &str) -> Result<(), ShellError> {
-            self.record(&format!("goto:{}:{url}", driver_id.unwrap_or("-")));
+        fn goto(&self, session_id: &str, url: &str) -> Result<(), ShellError> {
+            self.record(&format!("goto:{session_id}:{url}"));
+            Ok(())
+        }
+
+        fn goto_confirmed(
+            &self,
+            session_id: &str,
+            url: &str,
+            grant: &ConfirmationGrant,
+        ) -> Result<(), ShellError> {
+            self.record(&format!(
+                "goto_confirmed:{session_id}:{url}:{}",
+                grant.confirmation_id
+            ));
             Ok(())
         }
 
         fn screenshot(
             &self,
-            driver_id: Option<&str>,
+            session_id: &str,
             set_of_marks: bool,
         ) -> Result<ScreenshotImage, ShellError> {
-            self.record(&format!(
-                "screenshot:{}:marks={set_of_marks}",
-                driver_id.unwrap_or("-")
-            ));
+            self.record(&format!("screenshot:{session_id}:marks={set_of_marks}"));
             Err(ShellError::Usage(
                 "screenshot unused in transport tests".into(),
             ))
@@ -477,6 +505,20 @@ mod tests {
             Ok(TempodSessionEvents {
                 events: Vec::new(),
                 truncated_before_seq: None,
+            })
+        }
+
+        fn confirm(
+            &self,
+            session_id: &str,
+            confirmation_id: &str,
+        ) -> Result<tempo_schema::ConfirmationGrant, ShellError> {
+            self.record(&format!("confirm:{session_id}:{confirmation_id}"));
+            Ok(tempo_schema::ConfirmationGrant {
+                confirmation_id: confirmation_id.to_string(),
+                grant_token: "grant-token-test".to_string(),
+                issued_ms: 1,
+                expires_ms: 2,
             })
         }
     }
@@ -587,6 +629,11 @@ mod tests {
             client.model.active_tab,
             Some(1),
             "stale worker results must not undo local tab selection"
+        );
+        assert_eq!(
+            client.model.tabs.len(),
+            2,
+            "stale worker results must not drop locally managed tabs"
         );
     }
 
