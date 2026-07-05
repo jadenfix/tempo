@@ -1863,7 +1863,10 @@ mod tests {
         let joined = std::thread::scope(|scope| {
             scope
                 .spawn(|| {
-                    let _guard = mutex.lock().unwrap();
+                    let _guard = match mutex.lock() {
+                        Ok(guard) => guard,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
                     panic!("poison the lease mutex");
                 })
                 .join()
