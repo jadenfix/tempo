@@ -43,6 +43,12 @@ async fn run() -> Result<(), String> {
     if let Ok(chrome) = std::env::var(CDP_CHROME_ENV)
         && !chrome.trim().is_empty()
     {
+        let chrome = normalize_tempo_cdp_chrome(chrome);
+        if !Path::new(&chrome).exists() {
+            return Err(format!(
+                "TEMPO_CDP_CHROME path does not exist: {chrome:?} (after shell-escape unquoting)"
+            ));
+        }
         config = config.with_executable(chrome);
     }
     config = config.with_no_sandbox_env_opt_in();
@@ -54,6 +60,13 @@ async fn run() -> Result<(), String> {
         .map_err(|error| error.to_string())?;
 
     serve_driver_over_bound_socket(&socket_path, &mut driver).await
+}
+
+fn normalize_tempo_cdp_chrome(path: impl AsRef<str>) -> String {
+    path.as_ref()
+        .trim()
+        .trim_matches(|c| c == '\'' || c == '"')
+        .replace("\\ ", " ")
 }
 
 async fn serve_driver_over_bound_socket<D>(
