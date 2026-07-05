@@ -5,11 +5,15 @@
 //! until the daemon disconnects. Pair it with the daemon:
 //!
 //! ```text
-//! TEMPO_ENGINE_HOST_SOCKET=/tmp/tempo-engine.sock \
+//! SOCKET_DIR="$(mktemp -d "${TMPDIR:-/tmp}/tempo-engined-cdp.XXXXXX")"
+//! TEMPO_ENGINE_HOST_SOCKET="$SOCKET_DIR/engine.sock" \
 //!   TEMPO_CDP_CHROME=/path/to/chrome tempo-engined-cdp &
 //! # wait for "listening on ...", then attach:
-//! tempod --engine cdp --engine-socket /tmp/tempo-engine.sock
+//! tempod --engine cdp --engine-socket "$SOCKET_DIR/engine.sock"
 //! ```
+//!
+//! The socket path must live under a private directory; the server rejects
+//! world-accessible parents such as `/tmp`.
 //!
 //! The engine binds and the daemon connects (its `connect_engine_ipc` client),
 //! so this process must start first.
