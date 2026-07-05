@@ -23,7 +23,7 @@ use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::service::TowerToHyperService;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as JsonValue};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
@@ -74,6 +74,8 @@ use url::Url;
 const MAX_HTTP_BYTES: usize = 64 * 1024;
 const MAX_IDEMPOTENCY_KEY_BYTES: usize = 256;
 const MAX_SESSION_IDEMPOTENCY_RECORDS: usize = 1024;
+const MAX_SESSION_EVENTS_PER_SESSION: usize = 1024;
+const MAX_TERMINAL_SESSIONS: usize = 256;
 const MAX_WS_PAYLOAD_BYTES: usize = MAX_HTTP_BYTES;
 /// Maximum accepted TCP control-plane connections handled concurrently.
 const MAX_HTTP_CONNECTIONS: usize = 128;
@@ -435,6 +437,15 @@ pub struct TempodSessionEvent {
     pub event: TempodSessionEventKind,
 }
 
+/// Window returned by `/sessions/{id}/events`.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct TempodSessionEvents {
+    pub events: Vec<TempodSessionEvent>,
+    /// Earliest sequence still retained after local history eviction. When
+    /// present, events with lower sequence numbers have been truncated.
+    pub truncated_before_seq: Option<u64>,
+}
+
 /// Typed events clients can attach to for session logs and StepTriple telemetry.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -457,6 +468,51 @@ pub enum TempodSessionEventKind {
     HumanTakeoverRequired {
         takeover: HumanTakeover,
     },
+}
+
+#[derive(Clone, Debug, Default)]
+struct SessionEventLog {
+    events: VecDeque<TempodSessionEvent>,
+    next_seq: u64,
+    truncated_before_seq: Option<u64>,
+}
+
+impl SessionEventLog {
+    fn push(&mut self, id: &TempodSessionId, event: TempodSessionEventKind) -> TempodSessionEvent {
+        let record = TempodSessionEvent {
+            session_id: id.clone(),
+            seq: self.next_seq,
+            timestamp_ms: current_time_ms(),
+            event,
+        };
+        self.next_seq = self.next_seq.saturating_add(1);
+        self.events.push_back(record.clone());
+        let mut truncated = false;
+        while self.events.len() > MAX_SESSION_EVENTS_PER_SESSION {
+            self.events.pop_front();
+            truncated = true;
+        }
+        if truncated {
+            self.truncated_before_seq = self
+                .events
+                .front()
+                .map(|event| event.seq)
+                .or(Some(self.next_seq));
+        }
+        record
+    }
+
+    fn window_after(&self, after_seq: Option<u64>) -> TempodSessionEvents {
+        TempodSessionEvents {
+            events: self
+                .events
+                .iter()
+                .filter(|event| after_seq.is_none_or(|after| event.seq > after))
+                .cloned()
+                .collect(),
+            truncated_before_seq: self.truncated_before_seq,
+        }
+    }
 }
 
 /// Controls intentional local history retention for the headless control plane.
@@ -890,7 +946,7 @@ pub struct SessionPool {
     session_drivers: BTreeMap<TempodSessionId, AttachedEngineDriver>,
     session_act_batch_idempotency:
         BTreeMap<TempodSessionId, BTreeMap<String, SessionActBatchIdempotencyEntry>>,
-    events: BTreeMap<TempodSessionId, Vec<TempodSessionEvent>>,
+    events: BTreeMap<TempodSessionId, SessionEventLog>,
     otlp_exporter: Option<OtlpJsonExporter>,
     privacy_mode: PrivacyMode,
     otlp_http_exporter: Option<OtlpHttpExporter>,
@@ -1094,6 +1150,7 @@ impl SessionPool {
     /// (issue #230); this method serves already-locked callers (tests, and
     /// driverless metadata-only pools).
     pub fn create(&mut self, url: impl Into<String>) -> Result<TempodSession, TempodError> {
+        self.enforce_terminal_session_retention();
         self.ensure_accepting_session()?;
         let url = url.into();
         enforce_tempod_navigation_url(&self.url_policy, &url)?;
@@ -1236,7 +1293,7 @@ impl SessionPool {
         let root = self.driver.clone();
         self.clear_session_idempotency(id);
         self.record_event(id, TempodSessionEventKind::SessionKilled);
-        self.purge_terminal_session_if_stealth(id);
+        self.enforce_terminal_session_retention();
         Ok((session, detached, root))
     }
 
@@ -1255,7 +1312,7 @@ impl SessionPool {
         }
         self.session_act_batch_idempotency.clear();
         self.close_engine_resources(true);
-        self.purge_terminal_sessions_if_stealth();
+        self.enforce_terminal_session_retention();
     }
 
     pub fn draining(&self) -> bool {
@@ -1699,39 +1756,47 @@ impl SessionPool {
         })
     }
 
-    fn purge_terminal_session_if_stealth(&mut self, id: &TempodSessionId) {
-        if self.privacy_mode.retains_history() {
-            return;
+    fn enforce_terminal_session_retention(&mut self) {
+        let max_terminal = if self.privacy_mode.retains_history() {
+            MAX_TERMINAL_SESSIONS
+        } else {
+            0
+        };
+        let terminal = self
+            .sessions
+            .iter()
+            .filter(|(id, session)| self.session_record_can_be_purged(id, session))
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        let excess = terminal.len().saturating_sub(max_terminal);
+        for id in terminal.into_iter().take(excess) {
+            self.events.remove(&id);
+            self.clear_session_idempotency(&id);
+            self.sessions.remove(&id);
         }
-        self.events.remove(id);
-        self.clear_session_idempotency(id);
-        self.sessions.remove(id);
     }
 
-    fn purge_terminal_sessions_if_stealth(&mut self) {
-        if self.privacy_mode.retains_history() {
-            return;
+    fn session_record_can_be_purged(&self, id: &TempodSessionId, session: &TempodSession) -> bool {
+        match session.state {
+            TempodSessionState::Killed => true,
+            TempodSessionState::Adopted => !self.session_drivers.contains_key(id),
+            TempodSessionState::Running => false,
         }
-        self.events.clear();
-        self.session_act_batch_idempotency.clear();
-        self.sessions
-            .retain(|_, session| session.state == TempodSessionState::Running);
     }
 
     pub fn events(
         &self,
         id: &TempodSessionId,
         after_seq: Option<u64>,
-    ) -> Result<Vec<TempodSessionEvent>, TempodError> {
+    ) -> Result<TempodSessionEvents, TempodError> {
         if !self.sessions.contains_key(id) {
             return Err(TempodError::SessionNotFound(id.clone()));
         }
-        let events = self.events.get(id).map(Vec::as_slice).unwrap_or_default();
-        Ok(events
-            .iter()
-            .filter(|event| after_seq.is_none_or(|after| event.seq > after))
-            .cloned()
-            .collect())
+        Ok(self
+            .events
+            .get(id)
+            .map(|events| events.window_after(after_seq))
+            .unwrap_or_default())
     }
 
     fn record_event(
@@ -1747,15 +1812,7 @@ impl SessionPool {
                 event,
             };
         }
-        let events = self.events.entry(id.clone()).or_default();
-        let record = TempodSessionEvent {
-            session_id: id.clone(),
-            seq: events.len() as u64,
-            timestamp_ms: current_time_ms(),
-            event,
-        };
-        events.push(record.clone());
-        record
+        self.events.entry(id.clone()).or_default().push(id, event)
     }
 }
 
@@ -3723,7 +3780,8 @@ fn create_session_shared(
     url: String,
 ) -> Result<TempodSession, TempodError> {
     let root_driver = {
-        let pool = lock_pool(pool)?;
+        let mut pool = lock_pool(pool)?;
+        pool.enforce_terminal_session_retention();
         pool.ensure_accepting_session()?;
         enforce_tempod_navigation_url(&pool.url_policy, &url)?;
         pool.driver.clone()
@@ -3748,6 +3806,7 @@ fn create_session_shared(
     };
 
     let mut pool = lock_pool(pool)?;
+    pool.enforce_terminal_session_retention();
     if pool.draining {
         // Drain raced the off-lock engine work: the pool must stay empty, so
         // release the freshly-created context (bounded) instead of leaking it.
@@ -4428,6 +4487,27 @@ pub fn tempod_openapi(base_url: &str) -> JsonValue {
                     }
                 }
             },
+            "/sessions/{session_id}/events": {
+                "get": {
+                    "operationId": "sessionEvents",
+                    "security": [{"TempodBearer": []}],
+                    "parameters": [
+                        {"$ref": "#/components/parameters/SessionId"},
+                        {
+                            "name": "after_seq",
+                            "in": "query",
+                            "required": false,
+                            "schema": {"type": "integer", "minimum": 0}
+                        }
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "Window of retained session events after the optional cursor",
+                            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/TempodSessionEvents"}}}
+                        }
+                    }
+                }
+            },
             "/mcp": {
                 "get": {
                     "operationId": "mcpGet",
@@ -4504,6 +4584,34 @@ pub fn tempod_openapi(base_url: &str) -> JsonValue {
                             "type": "string",
                             "minLength": 1,
                             "maxLength": MAX_IDEMPOTENCY_KEY_BYTES
+                        }
+                    }
+                },
+                "TempodSessionEvent": {
+                    "type": "object",
+                    "additionalProperties": true,
+                    "required": ["session_id", "seq", "timestamp_ms", "event"],
+                    "properties": {
+                        "session_id": {"type": "string"},
+                        "seq": {"type": "integer", "minimum": 0},
+                        "timestamp_ms": {"type": "integer", "minimum": 0},
+                        "event": {"type": "object"}
+                    }
+                },
+                "TempodSessionEvents": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["events", "truncated_before_seq"],
+                    "properties": {
+                        "events": {
+                            "type": "array",
+                            "items": {"$ref": "#/components/schemas/TempodSessionEvent"}
+                        },
+                        "truncated_before_seq": {
+                            "anyOf": [
+                                {"type": "integer", "minimum": 0},
+                                {"type": "null"}
+                            ]
                         }
                     }
                 }
@@ -7506,7 +7614,7 @@ mod tests {
             TempodSessionEventKind::StepTriple { triple: step }
         );
 
-        let events = pool.events(&session.id, None)?;
+        let events = pool.events(&session.id, None)?.events;
         assert_eq!(events.len(), 4);
         assert!(matches!(
             events[0].event,
@@ -7519,7 +7627,7 @@ mod tests {
         ));
         assert_eq!(events[3].event, TempodSessionEventKind::SessionKilled);
 
-        let after_adopt = pool.events(&session.id, Some(1))?;
+        let after_adopt = pool.events(&session.id, Some(1))?.events;
         assert_eq!(after_adopt.len(), 2);
         assert_eq!(after_adopt[0].seq, 2);
         Ok(())
@@ -7545,7 +7653,7 @@ mod tests {
                 takeover: takeover.clone()
             }
         );
-        let events = pool.events(&session.id, None)?;
+        let events = pool.events(&session.id, None)?.events;
         assert!(events.iter().any(|event| matches!(
             &event.event,
             TempodSessionEventKind::HumanTakeoverRequired { takeover: seen } if *seen == takeover
@@ -7575,13 +7683,71 @@ mod tests {
             step_event.event,
             TempodSessionEventKind::StepTriple { .. }
         ));
-        assert_eq!(pool.events(&session.id, None)?, Vec::new());
+        assert_eq!(pool.events(&session.id, None)?.events, Vec::new());
 
         pool.kill(&session.id)?;
         assert!(matches!(
             pool.events(&session.id, None),
             Err(TempodError::SessionNotFound(_))
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn session_event_log_is_a_bounded_monotonic_ring() -> TestResult {
+        let mut pool = SessionPool::default();
+        let session = pool.create("https://ring.test")?;
+
+        for _ in 0..(MAX_SESSION_EVENTS_PER_SESSION + 2) {
+            pool.record_event(&session.id, TempodSessionEventKind::SessionAdopted);
+        }
+
+        let window = pool.events(&session.id, None)?;
+        assert_eq!(window.events.len(), MAX_SESSION_EVENTS_PER_SESSION);
+        assert_eq!(window.truncated_before_seq, Some(3));
+        assert_eq!(window.events.first().map(|event| event.seq), Some(3));
+        assert_eq!(
+            window.events.last().map(|event| event.seq),
+            Some((MAX_SESSION_EVENTS_PER_SESSION + 2) as u64)
+        );
+
+        let stale_cursor = pool.events(&session.id, Some(0))?;
+        assert_eq!(stale_cursor.truncated_before_seq, Some(3));
+        assert_eq!(stale_cursor.events.first().map(|event| event.seq), Some(3));
+
+        let recent_cursor = pool.events(
+            &session.id,
+            Some((MAX_SESSION_EVENTS_PER_SESSION + 1) as u64),
+        )?;
+        assert_eq!(recent_cursor.events.len(), 1);
+        assert_eq!(
+            recent_cursor.events.first().map(|event| event.seq),
+            Some((MAX_SESSION_EVENTS_PER_SESSION + 2) as u64)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn audit_mode_terminal_session_retention_is_bounded() -> TestResult {
+        let mut pool = SessionPool::default();
+
+        for index in 0..(MAX_TERMINAL_SESSIONS + 2) {
+            let session = pool.create(format!("https://terminal-{index}.test"))?;
+            pool.kill(&session.id)?;
+        }
+
+        assert_eq!(pool.sessions.len(), MAX_TERMINAL_SESSIONS);
+        assert_eq!(pool.events.len(), MAX_TERMINAL_SESSIONS);
+        assert!(!pool
+            .sessions
+            .contains_key(&TempodSessionId("session-0".into())));
+        assert!(!pool
+            .events
+            .contains_key(&TempodSessionId("session-0".into())));
+        assert!(pool.sessions.contains_key(&TempodSessionId(format!(
+            "session-{}",
+            MAX_TERMINAL_SESSIONS + 1
+        ))));
         Ok(())
     }
 
@@ -7673,8 +7839,8 @@ mod tests {
 
         pool.drain();
 
-        let running_events = pool.events(&running.id, None)?;
-        let adopted_events = pool.events(&adopted.id, None)?;
+        let running_events = pool.events(&running.id, None)?.events;
+        let adopted_events = pool.events(&adopted.id, None)?.events;
         assert_eq!(
             running_events.last().map(|event| event.event.clone()),
             Some(TempodSessionEventKind::SessionDrained)
@@ -7813,10 +7979,13 @@ mod tests {
             },
         )?;
         assert_eq!(response.status, 200);
-        let events: Vec<TempodSessionEvent> = serde_json::from_slice(&response.body)?;
-        assert_eq!(events.len(), 3);
-        assert_eq!(events[0].seq, 0);
-        assert_eq!(events[2].event, TempodSessionEventKind::SessionKilled);
+        let events: TempodSessionEvents = serde_json::from_slice(&response.body)?;
+        assert_eq!(events.events.len(), 3);
+        assert_eq!(events.events[0].seq, 0);
+        assert_eq!(
+            events.events[2].event,
+            TempodSessionEventKind::SessionKilled
+        );
 
         let response = route_http_request(
             &mut pool,
@@ -7829,11 +7998,11 @@ mod tests {
                 body: Vec::new(),
             },
         )?;
-        let events: Vec<TempodSessionEvent> = serde_json::from_slice(&response.body)?;
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0].seq, 1);
+        let events: TempodSessionEvents = serde_json::from_slice(&response.body)?;
+        assert_eq!(events.events.len(), 2);
+        assert_eq!(events.events[0].seq, 1);
         assert!(matches!(
-            events[0].event,
+            events.events[0].event,
             TempodSessionEventKind::StepTriple { .. }
         ));
         Ok(())
@@ -8159,6 +8328,20 @@ mod tests {
             openapi["components"]["schemas"]["ReadinessResponse"]["properties"]["reasons"]["items"]
                 ["enum"],
             json!(["draining", "engine_detached", "session_limit_reached"])
+        );
+        assert_eq!(
+            openapi["paths"]["/sessions/{session_id}/events"]["get"]["operationId"],
+            "sessionEvents"
+        );
+        assert_eq!(
+            openapi["paths"]["/sessions/{session_id}/events"]["get"]["responses"]["200"]["content"]
+                ["application/json"]["schema"]["$ref"],
+            "#/components/schemas/TempodSessionEvents"
+        );
+        assert_eq!(
+            openapi["components"]["schemas"]["TempodSessionEvents"]["properties"]
+                ["truncated_before_seq"]["anyOf"][1]["type"],
+            "null"
         );
     }
 
@@ -9765,7 +9948,7 @@ mod tests {
         );
 
         // The step event is still recorded despite the export failure.
-        let events = pool.events(&session.id, None)?;
+        let events = pool.events(&session.id, None)?.events;
         assert!(events
             .iter()
             .any(|event| matches!(event.event, TempodSessionEventKind::StepTriple { .. })));
