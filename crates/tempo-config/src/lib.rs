@@ -15,7 +15,8 @@
 //! startup instead of silently running with defaults. Every environment
 //! variable layered by this crate is a documented `ENV_*` constant here. Env
 //! knobs owned by lower-level crates stay there until tempod consumes them
-//! through [`TempodConfig`].
+//! through [`TempodConfig`]. See [`documented_env_registry`] for the full
+//! cross-crate `TEMPO_*` surface operators may set at startup.
 //!
 //! ```
 //! use tempo_config::TempodConfig;
@@ -316,6 +317,80 @@ impl TempodConfig {
     }
 }
 
+/// Cross-crate `TEMPO_*` registry for operators and docs. Tuple is
+/// `(variable, owning crate, purpose)`. Parsing may live in the owning crate;
+/// this list is documentation-only.
+pub fn documented_env_registry() -> &'static [(&'static str, &'static str, &'static str)] {
+    &[
+        (ENV_CONFIG_PATH, "tempo-config", "JSON config file path"),
+        (ENV_BIND_ADDR, "tempo-config", "tempod listen address"),
+        (ENV_ENGINE, "tempo-config", "engine kind: cdp or servo"),
+        (ENV_ENGINE_SOCKET, "tempo-config", "UDS path to engine host"),
+        (ENV_LOG_LEVEL, "tempo-config", "log level"),
+        (ENV_METRICS_ENABLED, "tempo-config", "metrics on/off"),
+        (
+            "TEMPO_TEMPOD_AUTH_TOKEN",
+            "tempo-headless",
+            "bearer token for tempod",
+        ),
+        (
+            "TEMPO_TEMPOD_AUTH_TOKEN_FILE",
+            "tempo-headless",
+            "owner-only runtime token file",
+        ),
+        (
+            "TEMPO_STEALTH_MODE",
+            "tempo-headless / tempo-session",
+            "privacy mode; suppresses durable state",
+        ),
+        (
+            "TEMPO_OTLP_ENDPOINT",
+            "tempo-headless",
+            "OTLP/HTTP trace export endpoint",
+        ),
+        (
+            "TEMPO_OTLP_JSONL",
+            "tempo-headless",
+            "JSONL trace export fallback path",
+        ),
+        (
+            "TEMPO_ENGINE_HOST_SOCKET",
+            "tempo-engine-host",
+            "engine daemon UDS path",
+        ),
+        (
+            "TEMPO_ENGINE_HOST_TOKEN",
+            "tempo-engine-host",
+            "engine IPC auth token",
+        ),
+        (
+            "TEMPO_CDP_CHROME",
+            "tempo-engine-cdp",
+            "Chrome/Chromium binary path",
+        ),
+        (
+            "TEMPO_CDP_NO_SANDBOX",
+            "tempo-engine-cdp",
+            "opt-in no-sandbox (CI only)",
+        ),
+        (
+            "TEMPO_DURABLE_RETENTION",
+            "tempo-session",
+            "cassette/journal retention policy",
+        ),
+        (
+            "TEMPO_DURABLE_ENCRYPTION_KEY_HEX",
+            "tempo-session",
+            "AEAD key for encrypted retention",
+        ),
+        (
+            "TEMPO_LIVE_MODEL",
+            "tempo-agent",
+            "opt-in live LLM tests (=1)",
+        ),
+    ]
+}
+
 fn parse_bool(var: &'static str, value: &str) -> Result<bool, ConfigError> {
     match value.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Ok(true),
@@ -355,7 +430,7 @@ pub enum ConfigError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::io::Write;
 
     fn no_env(_key: &str) -> Option<String> {
@@ -371,6 +446,23 @@ mod tests {
         let mut file = tempfile::NamedTempFile::new()?;
         file.write_all(json.as_bytes())?;
         Ok(file)
+    }
+
+    #[test]
+    fn documented_env_registry_includes_config_vars() {
+        let names: BTreeSet<_> = documented_env_registry()
+            .iter()
+            .map(|(name, _, _)| *name)
+            .collect();
+        for var in TempodConfig::env_vars() {
+            assert!(names.contains(var), "registry missing {var}");
+        }
+        assert!(
+            documented_env_registry().len() >= 17,
+            "registry should list tempo-config plus cross-crate runtime vars"
+        );
+        assert!(names.contains("TEMPO_TEMPOD_AUTH_TOKEN"));
+        assert!(names.contains("TEMPO_CDP_CHROME"));
     }
 
     #[test]
