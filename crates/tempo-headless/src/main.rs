@@ -9,6 +9,10 @@ fn main() {
         eprintln!("{}", usage());
         std::process::exit(0);
     }
+    if args.iter().any(|arg| arg == "-V" || arg == "--version") {
+        println!("{}", env!("CARGO_PKG_VERSION"));
+        std::process::exit(0);
+    }
     let config_overrides = match TempodOptions::config_overrides(&args) {
         Ok(overrides) => overrides,
         Err(err) => {

@@ -107,6 +107,13 @@ impl ShellOptions {
                         command: ShellCommand::Help,
                     });
                 }
+                "-V" | "--version" => {
+                    return Ok(Self {
+                        tempod_addr,
+                        auth_token,
+                        command: ShellCommand::Version,
+                    });
+                }
                 _ => break,
             }
         }
@@ -123,6 +130,7 @@ impl ShellOptions {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ShellCommand {
     Help,
+    Version,
     Health,
     Sessions,
     Open {
@@ -154,6 +162,10 @@ impl ShellCommand {
         match self {
             Self::Help => {
                 stdout.write_all(USAGE.as_bytes())?;
+                Ok(())
+            }
+            Self::Version => {
+                writeln!(stdout, "{}", env!("CARGO_PKG_VERSION"))?;
                 Ok(())
             }
             Self::Health => write_json(stdout, &client.health()?),
@@ -822,6 +834,13 @@ mod tests {
     };
 
     type TestResult = Result<(), Box<dyn Error>>;
+
+    #[test]
+    fn version_flag_selects_version_command() -> TestResult {
+        let options = ShellOptions::parse(["--version"])?;
+        assert!(matches!(options.command, ShellCommand::Version));
+        Ok(())
+    }
 
     #[test]
     fn parses_commands_with_tempod_option() -> TestResult {

@@ -98,6 +98,7 @@ where
 #[derive(Debug, PartialEq)]
 enum Command {
     Help,
+    Version,
     Schema {
         output: Output,
     },
@@ -160,6 +161,7 @@ impl Command {
 
         match command.as_str() {
             "-h" | "--help" | "help" => Ok(Self::Help),
+            "-V" | "--version" => Ok(Self::Version),
             "schema" => parse_schema(options),
             "scorecard" => parse_scorecard(options),
             "session-eval" => parse_session_eval(options),
@@ -187,6 +189,10 @@ impl Command {
         match self {
             Self::Help => {
                 stdout.write_all(USAGE.as_bytes())?;
+                Ok(())
+            }
+            Self::Version => {
+                writeln!(stdout, "{}", env!("CARGO_PKG_VERSION"))?;
                 Ok(())
             }
             Self::Schema { output } => {
@@ -1272,6 +1278,19 @@ mod tests {
     use tempo_session::{DurableEncryptionKey, RunId, SessionId, SessionJournal};
 
     type TestResult = Result<(), Box<dyn Error>>;
+
+    #[test]
+    fn version_flag_prints_crate_version() -> TestResult {
+        let mut stdout = Vec::new();
+
+        run_with_writer(["--version"], &mut stdout)?;
+
+        assert_eq!(
+            String::from_utf8(stdout)?,
+            format!("{}\n", env!("CARGO_PKG_VERSION"))
+        );
+        Ok(())
+    }
 
     #[test]
     fn schema_command_writes_schema_bundle_to_stdout() -> TestResult {
