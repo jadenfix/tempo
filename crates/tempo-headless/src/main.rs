@@ -9,6 +9,10 @@ fn main() {
         eprintln!("{}", usage());
         std::process::exit(0);
     }
+    if args.iter().any(|arg| arg == "-V" || arg == "--version") {
+        println!("{}", env!("CARGO_PKG_VERSION"));
+        std::process::exit(0);
+    }
     let config_overrides = match TempodOptions::config_overrides(&args) {
         Ok(overrides) => overrides,
         Err(err) => {
@@ -106,7 +110,11 @@ impl TempodOptions {
                     overrides.engine = Some(match value.as_str() {
                         "cdp" => tempo_config::EngineKind::Cdp,
                         "servo" => tempo_config::EngineKind::Servo,
-                        _ => return Err(format!("unknown engine: {value}\n{}", usage())),
+                        _ => {
+                            return Err(format!(
+                                "unknown engine: {value}\nRun tempod --help for usage."
+                            ));
+                        }
                     });
                 }
                 "--engine-socket" => {
@@ -122,7 +130,9 @@ impl TempodOptions {
                 }
                 "-h" | "--help" => {}
                 value if value.starts_with('-') => {
-                    return Err(format!("unknown tempod option: {value}\n{}", usage()));
+                    return Err(format!(
+                        "unknown tempod option: {value}\nRun tempod --help for usage."
+                    ));
                 }
                 value => {
                     if overrides.bind_addr.replace(value.to_string()).is_some() {
@@ -189,7 +199,9 @@ impl TempodOptions {
                 }
                 "-h" | "--help" => return Err(usage()),
                 value if value.starts_with('-') => {
-                    return Err(format!("unknown tempod option: {value}\n{}", usage()));
+                    return Err(format!(
+                        "unknown tempod option: {value}\nRun tempod --help for usage."
+                    ));
                 }
                 value => {
                     if addr.replace(value.to_string()).is_some() {
@@ -274,13 +286,15 @@ fn parse_engine(value: &str) -> Result<Engine, String> {
     match value {
         "cdp" => Ok(Engine::Cdp),
         "servo" => Ok(Engine::Servo),
-        _ => Err(format!("unknown engine: {value}\n{}", usage())),
+        _ => Err(format!(
+            "unknown engine: {value}\nRun tempod --help for usage."
+        )),
     }
 }
 
 fn usage() -> String {
     format!(
-        "usage: tempod [ADDR] [--engine cdp|servo] [--engine-socket PATH] [--allow-remote] [--auth-token TOKEN]\n\
+        "usage: tempod [ADDR] [-V, --version] [--engine cdp|servo] [--engine-socket PATH] [--allow-remote] [--auth-token TOKEN]\n\
          [--allow-private-network]\n\
          \n\
          layered config: defaults < JSON file named by {config_env} < TEMPO_* env < flags\n\
@@ -313,6 +327,11 @@ mod tests {
         assert!(options.allow_remote);
         assert_eq!(options.auth_token.as_deref(), Some("secret-token"));
         Ok(())
+    }
+
+    #[test]
+    fn help_advertises_version_flag() {
+        assert!(usage().contains("-V, --version"));
     }
 
     #[test]
