@@ -55,6 +55,7 @@ Correctness & honesty of the contract:
 Resource, lifecycle & availability:
 - [ ] Everything that can grow is bounded: input/response sizes, queues, maps, caches, retries, spawned tasks, and session/connection counts. Unbounded growth on remote-driven input is a blocker.
 - [ ] Size caps are enforced before or during construction/serialization of remote-driven JSON, DOM, screenshot, log, and tool-result data. A check that rejects only after allocating the complete payload is not a memory bound.
+- [ ] Bounded serialization helpers measure the source `Serialize` value before materializing an owned `Value`; converting to an owned tree before the cap check is still post-allocation rejection.
 - [ ] Stateful protocol handlers enforce live-state quotas in addition to per-message size caps; repeated valid commands must not grow maps, vectors, or dispatch scans without bound.
 - [ ] Moving blocking work onto std threads or blocking pools is not itself a bound; client-triggered thread fan-out needs a shared in-flight cap and an immediate structured rejection path.
 - [ ] Every engine/remote/subprocess round-trip has a timeout **and** a recovery path — a crash or hang is detected and healed (restart/reconnect, with backoff), not permanently terminal.

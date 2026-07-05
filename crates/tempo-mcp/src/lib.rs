@@ -1227,12 +1227,11 @@ impl ToolCall {
         value: T,
         max_bytes: usize,
     ) -> Self {
-        let structured_content = match serde_json::to_value(value) {
-            Ok(value) => value,
-            Err(error) => return Self::error(error.to_string()),
-        };
-        match serde_json::to_vec(&structured_content) {
-            Ok(bytes) if bytes.len() <= max_bytes => Self::success(structured_content),
+        match serde_json::to_vec(&value) {
+            Ok(bytes) if bytes.len() <= max_bytes => match serde_json::from_slice(&bytes) {
+                Ok(structured_content) => Self::success(structured_content),
+                Err(error) => Self::error(error.to_string()),
+            },
             Ok(bytes) => Self::cap_error(artifact, bytes.len(), max_bytes),
             Err(error) => Self::error(error.to_string()),
         }

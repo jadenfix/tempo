@@ -20,6 +20,7 @@
 - Operational metadata that exposes dependency state, capacity, policy, or topology is control-plane data. Guard it with the same auth/host/origin boundary unless the route is intentionally public and boring, like a static liveness check.
 - Stateful protocol surfaces need live-state quotas in addition to per-frame or per-body caps; repeated valid commands can be a resource attack even when each request is small.
 - A size cap checked only after fully materializing remote-driven JSON, DOM, screenshot, log, or tool-result data is not a memory bound. Enforce the cap while reading, collecting, diffing, or serializing unless the producer is already independently bounded.
+- Bounded serialization helpers must measure the source `Serialize` value before materializing an owned `Value`; converting to an owned tree before the cap check is still post-allocation rejection.
 - Model/tool result envelopes should carry one authoritative structured payload. Text fallbacks must be summaries, not a second serialized copy of large JSON or binary data.
 - Untrusted remote tool catalogs must not weaken local side-effect policy. If a remote descriptor lacks trusted side-effect metadata, classify the action at the strongest supported side effect before applying threshold origin rules.
 - UI-local state transitions and teardown/cancel paths must stay bounded independently of backend health. Moving I/O off-thread is incomplete if local controls or shutdown still serialize behind blocking transport work.
