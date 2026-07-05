@@ -1096,7 +1096,13 @@ pub fn tools() -> Vec<ToolDescriptor> {
                     ("origin", json!({"type": "string"})),
                     ("live_http", json!({"type": "boolean"})),
                     ("driver_id", json!({"type": "string"})),
-                    ("responses", json!({"type": "array"})),
+                    (
+                        "responses",
+                        json!({
+                            "type": "array",
+                            "items": probe_response_input_schema(),
+                        }),
+                    ),
                 ],
                 &[],
             ),
@@ -1275,12 +1281,14 @@ impl ToolCall {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DriverTargetArgs {
     #[serde(default)]
     driver_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ObserveDiffArgs {
     #[serde(default)]
     driver_id: Option<String>,
@@ -1288,6 +1296,7 @@ struct ObserveDiffArgs {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ActArgs {
     #[serde(default)]
     driver_id: Option<String>,
@@ -1304,6 +1313,7 @@ impl ActArgs {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ActBatchArgs {
     #[serde(default)]
     driver_id: Option<String>,
@@ -1320,17 +1330,20 @@ impl ActBatchArgs {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ForkArgs {
     #[serde(default)]
     driver_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CloseForkArgs {
     driver_id: String,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ExtractArgs {
     #[serde(default)]
     driver_id: Option<String>,
@@ -1338,6 +1351,7 @@ struct ExtractArgs {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ScreenshotArgs {
     #[serde(default)]
     driver_id: Option<String>,
@@ -1346,6 +1360,7 @@ struct ScreenshotArgs {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct HandshakeArgs {
     #[serde(default)]
     origin: Option<String>,
@@ -1382,8 +1397,10 @@ struct CanonicalWebOrigin {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ProbeResponseInput {
     path: String,
+    #[serde(deserialize_with = "deserialize_http_status_code")]
     status: u16,
     #[serde(default)]
     content_type: Option<String>,
@@ -1398,6 +1415,20 @@ impl From<ProbeResponseInput> for ProbeResponse {
             Some(content_type) => response.with_content_type(content_type),
             None => response,
         }
+    }
+}
+
+fn deserialize_http_status_code<'de, D>(deserializer: D) -> Result<u16, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let status = u16::deserialize(deserializer)?;
+    if (100..=599).contains(&status) {
+        Ok(status)
+    } else {
+        Err(serde::de::Error::custom(
+            "status must be an HTTP status code between 100 and 599",
+        ))
     }
 }
 
@@ -2000,6 +2031,21 @@ fn object_schema(properties: Vec<(&'static str, Value)>, required: &[&'static st
     })
 }
 
+fn probe_response_input_schema() -> Value {
+    object_schema(
+        vec![
+            ("path", json!({"type": "string"})),
+            (
+                "status",
+                json!({"type": "integer", "minimum": 100, "maximum": 599}),
+            ),
+            ("content_type", json!({"type": "string"})),
+            ("body", json!({"type": "string"})),
+        ],
+        &["path", "status"],
+    )
+}
+
 fn with_node_id_defs(mut schema: Value) -> Value {
     if let Value::Object(map) = &mut schema {
         map.insert(
@@ -2336,6 +2382,24 @@ mod tests {
 
     #[test]
     fn tool_schemas_describe_action_batch_and_extract_inputs() -> Result<(), String> {
+        for name in [
+            "observe",
+            "observe_diff",
+            "act",
+            "act_batch",
+            "fork",
+            "close_fork",
+            "extract",
+            "screenshot",
+            "handshake",
+        ] {
+            assert_eq!(
+                tool_input_schema(name)?["additionalProperties"],
+                false,
+                "{name} must advertise the same closed top-level argument object that serde parses"
+            );
+        }
+
         let act = tool_input_schema("act")?;
         let action_variants = act["properties"]["action"]["oneOf"]
             .as_array()
@@ -2389,6 +2453,18 @@ mod tests {
                 .unwrap_or(false),
             "extract node must explain where the id comes from"
         );
+
+        let handshake = tool_input_schema("handshake")?;
+        let responses = &handshake["properties"]["responses"];
+        assert_eq!(responses["type"], "array");
+        assert_eq!(responses["items"]["additionalProperties"], false);
+        assert_eq!(responses["items"]["required"], json!(["path", "status"]));
+        assert_eq!(responses["items"]["properties"]["path"]["type"], "string");
+        assert_eq!(
+            responses["items"]["properties"]["status"]["type"],
+            "integer"
+        );
+        assert_eq!(responses["items"]["properties"]["body"]["type"], "string");
         Ok(())
     }
 
@@ -2521,6 +2597,63 @@ mod tests {
         .ok_or("act without input_tainted should fail")?;
 
         assert!(error.contains("input_tainted is required"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tool_calls_reject_arguments_outside_published_schema() -> Result<(), String> {
+        let mut server = TempoMcpServer::new(MemoryDriver::new());
+
+        let top_level = call_tool_envelope(
+            &mut server,
+            "observe",
+            json!({"driver_id": "root", "unexpected": true}),
+        )
+        .await?;
+        assert_eq!(top_level["error"]["code"], -32602);
+        assert!(top_level["error"]["message"]
+            .as_str()
+            .ok_or("top-level error message must be a string")?
+            .contains("unknown field `unexpected`"));
+
+        let nested_response = call_tool_envelope(
+            &mut server,
+            "handshake",
+            json!({
+                "live_http": false,
+                "responses": [{
+                    "path": "/openapi.json",
+                    "status": 200,
+                    "headers": {"x-extra": "ignored-before-fix"}
+                }]
+            }),
+        )
+        .await?;
+        assert_eq!(nested_response["error"]["code"], -32602);
+        assert!(nested_response["error"]["message"]
+            .as_str()
+            .ok_or("nested error message must be a string")?
+            .contains("unknown field `headers`"));
+
+        for status in [99, 600] {
+            let invalid_status = call_tool_envelope(
+                &mut server,
+                "handshake",
+                json!({
+                    "live_http": false,
+                    "responses": [{
+                        "path": "/openapi.json",
+                        "status": status
+                    }]
+                }),
+            )
+            .await?;
+            assert_eq!(invalid_status["error"]["code"], -32602);
+            assert!(invalid_status["error"]["message"]
+                .as_str()
+                .ok_or("status range error message must be a string")?
+                .contains("status must be an HTTP status code between 100 and 599"));
+        }
         Ok(())
     }
 
