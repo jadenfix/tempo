@@ -3236,7 +3236,13 @@ async fn serve_bidi_websocket(mut socket: WebSocket, pool: Arc<Mutex<SessionPool
 /// never hold this guard across an engine round-trip (issue #230): engine work
 /// happens on cloned per-session driver handles after the guard is dropped.
 fn lock_pool(pool: &Arc<Mutex<SessionPool>>) -> Result<MutexGuard<'_, SessionPool>, TempodError> {
-    pool.lock().map_err(|_| TempodError::PoolLock)
+    // Poisoning is recovered (`into_inner`) for the same reason the driver
+    // `OpGate` recovers it (see [`OpGate::acquire`], #305): treating a one-off
+    // panic as fatal would permanently wedge every later pool-touching route
+    // behind `PoolLock` with no recovery (#413).
+    Ok(pool
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner))
 }
 
 /// `POST /sessions` with the engine round-trips OFF the pool lock (issue #230;
@@ -3511,49 +3517,76 @@ fn enforce_session_batch_policy(
     let idempotency_unavailable = report.idempotency_required && !report.idempotency_cache_retained;
     let ineffective_idempotency = missing_idempotency_key || idempotency_unavailable;
     if missing_confirmation || ineffective_idempotency {
-        let denied_action_index = match (missing_confirmation, ineffective_idempotency) {
-            (true, true) => match (first_confirmation_index, first_idempotency_index) {
-                (Some(confirmation_index), Some(idempotency_index)) => {
-                    confirmation_index.min(idempotency_index)
-                }
-                (Some(confirmation_index), None) => confirmation_index,
-                (None, Some(idempotency_index)) => idempotency_index,
-                (None, None) => 0,
-            },
-            (true, false) => first_confirmation_index.unwrap_or_default(),
-            (false, true) => first_idempotency_index.unwrap_or_default(),
-            (false, false) => unreachable!("policy denial requires at least one reason"),
-        };
-        let denied_action_kind = body
-            .batch
-            .actions
-            .get(denied_action_index)
-            .map(action_kind)
-            .unwrap_or("batch");
-        let confirmation_reason = if report.confirmed_claim_ignored {
-            "requires server-attributable confirmation before execution; confirmed=true was ignored"
-        } else {
-            "requires human confirmation before execution"
-        };
-        let idempotency_reason = if idempotency_unavailable {
-            "requires retained idempotency replay state before execution; stealth mode disables the idempotency cache"
-        } else {
-            "requires idempotency_key before execution"
-        };
-        let reason = match (missing_confirmation, ineffective_idempotency) {
-            (true, true) => format!("{confirmation_reason}; also {idempotency_reason}"),
-            (true, false) => confirmation_reason.to_string(),
-            (false, true) => idempotency_reason.to_string(),
-            (false, false) => unreachable!("policy denial requires at least one reason"),
-        };
-        return Err(TempodError::PolicyDenied(Box::new(PolicyDeniedError {
-            reason,
-            denied_action_index,
-            denied_action_kind,
-            policy: report,
-        })));
+        return Err(deny_session_batch_policy(
+            missing_confirmation,
+            ineffective_idempotency,
+            idempotency_unavailable,
+            first_confirmation_index,
+            first_idempotency_index,
+            body,
+            report,
+        ));
     }
     Ok(report)
+}
+
+/// Build the `PolicyDenied` error for a batch the boundary refuses to execute.
+///
+/// The `(false, false)` arms below were previously `unreachable!`. This runs
+/// while the caller holds the pool guard, so a panic here would poison the pool
+/// mutex and permanently wedge the daemon (#413). A logic bug that reached the
+/// denial path with no active reason now yields a plain denial instead of
+/// panicking; the normal single-/dual-reason paths are unchanged.
+fn deny_session_batch_policy(
+    missing_confirmation: bool,
+    ineffective_idempotency: bool,
+    idempotency_unavailable: bool,
+    first_confirmation_index: Option<usize>,
+    first_idempotency_index: Option<usize>,
+    body: &SessionActBatchRequest,
+    report: SessionBatchPolicyReport,
+) -> TempodError {
+    let denied_action_index = match (missing_confirmation, ineffective_idempotency) {
+        (true, true) => match (first_confirmation_index, first_idempotency_index) {
+            (Some(confirmation_index), Some(idempotency_index)) => {
+                confirmation_index.min(idempotency_index)
+            }
+            (Some(confirmation_index), None) => confirmation_index,
+            (None, Some(idempotency_index)) => idempotency_index,
+            (None, None) => 0,
+        },
+        (true, false) => first_confirmation_index.unwrap_or_default(),
+        (false, true) => first_idempotency_index.unwrap_or_default(),
+        (false, false) => 0,
+    };
+    let denied_action_kind = body
+        .batch
+        .actions
+        .get(denied_action_index)
+        .map(action_kind)
+        .unwrap_or("batch");
+    let confirmation_reason = if report.confirmed_claim_ignored {
+        "requires server-attributable confirmation before execution; confirmed=true was ignored"
+    } else {
+        "requires human confirmation before execution"
+    };
+    let idempotency_reason = if idempotency_unavailable {
+        "requires retained idempotency replay state before execution; stealth mode disables the idempotency cache"
+    } else {
+        "requires idempotency_key before execution"
+    };
+    let reason = match (missing_confirmation, ineffective_idempotency) {
+        (true, true) => format!("{confirmation_reason}; also {idempotency_reason}"),
+        (true, false) => confirmation_reason.to_string(),
+        (false, true) => idempotency_reason.to_string(),
+        (false, false) => "policy denied".to_string(),
+    };
+    TempodError::PolicyDenied(Box::new(PolicyDeniedError {
+        reason,
+        denied_action_index,
+        denied_action_kind,
+        policy: report,
+    }))
 }
 
 fn action_kind(action: &Action) -> &'static str {
@@ -10829,5 +10862,68 @@ mod tests {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(err) => Err(err),
         }
+    }
+
+    /// #413: a one-off panic under the pool guard poisons the mutex. `lock_pool`
+    /// must recover the guard (like the driver `OpGate`) instead of returning
+    /// `PoolLock` forever, so the pool stays usable and routes keep working.
+    #[test]
+    fn lock_pool_recovers_poisoned_pool_and_pool_stays_usable() -> TestResult {
+        let shared = Arc::new(Mutex::new(SessionPool::default()));
+
+        let poison_target = Arc::clone(&shared);
+        let outcome = thread::spawn(move || {
+            let _guard = match poison_target.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            panic!("poison the pool mutex while the guard is held");
+        })
+        .join();
+        assert!(
+            outcome.is_err(),
+            "helper thread must panic to poison the mutex"
+        );
+        assert!(shared.is_poisoned(), "pool mutex should now be poisoned");
+
+        // Recovery path: this used to return `TempodError::PoolLock` forever.
+        let mut guard = lock_pool(&shared)?;
+        // The recovered pool is fully functional (a real route surface).
+        let _session = guard.create("https://poison-recovery.test")?;
+        assert_eq!(guard.list().len(), 1);
+        Ok(())
+    }
+
+    /// #413: the denial builder used to `unreachable!` on `(false, false)`.
+    /// Because it runs under the pool guard, a panic there would poison the
+    /// pool and wedge the daemon. A logic bug reaching it must return a denial
+    /// error, not panic.
+    #[test]
+    fn deny_session_batch_policy_returns_error_instead_of_panicking_with_no_reason() -> TestResult {
+        let body: SessionActBatchRequest = serde_json::from_str(
+            r#"{"batch":{"actions":[],"quiescence":"composite"},"input_tainted":false}"#,
+        )?;
+        let report = SessionBatchPolicyReport {
+            input_tainted_declared: None,
+            input_tainted_effective: false,
+            forced_tainted_actions: 0,
+            max_side_effect: SideEffect::Read,
+            strongest_gate: ConfirmationGate::None,
+            confirmation_required: false,
+            confirmed: false,
+            confirmed_effective: false,
+            confirmed_claim_ignored: false,
+            idempotency_required: false,
+            idempotency_key_provided: false,
+            idempotency_cache_retained: true,
+        };
+
+        let error = deny_session_batch_policy(false, false, false, None, None, &body, report);
+        assert!(
+            matches!(error, TempodError::PolicyDenied(_)),
+            "no-reason denial must be a PolicyDenied error, not a panic"
+        );
+        assert_eq!(error.status(), 403);
+        Ok(())
     }
 }
