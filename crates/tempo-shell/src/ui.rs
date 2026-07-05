@@ -14,7 +14,9 @@
 use crate::agent::JournalLog;
 use crate::tab::{ScreenshotImage, Tab};
 use crate::{HealthResponse, ShellClient, ShellError};
-use tempo_headless::{TempodSession, TempodSessionEvent, TempodSessionState};
+#[cfg(test)]
+use tempo_headless::TempodSessionEvent;
+use tempo_headless::{TempodSession, TempodSessionEvents, TempodSessionState};
 
 /// One session row as shown in the list: the id/state/url triple the DoD asks
 /// for, flattened to display strings so the render layer stays trivial.
@@ -67,7 +69,7 @@ pub trait SessionService {
         &self,
         session_id: &str,
         after_seq: Option<u64>,
-    ) -> Result<Vec<TempodSessionEvent>, ShellError>;
+    ) -> Result<TempodSessionEvents, ShellError>;
 }
 
 impl SessionService for ShellClient {
@@ -107,7 +109,7 @@ impl SessionService for ShellClient {
         &self,
         session_id: &str,
         after_seq: Option<u64>,
-    ) -> Result<Vec<TempodSessionEvent>, ShellError> {
+    ) -> Result<TempodSessionEvents, ShellError> {
         ShellClient::events(self, session_id, after_seq)
     }
 }
@@ -436,7 +438,7 @@ impl ShellUiModel {
         };
         let after_seq = self.journal.follow(&session_id);
         match service.events(&session_id, after_seq) {
-            Ok(events) => self.journal.ingest(&events),
+            Ok(events) => self.journal.ingest(&events.events),
             Err(err) => self.set_error("events", &err),
         }
     }
@@ -690,18 +692,21 @@ mod tests {
             &self,
             session_id: &str,
             after_seq: Option<u64>,
-        ) -> Result<Vec<TempodSessionEvent>, ShellError> {
+        ) -> Result<TempodSessionEvents, ShellError> {
             self.record(format!(
                 "events:{session_id}:{}",
                 after_seq.map_or_else(|| "-".to_string(), |seq| seq.to_string())
             ));
             self.maybe_fail("events")?;
-            Ok(self
-                .canned_events
-                .iter()
-                .filter(|event| after_seq.is_none_or(|seq| event.seq > seq))
-                .cloned()
-                .collect())
+            Ok(TempodSessionEvents {
+                events: self
+                    .canned_events
+                    .iter()
+                    .filter(|event| after_seq.is_none_or(|seq| event.seq > seq))
+                    .cloned()
+                    .collect(),
+                truncated_before_seq: None,
+            })
         }
     }
 

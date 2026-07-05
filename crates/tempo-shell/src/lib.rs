@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
-use tempo_headless::{TempodSession, TempodSessionEvent, TempodSessionId};
+use tempo_headless::{TempodSession, TempodSessionEvents, TempodSessionId};
 use thiserror::Error;
 
 pub mod agent;
@@ -267,7 +267,7 @@ impl ShellClient {
         &self,
         session_id: &str,
         after_seq: Option<u64>,
-    ) -> Result<Vec<TempodSessionEvent>, ShellError> {
+    ) -> Result<TempodSessionEvents, ShellError> {
         let mut path = format!("/sessions/{}/events", safe_path_segment(session_id)?);
         if let Some(after_seq) = after_seq {
             path.push_str("?after_seq=");
@@ -1040,10 +1040,10 @@ mod tests {
         let initial = with_tempod(&pool, |addr| {
             ShellClient::new(addr.to_string()).events(&opened.id.0, None)
         })?;
-        assert_eq!(initial.len(), 1);
-        assert_eq!(initial[0].seq, 0);
+        assert_eq!(initial.events.len(), 1);
+        assert_eq!(initial.events[0].seq, 0);
         assert!(matches!(
-            initial[0].event,
+            initial.events[0].event,
             TempodSessionEventKind::SessionCreated { .. }
         ));
 
@@ -1054,10 +1054,10 @@ mod tests {
             ShellClient::new(addr.to_string()).events(&opened.id.0, Some(0))
         })?;
 
-        assert_eq!(after_create.len(), 1);
-        assert_eq!(after_create[0].seq, 1);
+        assert_eq!(after_create.events.len(), 1);
+        assert_eq!(after_create.events[0].seq, 1);
         assert!(matches!(
-            after_create[0].event,
+            after_create.events[0].event,
             TempodSessionEventKind::SessionAdopted
         ));
         Ok(())
@@ -1344,7 +1344,7 @@ mod tests {
         let events = with_tempod(&pool, |addr| {
             ShellClient::new(addr.to_string()).events(&session_id, None)
         })?;
-        assert!(!events.is_empty());
+        assert!(!events.events.is_empty());
 
         let closed = with_tempod(&pool, |addr| {
             ShellClient::new(addr.to_string()).close(&session_id)
