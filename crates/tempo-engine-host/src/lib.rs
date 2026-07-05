@@ -20,9 +20,10 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 use tempo_driver::{
-    BrowsingContextCreateOptions, DriverTrait, StepOutcome, TransportError, Unsupported,
+    BrowsingContextCreateOptions, DriverTrait, StepOutcome, TaintedValue, TransportError,
+    Unsupported,
 };
-use tempo_schema::{Action, ActionBatch, CompiledObservation, NodeId, ObservationDiff};
+use tempo_schema::{Action, ActionBatch, CompiledObservation, NodeId, ObservationDiff, Provenance};
 use tempo_session::{
     durable_retention_policy_from_env, DurableRetentionPolicy, JournalError, ResumeState, RunId,
     SessionId, SessionJournal,
@@ -483,9 +484,11 @@ pub enum DriverResponse {
     },
     Extracted {
         value: Value,
+        provenance: Provenance,
     },
     Evaluated {
         value: Value,
+        provenance: Provenance,
     },
     Screenshot {
         #[serde(with = "base64_bytes")]
@@ -1179,14 +1182,18 @@ where
             ),
         },
         DriverCommand::Extract { node } => match driver.extract(&node).await {
-            Ok(value) => DriverResponse::Extracted { value },
+            Ok(TaintedValue { value, provenance }) => {
+                DriverResponse::Extracted { value, provenance }
+            }
             Err(error) => driver_error(error),
         },
         DriverCommand::EvaluateScript {
             expression,
             await_promise,
         } => match driver.evaluate_script(&expression, await_promise).await {
-            Ok(value) => DriverResponse::Evaluated { value },
+            Ok(TaintedValue { value, provenance }) => {
+                DriverResponse::Evaluated { value, provenance }
+            }
             Err(error) => driver_error(error),
         },
         DriverCommand::Screenshot => match driver.screenshot().await {
@@ -1890,12 +1897,14 @@ mod tests {
             request_b.id,
             DriverResponse::Extracted {
                 value: json!("value-b"),
+                provenance: Provenance::Page,
             },
         )?;
         connection.write_driver_response(
             request_a.id,
             DriverResponse::Extracted {
                 value: json!("value-a"),
+                provenance: Provenance::Page,
             },
         )?;
 
@@ -1904,13 +1913,15 @@ mod tests {
         assert_eq!(
             response_a,
             DriverResponse::Extracted {
-                value: json!("value-a")
+                value: json!("value-a"),
+                provenance: Provenance::Page,
             }
         );
         assert_eq!(
             response_b,
             DriverResponse::Extracted {
-                value: json!("value-b")
+                value: json!("value-b"),
+                provenance: Provenance::Page,
             }
         );
         Ok(())
@@ -1941,6 +1952,7 @@ mod tests {
             wedged_request.id,
             DriverResponse::Extracted {
                 value: json!("late"),
+                provenance: Provenance::Page,
             },
         )?;
         let follow_up_client = shared.clone();
@@ -1958,6 +1970,7 @@ mod tests {
             fresh_request.id,
             DriverResponse::Extracted {
                 value: json!("fresh"),
+                provenance: Provenance::Page,
             },
         )?;
         let response = follow_up
@@ -1966,7 +1979,8 @@ mod tests {
         assert_eq!(
             response,
             DriverResponse::Extracted {
-                value: json!("fresh")
+                value: json!("fresh"),
+                provenance: Provenance::Page,
             }
         );
         Ok(())
@@ -2337,6 +2351,7 @@ mod tests {
                     "expression": "document.title",
                     "awaitPromise": true,
                 }),
+                provenance: Provenance::Page,
             }
         );
         assert_eq!(closed, DriverResponse::Closed);

@@ -956,19 +956,22 @@ mod tests {
             Err(Unsupported("contract driver does not fork"))
         }
 
-        async fn extract(&mut self, _node: &NodeId) -> Result<serde_json::Value, TransportError> {
-            Ok(serde_json::Value::Null)
+        async fn extract(
+            &mut self,
+            _node: &NodeId,
+        ) -> Result<tempo_driver::TaintedValue, TransportError> {
+            Ok(tempo_driver::TaintedValue::page(serde_json::Value::Null))
         }
 
         async fn evaluate_script(
             &mut self,
             expression: &str,
             await_promise: bool,
-        ) -> Result<serde_json::Value, TransportError> {
-            Ok(serde_json::json!({
+        ) -> Result<tempo_driver::TaintedValue, TransportError> {
+            Ok(tempo_driver::TaintedValue::page(serde_json::json!({
                 "expression": expression,
                 "awaitPromise": await_promise,
-            }))
+            })))
         }
 
         async fn screenshot(&mut self) -> Result<Vec<u8>, TransportError> {

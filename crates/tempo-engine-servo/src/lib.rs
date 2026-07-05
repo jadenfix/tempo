@@ -11,7 +11,7 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tempo_driver::{DriverTrait, Engine, StepOutcome, TransportError, Unsupported};
+use tempo_driver::{DriverTrait, Engine, StepOutcome, TaintedValue, TransportError, Unsupported};
 use tempo_engine_host::{
     DriverCommand, DriverResponse, DriverWireError, EngineHostError, EngineIpcClient,
 };
@@ -373,13 +373,15 @@ impl DriverTrait for ServoIpcDriver {
         }
     }
 
-    async fn extract(&mut self, node: &NodeId) -> Result<serde_json::Value, TransportError> {
+    async fn extract(&mut self, node: &NodeId) -> Result<TaintedValue, TransportError> {
         match self
             .request(DriverCommand::Extract { node: node.clone() })
             .await
             .map_err(servo_host_transport_error)?
         {
-            DriverResponse::Extracted { value } => Ok(value),
+            DriverResponse::Extracted { value, provenance } => {
+                Ok(TaintedValue::new(value, provenance))
+            }
             DriverResponse::Error { error } => Err(driver_wire_transport_error(error)),
             other => Err(unexpected_driver_response(other, "extract")),
         }
@@ -389,7 +391,7 @@ impl DriverTrait for ServoIpcDriver {
         &mut self,
         expression: &str,
         await_promise: bool,
-    ) -> Result<serde_json::Value, TransportError> {
+    ) -> Result<TaintedValue, TransportError> {
         match self
             .request(DriverCommand::EvaluateScript {
                 expression: expression.into(),
@@ -398,7 +400,9 @@ impl DriverTrait for ServoIpcDriver {
             .await
             .map_err(servo_host_transport_error)?
         {
-            DriverResponse::Evaluated { value } => Ok(value),
+            DriverResponse::Evaluated { value, provenance } => {
+                Ok(TaintedValue::new(value, provenance))
+            }
             DriverResponse::Error { error } => Err(driver_wire_transport_error(error)),
             other => Err(unexpected_driver_response(other, "evaluate_script")),
         }
@@ -2094,6 +2098,8 @@ mod tests {
         assert_eq!(driver.engine(), Engine::Servo);
         assert_eq!(observation.url, "https://servo.test");
         assert!(matches!(outcome, StepOutcome::Applied { .. }));
+        assert!(extracted.is_page_derived());
+        assert!(evaluated.is_page_derived());
         assert_eq!(extracted["node"], "submit");
         assert_eq!(evaluated["expression"], "document.title");
         assert_eq!(evaluated["awaitPromise"], true);

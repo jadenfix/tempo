@@ -36,8 +36,8 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tempo_driver::{
-    BrowsingContextCreateOptions, DriverTrait, Engine, StepOutcome, TransportError, Unsupported,
-    MAX_SCREENSHOT_BYTES, MAX_SCREENSHOT_HEIGHT, MAX_SCREENSHOT_WIDTH,
+    BrowsingContextCreateOptions, DriverTrait, Engine, StepOutcome, TaintedValue, TransportError,
+    Unsupported, MAX_SCREENSHOT_BYTES, MAX_SCREENSHOT_HEIGHT, MAX_SCREENSHOT_WIDTH,
 };
 use tempo_net::UrlPolicy;
 use tempo_observe::{finalize_observation, CompileOptions, RawElement, StableIdMapper};
@@ -1338,33 +1338,39 @@ impl DriverTrait for CdpTempoDriver {
         }))
     }
 
-    async fn extract(&mut self, node: &NodeId) -> Result<serde_json::Value, TransportError> {
+    async fn extract(&mut self, node: &NodeId) -> Result<TaintedValue, TransportError> {
         let Some(selector) = self.selector_for_node(node) else {
             let Some(refreshed) = self.refresh_selector_for_node(node).await? else {
-                return Ok(node_not_found_extraction(node));
+                return Ok(TaintedValue::page(node_not_found_extraction(node)));
             };
-            return self.extract_with_selector(&refreshed).await;
+            return self
+                .extract_with_selector(&refreshed)
+                .await
+                .map(TaintedValue::page);
         };
 
         let extracted = self.extract_with_selector(&selector).await?;
         if extraction_found(&extracted) {
-            return Ok(extracted);
+            return Ok(TaintedValue::page(extracted));
         }
 
         if let Some(refreshed) = self.refresh_selector_for_node(node).await?
             && refreshed != selector
         {
-            return self.extract_with_selector(&refreshed).await;
+            return self
+                .extract_with_selector(&refreshed)
+                .await
+                .map(TaintedValue::page);
         }
 
-        Ok(extracted)
+        Ok(TaintedValue::page(extracted))
     }
 
     async fn evaluate_script(
         &mut self,
         expression: &str,
         await_promise: bool,
-    ) -> Result<serde_json::Value, TransportError> {
+    ) -> Result<TaintedValue, TransportError> {
         let params = EvaluateParams::builder()
             .expression(expression)
             .return_by_value(true)
@@ -1376,9 +1382,10 @@ impl DriverTrait for CdpTempoDriver {
         let evaluate_result = self.page()?.evaluate(params).await;
         let remote_object = self.map_cdp_result_since(cursor, evaluate_result).await?;
         self.enforce_no_blocked_request_soon_since(cursor).await?;
-        remote_object
+        let value = remote_object
             .into_value::<serde_json::Value>()
-            .map_err(|error| TransportError::Other(error.to_string()))
+            .map_err(|error| TransportError::Other(error.to_string()))?;
+        Ok(TaintedValue::page(value))
     }
 
     async fn screenshot(&mut self) -> Result<Vec<u8>, TransportError> {
@@ -2599,9 +2606,9 @@ fn layout_probe_script(candidates: &[LayoutCandidate]) -> Result<String, Transpo
     let right = -Infinity;
     let bottom = -Infinity;
     for (const rect of rects) {{
-      // Skip only point-sized (0x0) boxes. A rect that is degenerate along
-      // one axis still occupies layout space, e.g. an empty container that a
-      // later action fills and the agent then extracts.
+      // Skip only point-sized (0x0) boxes. A rect that is degenerate along one
+      // axis still occupies layout space — e.g. an empty container that a later
+      // action fills and the agent then extracts — and must stay observable.
       if (rect.width <= 0 && rect.height <= 0) {{
         continue;
       }}
@@ -2643,8 +2650,9 @@ fn layout_probe_script(candidates: &[LayoutCandidate]) -> Result<String, Transpo
     const top = Math.max(0, rect.top);
     const right = Math.min(viewportWidth, rect.right);
     const bottom = Math.min(viewportHeight, rect.bottom);
-    // Keep boxes degenerate along exactly one axis after viewport clamp:
-    // they may represent containers that later gain meaningful dimensions.
+    // Strict comparison: a box that is degenerate along one axis after the
+    // viewport clamp (zero-height container, edge-touching element) is kept
+    // with its degenerate bounds; only boxes wholly outside the viewport drop.
     if (right < left || bottom < top) {{
       continue;
     }}
@@ -2688,8 +2696,9 @@ fn parse_layout_bounds(value: Option<&serde_json::Value>) -> Option<[f32; 4]> {
         }
         bounds[index] = number as f32;
     }
-    // Mirror the probe's retention rule: malformed negatives drop, 0x0 boxes
-    // are unobservable, but one-axis-degenerate boxes stay with their bounds.
+    // Mirror the probe's retention rule: negative extents are malformed and a
+    // point-sized (0x0) box is unobservable, but a box degenerate along one
+    // axis (zero-height container awaiting content) keeps its bounds.
     if bounds[2] < 0.0 || bounds[3] < 0.0 {
         return None;
     }
@@ -3432,7 +3441,7 @@ mod tests {
     }
 
     #[test]
-    fn layout_probe_result_parser_keeps_only_concrete_and_single_axis_degenerate_bounds() {
+    fn layout_probe_result_parser_keeps_concrete_and_single_axis_degenerate_bounds() {
         let parsed = parse_layout_probe_results(serde_json::json!([
             {"node": "node:visible", "bounds": [10.5, 20.0, 30.25, 40.75]},
             {"node": "node:zero-width", "bounds": [0.0, 0.0, 0.0, 10.0]},
@@ -3449,6 +3458,8 @@ mod tests {
             parsed.get(&NodeId("node:visible".into())).copied(),
             Some([10.5, 20.0, 30.25, 40.75])
         );
+        // Degenerate along one axis stays observable (empty containers that a
+        // later action fills); point-sized and negative extents are dropped.
         assert_eq!(
             parsed.get(&NodeId("node:zero-width".into())).copied(),
             Some([0.0, 0.0, 0.0, 10.0])
@@ -4771,6 +4782,11 @@ mod tests {
             .ok_or_else(|| std::io::Error::other("visible button missing bounds"))?;
         assert!(bounds[0] >= 0.0 && bounds[1] >= 0.0);
         assert!(bounds[2] > 0.0 && bounds[3] > 0.0);
+
+        // A rendered container that is degenerate along one axis (zero height,
+        // positive width) stays observable with its degenerate bounds — agents
+        // extract from empty containers that later actions fill. Only 0x0 and
+        // offscreen boxes are pruned.
         let pending = observation
             .elements
             .iter()

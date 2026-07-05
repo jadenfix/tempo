@@ -50,7 +50,8 @@ use tempo_bidi::{
 };
 use tempo_driver::{
     output_cap_message, BrowsingContextCreateOptions, BrowsingContextKind, DriverTrait, Engine,
-    StepOutcome, TransportError, Unsupported, MAX_PROTOCOL_RESPONSE_BYTES, MAX_SCREENSHOT_BYTES,
+    StepOutcome, TaintedValue, TransportError, Unsupported, MAX_PROTOCOL_RESPONSE_BYTES,
+    MAX_SCREENSHOT_BYTES,
 };
 use tempo_engine_host::{
     DriverCommand as HostDriverCommand, DriverResponse, DriverWireError, EngineHost,
@@ -774,12 +775,14 @@ impl AttachedEngineDriver {
         &self,
         command: HostDriverCommand,
         expected: &'static str,
-    ) -> Result<serde_json::Value, TransportError> {
+    ) -> Result<TaintedValue, TransportError> {
         match self
             .request(command)
             .map_err(driver_client_transport_error)?
         {
-            DriverResponse::Extracted { value } => Ok(value),
+            DriverResponse::Extracted { value, provenance } => {
+                Ok(TaintedValue::new(value, provenance))
+            }
             DriverResponse::Error { error } => Err(driver_wire_transport_error(error)),
             other => Err(unexpected_driver_response(other, expected)),
         }
@@ -789,12 +792,14 @@ impl AttachedEngineDriver {
         &self,
         command: HostDriverCommand,
         expected: &'static str,
-    ) -> Result<serde_json::Value, TransportError> {
+    ) -> Result<TaintedValue, TransportError> {
         match self
             .request(command)
             .map_err(driver_client_transport_error)?
         {
-            DriverResponse::Evaluated { value } => Ok(value),
+            DriverResponse::Evaluated { value, provenance } => {
+                Ok(TaintedValue::new(value, provenance))
+            }
             DriverResponse::Error { error } => Err(driver_wire_transport_error(error)),
             other => Err(unexpected_driver_response(other, expected)),
         }
@@ -904,7 +909,7 @@ impl DriverTrait for AttachedEngineDriver {
         Ok(Box::new(self.fork_attached().await?))
     }
 
-    async fn extract(&mut self, node: &NodeId) -> Result<serde_json::Value, TransportError> {
+    async fn extract(&mut self, node: &NodeId) -> Result<TaintedValue, TransportError> {
         self.request_value(HostDriverCommand::Extract { node: node.clone() }, "extract")
     }
 
@@ -912,7 +917,7 @@ impl DriverTrait for AttachedEngineDriver {
         &mut self,
         expression: &str,
         await_promise: bool,
-    ) -> Result<serde_json::Value, TransportError> {
+    ) -> Result<TaintedValue, TransportError> {
         self.request_evaluation(
             HostDriverCommand::EvaluateScript {
                 expression: expression.into(),
@@ -5394,7 +5399,7 @@ fn route_bidi_driver(
                     bidi_success_or_error(
                         id,
                         ScriptEvaluateResult {
-                            result: value,
+                            result: value.into_value(),
                             realm: Some(context.0),
                         },
                     ),
@@ -9843,7 +9848,7 @@ mod tests {
             }))
         }
 
-        async fn extract(&mut self, node: &NodeId) -> Result<serde_json::Value, TransportError> {
+        async fn extract(&mut self, node: &NodeId) -> Result<TaintedValue, TransportError> {
             self.inner.extract(node).await
         }
 
@@ -9851,7 +9856,7 @@ mod tests {
             &mut self,
             expression: &str,
             await_promise: bool,
-        ) -> Result<serde_json::Value, TransportError> {
+        ) -> Result<TaintedValue, TransportError> {
             self.inner.evaluate_script(expression, await_promise).await
         }
 

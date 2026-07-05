@@ -55,6 +55,7 @@ Correctness & honesty of the contract:
 Resource, lifecycle & availability:
 - [ ] Everything that can grow is bounded: input/response sizes, queues, maps, caches, retries, spawned tasks, and session/connection counts. Unbounded growth on remote-driven input is a blocker.
 - [ ] Size caps are enforced before or during construction/serialization of remote-driven JSON, DOM, screenshot, log, and tool-result data. A check that rejects only after allocating the complete payload is not a memory bound.
+- [ ] Bounded serialization helpers measure the source `Serialize` value before materializing an owned `Value`; converting to an owned tree before the cap check is still post-allocation rejection.
 - [ ] Stateful protocol handlers enforce live-state quotas in addition to per-message size caps; repeated valid commands must not grow maps, vectors, or dispatch scans without bound.
 - [ ] Moving blocking work onto std threads or blocking pools is not itself a bound; client-triggered thread fan-out needs a shared in-flight cap and an immediate structured rejection path.
 - [ ] Every engine/remote/subprocess round-trip has a timeout **and** a recovery path — a crash or hang is detected and healed (restart/reconnect, with backoff), not permanently terminal.
@@ -75,6 +76,7 @@ Trust boundaries & security:
 - [ ] Egress and proxy policy is bound to the concrete endpoint actually used after DNS, proxy resolution, redirects, and retries; validating a hostname, URL string, or only one candidate address is not enough when another resolved socket can be selected later.
 - [ ] Untrusted remote tool descriptors without trusted side-effect metadata are classified at the strongest supported side effect before threshold origin rules run; never flatten unknown remote tools to a weaker class.
 - [ ] Security or taint gates assert the production call path, not only the helper intended to be safe; model-facing page metadata is provenance-framed, not left as escaped-but-bare prompt attributes.
+- [ ] Page-derived extraction/script-evaluation results keep provenance in their typed return value and IPC/wire envelope; unwrapping to raw JSON before an agent or policy boundary is an unlabeled-taint bypass.
 - [ ] Untrusted descriptors and attestations (OpenAPI/WebMCP catalogs, handshake evidence) are origin-bound and cannot themselves drive side effects or inject secret headers.
 - [ ] Tests and docs that verify redaction do not commit realistic secret, token, password, API-key, or credential literals. Use scanner-safe inert fragments while still proving the sensitive value never appears in debug/display/error/export output.
 - [ ] Secret-bearing clients parse and validate configured base URLs before constructing requests: reject userinfo/query/fragment/path injection, require a pinned secure production origin, and make loopback/insecure fixtures use an explicitly named test opt-in.

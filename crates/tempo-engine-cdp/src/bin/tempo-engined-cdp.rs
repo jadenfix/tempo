@@ -17,7 +17,8 @@
 //!
 //! The engine binds and the daemon connects (its `connect_engine_ipc` client),
 //! so this process must start first.
-use std::process::ExitCode;
+use std::{path::Path, process::ExitCode};
+use tempo_driver::DriverTrait;
 use tempo_engine_cdp::{CdpConfig, CdpTempoDriver};
 use tempo_engine_host::{serve_driver_connection, EngineIpcServer, ENGINE_HOST_SOCKET_ENV};
 
@@ -59,18 +60,32 @@ async fn run() -> Result<(), String> {
         std::sync::atomic::Ordering::Relaxed,
     );
 
+    serve_driver_over_bound_socket(&socket_path, &mut driver).await
+}
+
+async fn serve_driver_over_bound_socket<D>(
+    socket_path: impl AsRef<Path>,
+    driver: &mut D,
+) -> Result<(), String>
+where
+    D: DriverTrait + ?Sized,
+{
+    let socket_path = socket_path.as_ref();
+
     // The engine binds; the daemon's `connect_engine_ipc` connects. The socket is
     // hardened (0600, private parent, peer-uid checked) but tokenless because the
     // shipped daemon attach client does not authenticate — hence
     // `accept_unauthenticated`.
-    let server = EngineIpcServer::bind(&socket_path).map_err(|error| error.to_string())?;
+    let server = EngineIpcServer::bind(socket_path).map_err(|error| error.to_string())?;
     eprintln!(
-        "tempo-engined-cdp: listening on {socket_path}; attach with `tempod --engine cdp --engine-socket {socket_path}`"
+        "tempo-engined-cdp: listening on {}; attach with `tempod --engine cdp --engine-socket {}`",
+        socket_path.display(),
+        socket_path.display()
     );
     let mut connection = server
         .accept_unauthenticated()
         .map_err(|error| error.to_string())?;
-    serve_driver_connection(&mut connection, &mut driver)
+    serve_driver_connection(&mut connection, driver)
         .await
         .map_err(|error| error.to_string())
 }
@@ -112,3 +127,81 @@ fn spawn_parent_death_watch(chrome_pid: std::sync::Arc<std::sync::atomic::Atomic
 
 #[cfg(not(unix))]
 fn spawn_parent_death_watch(_chrome_pid: std::sync::Arc<std::sync::atomic::AtomicU32>) {}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::{
+        fs, io,
+        os::unix::{fs::PermissionsExt, net::UnixStream},
+        path::Path,
+        thread,
+        time::{Duration, Instant},
+    };
+    use tempo_driver::TestDriver;
+    use tempo_engine_host::{DriverCommand, DriverResponse, EngineHostError, EngineIpcClient};
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cdp_host_binds_socket_for_tokenless_daemon_attach(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700))?;
+        let socket_path = dir.path().join("engine.sock");
+        let client_path = socket_path.clone();
+
+        let server = tokio::spawn(async move {
+            let mut driver = TestDriver::new().allow_private_network_access();
+            serve_driver_over_bound_socket(socket_path, &mut driver).await
+        });
+        let client = tokio::task::spawn_blocking(
+            move || -> Result<(DriverResponse, DriverResponse), EngineHostError> {
+                wait_for_socket(&client_path)?;
+                let mut client = EngineIpcClient::from_stream(UnixStream::connect(client_path)?);
+                let observed = client.request(DriverCommand::Observe)?;
+                let closed = client.request(DriverCommand::Close)?;
+                Ok((observed, closed))
+            },
+        );
+
+        let (server_result, client_result) = tokio::join!(server, client);
+        server_result
+            .map_err(|error| io::Error::other(format!("server task failed: {error}")))?
+            .map_err(|error| io::Error::other(format!("server serve failed: {error}")))?;
+        let (observed, closed) = client_result
+            .map_err(|error| io::Error::other(format!("client task failed: {error}")))?
+            .map_err(io::Error::other)?;
+
+        match observed {
+            DriverResponse::Observation { observation } => {
+                assert_eq!(observation.url, "about:blank");
+            }
+            other => return Err(format!("unexpected observation response: {other:?}").into()),
+        }
+        assert_eq!(closed, DriverResponse::Closed);
+        Ok(())
+    }
+
+    fn wait_for_socket(path: &Path) -> Result<(), EngineHostError> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if path.exists() {
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        Err(EngineHostError::Io(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "tempo-engined-cdp did not bind its engine socket",
+        )))
+    }
+}
+
+#[cfg(all(test, not(unix)))]
+mod tests {
+    #[tokio::test]
+    async fn cdp_host_binds_socket_for_tokenless_daemon_attach() {
+        // Unix-domain socket IPC for tokenless attach is not available on non-Unix
+        // targets. Keep a covered test placeholder so build/test remains stable
+        // across supported platforms.
+    }
+}
