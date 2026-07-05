@@ -42,6 +42,7 @@ observation, action, network, runtime, protocol, shell, eval, and compatibility 
   `tempo-session`, `tempo-agent`, `tempo-skills`, `tempo-speculate`, `tempo-toolexec`,
   `tempo-shell`, `tempo-evals`, `tempo-compat`, and `tempo-cli` carry the supporting
   browser, agent, security, replay, shell, evaluation, and operations layers.
+  `tempo-crawl` is a deferred SDK facade over `tempo-net` (zero in-tree consumers).
 
 ```
 cargo test --workspace   # contracts, conformance, runtime, protocol, and shell tests
