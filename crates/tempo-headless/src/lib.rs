@@ -5766,7 +5766,7 @@ pub fn tempod_openapi(base_url: &str) -> JsonValue {
                         "content": {"application/json": {"schema": {"$ref": "#/components/schemas/CreateRunRequest"}}}
                     },
                     "responses": {
-                        "200": {
+                        "201": {
                             "description": "Created and executed an agent run",
                             "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AgentRun"}}}
                         },
@@ -11435,6 +11435,11 @@ mod tests {
             openapi["paths"]["/sessions/{session_id}/runs"]["post"]["responses"]["409"]
                 ["description"],
             "Session already has an active writer"
+        );
+        assert_eq!(
+            openapi["paths"]["/sessions/{session_id}/runs"]["post"]["responses"]["201"]
+                ["description"],
+            "Created and executed an agent run"
         );
         assert_eq!(
             openapi["components"]["schemas"]["CreateRunRequest"]["properties"]["actions"]["items"]
