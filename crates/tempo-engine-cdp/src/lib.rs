@@ -23,7 +23,7 @@ use chromiumoxide::cdp::browser_protocol::page::{
     CaptureScreenshotFormat, CreateIsolatedWorldParams, Viewport,
 };
 use chromiumoxide::cdp::browser_protocol::target::{
-    CreateBrowserContextParams, CreateTargetParams,
+    CloseTargetParams, CreateBrowserContextParams, CreateTargetParams,
 };
 use chromiumoxide::cdp::js_protocol::runtime::{EvaluateParams, ExecutionContextId};
 use chromiumoxide::error::CdpError;
@@ -86,7 +86,26 @@ const CDP_POLICY_PROXY_ARGS: [&str; 6] = [
     "--proxy-server",
 ];
 const CDP_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
-const TIMED_OUT_NAVIGATION_RECOVERY_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const TEMPOD_ENGINE_IPC_TIMEOUT: Duration = Duration::from_secs(30);
+/// Bound on awaiting the `Page.navigate` command *response*. The response is
+/// advisory: on freshly created (especially child-context) targets Chrome's
+/// answer is sometimes lost while the navigation itself proceeds, so a short
+/// await here hands off to the readyState recovery poll below instead of
+/// burning the caller's deadline on a reply that will never come.
+const CDP_NAVIGATION_AWAIT_TIMEOUT: Duration = Duration::from_secs(5);
+const CDP_CHILD_TARGET_SETUP_TIMEOUT: Duration = Duration::from_secs(2);
+const CDP_CHILD_TARGET_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
+/// Window for the readyState/URL recovery poll after a timed-out navigation
+/// await. 5s await + 20s poll keeps the whole bounded-navigation path under
+/// tempod's 30s engine IPC deadline (typed `NavTimeout` instead of an opaque
+/// IPC timeout) while still letting slow-but-loading pages finish — the
+/// values are derived from the caller's bound, not from test tuning.
+const TIMED_OUT_NAVIGATION_RECOVERY_TIMEOUT: Duration = Duration::from_secs(20);
+/// Child-context navigation has extra target setup, Fetch policy install, and
+/// cleanup work inside the same tempod IPC call. Keep its recovery window below
+/// the root lane so the worst-case failure path still has cleanup margin.
+const CHILD_TIMED_OUT_NAVIGATION_RECOVERY_TIMEOUT: Duration = Duration::from_secs(17);
 const TIMED_OUT_NAVIGATION_RECOVERY_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Explicit opt-out for Chromium sandboxing in constrained CI/container setups.
@@ -378,21 +397,49 @@ impl CdpTempoDriver {
         cursor: u64,
         requested_url: &str,
     ) -> Result<(), TransportError> {
-        let deadline = Instant::now() + TIMED_OUT_NAVIGATION_RECOVERY_TIMEOUT;
+        self.recover_timed_out_navigation_since_with_timeout(
+            cursor,
+            requested_url,
+            TIMED_OUT_NAVIGATION_RECOVERY_TIMEOUT,
+        )
+        .await
+    }
+
+    async fn recover_timed_out_navigation_since_with_timeout(
+        &self,
+        cursor: u64,
+        requested_url: &str,
+        recovery_timeout: Duration,
+    ) -> Result<(), TransportError> {
+        let deadline = Instant::now() + recovery_timeout;
         loop {
             self.enforce_no_blocked_request_soon_since(cursor).await?;
-            let current_url = self.current_url().await?;
+            let current_url =
+                match tokio::time::timeout(remaining_until(deadline)?, self.current_url()).await {
+                    Ok(result) => result?,
+                    Err(_) => return Err(TransportError::NavTimeout),
+                };
             self.enforce_current_url_policy_value(&current_url)?;
             self.enforce_no_blocked_request_since(cursor)?;
-            if let Some(ready_state) = self.document_ready_state_since(cursor).await?
+            let ready_state = match tokio::time::timeout(
+                remaining_until(deadline)?,
+                self.document_ready_state_since(cursor),
+            )
+            .await
+            {
+                Ok(result) => result?,
+                Err(_) => return Err(TransportError::NavTimeout),
+            };
+            if let Some(ready_state) = ready_state
                 && timed_out_navigation_recovered(requested_url, &current_url, &ready_state)
             {
                 return Ok(());
             }
-            if Instant::now() >= deadline {
-                return Err(TransportError::NavTimeout);
-            }
-            tokio::time::sleep(TIMED_OUT_NAVIGATION_RECOVERY_INTERVAL).await;
+            tokio::time::sleep(std::cmp::min(
+                TIMED_OUT_NAVIGATION_RECOVERY_INTERVAL,
+                remaining_until(deadline)?,
+            ))
+            .await;
         }
     }
 
@@ -514,14 +561,18 @@ impl CdpTempoDriver {
         self.enforce_url_policy(url)?;
         self.clear_blocked_request()?;
         let cursor = self.request_policy_cursor();
-        match self.page()?.goto(url).await {
-            Ok(_page) => {}
-            Err(CdpError::Timeout) => {
-                self.recover_timed_out_navigation_since(cursor, url).await?;
-            }
-            Err(error) => {
-                self.enforce_no_blocked_request_soon_since(cursor).await?;
-                return Err(map_cdp_error(error));
+        if self.should_recreate_child_page_for_navigation() {
+            self.recreate_child_page_for_navigation(url, cursor).await?;
+        } else {
+            match tokio::time::timeout(CDP_NAVIGATION_AWAIT_TIMEOUT, self.page()?.goto(url)).await {
+                Ok(Ok(_page)) => {}
+                Ok(Err(CdpError::Timeout)) | Err(_) => {
+                    self.recover_timed_out_navigation_since(cursor, url).await?;
+                }
+                Ok(Err(error)) => {
+                    self.enforce_no_blocked_request_soon_since(cursor).await?;
+                    return Err(map_cdp_error(error));
+                }
             }
         }
         self.enforce_no_blocked_request_soon_since(cursor).await?;
@@ -537,6 +588,157 @@ impl CdpTempoDriver {
         let (final_url, dom_html) = self.snapshot_since(cursor).await?;
         self.record_snapshot_since(cursor, final_url, dom_html)
             .await
+    }
+
+    fn should_recreate_child_page_for_navigation(&self) -> bool {
+        self.browser_context_id.is_some()
+    }
+
+    /// Child-context navigation replaces the page with a fresh `about:blank`
+    /// target, installs per-page request policy on that target, then drives the
+    /// destination navigation. Creating the target at the destination would let
+    /// chromiumoxide start loading before Fetch interception exists, and a
+    /// timed-out create future can leave the browser with an orphan target.
+    async fn recreate_child_page_for_navigation(
+        &mut self,
+        url: &str,
+        cursor: u64,
+    ) -> Result<(), TransportError> {
+        let browser_context_id = self
+            .browser_context_id
+            .clone()
+            .ok_or_else(|| TransportError::Other("missing CDP browser context".into()))?;
+        let page_params = CreateTargetParams::builder()
+            .url("about:blank")
+            .browser_context_id(browser_context_id)
+            .build()
+            .map_err(|error| TransportError::Other(error.to_string()))?;
+        let new_page = match tokio::time::timeout(
+            CDP_CHILD_TARGET_SETUP_TIMEOUT,
+            self.browser.new_page(page_params),
+        )
+        .await
+        {
+            Ok(Ok(page)) => page,
+            // Dropping the create future is not cancellation: the target may
+            // already exist browser-side mid-load. Reap any page in this
+            // child context other than the current one so a retry loop
+            // against a hung destination cannot grow the browser unbounded.
+            Ok(Err(CdpError::Timeout)) | Err(_) => {
+                self.reap_orphan_child_pages().await;
+                self.enforce_no_blocked_request_soon_since(cursor).await?;
+                return Err(TransportError::NavTimeout);
+            }
+            Ok(Err(error)) => {
+                self.reap_orphan_child_pages().await;
+                self.enforce_no_blocked_request_soon_since(cursor).await?;
+                return Err(map_cdp_error(error));
+            }
+        };
+        let new_policy_task = match install_request_policy_bounded(
+            &new_page,
+            self.url_policy.clone(),
+            self.blocked_request_url.clone(),
+            self.request_policy_tracker.clone(),
+            CDP_CHILD_TARGET_SETUP_TIMEOUT,
+        )
+        .await
+        {
+            Ok(task) => task,
+            Err(error) => {
+                close_child_page_bounded(new_page).await;
+                return Err(error);
+            }
+        };
+
+        let old_page = self.page.replace(new_page);
+        let navigation_error = match tokio::time::timeout(
+            CDP_NAVIGATION_AWAIT_TIMEOUT,
+            self.page()?.goto(url),
+        )
+        .await
+        {
+            Ok(Ok(_page)) => None,
+            Ok(Err(CdpError::Timeout)) | Err(_) => self
+                .recover_timed_out_navigation_since_with_timeout(
+                    cursor,
+                    url,
+                    CHILD_TIMED_OUT_NAVIGATION_RECOVERY_TIMEOUT,
+                )
+                .await
+                .err(),
+            Ok(Err(error)) => {
+                if let Err(blocked) = self.enforce_no_blocked_request_soon_since(cursor).await {
+                    Some(blocked)
+                } else {
+                    Some(map_cdp_error(error))
+                }
+            }
+        };
+
+        if let Some(error) = navigation_error {
+            new_policy_task.abort();
+            let failed_page = self.page.take();
+            self.page = old_page;
+            if let Some(failed_page) = failed_page {
+                close_child_page_bounded(failed_page).await;
+            }
+            return Err(error);
+        }
+
+        if let Some(task) = self.request_policy_task.take() {
+            task.abort();
+        }
+        self.request_policy_task = Some(new_policy_task);
+        if let Ok(mut guard) = self.probe_context.lock() {
+            *guard = None;
+        }
+        if let Some(old_page) = old_page {
+            close_child_page_bounded(old_page).await;
+        }
+        Ok(())
+    }
+
+    /// Close every target in this driver's child browser context except the
+    /// page currently held. Used after a timed-out/failed target create,
+    /// where the dropped future may have left a half-created page behind
+    /// (`Target.createTarget` succeeds browser-side before `new_page`
+    /// resolves). Best-effort and bounded: reaping must not add unbounded
+    /// awaits to the failure path it cleans up.
+    async fn reap_orphan_child_pages(&mut self) {
+        let Some(context_id) = self.browser_context_id.clone() else {
+            return;
+        };
+        let deadline = Instant::now() + CDP_CHILD_TARGET_CLEANUP_TIMEOUT;
+        let current_target = self.page.as_ref().map(|page| page.target_id().clone());
+        let Ok(Ok(targets)) = tokio::time::timeout(
+            match remaining_until(deadline) {
+                Ok(remaining) => remaining,
+                Err(_) => return,
+            },
+            self.browser.fetch_targets(),
+        )
+        .await
+        else {
+            return;
+        };
+        for target in targets {
+            if target.browser_context_id.as_ref() != Some(&context_id) {
+                continue;
+            }
+            if Some(&target.target_id) == current_target.as_ref() {
+                continue;
+            }
+            let Ok(remaining) = remaining_until(deadline) else {
+                return;
+            };
+            let _ = tokio::time::timeout(
+                remaining,
+                self.browser
+                    .execute(CloseTargetParams::new(target.target_id.clone())),
+            )
+            .await;
+        }
     }
 
     async fn enrich_observation_from_ax_tree(
@@ -1620,6 +1822,33 @@ async fn install_request_policy(
     )))
 }
 
+async fn install_request_policy_bounded(
+    page: &Page,
+    url_policy: Arc<Mutex<UrlPolicy>>,
+    blocked_request_url: Arc<Mutex<Option<String>>>,
+    request_policy_tracker: Arc<RequestPolicyTracker>,
+    timeout: Duration,
+) -> Result<JoinHandle<()>, TransportError> {
+    match tokio::time::timeout(
+        timeout,
+        install_request_policy(
+            page,
+            url_policy,
+            blocked_request_url,
+            request_policy_tracker,
+        ),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(TransportError::NavTimeout),
+    }
+}
+
+async fn close_child_page_bounded(page: Page) {
+    let _ = tokio::time::timeout(CDP_CHILD_TARGET_CLEANUP_TIMEOUT, page.close()).await;
+}
+
 /// Pumps `Fetch.requestPaused` events, resuming each with bounded concurrency.
 ///
 /// Two properties matter here (see #441):
@@ -2112,6 +2341,13 @@ fn timed_out_navigation_recovered(
     ready_state: &str,
 ) -> bool {
     ready_state == "complete" && navigation_urls_match(requested_url, current_url)
+}
+
+fn remaining_until(deadline: Instant) -> Result<Duration, TransportError> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or(TransportError::NavTimeout)
 }
 
 fn env_flag_enabled(name: &str) -> bool {
@@ -3253,6 +3489,34 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpListener, TcpStream as StdTcpStream};
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Boundary test for the bounded-navigation budget: the whole timed-out
+    /// path (navigation await + readyState recovery) must resolve inside
+    /// tempod's 30s engine IPC deadline (`ENGINE_IPC_TIMEOUT` in
+    /// tempo-headless — restated here because the contract crate cannot
+    /// depend upward on the daemon crate), or attached callers get an opaque
+    /// IPC timeout instead of the typed `NavTimeout` this lane exists for.
+    #[test]
+    fn bounded_navigation_path_resolves_inside_engine_ipc_deadline() {
+        assert!(
+            CDP_NAVIGATION_AWAIT_TIMEOUT + TIMED_OUT_NAVIGATION_RECOVERY_TIMEOUT
+                < TEMPOD_ENGINE_IPC_TIMEOUT,
+            "navigation await + recovery must leave margin under the 30s engine IPC bound"
+        );
+        assert!(
+            CDP_CHILD_TARGET_SETUP_TIMEOUT
+                + CDP_CHILD_TARGET_SETUP_TIMEOUT
+                + CDP_NAVIGATION_AWAIT_TIMEOUT
+                + CHILD_TIMED_OUT_NAVIGATION_RECOVERY_TIMEOUT
+                + CDP_CHILD_TARGET_CLEANUP_TIMEOUT
+                < TEMPOD_ENGINE_IPC_TIMEOUT,
+            "child create + policy install + navigation recovery + cleanup must stay under the 30s engine IPC bound"
+        );
+        assert!(
+            CDP_CHILD_TARGET_CLEANUP_TIMEOUT < TEMPOD_ENGINE_IPC_TIMEOUT,
+            "child cleanup awaits must be individually bounded below the engine IPC deadline"
+        );
+    }
 
     #[test]
     fn navigation_url_match_accepts_chromium_normalization_only() {
@@ -5282,7 +5546,10 @@ mod tests {
             })
             .await
             .map_err(|error| std::io::Error::other(error.0))?;
-        child.goto(&url).await?;
+        let child_initial = tokio::time::timeout(Duration::from_secs(20), child.goto(&url))
+            .await
+            .map_err(|_| std::io::Error::other("child initial goto timed out"))??;
+        assert_eq!(child_initial.url, url);
         let child_value = child
             .evaluate_script(
                 "Promise.resolve(localStorage.getItem('tempoIsolation') === null ? '__missing__' : localStorage.getItem('tempoIsolation'))",
@@ -5295,6 +5562,28 @@ mod tests {
 
         assert_eq!(child_value, serde_json::json!("__missing__"));
         assert_eq!(child_cookie, serde_json::json!(""));
+        let child_observe = tokio::time::timeout(Duration::from_secs(20), child.observe())
+            .await
+            .map_err(|_| std::io::Error::other("child observe timed out"))??;
+        assert_eq!(child_observe.url, url);
+        let child_next_url = format!("{url}again");
+        let child_second_goto =
+            tokio::time::timeout(Duration::from_secs(20), child.goto(&child_next_url))
+                .await
+                .map_err(|_| std::io::Error::other("child second goto timed out"))??;
+        assert_eq!(child_second_goto.url, child_next_url);
+        let child_batch = tokio::time::timeout(
+            Duration::from_secs(20),
+            child.act_batch(&ActionBatch {
+                actions: vec![Action::Goto {
+                    url: format!("{url}batch"),
+                }],
+                quiescence: QuiescencePolicy::FixedMillis(0),
+            }),
+        )
+        .await
+        .map_err(|_| std::io::Error::other("child act_batch goto timed out"))??;
+        assert!(matches!(child_batch, StepOutcome::Applied { .. }));
 
         child.close().await?;
         driver.close().await?;
