@@ -1644,6 +1644,7 @@ async fn finish_paused_request_after_policy<Execute, Fut, Error>(
 ) where
     Execute: FnOnce(bool) -> Fut,
     Fut: std::future::Future<Output = Result<(), Error>>,
+    Error: std::fmt::Display,
 {
     let seq = request_policy_tracker.start_request();
     let blocked_url = if allowed {
@@ -1652,7 +1653,13 @@ async fn finish_paused_request_after_policy<Execute, Fut, Error>(
         mark_blocked_request_url(blocked_request_url, request_url);
         Some(request_url.to_string())
     };
-    let _resume_result = execute(allowed).await;
+    // Resume failures are non-fatal — Chrome routinely rejects continue/fail under
+    // races (e.g. "Invalid InterceptionId" on a request it cancelled mid-navigation)
+    // — so we swallow the error and keep pumping (#441). But log it: a systematic
+    // failure (every continue failing) should be diagnosable, not silent.
+    if let Err(error) = execute(allowed).await {
+        eprintln!("tempo-engine-cdp: failed to resume paused request {request_url}: {error}");
+    }
     request_policy_tracker.finish_request(seq, blocked_url);
 }
 
