@@ -1249,7 +1249,7 @@ mod tests {
     }
 
     #[test]
-    fn navigate_confirmation_gate_sets_native_confirmation_without_resubmit() {
+    fn navigate_confirmation_gate_sets_native_confirmation_without_resubmit() -> TestResult {
         let service = MockService {
             confirm_on_goto: true,
             ..MockService::default()
@@ -1269,11 +1269,9 @@ mod tests {
             model.tabs[0].surface.run_state,
             SurfaceRunState::AwaitingConfirmation
         );
-        let pending = model.tabs[0]
-            .surface
-            .pending_confirmation
-            .as_ref()
-            .expect("navigation gate should create pending confirmation");
+        let Some(pending) = model.tabs[0].surface.pending_confirmation.as_ref() else {
+            return Err("navigation gate should create pending confirmation".into());
+        };
         assert!(matches!(
             pending.replay,
             Some(PendingConfirmationReplay::Navigate { ref session_id, ref url })
@@ -1292,6 +1290,7 @@ mod tests {
             "dismiss must not resubmit with advisory confirmation"
         );
         assert!(model.status.contains("no advisory confirmation"));
+        Ok(())
     }
 
     #[test]
