@@ -6361,10 +6361,10 @@ fn openapi_component_schema(mut schema: JsonValue) -> JsonValue {
 fn rewrite_json_schema_refs_for_openapi(value: &mut JsonValue) {
     match value {
         JsonValue::Object(map) => {
-            if let Some(JsonValue::String(reference)) = map.get_mut("$ref") {
-                if let Some(definition) = reference.strip_prefix("#/$defs/") {
-                    *reference = format!("#/components/schemas/{definition}");
-                }
+            if let Some(JsonValue::String(reference)) = map.get_mut("$ref")
+                && let Some(definition) = reference.strip_prefix("#/$defs/")
+            {
+                *reference = format!("#/components/schemas/{definition}");
             }
             for value in map.values_mut() {
                 rewrite_json_schema_refs_for_openapi(value);
