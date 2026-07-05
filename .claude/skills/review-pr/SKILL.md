@@ -94,6 +94,7 @@ Fit & simplicity (more code is not better):
 Tests:
 - [ ] A test exercises the actual failure mode (survives the reverted-fix question above); new caps/timeouts/limits are tested at the boundary — at, below, above.
 - [ ] Local verification ran in an isolated worktree/target. If multiple Cargo commands share one fresh `CARGO_TARGET_DIR` concurrently, missing rlibs/object files/temp dirs are local harness races until reproduced sequentially.
+- [ ] CI filters that skip expensive security or engine build gates are conservative: workflow files, lockfiles, manifests, gate scripts, the gated crate, and direct local dependency crates still trigger the gate unless the PR documents a narrower proof.
 
 ## tempo hard rules (standing invariants — treat a violation as a blocker)
 
