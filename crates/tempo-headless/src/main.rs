@@ -106,7 +106,11 @@ impl TempodOptions {
                     overrides.engine = Some(match value.as_str() {
                         "cdp" => tempo_config::EngineKind::Cdp,
                         "servo" => tempo_config::EngineKind::Servo,
-                        _ => return Err(format!("unknown engine: {value}\n{}", usage())),
+                        _ => {
+                            return Err(format!(
+                                "unknown engine: {value}\nRun tempod --help for usage."
+                            ));
+                        }
                     });
                 }
                 "--engine-socket" => {
@@ -278,7 +282,9 @@ fn parse_engine(value: &str) -> Result<Engine, String> {
     match value {
         "cdp" => Ok(Engine::Cdp),
         "servo" => Ok(Engine::Servo),
-        _ => Err(format!("unknown engine: {value}\nRun tempod --help for usage.")),
+        _ => Err(format!(
+            "unknown engine: {value}\nRun tempod --help for usage."
+        )),
     }
 }
 

@@ -96,9 +96,7 @@ impl WindowConfig {
                     config.poll_interval = Duration::from_secs(seconds);
                 }
                 other => {
-                    return Err(ShellError::Usage(format!(
-                        "unknown option: {other}\nRun with --help for usage."
-                    )));
+                    return Err(ShellError::Usage(format!("unknown option: {other}")));
                 }
             }
             index += 1;
