@@ -1586,9 +1586,12 @@ mod tests {
             write_fixture_response(&mut stream, &body)
         });
 
-        let error = ShellClient::new(addr.to_string())
+        let error = match ShellClient::new(addr.to_string())
             .goto_session("session-123", "https://pay.test")
-            .expect_err("step_error must not be treated as successful navigation");
+        {
+            Ok(()) => return Err("step_error must not be treated as successful navigation".into()),
+            Err(error) => error,
+        };
 
         assert!(
             matches!(error, ShellError::Protocol(message) if message.contains("node not reachable"))
