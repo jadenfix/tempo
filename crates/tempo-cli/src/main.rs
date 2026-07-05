@@ -40,6 +40,9 @@ use thiserror::Error;
 const USAGE: &str = "\
 tempo-cli
 
+Options:
+  -V, --version
+
 Commands:
   schema [--output PATH]
   scorecard --input PATH [--output PATH] [--allow-missing-speculation]
@@ -60,6 +63,8 @@ Commands:
             [--allow-private-network]
             [--confirmation-mode deny|auto-clean|auto-all]
 ";
+
+const USAGE_HINT: &str = "Run with --help for usage.";
 
 fn main() -> ExitCode {
     let mut stdout = io::stdout().lock();
@@ -98,6 +103,7 @@ where
 #[derive(Debug, PartialEq)]
 enum Command {
     Help,
+    Version,
     Schema {
         output: Output,
     },
@@ -160,6 +166,7 @@ impl Command {
 
         match command.as_str() {
             "-h" | "--help" | "help" => Ok(Self::Help),
+            "-V" | "--version" => Ok(Self::Version),
             "schema" => parse_schema(options),
             "scorecard" => parse_scorecard(options),
             "session-eval" => parse_session_eval(options),
@@ -170,7 +177,7 @@ impl Command {
             "replay" => parse_replay(options),
             "run-cdp-task" => parse_run_cdp_task(options),
             other => Err(CliError::Usage(format!(
-                "unknown command: {other}\n\n{USAGE}"
+                "unknown command: {other}\n{USAGE_HINT}"
             ))),
         }
     }
@@ -187,6 +194,10 @@ impl Command {
         match self {
             Self::Help => {
                 stdout.write_all(USAGE.as_bytes())?;
+                Ok(())
+            }
+            Self::Version => {
+                writeln!(stdout, "{}", env!("CARGO_PKG_VERSION"))?;
                 Ok(())
             }
             Self::Schema { output } => {
@@ -650,7 +661,7 @@ fn required_value<T>(flag: &'static str, value: Option<T>) -> Result<T, CliError
 }
 
 fn unknown_flag(flag: &str) -> CliError {
-    CliError::Usage(format!("unknown flag: {flag}\n\n{USAGE}"))
+    CliError::Usage(format!("unknown flag: {flag}\n{USAGE_HINT}"))
 }
 
 fn parse_bool(flag: &'static str, value: String) -> Result<bool, CliError> {
@@ -1272,6 +1283,24 @@ mod tests {
     use tempo_session::{DurableEncryptionKey, RunId, SessionId, SessionJournal};
 
     type TestResult = Result<(), Box<dyn Error>>;
+
+    #[test]
+    fn version_flag_prints_crate_version() -> TestResult {
+        let mut stdout = Vec::new();
+
+        run_with_writer(["--version"], &mut stdout)?;
+
+        assert_eq!(
+            String::from_utf8(stdout)?,
+            format!("{}\n", env!("CARGO_PKG_VERSION"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn help_advertises_version_flag() {
+        assert!(USAGE.contains("-V, --version"));
+    }
 
     #[test]
     fn schema_command_writes_schema_bundle_to_stdout() -> TestResult {
@@ -2050,7 +2079,11 @@ mod tests {
         let result = run_with_writer(["schema", "--bad"], &mut Vec::new());
 
         match result {
-            Err(CliError::Usage(message)) => assert!(message.contains("unknown flag")),
+            Err(CliError::Usage(message)) => {
+                assert!(message.contains("unknown flag"));
+                assert!(message.contains("--help"));
+                assert!(!message.contains("Commands:"));
+            }
             other => return Err(unexpected_result(other)),
         }
         Ok(())

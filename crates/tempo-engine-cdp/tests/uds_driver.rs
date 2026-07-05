@@ -8,6 +8,7 @@ use tempo_engine_cdp::{CdpConfig, CdpTempoDriver};
 use tempo_engine_host::{
     serve_driver_connection, DriverCommand, DriverResponse, EngineIpcClient, EngineIpcConnection,
 };
+use tempo_schema::{Action, ActionBatch, QuiescencePolicy};
 
 #[tokio::test]
 async fn cdp_driver_serves_commands_over_engine_host_uds() -> Result<(), Box<dyn std::error::Error>>
@@ -25,11 +26,15 @@ async fn cdp_driver_serves_commands_over_engine_host_uds() -> Result<(), Box<dyn
                 DriverResponse,
                 DriverResponse,
                 DriverResponse,
+                DriverResponse,
             ),
             tempo_engine_host::EngineHostError,
         > {
+            let client_stream = client_stream;
+            client_stream.set_read_timeout(Some(Duration::from_secs(20)))?;
+            client_stream.set_write_timeout(Some(Duration::from_secs(20)))?;
             let mut client = EngineIpcClient::from_stream(client_stream);
-            let observed = client.request(DriverCommand::Goto { url })?;
+            let observed = client.request(DriverCommand::Goto { url: url.clone() })?;
             let created = client.request(DriverCommand::CreateBrowsingContext {
                 options: BrowsingContextCreateOptions {
                     kind: BrowsingContextKind::Tab,
@@ -42,9 +47,24 @@ async fn cdp_driver_serves_commands_over_engine_host_uds() -> Result<(), Box<dyn
                 ));
             };
             let child_observed = client.request_for(Some(&driver_id), DriverCommand::Observe)?;
+            let child_navigated = client.request_for(
+                Some(&driver_id),
+                DriverCommand::ActBatch {
+                    batch: ActionBatch {
+                        actions: vec![Action::Goto { url }],
+                        quiescence: QuiescencePolicy::FixedMillis(0),
+                    },
+                },
+            )?;
             let child_closed = client.request_for(Some(&driver_id), DriverCommand::Close)?;
             let closed = client.request(DriverCommand::Close)?;
-            Ok((observed, child_observed, child_closed, closed))
+            Ok((
+                observed,
+                child_observed,
+                child_navigated,
+                child_closed,
+                closed,
+            ))
         },
     );
 
@@ -56,7 +76,7 @@ async fn cdp_driver_serves_commands_over_engine_host_uds() -> Result<(), Box<dyn
         .allow_private_network_access();
     let mut connection = EngineIpcConnection::from_stream(server_stream);
     serve_driver_connection(&mut connection, &mut driver).await?;
-    let (observed, child_observed, child_closed, closed) = client.await??;
+    let (observed, child_observed, child_navigated, child_closed, closed) = client.await??;
 
     match observed {
         DriverResponse::Observation { observation } => {
@@ -79,6 +99,15 @@ async fn cdp_driver_serves_commands_over_engine_host_uds() -> Result<(), Box<dyn
             assert_eq!(observation.seq, 1);
         }
         other => return Err(format!("unexpected child driver response: {other:?}").into()),
+    }
+    match child_navigated {
+        DriverResponse::Step { outcome } => {
+            assert!(matches!(
+                outcome,
+                tempo_engine_host::WireStepOutcome::Applied { .. }
+            ));
+        }
+        other => return Err(format!("unexpected child act_batch response: {other:?}").into()),
     }
     assert_eq!(child_closed, DriverResponse::Closed);
     assert_eq!(closed, DriverResponse::Closed);
