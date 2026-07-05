@@ -1471,6 +1471,19 @@ fn decode_durable_record_bytes(
 fn parse_encrypted_record_document(
     record_text: &str,
 ) -> Result<Option<EncryptedRecordDocument>, JournalError> {
+    // Plaintext records (the default policy) never contain the envelope key, so
+    // skip the full `Value` parse on the common path. A substring hit still
+    // falls through to the authoritative top-level `get` check below, so a page
+    // value that merely embeds the literal is not misclassified.
+    //
+    // Envelope detection is canonical-encoding based: Tempo's own writer emits
+    // the field name literally, and only that spelling is recognized. A
+    // JSON-equivalent record that escapes characters inside the top-level key
+    // is treated as plaintext; external durable-record producers, if ever
+    // supported, must emit the canonical field name.
+    if !record_text.contains("tempo_session_envelope") {
+        return Ok(None);
+    }
     let Ok(value) = serde_json::from_str::<serde_json::Value>(record_text) else {
         return Ok(None);
     };
