@@ -96,8 +96,8 @@ const SOCKET_TIMEOUT: Duration = Duration::from_secs(30);
 const ENGINE_IPC_TIMEOUT: Duration = Duration::from_secs(30);
 /// Name of the packaged CDP engine host binary expected next to `tempod`.
 pub const PACKAGED_CDP_ENGINE_BINARY: &str = "tempo-engined-cdp";
-const AUTO_CDP_ENGINE_MAX_RESTARTS: u32 = 10;
-const AUTO_CDP_ENGINE_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
+const AUTO_CDP_ENGINE_MAX_RESTARTS: u32 = u32::MAX;
+const AUTO_CDP_ENGINE_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const AUTO_CDP_ENGINE_MONITOR_INTERVAL: Duration = Duration::from_millis(500);
 /// Upper bound on how long the whole engine-resource teardown (`drain` /
 /// `detach_engine_driver` / `Drop`) waits for blocking engine-IPC closes:
