@@ -863,7 +863,7 @@ fn replay_steps_from_entries(entries: &[JournalEntry]) -> Result<Vec<ReplayStep>
                 });
                 completed_steps += 1;
             }
-            JournalEvent::StepError { action, reason } => {
+            JournalEvent::StepError { action, reason, .. } => {
                 pending = None;
                 steps.push(ReplayStep {
                     index: completed_steps,

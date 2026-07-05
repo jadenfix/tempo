@@ -312,7 +312,9 @@ pub struct ResumeCursor {
     pub next_step: usize,
     pub pending_planned: Option<IdempotencyKey>,
     pub closed: bool,
-    pub last_step_error: Option<(usize, String)>,
+    /// `(step_index, reason, policy_denied)`. `policy_denied` is the typed tag
+    /// from the journal entry; `false` on legacy entries (fall back to prefix heuristic).
+    pub last_step_error: Option<(usize, String, bool)>,
 }
 
 impl ResumeCursor {
@@ -347,7 +349,11 @@ impl ResumeCursor {
                     completed_steps += 1;
                     pending_plan_index = None;
                 }
-                JournalEvent::StepError { action, reason } => {
+                JournalEvent::StepError {
+                    action,
+                    reason,
+                    policy_denied,
+                } => {
                     let index = completed_steps;
                     let planned = plan
                         .steps
@@ -356,7 +362,7 @@ impl ResumeCursor {
                     if &planned.action != action {
                         return Err(AgentError::JournalDiverged { index });
                     }
-                    last_step_error = Some((index, reason.clone()));
+                    last_step_error = Some((index, reason.clone(), *policy_denied));
                     completed_steps += 1;
                     pending_plan_index = None;
                 }
@@ -520,10 +526,17 @@ impl AgentLoop {
 
         let event = JournalEvent::from_step_outcome(step.action.clone(), outcome);
         let entry = self.journal.append(event.clone())?;
-        if let JournalEvent::StepError { reason, .. } = &event {
-            self.cursor
-                .last_step_error
-                .replace((self.cursor.completed_steps, reason.clone()));
+        if let JournalEvent::StepError {
+            reason,
+            policy_denied,
+            ..
+        } = &event
+        {
+            self.cursor.last_step_error.replace((
+                self.cursor.completed_steps,
+                reason.clone(),
+                *policy_denied,
+            ));
         }
         self.cursor.completed_steps += 1;
         self.cursor.next_step += 1;
@@ -551,7 +564,40 @@ impl AgentLoop {
         let entry = self.journal.append(event.clone())?;
         self.cursor
             .last_step_error
-            .replace((self.cursor.completed_steps, reason));
+            .replace((self.cursor.completed_steps, reason, false));
+        self.cursor.completed_steps += 1;
+        self.cursor.next_step += 1;
+        self.cursor.pending_planned = None;
+
+        StepTriple::from_event(step.key, entry.seq, step.action, event)
+    }
+
+    /// Record a policy-denial outcome. Like `record_next_outcome` for a
+    /// `StepError` but sets the typed `policy_denied: true` discriminant so
+    /// resume routes on the tag rather than the prose reason string.
+    pub fn record_policy_denied_outcome(
+        &mut self,
+        reason: impl Into<String>,
+    ) -> Result<StepTriple, AgentError> {
+        let step = self.next_step().ok_or(AgentError::PlanComplete)?.clone();
+        self.budget.charge(step.estimated_tokens)?;
+
+        if self.cursor.pending_planned.as_ref() != Some(&step.key) {
+            self.journal.append(JournalEvent::ActionPlanned {
+                action: step.action.clone(),
+            })?;
+        }
+
+        let reason = reason.into();
+        let event = JournalEvent::StepError {
+            action: step.action.clone(),
+            reason: reason.clone(),
+            policy_denied: true,
+        };
+        let entry = self.journal.append(event.clone())?;
+        self.cursor
+            .last_step_error
+            .replace((self.cursor.completed_steps, reason, true));
         self.cursor.completed_steps += 1;
         self.cursor.next_step += 1;
         self.cursor.pending_planned = None;
@@ -958,9 +1004,7 @@ impl AgentRunner {
 
             if !policy.confirmed {
                 let reason = policy_denied_reason(&policy);
-                let triple = agent.record_next_outcome(StepOutcome::StepError {
-                    reason: reason.clone(),
-                })?;
+                let triple = agent.record_policy_denied_outcome(reason.clone())?;
                 report.actions_completed += 1;
                 report.steps.push(AgentStepReport {
                     index,
@@ -1103,8 +1147,10 @@ impl AgentRunner {
             return true;
         }
 
-        if let Some((action_index, reason)) = &agent.cursor().last_step_error {
-            report.status = if is_policy_denial_reason(reason) {
+        if let Some((action_index, reason, policy_denied)) = &agent.cursor().last_step_error {
+            // Prefer the typed tag; fall back to the prefix heuristic for legacy
+            // entries written before the `policy_denied` field was introduced.
+            report.status = if *policy_denied || is_policy_denial_reason(reason) {
                 AgentRunStatus::PolicyDenied {
                     action_index: *action_index,
                     reason: reason.clone(),
@@ -1175,9 +1221,7 @@ impl AgentRunner {
             )?;
             if !policy.confirmed {
                 let reason = policy_denied_reason(&policy);
-                let triple = agent.record_next_outcome(StepOutcome::StepError {
-                    reason: reason.clone(),
-                })?;
+                let triple = agent.record_policy_denied_outcome(reason.clone())?;
                 report.actions_completed += 1;
                 report.steps.push(AgentStepReport {
                     index,
@@ -2462,6 +2506,7 @@ mod tests {
         journal.append(JournalEvent::StepError {
             action: second.clone(),
             reason: "not present".into(),
+            policy_denied: false,
         })?;
         journal.append(JournalEvent::SessionClosed)?;
         drop(journal);
@@ -2636,6 +2681,7 @@ mod tests {
         journal.append(JournalEvent::StepError {
             action,
             reason: "not present".into(),
+            policy_denied: false,
         })?;
         drop(journal);
 
@@ -4205,6 +4251,252 @@ mod tests {
         let report = runner.run_driver_task(&mut driver, &task).await?;
 
         assert!(matches!(report.status, AgentRunStatus::Interrupted { .. }));
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    // ── Issue #522: typed policy-denial tag round-trip tests ─────────────────
+
+    /// A live policy denial is journaled with `policy_denied: true`; resuming
+    /// the same journal must classify the step as `PolicyDenied`, not a generic
+    /// retriable `StepError`.
+    #[tokio::test]
+    async fn runner_resume_policy_denial_classified_as_policy_denied() -> TestResult {
+        let root = unique_dir("resume-policy-denial-tag")?;
+        remove_dir_if_exists(&root)?;
+        fs::create_dir_all(&root)?;
+        let journal_path = root.join("session.jsonl");
+        let action = Action::Click {
+            node: NodeId("submit".into()),
+        };
+        let task = DriverTask::with_steps(
+            "https://example.com",
+            vec![DriverStep::tainted(action.clone())],
+        );
+        let ids = AgentRunIds::new("run-resume-policy-denial", "session-resume-policy-denial");
+
+        // First run: hits policy denial, journals StepError { policy_denied: true }.
+        let mut driver = TestDriver::new().with_elements(vec![button("submit")]);
+        let first_runner = AgentRunner::new_plaintext_unsafe(&journal_path, ids.clone());
+        let first = first_runner.run_driver_task(&mut driver, &task).await?;
+        assert!(
+            matches!(first.status, AgentRunStatus::PolicyDenied { .. }),
+            "expected PolicyDenied on first run, got {:?}",
+            first.status
+        );
+
+        // Verify the journal carries the typed tag.
+        let entries = read_journal_entries(&journal_path)?;
+        assert!(entries.iter().any(|entry| matches!(
+            &entry.event,
+            JournalEvent::StepError {
+                policy_denied: true,
+                ..
+            }
+        )));
+
+        // Second run (resume): must surface PolicyDenied from the tag.
+        let mut second_driver = TestDriver::new().with_elements(vec![button("submit")]);
+        let second_runner = AgentRunner::new_plaintext_unsafe(&journal_path, ids);
+        let second = second_runner
+            .run_driver_task(&mut second_driver, &task)
+            .await?;
+        assert!(
+            matches!(second.status, AgentRunStatus::PolicyDenied { .. }),
+            "expected PolicyDenied on resume, got {:?}",
+            second.status
+        );
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    /// Reverted-fix sentinel: when `policy_denied: true` is set the resume
+    /// must classify `PolicyDenied` **even if the reason prose does not match
+    /// the "policy requires"/"policy denied" prefixes**. This test fails if the
+    /// code reverts to prefix-only matching.
+    #[test]
+    fn resume_cursor_policy_denial_tag_overrides_unmatched_prose() -> TestResult {
+        let root = unique_dir("cursor-policy-tag-prose")?;
+        remove_dir_if_exists(&root)?;
+        fs::create_dir_all(&root)?;
+        let journal_path = root.join("session.jsonl");
+        let action = Action::Scroll { x: 0.0, y: 1.0 };
+        let plan = TaskPlan::from_actions(vec![action.clone()], 4)?;
+        let mut journal = SessionJournal::open(
+            &journal_path,
+            RunId("run".into()),
+            SessionId("session".into()),
+        )?;
+        journal.append(JournalEvent::SessionStarted {
+            url: "https://example.com".into(),
+        })?;
+        journal.append(JournalEvent::ActionPlanned {
+            action: action.clone(),
+        })?;
+        // Reason deliberately does NOT start with "policy requires" or "policy denied"
+        // but the typed tag is set true — resume must still route PolicyDenied.
+        journal.append(JournalEvent::StepError {
+            action: action.clone(),
+            reason: "action not permitted by site policy".into(),
+            policy_denied: true,
+        })?;
+        drop(journal);
+
+        let agent = AgentLoop::open_plaintext_unsafe(
+            &journal_path,
+            RunId("run".into()),
+            SessionId("session".into()),
+            plan,
+            TokenBudget::new(20),
+        )?;
+
+        let Some((_, reason, tag)) = agent.cursor().last_step_error.as_ref() else {
+            return Err("last_step_error should be set".into());
+        };
+        assert!(*tag, "policy_denied tag must be true; reason = {reason:?}");
+        // The prefix heuristic alone would return false here.
+        assert!(!is_policy_denial_reason(reason));
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    /// Legacy back-compat: a `StepError` written before the `policy_denied`
+    /// field was introduced (field absent in JSON → `serde(default)` → `false`)
+    /// must still be classified `PolicyDenied` when the prose matches the
+    /// prefix heuristic.
+    ///
+    /// This is a pure in-memory test: it bypasses the on-disk journal layer and
+    /// directly constructs `JournalEntry` values with `policy_denied: false`
+    /// (the value `serde(default)` produces when the field is absent in
+    /// persisted JSON), then checks that `ResumeCursor::from_entries` stores
+    /// the tag and that the prefix heuristic fires correctly.
+    #[test]
+    fn resume_cursor_legacy_entry_without_tag_falls_back_to_prefix_heuristic() -> TestResult {
+        // Verify serde(default): JSON without the policy_denied field
+        // deserializes policy_denied as false.
+        let legacy_json = r#"{"kind":"step_error","action":{"kind":"scroll","x":0.0,"y":1.0},"reason":"policy requires Confirm for Click"}"#;
+        let event: JournalEvent = serde_json::from_str(legacy_json)?;
+        let JournalEvent::StepError { policy_denied, .. } = event else {
+            return Err("expected StepError".into());
+        };
+        assert!(
+            !policy_denied,
+            "legacy JSON without policy_denied should default to false via serde(default)"
+        );
+
+        // Verify ResumeCursor falls back to the prefix heuristic when tag is false.
+        let action = Action::Scroll { x: 0.0, y: 1.0 };
+        let plan = TaskPlan::from_actions(vec![action.clone()], 4)?;
+        let run_id = RunId("run-legacy".into());
+        let session_id = SessionId("session-legacy".into());
+        let entries = vec![
+            JournalEntry {
+                schema_version: "1".into(),
+                run_id: run_id.clone(),
+                session_id: session_id.clone(),
+                seq: 0,
+                timestamp_ms: 0,
+                event: JournalEvent::SessionStarted {
+                    url: "https://legacy.example.com".into(),
+                },
+            },
+            JournalEntry {
+                schema_version: "1".into(),
+                run_id: run_id.clone(),
+                session_id: session_id.clone(),
+                seq: 1,
+                timestamp_ms: 0,
+                event: JournalEvent::ActionPlanned {
+                    action: action.clone(),
+                },
+            },
+            JournalEntry {
+                schema_version: "1".into(),
+                run_id,
+                session_id,
+                seq: 2,
+                timestamp_ms: 0,
+                // policy_denied: false simulates a legacy entry (serde default).
+                event: JournalEvent::StepError {
+                    action,
+                    reason: "policy requires Confirm for Click".into(),
+                    policy_denied: false,
+                },
+            },
+        ];
+
+        let cursor = ResumeCursor::from_entries(&plan, &entries)?;
+        let Some((_, reason, tag)) = cursor.last_step_error.as_ref() else {
+            return Err("last_step_error should be set on legacy entry".into());
+        };
+        // Tag defaults to false on legacy entries.
+        assert!(!tag, "legacy entry has no tag, should default to false");
+        // The prefix heuristic must still fire for "policy requires ..." prose.
+        assert!(
+            is_policy_denial_reason(reason),
+            "prefix heuristic must match legacy reason: {reason:?}"
+        );
+
+        Ok(())
+    }
+
+    /// Reverted-fix sentinel, driven through the real resume path: a
+    /// `StepError` journaled with `policy_denied: true` but reason prose that
+    /// does NOT match the legacy prefix heuristic must still resume as
+    /// `PolicyDenied` via `AgentRunner::run_driver_task` →
+    /// `apply_resume_terminal_status`. Unlike
+    /// `resume_cursor_policy_denial_tag_overrides_unmatched_prose` (which only
+    /// inspects the cursor), this test asserts the caller-visible
+    /// `AgentRunStatus` and fails if lib.rs reverts `apply_resume_terminal_status`
+    /// to prefix-only matching (`is_policy_denial_reason(reason)` without the
+    /// `*policy_denied ||` tag check).
+    #[tokio::test]
+    async fn runner_resume_policy_denial_tag_overrides_unmatched_prose() -> TestResult {
+        let root = unique_dir("resume-policy-tag-unmatched-prose")?;
+        remove_dir_if_exists(&root)?;
+        fs::create_dir_all(&root)?;
+        let journal_path = root.join("session.jsonl");
+        let action = Action::Click {
+            node: NodeId("submit".into()),
+        };
+        let ids = AgentRunIds::new(
+            "run-resume-policy-tag-unmatched-prose",
+            "session-resume-policy-tag-unmatched-prose",
+        );
+
+        let mut journal =
+            SessionJournal::open(&journal_path, ids.run_id.clone(), ids.session_id.clone())?;
+        journal.append(JournalEvent::SessionStarted {
+            url: "https://example.com".into(),
+        })?;
+        journal.append(JournalEvent::ActionPlanned {
+            action: action.clone(),
+        })?;
+        // Reason deliberately does not start with "policy requires" or
+        // "policy denied" — only the typed tag marks this a policy denial.
+        let reason = "some opaque upstream message".to_string();
+        assert!(!is_policy_denial_reason(&reason));
+        journal.append(JournalEvent::StepError {
+            action: action.clone(),
+            reason: reason.clone(),
+            policy_denied: true,
+        })?;
+        drop(journal);
+
+        let task = DriverTask::new("https://example.com", vec![action]);
+        let mut driver = TestDriver::new();
+        let runner = AgentRunner::new_plaintext_unsafe(&journal_path, ids);
+        let report = runner.run_driver_task(&mut driver, &task).await?;
+
+        match &report.status {
+            AgentRunStatus::PolicyDenied { reason: got, .. } => {
+                assert_eq!(got, &reason);
+            }
+            other => return Err(format!("expected PolicyDenied, got {other:?}").into()),
+        }
 
         remove_dir_if_exists(&root)?;
         Ok(())

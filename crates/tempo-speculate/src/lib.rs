@@ -571,7 +571,7 @@ fn replay_steps(entries: &[JournalEntry]) -> Vec<ReplayStep> {
                 action: action.clone(),
                 diff: diff.clone(),
             }),
-            JournalEvent::StepError { action, reason } => steps.push(ReplayStep::StepError {
+            JournalEvent::StepError { action, reason, .. } => steps.push(ReplayStep::StepError {
                 seq: entry.seq,
                 action: action.clone(),
                 reason: reason.clone(),
@@ -998,6 +998,7 @@ mod tests {
                     JournalEvent::StepError {
                         action: Action::Scroll { x: 0.0, y: 1.0 },
                         reason: "historical error".into(),
+                        policy_denied: false,
                     },
                 ),
             ],
