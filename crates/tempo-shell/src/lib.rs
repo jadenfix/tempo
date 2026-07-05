@@ -403,13 +403,14 @@ impl ShellClient {
             }],
             quiescence: QuiescencePolicy::Composite,
         };
-        self.session_act_batch(
+        let outcome = self.session_act_batch(
             session_id,
             &batch,
             Some(false),
             Some(&foreground_navigation_idempotency_key(session_id, url)),
             grant,
         )?;
+        ensure_session_act_batch_applied(&outcome)?;
         Ok(())
     }
 
@@ -912,6 +913,27 @@ fn safe_path_segment(segment: &str) -> Result<&str, ShellError> {
         Ok(segment)
     } else {
         Err(ShellError::Usage(format!("invalid session id: {segment}")))
+    }
+}
+
+fn ensure_session_act_batch_applied(outcome: &Value) -> Result<(), ShellError> {
+    match outcome.get("status").and_then(Value::as_str) {
+        Some("applied") => Ok(()),
+        Some("step_error") => {
+            let reason = outcome
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("step error");
+            Err(ShellError::Protocol(format!(
+                "session act_batch step_error: {reason}"
+            )))
+        }
+        Some(status) => Err(ShellError::Protocol(format!(
+            "session act_batch returned unexpected status: {status}"
+        ))),
+        None => Err(ShellError::Protocol(
+            "session act_batch response missing status".into(),
+        )),
     }
 }
 
@@ -1536,6 +1558,41 @@ mod tests {
         assert!(request.contains("\"url\":\"https://pay.test\""));
         assert!(request.contains("\"input_tainted\":false"));
         assert!(request.contains("\"idempotency_key\":\"shell-goto-"));
+        match handle.join() {
+            Ok(result) => result?,
+            Err(_) => return Err("server thread failed".into()),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn session_goto_rejects_step_error_act_batch_outcome() -> TestResult {
+        let body = serde_json::to_vec(&json!({
+            "status": "step_error",
+            "reason": "node not reachable",
+            "policy": {}
+        }))?;
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let handle = thread::spawn(move || -> Result<(), std::io::Error> {
+            let (mut stream, _) = listener.accept()?;
+            let mut request = Vec::new();
+            stream.read_to_end(&mut request)?;
+            let header = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            write_fixture_response(&mut stream, header.as_bytes())?;
+            write_fixture_response(&mut stream, &body)
+        });
+
+        let error = ShellClient::new(addr.to_string())
+            .goto_session("session-123", "https://pay.test")
+            .expect_err("step_error must not be treated as successful navigation");
+
+        assert!(
+            matches!(error, ShellError::Protocol(message) if message.contains("node not reachable"))
+        );
         match handle.join() {
             Ok(result) => result?,
             Err(_) => return Err("server thread failed".into()),
