@@ -47,8 +47,10 @@ Correctness & honesty of the contract:
 - [ ] Tool and model result envelopes do not duplicate large structured payloads across text and structured channels; text fallbacks summarize, while binary artifacts use native media content blocks.
 - [ ] Handles/IDs the caller reuses across calls are stable, or their churn is handled rather than silently breaking multi-step callers.
 - [ ] Docs, comments, and declared schemas/types match what the code actually does — no present-tense claims for a stub, no `{"type":"object"}` standing in for a real schema.
+- [ ] Public enum-valued fields advertise the exact serde/runtime wire names. Generated clients must accept every value the server can emit, ideally by reusing the same schema helper or by a contract test that pins the full enum.
 - [ ] Model-facing tool schemas are self-contained and match the runtime parser — no opaque object placeholders, unresolved `$ref`s, or ambiguous aliases where the caller needs one canonical shape.
 - [ ] Runtime-visible contract changes update every public description in the same slice: OpenAPI paths/statuses/schemas, agent cards, SDK-facing docs, and compatibility fixtures. A route or response field that exists at runtime but is absent from the contract is a blocker for SDK workflows.
+- [ ] Clients that convert structured operation envelopes into `Result`-style APIs parse the authoritative payload status before mutating local state. HTTP 2xx alone is not success when the body can report `step_error`, unknown, missing, or non-applied outcomes.
 - [ ] When a caller starts trusting callee-embedded data it previously re-derived (a returned diff, status, or measurement), the callee's contract (trait docs, schema comments) is tightened in the same slice to require what the caller now assumes — otherwise a future implementation silently weakens the guarantee.
 - [ ] Public Rust schema struct changes update source callers too: `serde(default)` preserves old JSON compatibility, but it does not make existing struct literals compile. Scan/update workspace literals and downstream crates.
 - [ ] Compact wire-format changes that omit default, empty, or optional fields preserve both directions of compatibility: compact serialization, populated serialization, and default-filled deserialization all have reverted-fix-sensitive tests.
@@ -72,6 +74,7 @@ Security boundaries & auth:
 - [ ] Operational metadata routes that expose dependency health, capacity, policy, or topology are guarded like control-plane routes unless they intentionally return only static liveness.
 - [ ] Locks are narrow, consistently ordered, released on panic (poison recovered, not fatal), and never held across `.await`, navigation, or subprocess I/O — the pool lock especially, so `/health` and `/drain` stay responsive.
 - [ ] UI-local state transitions and teardown/cancel paths stay bounded independently of backend health. Moving I/O off-thread is not enough if local controls or shutdown still serialize behind blocking transport work.
+- [ ] Async UI/worker reconciliation preserves ownership boundaries. A stale UI snapshot must not replay a whole domain object into a worker or over a completed worker result when backend actions can mutate fields inside that object; send narrow local deltas.
 - [ ] Durable/journal writes use a batched single-writer path (e.g. WAL + a dedicated writer), not per-write open + full fsync; a crash or kill mid-write must be recoverable on restart with no torn or lost committed state.
 - [ ] Removing per-write fsync from a durable file comes with an integrity story, not just a recency argument: checksummed records, or detection-plus-self-heal for interior corruption (a well-terminated garbage line from out-of-order writeback), not only torn-tail repair. Heal-by-truncation is gated so a misconfigured key/policy on a healthy store can never trigger it.
 - [ ] A cached verdict about a shared mutable file (known-corrupt region, known-good prefix, parsed snapshot) is not revalidated by length or mtime equality once another writer can heal, truncate-and-re-append, or re-record in contract: identical payloads re-encode to identical lengths. The verdict is re-derived from content on use, or scoped to a single exclusive-lock hold.
@@ -99,6 +102,7 @@ Performance on hot paths (a regression here is a correctness bug for this projec
 Fit & simplicity (more code is not better):
 - [ ] The change does exactly what its issue needs — no speculative abstraction, dead branch, unused config knob, second way to do an existing thing, or new crate/feature with no caller.
 - [ ] It fits `final.md`: crate-layer direction is respected (a lower-layer contract crate must not depend upward on a higher-layer one), the driver contract stays engine-agnostic, observe/policy/taint stay pure, and public contracts stay versioned to evolve independently.
+- [ ] Cross-platform and shell changes keep Android/mobile constraints in the shared layers: no desktop-only IPC, filesystem, process, RAM, or windowing assumptions above the engine/transport boundary; platform-specific work stays in thin adapters.
 
 Tests:
 - [ ] A test exercises the actual failure mode (survives the reverted-fix question above); new caps/timeouts/limits are tested at the boundary — at, below, above.
