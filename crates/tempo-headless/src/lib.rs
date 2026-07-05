@@ -1651,6 +1651,7 @@ impl SessionPool {
             id,
             ManagerEvent::ConfirmationGranted {
                 confirmation_id: confirmation_id.to_string(),
+                grant: grant.clone(),
             },
         );
         Ok(grant)
@@ -6222,10 +6223,11 @@ pub fn tempod_openapi(base_url: &str) -> JsonValue {
                         {
                             "type": "object",
                             "additionalProperties": false,
-                            "required": ["kind", "confirmation_id"],
+                            "required": ["kind", "confirmation_id", "grant"],
                             "properties": {
                                 "kind": {"const": "confirmation_granted"},
-                                "confirmation_id": {"type": "string"}
+                                "confirmation_id": {"type": "string"},
+                                "grant": {"$ref": "#/components/schemas/ConfirmationGrant"}
                             }
                         },
                         {
@@ -8588,6 +8590,22 @@ mod tests {
         )?;
         assert_eq!(grant_response.status, 200);
         let grant: ConfirmationGrant = serde_json::from_slice(&grant_response.body)?;
+        let confirmation_event = pool
+            .events(&session.id, None)?
+            .events
+            .into_iter()
+            .find_map(|event| match event.event {
+                TempodSessionEventKind::Manager {
+                    event:
+                        ManagerEvent::ConfirmationGranted {
+                            confirmation_id: event_confirmation_id,
+                            grant: event_grant,
+                        },
+                } if event_confirmation_id == confirmation_id => Some(event_grant),
+                _ => None,
+            })
+            .ok_or("confirmation grant event should be recorded")?;
+        assert_eq!(confirmation_event, grant);
 
         let duplicate_grant = route_http_request(
             &mut pool,
