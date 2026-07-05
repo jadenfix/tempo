@@ -1756,18 +1756,42 @@ impl SessionPool {
         })
     }
 
+    /// Recovers the true creation order encoded in a session id minted by
+    /// `finish_create` (`format!("session-{}", self.next_id)`). `next_id` is a
+    /// strictly monotonic per-pool counter, so the parsed suffix is an exact
+    /// insertion sequence — unlike comparing `TempodSessionId`s as strings,
+    /// which sorts "session-10" before "session-2". Any id that (unexpectedly)
+    /// doesn't match the "session-<n>" shape sorts as if it were the oldest
+    /// (`0`) rather than panicking.
+    fn session_creation_seq(id: &TempodSessionId) -> u64 {
+        id.0
+            .strip_prefix("session-")
+            .and_then(|suffix| suffix.parse::<u64>().ok())
+            .unwrap_or(0)
+    }
+
     fn enforce_terminal_session_retention(&mut self) {
         let max_terminal = if self.privacy_mode.retains_history() {
             MAX_TERMINAL_SESSIONS
         } else {
             0
         };
-        let terminal = self
+        let mut terminal = self
             .sessions
             .iter()
             .filter(|(id, session)| self.session_record_can_be_purged(id, session))
             .map(|(id, _)| id.clone())
             .collect::<Vec<_>>();
+        // `self.sessions` is a `BTreeMap<TempodSessionId, _>`, and iterating it
+        // yields ascending order of `TempodSessionId`'s derived string `Ord` —
+        // NOT creation order. Ids are unpadded decimal counters
+        // (`format!("session-{}", self.next_id)`, see `finish_create`), so
+        // lexicographic order diverges from creation order at every
+        // digit-width boundary (e.g. "session-10" sorts before "session-2").
+        // Sort explicitly by the recovered insertion sequence so eviction is
+        // oldest-first, matching the "keep the most recent N terminal
+        // sessions" retention contract.
+        terminal.sort_by_key(Self::session_creation_seq);
         let excess = terminal.len().saturating_sub(max_terminal);
         for id in terminal.into_iter().take(excess) {
             self.events.remove(&id);
@@ -7748,6 +7772,63 @@ mod tests {
             "session-{}",
             MAX_TERMINAL_SESSIONS + 1
         ))));
+        Ok(())
+    }
+
+    /// Regression test for the ordering bug flagged in review of #519:
+    /// `enforce_terminal_session_retention` must evict the *oldest* terminal
+    /// sessions, not whichever sort first as `TempodSessionId` strings.
+    ///
+    /// `TempodSessionId`'s derived `Ord` compares the wrapped `"session-{n}"`
+    /// string lexicographically, so ids diverge from creation order across
+    /// every digit-width boundary (`"session-10"` < `"session-2"`). Creating
+    /// and killing 260 sessions one at a time (four more than
+    /// `MAX_TERMINAL_SESSIONS` = 256) forces multiple incremental eviction
+    /// rounds while both one/two/three-digit ids are simultaneously present
+    /// in the terminal set, exactly the scenario the review called out.
+    ///
+    /// The true oldest-first contract must evict ids 0..=3 and keep 4..=259
+    /// (the most recent 256). Sorting the terminal set by the ascending
+    /// `TempodSessionId` string instead (the pre-fix behavior) evicts
+    /// 0, 1, 10, 100 and wrongly retains 2 and 3 — verified by temporarily
+    /// reverting `enforce_terminal_session_retention` to
+    /// `terminal.sort()` (ascending `TempodSessionId` order, no
+    /// `session_creation_seq` key) locally, which fails this test with
+    /// exactly that mismatch, then restoring the fix.
+    #[test]
+    fn terminal_session_retention_evicts_true_oldest_across_digit_width_boundary() -> TestResult {
+        let mut pool = SessionPool::default();
+        let total = MAX_TERMINAL_SESSIONS + 4;
+
+        for index in 0..total {
+            let session = pool.create(format!("https://boundary-{index}.test"))?;
+            pool.kill(&session.id)?;
+        }
+
+        assert_eq!(pool.sessions.len(), MAX_TERMINAL_SESSIONS);
+
+        // The four oldest sessions (created before every other survivor)
+        // must be the ones evicted...
+        for stale in 0..4 {
+            assert!(
+                !pool
+                    .sessions
+                    .contains_key(&TempodSessionId(format!("session-{stale}"))),
+                "session-{stale} should have been evicted as one of the oldest terminal sessions"
+            );
+        }
+        // ...and every id from the digit-width boundary onward, including
+        // ids the lexicographic bug evicts too early ("session-10",
+        // "session-100") and ids it wrongly keeps past their turn
+        // ("session-2", "session-3" are covered above), must survive.
+        for fresh in [4_usize, 5, 9, 10, 11, 99, 100, 101, total - 1] {
+            assert!(
+                pool.sessions
+                    .contains_key(&TempodSessionId(format!("session-{fresh}"))),
+                "session-{fresh} is among the {MAX_TERMINAL_SESSIONS} most recently \
+                 terminated sessions and must not have been evicted"
+            );
+        }
         Ok(())
     }
 
