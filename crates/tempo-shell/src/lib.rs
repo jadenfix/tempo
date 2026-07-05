@@ -51,6 +51,8 @@ Options:
   --auth-token TOKEN (default: TEMPO_TEMPOD_AUTH_TOKEN or tempod runtime token file)
 ";
 
+const USAGE_HINT: &str = "Run with --help for usage.";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShellOptions {
     pub tempod_addr: String,
@@ -474,7 +476,7 @@ fn parse_command(args: &[String]) -> Result<ShellCommand, ShellError> {
         "drain" => no_args(rest, ShellCommand::Drain),
         "-h" | "--help" | "help" => Ok(ShellCommand::Help),
         other => Err(ShellError::Usage(format!(
-            "unknown command: {other}\n\n{USAGE}"
+            "unknown command: {other}\n{USAGE_HINT}"
         ))),
     }
 }

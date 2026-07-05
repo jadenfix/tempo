@@ -122,7 +122,9 @@ impl TempodOptions {
                 }
                 "-h" | "--help" => {}
                 value if value.starts_with('-') => {
-                    return Err(format!("unknown tempod option: {value}\n{}", usage()));
+                    return Err(format!(
+                        "unknown tempod option: {value}\nRun tempod --help for usage."
+                    ));
                 }
                 value => {
                     if overrides.bind_addr.replace(value.to_string()).is_some() {
@@ -189,7 +191,9 @@ impl TempodOptions {
                 }
                 "-h" | "--help" => return Err(usage()),
                 value if value.starts_with('-') => {
-                    return Err(format!("unknown tempod option: {value}\n{}", usage()));
+                    return Err(format!(
+                        "unknown tempod option: {value}\nRun tempod --help for usage."
+                    ));
                 }
                 value => {
                     if addr.replace(value.to_string()).is_some() {
@@ -274,7 +278,7 @@ fn parse_engine(value: &str) -> Result<Engine, String> {
     match value {
         "cdp" => Ok(Engine::Cdp),
         "servo" => Ok(Engine::Servo),
-        _ => Err(format!("unknown engine: {value}\n{}", usage())),
+        _ => Err(format!("unknown engine: {value}\nRun tempod --help for usage.")),
     }
 }
 
