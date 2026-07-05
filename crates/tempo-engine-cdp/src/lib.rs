@@ -5588,10 +5588,12 @@ mod tests {
             .map_err(|_| std::io::Error::other("child observe timed out"))??;
         assert_eq!(child_observe.url, url);
         let child_next_url = format!("{url}again");
-        let child_second_goto =
-            tokio::time::timeout(Duration::from_secs(20), child.goto(&child_next_url))
-                .await
-                .map_err(|_| std::io::Error::other("child second goto timed out"))??;
+        let child_second_goto = tokio::time::timeout(
+            Duration::from_secs(20),
+            goto_live_fixture_with_retry(child.as_mut(), &child_next_url),
+        )
+        .await
+        .map_err(|_| std::io::Error::other("child second goto timed out"))??;
         assert_eq!(child_second_goto.url, child_next_url);
         let child_batch = tokio::time::timeout(
             Duration::from_secs(20),
