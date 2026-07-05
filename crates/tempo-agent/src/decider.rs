@@ -766,7 +766,9 @@ struct DecidedResume {
     closed: bool,
     completed: Vec<ResumedRound>,
     pending: Option<ResumedRound>,
-    last_step_error: Option<String>,
+    /// `(reason, policy_denied)`. `policy_denied` is the typed tag from the
+    /// journal entry; `false` on legacy entries (fall back to prefix heuristic).
+    last_step_error: Option<(String, bool)>,
     /// A journaled human-takeover pause (#244). When set, resume surfaces the
     /// hard-pause terminal status instead of re-observing and continuing.
     human_takeover: Option<HumanTakeover>,
@@ -835,8 +837,8 @@ impl AgentRunner {
                 self.decided_report(state, DecidedRunStatus::HumanTakeoverRequired { takeover })
             );
         }
-        if let Some(reason) = resume.last_step_error {
-            let status = terminal_status_for_step_error(reason);
+        if let Some((reason, policy_denied)) = resume.last_step_error {
+            let status = terminal_status_for_step_error(reason, policy_denied);
             return Ok(self.decided_report(state, status));
         }
 
@@ -991,6 +993,7 @@ impl AgentRunner {
                 state.journal.append(JournalEvent::StepError {
                     action: action.clone(),
                     reason: reason.clone(),
+                    policy_denied: false,
                 })?;
                 state.actions_completed += 1;
                 state.steps_executed += 1;
@@ -1004,6 +1007,7 @@ impl AgentRunner {
                 state.journal.append(JournalEvent::StepError {
                     action: action.clone(),
                     reason: reason.clone(),
+                    policy_denied: false,
                 })?;
                 state.actions_completed += 1;
                 state.steps_executed += 1;
@@ -1023,6 +1027,7 @@ impl AgentRunner {
                 state.journal.append(JournalEvent::StepError {
                     action: action.clone(),
                     reason: reason.clone(),
+                    policy_denied: true,
                 })?;
                 state.actions_completed += 1;
                 state.steps_executed += 1;
@@ -1049,6 +1054,7 @@ impl AgentRunner {
                     JournalEvent::StepError {
                         action: action.clone(),
                         reason: reason.clone(),
+                        policy_denied: false,
                     },
                     Some(reason),
                 ),
@@ -1328,10 +1334,17 @@ fn charge_decision(
     }
 }
 
-fn terminal_status_for_step_error(reason: String) -> DecidedRunStatus {
+/// Route a journaled `StepError` to the correct `DecidedRunStatus` on resume.
+///
+/// `policy_denied` is the typed discriminant from the journal entry (written
+/// as of the fix for #522). Older on-disk entries have `policy_denied: false`
+/// (the `serde(default)` fallback); for those we fall back to the
+/// `is_policy_denial_reason` prefix heuristic so legacy journals still
+/// classify correctly.
+fn terminal_status_for_step_error(reason: String, policy_denied: bool) -> DecidedRunStatus {
     if reason == RESUME_INTERRUPTED_REASON {
         DecidedRunStatus::Interrupted { reason }
-    } else if is_policy_denial_reason(&reason) {
+    } else if policy_denied || is_policy_denial_reason(&reason) {
         DecidedRunStatus::PolicyDenied { reason }
     } else {
         DecidedRunStatus::StepError { reason }
@@ -1420,8 +1433,13 @@ fn decided_resume_from_entries(entries: &[JournalEntry]) -> Result<DecidedResume
                             })
                         }
                     }
-                    if let JournalEvent::StepError { reason, .. } = &entry.event {
-                        resume.last_step_error = Some(reason.clone());
+                    if let JournalEvent::StepError {
+                        reason,
+                        policy_denied,
+                        ..
+                    } = &entry.event
+                    {
+                        resume.last_step_error = Some((reason.clone(), *policy_denied));
                     }
                     pending.executed += 1;
                     pending.dangling_planned = false;

@@ -128,6 +128,13 @@ pub enum JournalEvent {
     StepError {
         action: Action,
         reason: String,
+        /// Typed discriminant set to `true` when this error was caused by a
+        /// policy gate or denial. Written as of this schema version; absent on
+        /// older on-disk entries (defaults to `false` via `serde(default)` —
+        /// consumers fall back to the `is_policy_denial_reason` prefix heuristic
+        /// when this field is `false` on a legacy entry).
+        #[serde(default)]
+        policy_denied: bool,
     },
     /// A CAPTCHA / auth-wall / login state was detected on the post-action page
     /// and the run hard-paused for a human to take over (#244). This is NOT a
@@ -151,7 +158,11 @@ impl JournalEvent {
     pub fn from_step_outcome(action: Action, outcome: StepOutcome) -> Self {
         match outcome {
             StepOutcome::Applied { diff } => Self::StepApplied { action, diff },
-            StepOutcome::StepError { reason } => Self::StepError { action, reason },
+            StepOutcome::StepError { reason } => Self::StepError {
+                action,
+                reason,
+                policy_denied: false,
+            },
         }
     }
 
@@ -1918,6 +1929,7 @@ mod tests {
             JournalEvent::StepError {
                 action,
                 reason: "node not found".into(),
+                policy_denied: false,
             }
         );
     }
