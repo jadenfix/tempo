@@ -18,4 +18,5 @@
 - Stateful protocol surfaces need live-state quotas in addition to per-frame or per-body caps; repeated valid commands can be a resource attack even when each request is small.
 - A size cap checked only after fully materializing remote-driven JSON, DOM, screenshot, log, or tool-result data is not a memory bound. Enforce the cap while reading, collecting, diffing, or serializing unless the producer is already independently bounded.
 - Model/tool result envelopes should carry one authoritative structured payload. Text fallbacks must be summaries, not a second serialized copy of large JSON or binary data.
+- Untrusted remote tool catalogs must not weaken local side-effect policy. If a remote descriptor lacks trusted side-effect metadata, classify the action at the strongest supported side effect before applying threshold origin rules.
 - More code is not more optimized. Prefer the smallest change that proves the invariant, removes duplicated paths, or makes an existing contract honest.
