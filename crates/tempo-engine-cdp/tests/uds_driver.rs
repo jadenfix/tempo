@@ -1,6 +1,8 @@
 use std::io::Write;
 use std::net::TcpListener;
 use std::os::unix::net::UnixStream;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 use tempo_driver::{BrowsingContextCreateOptions, BrowsingContextKind};
 use tempo_engine_cdp::{CdpConfig, CdpTempoDriver};
 use tempo_engine_host::{
@@ -80,6 +82,79 @@ async fn cdp_driver_serves_commands_over_engine_host_uds() -> Result<(), Box<dyn
     }
     assert_eq!(child_closed, DriverResponse::Closed);
     assert_eq!(closed, DriverResponse::Closed);
+    Ok(())
+}
+
+/// Reverted-fix-sensitive regression test for #397's actual failure seam: the
+/// shipped `tempo-engined-cdp` binary must *bind* the driver UDS named by
+/// `TEMPO_ENGINE_HOST_SOCKET` so a `tempod`-style client can *connect* to it.
+///
+/// Unlike [`cdp_driver_serves_commands_over_engine_host_uds`] above (which
+/// pre-creates a `UnixStream::pair` and calls `serve_driver_connection`
+/// directly, never touching a filesystem socket or the binary), this test
+/// spawns the actual compiled `tempo-engined-cdp` executable and connects to
+/// it exactly the way `tempod`'s `connect_engine_ipc` does: a bare
+/// `UnixStream::connect` with no auth frame.
+///
+/// If the binary is ever reverted to its pre-fix shape
+/// (`EngineIpcConnection::connect(socket_path)` instead of
+/// `EngineIpcServer::bind(&socket_path)`), nothing ever creates the socket
+/// file at `socket_path` -- the binary itself would be the one waiting to
+/// connect to it -- so every connect attempt below fails with ENOENT until
+/// the deadline, and this test fails instead of silently passing.
+#[test]
+fn tempo_engined_cdp_binary_binds_socket_for_tempod_style_connect(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(chrome) = std::env::var_os("TEMPO_CDP_CHROME") else {
+        eprintln!("skipping live CDP UDS test; TEMPO_CDP_CHROME is unset");
+        return Ok(());
+    };
+
+    let root = tempfile::tempdir()?;
+    // `EngineIpcServer::bind` requires a private (mode 0700) parent directory
+    // and creates one itself when absent; pointing the socket at a directory
+    // that does not exist yet (rather than `root` itself, whose mode comes
+    // from the process umask) exercises that same path the shipped binary
+    // relies on.
+    let socket_path = root.path().join("host").join("engine.sock");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tempo-engined-cdp"))
+        .env("TEMPO_ENGINE_HOST_SOCKET", &socket_path)
+        .env("TEMPO_CDP_CHROME", &chrome)
+        .env("TEMPO_CDP_NO_SANDBOX", "1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let connected = loop {
+        if UnixStream::connect(&socket_path).is_ok() {
+            break true;
+        }
+        if let Some(status) = child.try_wait()? {
+            let _ = child.wait();
+            return Err(format!(
+                "tempo-engined-cdp exited ({status}) before binding {}",
+                socket_path.display()
+            )
+            .into());
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    if !connected {
+        return Err(format!(
+            "timed out waiting for tempo-engined-cdp to accept connections on {}",
+            socket_path.display()
+        )
+        .into());
+    }
     Ok(())
 }
 

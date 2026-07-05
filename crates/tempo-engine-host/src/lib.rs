@@ -544,6 +544,22 @@ impl EngineIpcServer {
         Ok(EngineIpcConnection { stream })
     }
 
+    /// Accept a peer that is authorized by uid alone, skipping the control-token
+    /// handshake.
+    ///
+    /// The shipped `tempod` engine-attach client (`connect_engine_ipc` ->
+    /// [`EngineIpcClient::from_stream`]) speaks the driver protocol without an
+    /// auth frame, so an engine host that serves it (the `tempo-engined-cdp`
+    /// binary) must not demand the token. Security rests on the same footing as
+    /// [`accept`](Self::accept) minus the token: [`bind`](Self::bind) creates the
+    /// socket `0600` inside a private-parent directory, and every peer's uid must
+    /// match the owner's. Callers that do authenticate keep using `accept`.
+    pub fn accept_unauthenticated(&self) -> Result<EngineIpcConnection, EngineHostError> {
+        let (stream, _) = self.listener.accept()?;
+        authorize_peer(&stream)?;
+        Ok(EngineIpcConnection { stream })
+    }
+
     pub fn local_path(&self) -> &Path {
         &self.path
     }
@@ -2209,6 +2225,44 @@ mod tests {
         let diff = ObservationDiff {
             since_seq: 41,
             seq: 42,
+            omitted: 0,
+            added: vec![],
+            removed: vec![],
+            changed: vec![],
+        };
+        connection
+            .write_driver_response(request.id, DriverResponse::Diff { diff: diff.clone() })?;
+
+        let response = join_client(handle)?;
+        assert_eq!(response, DriverResponse::Diff { diff });
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn accept_unauthenticated_serves_tokenless_from_stream_client() -> TestResult {
+        // Mirrors the shipped daemon attach path: `connect_engine_ipc` connects a
+        // tokenless `EngineIpcClient::from_stream`, and the `tempo-engined-cdp`
+        // host accepts it via `accept_unauthenticated` (uid-checked, no token).
+        let root = unique_dir("uds-tokenless")?;
+        remove_dir_if_exists(&root)?;
+        create_private_dir(&root)?;
+        let socket_path = root.join("engine.sock");
+        let server = EngineIpcServer::bind(&socket_path)?;
+        let client_path = socket_path.clone();
+
+        let handle = thread::spawn(move || -> Result<DriverResponse, EngineHostError> {
+            let mut client = EngineIpcClient::from_stream(UnixStream::connect(client_path)?);
+            client.request(DriverCommand::ObserveDiff { since_seq: 7 })
+        });
+
+        let mut connection = server.accept_unauthenticated()?;
+        let request = connection.read_driver_request()?;
+        assert_eq!(request.command, DriverCommand::ObserveDiff { since_seq: 7 });
+        let diff = ObservationDiff {
+            since_seq: 7,
+            seq: 8,
             omitted: 0,
             added: vec![],
             removed: vec![],
