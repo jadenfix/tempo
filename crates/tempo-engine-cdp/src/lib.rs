@@ -457,6 +457,7 @@ impl CdpTempoDriver {
         let (mut compiled, selectors_by_node) =
             compile_observation(&mut self.stable_id_mapper, url, dom_html, self.seq);
         self.selectors_by_node = selectors_by_node;
+        self.populate_live_layout_bounds(&mut compiled).await?;
         self.enrich_observation_from_ax_tree(&mut compiled).await?;
         // Finish the live observation the same way the fixture compiler does:
         // rank-sort, apply the byte/token budget, and populate set-of-marks labels.
@@ -570,6 +571,50 @@ impl CdpTempoDriver {
             },
         )
         .await
+    }
+
+    async fn populate_live_layout_bounds(
+        &self,
+        observation: &mut CompiledObservation,
+    ) -> Result<(), TransportError> {
+        if observation.elements.is_empty() {
+            return Ok(());
+        }
+
+        let candidates: Vec<_> = observation
+            .elements
+            .iter()
+            .filter_map(|element| {
+                self.selectors_by_node
+                    .get(&element.node_id)
+                    .map(|selector| LayoutCandidate {
+                        node_id: element.node_id.clone(),
+                        selector: selector.clone(),
+                    })
+            })
+            .collect();
+        if candidates.is_empty() {
+            observation.elements.clear();
+            return Ok(());
+        }
+
+        self.enforce_current_url_policy().await?;
+        let layouts = self.live_layouts_for_candidates(&candidates).await?;
+        apply_layout_bounds(&mut observation.elements, &layouts);
+        Ok(())
+    }
+
+    async fn live_layouts_for_candidates(
+        &self,
+        candidates: &[LayoutCandidate],
+    ) -> Result<BTreeMap<NodeId, [f32; 4]>, TransportError> {
+        self.page()?
+            .evaluate(layout_probe_script(candidates)?)
+            .await
+            .map_err(map_cdp_error)?
+            .into_value::<serde_json::Value>()
+            .map_err(|error| TransportError::Other(error.to_string()))
+            .map(parse_layout_probe_results)
     }
 
     /// URL policy is enforced once by `enrich_observation_from_ax_tree` before
@@ -2513,6 +2558,159 @@ fn top_ranked_indices(elements: &[InteractiveElement], limit: usize) -> Vec<usiz
     indices
 }
 
+#[derive(Clone, Debug)]
+struct LayoutCandidate {
+    node_id: NodeId,
+    selector: String,
+}
+
+fn layout_probe_script(candidates: &[LayoutCandidate]) -> Result<String, TransportError> {
+    let encoded_candidates = serde_json::to_string(
+        &candidates
+            .iter()
+            .map(|candidate| {
+                serde_json::json!({
+                    "node": candidate.node_id.0.as_str(),
+                    "selector": candidate.selector.as_str(),
+                })
+            })
+            .collect::<Vec<_>>(),
+    )
+    .map_err(|error| TransportError::Other(error.to_string()))?;
+
+    Ok(format!(
+        r#"(() => {{
+  const candidates = {encoded_candidates};
+  const viewportWidth = Math.max(
+    document.documentElement ? document.documentElement.clientWidth : 0,
+    window.innerWidth || 0
+  );
+  const viewportHeight = Math.max(
+    document.documentElement ? document.documentElement.clientHeight : 0,
+    window.innerHeight || 0
+  );
+  const round = (value) => Math.round(value * 100) / 100;
+  const unionRects = (rects) => {{
+    let left = Infinity;
+    let top = Infinity;
+    let right = -Infinity;
+    let bottom = -Infinity;
+    for (const rect of rects) {{
+      // Skip only point-sized (0x0) boxes. A rect that is degenerate along one
+      // axis still occupies layout space — e.g. an empty container that a later
+      // action fills and the agent then extracts — and must stay observable.
+      if (rect.width <= 0 && rect.height <= 0) {{
+        continue;
+      }}
+      left = Math.min(left, rect.left);
+      top = Math.min(top, rect.top);
+      right = Math.max(right, rect.right);
+      bottom = Math.max(bottom, rect.bottom);
+    }}
+    if (!Number.isFinite(left) || !Number.isFinite(top) ||
+        !Number.isFinite(right) || !Number.isFinite(bottom)) {{
+      return null;
+    }}
+    return {{left, top, right, bottom}};
+  }};
+  const isTypeHidden = (element) =>
+    element.tagName && element.tagName.toLowerCase() === 'input' &&
+    String(element.getAttribute('type') || '').toLowerCase() === 'hidden';
+  const output = [];
+  for (const candidate of candidates) {{
+    let element = null;
+    try {{
+      element = document.querySelector(candidate.selector);
+    }} catch (_error) {{
+      continue;
+    }}
+    if (!element || isTypeHidden(element) || element.closest('[hidden]')) {{
+      continue;
+    }}
+    const style = window.getComputedStyle(element);
+    if (style.display === 'none' || style.visibility === 'hidden' ||
+        style.visibility === 'collapse' || Number(style.opacity) === 0) {{
+      continue;
+    }}
+    const rect = unionRects(Array.from(element.getClientRects()));
+    if (!rect) {{
+      continue;
+    }}
+    const left = Math.max(0, rect.left);
+    const top = Math.max(0, rect.top);
+    const right = Math.min(viewportWidth, rect.right);
+    const bottom = Math.min(viewportHeight, rect.bottom);
+    // Strict comparison: a box that is degenerate along one axis after the
+    // viewport clamp (zero-height container, edge-touching element) is kept
+    // with its degenerate bounds; only boxes wholly outside the viewport drop.
+    if (right < left || bottom < top) {{
+      continue;
+    }}
+    output.push({{
+      node: candidate.node,
+      bounds: [round(left), round(top), round(right - left), round(bottom - top)],
+    }});
+  }}
+  return output;
+}})()"#
+    ))
+}
+
+fn parse_layout_probe_results(value: serde_json::Value) -> BTreeMap<NodeId, [f32; 4]> {
+    let mut layouts = BTreeMap::new();
+    let Some(entries) = value.as_array() else {
+        return layouts;
+    };
+    for entry in entries {
+        let Some(node) = entry.get("node").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let Some(bounds) = parse_layout_bounds(entry.get("bounds")) else {
+            continue;
+        };
+        layouts.insert(NodeId(node.to_string()), bounds);
+    }
+    layouts
+}
+
+fn parse_layout_bounds(value: Option<&serde_json::Value>) -> Option<[f32; 4]> {
+    let values = value?.as_array()?;
+    if values.len() != 4 {
+        return None;
+    }
+    let mut bounds = [0.0_f32; 4];
+    for (index, value) in values.iter().enumerate() {
+        let number = value.as_f64()?;
+        if !number.is_finite() {
+            return None;
+        }
+        bounds[index] = number as f32;
+    }
+    // Mirror the probe's retention rule: negative extents are malformed and a
+    // point-sized (0x0) box is unobservable, but a box degenerate along one
+    // axis (zero-height container awaiting content) keeps its bounds.
+    if bounds[2] < 0.0 || bounds[3] < 0.0 {
+        return None;
+    }
+    if bounds[2] <= 0.0 && bounds[3] <= 0.0 {
+        return None;
+    }
+    Some(bounds)
+}
+
+fn apply_layout_bounds(
+    elements: &mut Vec<InteractiveElement>,
+    layouts: &BTreeMap<NodeId, [f32; 4]>,
+) {
+    elements.retain_mut(|element| {
+        let Some(bounds) = layouts.get(&element.node_id) else {
+            return false;
+        };
+        element.bounds = Some(*bounds);
+        true
+    });
+}
+
 fn page_taint(value: &str) -> Vec<TaintSpan> {
     vec![TaintSpan {
         provenance: Provenance::Page,
@@ -3212,6 +3410,90 @@ mod tests {
             encoded.len() <= tempo_observe::DEFAULT_MAX_BYTES,
             "encoded observation should stay under the default byte budget"
         );
+    }
+
+    #[test]
+    fn layout_probe_script_json_encodes_candidates_and_filters_visibility(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let script = layout_probe_script(&[LayoutCandidate {
+            node_id: NodeId("node:1".into()),
+            selector: r#"[id="save"]"#.into(),
+        }])?;
+        let encoded_selector = serde_json::to_string(r#"[id="save"]"#)?;
+
+        assert!(script.contains(&format!("\"selector\":{encoded_selector}")));
+        assert!(script.contains("document.querySelector(candidate.selector)"));
+        assert!(script.contains("element.getClientRects()"));
+        assert!(script.contains("element.closest('[hidden]')"));
+        assert!(script.contains("getAttribute('type')"));
+        assert!(script.contains("right < left || bottom < top"));
+        Ok(())
+    }
+
+    #[test]
+    fn layout_probe_result_parser_keeps_concrete_and_single_axis_degenerate_bounds() {
+        let parsed = parse_layout_probe_results(serde_json::json!([
+            {"node": "node:visible", "bounds": [10.5, 20.0, 30.25, 40.75]},
+            {"node": "node:zero-width", "bounds": [0.0, 0.0, 0.0, 10.0]},
+            {"node": "node:zero-height", "bounds": [0.0, 0.0, 10.0, 0.0]},
+            {"node": "node:point", "bounds": [5.0, 5.0, 0.0, 0.0]},
+            {"node": "node:negative", "bounds": [0.0, 0.0, -1.0, 10.0]},
+            {"node": "node:bad", "bounds": [0.0, 0.0, "wide", 10.0]},
+            {"node": "node:short", "bounds": [0.0, 0.0, 10.0]},
+            {"node": 7, "bounds": [0.0, 0.0, 10.0, 10.0]}
+        ]));
+
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(
+            parsed.get(&NodeId("node:visible".into())).copied(),
+            Some([10.5, 20.0, 30.25, 40.75])
+        );
+        // Degenerate along one axis stays observable (empty containers that a
+        // later action fills); point-sized and negative extents are dropped.
+        assert_eq!(
+            parsed.get(&NodeId("node:zero-width".into())).copied(),
+            Some([0.0, 0.0, 0.0, 10.0])
+        );
+        assert_eq!(
+            parsed.get(&NodeId("node:zero-height".into())).copied(),
+            Some([0.0, 0.0, 10.0, 0.0])
+        );
+    }
+
+    #[test]
+    fn layout_filter_drops_elements_without_live_bounds_before_marks(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut elements = vec![
+            sample_element("node:hidden", 1.0),
+            sample_element("node:visible", 0.9),
+            sample_element("node:missing", 0.8),
+        ];
+        let layouts = BTreeMap::from([(NodeId("node:visible".into()), [4.0, 8.0, 40.0, 20.0])]);
+
+        apply_layout_bounds(&mut elements, &layouts);
+        let observation = finalize_observation(
+            "https://example.test/".into(),
+            1,
+            elements,
+            CompileOptions::default(),
+        );
+
+        assert_eq!(observation.elements.len(), 1);
+        assert_eq!(observation.elements[0].node_id.0, "node:visible");
+        assert_eq!(observation.elements[0].bounds, Some([4.0, 8.0, 40.0, 20.0]));
+        assert_eq!(observation.marks, vec![(NodeId("node:visible".into()), 1)]);
+        for (node_id, _label) in &observation.marks {
+            let marked = observation
+                .elements
+                .iter()
+                .find(|element| element.node_id == *node_id)
+                .ok_or_else(|| std::io::Error::other("mark references missing element"))?;
+            assert!(
+                marked.bounds.is_some(),
+                "mark must reference bounded element"
+            );
+        }
+        Ok(())
     }
 
     #[test]
@@ -4442,6 +4724,115 @@ mod tests {
         assert_eq!(
             email.value.first().map(|span| span.text.as_str()),
             Some("me@example.com"),
+        );
+
+        driver.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_cdp_layout_pass_bounds_marks_and_filters_hidden_controls(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(chrome) = std::env::var_os("TEMPO_CDP_CHROME") else {
+            eprintln!("skipping live CDP layout observation test; TEMPO_CDP_CHROME is unset");
+            return Ok(());
+        };
+        let config = CdpConfig::default()
+            .with_executable(chrome.to_string_lossy())
+            .with_no_sandbox_env_opt_in();
+        let mut driver = CdpTempoDriver::launch_with(config).await?;
+        driver
+            .evaluate_script(
+                r#"(() => {
+                    document.body.style.margin = '0';
+                    document.body.innerHTML = [
+                        '<button id="visible" style="position:absolute;left:20px;top:24px;width:96px;height:32px">Visible</button>',
+                        '<button id="display-none" style="display:none">Display none</button>',
+                        '<button id="visibility-hidden" style="visibility:hidden">Visibility hidden</button>',
+                        '<button id="zero" style="position:absolute;left:20px;top:80px;width:0;height:0;padding:0;border:0;overflow:hidden">Zero size</button>',
+                        '<button id="offscreen" style="position:absolute;left:-1000px;top:20px;width:80px;height:24px">Offscreen</button>',
+                        '<div id="pending" tabindex="0" aria-label="Pending" style="position:absolute;left:20px;top:120px;width:200px;height:0"></div>',
+                        '<input id="secret" type="hidden" value="secret-token">'
+                    ].join('');
+                    return true;
+                })()"#,
+                true,
+            )
+            .await?;
+
+        let observation = driver.observe().await?;
+
+        let visible = observation
+            .elements
+            .iter()
+            .find(|element| element.name.first().map(|span| span.text.as_str()) == Some("Visible"))
+            .ok_or_else(|| std::io::Error::other("missing visible button"))?;
+        let bounds = visible
+            .bounds
+            .ok_or_else(|| std::io::Error::other("visible button missing bounds"))?;
+        assert!(bounds[0] >= 0.0 && bounds[1] >= 0.0);
+        assert!(bounds[2] > 0.0 && bounds[3] > 0.0);
+
+        // A rendered container that is degenerate along one axis (zero height,
+        // positive width) stays observable with its degenerate bounds — agents
+        // extract from empty containers that later actions fill. Only 0x0 and
+        // offscreen boxes are pruned.
+        let pending = observation
+            .elements
+            .iter()
+            .find(|element| element.name.first().map(|span| span.text.as_str()) == Some("Pending"))
+            .ok_or_else(|| std::io::Error::other("zero-height container should stay observable"))?;
+        let pending_bounds = pending
+            .bounds
+            .ok_or_else(|| std::io::Error::other("zero-height container missing bounds"))?;
+        assert!(pending_bounds[2] > 0.0, "positive width preserved");
+        assert_eq!(pending_bounds[3], 0.0, "degenerate height preserved");
+
+        for hidden_text in [
+            "Display none",
+            "Visibility hidden",
+            "Zero size",
+            "Offscreen",
+            "secret-token",
+        ] {
+            assert!(
+                !observation.elements.iter().any(|element| {
+                    element
+                        .name
+                        .iter()
+                        .chain(element.value.iter())
+                        .any(|span| span.text == hidden_text)
+                }),
+                "{hidden_text:?} should be filtered before finalization"
+            );
+        }
+
+        assert!(!observation.marks.is_empty());
+        for (node_id, _label) in &observation.marks {
+            let marked = observation
+                .elements
+                .iter()
+                .find(|element| element.node_id == *node_id)
+                .ok_or_else(|| std::io::Error::other("mark references missing element"))?;
+            assert!(
+                marked.bounds.is_some(),
+                "live CDP marks must reference elements with concrete bounds"
+            );
+        }
+        let encoded = serde_json::to_vec(&observation)?;
+        assert!(
+            encoded.len() <= tempo_observe::DEFAULT_MAX_BYTES,
+            "live observation should stay within the default budget"
+        );
+
+        let raw_screenshot = driver.screenshot().await?;
+        let mut unmarked = observation.clone();
+        unmarked.marks.clear();
+        let baseline = tempo_observe::composite_set_of_marks_png(&raw_screenshot, &unmarked)?;
+        let marked = tempo_observe::composite_set_of_marks_png(&raw_screenshot, &observation)?;
+        assert_ne!(
+            marked, baseline,
+            "set-of-marks compositing should change screenshot pixels when live bounds exist"
         );
 
         driver.close().await?;
