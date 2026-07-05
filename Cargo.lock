@@ -8764,6 +8764,7 @@ dependencies = [
  "tempo-engine-host",
  "tempo-headless",
  "tempo-mcp",
+ "tempo-net",
  "tempo-schema",
  "tempo-taint",
  "thiserror 2.0.18",
