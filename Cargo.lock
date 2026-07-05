@@ -8642,6 +8642,7 @@ dependencies = [
  "tempo-engine-host",
  "tempo-mcp",
  "tempo-net",
+ "tempo-observe",
  "tempo-policy",
  "tempo-schema",
  "tempo-telemetry",
