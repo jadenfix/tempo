@@ -1090,6 +1090,7 @@ struct CachedSessionActBatchResponse {
 struct StoredConfirmationRequest {
     request: ConfirmationRequest,
     request_fingerprint: JsonValue,
+    grant_issued: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1541,6 +1542,11 @@ impl SessionPool {
         }
         let now = current_time_ms();
         self.prune_expired_confirmations(now);
+        if let Some(existing) = self.pending_confirmations.values().find(|stored| {
+            stored.request.session_id == id.0 && stored.request_fingerprint == request_fingerprint
+        }) {
+            return Ok(existing.request.clone());
+        }
         let confirmation_id = format!("confirmation-{}", random_hex(CONFIRMATION_ID_BYTES)?);
         let request = ConfirmationRequest {
             confirmation_id: confirmation_id.clone(),
@@ -1558,6 +1564,7 @@ impl SessionPool {
             StoredConfirmationRequest {
                 request: request.clone(),
                 request_fingerprint,
+                grant_issued: false,
             },
         );
         self.record_manager_event(
@@ -1581,11 +1588,16 @@ impl SessionPool {
         self.prune_expired_confirmations(now);
         let stored = self
             .pending_confirmations
-            .get(confirmation_id)
+            .get_mut(confirmation_id)
             .ok_or_else(|| TempodError::SessionNotFound(TempodSessionId(confirmation_id.into())))?;
         if stored.request.session_id != id.0 {
             return Err(TempodError::Conflict(
                 "confirmation request belongs to a different session".into(),
+            ));
+        }
+        if stored.grant_issued {
+            return Err(TempodError::Conflict(
+                "confirmation request already has a minted grant".into(),
             ));
         }
         let grant = ConfirmationGrant {
@@ -1594,6 +1606,7 @@ impl SessionPool {
             issued_ms: now,
             expires_ms: stored.request.expires_ms,
         };
+        stored.grant_issued = true;
         self.confirmation_grants.insert(
             grant.grant_token.clone(),
             StoredConfirmationGrant {
@@ -1719,6 +1732,9 @@ impl SessionPool {
                 .runs
                 .get_mut(run_id)
                 .ok_or_else(|| TempodError::SessionNotFound(TempodSessionId(run_id.0.clone())))?;
+            if run.state == AgentRunState::Cancelled && state != AgentRunState::Cancelled {
+                return Ok(run.clone());
+            }
             run.state = state;
             run.updated_ms = now;
             run.completed_ms = match state {
@@ -1772,21 +1788,66 @@ impl SessionPool {
     }
 
     fn cancel_run(&mut self, run_id: &AgentRunId) -> Result<AgentRun, TempodError> {
+        let run = self.run(run_id)?;
+        if matches!(
+            run.state,
+            AgentRunState::Completed | AgentRunState::Failed | AgentRunState::Cancelled
+        ) {
+            return Err(TempodError::Conflict(format!(
+                "run_not_cancellable: run {} is already {:?}",
+                run_id.0, run.state
+            )));
+        }
         self.finish_agent_run(run_id, AgentRunState::Cancelled, None)
     }
 
     fn resume_run(&mut self, run_id: &AgentRunId) -> Result<AgentRun, TempodError> {
         let now = current_time_ms();
-        let (session_id, run) = {
+        let session_id = self
+            .runs
+            .get(run_id)
+            .map(|run| TempodSessionId(run.session_id.clone()))
+            .ok_or_else(|| TempodError::SessionNotFound(TempodSessionId(run_id.0.clone())))?;
+        match self.owners.get(&session_id) {
+            Some(ControlOwner::Human { .. }) => {
+                return Err(TempodError::Conflict(
+                    "session_busy: human currently owns the session".into(),
+                ));
+            }
+            Some(ControlOwner::Agent {
+                run_id: Some(active_run),
+            }) if active_run != run_id => {
+                return Err(TempodError::Conflict(format!(
+                    "session_busy: active run {} owns the session",
+                    active_run.0
+                )));
+            }
+            _ => {}
+        }
+        if let Some(active_run) = self.active_runs.get(&session_id)
+            && active_run != run_id
+        {
+            return Err(TempodError::Conflict(format!(
+                "session_busy: active run {} owns the session",
+                active_run.0
+            )));
+        }
+        let run = {
             let run = self
                 .runs
                 .get_mut(run_id)
                 .ok_or_else(|| TempodError::SessionNotFound(TempodSessionId(run_id.0.clone())))?;
+            if !matches!(run.state, AgentRunState::WaitingForHuman) {
+                return Err(TempodError::Conflict(format!(
+                    "run_not_resumable: run {} is {:?}, expected WaitingForHuman",
+                    run_id.0, run.state
+                )));
+            }
             run.state = AgentRunState::Running;
             run.updated_ms = now;
             run.completed_ms = None;
             run.last_error = None;
-            (TempodSessionId(run.session_id.clone()), run.clone())
+            run.clone()
         };
         self.active_runs.insert(session_id.clone(), run_id.clone());
         let owner = ControlOwner::Agent {
@@ -7619,6 +7680,46 @@ mod tests {
     const WS_OPCODE_TEXT: u8 = 0x1;
     const WS_OPCODE_CLOSE: u8 = 0x8;
 
+    fn insert_test_run(
+        pool: &mut SessionPool,
+        session_id: &TempodSessionId,
+        state: AgentRunState,
+        active: bool,
+    ) -> AgentRunId {
+        let run_id = AgentRunId(format!("test-run-{}", pool.next_run_id));
+        pool.next_run_id = pool.next_run_id.saturating_add(1);
+        let now = current_time_ms();
+        let run = AgentRun {
+            run_id: run_id.clone(),
+            session_id: session_id.0.clone(),
+            state,
+            goal: Some("test goal".into()),
+            created_ms: now,
+            updated_ms: now,
+            completed_ms: matches!(
+                state,
+                AgentRunState::Completed | AgentRunState::Failed | AgentRunState::Cancelled
+            )
+            .then_some(now),
+            last_error: None,
+        };
+        pool.runs.insert(run_id.clone(), run);
+        pool.session_runs
+            .entry(session_id.clone())
+            .or_default()
+            .push(run_id.clone());
+        if active {
+            pool.active_runs.insert(session_id.clone(), run_id.clone());
+            pool.owners.insert(
+                session_id.clone(),
+                ControlOwner::Agent {
+                    run_id: Some(run_id.clone()),
+                },
+            );
+        }
+        run_id
+    }
+
     fn header_end(bytes: &[u8]) -> Option<usize> {
         bytes.windows(4).position(|window| window == b"\r\n\r\n")
     }
@@ -8070,6 +8171,99 @@ mod tests {
             .attachments
             .iter()
             .any(|attachment| attachment.surface_id == ShellSurfaceId("desk-1".into())));
+        Ok(())
+    }
+
+    #[test]
+    fn run_resume_requires_waiting_for_human_state() -> TestResult {
+        let mut pool = SessionPool::default();
+        let session = pool.finish_create("https://runs.test".into(), None);
+        let run_id = insert_test_run(&mut pool, &session.id, AgentRunState::Completed, false);
+
+        let error = pool
+            .resume_run(&run_id)
+            .expect_err("completed run must not resume");
+
+        assert!(
+            matches!(error, TempodError::Conflict(message) if message.contains("run_not_resumable"))
+        );
+        assert_eq!(pool.run(&run_id)?.state, AgentRunState::Completed);
+        assert_eq!(
+            pool.session_owner(&session.id),
+            ControlOwner::Agent { run_id: None }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn run_resume_rejects_human_owned_waiting_run() -> TestResult {
+        let mut pool = SessionPool::default();
+        let session = pool.finish_create("https://runs.test".into(), None);
+        let run_id = insert_test_run(&mut pool, &session.id, AgentRunState::WaitingForHuman, true);
+        pool.adopt_with_surface(
+            &session.id,
+            Some(RegisterSurfaceRequest {
+                surface_id: Some(ShellSurfaceId("desk-human".into())),
+                platform: Some("macos".into()),
+                label: None,
+                engine_tier: Some(BrowserEngineTier::T1),
+                profile_id: None,
+                storage_continuity: Some(StorageContinuityMode::SharedProfile),
+            }),
+        )?;
+
+        let error = pool
+            .resume_run(&run_id)
+            .expect_err("human-owned waiting run must require handoff first");
+
+        assert!(
+            matches!(error, TempodError::Conflict(message) if message.contains("human currently owns"))
+        );
+        assert_eq!(pool.run(&run_id)?.state, AgentRunState::WaitingForHuman);
+        assert_eq!(
+            pool.session_owner(&session.id),
+            ControlOwner::Human {
+                surface_id: ShellSurfaceId("desk-human".into())
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn run_resume_succeeds_after_handoff() -> TestResult {
+        let mut pool = SessionPool::default();
+        let session = pool.finish_create("https://runs.test".into(), None);
+        let run_id = insert_test_run(&mut pool, &session.id, AgentRunState::WaitingForHuman, true);
+        pool.adopt_with_surface(&session.id, None)?;
+        pool.handoff(&session.id)?;
+
+        let resumed = pool.resume_run(&run_id)?;
+
+        assert_eq!(resumed.state, AgentRunState::Running);
+        assert_eq!(
+            pool.session_owner(&session.id),
+            ControlOwner::Agent {
+                run_id: Some(run_id.clone())
+            }
+        );
+        assert_eq!(pool.active_runs.get(&session.id), Some(&run_id));
+        Ok(())
+    }
+
+    #[test]
+    fn run_cancel_rejects_terminal_run() -> TestResult {
+        let mut pool = SessionPool::default();
+        let session = pool.finish_create("https://runs.test".into(), None);
+        let run_id = insert_test_run(&mut pool, &session.id, AgentRunState::Failed, false);
+
+        let error = pool
+            .cancel_run(&run_id)
+            .expect_err("terminal run must not be cancellable");
+
+        assert!(
+            matches!(error, TempodError::Conflict(message) if message.contains("run_not_cancellable"))
+        );
+        assert_eq!(pool.run(&run_id)?.state, AgentRunState::Failed);
         Ok(())
     }
 
