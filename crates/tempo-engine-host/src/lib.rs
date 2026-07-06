@@ -1565,7 +1565,10 @@ fn authorize_peer(stream: &UnixStream) -> Result<(), EngineHostError> {
     target_os = "dragonfly"
 )))]
 fn authorize_peer(_stream: &UnixStream) -> Result<(), EngineHostError> {
-    Ok(())
+    Err(EngineHostError::PeerCredentials(format!(
+        "peer credential checks are unsupported on {}",
+        std::env::consts::OS
+    )))
 }
 
 /// Pure uid comparison extracted for testing: the peer is authorized only when
