@@ -1231,7 +1231,7 @@ impl AgentRunner {
     ///   * without cache, navigating actions (`Goto`/`Click`/`Type`/`Select`/
     ///     `Skill`) still full-observe because a diff carries no URL;
     ///   * without cache, a diff that adds an element, was not computed against
-    ///     our exact base, or that a marked page cannot reproduce is declined by
+    ///     our exact base, or carries ambiguous/malformed marks is declined by
     ///     [`reconstruct_observation`] and full-observed instead.
     async fn reobserve_after_action<D>(
         &self,
@@ -1441,6 +1441,9 @@ fn reconstruct_observation(
         .iter()
         .map(|element| element.node_id.0.as_str())
         .collect();
+    if !base.marks.is_empty() && diff.marks.is_empty() && !reconstructed_ids.is_empty() {
+        return None;
+    }
     if !diff
         .marks
         .iter()
@@ -3716,6 +3719,10 @@ mod tests {
             marks: vec![(NodeId("a".into()), 1)],
             ..base.clone()
         };
+        assert!(
+            reconstruct_observation(&marked, &ok).is_none(),
+            "missing diff marks are ambiguous for a marked base, so full observe"
+        );
         let Some(rebuilt) = reconstruct_observation(
             &marked,
             &ObservationDiff {
