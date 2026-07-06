@@ -873,7 +873,8 @@ pub fn observation_corpus_report(
         if let Some(previous) = &previous_observation {
             diff_snapshots += 1;
             let diff = diff_observations(previous, &snapshot.observation);
-            if diff_reconstructs_current(previous, &snapshot.observation, &diff) {
+            if diff_reconstructs_current(previous, &snapshot.observation, &diff, options.max_marks)
+            {
                 diff_reconstructable_snapshots += 1;
             }
         }
@@ -924,6 +925,7 @@ fn diff_reconstructs_current(
     previous: &CompiledObservation,
     current: &CompiledObservation,
     diff: &ObservationDiff,
+    max_marks: usize,
 ) -> bool {
     if diff.since_seq != previous.seq || diff.seq != current.seq {
         return false;
@@ -983,9 +985,8 @@ fn diff_reconstructs_current(
         elements.push(added.clone());
     }
 
-    let mut reconstructed = make_observation(&previous.url, diff.seq, elements, 0);
-    reconstructed.marks = current.marks.clone();
-    serialized_observations_equal(&reconstructed, current)
+    let reconstructed = make_observation(&previous.url, diff.seq, elements, max_marks);
+    reconstructed_observation_matches_current(reconstructed, current, max_marks)
 }
 
 fn corpus_identity_key(raw: &RawElement) -> String {
@@ -1145,6 +1146,49 @@ fn ratio(numerator: usize, denominator: usize) -> f64 {
     } else {
         numerator as f64 / denominator as f64
     }
+}
+
+fn reconstructed_observation_matches_current(
+    mut reconstructed: CompiledObservation,
+    current: &CompiledObservation,
+    max_marks: usize,
+) -> bool {
+    // `ObservationDiff` carries element deltas, omitted count, and seq, but it
+    // intentionally does not carry set-of-marks labels. Marks can now be stable
+    // across rank insertions, so their numeric labels are stateful metadata on
+    // the current observation rather than data reconstructable from the diff.
+    if !marks_reference_marked_prefix(current, max_marks) {
+        return false;
+    }
+    reconstructed.marks = current.marks.clone();
+    serialized_observations_equal(&reconstructed, current)
+}
+
+fn marks_reference_marked_prefix(observation: &CompiledObservation, max_marks: usize) -> bool {
+    let marked_prefix: HashSet<&str> = observation
+        .elements
+        .iter()
+        .take(max_marks)
+        .map(|element| element.node_id.0.as_str())
+        .collect();
+    if observation.marks.len() > marked_prefix.len() {
+        return false;
+    }
+
+    let mut node_ids = HashSet::with_capacity(observation.marks.len());
+    let mut labels = HashSet::with_capacity(observation.marks.len());
+    for (node_id, label) in &observation.marks {
+        if *label == 0 {
+            return false;
+        }
+        if !marked_prefix.contains(node_id.0.as_str()) {
+            return false;
+        }
+        if !node_ids.insert(node_id.0.as_str()) || !labels.insert(*label) {
+            return false;
+        }
+    }
+    true
 }
 
 fn serialized_observations_equal(left: &CompiledObservation, right: &CompiledObservation) -> bool {
@@ -2299,7 +2343,74 @@ mod tests {
             changed: Vec::new(),
         };
 
-        assert!(!diff_reconstructs_current(&previous, &current, &lossy_diff));
+        assert!(!diff_reconstructs_current(
+            &previous,
+            &current,
+            &lossy_diff,
+            2
+        ));
+    }
+
+    #[test]
+    fn diff_reconstruction_accepts_stateful_mark_labels() {
+        let mut compiler = ObservationCompiler::new();
+        let previous = compiler.compile(ObservationInput::new(
+            "https://order.example",
+            vec![
+                RawElement::new("searchbox", "Search").stable_hint("search"),
+                RawElement::new("button", "Pay now").stable_hint("pay"),
+                RawElement::new("link", "Terms").stable_hint("terms"),
+            ],
+        ));
+        let pay = previous
+            .elements
+            .iter()
+            .find(|element| element.name[0].text == "Pay now")
+            .map(|element| element.node_id.clone());
+        let Some(pay) = pay else {
+            panic!("pay element should be retained");
+        };
+        let previous_pay_label = previous
+            .marks
+            .iter()
+            .find(|(node_id, _)| node_id == &pay)
+            .map(|(_, label)| *label);
+        let Some(previous_pay_label) = previous_pay_label else {
+            panic!("pay element should be marked");
+        };
+
+        let current = compiler.compile(ObservationInput::new(
+            "https://order.example",
+            vec![
+                RawElement::new("button", "Pay now").stable_hint("pay"),
+                RawElement::new("link", "Terms").stable_hint("terms"),
+            ],
+        ));
+        let current_pay_label = current
+            .marks
+            .iter()
+            .find(|(node_id, _)| node_id == &pay)
+            .map(|(_, label)| *label);
+        let Some(current_pay_label) = current_pay_label else {
+            panic!("pay element should remain marked");
+        };
+        assert_eq!(current_pay_label, previous_pay_label);
+
+        let ordinal = make_observation(
+            &current.url,
+            current.seq,
+            current.elements.clone(),
+            DEFAULT_MAX_MARKS,
+        );
+        assert_ne!(ordinal.marks, current.marks);
+
+        let diff = diff_observations(&previous, &current);
+        assert!(diff_reconstructs_current(
+            &previous,
+            &current,
+            &diff,
+            DEFAULT_MAX_MARKS
+        ));
     }
 
     #[test]
