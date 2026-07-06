@@ -3204,6 +3204,110 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn openapi_fast_path_decision_is_not_executable_for_driver_tasks() {
+        let decision = StructuredFastPathDecision::new(
+            "https://api.example",
+            StructuredLane::Api,
+            StructuredSignal::OpenApi,
+            "/openapi.json",
+        );
+        let task = DriverTask::new(
+            "https://api.example/app",
+            vec![Action::Skill {
+                name: "mark_invoice_paid".into(),
+                input: serde_json::json!({
+                    "Authorization": "scanner-safe-fixture",
+                    "Cookie": "scanner-safe-fixture",
+                }),
+            }],
+        );
+
+        assert!(
+            !decision.supports_driver_task(&task),
+            "untrusted OpenAPI descriptors require a trust and secret-binding model before direct execution"
+        );
+    }
+
+    #[tokio::test]
+    async fn runner_openapi_fast_path_falls_through_to_browser_for_skill_actions() -> TestResult {
+        let root = unique_dir("runner-openapi-fast-path-fallback")?;
+        remove_dir_if_exists(&root)?;
+        fs::create_dir_all(&root)?;
+        let journal_path = root.join("session.jsonl");
+        let task = DriverTask::new(
+            "structured://api-fixture/app",
+            vec![Action::Skill {
+                name: "mark_invoice_paid".into(),
+                input: serde_json::json!({"invoice": "inv_fixture"}),
+            }],
+        );
+        let mut driver = FailingDriver::new(TransportFailurePoint::Goto);
+        let runner = AgentRunner::new_plaintext_unsafe(
+            &journal_path,
+            AgentRunIds::new("run-openapi-fallback", "session-openapi-fallback"),
+        )
+        .with_structured_fast_path(StructuredFastPath::with_probe(fake_render_probe));
+
+        let error = runner.run_driver_task(&mut driver, &task).await.err();
+
+        assert_eq!(driver.goto_calls, 1);
+        assert!(matches!(
+            error,
+            Some(AgentError::Transport {
+                context,
+                source: TransportError::NavTimeout,
+            }) if context == "initial goto"
+        ));
+        let entries = read_journal_entries(&journal_path)?;
+        assert!(!entries
+            .iter()
+            .any(|entry| matches!(entry.event, JournalEvent::StructuredFastPathSelected { .. })));
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_structured_task_rejects_openapi_decisions() -> TestResult {
+        let root = unique_dir("structured-openapi-rejected")?;
+        remove_dir_if_exists(&root)?;
+        fs::create_dir_all(&root)?;
+        let journal_path = root.join("session.jsonl");
+        let task = DriverTask::new(
+            "https://api.example/app",
+            vec![Action::Skill {
+                name: "mark_invoice_paid".into(),
+                input: serde_json::json!({"invoice": "inv_fixture"}),
+            }],
+        );
+        let decision = StructuredFastPathDecision::new(
+            "https://api.example",
+            StructuredLane::Api,
+            StructuredSignal::OpenApi,
+            "/openapi.json",
+        );
+        let runner = AgentRunner::new_plaintext_unsafe(
+            &journal_path,
+            AgentRunIds::new("run-openapi-rejected", "session-openapi-rejected"),
+        );
+
+        let error = runner.run_structured_task(&task, decision).await.err();
+
+        assert!(matches!(
+            error,
+            Some(AgentError::StructuredFastPathUnsupported { reason })
+                if reason.contains("lane=api signal=openapi")
+        ));
+        assert!(
+            !journal_path.exists(),
+            "rejected OpenAPI direct execution must not open a structured session"
+        );
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn runner_render_fast_path_decision_falls_through_to_driver() -> TestResult {
         let root = unique_dir("runner-render-fast-path")?;
