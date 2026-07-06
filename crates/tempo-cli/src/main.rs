@@ -11,6 +11,10 @@ use std::fs::File;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use tempo_agent::decider::{
+    AnthropicConfig, AnthropicDecider, DecidedRunReport, DecidedRunStatus, DecidedTaskSpec,
+    DecisionUsage, ScriptedDecider,
+};
 use tempo_agent::{
     step_triples_from_journal_entries, AgentRunEngine, AgentRunIds, AgentRunReport, AgentRunStatus,
     AgentRunner, ConfirmationMode, DriverTask, IdempotencyKey, StepTriple, StepTripleOutcome,
@@ -66,6 +70,11 @@ Commands:
             [--run-id ID] [--session-id ID] [--chrome PATH]
             [--allow-private-network]
             [--confirmation-mode deny|auto-clean]
+  run-decided-task --start-url URL --goal TEXT --journal PATH
+            --decider scripted|anthropic [--decisions PATH] [--output PATH]
+            [--run-id ID] [--session-id ID] [--chrome PATH]
+            [--allow-private-network]
+            [--confirmation-mode deny|auto-clean] [--max-rounds N]
 ";
 
 const USAGE_HINT: &str = "Run with --help for usage.";
@@ -163,6 +172,26 @@ enum Command {
         allow_private_network: bool,
         confirmation_mode: ConfirmationMode,
     },
+    RunDecidedTask {
+        start_url: String,
+        goal: String,
+        decider: RunDecidedTaskDecider,
+        decisions: Option<PathBuf>,
+        journal: PathBuf,
+        output: Output,
+        run_id: String,
+        session_id: String,
+        chrome: Option<String>,
+        allow_private_network: bool,
+        confirmation_mode: ConfirmationMode,
+        max_rounds: Option<usize>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RunDecidedTaskDecider {
+    Scripted,
+    Anthropic,
 }
 
 impl Command {
@@ -190,6 +219,7 @@ impl Command {
             "taint-gate" => parse_taint_gate(options),
             "replay" => parse_replay(options),
             "run-cdp-task" => parse_run_cdp_task(options),
+            "run-decided-task" => parse_run_decided_task(options),
             other => Err(CliError::Usage(format!(
                 "unknown command: {other}\n{USAGE_HINT}"
             ))),
@@ -362,6 +392,40 @@ impl Command {
                     allow_private_network,
                     confirmation_mode,
                     structured_fast_path: StructuredFastPath::live(),
+                    retention_policy,
+                })?;
+                write_json(&output, &report, stdout)
+            }
+            Self::RunDecidedTask {
+                start_url,
+                goal,
+                decider,
+                decisions,
+                journal,
+                output,
+                run_id,
+                session_id,
+                chrome,
+                allow_private_network,
+                confirmation_mode,
+                max_rounds,
+            } => {
+                let scripted_decisions = match decisions {
+                    Some(path) => read_json(&path)?,
+                    None => Vec::new(),
+                };
+                let report = run_decided_task(RunDecidedTaskConfig {
+                    start_url,
+                    goal,
+                    scripted_decisions,
+                    decider,
+                    journal,
+                    run_id,
+                    session_id,
+                    chrome,
+                    allow_private_network,
+                    confirmation_mode,
+                    max_rounds,
                     retention_policy,
                 })?;
                 write_json(&output, &report, stdout)
@@ -740,6 +804,79 @@ fn parse_run_cdp_task(options: &[String]) -> Result<Command, CliError> {
     })
 }
 
+fn parse_run_decided_task(options: &[String]) -> Result<Command, CliError> {
+    let mut start_url = None;
+    let mut goal = None;
+    let mut decider = RunDecidedTaskDecider::Scripted;
+    let mut decisions = None;
+    let mut journal = None;
+    let mut output = Output::Stdout;
+    let mut run_id = "tempo-cli-run".to_string();
+    let mut session_id = "tempo-cli-session".to_string();
+    let mut chrome = None;
+    let mut allow_private_network = false;
+    let mut confirmation_mode = ConfirmationMode::DenyHumanRequired;
+    let mut max_rounds = None;
+    let mut index = 0;
+
+    while index < options.len() {
+        match options[index].as_str() {
+            "--start-url" => start_url = Some(take_value(options, &mut index)?),
+            "--goal" => goal = Some(take_value(options, &mut index)?),
+            "--decider" => {
+                decider = parse_decided_decider(take_value(options, &mut index)?)?;
+            }
+            "--decisions" => {
+                decisions = Some(PathBuf::from(take_value(options, &mut index)?));
+            }
+            "--journal" => journal = Some(PathBuf::from(take_value(options, &mut index)?)),
+            "--output" => output = Output::Path(PathBuf::from(take_value(options, &mut index)?)),
+            "--run-id" => run_id = take_value(options, &mut index)?,
+            "--session-id" => session_id = take_value(options, &mut index)?,
+            "--chrome" => chrome = Some(take_value(options, &mut index)?),
+            "--allow-private-network" => allow_private_network = true,
+            "--confirmation-mode" => {
+                confirmation_mode = parse_confirmation_mode(take_value(options, &mut index)?)?;
+            }
+            "--max-rounds" => {
+                max_rounds = Some(parse_usize(
+                    "--max-rounds",
+                    take_value(options, &mut index)?,
+                )?);
+            }
+            "-h" | "--help" => return Ok(Command::Help),
+            flag => return Err(unknown_flag(flag)),
+        }
+        index += 1;
+    }
+
+    if matches!(decider, RunDecidedTaskDecider::Scripted) && decisions.is_none() {
+        return Err(CliError::Usage(
+            "run-decided-task requires --decisions when --decider scripted is used".into(),
+        ));
+    }
+    if matches!(decider, RunDecidedTaskDecider::Anthropic) && decisions.is_some() {
+        return Err(CliError::Usage(
+            "run-decided-task accepts --decisions only with --decider scripted".into(),
+        ));
+    }
+
+    Ok(Command::RunDecidedTask {
+        start_url: required_string("--start-url", start_url)?,
+        goal: required_string("--goal", goal)?,
+        decider,
+        decisions,
+        journal: required_path("--journal", journal)?,
+        output,
+        run_id,
+        session_id,
+        chrome,
+        allow_private_network,
+        confirmation_mode,
+        max_rounds,
+    })
+}
+
 fn take_value(options: &[String], index: &mut usize) -> Result<String, CliError> {
     let flag = options[*index].clone();
     *index += 1;
@@ -796,6 +933,17 @@ fn parse_confirmation_mode(value: String) -> Result<ConfirmationMode, CliError> 
     }
 }
 
+fn parse_decided_decider(value: String) -> Result<RunDecidedTaskDecider, CliError> {
+    match value.as_str() {
+        "scripted" => Ok(RunDecidedTaskDecider::Scripted),
+        "anthropic" => Ok(RunDecidedTaskDecider::Anthropic),
+        _ => Err(CliError::InvalidValue {
+            flag: "--decider",
+            value,
+        }),
+    }
+}
+
 fn parse_f64(flag: &'static str, value: String) -> Result<f64, CliError> {
     value
         .parse()
@@ -809,6 +957,12 @@ fn parse_f32(flag: &'static str, value: String) -> Result<f32, CliError> {
 }
 
 fn parse_u64(flag: &'static str, value: String) -> Result<u64, CliError> {
+    value
+        .parse()
+        .map_err(|_| CliError::InvalidValue { flag, value })
+}
+
+fn parse_usize(flag: &'static str, value: String) -> Result<usize, CliError> {
     value
         .parse()
         .map_err(|_| CliError::InvalidValue { flag, value })
@@ -1018,6 +1172,32 @@ struct RunCdpTaskConfig {
     retention_policy: Option<DurableRetentionPolicy>,
 }
 
+struct RunDecidedTaskConfig {
+    start_url: String,
+    goal: String,
+    scripted_decisions: Vec<Vec<Action>>,
+    decider: RunDecidedTaskDecider,
+    journal: PathBuf,
+    run_id: String,
+    session_id: String,
+    chrome: Option<String>,
+    allow_private_network: bool,
+    confirmation_mode: ConfirmationMode,
+    max_rounds: Option<usize>,
+    retention_policy: Option<DurableRetentionPolicy>,
+}
+
+struct RunDecidedTaskDriverConfig {
+    start_url: String,
+    goal: String,
+    journal: PathBuf,
+    run_id: String,
+    session_id: String,
+    confirmation_mode: ConfirmationMode,
+    max_rounds: Option<usize>,
+    retention_policy: Option<DurableRetentionPolicy>,
+}
+
 #[derive(Debug, PartialEq, Eq, Serialize)]
 struct RunCdpTaskReport {
     engine: String,
@@ -1072,6 +1252,51 @@ struct RunCdpTaskStepOutcome {
     reason: Option<String>,
 }
 
+#[derive(Debug, PartialEq, Eq, Serialize)]
+struct RunDecidedTaskReport {
+    engine: String,
+    journal: String,
+    status: RunDecidedTaskStatus,
+    actions_completed: usize,
+    rounds: Vec<RunDecidedTaskRound>,
+    usage: RunDecidedTaskUsage,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize)]
+struct RunDecidedTaskStatus {
+    state: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    used: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_rounds: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    takeover_kind: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    takeover_url: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize)]
+struct RunDecidedTaskRound {
+    index: usize,
+    actions: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rationale: Option<String>,
+    resumed: bool,
+    usage: RunDecidedTaskUsage,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+struct RunDecidedTaskUsage {
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_input_tokens: u64,
+    total_tokens: u64,
+}
+
 impl RunCdpTaskReport {
     fn from_agent_report(report: AgentRunReport) -> Self {
         Self {
@@ -1083,6 +1308,41 @@ impl RunCdpTaskReport {
             max_observation_bytes: report.max_observation_bytes,
             max_observation_tokens: report.max_observation_tokens,
             steps: report.steps.iter().map(RunCdpTaskStep::from).collect(),
+        }
+    }
+}
+
+impl RunDecidedTaskReport {
+    fn from_decided_report(report: DecidedRunReport, engine: AgentRunEngine) -> Self {
+        Self {
+            engine: engine_name(engine),
+            journal: report.journal_path.display().to_string(),
+            status: decided_status(&report.status),
+            actions_completed: report.actions_completed,
+            rounds: report
+                .rounds
+                .iter()
+                .enumerate()
+                .map(|(index, round)| RunDecidedTaskRound {
+                    index,
+                    actions: round.actions,
+                    rationale: round.rationale.clone(),
+                    resumed: round.resumed,
+                    usage: RunDecidedTaskUsage::from(round.usage),
+                })
+                .collect(),
+            usage: RunDecidedTaskUsage::from(report.usage),
+        }
+    }
+}
+
+impl From<DecisionUsage> for RunDecidedTaskUsage {
+    fn from(usage: DecisionUsage) -> Self {
+        Self {
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            cache_read_input_tokens: usage.cache_read_input_tokens,
+            total_tokens: usage.total_tokens(),
         }
     }
 }
@@ -1157,6 +1417,84 @@ fn run_cdp_task(config: RunCdpTaskConfig) -> Result<RunCdpTaskReport, CliError> 
         close_result?;
         Ok(RunCdpTaskReport::from_agent_report(report))
     })
+}
+
+fn run_decided_task(config: RunDecidedTaskConfig) -> Result<RunDecidedTaskReport, CliError> {
+    if matches!(config.decider, RunDecidedTaskDecider::Anthropic) {
+        require_live_model_opt_in()?;
+    }
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async move {
+        let mut cdp_config = CdpConfig::default().with_no_sandbox_env_opt_in();
+        if let Some(chrome) = config.chrome {
+            cdp_config = cdp_config.with_executable(chrome);
+        }
+        let mut driver = CdpTempoDriver::launch_with(cdp_config).await?;
+        if config.allow_private_network {
+            driver = driver.allow_private_network_access();
+        }
+
+        let driver_config = RunDecidedTaskDriverConfig {
+            start_url: config.start_url,
+            goal: config.goal,
+            journal: config.journal,
+            run_id: config.run_id,
+            session_id: config.session_id,
+            confirmation_mode: config.confirmation_mode,
+            max_rounds: config.max_rounds,
+            retention_policy: config.retention_policy,
+        };
+        let engine = AgentRunEngine::Driver(driver.engine());
+        let run_result = match config.decider {
+            RunDecidedTaskDecider::Scripted => {
+                let mut decider = ScriptedDecider::new(config.scripted_decisions);
+                run_decided_task_with_driver(&mut driver, &mut decider, driver_config, engine).await
+            }
+            RunDecidedTaskDecider::Anthropic => {
+                let mut decider = AnthropicDecider::new(AnthropicConfig::from_env()?)?;
+                run_decided_task_with_driver(&mut driver, &mut decider, driver_config, engine).await
+            }
+        };
+        let close_result = driver.close().await;
+        let report = run_result?;
+        close_result?;
+        Ok(report)
+    })
+}
+
+async fn run_decided_task_with_driver<D, M>(
+    driver: &mut D,
+    decider: &mut M,
+    config: RunDecidedTaskDriverConfig,
+    engine: AgentRunEngine,
+) -> Result<RunDecidedTaskReport, CliError>
+where
+    D: DriverTrait + ?Sized,
+    M: tempo_agent::decider::Decider + ?Sized,
+{
+    let mut spec = DecidedTaskSpec::new(config.start_url, config.goal);
+    if let Some(max_rounds) = config.max_rounds {
+        spec = spec.with_max_rounds(max_rounds);
+    }
+    let runner = AgentRunner::new(
+        &config.journal,
+        AgentRunIds::new(config.run_id, config.session_id),
+    )
+    .with_confirmation_mode(config.confirmation_mode);
+    let runner = with_retention_policy(runner, config.retention_policy);
+    let report = runner.run_decided_task(driver, decider, &spec).await?;
+    Ok(RunDecidedTaskReport::from_decided_report(report, engine))
+}
+
+fn require_live_model_opt_in() -> Result<(), CliError> {
+    match env::var("TEMPO_LIVE_MODEL").as_deref() {
+        Ok("1") => Ok(()),
+        _ => Err(CliError::Usage(
+            "run-decided-task --decider anthropic requires TEMPO_LIVE_MODEL=1".into(),
+        )),
+    }
 }
 
 fn with_retention_policy(
@@ -1246,6 +1584,83 @@ fn run_status(status: &AgentRunStatus) -> RunCdpTaskStatus {
     }
 }
 
+fn decided_status(status: &DecidedRunStatus) -> RunDecidedTaskStatus {
+    match status {
+        DecidedRunStatus::Completed => RunDecidedTaskStatus {
+            state: "completed",
+            reason: None,
+            used: None,
+            max: None,
+            max_rounds: None,
+            takeover_kind: None,
+            takeover_url: None,
+        },
+        DecidedRunStatus::AlreadyComplete => RunDecidedTaskStatus {
+            state: "already_complete",
+            reason: None,
+            used: None,
+            max: None,
+            max_rounds: None,
+            takeover_kind: None,
+            takeover_url: None,
+        },
+        DecidedRunStatus::TokenBudgetExhausted { used, max } => RunDecidedTaskStatus {
+            state: "token_budget_exhausted",
+            reason: None,
+            used: Some(*used),
+            max: Some(*max),
+            max_rounds: None,
+            takeover_kind: None,
+            takeover_url: None,
+        },
+        DecidedRunStatus::RoundLimitReached { max_rounds } => RunDecidedTaskStatus {
+            state: "round_limit_reached",
+            reason: None,
+            used: None,
+            max: None,
+            max_rounds: Some(*max_rounds),
+            takeover_kind: None,
+            takeover_url: None,
+        },
+        DecidedRunStatus::StepError { reason } => RunDecidedTaskStatus {
+            state: "step_error",
+            reason: Some(reason.clone()),
+            used: None,
+            max: None,
+            max_rounds: None,
+            takeover_kind: None,
+            takeover_url: None,
+        },
+        DecidedRunStatus::PolicyDenied { reason } => RunDecidedTaskStatus {
+            state: "policy_denied",
+            reason: Some(reason.clone()),
+            used: None,
+            max: None,
+            max_rounds: None,
+            takeover_kind: None,
+            takeover_url: None,
+        },
+        DecidedRunStatus::HumanTakeoverRequired { takeover } => RunDecidedTaskStatus {
+            state: "human_takeover_required",
+            reason: Some(takeover.reason.clone()),
+            used: None,
+            max: None,
+            max_rounds: None,
+            takeover_kind: Some(takeover.kind.label()),
+            takeover_url: Some(takeover.url.clone()),
+        },
+        DecidedRunStatus::Interrupted { reason } => RunDecidedTaskStatus {
+            state: "interrupted",
+            reason: Some(reason.clone()),
+            used: None,
+            max: None,
+            max_rounds: None,
+            takeover_kind: None,
+            takeover_url: None,
+        },
+    }
+}
+
 fn step_outcome(outcome: &StepTripleOutcome) -> RunCdpTaskStepOutcome {
     match outcome {
         StepTripleOutcome::Applied { .. } => RunCdpTaskStepOutcome {
@@ -1324,6 +1739,8 @@ enum CliError {
     Journal(#[from] JournalError),
     #[error("agent operation failed: {0}")]
     Agent(#[from] tempo_agent::AgentError),
+    #[error("decider operation failed: {0}")]
+    Decider(#[from] tempo_agent::decider::DeciderError),
     #[error("driver operation failed: {0}")]
     Transport(#[from] TransportError),
     #[error("scorecard gate failed with {violations} violation(s)")]
@@ -1371,6 +1788,7 @@ impl CliError {
             | Self::Compat(_)
             | Self::Journal(_)
             | Self::Agent(_)
+            | Self::Decider(_)
             | Self::Transport(_) => 1,
         }
     }
@@ -1386,6 +1804,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
     use tempo_agent::{StructuredFastPathDecision, StructuredLane, StructuredSignal};
     use tempo_compat::{CompatScorecard, EngineProbe, OriginScore};
+    use tempo_driver::TestDriver;
     use tempo_observe::RawElement;
     use tempo_schema::{
         Action, CompiledObservation, InteractiveElement, NodeId, ObservationDiff, Provenance,
@@ -2195,6 +2614,175 @@ mod tests {
             }
             other => return Err(format!("unexpected command parse result: {other:?}").into()),
         }
+        Ok(())
+    }
+
+    #[test]
+    fn run_decided_task_command_parses_scripted_options() -> TestResult {
+        let decisions = PathBuf::from("decisions.json");
+        let journal = PathBuf::from("session.jsonl");
+        let output = PathBuf::from("report.json");
+
+        let command = Command::parse([
+            "run-decided-task".to_string(),
+            "--start-url".into(),
+            "https://example.com".into(),
+            "--goal".into(),
+            "scroll then stop".into(),
+            "--decider".into(),
+            "scripted".into(),
+            "--decisions".into(),
+            input_string(&decisions),
+            "--journal".into(),
+            input_string(&journal),
+            "--output".into(),
+            input_string(&output),
+            "--run-id".into(),
+            "run-decided".into(),
+            "--session-id".into(),
+            "session-decided".into(),
+            "--chrome".into(),
+            "/Applications/Chromium.app/Contents/MacOS/Chromium".into(),
+            "--allow-private-network".into(),
+            "--confirmation-mode".into(),
+            "auto-clean".into(),
+            "--max-rounds".into(),
+            "4".into(),
+        ])?;
+
+        match command {
+            Command::RunDecidedTask {
+                start_url,
+                goal,
+                decider,
+                decisions: Some(parsed_decisions),
+                journal: parsed_journal,
+                output: Output::Path(parsed_output),
+                run_id,
+                session_id,
+                chrome,
+                allow_private_network,
+                confirmation_mode,
+                max_rounds,
+            } => {
+                assert_eq!(start_url, "https://example.com");
+                assert_eq!(goal, "scroll then stop");
+                assert_eq!(decider, RunDecidedTaskDecider::Scripted);
+                assert_eq!(parsed_decisions, decisions);
+                assert_eq!(parsed_journal, journal);
+                assert_eq!(parsed_output, output);
+                assert_eq!(run_id, "run-decided");
+                assert_eq!(session_id, "session-decided");
+                assert_eq!(
+                    chrome.as_deref(),
+                    Some("/Applications/Chromium.app/Contents/MacOS/Chromium")
+                );
+                assert!(allow_private_network);
+                assert_eq!(confirmation_mode, ConfirmationMode::AutoConfirmClean);
+                assert_eq!(max_rounds, Some(4));
+            }
+            other => return Err(format!("unexpected command parse result: {other:?}").into()),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn run_decided_task_scripted_mode_requires_decisions() -> TestResult {
+        let result = Command::parse([
+            "run-decided-task",
+            "--start-url",
+            "https://example.com",
+            "--goal",
+            "finish",
+            "--journal",
+            "session.jsonl",
+        ]);
+
+        match result {
+            Err(CliError::Usage(message)) => assert!(message.contains("requires --decisions")),
+            other => return Err(format!("unexpected command parse result: {other:?}").into()),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn run_decided_task_anthropic_mode_rejects_decisions_file() -> TestResult {
+        let result = Command::parse([
+            "run-decided-task",
+            "--start-url",
+            "https://example.com",
+            "--goal",
+            "finish",
+            "--decider",
+            "anthropic",
+            "--decisions",
+            "decisions.json",
+            "--journal",
+            "session.jsonl",
+        ]);
+
+        match result {
+            Err(CliError::Usage(message)) => {
+                assert!(message.contains("only with --decider scripted"))
+            }
+            other => return Err(format!("unexpected command parse result: {other:?}").into()),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn run_decided_task_with_test_driver_completes_and_journals() -> TestResult {
+        let dir = unique_dir("run-decided-driver")?;
+        let journal = dir.join("session.jsonl");
+        let retention_policy = DurableRetentionPolicy::PlaintextUnsafe;
+        let mut driver = TestDriver::new()
+            .allow_private_network_access()
+            .with_elements(observation(0).elements);
+        let mut decider =
+            ScriptedDecider::new(vec![vec![Action::Scroll { x: 0.0, y: 10.0 }], Vec::new()]);
+        let engine = AgentRunEngine::Driver(driver.engine());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+
+        let report = runtime.block_on(run_decided_task_with_driver(
+            &mut driver,
+            &mut decider,
+            RunDecidedTaskDriverConfig {
+                start_url: "https://example.com".into(),
+                goal: "scroll then stop".into(),
+                journal: journal.clone(),
+                run_id: "run-decided-driver".into(),
+                session_id: "session-decided-driver".into(),
+                confirmation_mode: ConfirmationMode::DenyHumanRequired,
+                max_rounds: Some(4),
+                retention_policy: Some(retention_policy.clone()),
+            },
+            engine,
+        ))?;
+
+        assert_eq!(report.engine, "test");
+        assert_eq!(report.status.state, "completed");
+        assert_eq!(report.actions_completed, 1);
+        assert_eq!(report.rounds.len(), 2);
+        assert_eq!(report.rounds[0].actions, 1);
+        assert_eq!(report.rounds[1].actions, 0);
+        assert_eq!(report.usage.total_tokens, 0);
+        let entries = read_journal_entries_with_retention_policy(&journal, &retention_policy)?;
+        assert!(entries
+            .iter()
+            .any(|entry| matches!(entry.event, JournalEvent::ModelDecision { .. })));
+        assert!(entries
+            .iter()
+            .any(|entry| matches!(entry.event, JournalEvent::ActionPlanned { .. })));
+        assert!(entries
+            .iter()
+            .any(|entry| matches!(entry.event, JournalEvent::StepApplied { .. })));
+        assert!(matches!(
+            entries.last().map(|entry| &entry.event),
+            Some(JournalEvent::SessionClosed)
+        ));
+        remove_dir(&dir)?;
         Ok(())
     }
 
