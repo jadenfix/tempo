@@ -232,6 +232,16 @@ impl CdpTempoDriver {
     }
 
     /// Launch a real browser with an explicit CDP configuration.
+    /// OS pid of the spawned Chromium child, when the handle is still held.
+    /// Exposed so a host binary's teardown path (e.g. the parent-death watch
+    /// in `tempo-engined-cdp`) can reap the browser tree even when it cannot
+    /// run the async `close` path.
+    pub fn chrome_pid(&mut self) -> Option<u32> {
+        self.browser
+            .get_mut_child()
+            .and_then(|child| child.as_mut_inner().id())
+    }
+
     pub async fn launch_with(config: CdpConfig) -> Result<Self, TransportError> {
         config.validate_policy_proxy_args()?;
         let profile_dir = tempfile::Builder::new()

@@ -107,6 +107,15 @@ const SOCKET_TIMEOUT: Duration = Duration::from_secs(30);
 /// Timeout applied to engine-host IPC round-trips so a stalled engine cannot
 /// wedge the daemon indefinitely.
 const ENGINE_IPC_TIMEOUT: Duration = Duration::from_secs(30);
+/// Name of the packaged CDP engine host binary expected next to `tempod`.
+pub const PACKAGED_CDP_ENGINE_BINARY: &str = "tempo-engined-cdp";
+const AUTO_CDP_ENGINE_MAX_RESTARTS: u32 = u32::MAX;
+const AUTO_CDP_ENGINE_MONITOR_MAX_RESTARTS: u32 = 10;
+const AUTO_CDP_ENGINE_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+const AUTO_CDP_ENGINE_MONITOR_INTERVAL: Duration = Duration::from_millis(500);
+const AUTO_CDP_ENGINE_MONITOR_BASE_BACKOFF: Duration = Duration::from_millis(200);
+const AUTO_CDP_ENGINE_MONITOR_MAX_BACKOFF: Duration = Duration::from_secs(10);
+const AUTO_CDP_ENGINE_MONITOR_STABLE_WINDOW: Duration = Duration::from_secs(90);
 /// Upper bound on how long the whole engine-resource teardown (`drain` /
 /// `detach_engine_driver` / `Drop`) waits for blocking engine-IPC closes:
 /// forked BiDi contexts, MCP forks, session-owned contexts, and the root-driver
@@ -3307,6 +3316,305 @@ pub fn run_tempod_with_config_and_navigation_url_policy(
         SessionPool::from_env().with_navigation_url_policy(url_policy),
     ));
     serve_forever_with_config(listener, pool, config)
+}
+
+/// Run tempod with the packaged CDP engine binary auto-started from the same
+/// directory as the current `tempod` executable.
+pub fn run_tempod_with_packaged_cdp_engine_config_and_navigation_url_policy(
+    addr: &str,
+    config: TempodServerConfig,
+    url_policy: UrlPolicy,
+) -> Result<(), TempodError> {
+    let engine_binary = discover_packaged_cdp_engine_binary()?;
+    run_tempod_with_auto_cdp_engine_config_and_navigation_url_policy(
+        addr,
+        config,
+        engine_binary,
+        url_policy,
+    )
+}
+
+/// Run tempod with a CDP engine child that tempod starts and supervises.
+pub fn run_tempod_with_auto_cdp_engine_config_and_navigation_url_policy(
+    addr: &str,
+    config: TempodServerConfig,
+    engine_binary: impl AsRef<Path>,
+    url_policy: UrlPolicy,
+) -> Result<(), TempodError> {
+    let config = ensure_runtime_auth(config.with_bind_addr_host(addr))?;
+    config.validate_bind_addr(addr)?;
+    let listener = TcpListener::bind(addr)?;
+    let runtime_dir = AutoCdpRuntimeDir::create()?;
+    let socket_path = runtime_dir.socket_path();
+    let mut host = EngineHost::spawn(
+        EngineHostConfig::new(engine_binary.as_ref())
+            .control_socket(socket_path.clone())
+            .restart(tempo_engine_host::RestartPolicy::Always {
+                max_restarts: AUTO_CDP_ENGINE_MAX_RESTARTS,
+            }),
+    )?;
+    let client =
+        connect_auto_started_engine(&socket_path, &mut host, AUTO_CDP_ENGINE_STARTUP_TIMEOUT)?;
+    let mut pool = SessionPool::from_env().with_navigation_url_policy(url_policy);
+    pool.attach_engine_driver(Engine::Cdp, client)?;
+    let pool = Arc::new(Mutex::new(pool));
+    spawn_auto_cdp_engine_monitor(Arc::clone(&pool), host, socket_path.clone());
+    spawn_engine_liveness_monitor(
+        Arc::clone(&pool),
+        Engine::Cdp,
+        socket_path,
+        EngineReconnectPolicy::default(),
+    );
+    let _runtime_dir = runtime_dir;
+    serve_forever_with_config(listener, pool, config)
+}
+
+fn discover_packaged_cdp_engine_binary() -> Result<PathBuf, TempodError> {
+    let current_exe = std::env::current_exe()?;
+    discover_packaged_cdp_engine_binary_next_to(&current_exe)
+}
+
+fn discover_packaged_cdp_engine_binary_next_to(
+    tempod_exe: impl AsRef<Path>,
+) -> Result<PathBuf, TempodError> {
+    let tempod_exe = tempod_exe.as_ref();
+    let binary = packaged_cdp_engine_binary_next_to(tempod_exe)?;
+    let parent = tempod_exe.parent().ok_or_else(|| {
+        TempodError::DriverUnavailable(format!(
+            "cannot locate packaged CDP engine binary because tempod path has no parent: {}; pass --engine-socket PATH",
+            tempod_exe.display()
+        ))
+    })?;
+    validate_packaged_cdp_engine_binary_parent(parent)?;
+    if binary.is_file() {
+        return Ok(binary);
+    }
+    Err(TempodError::DriverUnavailable(format!(
+        "missing packaged CDP engine binary at {}; install/copy {} next to tempod, or start an engine yourself and pass --engine-socket PATH",
+        binary.display(),
+        packaged_cdp_engine_binary_file_name()
+    )))
+}
+
+fn packaged_cdp_engine_binary_next_to(tempod_exe: &Path) -> Result<PathBuf, TempodError> {
+    let dir = tempod_exe.parent().ok_or_else(|| {
+        TempodError::DriverUnavailable(format!(
+            "cannot locate packaged CDP engine binary because tempod path has no parent: {}; pass --engine-socket PATH",
+            tempod_exe.display()
+        ))
+    })?;
+    Ok(dir.join(packaged_cdp_engine_binary_file_name()))
+}
+
+#[cfg(unix)]
+fn validate_packaged_cdp_engine_binary_parent(parent: &Path) -> Result<(), TempodError> {
+    let metadata = std::fs::symlink_metadata(parent).map_err(TempodError::Io)?;
+    if metadata.file_type().is_symlink() {
+        return Err(TempodError::DriverUnavailable(
+            "packaged CDP engine parent path cannot be a symlink".into(),
+        ));
+    }
+    if !metadata.file_type().is_dir() {
+        return Err(TempodError::DriverUnavailable(
+            "packaged CDP engine parent path must be a directory".into(),
+        ));
+    }
+    use std::os::unix::fs::PermissionsExt;
+    if metadata.permissions().mode() & 0o022 != 0 {
+        return Err(TempodError::DriverUnavailable(format!(
+            "packaged CDP engine parent path is insecure: {} is writable by group/other",
+            parent.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_packaged_cdp_engine_binary_parent(_parent: &Path) -> Result<(), TempodError> {
+    Ok(())
+}
+
+fn packaged_cdp_engine_binary_file_name() -> String {
+    format!(
+        "{}{}",
+        PACKAGED_CDP_ENGINE_BINARY,
+        std::env::consts::EXE_SUFFIX
+    )
+}
+
+struct AutoCdpRuntimeDir {
+    path: PathBuf,
+}
+
+impl AutoCdpRuntimeDir {
+    fn create() -> Result<Self, TempodError> {
+        for attempt in 0..100_u32 {
+            let path = auto_cdp_runtime_base_dir().join(format!(
+                "tempo-cdp-{}-{:x}-{attempt}",
+                std::process::id(),
+                current_time_ns()
+            ));
+            match create_private_dir(&path) {
+                Ok(()) => {
+                    set_private_dir_permissions(&path)?;
+                    return Ok(Self { path });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(TempodError::Io(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "could not allocate a private tempod CDP engine socket directory",
+        )))
+    }
+
+    fn socket_path(&self) -> PathBuf {
+        self.path.join("engine.sock")
+    }
+}
+
+#[cfg(unix)]
+fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    let mut builder = std::fs::DirBuilder::new();
+    builder.mode(0o700);
+    builder.create(path)
+}
+
+#[cfg(not(unix))]
+fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    std::fs::create_dir(path)
+}
+
+fn auto_cdp_runtime_base_dir() -> PathBuf {
+    let short_tmp = PathBuf::from("/tmp");
+    if short_tmp.is_dir() {
+        short_tmp
+    } else {
+        std::env::temp_dir()
+    }
+}
+
+impl Drop for AutoCdpRuntimeDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+fn set_private_dir_permissions(path: &Path) -> Result<(), TempodError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let current = std::fs::metadata(path)?.permissions().mode() & 0o777;
+        if current == 0o700 {
+            return Ok(());
+        }
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+fn connect_auto_started_engine(
+    socket_path: &Path,
+    host: &mut EngineHost,
+    timeout: Duration,
+) -> Result<EngineIpcClient, TempodError> {
+    let deadline = Instant::now() + timeout;
+    let mut last_error = None;
+    loop {
+        if Instant::now() >= deadline {
+            let detail = last_error
+                .map(|error: TempodError| error.to_string())
+                .unwrap_or_else(|| "socket was never connectable".to_string());
+            return Err(TempodError::DriverUnavailable(format!(
+                "timed out waiting for auto-started CDP engine socket at {}: {detail}; start the engine yourself and pass --engine-socket PATH",
+                socket_path.display()
+            )));
+        }
+        match connect_engine_ipc(socket_path) {
+            Ok(client) => return Ok(client),
+            Err(error) => last_error = Some(error),
+        }
+        if let Some(status) = host.try_wait()? {
+            return Err(TempodError::DriverUnavailable(format!(
+                "auto-started CDP engine exited before its socket became ready (status: {status}); set TEMPO_CDP_CHROME to a working Chrome/Chromium binary or start the engine yourself and pass --engine-socket PATH"
+            )));
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn spawn_auto_cdp_engine_monitor(
+    pool: Arc<Mutex<SessionPool>>,
+    mut host: EngineHost,
+    socket_path: PathBuf,
+) {
+    let policy = EngineReconnectPolicy {
+        poll_interval: AUTO_CDP_ENGINE_MONITOR_INTERVAL,
+        base_backoff: AUTO_CDP_ENGINE_MONITOR_BASE_BACKOFF,
+        max_backoff: AUTO_CDP_ENGINE_MONITOR_MAX_BACKOFF,
+        max_attempts: Some(AUTO_CDP_ENGINE_MONITOR_MAX_RESTARTS),
+        stable_window: AUTO_CDP_ENGINE_MONITOR_STABLE_WINDOW,
+    };
+    let mut controller = ReconnectController::new(policy.clone(), Instant::now());
+    thread::spawn(move || loop {
+        if Arc::strong_count(&pool) <= 1 {
+            return;
+        }
+        thread::sleep(policy.poll_interval);
+
+        let child_exited = match host.try_wait() {
+            Ok(Some(_)) => true,
+            Ok(None) => false,
+            Err(error) => {
+                log_tempod_error("auto-started CDP engine status check failed", error);
+                if let Ok(mut guard) = pool.lock() {
+                    guard.detach_engine_driver();
+                }
+                return;
+            }
+        };
+
+        match controller.on_sample(child_exited, Instant::now()) {
+            ReconnectAction::Idle => {}
+            ReconnectAction::GiveUp => {
+                log_tempod_warn(
+                    "auto-started CDP engine restart budget exhausted; leaving detached",
+                )
+                .field("issue", "#398")
+                .field("attempts", controller.attempts.to_string())
+                .emit();
+                if let Ok(mut guard) = pool.lock() {
+                    guard.detach_engine_driver();
+                }
+                return;
+            }
+            ReconnectAction::Reconnect { backoff } => {
+                let delay = jittered_backoff(backoff, policy.max_backoff, current_time_ns());
+                thread::sleep(delay);
+                match host.restart_if_exited() {
+                    Ok(false) => {}
+                    Ok(true) => {
+                        controller.record_reconnect(Instant::now());
+                        tempo_telemetry::logger()
+                            .event(
+                                tempo_telemetry::Level::Warn,
+                                "tempod",
+                                "auto-started CDP engine child restarted",
+                            )
+                            .field("engine_socket", socket_path.display().to_string())
+                            .field("restarts", host.restart_count().to_string())
+                            .emit();
+                    }
+                    Err(error) => {
+                        controller.record_failure();
+                        log_tempod_error("auto-started CDP engine child restart failed", error);
+                    }
+                }
+            }
+        }
+    });
 }
 
 /// Run tempod with an already-running engine reachable through the UDS driver protocol.
@@ -13928,6 +14236,156 @@ mod tests {
         assert!(restarted);
         assert_ne!(first_pid, second_pid);
         supervisor.kill("engine-a")?;
+        Ok(())
+    }
+
+    #[test]
+    fn packaged_cdp_binary_discovery_reports_actionable_missing_binary() -> TestResult {
+        let dir = unique_dir("missing-cdp-engine")?;
+        std::fs::create_dir_all(&dir)?;
+        let tempod = dir.join(format!("tempod{}", std::env::consts::EXE_SUFFIX));
+        std::fs::write(&tempod, b"")?;
+
+        let error = match discover_packaged_cdp_engine_binary_next_to(&tempod) {
+            Ok(path) => return Err(format!("unexpectedly discovered {}", path.display()).into()),
+            Err(error) => error.to_string(),
+        };
+
+        assert!(error.contains(PACKAGED_CDP_ENGINE_BINARY), "{error}");
+        assert!(error.contains("--engine-socket PATH"), "{error}");
+        remove_dir_if_exists(&dir)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discover_packaged_cdp_binary_rejects_insecure_parent_directory() -> TestResult {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = unique_dir("insecure-cdp-binary-parent")?;
+        std::fs::create_dir_all(&dir)?;
+        let tempod = dir.join(format!("tempod{}", std::env::consts::EXE_SUFFIX));
+        std::fs::write(&tempod, b"")?;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777))?;
+
+        let error = match discover_packaged_cdp_engine_binary_next_to(&tempod) {
+            Ok(path) => return Err(format!("unexpectedly discovered {}", path.display()).into()),
+            Err(error) => error.to_string(),
+        };
+
+        assert!(error.contains("writable by group/other"), "{error}");
+
+        remove_dir_if_exists(&dir)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn connect_auto_started_engine_observes_child_exit_before_socket_bind() -> TestResult {
+        let dir = auto_cdp_runtime_base_dir().join(format!(
+            "tempo-headless-auto-cdp-child-exit-{}-{:x}",
+            std::process::id(),
+            current_time_ns()
+        ));
+        std::fs::create_dir_all(&dir)?;
+        let socket_path = dir.join("engine.sock");
+        let mut host = EngineHost::spawn(
+            EngineHostConfig::new("sh")
+                .arg("-c")
+                .arg("exit 1")
+                .control_socket(socket_path.clone())
+                .restart(tempo_engine_host::RestartPolicy::Never),
+        )?;
+
+        let result = connect_auto_started_engine(&socket_path, &mut host, Duration::from_secs(2));
+        let error = match result {
+            Ok(_) => panic!("expected auto-started CDP child to fail before bind"),
+            Err(error) => error.to_string(),
+        };
+
+        assert!(
+            error.contains("auto-started CDP engine exited before its socket became ready"),
+            "{error}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auto_started_cdp_engine_waits_for_socket_and_attaches() -> TestResult {
+        use std::os::unix::net::UnixListener;
+
+        let dir = auto_cdp_runtime_base_dir().join(format!(
+            "tempo-headless-auto-cdp-child-{}-{:x}",
+            std::process::id(),
+            current_time_ns()
+        ));
+        std::fs::create_dir_all(&dir)?;
+        set_private_dir_permissions(&dir)?;
+        let socket_path = dir.join("engine.sock");
+        let mut host = EngineHost::spawn(
+            EngineHostConfig::new("sh")
+                .arg("-c")
+                .arg("sleep 5")
+                .control_socket(socket_path.clone())
+                .restart(tempo_engine_host::RestartPolicy::Never),
+        )?;
+        let server_path = socket_path.clone();
+        let server = thread::spawn(move || -> Result<(), String> {
+            thread::sleep(Duration::from_millis(50));
+            let listener = UnixListener::bind(&server_path).map_err(|error| error.to_string())?;
+            let (_stream, _) = listener.accept().map_err(|error| error.to_string())?;
+            Ok(())
+        });
+
+        let _client = connect_auto_started_engine(&socket_path, &mut host, Duration::from_secs(5))?;
+
+        server
+            .join()
+            .map_err(|_| "fake engine socket thread panicked")?
+            .map_err(|error| format!("fake engine socket failed: {error}"))?;
+        let _ = host.kill();
+        remove_dir_if_exists(&dir)?;
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn auto_started_cdp_engine_waits_for_socket_and_attaches() -> TestResult {
+        Ok(())
+    }
+
+    #[test]
+    fn auto_started_cdp_remote_bind_resolves_runtime_auth_before_validation() -> TestResult {
+        let root = unique_dir("auto-cdp-remote-runtime-auth")?;
+        remove_dir_if_exists(&root)?;
+        let token_path = root.join("tempod.token");
+        let missing_engine = root.join("missing-tempo-engined-cdp");
+        let _runtime_auth_path = scoped_test_runtime_auth_token_path(token_path.clone());
+
+        let error = match run_tempod_with_auto_cdp_engine_config_and_navigation_url_policy(
+            "0.0.0.0:0",
+            TempodServerConfig::new().allow_remote_binds(),
+            &missing_engine,
+            UrlPolicy::block_private(),
+        ) {
+            Ok(()) => return Err("missing auto-started engine binary should fail".into()),
+            Err(error) => error,
+        };
+
+        let message = error.to_string();
+        assert!(
+            !message.contains("non-loopback tempod bind"),
+            "auto-started CDP should synthesize runtime auth before remote bind validation: {message}"
+        );
+        assert!(
+            load_tempod_runtime_auth_token_at(&token_path)?.is_some(),
+            "auto-started CDP should create the runtime auth token before engine spawn"
+        );
+
+        remove_dir_if_exists(&root)?;
         Ok(())
     }
 

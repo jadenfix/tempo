@@ -16,6 +16,10 @@ target latency/RAM budgets pass on that target.
 Current repo state to reconcile before treating any milestone below as
 committed implementation work:
 
+- **Release preview**: the current shippable preview is local CDP on macOS/Linux:
+  `tempod` runs on loopback, auto-starts a sibling `tempo-engined-cdp` binary,
+  and attaches over a private Unix-domain socket. Servo T1, fleet headless, and
+  non-Unix transports are target state until their gates pass.
 - **Servo engine lane**: #246 tracks that `tempo-engine-servo` is still a
   compatibility/type-check shim, not a production libservo embed. T1 shell work
   must not assume the Servo lane already satisfies the final.md gates.
@@ -107,8 +111,8 @@ contract.
 
 - **macOS (first target)**: target state is a winit + wgpu surface for the
   Servo compositor, menu-bar daemon mode for headless agent fleets, and
-  Keychain-backed identity. `tempod` can run locally today, but #247 and #249
-  mean the windowed shell and spec-conformant daemon are still future work.
+  Keychain-backed identity. The release preview is local CDP `tempod`; #247 and
+  #249 mean the windowed shell and spec-conformant daemon are still future work.
 - **Windows**: target state is the same winit/wgpu shell, WebView2 as the T2
   lane, and a Windows-native transport behind the same frame contract.
   Named-pipe work is gated by #260 peer authentication and platform-specific
@@ -165,9 +169,10 @@ treatment rather than one being emulated on top of the other.
 - No compositor, no window, no font/paint pipeline warm-up: the observation
   projection (`tempo-observe`) is the *only* output surface unless a
   screenshot is explicitly requested.
-- Headless daemon (`tempod`) is the product: UDS/named-pipe control plane,
-  MCP + BiDi + OpenAPI in front, N engines behind, state forking
-  (`tempo-speculate`) for parallel exploration.
+- Headless daemon (`tempod`) is the product. In the release preview this means
+  loopback CDP with the packaged `tempo-engined-cdp`; the broader target is
+  UDS/named-pipe control plane, MCP + BiDi + OpenAPI in front, N engines behind,
+  and state forking (`tempo-speculate`) for parallel exploration.
 - Every latency budget in §5 is measured in this mode first — it is the mode
   with nothing to hide behind.
 
