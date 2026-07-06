@@ -17,6 +17,9 @@ SENTINELS=(
   "tempo-headless|tests::bidi_endpoint_denies_client_claimed_clean_script_without_confirmation_channel|BiDi forced taint on script"
   "tempo-headless|tests::bidi_endpoint_denies_unconfirmed_tainted_script_before_driver_execution|BiDi no driver IPC before script denial"
   "tempo-agent|decider::tests::decided_goto_recomputes_page_text_taint_and_denies_before_driver_execution|decided loop no driver execution before denial"
+  "tempo-agent|tests::openapi_fast_path_decision_is_not_executable_for_driver_tasks|OpenAPI descriptor cannot execute driver task"
+  "tempo-agent|tests::runner_openapi_fast_path_falls_through_to_browser_for_skill_actions|OpenAPI fast path falls through to browser"
+  "tempo-agent|tests::run_structured_task_rejects_openapi_decisions|OpenAPI structured execution rejected"
 )
 
 for sentinel in "${SENTINELS[@]}"; do
