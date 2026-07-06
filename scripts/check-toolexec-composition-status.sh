@@ -39,6 +39,9 @@ if ((${#runtime_dependents[@]} == 0)); then
   require_grep 'docs/TAINT_SANDBOX_ADR.md' \
     final.md \
     'final.md must link the taint-to-sandbox ADR while dispatch is deferred'
+  require_grep 'agent-facing runtime dispatch sentinel proves page-tainted non-browser compute reaches beatbox' \
+    final.md \
+    'M5 must require an agent-facing runtime dispatch sentinel, not only the bridge canary'
   require_grep 'real_beatboxd_tainted_canary_denies_import_egress' \
     tests/toolexec-live/tests/live.rs \
     'live beatbox canary test is missing'
