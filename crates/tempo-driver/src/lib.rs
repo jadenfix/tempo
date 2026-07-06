@@ -5,7 +5,7 @@
 //! `DriverTrait` v2 is a superset of `beater_browser::BrowserDriver`, adding diff-based
 //! re-observation, batched actions, page-state forking, and typed extraction. It is
 //! implemented today by the CDP preview lane, by the Servo target lane as its
-//! promotion gates land, by the planned system-WebView T2 lane, and by the
+//! promotion gates land, by the system-WebView T2 adapter scaffold, and by the
 //! optional `TestDriver` for conformance tests. The grounding contract is
 //! preserved: a NodeId miss is a `StepError`, never a `TransportError`.
 
