@@ -2729,6 +2729,13 @@ impl SessionPool {
         Ok(driver)
     }
 
+    fn ensure_session_record(&self, id: &TempodSessionId) -> Result<(), TempodError> {
+        if !self.sessions.contains_key(id) {
+            return Err(TempodError::SessionNotFound(id.clone()));
+        }
+        Ok(())
+    }
+
     /// Recovers the true creation order encoded in a session id minted by
     /// `finish_create` (`format!("session-{}", self.next_id)`). `next_id` is a
     /// strictly monotonic per-pool counter, so the parsed suffix is an exact
@@ -8347,6 +8354,12 @@ fn route_session_mcp(
     origin: Option<&str>,
     body: &[u8],
 ) -> HttpResponse {
+    if let Err(error) = lock_pool(pool).and_then(|pool| pool.ensure_session_record(id)) {
+        return tempod_error_response(&error);
+    }
+    if let Some(response) = route_session_mcp_shared_session_tool(pool, id, origin, body) {
+        return response;
+    }
     let driver = match lock_pool(pool).and_then(|mut pool| {
         pool.ensure_foreground_writer_available(id)?;
         pool.session_driver(id)
@@ -8354,9 +8367,6 @@ fn route_session_mcp(
         Ok(driver) => driver,
         Err(error) => return tempod_error_response(&error),
     };
-    if let Some(response) = route_session_mcp_shared_session_tool(pool, id, origin, body) {
-        return response;
-    }
     let server = tempo_mcp::TempoMcpServer::new(driver).without_fork_tools();
     HttpResponse::from_mcp(futures::executor::block_on(
         server.handle_post(origin, body),
@@ -14926,6 +14936,104 @@ mod tests {
     }
 
     #[test]
+    fn session_scoped_mcp_tools_list_works_without_session_driver() -> TestResult {
+        let mut pool = SessionPool::default();
+        let session = pool.finish_create("https://driverless-session-mcp.test".into(), None);
+
+        let response = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: format!("/sessions/{}/mcp", session.id.0),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: br#"{"jsonrpc":"2.0","id":41,"method":"tools/list"}"#.to_vec(),
+            },
+        )?;
+
+        assert_eq!(response.status, 200);
+        let value: Value = serde_json::from_slice(&response.body)?;
+        assert_eq!(value["id"], 41);
+        let tool_names = value["result"]["tools"]
+            .as_array()
+            .ok_or("tools/list result must be an array")?
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect::<Vec<_>>();
+        assert!(tool_names.contains(&"act"));
+        assert!(tool_names.contains(&"act_batch"));
+        assert!(!tool_names.contains(&"fork"));
+        assert!(!tool_names.contains(&"close_fork"));
+        Ok(())
+    }
+
+    #[test]
+    fn session_scoped_mcp_tools_list_rejects_unknown_session() -> TestResult {
+        let mut pool = SessionPool::default();
+
+        let response = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/sessions/missing/mcp".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: br#"{"jsonrpc":"2.0","id":41,"method":"tools/list"}"#.to_vec(),
+            },
+        )?;
+
+        assert_eq!(response.status, 404);
+        let value: Value = serde_json::from_slice(&response.body)?;
+        assert!(value["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("session not found")));
+        Ok(())
+    }
+
+    #[test]
+    fn session_scoped_mcp_policy_denial_works_without_session_driver() -> TestResult {
+        let mut pool = SessionPool::default();
+        let session = pool.finish_create("https://driverless-session-mcp.test".into(), None);
+
+        let mut request = mcp_tool_request(
+            42,
+            "act_batch",
+            json!({
+                "batch": {
+                    "actions": [{"kind": "click", "node": "purchase"}],
+                    "quiescence": "composite"
+                },
+                "input_tainted": false,
+                "confirmed": true,
+                "idempotency_key": "driverless-mcp-purchase"
+            }),
+        )?;
+        request.path = format!("/sessions/{}/mcp", session.id.0);
+        let response = route_http_request(&mut pool, request)?;
+
+        assert_eq!(response.status, 200);
+        let value: Value = serde_json::from_slice(&response.body)?;
+        assert_eq!(value["id"], 42);
+        assert_eq!(value["result"]["isError"], true);
+        let structured = &value["result"]["structuredContent"];
+        assert_eq!(structured["policy"]["confirmation_required"], true);
+        assert_eq!(structured["policy"]["confirmed_effective"], false);
+        assert_eq!(
+            structured["confirmation_request"]["session_id"],
+            session.id.0.as_str()
+        );
+        assert!(
+            structured["error"]
+                .as_str()
+                .is_some_and(|error| !error.contains("DriverUnavailable")),
+            "policy denial should happen before session driver lookup"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn session_scoped_mcp_is_forkless_because_server_state_is_request_scoped() -> TestResult {
         let mut pool = SessionPool::default();
         let handle = attach_driver_handler(&mut pool, |request| {
@@ -15085,9 +15193,11 @@ mod tests {
         request.path = format!("/sessions/{}/mcp", session.id.0);
         let response = route_http_request(&mut pool, request)?;
 
-        assert_eq!(response.status, 409);
+        assert_eq!(response.status, 200);
         let value: Value = serde_json::from_slice(&response.body)?;
-        assert!(value["error"]
+        assert_eq!(value["id"], 23);
+        assert_eq!(value["result"]["isError"], true);
+        assert!(value["result"]["structuredContent"]["error"]
             .as_str()
             .is_some_and(|error| error.contains(&run_id.0)));
         assert_eq!(
