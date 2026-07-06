@@ -8535,6 +8535,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "chromiumoxide",
+ "criterion",
  "futures",
  "serde_json",
  "tempfile",

@@ -1771,6 +1771,33 @@ async fn wait_for_no_blocked_request_since(
     wait_for_no_blocked_request_with_grace(tracker, cursor, REQUEST_POLICY_EVENT_GRACE, true).await
 }
 
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub enum RequestPolicyWaitBenchCase {
+    IdleNoObservedRequest,
+    ObservedCleanRequest,
+}
+
+#[doc(hidden)]
+pub async fn request_policy_wait_bench_once(
+    case: RequestPolicyWaitBenchCase,
+) -> Result<Duration, TransportError> {
+    let tracker = RequestPolicyTracker::new();
+    let cursor = tracker.cursor();
+    match case {
+        RequestPolicyWaitBenchCase::IdleNoObservedRequest => {}
+        RequestPolicyWaitBenchCase::ObservedCleanRequest => {
+            let seq = tracker.start_request();
+            tracker.finish_request(seq, None);
+        }
+    }
+
+    let started = Instant::now();
+    wait_for_no_blocked_request_with_grace(&tracker, cursor, REQUEST_POLICY_EVENT_GRACE, true)
+        .await?;
+    Ok(started.elapsed())
+}
+
 /// Settle variant with no minimum event grace: drains pending requests since
 /// `cursor` so a policy-blocked verdict still surfaces, but returns as soon as
 /// nothing is pending. Sound ONLY when a full `REQUEST_POLICY_EVENT_GRACE` has

@@ -26,7 +26,12 @@ tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-threa
 url = "2"
 
 [dev-dependencies]
+criterion.workspace = true
 tempo-driver = { path = "../tempo-driver", features = ["test-driver"] }
+
+[[bench]]
+name = "request_policy"
+harness = false
 
 [lints]
 workspace = true

@@ -157,7 +157,7 @@ jobs:
       - name: criterion benches compile and run once (test mode)
         run: >
           cargo bench
-          -p tempo-observe -p tempo-engine-host -p tempo-act
+          -p tempo-observe -p tempo-engine-host -p tempo-engine-cdp -p tempo-act
           -p tempo-policy -p tempo-session
           -- --test
 
