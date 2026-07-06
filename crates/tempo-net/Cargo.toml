@@ -11,6 +11,7 @@ ed25519-dalek = "2"
 httpdate = "1"
 sha2.workspace = true
 tempo-schema = { path = "../tempo-schema" }
+tempo-urlpolicy = { path = "../tempo-urlpolicy" }
 url = "2"
 
 [lints]
