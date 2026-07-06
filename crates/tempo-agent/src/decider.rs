@@ -34,7 +34,11 @@ use tempo_policy::{
     InputTaint, Origin,
 };
 use tempo_schema::{Action, CompiledObservation, HumanTakeover, ObservationDiff, SideEffect};
-use tempo_session::{read_journal_entries, JournalEntry, JournalEvent, SessionJournal};
+#[cfg(test)]
+use tempo_session::read_journal_entries;
+use tempo_session::{
+    read_journal_entries_with_retention_policy, JournalEntry, JournalEvent, SessionJournal,
+};
 use tempo_taint::{serialize_observation_diff_for_model, serialize_observation_for_model};
 use thiserror::Error;
 
@@ -851,12 +855,15 @@ impl AgentRunner {
         D: DriverTrait + ?Sized,
         M: Decider + ?Sized,
     {
-        let journal = SessionJournal::open(
+        let retention_policy = self.resolved_retention_policy()?;
+        let journal = SessionJournal::open_with_retention_policy(
             &self.journal_path,
             self.ids.run_id.clone(),
             self.ids.session_id.clone(),
+            retention_policy.clone(),
         )?;
-        let entries = read_journal_entries(&self.journal_path)?;
+        let entries =
+            read_journal_entries_with_retention_policy(&self.journal_path, &retention_policy)?;
         let resume = decided_resume_from_entries(&entries)?;
 
         let mut state = DecidedRunState {
@@ -1899,7 +1906,7 @@ mod tests {
     async fn scripted_decider_drives_hermetic_decided_run() -> TestResult {
         let (root, journal_path) = journal_root("decided-scripted")?;
         let mut driver = CountingDriver::new(vec![button("submit")]);
-        let runner = AgentRunner::new(
+        let runner = AgentRunner::new_plaintext_unsafe(
             &journal_path,
             AgentRunIds::new("run-decided-scripted", "session-decided-scripted"),
         )
@@ -1943,7 +1950,7 @@ mod tests {
             url: "https://example.com/search?q=Submit".into(),
         };
         let mut driver = CountingDriver::new(vec![button("submit")]);
-        let runner = AgentRunner::new(
+        let runner = AgentRunner::new_plaintext_unsafe(
             &journal_path,
             AgentRunIds::new("run-decided-goto-taint", "session-decided-goto-taint"),
         )
@@ -1995,7 +2002,7 @@ mod tests {
     async fn decided_step_reuses_post_action_cached_observation() -> TestResult {
         let (root, journal_path) = journal_root("decided-cached-post-action")?;
         let mut driver = CountingDriver::new(vec![button("submit")]);
-        let runner = AgentRunner::new(
+        let runner = AgentRunner::new_plaintext_unsafe(
             &journal_path,
             AgentRunIds::new("run-decided-cached", "session-decided-cached"),
         )
@@ -2162,7 +2169,7 @@ mod tests {
     ) -> TestResult {
         let (root, journal_path) = journal_root("decided-captcha-pause")?;
         let mut driver = ChallengeAfterActionDriver::new();
-        let runner = AgentRunner::new(
+        let runner = AgentRunner::new_plaintext_unsafe(
             &journal_path,
             AgentRunIds::new("run-captcha", "session-captcha"),
         )
@@ -2240,7 +2247,7 @@ mod tests {
         ])?;
 
         let mut driver = TestDriver::new().with_elements(vec![button("submit")]);
-        let runner = AgentRunner::new(
+        let runner = AgentRunner::new_plaintext_unsafe(
             &journal_path,
             AgentRunIds::new("run-decided-anthropic", "session-decided-anthropic"),
         )
@@ -2273,9 +2280,10 @@ mod tests {
                 JournalEvent::ModelDecision {
                     cache_read_input_tokens,
                     ..
-                } => Some(*cache_read_input_tokens),
+                } => Some(cache_read_input_tokens),
                 _ => None,
             })
+            .copied()
             .collect();
         assert_eq!(cache_reads, vec![0, 40]);
         let first_decision = entries
@@ -2506,7 +2514,8 @@ mod tests {
     ) -> TestResult {
         let (root, journal_path) = journal_root("decided-budget")?;
         let ids = AgentRunIds::new("run-decided-budget", "session-decided-budget");
-        let runner = AgentRunner::new(&journal_path, ids).with_token_budget(TokenBudget::new(100));
+        let runner = AgentRunner::new_plaintext_unsafe(&journal_path, ids)
+            .with_token_budget(TokenBudget::new(100));
         let spec = DecidedTaskSpec::new("https://example.com", "click submit");
         let mut driver = TestDriver::new().with_elements(vec![button("submit")]);
         let usage = DecisionUsage {
@@ -2592,7 +2601,7 @@ mod tests {
         let mut driver = TestDriver::new().with_elements(vec![button("submit")]);
         // Force a real navigation so the driver has page state to observe.
         driver.goto("https://example.com").await?;
-        let runner = AgentRunner::new(&journal_path, ids)
+        let runner = AgentRunner::new_plaintext_unsafe(&journal_path, ids)
             .with_confirmation_mode(ConfirmationMode::AutoConfirmAll)
             .with_token_budget(TokenBudget::new(100));
         let mut decider = FixedUsageDecider {
@@ -2654,7 +2663,8 @@ mod tests {
 
         let mut driver = TestDriver::new().with_elements(vec![button("submit")]);
         driver.goto("https://example.com").await?;
-        let runner = AgentRunner::new(&journal_path, ids).with_token_budget(TokenBudget::new(100));
+        let runner = AgentRunner::new_plaintext_unsafe(&journal_path, ids)
+            .with_token_budget(TokenBudget::new(100));
         let mut decider = FixedUsageDecider {
             actions: Vec::new(),
             usage: DecisionUsage::default(),
@@ -2715,7 +2725,8 @@ mod tests {
 
         let mut driver = TestDriver::new().with_elements(vec![button("submit")]);
         driver.goto("https://example.com").await?;
-        let runner = AgentRunner::new(&journal_path, ids).with_token_budget(TokenBudget::new(100));
+        let runner = AgentRunner::new_plaintext_unsafe(&journal_path, ids)
+            .with_token_budget(TokenBudget::new(100));
         let mut decider = FixedUsageDecider {
             actions: Vec::new(),
             usage: DecisionUsage::default(),
@@ -2748,7 +2759,7 @@ mod tests {
     async fn decided_run_respects_configured_round_ceiling() -> TestResult {
         let (root, journal_path) = journal_root("decided-round-limit")?;
         let mut driver = TestDriver::new().with_elements(vec![button("submit")]);
-        let runner = AgentRunner::new(
+        let runner = AgentRunner::new_plaintext_unsafe(
             &journal_path,
             AgentRunIds::new("run-decided-rounds", "session-decided-rounds"),
         )
@@ -3331,7 +3342,7 @@ mod tests {
         let mut inc_driver = DiffDriver::new(init, pages, false);
         let inc_calls = Arc::clone(&inc_driver.calls);
         let mut inc_decider = ScriptedDecider::new(batches());
-        AgentRunner::new(&journal_inc, AgentRunIds::new("run-inc", "session-inc"))
+        AgentRunner::new_plaintext_unsafe(&journal_inc, AgentRunIds::new("run-inc", "session-inc"))
             .run_decided_task(&mut inc_driver, &mut inc_decider, &spec)
             .await?;
         let inc_entries = read_journal_entries(&journal_inc)?;
@@ -3341,9 +3352,12 @@ mod tests {
         let mut full_driver = DiffDriver::new(init, pages, true).without_cached_observations();
         let full_calls = Arc::clone(&full_driver.calls);
         let mut full_decider = ScriptedDecider::new(batches());
-        AgentRunner::new(&journal_full, AgentRunIds::new("run-full", "session-full"))
-            .run_decided_task(&mut full_driver, &mut full_decider, &spec)
-            .await?;
+        AgentRunner::new_plaintext_unsafe(
+            &journal_full,
+            AgentRunIds::new("run-full", "session-full"),
+        )
+        .run_decided_task(&mut full_driver, &mut full_decider, &spec)
+        .await?;
         let full_entries = read_journal_entries(&journal_full)?;
 
         // The add step's observation must contain "a" *before* "b" — proof the
@@ -3400,9 +3414,10 @@ mod tests {
         let mut decider = PromptContextRecordingDecider::new(vec![vec![scroll_action()], vec![]]);
         let spec = DecidedTaskSpec::new("https://example.com", "settle the page");
 
-        let report = AgentRunner::new(&journal, AgentRunIds::new("run-pd", "session-pd"))
-            .run_decided_task(&mut driver, &mut decider, &spec)
-            .await?;
+        let report =
+            AgentRunner::new_plaintext_unsafe(&journal, AgentRunIds::new("run-pd", "session-pd"))
+                .run_decided_task(&mut driver, &mut decider, &spec)
+                .await?;
 
         assert_eq!(report.status, DecidedRunStatus::Completed);
         assert_eq!(decider.seen_prompt_context, vec![false, true]);
@@ -3425,9 +3440,10 @@ mod tests {
         let mut decider = ScriptedDecider::new(vec![vec![scroll_action()], vec![]]);
         let spec = DecidedTaskSpec::new("https://example.com", "scroll then stop");
 
-        let report = AgentRunner::new(&journal, AgentRunIds::new("run-tk", "session-tk"))
-            .run_decided_task(&mut driver, &mut decider, &spec)
-            .await?;
+        let report =
+            AgentRunner::new_plaintext_unsafe(&journal, AgentRunIds::new("run-tk", "session-tk"))
+                .run_decided_task(&mut driver, &mut decider, &spec)
+                .await?;
 
         let DecidedRunStatus::HumanTakeoverRequired { takeover } = &report.status else {
             return Err(format!("expected HumanTakeoverRequired, got {:?}", report.status).into());
@@ -3454,7 +3470,7 @@ mod tests {
         let mut decider = ScriptedDecider::new(vec![vec![select_action("sel")], vec![]]);
         let spec = DecidedTaskSpec::new("https://example.com", "select a jump menu");
 
-        AgentRunner::new(&journal, AgentRunIds::new("run-nav", "session-nav"))
+        AgentRunner::new_plaintext_unsafe(&journal, AgentRunIds::new("run-nav", "session-nav"))
             .with_confirmation_mode(ConfirmationMode::AutoConfirmAll)
             .run_decided_task(&mut driver, &mut decider, &spec)
             .await?;
@@ -3482,7 +3498,7 @@ mod tests {
         let mut decider = ScriptedDecider::new(vec![vec![select_action("sel")], vec![]]);
         let spec = DecidedTaskSpec::new("https://example.com", "select a jump menu");
 
-        AgentRunner::new(
+        AgentRunner::new_plaintext_unsafe(
             &journal,
             AgentRunIds::new("run-stale-cache", "session-stale-cache"),
         )
@@ -3525,7 +3541,7 @@ mod tests {
             );
             let mut decider =
                 ScriptedDecider::new(vec![vec![scroll_action()], vec![scroll_action()], vec![]]);
-            AgentRunner::new(&journal, AgentRunIds::new(&label, &label))
+            AgentRunner::new_plaintext_unsafe(&journal, AgentRunIds::new(&label, &label))
                 .run_decided_task(&mut driver, &mut decider, &spec)
                 .await?;
             let entries = read_journal_entries(&journal)?;

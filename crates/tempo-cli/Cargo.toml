@@ -25,5 +25,8 @@ tempo-taint = { path = "../tempo-taint" }
 thiserror.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread"] }
 
+[dev-dependencies]
+tempo-driver = { path = "../tempo-driver", features = ["test-driver"] }
+
 [lints]
 workspace = true
