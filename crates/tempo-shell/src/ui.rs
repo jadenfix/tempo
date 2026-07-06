@@ -796,10 +796,13 @@ mod tests {
     use tempo_driver::{Engine, TestDriver};
     #[cfg(unix)]
     use tempo_engine_host::{serve_driver_connection, EngineIpcClient, EngineIpcConnection};
-    use tempo_headless::{serve_forever, SessionPool, TempodSessionEventKind, TempodSessionId};
+    use tempo_headless::{
+        serve_forever_with_auth, SessionPool, TempodAuth, TempodSessionEventKind, TempodSessionId,
+    };
     use tempo_net::UrlPolicy;
 
     type TestResult = Result<(), Box<dyn Error>>;
+    const TEMPOD_FIXTURE_AUTH_TOKEN: &str = "fixture-token";
 
     #[cfg(unix)]
     fn attach_test_driver(
@@ -1828,11 +1831,12 @@ mod tests {
         let addr = listener.local_addr()?;
         let server_pool = Arc::clone(&pool);
         // serve_forever loops until the process exits; the test never joins it.
-        thread::spawn(move || {
-            let _ = serve_forever(listener, server_pool);
+        thread::spawn(move || -> Result<(), tempo_headless::TempodError> {
+            let auth = TempodAuth::bearer(TEMPOD_FIXTURE_AUTH_TOKEN)?;
+            serve_forever_with_auth(listener, server_pool, auth)
         });
 
-        let client = ShellClient::new(addr.to_string());
+        let client = ShellClient::new(addr.to_string()).with_auth_token(TEMPOD_FIXTURE_AUTH_TOKEN);
         let mut model = ShellUiModel::new(addr.to_string());
 
         model.dispatch(UiAction::Refresh, &client);
