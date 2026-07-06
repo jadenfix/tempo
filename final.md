@@ -296,7 +296,8 @@ routed to **beatbox** (`~/Desktop/beater/beatbox`), the polyglot sandbox daemon
 Current preview caveat: `tempo-toolexec` exists, but live `tempod`/agent CDP
 flows do not yet dispatch tainted transforms through beatbox. The taint+sandbox
 composition below is an acceptance gate for beta/remote operation, not a local
-CDP preview guarantee.
+CDP preview guarantee. The dispatch locus and evidence bar are pinned in
+[`docs/TAINT_SANDBOX_ADR.md`](docs/TAINT_SANDBOX_ADR.md).
 
 ### 6.1 What runs in beatbox
 
@@ -355,6 +356,14 @@ beatbox already shares tempo's conventions — edition 2024, `unsafe_code = forb
 ### 6.5 Ownership & sequencing
 
 `tempo-toolexec` lives in WS7 (E8) and is **fully parallel** — it depends only on `beatbox-client` (which exists today) and `tempo-schema`, never on the engine. Its DoD is in §8. The taint⋈sandbox rule requires `tempo-taint` (WS4) to expose a "does this value carry taint?" predicate; that predicate is part of contract **C1**, so the two crates integrate at the schema layer, not by direct dependency.
+
+ADR decision: live taint-to-sandbox dispatch belongs at the
+`tempod`/headless runtime execution boundary immediately before non-browser
+compute runs on page-derived input. Browser actions stay behind `tempo-policy`;
+compute side effects route through `tempo-toolexec` to beatbox. The local CDP
+preview keeps this explicitly deferred until a runtime integration test proves
+that an agent-facing tainted transform reaches beatbox with `net:Deny`,
+`secrets:[]`, and no canary egress.
 
 ---
 
@@ -435,7 +444,7 @@ Milestones are **capability gates**, not calendar points. Each lists the objecti
 - **M2 — Servo M-vanilla.** *Evidence:* one libservo WebView navigates, screenshots, receives input, evaluates JS, and re-issues all requests through `tempo-net` — driven over the UDS wire protocol; passes the goto/screenshot/input/js-eval slice of conformance. *Effect:* WS6 interceptor, WS8 agent tabs, WS10 Servo lane unblocked.
 - **M3 — Servo observation live.** *Evidence:* AccessKit stream → `tempo-observe` produces a compiled observation meeting the ≤4KB/≤1.5K-token budget on ≥ 20 live sites; stable-ID survival ≥ 99% on those sites. *Effect:* first fully-native Servo agent session.
 - **M4 — Parity & speculation.** *Evidence:* Servo lane reaches an agreed % of the CDP lane's WebVoyager score in the differential harness; speculation shows **≥ 15% wall-clock reduction** on the multi-branch suite (else it does not ship on-by-default). *Effect:* Servo becomes the default lane for passing origins.
-- **M5 — Security & fleet hardening.** *Evidence:* injection red-team corpus produces **zero unconfirmed Send/Purchase/Delete**; taint⋈sandbox canary test passes; session handoff (headless→window→headless) preserves state; remote fleet create/adopt/kill + OTLP verified across ≥ 2 hosts. *Effect:* production-ready posture.
+- **M5 — Security & fleet hardening.** *Evidence:* injection red-team corpus produces **zero unconfirmed Send/Purchase/Delete**; an agent-facing runtime dispatch sentinel proves page-tainted non-browser compute reaches beatbox with `net:Deny`, `secrets:[]`, and no canary egress; session handoff (headless→window→headless) preserves state; remote fleet create/adopt/kill + OTLP verified across ≥ 2 hosts. *Effect:* production-ready posture.
 
 ### 8.3 CI and security invariants (continuous where wired)
 

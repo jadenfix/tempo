@@ -46,6 +46,8 @@ jobs:
         run: bash scripts/check-no-solver.sh
       - name: denial sentinel guard (#332)
         run: bash scripts/check-denial-sentinels.sh
+      - name: toolexec composition status (#406)
+        run: bash scripts/check-toolexec-composition-status.sh
       - name: cargo test (contracts + conformance)
         run: cargo test --workspace
       - name: cargo test (toolexec live beatbox)
