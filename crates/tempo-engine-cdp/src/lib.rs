@@ -1771,6 +1771,7 @@ async fn wait_for_no_blocked_request_since(
     wait_for_no_blocked_request_with_grace(tracker, cursor, REQUEST_POLICY_EVENT_GRACE, true).await
 }
 
+#[cfg(feature = "bench-internals")]
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug)]
 pub enum RequestPolicyWaitBenchCase {
@@ -1778,6 +1779,7 @@ pub enum RequestPolicyWaitBenchCase {
     ObservedCleanRequest,
 }
 
+#[cfg(feature = "bench-internals")]
 #[doc(hidden)]
 pub async fn request_policy_wait_bench_once(
     case: RequestPolicyWaitBenchCase,
