@@ -13,6 +13,10 @@ needs a concrete traced failure, not a preference for more code.
   expose socket-safe request parts and an already-open stream. Any checked
   dispatch fallback must pin the connection to the checked socket instead of
   re-resolving the URL.
+- Engine/control IPC must fail closed on platforms without an implemented
+  peer-auth transport. Local-only is not enough; require same-user peer
+  credentials, named-pipe ACLs, app-private sockets, or an explicit unsupported
+  gate.
 - Cassette and replay-fork import defaults must fail closed to authenticated
   durable retention. Plaintext replay helpers are compatibility/test fixtures
   only and must be explicitly named unsafe.

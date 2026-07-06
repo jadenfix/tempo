@@ -32,6 +32,8 @@ committed implementation work:
 - **Cross-platform secure IPC**: #260 owns native secure transports and peer
   authentication. Windows named pipes, Android app-private sockets, and mobile
   packaging must satisfy that issue's security bar rather than bypass it.
+  `tempo-engine-host` is fail-closed on Unix targets that lack explicit peer
+  credential support; adding a target requires wiring a real peer-auth API first.
 - **Portable core CI**: the `windows-core` CI job checks the engine-agnostic
   crates on native `windows-latest`. That is the compatibility bar for the
   contract, observation/action, policy/taint, network, session, agent, MCP/BiDi,
