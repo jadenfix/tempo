@@ -706,6 +706,22 @@ pub struct SharedEngineIpcClient {
     inner: Arc<SharedIpcInner>,
 }
 
+#[derive(Debug, Error)]
+pub enum EngineIpcRequestError {
+    #[error("engine request failed before dispatch: {0}")]
+    NotDispatched(#[source] EngineHostError),
+    #[error("engine request failed after dispatch status became uncertain: {0}")]
+    DispatchUncertain(#[source] EngineHostError),
+}
+
+impl EngineIpcRequestError {
+    pub fn into_inner(self) -> EngineHostError {
+        match self {
+            Self::NotDispatched(error) | Self::DispatchUncertain(error) => error,
+        }
+    }
+}
+
 struct SharedIpcInner {
     writer: Mutex<SharedIpcWriter>,
     pending: Mutex<SharedIpcPending>,
@@ -778,10 +794,26 @@ impl SharedEngineIpcClient {
         command: DriverCommand,
         timeout: Duration,
     ) -> Result<DriverResponse, EngineHostError> {
+        self.request_for_with_dispatch_status(driver_id, command, timeout)
+            .map_err(EngineIpcRequestError::into_inner)
+    }
+
+    /// Send one driver command and preserve whether an error happened before
+    /// the frame was fully dispatched to the engine. Callers with idempotency
+    /// semantics can retry or clear provisional leases only for
+    /// [`EngineIpcRequestError::NotDispatched`].
+    pub fn request_for_with_dispatch_status(
+        &self,
+        driver_id: Option<&str>,
+        command: DriverCommand,
+        timeout: Duration,
+    ) -> Result<DriverResponse, EngineIpcRequestError> {
         let payload = serde_json::to_value(DriverRequestPayload {
             driver_id: driver_id.map(str::to_string),
             command,
-        })?;
+        })
+        .map_err(EngineHostError::from)
+        .map_err(EngineIpcRequestError::NotDispatched)?;
         let (tx, rx) = mpsc::channel();
 
         // Lock order is writer -> pending everywhere; the reader takes only
@@ -789,30 +821,29 @@ impl SharedEngineIpcClient {
         // is written so the reader can never see a response for an id that is
         // not yet registered.
         let id = {
-            let mut writer = self
-                .inner
-                .writer
-                .lock()
-                .map_err(|_| EngineHostError::IpcClosed {
+            let mut writer = self.inner.writer.lock().map_err(|_| {
+                EngineIpcRequestError::NotDispatched(EngineHostError::IpcClosed {
                     reason: "engine IPC writer lock poisoned".into(),
-                })?;
+                })
+            })?;
             let id = writer.next_id;
             writer.next_id = writer
                 .next_id
                 .checked_add(1)
-                .ok_or(EngineHostError::RequestIdExhausted)?;
+                .ok_or(EngineHostError::RequestIdExhausted)
+                .map_err(EngineIpcRequestError::NotDispatched)?;
             {
-                let mut pending =
-                    self.inner
-                        .pending
-                        .lock()
-                        .map_err(|_| EngineHostError::IpcClosed {
-                            reason: "engine IPC pending lock poisoned".into(),
-                        })?;
+                let mut pending = self.inner.pending.lock().map_err(|_| {
+                    EngineIpcRequestError::NotDispatched(EngineHostError::IpcClosed {
+                        reason: "engine IPC pending lock poisoned".into(),
+                    })
+                })?;
                 if let Some(reason) = &pending.dead {
-                    return Err(EngineHostError::IpcClosed {
-                        reason: reason.clone(),
-                    });
+                    return Err(EngineIpcRequestError::NotDispatched(
+                        EngineHostError::IpcClosed {
+                            reason: reason.clone(),
+                        },
+                    ));
                 }
                 pending.waiters.insert(id, tx);
             }
@@ -823,23 +854,29 @@ impl SharedEngineIpcClient {
                 &WireFrame::new(id, DRIVER_REQUEST_METHOD, payload),
             ) {
                 self.forget_waiter(id);
-                return Err(error);
+                return Err(EngineIpcRequestError::NotDispatched(error));
             }
             id
         };
 
         match rx.recv_timeout(timeout) {
             Ok(Ok(response)) => Ok(response),
-            Ok(Err(reason)) => Err(EngineHostError::IpcClosed { reason }),
+            Ok(Err(reason)) => Err(EngineIpcRequestError::DispatchUncertain(
+                EngineHostError::IpcClosed { reason },
+            )),
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 // Deregister so the reader discards the late response instead
                 // of delivering it to a caller that has already given up.
                 self.forget_waiter(id);
-                Err(EngineHostError::IpcTimeout { timeout })
+                Err(EngineIpcRequestError::DispatchUncertain(
+                    EngineHostError::IpcTimeout { timeout },
+                ))
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => Err(EngineHostError::IpcClosed {
-                reason: "engine IPC reader exited without a response".into(),
-            }),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(
+                EngineIpcRequestError::DispatchUncertain(EngineHostError::IpcClosed {
+                    reason: "engine IPC reader exited without a response".into(),
+                }),
+            ),
         }
     }
 
@@ -2026,6 +2063,30 @@ mod tests {
         assert!(later.is_err());
         assert!(started.elapsed() < Duration::from_secs(2));
         Ok(())
+    }
+
+    #[test]
+    fn shared_client_classifies_dead_connection_as_not_dispatched() -> TestResult {
+        let (client_stream, server_stream) = UnixStream::pair()?;
+        let shared = SharedEngineIpcClient::from_stream(client_stream)?;
+        drop(server_stream);
+
+        let result = shared.request_for_with_dispatch_status(
+            None,
+            DriverCommand::Observe,
+            Duration::from_secs(1),
+        );
+        match result {
+            Err(EngineIpcRequestError::NotDispatched(_)) => Ok(()),
+            Err(EngineIpcRequestError::DispatchUncertain(error)) => Err(format!(
+                "dead connection before write must not be classified as uncertain dispatch: {error}"
+            )
+            .into()),
+            Ok(response) => Err(format!(
+                "dead connection before write unexpectedly returned response: {response:?}"
+            )
+            .into()),
+        }
     }
 
     #[test]

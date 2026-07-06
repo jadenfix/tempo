@@ -60,7 +60,8 @@ use tempo_driver::{
 };
 use tempo_engine_host::{
     DriverCommand as HostDriverCommand, DriverResponse, DriverWireError, EngineHost,
-    EngineHostConfig, EngineHostError, EngineIpcClient, SharedEngineIpcClient,
+    EngineHostConfig, EngineHostError, EngineIpcClient, EngineIpcRequestError,
+    SharedEngineIpcClient,
 };
 use tempo_net::UrlPolicy;
 use tempo_policy::trust::{
@@ -833,9 +834,19 @@ impl AttachedEngineDriver {
         if let Some(cancel) = cancel {
             cancel.check_driver()?;
         }
-        Ok(self
-            .client
-            .request_for(self.driver_id.as_deref(), command, ENGINE_IPC_TIMEOUT)?)
+        match self.client.request_for_with_dispatch_status(
+            self.driver_id.as_deref(),
+            command,
+            ENGINE_IPC_TIMEOUT,
+        ) {
+            Ok(response) => Ok(response),
+            Err(EngineIpcRequestError::NotDispatched(error)) => {
+                Err(DriverClientError::FailedBeforeDispatch(error))
+            }
+            Err(EngineIpcRequestError::DispatchUncertain(error)) => {
+                Err(DriverClientError::Host(error))
+            }
+        }
     }
 
     /// Bounded liveness probe on the shared engine (#440): one root-context
@@ -1036,7 +1047,7 @@ impl AttachedEngineDriver {
         cancel: &RequestCancel,
     ) -> Result<StepOutcome, CancellableDriverError> {
         enforce_batch_navigation_url_policy_transport(&self.url_policy, batch)
-            .map_err(CancellableDriverError::Transport)?;
+            .map_err(CancellableDriverError::FailedBeforeDispatch)?;
         self.request_step_cancellable(
             HostDriverCommand::ActBatch {
                 batch: batch.clone(),
@@ -1143,6 +1154,8 @@ enum DriverClientError {
         "engine driver is busy: another operation on this session/context did not finish in time"
     )]
     Busy,
+    #[error("engine request failed before dispatch: {0}")]
+    FailedBeforeDispatch(EngineHostError),
     #[error("engine host failed: {0}")]
     Host(#[from] EngineHostError),
 }
@@ -1159,6 +1172,9 @@ fn cancellable_driver_error(error: DriverClientError) -> CancellableDriverError 
         DriverClientError::Busy => CancellableDriverError::FailedBeforeDispatch(
             driver_client_transport_error(DriverClientError::Busy),
         ),
+        DriverClientError::FailedBeforeDispatch(error) => {
+            CancellableDriverError::FailedBeforeDispatch(TransportError::Other(error.to_string()))
+        }
         other => CancellableDriverError::Transport(driver_client_transport_error(other)),
     }
 }
@@ -16120,6 +16136,25 @@ mod tests {
     }
 
     #[test]
+    fn issue414_host_pre_dispatch_error_is_classified_before_dispatch() -> TestResult {
+        match cancellable_driver_error(DriverClientError::FailedBeforeDispatch(
+            EngineHostError::RequestIdExhausted,
+        )) {
+            CancellableDriverError::FailedBeforeDispatch(error) => {
+                assert!(error.to_string().contains("request id"));
+                Ok(())
+            }
+            CancellableDriverError::CancelledBeforeDispatch => {
+                Err("host pre-dispatch error must not be classified as cancellation".into())
+            }
+            CancellableDriverError::Transport(error) => Err(format!(
+                "host pre-dispatch error must not be classified as post-dispatch transport: {error}"
+            )
+            .into()),
+        }
+    }
+
+    #[test]
     fn issue414_successful_idempotent_act_batch_replays_cached_terminal_response() -> TestResult {
         let mut pool = SessionPool::default();
         let handle = attach_driver_handler(&mut pool, |request| match request.command {
@@ -16269,6 +16304,62 @@ mod tests {
             );
         }
         assert_no_driver_ipc(&mut server_stream)?;
+        discard_unserved_attached_engine(&mut *lock_pool(&shared)?);
+        Ok(())
+    }
+
+    #[test]
+    fn issue414_resolved_url_policy_denial_clears_provisional_idempotency() -> TestResult {
+        let mut pool = SessionPool::default();
+        let handle = attach_driver_handler(&mut pool, |request| {
+            assert!(matches!(request.command, HostDriverCommand::Observe));
+            DriverResponse::Observation {
+                observation: observation("https://resolved-policy.test", 1),
+            }
+        })?;
+        let session_driver = pool
+            .driver
+            .clone()
+            .ok_or("attached engine driver should be present")?
+            .with_navigation_url_policy(UrlPolicy::block_private());
+        let session =
+            pool.finish_create("https://resolved-policy.test".into(), Some(session_driver));
+        let body_bytes = br#"{
+            "batch": {
+                "actions": [{"kind": "goto", "url": "http://localhost/resolved-private"}],
+                "quiescence": "composite"
+            },
+            "input_tainted": false,
+            "idempotency_key": "resolved-private"
+        }"#;
+        let body = parse_session_act_batch_request(body_bytes)?;
+        let request_fingerprint = session_act_batch_idempotency_fingerprint(&body);
+        let session_id = session.id.clone();
+        let shared = Arc::new(Mutex::new(pool));
+
+        let response =
+            route_session_act_batch(&shared, session_id.clone(), body, &RequestCancel::default())?;
+        assert_eq!(response.status, 500);
+        let response_body: Value = serde_json::from_slice(&response.body)?;
+        assert!(response_body["error"]
+            .as_str()
+            .ok_or("error body should contain a string")?
+            .contains("URL policy"));
+
+        {
+            let pool = lock_pool(&shared)?;
+            assert_eq!(pool.session_idempotency_record_count(&session_id), 0);
+            assert!(
+                pool.cached_session_act_batch_response(
+                    &session_id,
+                    "resolved-private",
+                    &request_fingerprint,
+                )?
+                .is_none(),
+                "resolved URL policy denial happens before dispatch and must not leave unknown-outcome replay"
+            );
+        }
+        join_driver_handler(handle)?;
         discard_unserved_attached_engine(&mut *lock_pool(&shared)?);
         Ok(())
     }
