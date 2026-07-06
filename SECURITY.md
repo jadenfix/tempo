@@ -38,7 +38,10 @@ file them normally.
 
 ## Standing security invariants
 
-CI enforces these on every PR (see `final.md` §8.3): the injection red-team
-corpus must produce zero unconfirmed Send/Purchase/Delete; the SSRF suite and
-policy-gate property tests run on any PR touching observe/act/net/policy/
-taint/toolexec; `unsafe_code` is forbidden workspace-wide.
+These are review targets and CI gates where the corresponding implementation is
+wired (see `final.md` §8.3): the injection red-team corpus must produce zero
+unconfirmed Send/Purchase/Delete; the SSRF suite and policy-gate property tests
+run on any PR touching observe/act/net/policy/taint/toolexec; `unsafe_code` is
+forbidden workspace-wide. Shipped preview guarantees are the scoped guarantees
+listed in `README.md` and `final.md`; roadmap gates do not imply shipped
+protections until their evidence is green.

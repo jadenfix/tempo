@@ -47,6 +47,7 @@ Correctness & honesty of the contract:
 - [ ] Tool and model result envelopes do not duplicate large structured payloads across text and structured channels; text fallbacks summarize, while binary artifacts use native media content blocks.
 - [ ] Handles/IDs the caller reuses across calls are stable, or their churn is handled rather than silently breaking multi-step callers.
 - [ ] Docs, comments, and declared schemas/types match what the code actually does — no present-tense claims for a stub, no `{"type":"object"}` standing in for a real schema.
+- [ ] Security/privacy docs do not rely on one top-level disclaimer to narrow later absolute claims. Wording such as "all", "every", "owns", "guarantees", or "resistance" carries local shipped-vs-roadmap scope where it appears.
 - [ ] Public enum-valued fields advertise the exact serde/runtime wire names. Generated clients must accept every value the server can emit, ideally by reusing the same schema helper or by a contract test that pins the full enum.
 - [ ] Model-facing tool schemas are self-contained and match the runtime parser — no opaque object placeholders, unresolved `$ref`s, or ambiguous aliases where the caller needs one canonical shape.
 - [ ] Runtime-visible contract changes update every public description in the same slice: OpenAPI paths/statuses/schemas, agent cards, SDK-facing docs, and compatibility fixtures. A route or response field that exists at runtime but is absent from the contract is a blocker for SDK workflows.

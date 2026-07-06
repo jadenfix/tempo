@@ -6,6 +6,20 @@
 
 Engine strategy is **CDP-first for the current developer preview, Servo-promotable by evidence**: the runnable lane is headless Chromium via CDP behind the same driver trait; [Servo](https://servo.org) is the Rust-native target lane on every upstream-supported Servo target and promotes after the M-vanilla/M4 gates pass. Platform availability is code-backed by `tempo-engine-servo::servo_platform_support_matrix()` so macOS, Linux, Windows, Android, OpenHarmony, and future Servo targets share one source of truth. tempo reuses the existing **beater** stack heavily (`~/Desktop/beater`) — the browser-automation crates, the durable agent loop, the discovery/handshake surfaces, and the polyglot sandbox.
 
+### Current preview security/privacy boundary
+
+This document describes the destination architecture and the evidence required
+to ship each capability. The local CDP preview currently guarantees only the
+paths enforced in code:
+
+| Area | Current preview guarantee | Not yet a shipped guarantee |
+|---|---|---|
+| Control plane | `tempod` defaults to loopback and requires bearer auth on REST, MCP, and BiDi control paths; Host and Origin checks are CSRF/DNS-rebinding defenses, not identity. | Production remote/fleet control, multi-host trust, and public service posture remain gated on the remote/fleet work. `--allow-remote` is a test escape hatch. |
+| Stealth mode | `TEMPO_STEALTH_MODE` disables Tempo's intentional local retention: in-memory session-event history, terminal-session history, OTLP/JSONL telemetry export, Prometheus metrics exposition, idempotency replay cache, durable journals, and replay cassettes. | It does not erase browser-profile files, Chromium or OS crash logs, process supervisor logs, swap, filesystem snapshots, proxy/server logs, or artifacts written by external tools outside Tempo's retention path. |
+| Web Bot Auth | Signing primitives exist in `tempo-net` and selected dispatch paths. | Universal signing for all engine traffic, structured API calls, MCP calls, and hosted key-directory identity is a roadmap gate. |
+| Injection/exfiltration resistance | Current policy/taint gates protect browser side effects that are wired through the shipped action paths. | Authenticated/private-account exfiltration resistance via mandatory tainted-compute dispatch to beatbox is not a local preview guarantee until the taint-to-sandbox composition is wired into live dispatch. |
+| Journals/cassettes | Durable state supports plaintext, encrypted retention, and owner-only file modes when enabled; stealth rejects durable journal/cassette creation. | Replay portability and integrity for every product lane remain DoD items, not blanket guarantees for all preview workflows. |
+
 ---
 
 ## 1. Vision — what tempo *is* when it's done
@@ -47,7 +61,7 @@ What an agent needs from a browser that Chrome, Firefox, and Arc were never buil
 5. **State forking & speculation.** Exploring options means re-driving from scratch today. → fork page state and explore *k* branches in parallel; speculate the next action while the model still reasons (arXiv 2510.04371 shows ~20% latency reduction; Accio 2605.16565 treats offline site-structure as a speculative primitive).
 6. **Determinism, journal, replay.** Agents crash, get killed, need audit. → every step journaled (reuse beater-agent's crash-safe SQLite journal); full session replay from cassettes (beater-replay); deterministic re-execution where possible.
 7. **A hard trust boundary.** Page content is *data*, never *instructions* — the lesson of every Comet/Atlas injection. → **taint labels** on every observation span (page-derived / system / user), carried end-to-end into the prompt serializer, plus a **side-effect policy gate**.
-8. **Agent identity on the wire.** The web is deploying cryptographic bot verification right now. → Web Bot Auth HTTP message signatures built into the network layer; dual-mode (agent-declared vs user-driven) per origin.
+8. **Agent identity on the wire.** The web is deploying cryptographic bot verification right now. → Web Bot Auth HTTP message signatures in selected preview paths, with universal network-layer signing and dual-mode identity (agent-declared vs user-driven) per origin as roadmap gates.
 9. **The structured-web fast path.** If a site exposes agent tools/APIs, rendering it is wasted work. → probe `.well-known/beater.json`, agent-card, `llms.txt`, OpenAPI, and WebMCP *before* rendering; when present, **skip pixels entirely** and call tools.
 10. **Parallelism & remote management.** Agents run many sessions, often on remote fleets and sometimes on constrained mobile devices. → headless-first daemon, session pool, per-session ephemeral profiles, portable journals, OTLP observability, and thin platform adapters so Android/mobile support does not inherit desktop-only IPC, RAM, or windowing assumptions. Remote/fleet operation is gated beyond the local CDP preview.
 
@@ -81,9 +95,9 @@ What an agent needs from a browser that Chrome, Firefox, and Arc were never buil
                  │ mapper, ranker, diff engine,  │      │ Chrome; local CDP default   │
                  │ set-of-marks compositor       │      │ until Servo gates promote   │
                  └───────────────┬───────────────┘      └─────────────────────────────┘
-                                 │ all engine HTTP(S) intercepted (Servo load_web_resource)
+                                 │ destination Servo lane: engine HTTP(S) intercepted
                  ┌───────────────▼───────────────────────────────────────────────────┐
-                 │ tempo-net: OWNS the network — Web Bot Auth signing (RFC 9421),     │
+                 │ tempo-net destination: Web Bot Auth signing (RFC 9421),            │
                  │ per-session ephemeral profiles, SSRF UrlPolicy (beater-browser),   │
                  │ quiescence counters, fork-replay response cache, proxy/egress      │
                  └───────────────────────────────────────────────────────────────────┘
@@ -113,7 +127,7 @@ Layer → crate → responsibility (beater reuse in italics).
 - `tempo-speculate` — k-branch speculative execution + page-state forking. **v1 fork = replay-emulation** (clone cookies/storage/history from tempo-net + tempo-session, re-navigate, fast-replay the journal prefix against cassette-cached responses — works on *both* engines). **v2 = native Servo fork** (fork branch).
 
 **L4 — Network & fast path**
-- `tempo-net` — the interceptor-backed network layer that **owns all engine traffic**: re-issues every request; Web Bot Auth HTTP message signatures (RFC 9421, Ed25519); dual-mode identity (agent-declared vs user-driven, per origin); per-session ephemeral profiles (cookie jar + storage partition); SSRF at the socket level (*beater `UrlPolicy` semantics*); request/response audit; quiescence counters; fork-replay cache; proxy/egress policy.
+- `tempo-net` — the destination interceptor-backed network layer that owns engine traffic: re-issues requests; Web Bot Auth HTTP message signatures (RFC 9421, Ed25519); dual-mode identity (agent-declared vs user-driven, per origin); per-session ephemeral profiles (cookie jar + storage partition); SSRF at the socket level (*beater `UrlPolicy` semantics*); request/response audit; quiescence counters; fork-replay cache; proxy/egress policy. In the local CDP preview, Web Bot Auth and network ownership are implemented only on selected `tempo-net` paths, not as a blanket guarantee for every engine/API/MCP request.
 - `tempo-handshake` — pre-render structured-web probe: parallel fetch of `.well-known/beater.json`, `agent-card.json`, `openapi.json`, `llms.txt`, `/mcp/catalog.json`; WebMCP (`navigator.modelContext`) detection; **lane decision — API/MCP (skip pixels) vs render.** The client counterpart to *beater-connect*.
 
 **L5 — Runtime & protocol surface**
@@ -161,7 +175,12 @@ Layer → crate → responsibility (beater reuse in italics).
 
 Verified against the 2026 Servo embedding surface (`doc.servo.org` `servo::WebView` / `WebViewDelegate`; servo.org monthly posts through April 2026; PRs #39583, #35720, #41924, #42336, #42338). Everything marked **[fork]** is our patch, not upstream.
 
-**Consequence baked into the design: tempo owns the network.** Servo's `load_web_resource` interception lets us re-issue *every* request through `tempo-net` — which is where Web Bot Auth signing, ephemeral profiles, SSRF, fork-replay caching, and quiescence counters all live.
+**Destination consequence baked into the Servo design: tempo owns the network at
+the interception point.** Servo's `load_web_resource` hook is the planned place
+to re-issue engine requests through `tempo-net` so Web Bot Auth signing,
+ephemeral profiles, SSRF, fork-replay caching, and quiescence counters share one
+policy path. The local CDP preview does not yet make this a universal guarantee
+for every engine request, structured API call, or MCP call.
 
 | Capability | Status (2026) | How tempo gets it |
 |---|---|---|
@@ -319,7 +338,7 @@ evil.com," the transform that touches that text has `net: Deny` and
 The policy gate (`tempo-policy`) still governs *browser* side-effects; beatbox
 governs *compute* side-effects. Until that wiring lands, the local preview must
 not claim authenticated/private-account exfiltration resistance beyond the
-current taint-aware action gates.
+current taint-aware action gates and confirmation policy.
 
 ### 6.3 What beatbox gives back that tempo needs
 
@@ -418,12 +437,18 @@ Milestones are **capability gates**, not calendar points. Each lists the objecti
 - **M4 — Parity & speculation.** *Evidence:* Servo lane reaches an agreed % of the CDP lane's WebVoyager score in the differential harness; speculation shows **≥ 15% wall-clock reduction** on the multi-branch suite (else it does not ship on-by-default). *Effect:* Servo becomes the default lane for passing origins.
 - **M5 — Security & fleet hardening.** *Evidence:* injection red-team corpus produces **zero unconfirmed Send/Purchase/Delete**; taint⋈sandbox canary test passes; session handoff (headless→window→headless) preserves state; remote fleet create/adopt/kill + OTLP verified across ≥ 2 hosts. *Effect:* production-ready posture.
 
-### 8.3 Always-green invariants (enforced continuously, not per-milestone)
+### 8.3 CI and security invariants (continuous where wired)
 
-- Every engine passes conformance suite v2 on every commit (no engine regresses).
-- `tempo-engine-servo` always builds against pinned **vanilla** Servo (fork features strictly additive) and its platform matrix stays the source of truth for every Servo-available target.
-- CI budget evaluators (§10) fail the build on regression beyond the stated p50/p95 bars.
-- Injection corpus + SSRF suite + policy-gate property tests run on every PR touching observe/act/net/policy/taint/toolexec.
+- Engine lanes with shipped CI coverage must pass their conformance gates before
+  merge; future lanes become required only after their harnesses are wired.
+- `tempo-engine-servo` build gates run on Servo-gated changes against pinned
+  **vanilla** Servo and the tempo fork; scheduled/manual Servo audits remain
+  supply-chain checks rather than proof that every commit exercised every
+  Servo-available target.
+- CI budget evaluators (§10) fail the build on regression beyond the stated
+  p50/p95 bars once the corresponding evaluator is in the required check set.
+- Injection corpus + SSRF suite + policy-gate property tests run on every PR
+  touching observe/act/net/policy/taint/toolexec where those gates are wired.
 - Workspace lints hold repo-wide: `unsafe_code = forbid`, `unwrap_used`/`expect_used = deny` (inherited from beater/beatbox conventions).
 
 ---
@@ -447,7 +472,10 @@ Team-shape risk (only E2/E3 deep in Servo) is mitigated structurally by contract
 
 ## 10. Verification strategy
 
-- **Conformance.** Every engine passes conformance suite v2 (superset of beater's `assert_browser_driver_conformance`): grounding contract, SSRF guard, diff-observation, and correct `Unsupported`-capability behavior.
+- **Conformance.** Required engine lanes must pass the conformance suite wired
+  for that lane before merge; the destination v2 suite is a superset of
+  beater's `assert_browser_driver_conformance`: grounding contract, SSRF guard,
+  diff-observation, and correct `Unsupported`-capability behavior.
 - **Cross-engine differential testing.** Identical scripted tasks through the Servo and CDP lanes; compare StepTriples (grounding rate, interactive-element recall of compiled observations with the CDP AX tree as oracle, outcome divergence). This doubles as the Servo-compat signal.
 - **Agent evals.** WebVoyager, WebArena(-Lite), Mind2Web-Live via `tempo-evals` on the beater-eval/judge stack, with regression gates; baseline-vs-candidate A/B.
 - **Budgets enforced as CI evaluators.** Compiled observation ≤ 4KB / ≤ 1.5K tokens p50 (≤ 8KB p95); observe latency post-quiescence p50 ≤ 150ms, p95 ≤ 500ms; action→quiescent p50 ≤ 1.2s; per-task token ceilings per eval class; **speculation must show ≥ 15% wall-clock reduction on the multi-branch suite or it does not ship on-by-default.**

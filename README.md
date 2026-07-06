@@ -92,6 +92,15 @@ cargo test --workspace   # contracts, conformance, runtime, protocol, and shell 
   binding. `TEMPO_STEALTH_MODE` suppresses tempod's in-memory history,
   telemetry, and idempotency cache; it does not promise OS, filesystem, or
   Chromium artifact erasure.
+- Privacy/security claims are scoped to the code path that enforces them.
+  Today, Web Bot Auth signing is opt-in and limited to selected `tempo-net`
+  paths; it is not a blanket signature on every engine, OpenAPI, or MCP request.
+  Stealth mode prevents Tempo from intentionally retaining session-event
+  history, OTLP/JSONL telemetry, Prometheus metrics exposition, idempotency
+  replay cache, durable journals, and replay cassettes. It does not erase
+  browser-profile files, Chrome/OS crash logs, process-manager logs, swap,
+  filesystem snapshots, proxy/server logs, or artifacts produced by external
+  tools outside Tempo's retention path.
 - Supply-chain policy lives in [`deny.toml`](./deny.toml) (checked in CI);
   tagged `v*` releases build stripped, thin-LTO `tempod` + `tempo-cli`
   binaries for macOS and Linux.

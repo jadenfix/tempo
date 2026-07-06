@@ -17,6 +17,9 @@ needs a concrete traced failure, not a preference for more code.
 - HTTP success is not operation success when the response body carries a status
   envelope. Clients must parse `step_error`, missing, unknown, and non-applied
   statuses before mutating local state.
+- Security/privacy docs cannot rely on one top-level disclaimer to narrow later
+  absolute claims. Wording such as "all", "every", "owns", "guarantees", or
+  "resistance" needs local shipped-vs-roadmap scope where it appears.
 
 ## Async State Ownership
 
