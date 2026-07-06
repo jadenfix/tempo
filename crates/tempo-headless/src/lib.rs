@@ -5919,7 +5919,11 @@ pub fn tempod_openapi(base_url: &str) -> JsonValue {
             "/health": {
                 "get": {
                     "operationId": "health",
-                    "responses": {"200": {"description": "tempod is reachable"}}
+                    "security": [{"TempodBearer": []}],
+                    "responses": {
+                        "200": {"description": "tempod is reachable"},
+                        "401": {"description": "Bearer auth is required on non-loopback tempod binds"}
+                    }
                 }
             },
             "/ready": {
@@ -5941,7 +5945,45 @@ pub fn tempod_openapi(base_url: &str) -> JsonValue {
             TEMPOD_OPENAPI_PATH: {
                 "get": {
                     "operationId": "openapi",
-                    "responses": {"200": {"description": "OpenAPI 3.1 document"}}
+                    "security": [{"TempodBearer": []}],
+                    "responses": {
+                        "200": {"description": "OpenAPI 3.1 document"},
+                        "401": {"description": "Bearer auth is required on non-loopback tempod binds"}
+                    }
+                }
+            },
+            tempo_mcp::A2A_AGENT_CARD_PATH: {
+                "get": {
+                    "operationId": "agentCard",
+                    "security": [{"TempodBearer": []}],
+                    "responses": {
+                        "200": {
+                            "description": "A2A agent card metadata for this tempod control plane",
+                            "content": {
+                                tempo_mcp::A2A_AGENT_CARD_CONTENT_TYPE: {
+                                    "schema": {"type": "object", "additionalProperties": true}
+                                }
+                            }
+                        },
+                        "401": {"description": "Bearer auth is required on non-loopback tempod binds"}
+                    }
+                }
+            },
+            tempo_mcp::A2A_AGENT_JSON_PATH: {
+                "get": {
+                    "operationId": "agentJson",
+                    "security": [{"TempodBearer": []}],
+                    "responses": {
+                        "200": {
+                            "description": "A2A agent metadata alias for this tempod control plane",
+                            "content": {
+                                tempo_mcp::A2A_AGENT_CARD_CONTENT_TYPE: {
+                                    "schema": {"type": "object", "additionalProperties": true}
+                                }
+                            }
+                        },
+                        "401": {"description": "Bearer auth is required on non-loopback tempod binds"}
+                    }
                 }
             },
             "/sessions": {
@@ -6292,6 +6334,46 @@ pub fn tempod_openapi(base_url: &str) -> JsonValue {
                             "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AgentRun"}}}
                         },
                         "409": {"description": "Session is owned by a human surface"}
+                    }
+                }
+            },
+            "/drain": {
+                "post": {
+                    "operationId": "drain",
+                    "security": [{"TempodBearer": []}],
+                    "responses": {
+                        "200": {
+                            "description": "Enter draining mode and close engine resources",
+                            "content": {"application/json": {"schema": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "required": ["draining", "sessions"],
+                                "properties": {
+                                    "draining": {"type": "boolean"},
+                                    "sessions": {
+                                        "type": "array",
+                                        "items": {"$ref": "#/components/schemas/TempodSession"}
+                                    }
+                                }
+                            }}}
+                        }
+                    }
+                }
+            },
+            TEMPOD_METRICS_PATH: {
+                "get": {
+                    "operationId": "metrics",
+                    "security": [{"TempodBearer": []}],
+                    "responses": {
+                        "200": {
+                            "description": "Prometheus metrics exposition",
+                            "content": {
+                                tempo_telemetry::PROMETHEUS_CONTENT_TYPE: {
+                                    "schema": {"type": "string"}
+                                }
+                            }
+                        },
+                        "404": {"description": "Metrics exposition disabled by configuration"}
                     }
                 }
             }
@@ -6859,9 +6941,10 @@ fn session_id_query(query: Option<&str>) -> Result<Option<String>, TempodError> 
 
 /// Whether a route must pass the loopback-Origin guard. Session/control-plane routes (create, drain, adopt, delete, list,
 /// session events, and any unrecognised — hence potentially state-changing —
-/// route) are guarded. Exempt are the public idempotent metadata routes
-/// (`/health`, the A2A agent card, `GET /mcp`) and the routes that already run
-/// their own Origin check (`POST /mcp` via `route_mcp`, `POST /bidi`, and the
+/// route) are guarded. Exempt are loopback discovery metadata routes
+/// (`/health`, OpenAPI, the A2A agent card, `GET /mcp`); public metadata routes
+/// require bearer auth when the listener is bound on a non-loopback address.
+/// Also exempt are routes that already run their own Origin check (`POST /mcp` via `route_mcp`, `POST /bidi`, and the
 /// `GET /bidi` WebSocket upgrade handler). The guard relies
 /// on `origin_allowed` returning `true` when no Origin header is present, so
 /// non-browser/CLI clients keep working.
@@ -11829,6 +11912,22 @@ mod tests {
             openapi["paths"]["/mcp"]["post"]["security"],
             json!([{"TempodBearer": []}])
         );
+        for path in [
+            "/health",
+            TEMPOD_OPENAPI_PATH,
+            tempo_mcp::A2A_AGENT_CARD_PATH,
+            tempo_mcp::A2A_AGENT_JSON_PATH,
+        ] {
+            assert_eq!(
+                openapi["paths"][path]["get"]["security"],
+                json!([{"TempodBearer": []}]),
+                "{path} must advertise bearer auth for non-loopback clients"
+            );
+            assert_eq!(
+                openapi["paths"][path]["get"]["responses"]["401"]["description"],
+                "Bearer auth is required on non-loopback tempod binds"
+            );
+        }
         assert_eq!(
             openapi["paths"]["/ready"]["get"]["responses"]["503"]["content"]["application/json"]
                 ["schema"]["$ref"],
@@ -11847,6 +11946,29 @@ mod tests {
                 "engine_dead",
                 "session_limit_reached"
             ])
+        );
+        assert_eq!(
+            openapi["paths"]["/.well-known/agent-card.json"]["get"]["operationId"],
+            "agentCard"
+        );
+        assert_eq!(
+            openapi["paths"]["/.well-known/agent.json"]["get"]["operationId"],
+            "agentJson"
+        );
+        assert_eq!(openapi["paths"]["/drain"]["post"]["operationId"], "drain");
+        assert_eq!(
+            openapi["paths"]["/drain"]["post"]["responses"]["200"]["content"]["application/json"]
+                ["schema"]["properties"]["sessions"]["items"]["$ref"],
+            "#/components/schemas/TempodSession"
+        );
+        assert_eq!(
+            openapi["paths"]["/metrics"]["get"]["operationId"],
+            "metrics"
+        );
+        assert_eq!(
+            openapi["paths"]["/metrics"]["get"]["responses"]["200"]["content"]
+                [tempo_telemetry::PROMETHEUS_CONTENT_TYPE]["schema"]["type"],
+            "string"
         );
         assert_eq!(
             openapi["paths"]["/sessions/{session_id}/events"]["get"]["operationId"],

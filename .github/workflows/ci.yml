@@ -137,6 +137,14 @@ jobs:
           -p tempo-compat
           -p tempo-config
 
+  macos-engine-host:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.96.1
+      - name: cargo test (engine-host peer credentials)
+        run: cargo test --locked -p tempo-engine-host
+
   bench-smoke:
     runs-on: ubuntu-latest
     steps:
