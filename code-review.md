@@ -38,6 +38,18 @@ needs a concrete traced failure, not a preference for more code.
 - Security/privacy docs cannot rely on one top-level disclaimer to narrow later
   absolute claims. Wording such as "all", "every", "owns", "guarantees", or
   "resistance" needs local shipped-vs-roadmap scope where it appears.
+- "Zero history", "zero trace", and "stealth" claims need test-backed sink
+  coverage. Name the covered durable sinks, including journals, cassettes,
+  telemetry, logs, engine profiles, browser cache/storage, crash reports, and OS
+  temp files; state any OS, browser, network, or remote-service traces that are
+  out of scope.
+- Encryption claims must name protected data, key source, integrity mode,
+  rotation/recovery behavior, and fail-closed handling for missing keys,
+  unauthenticated data, and corrupt records.
+- Stealth mode is local privacy, profile isolation, retention suppression, and
+  policy enforcement. CAPTCHA solving, anti-bot bypass, or fingerprint-spoofing
+  escalation are separate product/security decisions and should not be hidden
+  under a generic stealth label.
 - Taint-to-beatbox security is not proven by `tempo-toolexec` helpers alone. A
   shipped claim needs an agent-facing runtime path that preserves page
   provenance to the execution boundary and a live beatbox canary proving
