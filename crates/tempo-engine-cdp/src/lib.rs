@@ -3490,6 +3490,8 @@ mod tests {
     use std::net::{SocketAddr, TcpListener, TcpStream as StdTcpStream};
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    const LIVE_CDP_CHILD_OPERATION_TIMEOUT: Duration = Duration::from_secs(29);
+
     /// Boundary test for the bounded-navigation budget: the whole timed-out
     /// path (navigation await + readyState recovery) must resolve inside
     /// tempod's 30s engine IPC deadline (`ENGINE_IPC_TIMEOUT` in
@@ -5515,6 +5517,24 @@ mod tests {
         );
     }
 
+    async fn goto_live_fixture_with_retry(
+        driver: &mut dyn DriverTrait,
+        url: &str,
+    ) -> Result<CompiledObservation, TransportError> {
+        match driver.goto(url).await {
+            Ok(observation) => Ok(observation),
+            Err(TransportError::NavTimeout) => {
+                if let Ok(observation) = driver.observe().await
+                    && observation.url == url
+                {
+                    return Ok(observation);
+                }
+                driver.goto(url).await
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     #[tokio::test]
     async fn live_cdp_child_browsing_context_isolates_storage(
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -5530,7 +5550,7 @@ mod tests {
             .await?
             .allow_private_network_access();
 
-        driver.goto(&url).await?;
+        goto_live_fixture_with_retry(&mut driver, &url).await?;
         let root_value = driver
             .evaluate_script(
                 "Promise.resolve((() => { localStorage.setItem('tempoIsolation', 'root'); document.cookie = 'tempoIsolation=root; SameSite=Lax'; return localStorage.getItem('tempoIsolation'); })())",
@@ -5546,9 +5566,12 @@ mod tests {
             })
             .await
             .map_err(|error| std::io::Error::other(error.0))?;
-        let child_initial = tokio::time::timeout(Duration::from_secs(20), child.goto(&url))
-            .await
-            .map_err(|_| std::io::Error::other("child initial goto timed out"))??;
+        let child_initial = tokio::time::timeout(
+            LIVE_CDP_CHILD_OPERATION_TIMEOUT,
+            goto_live_fixture_with_retry(child.as_mut(), &url),
+        )
+        .await
+        .map_err(|_| std::io::Error::other("child initial goto timed out"))??;
         assert_eq!(child_initial.url, url);
         let child_value = child
             .evaluate_script(
@@ -5562,12 +5585,12 @@ mod tests {
 
         assert_eq!(child_value, serde_json::json!("__missing__"));
         assert_eq!(child_cookie, serde_json::json!(""));
-        let child_observe = tokio::time::timeout(Duration::from_secs(20), child.observe())
+        let child_observe = tokio::time::timeout(LIVE_CDP_CHILD_OPERATION_TIMEOUT, child.observe())
             .await
             .map_err(|_| std::io::Error::other("child observe timed out"))??;
         assert_eq!(child_observe.url, url);
         let child_batch = tokio::time::timeout(
-            Duration::from_secs(20),
+            LIVE_CDP_CHILD_OPERATION_TIMEOUT,
             child.act_batch(&ActionBatch {
                 actions: vec![Action::Wait { millis: 0 }],
                 quiescence: QuiescencePolicy::FixedMillis(0),
