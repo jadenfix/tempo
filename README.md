@@ -56,6 +56,8 @@ and `scripts/new-agent-worktree.sh` to create isolated PR-sized checkouts.
 
 **[`docs/PLATFORMS.md`](./docs/PLATFORMS.md)** is the cross-platform plan — how the same agent contract ships on macOS, Windows, Android, and iOS via three engine tiers (embedded Servo, system webview, API-first no-engine), with per-hop latency budgets and per-tier RAM discipline as milestone gates.
 
+**[`docs/ENGINE_RUNTIME_GOVERNANCE_ADR.md`](./docs/ENGINE_RUNTIME_GOVERNANCE_ADR.md)** records the preview governance decisions for CDP-vs-Servo defaults, shell-to-`tempod` topology, and independent C1/C2/C3/wire-protocol versioning.
+
 ## Layout
 
 Cargo workspace under `crates/`. The implementation is split into contract, engine,
