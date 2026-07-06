@@ -2017,7 +2017,7 @@ mod tests {
             &journal_path,
             AgentRunIds::new("run-captcha", "session-captcha"),
         )
-        .with_confirmation_mode(ConfirmationMode::AutoConfirmClean);
+        .with_confirmation_mode(ConfirmationMode::AutoConfirmAll);
         // Two actions queued in one batch. The CAPTCHA appears after the first,
         // so the second must NEVER execute.
         let mut decider = ScriptedDecider::new(vec![vec![click("submit"), click("submit")]]);
@@ -2095,7 +2095,7 @@ mod tests {
             &journal_path,
             AgentRunIds::new("run-decided-anthropic", "session-decided-anthropic"),
         )
-        .with_confirmation_mode(ConfirmationMode::AutoConfirmClean)
+        .with_confirmation_mode(ConfirmationMode::AutoConfirmAll)
         .with_token_budget(TokenBudget::new(1_000));
         let mut decider = AnthropicDecider::new(fixture_config(&origin))?;
         let spec = DecidedTaskSpec::new("https://example.com", "click the submit button");
@@ -2440,7 +2440,7 @@ mod tests {
         // Force a real navigation so the driver has page state to observe.
         driver.goto("https://example.com").await?;
         let runner = AgentRunner::new(&journal_path, ids)
-            .with_confirmation_mode(ConfirmationMode::AutoConfirmClean)
+            .with_confirmation_mode(ConfirmationMode::AutoConfirmAll)
             .with_token_budget(TokenBudget::new(100));
         let mut decider = FixedUsageDecider {
             actions: Vec::new(),
@@ -2599,7 +2599,7 @@ mod tests {
             &journal_path,
             AgentRunIds::new("run-decided-rounds", "session-decided-rounds"),
         )
-        .with_confirmation_mode(ConfirmationMode::AutoConfirmClean)
+        .with_confirmation_mode(ConfirmationMode::AutoConfirmAll)
         .with_token_budget(TokenBudget::new(1_000));
         // Never reports done, so only the configured ceiling can stop the run.
         let mut decider = FixedUsageDecider {
@@ -3174,7 +3174,7 @@ mod tests {
         let spec = DecidedTaskSpec::new("https://example.com", "select a jump menu");
 
         AgentRunner::new(&journal, AgentRunIds::new("run-nav", "session-nav"))
-            .with_confirmation_mode(ConfirmationMode::AutoConfirmClean)
+            .with_confirmation_mode(ConfirmationMode::AutoConfirmAll)
             .run_decided_task(&mut driver, &mut decider, &spec)
             .await?;
 
