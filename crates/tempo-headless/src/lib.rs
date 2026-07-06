@@ -2729,6 +2729,13 @@ impl SessionPool {
         Ok(driver)
     }
 
+    fn ensure_session_record(&self, id: &TempodSessionId) -> Result<(), TempodError> {
+        if !self.sessions.contains_key(id) {
+            return Err(TempodError::SessionNotFound(id.clone()));
+        }
+        Ok(())
+    }
+
     /// Recovers the true creation order encoded in a session id minted by
     /// `finish_create` (`format!("session-{}", self.next_id)`). `next_id` is a
     /// strictly monotonic per-pool counter, so the parsed suffix is an exact
@@ -8347,6 +8354,9 @@ fn route_session_mcp(
     origin: Option<&str>,
     body: &[u8],
 ) -> HttpResponse {
+    if let Err(error) = lock_pool(pool).and_then(|pool| pool.ensure_session_record(id)) {
+        return tempod_error_response(&error);
+    }
     if let Some(response) = route_session_mcp_shared_session_tool(pool, id, origin, body) {
         return response;
     }
@@ -14955,6 +14965,30 @@ mod tests {
         assert!(tool_names.contains(&"act_batch"));
         assert!(!tool_names.contains(&"fork"));
         assert!(!tool_names.contains(&"close_fork"));
+        Ok(())
+    }
+
+    #[test]
+    fn session_scoped_mcp_tools_list_rejects_unknown_session() -> TestResult {
+        let mut pool = SessionPool::default();
+
+        let response = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/sessions/missing/mcp".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: br#"{"jsonrpc":"2.0","id":41,"method":"tools/list"}"#.to_vec(),
+            },
+        )?;
+
+        assert_eq!(response.status, 404);
+        let value: Value = serde_json::from_slice(&response.body)?;
+        assert!(value["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("session not found")));
         Ok(())
     }
 
