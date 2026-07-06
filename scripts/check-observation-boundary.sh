@@ -6,7 +6,7 @@ cd "$root"
 
 # Raw engine accessibility/compiler-input types must stay in engine adapters or
 # fixtures. tempod-side crates consume tempo-schema observations/diffs only.
-raw_boundary_pattern='(accesskit::|AccessKit|TreeUpdate|AXNode|AXTree|FullAXTree|GetFullAXTree|RawElement|ObservationInput|StableIdMapper|finalize_observation)'
+raw_boundary_pattern='(accesskit::|AccessKit|TreeUpdate|AxNode|AxValue|AXNode|AXTree|FullAXTree|GetFullAXTree|GetPartialAxTree|RawElement|ObservationInput|ObservationCompiler|StableIdMapper|finalize_observation)'
 
 scan_raw_boundary_leaks() {
   local found=1 file matches
@@ -38,6 +38,7 @@ violations="$(
     crates/tempo-bidi/src \
     crates/tempo-agent/src \
     crates/tempo-engine-host/src \
+    crates/tempo-schema/src \
     || true
 )"
 
@@ -68,3 +69,19 @@ require_grep 'docs/OBSERVATION_COMPILE_LOCUS_ADR.md' \
 require_grep 'native Servo/out-of-process lane is deferred' \
   final.md \
   'final.md must scope native Servo engine-side observation compilation as deferred until wired'
+
+require_grep '^tempo-observe[[:space:]]*=' \
+  crates/tempo-engine-cdp/Cargo.toml \
+  'tempo-engine-cdp must keep tempo-observe so CDP AX/DOM data is compiled before DriverResponse crosses into tempod'
+
+servo_raw_imports="$(scan_raw_boundary_leaks crates/tempo-engine-servo/src || true)"
+if [[ -n "$servo_raw_imports" ]] \
+  && ! grep -Eq '^tempo-observe[[:space:]]*=' crates/tempo-engine-servo/Cargo.toml; then
+  cat >&2 <<'MSG'
+tempo-engine-servo mentions raw accessibility/compiler-input types but does not
+depend on tempo-observe. The native lane must compile AccessKit-derived inputs
+inside the engine process before DriverResponse crosses into tempod.
+MSG
+  printf '%s\n' "$servo_raw_imports" >&2
+  exit 1
+fi
