@@ -64,7 +64,7 @@ Resource, lifecycle & availability:
 - [ ] Size caps are enforced before or during construction/serialization of remote-driven JSON, DOM, screenshot, log, and tool-result data. A check that rejects only after allocating the complete payload is not a memory bound.
 - [ ] Bounded serialization helpers measure the source `Serialize` value before materializing an owned `Value`; converting to an owned tree before the cap check is still post-allocation rejection.
 - [ ] Stateful protocol handlers enforce live-state quotas in addition to per-message size caps; repeated valid commands must not grow maps, vectors, or dispatch scans without bound.
-- [ ] Moving blocking work onto std threads or blocking pools is not itself a bound; client-triggered thread fan-out needs a shared in-flight cap and an immediate structured rejection path.
+- [ ] Moving blocking work onto std threads or blocking pools is not itself a bound; client-triggered thread fan-out needs a shared in-flight cap and an immediate structured rejection path. If the work can drive engine operations or side effects, client disconnect must cancel before dispatch or remain covered by an independent live-work quota.
 - [ ] Every engine/remote/subprocess round-trip has a timeout **and** a recovery path — a crash or hang is detected and healed (restart/reconnect, with backoff), not permanently terminal.
 - [ ] `timeout` around a create-style browser/remote call is not cancellation; dropped futures can still create remote resources, so timeout paths need a reap, track, or cleanup strategy.
 - [ ] Deadline fixes bound the whole path, including setup and cleanup awaits introduced by the fix; timeout values are derived from the caller's deadline with recovery margin, not just from test silence.

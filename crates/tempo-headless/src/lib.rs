@@ -33,7 +33,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::TrySendError;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread;
@@ -92,6 +92,10 @@ const CONFIRMATION_TOKEN_BYTES: usize = 32;
 const MAX_WS_PAYLOAD_BYTES: usize = MAX_HTTP_BYTES;
 /// Maximum accepted TCP control-plane connections handled concurrently.
 const MAX_HTTP_CONNECTIONS: usize = 128;
+/// Maximum detached blocking route workers that may keep running after a client
+/// disconnects before the response is delivered. This caps engine-side work
+/// that `spawn_blocking` cannot cancel once started.
+const MAX_BLOCKING_ROUTE_TASKS: usize = 64;
 /// Maximum retained tempod sessions. Killed sessions stay in the in-memory
 /// session map until the reaper lands (#412), so cap the retained map, not just
 /// currently-running sessions.
@@ -107,6 +111,7 @@ const SOCKET_TIMEOUT: Duration = Duration::from_secs(30);
 /// Timeout applied to engine-host IPC round-trips so a stalled engine cannot
 /// wedge the daemon indefinitely.
 const ENGINE_IPC_TIMEOUT: Duration = Duration::from_secs(30);
+const OP_GATE_CANCEL_POLL: Duration = Duration::from_millis(10);
 /// Name of the packaged CDP engine host binary expected next to `tempod`.
 pub const PACKAGED_CDP_ENGINE_BINARY: &str = "tempo-engined-cdp";
 const AUTO_CDP_ENGINE_MAX_RESTARTS: u32 = u32::MAX;
@@ -635,6 +640,43 @@ const fn metrics_enabled_for_privacy(
     configured_metrics_enabled && privacy_mode.retains_history()
 }
 
+#[derive(Clone, Default)]
+struct RequestCancel {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl RequestCancel {
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    fn check_driver(&self) -> Result<(), DriverClientError> {
+        if self.is_cancelled() {
+            return Err(DriverClientError::Cancelled);
+        }
+        Ok(())
+    }
+
+    fn check_tempod(&self) -> Result<(), TempodError> {
+        if self.is_cancelled() {
+            return Err(TempodError::RequestCancelled);
+        }
+        Ok(())
+    }
+}
+
+struct RequestCancelOnDrop(RequestCancel);
+
+impl Drop for RequestCancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
 /// Per-driver (per browsing context / fork / root) operation gate.
 ///
 /// Serializes engine round-trips issued through clones of the SAME driver
@@ -671,6 +713,35 @@ impl OpGate {
             let remaining = deadline
                 .and_then(|deadline| deadline.checked_duration_since(std::time::Instant::now()))?;
             busy = match self.released.wait_timeout(busy, remaining) {
+                Ok((guard, _)) => guard,
+                Err(poisoned) => poisoned.into_inner().0,
+            };
+        }
+    }
+
+    fn acquire_cancellable(
+        self: &Arc<Self>,
+        timeout: Duration,
+        cancel: &RequestCancel,
+    ) -> Result<OpGateGuard, DriverClientError> {
+        let deadline = std::time::Instant::now().checked_add(timeout);
+        let mut busy = self
+            .busy
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        loop {
+            cancel.check_driver()?;
+            if !*busy {
+                *busy = true;
+                return Ok(OpGateGuard {
+                    gate: Arc::clone(self),
+                });
+            }
+            let remaining = deadline
+                .and_then(|deadline| deadline.checked_duration_since(std::time::Instant::now()))
+                .ok_or(DriverClientError::Busy)?;
+            let wait = remaining.min(OP_GATE_CANCEL_POLL);
+            busy = match self.released.wait_timeout(busy, wait) {
                 Ok((guard, _)) => guard,
                 Err(poisoned) => poisoned.into_inner().0,
             };
@@ -739,13 +810,29 @@ impl AttachedEngineDriver {
     }
 
     fn request(&self, command: HostDriverCommand) -> Result<DriverResponse, DriverClientError> {
+        self.request_cancellable(command, None)
+    }
+
+    fn request_cancellable(
+        &self,
+        command: HostDriverCommand,
+        cancel: Option<&RequestCancel>,
+    ) -> Result<DriverResponse, DriverClientError> {
         // Same-driver ordering: hold this driver's gate for the round-trip.
         // The gate wait and the round-trip itself are both bounded, and no
         // other lock (pool, MCP, or another session's gate) is held here.
-        let _gate = self
-            .gate
-            .acquire(ENGINE_IPC_TIMEOUT)
-            .ok_or(DriverClientError::Busy)?;
+        let _gate = match cancel {
+            Some(cancel) => self.gate.acquire_cancellable(ENGINE_IPC_TIMEOUT, cancel)?,
+            None => self
+                .gate
+                .acquire(ENGINE_IPC_TIMEOUT)
+                .ok_or(DriverClientError::Busy)?,
+        };
+        // After the frame is written, cancellation cannot safely release the
+        // same-driver gate because the engine may still be applying a mutation.
+        if let Some(cancel) = cancel {
+            cancel.check_driver()?;
+        }
         Ok(self
             .client
             .request_for(self.driver_id.as_deref(), command, ENGINE_IPC_TIMEOUT)?)
@@ -787,6 +874,22 @@ impl AttachedEngineDriver {
         }
     }
 
+    fn request_observation_cancellable(
+        &self,
+        command: HostDriverCommand,
+        expected: &'static str,
+        cancel: &RequestCancel,
+    ) -> Result<CompiledObservation, TransportError> {
+        match self
+            .request_cancellable(command, Some(cancel))
+            .map_err(driver_client_transport_error)?
+        {
+            DriverResponse::Observation { observation } => Ok(observation),
+            DriverResponse::Error { error } => Err(driver_wire_transport_error(error)),
+            other => Err(unexpected_driver_response(other, expected)),
+        }
+    }
+
     fn request_diff(
         &self,
         command: HostDriverCommand,
@@ -814,6 +917,28 @@ impl AttachedEngineDriver {
             DriverResponse::Step { outcome } => Ok(outcome.into()),
             DriverResponse::Error { error } => Err(driver_wire_transport_error(error)),
             other => Err(unexpected_driver_response(other, expected)),
+        }
+    }
+
+    fn request_step_cancellable(
+        &self,
+        command: HostDriverCommand,
+        expected: &'static str,
+        cancel: &RequestCancel,
+    ) -> Result<StepOutcome, CancellableDriverError> {
+        match self
+            .request_cancellable(command, Some(cancel))
+            .map_err(|error| match error {
+                DriverClientError::Cancelled => CancellableDriverError::CancelledBeforeDispatch,
+                other => CancellableDriverError::Transport(driver_client_transport_error(other)),
+            })? {
+            DriverResponse::Step { outcome } => Ok(outcome.into()),
+            DriverResponse::Error { error } => Err(CancellableDriverError::Transport(
+                driver_wire_transport_error(error),
+            )),
+            other => Err(CancellableDriverError::Transport(
+                unexpected_driver_response(other, expected),
+            )),
         }
     }
 
@@ -898,6 +1023,29 @@ impl AttachedEngineDriver {
             Ok(_) => Err(Unsupported("unexpected engine IPC create context response")),
             Err(_) => Err(Unsupported("engine IPC create context failed")),
         }
+    }
+
+    fn observe_with_cancel(
+        &self,
+        cancel: &RequestCancel,
+    ) -> Result<CompiledObservation, TransportError> {
+        self.request_observation_cancellable(HostDriverCommand::Observe, "observe", cancel)
+    }
+
+    fn act_batch_with_cancel(
+        &self,
+        batch: &ActionBatch,
+        cancel: &RequestCancel,
+    ) -> Result<StepOutcome, CancellableDriverError> {
+        enforce_batch_navigation_url_policy_transport(&self.url_policy, batch)
+            .map_err(CancellableDriverError::Transport)?;
+        self.request_step_cancellable(
+            HostDriverCommand::ActBatch {
+                batch: batch.clone(),
+            },
+            "act_batch",
+            cancel,
+        )
     }
 }
 
@@ -991,12 +1139,19 @@ impl DriverTrait for AttachedEngineDriver {
 
 #[derive(Debug, Error)]
 enum DriverClientError {
+    #[error("request was cancelled before dispatch")]
+    Cancelled,
     #[error(
         "engine driver is busy: another operation on this session/context did not finish in time"
     )]
     Busy,
     #[error("engine host failed: {0}")]
     Host(#[from] EngineHostError),
+}
+
+enum CancellableDriverError {
+    CancelledBeforeDispatch,
+    Transport(TransportError),
 }
 
 /// In-memory session pool for a tempod process.
@@ -2435,6 +2590,26 @@ impl SessionPool {
                 },
             );
         Ok(())
+    }
+
+    fn clear_session_act_batch_response(
+        &mut self,
+        id: &TempodSessionId,
+        key: &str,
+        request_fingerprint: &JsonValue,
+    ) {
+        let Some(bucket) = self.session_act_batch_idempotency.get_mut(id) else {
+            return;
+        };
+        let should_remove = bucket
+            .get(key)
+            .is_some_and(|entry| &entry.request_fingerprint == request_fingerprint);
+        if should_remove {
+            bucket.remove(key);
+        }
+        if bucket.is_empty() {
+            self.session_act_batch_idempotency.remove(id);
+        }
     }
 
     #[cfg(test)]
@@ -3937,13 +4112,17 @@ fn reconnect_engine(
 #[derive(Clone)]
 struct ConnectionLimiter {
     http: Arc<Semaphore>,
+    blocking_routes: Arc<Semaphore>,
     websocket: Arc<Semaphore>,
     #[cfg(test)]
     max_http: usize,
+    #[cfg(test)]
+    max_blocking_routes: usize,
     max_websocket: usize,
 }
 
 type ConnectionPermit = OwnedSemaphorePermit;
+type BlockingRoutePermit = OwnedSemaphorePermit;
 
 /// Per-connection slot holding the HTTP connection permit. A successful BiDi
 /// WebSocket upgrade takes the HTTP permit out and holds a WebSocket permit
@@ -3959,11 +4138,22 @@ impl Default for ConnectionLimiter {
 
 impl ConnectionLimiter {
     fn new(max_http: usize, max_websocket: usize) -> Self {
+        Self::new_with_blocking(max_http, max_websocket, MAX_BLOCKING_ROUTE_TASKS)
+    }
+
+    fn new_with_blocking(
+        max_http: usize,
+        max_websocket: usize,
+        max_blocking_routes: usize,
+    ) -> Self {
         Self {
             http: Arc::new(Semaphore::new(max_http)),
+            blocking_routes: Arc::new(Semaphore::new(max_blocking_routes)),
             websocket: Arc::new(Semaphore::new(max_websocket)),
             #[cfg(test)]
             max_http,
+            #[cfg(test)]
+            max_blocking_routes,
             max_websocket,
         }
     }
@@ -3976,9 +4166,19 @@ impl ConnectionLimiter {
         Arc::clone(&self.websocket).try_acquire_owned().ok()
     }
 
+    fn try_acquire_blocking_route(&self) -> Option<BlockingRoutePermit> {
+        Arc::clone(&self.blocking_routes).try_acquire_owned().ok()
+    }
+
     fn active_websockets(&self) -> usize {
         self.max_websocket
             .saturating_sub(self.websocket.available_permits())
+    }
+
+    #[cfg(test)]
+    fn active_blocking_routes(&self) -> usize {
+        self.max_blocking_routes
+            .saturating_sub(self.blocking_routes.available_permits())
     }
 
     #[cfg(test)]
@@ -4631,6 +4831,29 @@ where
     }
 }
 
+/// Run a potentially engine-driving blocking route behind a separate worker
+/// cap. If the HTTP client disconnects, Tokio cannot cancel a started
+/// `spawn_blocking` closure, so the permit rides inside the closure and keeps
+/// detached work bounded until it actually finishes.
+async fn run_limited_blocking<T, F>(limiter: ConnectionLimiter, work: F) -> Response
+where
+    T: IntoResponse + Send + 'static,
+    F: FnOnce(RequestCancel) -> T + Send + 'static,
+{
+    let Some(permit) = limiter.try_acquire_blocking_route() else {
+        return TempodError::ConnectionLimit("blocking route worker limit reached".into())
+            .into_response();
+    };
+    let cancel = RequestCancel::default();
+    let worker_cancel = cancel.clone();
+    let _cancel_on_drop = RequestCancelOnDrop(cancel);
+    run_blocking(move || {
+        let _permit = permit;
+        work(worker_cancel)
+    })
+    .await
+}
+
 /// GET /health never touches the pool or the blocking pool: it must answer
 /// even while every route worker is busy with engine or lock work.
 async fn health() -> HttpResponse {
@@ -5024,10 +5247,13 @@ async fn session_act_batch(
     UrlPath(id): UrlPath<String>,
     body: Bytes,
 ) -> Response {
-    run_blocking(move || -> Result<HttpResponse, TempodError> {
-        let body = parse_session_act_batch_request(&body)?;
-        route_session_act_batch(&state.pool, TempodSessionId(id), body)
-    })
+    run_limited_blocking(
+        state.limiter.clone(),
+        move |cancel| -> Result<HttpResponse, TempodError> {
+            let body = parse_session_act_batch_request(&body)?;
+            route_session_act_batch(&state.pool, TempodSessionId(id), body, &cancel)
+        },
+    )
     .await
 }
 
@@ -5390,6 +5616,7 @@ fn session_batch_policy_observation(
     pool: &Arc<Mutex<SessionPool>>,
     id: &TempodSessionId,
     body: &SessionActBatchRequest,
+    cancel: &RequestCancel,
 ) -> Result<Option<CompiledObservation>, TempodError> {
     let claims = session_batch_caller_claims(body);
     let needs_evidence = body.batch.actions.iter().any(|action| {
@@ -5398,10 +5625,11 @@ fn session_batch_policy_observation(
     if !needs_evidence {
         return Ok(None);
     }
+    cancel.check_tempod()?;
     // Clone the driver handle under a brief lock, then observe with NO pool lock
     // held (engine round-trip, #230). observe carries the existing IPC timeout.
-    let mut driver = lock_pool(pool)?.session_driver(id)?;
-    let observation = futures::executor::block_on(driver.observe()).map_err(|error| {
+    let driver = lock_pool(pool)?.session_driver(id)?;
+    let observation = driver.observe_with_cancel(cancel).map_err(|error| {
         TempodError::Driver(format!(
             "policy taint recomputation requires an observation, but observe failed: {error}"
         ))
@@ -5413,8 +5641,10 @@ fn route_session_act_batch(
     pool: &Arc<Mutex<SessionPool>>,
     id: TempodSessionId,
     body: SessionActBatchRequest,
+    cancel: &RequestCancel,
 ) -> Result<HttpResponse, TempodError> {
     let request_fingerprint = session_act_batch_idempotency_fingerprint(&body);
+    cancel.check_tempod()?;
     {
         let pool = lock_pool(pool)?;
         pool.ensure_foreground_writer_available(&id)?;
@@ -5431,9 +5661,10 @@ fn route_session_act_batch(
     // could change a gate outcome, and do it with NO pool lock held (engine
     // round-trip, #230). Evidence-free denials never observe or reserve the
     // idempotency lease.
-    let observation = session_batch_policy_observation(pool, &id, &body)?;
+    let observation = session_batch_policy_observation(pool, &id, &body, cancel)?;
+    cancel.check_tempod()?;
 
-    let (mut driver, idempotency_key, policy, consume_grant) = {
+    let (driver, idempotency_key, policy, consume_grant) = {
         let mut pool = lock_pool(pool)?;
         pool.ensure_foreground_writer_available(&id)?;
         let server_confirmed = pool.validate_confirmation_grant(
@@ -5488,12 +5719,19 @@ fn route_session_act_batch(
         (driver, idempotency_key, policy, server_confirmed)
     };
 
-    let response = match futures::executor::block_on(driver.act_batch(&body.batch)) {
+    cancel.check_tempod()?;
+    let response = match driver.act_batch_with_cancel(&body.batch, cancel) {
         Ok(outcome) => CachedSessionActBatchResponse {
             status: 200,
             body: step_outcome_response(outcome, policy),
         },
-        Err(error) => CachedSessionActBatchResponse {
+        Err(CancellableDriverError::CancelledBeforeDispatch) => {
+            if let Some(key) = idempotency_key.as_deref() {
+                lock_pool(pool)?.clear_session_act_batch_response(&id, key, &request_fingerprint);
+            }
+            return Err(TempodError::RequestCancelled);
+        }
+        Err(CancellableDriverError::Transport(error)) => CachedSessionActBatchResponse {
             status: 500,
             body: json!({ "error": error.to_string() }),
         },
@@ -8253,6 +8491,8 @@ pub enum TempodError {
     Conflict(String),
     #[error("forbidden: {0}")]
     Forbidden(String),
+    #[error("request cancelled before dispatch")]
+    RequestCancelled,
     #[error("{0}")]
     PolicyDenied(Box<PolicyDeniedError>),
     #[error("connection limit reached: {0}")]
@@ -8282,6 +8522,7 @@ impl TempodError {
             Self::Unauthorized(_) => 401,
             Self::Conflict(_) => 409,
             Self::Forbidden(_) => 403,
+            Self::RequestCancelled => 499,
             Self::PolicyDenied(_) => 403,
             Self::SessionLimit { .. } => 429,
             Self::SessionNotFound(_) | Self::EngineNotFound(_) => 404,
@@ -15774,6 +16015,64 @@ mod tests {
 
         drop(held);
         assert!(!handle.is_finished());
+        Ok(())
+    }
+
+    #[test]
+    fn issue414_limited_blocking_route_rejects_when_worker_budget_is_exhausted() -> TestResult {
+        let limiter = ConnectionLimiter::new_with_blocking(1, 1, 1);
+        let held = limiter
+            .try_acquire_blocking_route()
+            .ok_or("initial blocking route permit must be available")?;
+        assert_eq!(limiter.active_blocking_routes(), 1);
+
+        let runtime = transport_runtime()?;
+        let rejected = runtime.block_on(run_limited_blocking(
+            limiter.clone(),
+            |_| -> Result<HttpResponse, TempodError> {
+                Ok(HttpResponse::json(200, json!({"unexpected": true})))
+            },
+        ));
+        assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(limiter.active_blocking_routes(), 1);
+
+        drop(held);
+        let accepted = runtime.block_on(run_limited_blocking(
+            limiter.clone(),
+            |_| -> Result<HttpResponse, TempodError> { Ok(HttpResponse::json(200, json!({}))) },
+        ));
+        assert_eq!(accepted.status(), StatusCode::OK);
+        assert_eq!(limiter.active_blocking_routes(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn issue414_op_gate_waiter_returns_promptly_when_request_is_cancelled() -> TestResult {
+        let gate = Arc::new(OpGate::default());
+        let _held = gate
+            .acquire(Duration::from_secs(1))
+            .ok_or("initial gate acquisition must succeed")?;
+        let cancel = RequestCancel::default();
+        let waiter_gate = Arc::clone(&gate);
+        let waiter_cancel = cancel.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let waiter = thread::spawn(move || {
+            let _ = started_tx.send(());
+            let started = Instant::now();
+            let result = waiter_gate.acquire_cancellable(Duration::from_secs(5), &waiter_cancel);
+            (result, started.elapsed())
+        });
+
+        started_rx.recv_timeout(Duration::from_secs(1))?;
+        thread::sleep(Duration::from_millis(20));
+        cancel.cancel();
+        let (result, elapsed) = waiter.join().map_err(|_| "gate waiter panicked")?;
+
+        assert!(matches!(result, Err(DriverClientError::Cancelled)));
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "cancelled gate waiter should not wait for full timeout: {elapsed:?}"
+        );
         Ok(())
     }
 
