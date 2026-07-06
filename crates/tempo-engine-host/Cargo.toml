@@ -15,7 +15,7 @@ tempo-driver = { path = "../tempo-driver" }
 tempo-schema = { path = "../tempo-schema" }
 tempo-session = { path = "../tempo-session" }
 serde.workspace = true
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
 thiserror.workspace = true
 tokio = { version = "1", features = ["rt"] }
 
