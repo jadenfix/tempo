@@ -1565,6 +1565,96 @@ pub const DEFAULT_CRAWL_MAX_PENDING_BYTES_PER_ORIGIN: usize = 512 * 1024;
 /// supplied deterministic ticks.
 pub const DEFAULT_CRAWL_MIN_DELAY_TICKS: u64 = 1;
 
+/// Machine-readable crawl/AI usage categories understood by Tempo's consent
+/// parser (#243). Unknown AIPREF/RSL categories are ignored until the runtime
+/// has a concrete behavior for them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CrawlUsageCategory {
+    /// Search/RAG-style retrieval and indexing.
+    Search,
+    /// Training or derivative model-building retention.
+    TrainAi,
+}
+
+/// Parsed AIPREF `Content-Usage` preferences from response headers or
+/// robots.txt. Missing categories are permissive; explicit `n` denies that
+/// category.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ContentUsagePolicy {
+    search: Option<bool>,
+    train_ai: Option<bool>,
+}
+
+impl ContentUsagePolicy {
+    pub fn parse_header_values<'a>(values: impl IntoIterator<Item = &'a str>) -> Self {
+        let mut policy = Self::default();
+        for value in values {
+            policy.apply_directives(value);
+        }
+        policy
+    }
+
+    pub fn allows(&self, category: CrawlUsageCategory) -> bool {
+        match category {
+            CrawlUsageCategory::Search => self.search.unwrap_or(true),
+            CrawlUsageCategory::TrainAi => self.train_ai.unwrap_or(true),
+        }
+    }
+
+    pub fn explicit(&self, category: CrawlUsageCategory) -> Option<bool> {
+        match category {
+            CrawlUsageCategory::Search => self.search,
+            CrawlUsageCategory::TrainAi => self.train_ai,
+        }
+    }
+
+    fn apply_directives(&mut self, value: &str) {
+        for token in value.split([',', ';']) {
+            let Some((name, raw_decision)) = token.split_once('=') else {
+                continue;
+            };
+            let Some(decision) = parse_content_usage_decision(raw_decision) else {
+                continue;
+            };
+            match normalize_content_usage_name(name).as_str() {
+                "search" => self.search = Some(decision),
+                "train-ai" => self.train_ai = Some(decision),
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Response-level crawl classification. Payment-required is separated from
+/// generic errors so callers can surface pay-per-crawl policy to users instead
+/// of retrying or treating it as an engine failure.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CrawlResponseClassification {
+    Normal,
+    PaymentRequired { price: String },
+}
+
+pub fn content_usage_from_response(response: &NetworkResponseRecord) -> ContentUsagePolicy {
+    ContentUsagePolicy::parse_header_values(
+        response
+            .header_values("content-usage")
+            .into_iter()
+            .flatten()
+            .map(String::as_str),
+    )
+}
+
+pub fn classify_crawl_response(response: &NetworkResponseRecord) -> CrawlResponseClassification {
+    if response.status == 402
+        && let Some(price) = response
+            .header_values("crawler-price")
+            .and_then(|values| values.iter().find_map(|value| nonempty_header_value(value)))
+    {
+        return CrawlResponseClassification::PaymentRequired { price };
+    }
+    CrawlResponseClassification::Normal
+}
+
 /// Origin-scoped crawl policy evaluated before dispatching a request.
 #[derive(Clone, PartialEq, Eq)]
 pub struct CrawlPolicy {
@@ -1636,6 +1726,7 @@ impl Default for CrawlPolicy {
 pub struct RobotsRules {
     directives: Vec<RobotsDirective>,
     crawl_delay_ticks: Option<u64>,
+    content_usage: ContentUsagePolicy,
 }
 
 impl RobotsRules {
@@ -1650,6 +1741,7 @@ impl RobotsRules {
                 path: "/".into(),
             }],
             crawl_delay_ticks: None,
+            content_usage: ContentUsagePolicy::default(),
         }
     }
 
@@ -1726,6 +1818,10 @@ impl RobotsRules {
                     }
                     current_group_has_rules = true;
                 }
+                "content-usage" => {
+                    current_group.content_usage.apply_directives(value);
+                    current_group_has_rules = true;
+                }
                 _ => {}
             }
         }
@@ -1760,6 +1856,14 @@ impl RobotsRules {
     pub fn crawl_delay_ticks(&self) -> Option<u64> {
         self.crawl_delay_ticks
     }
+
+    pub fn content_usage(&self) -> &ContentUsagePolicy {
+        &self.content_usage
+    }
+
+    pub fn allows_usage(&self, category: CrawlUsageCategory) -> bool {
+        self.content_usage.allows(category)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1779,6 +1883,7 @@ struct RobotsGroup {
     agents: Vec<String>,
     directives: Vec<RobotsDirective>,
     crawl_delay_ticks: Option<u64>,
+    content_usage: ContentUsagePolicy,
 }
 
 impl RobotsGroup {
@@ -1786,6 +1891,7 @@ impl RobotsGroup {
         if self.agents.is_empty() {
             self.directives.clear();
             self.crawl_delay_ticks = None;
+            self.content_usage = ContentUsagePolicy::default();
             return;
         }
         groups.push(std::mem::take(self));
@@ -1822,6 +1928,7 @@ fn select_robots_rules(target: &str, groups: Vec<RobotsGroup>) -> RobotsRules {
                     .unwrap_or(delay),
             );
         }
+        merge_content_usage(&mut rules.content_usage, group.content_usage);
     }
     rules
 }
@@ -3866,6 +3973,45 @@ fn header_value_count(headers: &BTreeMap<String, Vec<String>>) -> usize {
     headers.values().map(Vec::len).sum()
 }
 
+fn normalize_content_usage_name(name: &str) -> String {
+    name.trim()
+        .trim_matches('"')
+        .to_ascii_lowercase()
+        .replace('_', "-")
+}
+
+fn parse_content_usage_decision(value: &str) -> Option<bool> {
+    match value.trim().trim_matches('"').to_ascii_lowercase().as_str() {
+        "y" | "yes" | "true" | "1" | "allow" | "allowed" => Some(true),
+        "n" | "no" | "false" | "0" | "deny" | "denied" | "disallow" | "disallowed" => Some(false),
+        _ => None,
+    }
+}
+
+fn merge_content_usage(target: &mut ContentUsagePolicy, source: ContentUsagePolicy) {
+    if let Some(search) = source.search {
+        target.search = Some(
+            target
+                .search
+                .map(|current| current && search)
+                .unwrap_or(search),
+        );
+    }
+    if let Some(train_ai) = source.train_ai {
+        target.train_ai = Some(
+            target
+                .train_ai
+                .map(|current| current && train_ai)
+                .unwrap_or(train_ai),
+        );
+    }
+}
+
+fn nonempty_header_value(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
 fn crawl_origin(origin_or_url: &str) -> Result<String, CrawlError> {
     let parts = UrlParts::parse(origin_or_url).map_err(|reason| CrawlError { reason })?;
     Ok(parts.origin())
@@ -5678,6 +5824,73 @@ Crawl-delay: 3
         assert!(robots.allows_path("/private/public"));
         assert!(robots.allows_path("/public"));
         assert_eq!(robots.crawl_delay_ticks(), Some(3));
+    }
+
+    #[test]
+    fn content_usage_response_headers_parse_per_category() {
+        let response = NetworkResponseRecord::new("r1", "https://example.com/page", 200)
+            .with_header("Content-Usage", "search=n, train-ai=y")
+            .with_header("Content-Usage", "unknown=n; train_ai=no");
+
+        let policy = content_usage_from_response(&response);
+
+        assert_eq!(policy.explicit(CrawlUsageCategory::Search), Some(false));
+        assert_eq!(policy.explicit(CrawlUsageCategory::TrainAi), Some(false));
+        assert!(!policy.allows(CrawlUsageCategory::Search));
+        assert!(!policy.allows(CrawlUsageCategory::TrainAi));
+    }
+
+    #[test]
+    fn robots_rules_parse_content_usage_for_matching_agent() {
+        let robots = RobotsRules::parse_for_agent(
+            "TempoBot",
+            r#"
+User-agent: OtherBot
+Content-Usage: search=n, train-ai=n
+
+User-agent: TempoBot
+Allow: /
+Content-Usage: search=y, train-ai=n
+"#,
+        );
+
+        assert!(robots.allows_path("/page"));
+        assert!(robots.allows_usage(CrawlUsageCategory::Search));
+        assert!(!robots.allows_usage(CrawlUsageCategory::TrainAi));
+        assert_eq!(
+            robots.content_usage().explicit(CrawlUsageCategory::Search),
+            Some(true)
+        );
+        assert_eq!(
+            robots.content_usage().explicit(CrawlUsageCategory::TrainAi),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn crawl_response_classifies_pay_per_crawl_402() {
+        let paid = NetworkResponseRecord::new("r1", "https://example.com/page", 402)
+            .with_header("crawler-price", "USD 0.001");
+        assert_eq!(
+            classify_crawl_response(&paid),
+            CrawlResponseClassification::PaymentRequired {
+                price: "USD 0.001".into()
+            }
+        );
+
+        let ordinary_402 = NetworkResponseRecord::new("r2", "https://example.com/page", 402);
+        assert_eq!(
+            classify_crawl_response(&ordinary_402),
+            CrawlResponseClassification::Normal
+        );
+
+        let advertised_without_402 =
+            NetworkResponseRecord::new("r3", "https://example.com/page", 200)
+                .with_header("crawler-price", "USD 0.001");
+        assert_eq!(
+            classify_crawl_response(&advertised_without_402),
+            CrawlResponseClassification::Normal
+        );
     }
 
     #[test]
