@@ -47,6 +47,53 @@ fn session_state_label(state: TempodSessionState) -> &'static str {
     }
 }
 
+/// Human-facing session id for dense UI rows. The full id remains available via
+/// hover/tooltips and actions; the visible row should not be a UUID wall.
+pub fn compact_session_id(id: &str) -> String {
+    compact_middle(id, 8, 4)
+}
+
+pub fn session_state_display(state: &str) -> &'static str {
+    match state {
+        "running" => "Running",
+        "adopted" => "Human",
+        "killed" => "Closed",
+        _ => "Unknown",
+    }
+}
+
+pub fn session_row_title(row: &SessionRow) -> String {
+    let host = display_host(&row.url).unwrap_or(row.url.as_str());
+    format!("{} - {}", session_state_display(&row.state), host)
+}
+
+fn compact_middle(value: &str, prefix: usize, suffix: usize) -> String {
+    let len = value.chars().count();
+    if len <= prefix + suffix + 3 {
+        return value.to_string();
+    }
+    let head = value.chars().take(prefix).collect::<String>();
+    let tail = value
+        .chars()
+        .rev()
+        .take(suffix)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<String>();
+    format!("{head}...{tail}")
+}
+
+fn display_host(url: &str) -> Option<&str> {
+    let (_, rest) = url.split_once("://")?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    if authority.is_empty() {
+        None
+    } else {
+        Some(authority)
+    }
+}
+
 /// The slice of [`ShellClient`] the window needs. Expressed as a trait so the
 /// reducer is testable against a mock without opening a socket — and so the
 /// transport is never reimplemented: [`ShellClient`] is the only production
@@ -241,6 +288,9 @@ pub struct ShellUiModel {
     pub open_url: String,
     pub sessions: Vec<SessionRow>,
     pub status: String,
+    /// Most recent transport/action failure, rendered as a compact error banner
+    /// by the window instead of being buried in the ordinary status line.
+    pub last_error: Option<String>,
     pub healthy: Option<bool>,
     /// One tab per tempod session, each with its own history/omnibox/snapshot.
     pub tabs: Vec<Tab>,
@@ -261,6 +311,7 @@ impl Default for ShellUiModel {
             open_url: String::new(),
             sessions: Vec::new(),
             status: "Idle — press Refresh to list sessions.".to_string(),
+            last_error: None,
             healthy: None,
             tabs: Vec::new(),
             active_tab: None,
@@ -333,7 +384,8 @@ impl ShellUiModel {
                 // A new tab targets its tempod session; root MCP is reserved for
                 // CLI/legacy attached-driver calls.
                 let tab = Tab::new(row.id.clone(), None, session.url.clone());
-                self.status = format!("Opened tab {} → {}", row.id, row.url);
+                self.status = format!("Opened tab {} -> {}", compact_session_id(&row.id), row.url);
+                self.last_error = None;
                 self.upsert(row);
                 self.tabs.push(tab);
                 self.active_tab = Some(self.tabs.len() - 1);
@@ -345,7 +397,8 @@ impl ShellUiModel {
 
     fn select_tab(&mut self, index: usize) {
         if let Some(tab) = self.tabs.get(index) {
-            self.status = format!("Switched to tab {}", tab.session_id);
+            self.status = format!("Switched to tab {}", compact_session_id(&tab.session_id));
+            self.last_error = None;
             self.active_tab = Some(index);
             self.marks_overlay = tab.surface.marks_overlay;
         } else {
@@ -372,7 +425,8 @@ impl ShellUiModel {
                     .active_tab()
                     .map(|tab| tab.surface.marks_overlay)
                     .unwrap_or(false);
-                self.status = format!("Closed tab {session_id}");
+                self.status = format!("Closed tab {}", compact_session_id(&session_id));
+                self.last_error = None;
             }
             Err(err) => self.set_error("close tab", &err),
         }
@@ -418,7 +472,10 @@ impl ShellUiModel {
             }
         };
         match outcome {
-            Ok((session_id, url)) => self.status = format!("Tab {session_id} → {url}"),
+            Ok((session_id, url)) => {
+                self.status = format!("Tab {} -> {url}", compact_session_id(&session_id));
+                self.last_error = None;
+            }
             Err(err) => self.set_error("goto", &err),
         }
     }
@@ -465,7 +522,12 @@ impl ShellUiModel {
         };
         match outcome {
             Ok(session_id) => {
-                self.status = format!("{}: tab {session_id} → {url}", step.label_capitalized());
+                self.status = format!(
+                    "{}: tab {} -> {url}",
+                    step.label_capitalized(),
+                    compact_session_id(&session_id)
+                );
+                self.last_error = None;
             }
             Err(err) => self.set_error("goto", &err),
         }
@@ -499,7 +561,13 @@ impl ShellUiModel {
             }
         };
         match outcome {
-            Ok(session_id) => self.status = format!("Screenshot refreshed for tab {session_id}"),
+            Ok(session_id) => {
+                self.status = format!(
+                    "Screenshot refreshed for tab {}",
+                    compact_session_id(&session_id)
+                );
+                self.last_error = None;
+            }
             Err(err) => self.set_error("screenshot", &err),
         }
     }
@@ -562,6 +630,7 @@ impl ShellUiModel {
                     tab.status = format!("Handed off and resumed {}", run.run_id.0);
                 }
                 self.status = format!("Handed off {session_id} and resumed {}", run.run_id.0);
+                self.last_error = None;
             }
             Err(err) => self.set_error("resume", &err),
         }
@@ -578,6 +647,7 @@ impl ShellUiModel {
             tab.surface.dismiss_confirmation();
             tab.status = "Confirmation dismissed; action was not resubmitted.".to_string();
             self.status = "Confirmation dismissed; no advisory confirmation was sent.".to_string();
+            self.last_error = None;
         }
     }
 
@@ -616,6 +686,7 @@ impl ShellUiModel {
                                 "Confirmed {} and replayed navigation",
                                 grant.confirmation_id
                             );
+                            self.last_error = None;
                         }
                         Err(err) => {
                             if let Some(tab) = self.tabs.get_mut(active) {
@@ -632,6 +703,7 @@ impl ShellUiModel {
                     tab.status = format!("Confirmed {}", grant.confirmation_id);
                 }
                 self.status = format!("Confirmed {}", grant.confirmation_id);
+                self.last_error = None;
             }
             Err(err) => self.set_error("confirm", &err),
         }
@@ -651,6 +723,7 @@ impl ShellUiModel {
         } else {
             "Set-of-marks overlay OFF — refresh page to apply.".to_string()
         };
+        self.last_error = None;
     }
 
     fn refresh(&mut self, service: &dyn SessionService) {
@@ -666,6 +739,7 @@ impl ShellUiModel {
             Ok(sessions) => {
                 self.sessions = sessions.iter().map(SessionRow::from).collect();
                 self.status = format!("Listed {} session(s).", self.sessions.len());
+                self.last_error = None;
             }
             Err(err) => self.set_error("sessions", &err),
         }
@@ -680,7 +754,8 @@ impl ShellUiModel {
         match service.open(&url) {
             Ok(session) => {
                 let row = SessionRow::from(&session);
-                self.status = format!("Opened {} → {}", row.id, row.url);
+                self.status = format!("Opened {} -> {}", compact_session_id(&row.id), row.url);
+                self.last_error = None;
                 self.upsert(row);
                 self.open_url.clear();
             }
@@ -692,7 +767,8 @@ impl ShellUiModel {
         match service.adopt(session_id) {
             Ok(session) => {
                 let row = SessionRow::from(&session);
-                self.status = format!("Adopted {}", row.id);
+                self.status = format!("Adopted {}", compact_session_id(&row.id));
+                self.last_error = None;
                 self.upsert(row);
                 self.ensure_adopted_tab(&session);
             }
@@ -704,7 +780,8 @@ impl ShellUiModel {
         match service.close(session_id) {
             Ok(session) => {
                 let row = SessionRow::from(&session);
-                self.status = format!("Closed {}", row.id);
+                self.status = format!("Closed {}", compact_session_id(&row.id));
+                self.last_error = None;
                 self.upsert(row);
                 self.remove_tab_for_session(session_id);
             }
@@ -777,7 +854,9 @@ impl ShellUiModel {
     }
 
     fn set_error(&mut self, op: &str, err: &ShellError) {
-        self.status = format!("{op} failed: {err}");
+        let message = format!("{op} failed: {err}");
+        self.status = message.clone();
+        self.last_error = Some(message);
     }
 }
 
@@ -1130,6 +1209,19 @@ mod tests {
     }
 
     #[test]
+    fn session_rows_have_compact_human_display_labels() {
+        let row = SessionRow {
+            id: "018f1a37-43f8-76ea-a021-9f248d62d1fd".into(),
+            state: "adopted".into(),
+            url: "https://docs.example.test/path?q=1".into(),
+        };
+
+        assert_eq!(compact_session_id(&row.id), "018f1a37...d1fd");
+        assert_eq!(session_state_display(&row.state), "Human");
+        assert_eq!(session_row_title(&row), "Human - docs.example.test");
+    }
+
+    #[test]
     fn open_dispatches_open_and_adds_row() {
         let service = MockService::default();
         let mut model = ShellUiModel {
@@ -1262,6 +1354,24 @@ mod tests {
             "status was {:?}",
             model.status
         );
+        assert_eq!(model.last_error, Some(model.status.clone()));
+    }
+
+    #[test]
+    fn successful_refresh_clears_previous_error_banner() {
+        let failing = MockService {
+            fail: Some("sessions"),
+            ..MockService::default()
+        };
+        let passing = MockService::default();
+        let mut model = ShellUiModel::default();
+
+        model.dispatch(UiAction::Refresh, &failing);
+        assert!(model.last_error.is_some());
+
+        model.dispatch(UiAction::Refresh, &passing);
+        assert_eq!(model.last_error, None);
+        assert_eq!(model.status, "Listed 0 session(s).");
     }
 
     #[test]

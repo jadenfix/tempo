@@ -17,8 +17,10 @@ use tempo_headless::TEMPO_TEMPOD_AUTH_TOKEN_ENV;
 use thiserror::Error;
 
 use crate::tab::ScreenshotImage;
-use crate::transport::TransportClient;
-use crate::ui::{SessionService, UiAction};
+use crate::transport::{Enqueued, TransportClient};
+use crate::ui::{
+    compact_session_id, session_row_title, session_state_display, SessionService, UiAction,
+};
 use crate::{validate_auth_token, ShellClient, ShellError, DEFAULT_TEMPOD_ADDR};
 
 const DEFAULT_POLL_SECONDS: u64 = 3;
@@ -147,6 +149,7 @@ struct ShellApp {
 
 impl ShellApp {
     fn new(config: WindowConfig, ctx: egui::Context) -> Self {
+        apply_tempo_theme(&ctx);
         // The worker rebuilds the transport from the (editable) base URL on every
         // dispatch, exactly as the old inline path did; the auth token is folded
         // in here. Injected as a factory so the worker owns no egui/window types.
@@ -229,29 +232,31 @@ impl ShellApp {
     /// the active session's `/sessions/{id}/events`. Read-only; the reducer owns
     /// all state. Tainted steps are flagged inline.
     fn show_agent_journal(&self, ui: &mut egui::Ui) {
-        ui.separator();
-        ui.label("agent journal (session events):");
-        if self.transport.model.journal.entries.is_empty() {
-            ui.label("(no events yet)");
-            return;
-        }
-        egui::ScrollArea::vertical()
-            .max_height(200.0)
-            .stick_to_bottom(true)
+        egui::CollapsingHeader::new("Agent Journal")
+            .default_open(true)
             .show(ui, |ui| {
-                for entry in &self.transport.model.journal.entries {
-                    let mut line = format!("#{} {}", entry.seq, entry.kind);
-                    if !entry.detail.is_empty() {
-                        line.push_str(&format!(" — {}", entry.detail));
-                    }
-                    let text = egui::RichText::new(line).monospace();
-                    let text = if entry.tainted {
-                        text.color(egui::Color32::from_rgb(220, 50, 50))
-                    } else {
-                        text
-                    };
-                    ui.label(text);
+                if self.transport.model.journal.entries.is_empty() {
+                    ui.label("(no events yet)");
+                    return;
                 }
+                egui::ScrollArea::vertical()
+                    .max_height(200.0)
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        for entry in &self.transport.model.journal.entries {
+                            let mut line = format!("#{} {}", entry.seq, entry.kind);
+                            if !entry.detail.is_empty() {
+                                line.push_str(&format!(" - {}", entry.detail));
+                            }
+                            let text = egui::RichText::new(line).monospace();
+                            let text = if entry.tainted {
+                                text.color(egui::Color32::from_rgb(205, 71, 71))
+                            } else {
+                                text
+                            };
+                            ui.label(text);
+                        }
+                    });
             });
     }
 
@@ -274,6 +279,64 @@ impl ShellApp {
                 if surface.marks_overlay { "on" } else { "off" }
             ));
         });
+    }
+}
+
+fn apply_tempo_theme(ctx: &egui::Context) {
+    ctx.all_styles_mut(|style| {
+        style.text_styles.insert(
+            egui::TextStyle::Heading,
+            egui::FontId::new(20.0, egui::FontFamily::Proportional),
+        );
+        style.text_styles.insert(
+            egui::TextStyle::Body,
+            egui::FontId::new(14.0, egui::FontFamily::Proportional),
+        );
+        style.text_styles.insert(
+            egui::TextStyle::Button,
+            egui::FontId::new(14.0, egui::FontFamily::Proportional),
+        );
+        style.text_styles.insert(
+            egui::TextStyle::Monospace,
+            egui::FontId::new(13.0, egui::FontFamily::Monospace),
+        );
+        style.spacing.item_spacing = egui::vec2(10.0, 6.0);
+        style.spacing.button_padding = egui::vec2(9.0, 5.0);
+        style.spacing.interact_size = egui::vec2(44.0, 26.0);
+        style.spacing.text_edit_width = 420.0;
+        style.visuals.panel_fill = egui::Color32::from_rgb(19, 21, 24);
+        style.visuals.window_fill = egui::Color32::from_rgb(24, 27, 31);
+        style.visuals.extreme_bg_color = egui::Color32::from_rgb(12, 14, 17);
+        style.visuals.faint_bg_color = egui::Color32::from_rgb(31, 35, 40);
+        style.visuals.hyperlink_color = egui::Color32::from_rgb(71, 149, 217);
+        style.visuals.warn_fg_color = egui::Color32::from_rgb(220, 150, 55);
+        style.visuals.error_fg_color = egui::Color32::from_rgb(222, 82, 82);
+        style.visuals.selection.bg_fill = egui::Color32::from_rgb(43, 98, 128);
+        style.visuals.selection.stroke =
+            egui::Stroke::new(1.0, egui::Color32::from_rgb(232, 240, 247));
+        for widget in [
+            &mut style.visuals.widgets.noninteractive,
+            &mut style.visuals.widgets.inactive,
+            &mut style.visuals.widgets.hovered,
+            &mut style.visuals.widgets.active,
+            &mut style.visuals.widgets.open,
+        ] {
+            widget.corner_radius = egui::CornerRadius::same(6);
+        }
+        style.visuals.widgets.inactive.weak_bg_fill = egui::Color32::from_rgb(38, 43, 49);
+        style.visuals.widgets.hovered.weak_bg_fill = egui::Color32::from_rgb(52, 59, 67);
+        style.visuals.widgets.active.weak_bg_fill = egui::Color32::from_rgb(46, 104, 132);
+    });
+}
+
+fn enqueue_with_status(transport: &mut TransportClient, action: UiAction) {
+    match transport.enqueue(action) {
+        Enqueued::Sent | Enqueued::Coalesced => {}
+        Enqueued::Disconnected => {
+            transport.model.status =
+                "Transport worker stopped - showing last-known state.".to_string();
+            transport.model.last_error = Some(transport.model.status.clone());
+        }
     }
 }
 
@@ -365,14 +428,14 @@ impl eframe::App for ShellApp {
         self.transport.drain();
 
         if self.due_for_poll() {
-            self.transport.enqueue(UiAction::Refresh);
+            enqueue_with_status(&mut self.transport, UiAction::Refresh);
             // Keep the active tab's page-state snapshot and journal/event stream
             // fresh on the same cadence (the DoD's "refreshed on an interval"; the
             // buttons below are the manual paths). The worker coalesces a poll of a
             // kind already in flight so a slow tempod can't make them pile up.
             if self.transport.model.active_tab().is_some() {
-                self.transport.enqueue(UiAction::RefreshScreenshot);
-                self.transport.enqueue(UiAction::PollEvents);
+                enqueue_with_status(&mut self.transport, UiAction::RefreshScreenshot);
+                enqueue_with_status(&mut self.transport, UiAction::PollEvents);
             }
             self.last_poll = Some(Instant::now());
         }
@@ -444,26 +507,36 @@ impl eframe::App for ShellApp {
 
             let session_rows = self.transport.model.sessions.clone();
             if !session_rows.is_empty() {
-                ui.label("sessions:");
-                egui::Grid::new("tempo-session-list")
-                    .striped(true)
+                egui::CollapsingHeader::new(format!("Sessions ({})", session_rows.len()))
+                    .default_open(true)
                     .show(ui, |ui| {
-                        ui.label("id");
-                        ui.label("state");
-                        ui.label("url");
-                        ui.end_row();
-                        for row in session_rows {
-                            ui.monospace(&row.id);
-                            ui.label(&row.state);
-                            ui.label(&row.url);
-                            if ui.button("Adopt").clicked() {
-                                pending = Some(UiAction::Adopt(row.id.clone()));
-                            }
-                            if ui.button("Close").clicked() {
-                                pending = Some(UiAction::Close(row.id));
-                            }
-                            ui.end_row();
-                        }
+                        egui::Grid::new("tempo-session-list")
+                            .striped(true)
+                            .num_columns(6)
+                            .show(ui, |ui| {
+                                ui.label("session");
+                                ui.label("state");
+                                ui.label("url");
+                                ui.label("id");
+                                ui.label("");
+                                ui.label("");
+                                ui.end_row();
+                                for row in session_rows {
+                                    ui.label(egui::RichText::new(session_row_title(&row)).strong())
+                                        .on_hover_text(&row.id);
+                                    ui.label(session_state_display(&row.state));
+                                    ui.label(&row.url);
+                                    ui.monospace(compact_session_id(&row.id))
+                                        .on_hover_text(&row.id);
+                                    if ui.button("Adopt").clicked() {
+                                        pending = Some(UiAction::Adopt(row.id.clone()));
+                                    }
+                                    if ui.button("Close").clicked() {
+                                        pending = Some(UiAction::Close(row.id));
+                                    }
+                                    ui.end_row();
+                                }
+                            });
                     });
                 ui.separator();
             }
@@ -566,6 +639,16 @@ impl eframe::App for ShellApp {
             }
 
             ui.separator();
+            if let Some(error) = &self.transport.model.last_error {
+                ui.group(|ui| {
+                    ui.label(
+                        egui::RichText::new("ERROR")
+                            .strong()
+                            .color(egui::Color32::from_rgb(222, 82, 82)),
+                    );
+                    ui.label(error);
+                });
+            }
             ui.label(&self.transport.model.status);
             if self.transport.is_down() {
                 ui.label(
@@ -576,7 +659,7 @@ impl eframe::App for ShellApp {
         }
 
         if let Some(action) = pending {
-            self.transport.enqueue(action);
+            enqueue_with_status(&mut self.transport, action);
         }
 
         self.show_page_state(ui);
@@ -614,12 +697,19 @@ mod tests {
     /// worker is spawned but idle until an action is enqueued.
     #[test]
     fn shell_app_constructs_from_config() {
-        let app = ShellApp::new(WindowConfig::default(), egui::Context::default());
+        let ctx = egui::Context::default();
+        let app = ShellApp::new(WindowConfig::default(), ctx.clone());
         assert_eq!(app.transport.model.base_url, DEFAULT_TEMPOD_ADDR);
         assert_eq!(app.transport.base_url, DEFAULT_TEMPOD_ADDR);
         assert!(app.last_poll.is_none());
         assert!(app.due_for_poll());
         assert!(app.screenshot_texture.is_none());
+        let style = ctx.style_of(egui::Theme::Dark);
+        assert_eq!(style.spacing.interact_size.y, 26.0);
+        assert_eq!(
+            style.visuals.panel_fill,
+            egui::Color32::from_rgb(19, 21, 24)
+        );
     }
 
     /// The screenshot-pane decode path is pure (no display) and expands RGB to
