@@ -2527,7 +2527,7 @@ impl ConnectionPinnedCrawlDispatch {
             body_sha256: checked.dispatch.request.body_sha256,
             scheme: parts.scheme,
             authority,
-            host: parts.audit_host,
+            host: parts.host,
             path_and_query,
             origin: checked.dispatch.origin,
             resolved_socket: checked.resolved_socket,
