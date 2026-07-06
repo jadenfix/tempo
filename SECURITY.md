@@ -44,4 +44,7 @@ unconfirmed Send/Purchase/Delete; the SSRF suite and policy-gate property tests
 run on any PR touching observe/act/net/policy/taint/toolexec; `unsafe_code` is
 forbidden workspace-wide. Shipped preview guarantees are the scoped guarantees
 listed in `README.md` and `final.md`; roadmap gates do not imply shipped
-protections until their evidence is green.
+protections until their evidence is green. In particular, ADR 0001 keeps
+mandatory tainted-compute dispatch through beatbox deferred until a
+production-path agent/headless integration test proves it, even though the
+`tempo-toolexec` bridge and live beatbox canary are already tested.

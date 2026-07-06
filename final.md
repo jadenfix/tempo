@@ -297,7 +297,7 @@ Current preview caveat: `tempo-toolexec` exists, but live `tempod`/agent CDP
 flows do not yet dispatch tainted transforms through beatbox. The taint+sandbox
 composition below is an acceptance gate for beta/remote operation, not a local
 CDP preview guarantee. The dispatch locus and evidence bar are pinned in
-`docs/TAINT_SANDBOX_ADR.md`.
+[`docs/TAINT_SANDBOX_ADR.md`](docs/TAINT_SANDBOX_ADR.md).
 
 ### 6.1 What runs in beatbox
 
