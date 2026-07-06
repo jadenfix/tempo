@@ -296,7 +296,8 @@ routed to **beatbox** (`~/Desktop/beater/beatbox`), the polyglot sandbox daemon
 Current preview caveat: `tempo-toolexec` exists, but live `tempod`/agent CDP
 flows do not yet dispatch tainted transforms through beatbox. The taint+sandbox
 composition below is an acceptance gate for beta/remote operation, not a local
-CDP preview guarantee.
+CDP preview guarantee. The dispatch locus and evidence bar are pinned in
+`docs/TAINT_SANDBOX_ADR.md`.
 
 ### 6.1 What runs in beatbox
 
@@ -355,6 +356,14 @@ beatbox already shares tempo's conventions — edition 2024, `unsafe_code = forb
 ### 6.5 Ownership & sequencing
 
 `tempo-toolexec` lives in WS7 (E8) and is **fully parallel** — it depends only on `beatbox-client` (which exists today) and `tempo-schema`, never on the engine. Its DoD is in §8. The taint⋈sandbox rule requires `tempo-taint` (WS4) to expose a "does this value carry taint?" predicate; that predicate is part of contract **C1**, so the two crates integrate at the schema layer, not by direct dependency.
+
+ADR decision: live taint-to-sandbox dispatch belongs at the
+`tempod`/headless runtime execution boundary immediately before non-browser
+compute runs on page-derived input. Browser actions stay behind `tempo-policy`;
+compute side effects route through `tempo-toolexec` to beatbox. The local CDP
+preview keeps this explicitly deferred until a runtime integration test proves
+that an agent-facing tainted transform reaches beatbox with `net:Deny`,
+`secrets:[]`, and no canary egress.
 
 ---
 

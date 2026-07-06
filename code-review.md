@@ -23,6 +23,10 @@ needs a concrete traced failure, not a preference for more code.
 - Security/privacy docs cannot rely on one top-level disclaimer to narrow later
   absolute claims. Wording such as "all", "every", "owns", "guarantees", or
   "resistance" needs local shipped-vs-roadmap scope where it appears.
+- Taint-to-beatbox security is not proven by `tempo-toolexec` helpers alone. A
+  shipped claim needs an agent-facing runtime path that preserves page
+  provenance to the execution boundary and a live beatbox canary proving
+  `net:Deny`, `secrets:[]`, and no egress.
 
 ## Async State Ownership
 
