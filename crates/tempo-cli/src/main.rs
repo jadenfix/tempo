@@ -23,8 +23,9 @@ use tempo_compat::{
 use tempo_driver::{DriverTrait, TransportError};
 use tempo_engine_cdp::{CdpConfig, CdpTempoDriver};
 use tempo_evals::{
-    eval_record_from_session_journal_with_retention_policy, read_eval_records, write_scorecard,
-    EvalBudget, EvalError, Lane, Scorecard, SessionEvalDescriptor,
+    eval_record_from_session_journal_with_retention_policy, read_eval_records,
+    write_e2e_budget_report, write_scorecard, E2eBudgetReport, E2eLatencyBudget, EvalBudget,
+    EvalError, Lane, Scorecard, SessionEvalDescriptor,
 };
 use tempo_observe::{
     observation_corpus_report, CompileOptions, ObservationCorpusReport, ObservationInput,
@@ -47,6 +48,8 @@ Commands:
   schema [--output PATH]
   scorecard --input PATH [--output PATH] [--allow-missing-speculation]
             [--min-success-rate N] [--max-fallback-rate N]
+  e2e-budget --input PATH [--output PATH]
+            [--max-observe-p50-ms N] [--max-act-to-settled-p50-ms N]
   session-eval --journal PATH --suite NAME --case-id ID --origin URL
             --lane api|servo|cdp --success BOOL --fallback-used BOOL
             [--baseline-wall-clock-ms N] [--unconfirmed-high-risk-actions N]
@@ -112,6 +115,11 @@ enum Command {
         output: Output,
         budget: EvalBudget,
     },
+    E2eBudget {
+        input: PathBuf,
+        output: Output,
+        budget: E2eLatencyBudget,
+    },
     SessionEval {
         journal: PathBuf,
         descriptor: SessionEvalDescriptor,
@@ -169,6 +177,7 @@ impl Command {
             "-V" | "--version" => Ok(Self::Version),
             "schema" => parse_schema(options),
             "scorecard" => parse_scorecard(options),
+            "e2e-budget" => parse_e2e_budget(options),
             "session-eval" => parse_session_eval(options),
             "compat-lanes" => parse_compat_lanes(options),
             "observe-gate" => parse_observe_gate(options),
@@ -220,6 +229,25 @@ impl Command {
                 } else {
                     Err(CliError::GateFailed {
                         violations: scorecard.violations.len(),
+                    })
+                }
+            }
+            Self::E2eBudget {
+                input,
+                output,
+                budget,
+            } => {
+                let records = read_eval_records(&input)?;
+                let report = E2eBudgetReport::from_records(&records, &budget)?;
+                match &output {
+                    Output::Stdout => write_json(&output, &report, stdout)?,
+                    Output::Path(path) => write_e2e_budget_report(path, &report)?,
+                }
+                if report.passes() {
+                    Ok(())
+                } else {
+                    Err(CliError::GateFailed {
+                        violations: report.violations.len(),
                     })
                 }
             }
@@ -391,6 +419,41 @@ fn parse_scorecard(options: &[String]) -> Result<Command, CliError> {
     }
 
     Ok(Command::Scorecard {
+        input: required_path("--input", input)?,
+        output,
+        budget,
+    })
+}
+
+fn parse_e2e_budget(options: &[String]) -> Result<Command, CliError> {
+    let mut input = None;
+    let mut output = Output::Stdout;
+    let mut budget = E2eLatencyBudget::default();
+    let mut index = 0;
+
+    while index < options.len() {
+        match options[index].as_str() {
+            "--input" => input = Some(PathBuf::from(take_value(options, &mut index)?)),
+            "--output" => output = Output::Path(PathBuf::from(take_value(options, &mut index)?)),
+            "--max-observe-p50-ms" => {
+                budget.max_observe_latency_ms_p50 = Some(parse_u64(
+                    "--max-observe-p50-ms",
+                    take_value(options, &mut index)?,
+                )?);
+            }
+            "--max-act-to-settled-p50-ms" => {
+                budget.max_act_to_settled_ms_p50 = Some(parse_u64(
+                    "--max-act-to-settled-p50-ms",
+                    take_value(options, &mut index)?,
+                )?);
+            }
+            "-h" | "--help" => return Ok(Command::Help),
+            flag => return Err(unknown_flag(flag)),
+        }
+        index += 1;
+    }
+
+    Ok(Command::E2eBudget {
         input: required_path("--input", input)?,
         output,
         budget,
@@ -1392,6 +1455,90 @@ mod tests {
     }
 
     #[test]
+    fn e2e_budget_command_reads_records_and_writes_report() -> TestResult {
+        let dir = unique_dir("e2e-budget")?;
+        let input = dir.join("records.jsonl");
+        let output = dir.join("e2e-budget.json");
+        let mut record = EvalRecordBuilder::new("case-a")
+            .baseline_wall_clock_ms(2_000)
+            .wall_clock_ms(1_000)
+            .build();
+        record.round_trips = 2;
+        record.input_tokens = 600;
+        record.output_tokens = 120;
+        record.cache_read_input_tokens = 200;
+        record.observe_latencies_ms = vec![90, 100];
+        record.action_latencies_ms = vec![120, 130];
+        record.settle_latencies_ms = vec![40, 50];
+        record.act_to_settled_latencies_ms = vec![160, 180];
+        record.prefill_latencies_ms = vec![80, 100];
+        record.decode_latencies_ms = vec![220, 260];
+        write_records(&input, &[record])?;
+        let mut stdout = Vec::new();
+
+        run_with_writer(
+            [
+                "e2e-budget".to_string(),
+                "--input".into(),
+                input_string(&input),
+                "--output".into(),
+                input_string(&output),
+                "--max-observe-p50-ms".into(),
+                "100".into(),
+                "--max-act-to-settled-p50-ms".into(),
+                "180".into(),
+            ],
+            &mut stdout,
+        )?;
+
+        let report: E2eBudgetReport = serde_json::from_reader(File::open(&output)?)?;
+        assert!(stdout.is_empty());
+        assert!(report.passes());
+        assert_eq!(report.total_cases, 1);
+        assert_eq!(report.total_round_trips, 2);
+        assert_eq!(report.input_tokens, 600);
+        assert_eq!(report.cache_read_input_tokens, 200);
+        assert_eq!(report.subsystems[0].subsystem, "decode");
+        remove_dir(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn e2e_budget_command_writes_then_reports_gate_failures() -> TestResult {
+        let dir = unique_dir("e2e-budget-fail")?;
+        let input = dir.join("records.jsonl");
+        let output = dir.join("e2e-budget.json");
+        let mut record = EvalRecordBuilder::new("case-a").build();
+        record.observe_latencies_ms = vec![200];
+        record.act_to_settled_latencies_ms = vec![700];
+        write_records(&input, &[record])?;
+        let mut stdout = Vec::new();
+
+        let result = run_with_writer(
+            [
+                "e2e-budget".to_string(),
+                "--input".into(),
+                input_string(&input),
+                "--output".into(),
+                input_string(&output),
+                "--max-observe-p50-ms".into(),
+                "150".into(),
+                "--max-act-to-settled-p50-ms".into(),
+                "600".into(),
+            ],
+            &mut stdout,
+        );
+
+        match result {
+            Err(CliError::GateFailed { violations }) => assert_eq!(violations, 2),
+            other => return Err(unexpected_result(other)),
+        }
+        assert!(output.exists());
+        remove_dir(&dir)?;
+        Ok(())
+    }
+
+    #[test]
     fn compat_lanes_command_reads_scorecard_and_writes_lane_table() -> TestResult {
         let dir = unique_dir("compat")?;
         let input = dir.join("compat.json");
@@ -1780,6 +1927,10 @@ mod tests {
         let record: tempo_evals::EvalRecord = serde_json::from_reader(File::open(&output)?)?;
         assert_eq!(record.suite, "journal");
         assert_eq!(record.step_count, 1);
+        assert_eq!(record.round_trips, 1);
+        assert_eq!(record.input_tokens, 320);
+        assert_eq!(record.output_tokens, 24);
+        assert_eq!(record.cache_read_input_tokens, 80);
         assert!(record.max_observation_bytes > 0);
         remove_dir(&dir)?;
         Ok(())
@@ -1843,17 +1994,18 @@ mod tests {
         )?;
 
         let value: Value = serde_json::from_slice(&stdout)?;
-        assert_eq!(value["entries"], 5);
+        assert_eq!(value["entries"], 6);
         assert_eq!(value["session_started"], true);
         assert_eq!(value["session_closed"], true);
+        assert_eq!(value["model_decisions"], 1);
         assert_eq!(value["applied_steps"], 1);
         assert_eq!(value["step_triples"].as_array().map(Vec::len), Some(1));
-        assert_eq!(value["step_triples"][0]["seq"], 3);
+        assert_eq!(value["step_triples"][0]["seq"], 4);
         assert_eq!(value["step_triples"][0]["action"]["kind"], "scroll");
         assert_eq!(value["step_triples"][0]["outcome"]["kind"], "applied");
         assert_eq!(value["steps"].as_array().map(Vec::len), Some(1));
         assert_eq!(value["steps"][0]["index"], 0);
-        assert_eq!(value["steps"][0]["journal_seq"], 3);
+        assert_eq!(value["steps"][0]["journal_seq"], 4);
         assert_eq!(value["steps"][0]["action"]["kind"], "scroll");
         assert_eq!(value["steps"][0]["outcome"]["state"], "applied");
         assert_eq!(value["steps"][0]["outcome"]["diff_since_seq"], 0);
@@ -1881,8 +2033,9 @@ mod tests {
         )?;
 
         let value: Value = serde_json::from_slice(&stdout)?;
-        assert_eq!(value["entries"], 5);
+        assert_eq!(value["entries"], 6);
         assert_eq!(value["session_started"], true);
+        assert_eq!(value["model_decisions"], 1);
         assert_eq!(value["applied_steps"], 1);
         remove_dir(&dir)?;
         Ok(())
@@ -2168,6 +2321,14 @@ mod tests {
                     max_observation_tokens: 128,
                     observe_latencies_ms: vec![20],
                     action_latencies_ms: vec![30],
+                    settle_latencies_ms: Vec::new(),
+                    act_to_settled_latencies_ms: Vec::new(),
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cache_read_input_tokens: 0,
+                    prefill_latencies_ms: Vec::new(),
+                    decode_latencies_ms: Vec::new(),
+                    round_trips: 0,
                     wall_clock_ms: 100,
                     baseline_wall_clock_ms: None,
                     unconfirmed_high_risk_actions: 0,
@@ -2231,6 +2392,13 @@ mod tests {
         })?;
         journal.append(JournalEvent::Observation {
             observation: observation(0),
+        })?;
+        journal.append(JournalEvent::ModelDecision {
+            actions: vec![action.clone()],
+            rationale: Some("scroll down".into()),
+            input_tokens: 320,
+            output_tokens: 24,
+            cache_read_input_tokens: 80,
         })?;
         journal.append(JournalEvent::ActionPlanned {
             action: action.clone(),
