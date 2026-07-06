@@ -3,7 +3,7 @@ set -euo pipefail
 
 default_repo="https://github.com/jadenfix/servo"
 repo="${TEMPO_SERVO_REPO:-$default_repo}"
-audited_rev="fb6c9d511f67a311f5883ec859aa0c5dd88d19c3"
+audited_rev="tempo-servo-0.3"
 ref="${TEMPO_SERVO_REF:-$audited_rev}"
 path="${TEMPO_SERVO_PATH:-}"
 allow_unaudited="${TEMPO_SERVO_ALLOW_UNAUDITED:-}"
