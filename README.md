@@ -4,7 +4,7 @@ An **AI-agent-native browser**, built from first principles in Rust.
 
 Today's agentic browsers drive the web the way a human would — *screenshot → reason → one click → repeat*. That loop is slow, expensive, and prompt-injectable. tempo replaces it with **structured observation** (ranked, stably-identified, diff-able elements at ~2–5KB instead of a 40–500K-token DOM dump), **batched semantic actions** with a real page-settled signal, **state forking** for speculative parallel exploration, and an **API-first fast path** that skips rendering entirely when a site already speaks an agent protocol.
 
-Engine strategy is **Rust-first**: [Servo](https://servo.org) is the primary rendering engine; a headless-Chromium lane (CDP) is a per-origin fallback behind the same driver trait. tempo reuses the sibling **beater** stack (`../beater-agents`, `../beater.js`, `../beater.js-connect`, `../beatbox`).
+Engine strategy is **Rust-first**: [Servo](https://servo.org) is the primary rendering engine; a headless-Chromium lane (CDP) is a per-origin fallback behind the same driver trait. tempo is standalone by default, with optional protocol-level connections to sibling ecosystem projects when those integrations are present.
 
 Servo compatibility is explicit. The default `servo-vanilla` lane stays pinned
 to the upstream-compatible Servo crate, while `scripts/cargo-servo-tempo.sh`
@@ -15,7 +15,7 @@ sources require `TEMPO_SERVO_ALLOW_UNAUDITED=1`.
 
 ## Platform Direction
 
-Tempo tracks the platforms where upstream Servo is available: macOS, Linux, Windows, Android, and OpenHarmony. `tempo-engine-servo` exposes this as `servo_platform_support_matrix()` so Swift/macOS, Android, OpenHarmony, desktop, and other SDK wrappers can read the same source of truth.
+Tempo tracks every platform where upstream Servo is available: macOS, Linux, Windows, Android, and OpenHarmony. `tempo-engine-servo` exposes this as `servo_platform_support_matrix()` so Swift/macOS, Android, OpenHarmony, desktop, and other SDK wrappers read the same source of truth instead of hand-maintaining divergent platform lists.
 
 Android and OpenHarmony use the Unix-domain-socket control plane in app-private storage. Windows is listed as an upstream Servo platform, but Tempo's local `tempod`/engine-host path is not Windows-ready until the Unix-only IPC code is replaced with a Windows-native transport adapter and matching cfg gates.
 
@@ -64,3 +64,11 @@ cargo test --workspace   # contracts, conformance, runtime, protocol, and shell 
   binaries for macOS and Linux.
 - See [`CONTRIBUTING.md`](./CONTRIBUTING.md) and [`SECURITY.md`](./SECURITY.md).
   Licensed [Apache-2.0](./LICENSE).
+
+## Ecosystem
+
+tempo is part of the [ecosystem](https://github.com/jadenfix/ecosystem) — a family of Rust-first, local-first agent-infrastructure projects. It is fully standalone: any agent can drive the web through its structured-observation and batched-action contract, no sibling project required. Within the family it can connect for:
+
+- sandboxing tool execution in [beatbox](https://github.com/jadenfix/beatbox) and rendering through the audited [servo fork](https://github.com/jadenfix/servo)
+- exporting session traces to [beater](https://github.com/jadenfix/beater) for observability, deep fork/patch/replay of sessions, evals, and CI gates (roadmap)
+- serving as the web-authority surface for agents governed by [beaterOS](https://github.com/jadenfix/beaterOS)

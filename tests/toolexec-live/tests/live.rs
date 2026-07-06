@@ -19,7 +19,7 @@ type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 async fn real_beatboxd_execute_smoke_uses_http_client() -> TestResult {
     let beatboxd = RealBeatboxd::spawn().await?;
 
-    let executor = ToolExecClient::new(beatboxd.base_url());
+    let executor = ToolExecClient::new(beatboxd.base_url())?;
     let execution = executor
         .execute_trusted_request(&live_smoke_request("tempo-toolexec-live-execute"))
         .await?;
@@ -33,7 +33,7 @@ async fn real_beatboxd_execute_smoke_uses_http_client() -> TestResult {
 async fn real_beatboxd_job_smoke_uses_http_client() -> TestResult {
     let beatboxd = RealBeatboxd::spawn().await?;
 
-    let executor = ToolExecClient::new(beatboxd.base_url());
+    let executor = ToolExecClient::new(beatboxd.base_url())?;
     let request = live_smoke_request("tempo-toolexec-live-job");
     let created = executor.create_trusted_job(&request).await?;
 
@@ -102,7 +102,7 @@ async fn real_beatboxd_tainted_canary_denies_import_egress() -> TestResult {
     };
     let request = transform.clone().try_into_request()?;
 
-    let executor = ToolExecClient::new(beatboxd.base_url());
+    let executor = ToolExecClient::new(beatboxd.base_url())?;
     let execution = executor.execute_tainted_transform(transform).await?;
     assert_eq!(
         execution.step_status,
