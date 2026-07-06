@@ -110,7 +110,22 @@ pub async fn execute_action<D>(
 where
     D: DriverTrait + ?Sized,
 {
-    execute_action_grounded(driver, action, Grounding::TrustMatchingDiff).await
+    let before = driver.observe().await?;
+    execute_action_from_seq(driver, action, before.seq).await
+}
+
+/// Execute a single action when the caller already holds the pre-action
+/// observation sequence. This avoids re-running the full observation pipeline
+/// solely to recover `before.seq`.
+pub async fn execute_action_from_seq<D>(
+    driver: &mut D,
+    action: &Action,
+    since_seq: u64,
+) -> Result<ActionExecution, TransportError>
+where
+    D: DriverTrait + ?Sized,
+{
+    execute_action_grounded(driver, action, since_seq, Grounding::TrustMatchingDiff).await
 }
 
 /// [`execute_action`], but the grounding diff always comes from an independent
@@ -123,23 +138,24 @@ pub async fn execute_action_verified<D>(
 where
     D: DriverTrait + ?Sized,
 {
-    execute_action_grounded(driver, action, Grounding::IndependentRediff).await
+    let before = driver.observe().await?;
+    execute_action_grounded(driver, action, before.seq, Grounding::IndependentRediff).await
 }
 
 async fn execute_action_grounded<D>(
     driver: &mut D,
     action: &Action,
+    since_seq: u64,
     grounding: Grounding,
 ) -> Result<ActionExecution, TransportError>
 where
     D: DriverTrait + ?Sized,
 {
-    let before = driver.observe().await?;
     let outcome = driver.act(action).await?;
     finish_execution(
         driver,
         outcome,
-        before.seq,
+        since_seq,
         1,
         action.side_effect(),
         driver.engine(),
@@ -662,8 +678,25 @@ mod tests {
         assert_eq!(execution.since_seq, 10);
         assert_eq!(execution.seq, 11);
         assert_eq!(execution.diff.changed.len(), 1);
+        assert_eq!(driver.observe_calls, 1);
         // The action's embedded diff was computed against exactly the
         // pre-action base (since_seq 10), so no forced re-diff is issued.
+        assert!(driver.observe_diff_calls.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn executor_uses_caller_base_seq_without_pre_observe() -> Result<(), String> {
+        let mut driver = ContractDriver::new();
+        let action = Action::Click {
+            node: NodeId("button".into()),
+        };
+        let execution = block_on(execute_action_from_seq(&mut driver, &action, 10))
+            .map_err(|error| error.to_string())?;
+        assert!(execution.applied());
+        assert_eq!(execution.since_seq, 10);
+        assert_eq!(execution.seq, 11);
+        assert_eq!(driver.observe_calls, 0);
         assert!(driver.observe_diff_calls.is_empty());
         Ok(())
     }
@@ -846,6 +879,7 @@ mod tests {
     #[derive(Debug)]
     struct ContractDriver {
         seq: u64,
+        observe_calls: usize,
         observe_diff_calls: Vec<u64>,
     }
 
@@ -853,6 +887,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 seq: 10,
+                observe_calls: 0,
                 observe_diff_calls: Vec::new(),
             }
         }
@@ -881,6 +916,7 @@ mod tests {
         }
 
         async fn observe(&mut self) -> Result<CompiledObservation, TransportError> {
+            self.observe_calls += 1;
             Ok(self.observation())
         }
 

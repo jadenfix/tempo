@@ -26,7 +26,7 @@ use std::collections::{HashSet, VecDeque};
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::time::Duration;
-use tempo_act::{detect_human_takeover, execute_action, ExecutionStatus};
+use tempo_act::{detect_human_takeover, execute_action_from_seq, ExecutionStatus};
 use tempo_driver::{DriverTrait, TransportError};
 use tempo_policy::{
     trust::{action_caller_texts, observation_text_taint},
@@ -1040,9 +1040,11 @@ impl AgentRunner {
             state.journal.append(JournalEvent::ActionPlanned {
                 action: action.clone(),
             })?;
-            let execution = execute_action(driver, action).await.map_err(|source| {
-                decided_transport_error(&mut state.journal, "decided execute action", source)
-            })?;
+            let execution = execute_action_from_seq(driver, action, observation.seq)
+                .await
+                .map_err(|source| {
+                    decided_transport_error(&mut state.journal, "decided execute action", source)
+                })?;
             let (outcome, step_error) = match execution.status {
                 ExecutionStatus::Applied => (
                     JournalEvent::StepApplied {
@@ -1781,12 +1783,12 @@ mod tests {
     #[tokio::test]
     async fn scripted_decider_drives_hermetic_decided_run() -> TestResult {
         let (root, journal_path) = journal_root("decided-scripted")?;
-        let mut driver = TestDriver::new().with_elements(vec![button("submit")]);
+        let mut driver = CountingDriver::new(vec![button("submit")]);
         let runner = AgentRunner::new(
             &journal_path,
             AgentRunIds::new("run-decided-scripted", "session-decided-scripted"),
         )
-        .with_confirmation_mode(ConfirmationMode::AutoConfirmClean);
+        .with_confirmation_mode(ConfirmationMode::AutoConfirmAll);
         let mut decider = ScriptedDecider::new(vec![vec![click("submit")]]);
         let spec = DecidedTaskSpec::new("https://example.com", "click submit");
 
@@ -1799,6 +1801,10 @@ mod tests {
         assert_eq!(report.rounds.len(), 2);
         assert!(!report.rounds[0].resumed);
         assert_eq!(report.usage, DecisionUsage::default());
+        assert_eq!(driver.goto_calls, 1);
+        assert_eq!(driver.observe_calls, 1);
+        assert_eq!(driver.observe_diff_calls, 0);
+        assert_eq!(driver.act_calls, 1);
 
         let entries = read_journal_entries(&journal_path)?;
         let decisions = entries
