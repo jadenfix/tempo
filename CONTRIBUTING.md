@@ -14,6 +14,14 @@ consumed as git dependencies pinned by rev, not by local path, so a fresh fork
 compiles without any other checkout. Servo is optional and feature-gated
 (`servo-vanilla` / `servo-tempo`); see the README for the fork/audit rules.
 
+For a local browser preview, use the README's CDP quickstart: build
+`tempod` plus `tempo-engined-cdp`, set `TEMPO_CDP_CHROME` to a Chrome/Chromium
+binary, start `tempod` on loopback, then drive it with the `tempo` control CLI
+or launch the gated GUI with
+`cargo run -p tempo-shell --features window --bin tempo-window -- --tempod 127.0.0.1:8787`.
+`cargo run -p tempo-cli -- env-vars` prints the cross-crate `TEMPO_*` registry
+for local setup and automation.
+
 ## Non-negotiable workspace invariants
 
 Enforced by workspace lints and CI on every PR:

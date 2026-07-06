@@ -46,6 +46,7 @@ Options:
 
 Commands:
   schema [--output PATH]
+  env-vars [--output PATH]
   scorecard --input PATH [--output PATH] [--allow-missing-speculation]
             [--min-success-rate N] [--max-fallback-rate N]
   e2e-budget --input PATH [--output PATH]
@@ -108,6 +109,9 @@ enum Command {
     Help,
     Version,
     Schema {
+        output: Output,
+    },
+    EnvVars {
         output: Output,
     },
     Scorecard {
@@ -176,6 +180,7 @@ impl Command {
             "-h" | "--help" | "help" => Ok(Self::Help),
             "-V" | "--version" => Ok(Self::Version),
             "schema" => parse_schema(options),
+            "env-vars" => parse_env_vars(options),
             "scorecard" => parse_scorecard(options),
             "e2e-budget" => parse_e2e_budget(options),
             "session-eval" => parse_session_eval(options),
@@ -213,6 +218,7 @@ impl Command {
                 let schema = tempo_schema::schema_bundle_json_schema();
                 write_json(&output, &schema, stdout)
             }
+            Self::EnvVars { output } => write_json(&output, &env_var_registry(), stdout),
             Self::Scorecard {
                 input,
                 output,
@@ -379,6 +385,24 @@ enum Output {
     Path(PathBuf),
 }
 
+#[derive(Serialize)]
+struct EnvVarRegistryEntry {
+    name: &'static str,
+    owner: &'static str,
+    purpose: &'static str,
+}
+
+fn env_var_registry() -> Vec<EnvVarRegistryEntry> {
+    tempo_config::documented_env_registry()
+        .iter()
+        .map(|(name, owner, purpose)| EnvVarRegistryEntry {
+            name,
+            owner,
+            purpose,
+        })
+        .collect()
+}
+
 fn parse_schema(options: &[String]) -> Result<Command, CliError> {
     let mut output = Output::Stdout;
     let mut index = 0;
@@ -391,6 +415,20 @@ fn parse_schema(options: &[String]) -> Result<Command, CliError> {
         index += 1;
     }
     Ok(Command::Schema { output })
+}
+
+fn parse_env_vars(options: &[String]) -> Result<Command, CliError> {
+    let mut output = Output::Stdout;
+    let mut index = 0;
+    while index < options.len() {
+        match options[index].as_str() {
+            "--output" => output = Output::Path(PathBuf::from(take_value(options, &mut index)?)),
+            "-h" | "--help" => return Ok(Command::Help),
+            flag => return Err(unknown_flag(flag)),
+        }
+        index += 1;
+    }
+    Ok(Command::EnvVars { output })
 }
 
 fn parse_scorecard(options: &[String]) -> Result<Command, CliError> {
@@ -1376,6 +1414,11 @@ mod tests {
     }
 
     #[test]
+    fn help_advertises_env_vars_registry() {
+        assert!(USAGE.contains("env-vars [--output PATH]"));
+    }
+
+    #[test]
     fn schema_command_writes_schema_bundle_to_stdout() -> TestResult {
         let mut stdout = Vec::new();
 
@@ -1383,6 +1426,26 @@ mod tests {
 
         let value: Value = serde_json::from_slice(&stdout)?;
         assert_eq!(value["title"], "tempo C1/C2 schema bundle");
+        Ok(())
+    }
+
+    #[test]
+    fn env_vars_command_writes_cross_crate_registry_to_stdout() -> TestResult {
+        let mut stdout = Vec::new();
+
+        run_with_writer(["env-vars"], &mut stdout)?;
+
+        let value: Value = serde_json::from_slice(&stdout)?;
+        let entries = value
+            .as_array()
+            .ok_or_else(|| io::Error::other("env-vars output must be an array"))?;
+        assert!(entries.iter().any(
+            |entry| entry["name"] == "TEMPO_CDP_CHROME" && entry["owner"] == "tempo-engine-cdp"
+        ));
+        assert!(entries
+            .iter()
+            .any(|entry| entry["name"] == "TEMPO_TEMPOD_AUTH_TOKEN"
+                && entry["owner"] == "tempo-headless"));
         Ok(())
     }
 

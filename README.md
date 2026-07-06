@@ -26,6 +26,24 @@ TEMPO_CDP_CHROME=/path/to/chrome \
   ./target/debug/tempod
 ```
 
+In another terminal, use the control CLI to create or inspect sessions:
+
+```
+cargo run -p tempo-shell --bin tempo -- health
+cargo run -p tempo-shell --bin tempo -- open https://example.com
+cargo run -p tempo-shell --bin tempo -- sessions
+```
+
+To open the human-visible window, build the gated GUI binary explicitly:
+
+```
+cargo run -p tempo-shell --features window --bin tempo-window -- \
+  --tempod 127.0.0.1:8787
+```
+
+The window reads the same runtime token file as the control CLI. If you set a
+token manually, pass `--auth-token TOKEN` or export `TEMPO_TEMPOD_AUTH_TOKEN`.
+
 Advanced users can still start an engine manually and attach to it:
 
 ```
@@ -40,6 +58,27 @@ The preview binds `tempod` to `127.0.0.1:8787` by default. Servo, remote/fleet
 operation, Windows-native IPC, crawler execution, cassette import, and
 authenticated/private-account safety claims are roadmap/beta gates, not this
 preview.
+
+### Binary matrix
+
+- `tempod` (`cargo run -p tempo-headless --bin tempod`) is the local HTTP
+  control plane. It binds `127.0.0.1:8787` by default, requires bearer auth, and
+  auto-starts the packaged CDP engine unless `--engine-socket` is supplied.
+- `tempo-engined-cdp` (`cargo run -p tempo-engine-cdp --bin tempo-engined-cdp`)
+  is the packaged Chromium/CDP engine host used by `tempod` and manual UDS
+  attach flows.
+- `tempo` (`cargo run -p tempo-shell --bin tempo`) is the JSON control CLI for
+  health, sessions, open/adopt/handoff/resume, events, and MCP tool calls. It is
+  not the browser window.
+- `tempo-window` (`cargo run -p tempo-shell --features window --bin tempo-window`)
+  is the gated human GUI over the same `tempod` API.
+- `tempo-cli` (`cargo run -p tempo-cli --bin tempo-cli`) emits schemas, eval
+  scorecards, fixture gates, replay summaries, CDP task runs, and the
+  machine-readable environment registry.
+
+Run any CLI with `-V` or `--version` for the crate version. Run
+`cargo run -p tempo-cli -- env-vars` to print every documented `TEMPO_*` runtime
+variable as JSON; add `--output path/to/env-vars.json` to write it to a file.
 
 ## Platform Direction
 
