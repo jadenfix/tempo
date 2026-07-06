@@ -24,6 +24,8 @@ use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::service::TowerToHyperService;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as JsonValue};
+#[cfg(test)]
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::convert::Infallible;
 use std::fmt;
@@ -161,6 +163,32 @@ const TEMPOD_AUTH_TOKEN_FILE_NAME: &str = "tempod.token";
 /// cannot be recovered by an offline dictionary search of the exported value.
 const REDACTED_MARKER: &str = "[redacted]";
 
+#[cfg(test)]
+thread_local! {
+    static TEST_RUNTIME_AUTH_TOKEN_PATH: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+struct TestRuntimeAuthTokenPathGuard {
+    previous: Option<PathBuf>,
+}
+
+#[cfg(test)]
+impl Drop for TestRuntimeAuthTokenPathGuard {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        TEST_RUNTIME_AUTH_TOKEN_PATH.with(|path| {
+            *path.borrow_mut() = previous;
+        });
+    }
+}
+
+#[cfg(test)]
+fn scoped_test_runtime_auth_token_path(path: PathBuf) -> TestRuntimeAuthTokenPathGuard {
+    let previous = TEST_RUNTIME_AUTH_TOKEN_PATH.with(|slot| slot.borrow_mut().replace(path));
+    TestRuntimeAuthTokenPathGuard { previous }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TempodRuntimeAuthToken {
     pub token: String,
@@ -209,6 +237,10 @@ impl TempodAuth {
 }
 
 pub fn tempod_runtime_auth_token_path() -> PathBuf {
+    #[cfg(test)]
+    if let Some(path) = TEST_RUNTIME_AUTH_TOKEN_PATH.with(|slot| slot.borrow().clone()) {
+        return path;
+    }
     if let Some(path) =
         std::env::var_os(TEMPO_TEMPOD_AUTH_TOKEN_FILE_ENV).filter(|path| !path.is_empty())
     {
@@ -3268,7 +3300,7 @@ pub fn run_tempod_with_config_and_navigation_url_policy(
     config: TempodServerConfig,
     url_policy: UrlPolicy,
 ) -> Result<(), TempodError> {
-    let config = config.with_bind_addr_host(addr);
+    let config = ensure_runtime_auth(config.with_bind_addr_host(addr))?;
     config.validate_bind_addr(addr)?;
     let listener = TcpListener::bind(addr)?;
     let pool = Arc::new(Mutex::new(
@@ -3324,7 +3356,7 @@ pub fn run_tempod_with_attached_driver_config_and_navigation_url_policy(
     socket_path: impl AsRef<Path>,
     url_policy: UrlPolicy,
 ) -> Result<(), TempodError> {
-    let config = config.with_bind_addr_host(addr);
+    let config = ensure_runtime_auth(config.with_bind_addr_host(addr))?;
     config.validate_bind_addr(addr)?;
     let listener = TcpListener::bind(addr)?;
     let socket_path = socket_path.as_ref().to_path_buf();
@@ -3677,6 +3709,7 @@ pub fn serve_forever_with_config(
     pool: Arc<Mutex<SessionPool>>,
     config: TempodServerConfig,
 ) -> Result<(), TempodError> {
+    let config = ensure_runtime_auth(config)?;
     config.validate_listener(&listener)?;
     let host_guard = TempodHostGuard::from_listener(&listener, &config.allowed_hosts)?;
     serve_forever_trusted(
@@ -3689,13 +3722,21 @@ pub fn serve_forever_with_config(
 }
 
 #[cfg(test)]
-fn serve_forever_with_limits(
+fn serve_forever_without_auth_for_tests_with_limits(
     listener: TcpListener,
     pool: Arc<Mutex<SessionPool>>,
     limiter: ConnectionLimiter,
 ) -> Result<(), TempodError> {
     let host_guard = TempodHostGuard::from_listener(&listener, &BTreeSet::new())?;
     serve_forever_trusted(listener, pool, TempodAuth::disabled(), host_guard, limiter)
+}
+
+#[cfg(test)]
+fn serve_forever_without_auth_for_tests(
+    listener: TcpListener,
+    pool: Arc<Mutex<SessionPool>>,
+) -> Result<(), TempodError> {
+    serve_forever_without_auth_for_tests_with_limits(listener, pool, ConnectionLimiter::default())
 }
 
 fn serve_forever_trusted(
@@ -3755,6 +3796,7 @@ pub fn serve_one_with_config(
     pool: Arc<Mutex<SessionPool>>,
     config: TempodServerConfig,
 ) -> Result<(), TempodError> {
+    let config = ensure_runtime_auth(config)?;
     config.validate_listener(&listener)?;
     let host_guard = TempodHostGuard::from_listener(&listener, &config.allowed_hosts)?;
     serve_one_trusted(
@@ -3764,6 +3806,36 @@ pub fn serve_one_with_config(
         host_guard,
         ConnectionLimiter::default(),
     )
+}
+
+#[cfg(test)]
+fn serve_one_without_auth_for_tests(
+    listener: TcpListener,
+    pool: Arc<Mutex<SessionPool>>,
+) -> Result<(), TempodError> {
+    let host_guard = TempodHostGuard::from_listener(&listener, &BTreeSet::new())?;
+    serve_one_trusted(
+        listener,
+        pool,
+        TempodAuth::disabled(),
+        host_guard,
+        ConnectionLimiter::default(),
+    )
+}
+
+fn ensure_runtime_auth(config: TempodServerConfig) -> Result<TempodServerConfig, TempodError> {
+    ensure_runtime_auth_with(config, load_or_create_tempod_runtime_auth_token)
+}
+
+fn ensure_runtime_auth_with(
+    config: TempodServerConfig,
+    load_token: impl FnOnce() -> Result<TempodRuntimeAuthToken, TempodError>,
+) -> Result<TempodServerConfig, TempodError> {
+    if config.auth.is_required() {
+        return Ok(config);
+    }
+    let token = load_token()?.token;
+    Ok(config.with_auth(TempodAuth::bearer(token)?))
 }
 
 fn serve_one_trusted(
@@ -9910,7 +9982,9 @@ mod tests {
         for _ in 0..count {
             let listener = listener.try_clone()?;
             let pool = Arc::clone(pool);
-            handles.push(thread::spawn(move || serve_one(listener, pool)));
+            handles.push(thread::spawn(move || {
+                serve_one_without_auth_for_tests(listener, pool)
+            }));
         }
         Ok(handles)
     }
@@ -10504,7 +10578,7 @@ mod tests {
         // bounded IPC wait; never joined).
         let wedged_listener = listener.try_clone()?;
         let wedged_pool = Arc::clone(&pool);
-        thread::spawn(move || serve_one(wedged_listener, wedged_pool));
+        thread::spawn(move || serve_one_without_auth_for_tests(wedged_listener, wedged_pool));
         thread::spawn(move || {
             let _ = http_post(
                 addr,
@@ -10963,7 +11037,7 @@ mod tests {
         let addr = listener.local_addr()?;
         let pool = Arc::new(Mutex::new(SessionPool::default()));
         let server_pool = Arc::clone(&pool);
-        let handle = thread::spawn(move || serve_one(listener, server_pool));
+        let handle = thread::spawn(move || serve_one_without_auth_for_tests(listener, server_pool));
 
         let body = r#"{"url":"https://one.test","driverless":true}"#;
         let response = send_http(
@@ -10981,7 +11055,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let addr = listener.local_addr()?;
         let server_pool = Arc::clone(&pool);
-        let handle = thread::spawn(move || serve_one(listener, server_pool));
+        let handle = thread::spawn(move || serve_one_without_auth_for_tests(listener, server_pool));
 
         let response = send_http(addr, "GET /sessions HTTP/1.1\r\n\r\n")?;
         join_server(handle)?;
@@ -11266,7 +11340,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let addr = listener.local_addr()?;
         let pool = Arc::new(Mutex::new(SessionPool::default()));
-        let handle = thread::spawn(move || serve_one(listener, pool));
+        let handle = thread::spawn(move || serve_one_without_auth_for_tests(listener, pool));
 
         let response = send_http(
             addr,
@@ -11585,7 +11659,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let addr = listener.local_addr()?;
         let pool = Arc::new(Mutex::new(SessionPool::default()));
-        let handle = thread::spawn(move || serve_one(listener, pool));
+        let handle = thread::spawn(move || serve_one_without_auth_for_tests(listener, pool));
         let mut stream = TcpStream::connect(addr)?;
         stream.set_read_timeout(Some(Duration::from_secs(5)))?;
 
@@ -11636,7 +11710,7 @@ mod tests {
         let pool = Arc::new(Mutex::new(pool));
         let handle = thread::spawn({
             let pool = Arc::clone(&pool);
-            move || serve_one(listener, pool)
+            move || serve_one_without_auth_for_tests(listener, pool)
         });
         let mut stream = TcpStream::connect(addr)?;
         stream.set_read_timeout(Some(Duration::from_secs(5)))?;
@@ -13779,7 +13853,7 @@ mod tests {
         let addr = listener.local_addr()?;
         let pool = Arc::new(Mutex::new(SessionPool::default()));
         let server_pool = Arc::clone(&pool);
-        let handle = thread::spawn(move || serve_one(listener, server_pool));
+        let handle = thread::spawn(move || serve_one_without_auth_for_tests(listener, server_pool));
 
         let body = r#"{"url":"https://chunked.test","driverless":true}"#;
         let request = format!(
@@ -13803,7 +13877,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let addr = listener.local_addr()?;
         let pool = Arc::new(Mutex::new(SessionPool::default()));
-        let handle = thread::spawn(move || serve_one(listener, pool));
+        let handle = thread::spawn(move || serve_one_without_auth_for_tests(listener, pool));
 
         let oversized = "x".repeat(MAX_HTTP_BYTES + 1);
         let response = send_http(
@@ -14271,7 +14345,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let addr = listener.local_addr()?;
         let pool = Arc::new(Mutex::new(SessionPool::default()));
-        let handle = thread::spawn(move || serve_one(listener, pool));
+        let handle = thread::spawn(move || serve_one_without_auth_for_tests(listener, pool));
 
         let response = send_http(
             addr,
@@ -14479,6 +14553,61 @@ mod tests {
             load_tempod_runtime_auth_token_at(&path),
             Err(TempodError::Io(error)) if error.kind() == std::io::ErrorKind::PermissionDenied
         ));
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn serving_config_without_auth_resolves_runtime_bearer_token() -> TestResult {
+        let config = ensure_runtime_auth_with(TempodServerConfig::new(), || {
+            Ok(TempodRuntimeAuthToken {
+                token: "runtime-token".into(),
+                path: PathBuf::from("fixture-token"),
+            })
+        })?;
+
+        assert!(config.auth_is_required());
+        Ok(())
+    }
+
+    #[test]
+    fn serving_config_with_explicit_auth_does_not_touch_runtime_token() -> TestResult {
+        let config = ensure_runtime_auth_with(
+            TempodServerConfig::new().with_auth(TempodAuth::bearer("explicit-token")?),
+            || panic!("explicit serving auth should not load the runtime token"),
+        )?;
+
+        assert!(config.auth_is_required());
+        Ok(())
+    }
+
+    #[test]
+    fn serve_one_default_config_requires_runtime_bearer_token() -> TestResult {
+        let root = unique_dir("serve-one-runtime-auth")?;
+        remove_dir_if_exists(&root)?;
+        let token_path = root.join("tempod.token");
+        let body = r#"{"url":"https://one.test","driverless":true}"#;
+
+        let missing = serve_one_post_session_with_runtime_auth_path(&token_path, None, body)?;
+        assert!(
+            missing.starts_with("HTTP/1.1 401 Unauthorized"),
+            "default serve_one must reject missing bearer token, got: {missing}"
+        );
+
+        let token = std::fs::read_to_string(&token_path)?.trim().to_string();
+        assert!(
+            token.len() >= 40,
+            "serve_one should create a high-entropy runtime token"
+        );
+
+        let allowed =
+            serve_one_post_session_with_runtime_auth_path(&token_path, Some(&token), body)?;
+        assert!(
+            allowed.starts_with("HTTP/1.1 201 Created"),
+            "runtime bearer token should authorize the public serve_one path, got: {allowed}"
+        );
+        assert!(allowed.contains("\"id\":\"session-0\""));
 
         remove_dir_if_exists(&root)?;
         Ok(())
@@ -14695,12 +14824,6 @@ mod tests {
 
         let listener = TcpListener::bind("0.0.0.0:0")?;
         assert!(matches!(
-            serve_forever(listener, Arc::clone(&pool)),
-            Err(TempodError::BadRequest(_))
-        ));
-
-        let listener = TcpListener::bind("0.0.0.0:0")?;
-        assert!(matches!(
             serve_forever_with_auth(
                 listener,
                 Arc::clone(&pool),
@@ -14711,19 +14834,28 @@ mod tests {
 
         let listener = TcpListener::bind("0.0.0.0:0")?;
         assert!(matches!(
-            serve_one(listener, Arc::clone(&pool)),
-            Err(TempodError::BadRequest(_))
-        ));
-
-        let listener = TcpListener::bind("0.0.0.0:0")?;
-        assert!(matches!(
-            serve_one_with_config(
+            serve_one_with_auth(
                 listener,
-                pool,
-                TempodServerConfig::new().allow_remote_binds()
+                Arc::clone(&pool),
+                TempodAuth::bearer("secret-token")?
             ),
             Err(TempodError::BadRequest(_))
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn listener_config_allows_non_loopback_with_remote_flag_and_runtime_auth() -> TestResult {
+        let listener = TcpListener::bind("0.0.0.0:0")?;
+        let config =
+            ensure_runtime_auth_with(TempodServerConfig::new().allow_remote_binds(), || {
+                Ok(TempodRuntimeAuthToken {
+                    token: "runtime-token".into(),
+                    path: PathBuf::from("fixture-token"),
+                })
+            })?;
+
+        assert!(config.validate_listener(&listener).is_ok());
         Ok(())
     }
 
@@ -14884,7 +15016,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let addr = listener.local_addr()?;
         let pool = Arc::new(Mutex::new(SessionPool::default()));
-        let handle = thread::spawn(move || serve_one(listener, pool));
+        let handle = thread::spawn(move || serve_one_without_auth_for_tests(listener, pool));
 
         let response = send_http(
             addr,
@@ -14908,7 +15040,8 @@ mod tests {
         let pool = Arc::new(Mutex::new(SessionPool::default()));
         let server_pool = Arc::clone(&pool);
         // serve_forever must keep accepting after a faulty connection.
-        let handle = thread::spawn(move || serve_forever(listener, server_pool));
+        let handle =
+            thread::spawn(move || serve_forever_without_auth_for_tests(listener, server_pool));
 
         // First client connects and disconnects immediately without sending a
         // request (client-side reset), which previously bubbled an Io error out
@@ -14944,8 +15077,9 @@ mod tests {
         let pool = Arc::new(Mutex::new(SessionPool::default()));
         let limiter = ConnectionLimiter::new(1, 1);
         let server_limiter = limiter.clone();
-        let handle =
-            thread::spawn(move || serve_forever_with_limits(listener, pool, server_limiter));
+        let handle = thread::spawn(move || {
+            serve_forever_without_auth_for_tests_with_limits(listener, pool, server_limiter)
+        });
 
         let held = TcpStream::connect(addr)?;
         wait_for_connection_counts(&limiter, (1, 0))?;
@@ -14967,8 +15101,9 @@ mod tests {
         let pool = Arc::new(Mutex::new(SessionPool::default()));
         let limiter = ConnectionLimiter::new(1, 1);
         let server_limiter = limiter.clone();
-        let handle =
-            thread::spawn(move || serve_forever_with_limits(listener, pool, server_limiter));
+        let handle = thread::spawn(move || {
+            serve_forever_without_auth_for_tests_with_limits(listener, pool, server_limiter)
+        });
 
         let mut held = open_bidi_websocket(addr)?;
         wait_for_connection_counts(&limiter, (0, 1))?;
@@ -14997,8 +15132,9 @@ mod tests {
         let pool = Arc::new(Mutex::new(SessionPool::default()));
         let limiter = ConnectionLimiter::new(1, 1);
         let server_limiter = limiter.clone();
-        let handle =
-            thread::spawn(move || serve_forever_with_limits(listener, pool, server_limiter));
+        let handle = thread::spawn(move || {
+            serve_forever_without_auth_for_tests_with_limits(listener, pool, server_limiter)
+        });
 
         let mut first = open_bidi_websocket(addr)?;
         wait_for_connection_counts(&limiter, (0, 1))?;
@@ -15420,6 +15556,33 @@ mod tests {
         stream.write_all(request.as_bytes())?;
         stream.shutdown(std::net::Shutdown::Write)?;
         read_http_response(&mut stream)
+    }
+
+    fn serve_one_post_session_with_runtime_auth_path(
+        token_path: &Path,
+        bearer: Option<&str>,
+        body: &str,
+    ) -> Result<String, Box<dyn Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let pool = Arc::new(Mutex::new(SessionPool::default()));
+        let token_path = token_path.to_path_buf();
+        let handle = thread::spawn(move || {
+            let _runtime_auth_path = scoped_test_runtime_auth_token_path(token_path);
+            serve_one(listener, pool)
+        });
+        let authorization = bearer
+            .map(|token| format!("authorization: Bearer {token}\r\n"))
+            .unwrap_or_default();
+        let response = send_http(
+            addr,
+            &format!(
+                "POST /sessions HTTP/1.1\r\n{authorization}content-length: {}\r\n\r\n{body}",
+                body.len()
+            ),
+        )?;
+        join_server(handle)?;
+        Ok(response)
     }
 
     fn request_with_default_host(addr: std::net::SocketAddr, request: &str) -> String {
