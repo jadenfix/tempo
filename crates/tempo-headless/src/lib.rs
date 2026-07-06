@@ -5927,6 +5927,36 @@ pub fn tempod_openapi(base_url: &str) -> JsonValue {
                     "responses": {"200": {"description": "OpenAPI 3.1 document"}}
                 }
             },
+            tempo_mcp::A2A_AGENT_CARD_PATH: {
+                "get": {
+                    "operationId": "agentCard",
+                    "responses": {
+                        "200": {
+                            "description": "A2A agent card metadata for this tempod control plane",
+                            "content": {
+                                tempo_mcp::A2A_AGENT_CARD_CONTENT_TYPE: {
+                                    "schema": {"type": "object", "additionalProperties": true}
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            tempo_mcp::A2A_AGENT_JSON_PATH: {
+                "get": {
+                    "operationId": "agentJson",
+                    "responses": {
+                        "200": {
+                            "description": "A2A agent metadata alias for this tempod control plane",
+                            "content": {
+                                tempo_mcp::A2A_AGENT_CARD_CONTENT_TYPE: {
+                                    "schema": {"type": "object", "additionalProperties": true}
+                                }
+                            }
+                        }
+                    }
+                }
+            },
             "/sessions": {
                 "get": {
                     "operationId": "listSessions",
@@ -6275,6 +6305,46 @@ pub fn tempod_openapi(base_url: &str) -> JsonValue {
                             "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AgentRun"}}}
                         },
                         "409": {"description": "Session is owned by a human surface"}
+                    }
+                }
+            },
+            "/drain": {
+                "post": {
+                    "operationId": "drain",
+                    "security": [{"TempodBearer": []}],
+                    "responses": {
+                        "200": {
+                            "description": "Enter draining mode and close engine resources",
+                            "content": {"application/json": {"schema": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "required": ["draining", "sessions"],
+                                "properties": {
+                                    "draining": {"type": "boolean"},
+                                    "sessions": {
+                                        "type": "array",
+                                        "items": {"$ref": "#/components/schemas/TempodSession"}
+                                    }
+                                }
+                            }}}
+                        }
+                    }
+                }
+            },
+            TEMPOD_METRICS_PATH: {
+                "get": {
+                    "operationId": "metrics",
+                    "security": [{"TempodBearer": []}],
+                    "responses": {
+                        "200": {
+                            "description": "Prometheus metrics exposition",
+                            "content": {
+                                tempo_telemetry::PROMETHEUS_CONTENT_TYPE: {
+                                    "schema": {"type": "string"}
+                                }
+                            }
+                        },
+                        "404": {"description": "Metrics exposition disabled by configuration"}
                     }
                 }
             }
@@ -11781,6 +11851,29 @@ mod tests {
                 "engine_dead",
                 "session_limit_reached"
             ])
+        );
+        assert_eq!(
+            openapi["paths"]["/.well-known/agent-card.json"]["get"]["operationId"],
+            "agentCard"
+        );
+        assert_eq!(
+            openapi["paths"]["/.well-known/agent.json"]["get"]["operationId"],
+            "agentJson"
+        );
+        assert_eq!(openapi["paths"]["/drain"]["post"]["operationId"], "drain");
+        assert_eq!(
+            openapi["paths"]["/drain"]["post"]["responses"]["200"]["content"]["application/json"]
+                ["schema"]["properties"]["sessions"]["items"]["$ref"],
+            "#/components/schemas/TempodSession"
+        );
+        assert_eq!(
+            openapi["paths"]["/metrics"]["get"]["operationId"],
+            "metrics"
+        );
+        assert_eq!(
+            openapi["paths"]["/metrics"]["get"]["responses"]["200"]["content"]
+                [tempo_telemetry::PROMETHEUS_CONTENT_TYPE]["schema"]["type"],
+            "string"
         );
         assert_eq!(
             openapi["paths"]["/sessions/{session_id}/events"]["get"]["operationId"],
