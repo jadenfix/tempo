@@ -14587,7 +14587,7 @@ mod tests {
         let root = unique_dir("serve-one-runtime-auth")?;
         remove_dir_if_exists(&root)?;
         let token_path = root.join("tempod.token");
-        let body = r#"{"url":"https://one.test"}"#;
+        let body = r#"{"url":"https://one.test","driverless":true}"#;
 
         let missing = serve_one_post_session_with_runtime_auth_path(&token_path, None, body)?;
         assert!(
