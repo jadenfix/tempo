@@ -2488,7 +2488,7 @@ impl CheckedCrawlDispatch {
 /// HTTP/TLS request state from the scheme, authority, host, path/query, headers,
 /// and already-approved socket without giving an HTTP client a hostname to
 /// resolve again.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ConnectionPinnedCrawlDispatch {
     request_id: RequestId,
     method: String,
@@ -2506,6 +2506,32 @@ pub struct ConnectionPinnedCrawlDispatch {
     audit: AuditRecord,
     egress: EgressRecord,
     web_bot_auth_headers: Option<SignatureHeaders>,
+}
+
+impl fmt::Debug for ConnectionPinnedCrawlDispatch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConnectionPinnedCrawlDispatch")
+            .field("request_id", &self.request_id)
+            .field("method", &self.method)
+            .field("profile_id", &self.profile_id)
+            .field("identity_mode", &self.identity_mode)
+            .field("header_count", &header_value_count(&self.headers))
+            .field("body_size", &self.body_size)
+            .field("body_sha256_present", &self.body_sha256.is_some())
+            .field("scheme", &self.scheme)
+            .field("authority", &"[redacted]")
+            .field("host", &"[redacted]")
+            .field("path_and_query", &"[redacted]")
+            .field("origin", &self.origin)
+            .field("resolved_socket", &self.resolved_socket)
+            .field("audit", &self.audit)
+            .field("egress", &self.egress)
+            .field(
+                "web_bot_auth_headers_present",
+                &self.web_bot_auth_headers.is_some(),
+            )
+            .finish()
+    }
 }
 
 impl ConnectionPinnedCrawlDispatch {
@@ -7255,6 +7281,41 @@ Disallow: /private
         assert!(pinned.body_sha256().is_some());
         assert_eq!(pinned.audit().origin, "https://example.com:8443");
         assert_eq!(pinned.egress().domain, "example.com");
+        Ok(())
+    }
+
+    #[test]
+    fn connection_pinned_debug_redacts_headers_query_and_signatures() -> Result<(), Box<dyn Error>>
+    {
+        let key = WebBotAuthSigningKey::from_seed("tempo-agent", &[8u8; 32])?;
+        let dispatch = CrawlDispatch {
+            request: NetworkRequest::new(
+                "r1",
+                "GET",
+                "https://secret.example/path?token=query-secret",
+                "profile-a",
+                IdentityMode::AgentDeclared,
+            )
+            .with_header("authorization", "Bearer header-secret")
+            .with_header("cookie", "session=cookie-secret"),
+            origin: "https://secret.example".into(),
+        };
+        let checked = dispatch.check_signed(
+            &UrlPolicy::block_private(),
+            &EgressPolicy::allow_all(),
+            SocketAddr::from(([93, 184, 216, 34], 443)),
+            &key,
+            1_800_000_000,
+        )?;
+        let pinned = checked.into_connection_pinned()?;
+        let debug = format!("{pinned:?}");
+
+        assert!(!debug.contains("query-secret"), "{debug}");
+        assert!(!debug.contains("header-secret"), "{debug}");
+        assert!(!debug.contains("cookie-secret"), "{debug}");
+        assert!(!debug.contains("Signature-Input"), "{debug}");
+        assert!(debug.contains("header_count"));
+        assert!(debug.contains("web_bot_auth_headers_present"));
         Ok(())
     }
 
