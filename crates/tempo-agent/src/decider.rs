@@ -56,6 +56,11 @@ pub const DEFAULT_MAX_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
 /// Default ceiling on decide rounds per run, bounding a looping model.
 pub const DEFAULT_MAX_DECISION_ROUNDS: usize = 16;
 
+/// Browser-use-style upper bound for one model-decided action batch (#478).
+/// The runner still re-observes after each action; this cap limits stale queued
+/// work when the page changes faster than a model can re-ground.
+pub const MAX_DECIDED_BATCH_ACTIONS: usize = 5;
+
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const DECIDE_TOOL_NAME: &str = "decide_actions";
 const DEFAULT_MAX_OUTPUT_TOKENS: u64 = 2048;
@@ -519,9 +524,12 @@ fn decider_system_text(goal: &str) -> String {
     format!(
         "You drive a web browser through the structured tempo action space.\n\
          Decide the next batch of actions that makes progress toward the goal, \
-         using only NodeIds present in the current observation. Call the \
-         `decide_actions` tool exactly once per turn. When the goal is complete, \
-         set `done` to true and return an empty `actions` array.\n\nGoal: {goal}"
+         using only NodeIds present in the current observation. Return at most \
+         {MAX_DECIDED_BATCH_ACTIONS} actions, and stop the batch immediately \
+         after any navigation or send-class action because the next action must \
+         re-ground against the new page state. Call the `decide_actions` tool \
+         exactly once per turn. When the goal is complete, set `done` to true \
+         and return an empty `actions` array.\n\nGoal: {goal}"
     )
 }
 
@@ -543,7 +551,8 @@ fn decide_tool(action_schema: &serde_json::Value) -> serde_json::Value {
                 },
                 "actions": {
                     "type": "array",
-                    "description": "Actions to execute next, in order. Empty when done.",
+                    "description": "Actions to execute next, in order. Empty when done. At most five actions; stop after a navigation or send-class action.",
+                    "maxItems": MAX_DECIDED_BATCH_ACTIONS,
                     "items": action_schema
                 }
             },
@@ -975,6 +984,7 @@ impl AgentRunner {
                 };
                 decider.decide(&request).await?
             };
+            let decided = sanitize_decided_batch(decided);
             total_decisions += 1;
 
             // Journal-before-effect: the decision (and its usage) is durable
@@ -1497,6 +1507,27 @@ fn decided_transport_error(
     }
 }
 
+fn action_terminates_sequence(action: &Action) -> bool {
+    matches!(action, Action::Goto { .. }) || action.side_effect() >= SideEffect::Send
+}
+
+fn sanitize_decided_actions(actions: Vec<Action>) -> Vec<Action> {
+    let mut sanitized = Vec::new();
+    for action in actions.into_iter().take(MAX_DECIDED_BATCH_ACTIONS) {
+        let terminates = action_terminates_sequence(&action);
+        sanitized.push(action);
+        if terminates {
+            break;
+        }
+    }
+    sanitized
+}
+
+fn sanitize_decided_batch(mut batch: DecidedBatch) -> DecidedBatch {
+    batch.actions = sanitize_decided_actions(batch.actions);
+    batch
+}
+
 /// Rebuild the decided-loop cursor from journal entries: which decisions are
 /// fully executed, which one is pending, and whether a step's intent was
 /// journaled without an outcome.
@@ -1594,6 +1625,23 @@ fn decided_resume_from_entries(entries: &[JournalEntry]) -> Result<DecidedResume
         }
     }
 
+    // Older journals may contain a not-yet-executed model decision with a stale
+    // tail after a navigation/send-class action. Truncate only the still-pending
+    // in-memory replay cursor; already-completed historical rounds remain
+    // readable as recorded.
+    if let Some(mut pending) = resume.pending.take() {
+        if !pending.dangling_planned {
+            pending.actions = sanitize_decided_actions(pending.actions);
+            if pending.executed >= pending.actions.len() {
+                resume.completed.push(pending);
+            } else {
+                resume.pending = Some(pending);
+            }
+        } else {
+            resume.pending = Some(pending);
+        }
+    }
+
     Ok(resume)
 }
 
@@ -1625,6 +1673,10 @@ mod tests {
         Action::Click {
             node: NodeId(node.into()),
         }
+    }
+
+    fn goto_action(url: &str) -> Action {
+        Action::Goto { url: url.into() }
     }
 
     fn journal_root(label: &str) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
@@ -1938,6 +1990,62 @@ mod tests {
             entries.last().map(|entry| &entry.event),
             Some(JournalEvent::SessionClosed)
         ));
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn decided_actions_are_capped_and_truncated_after_terminator() {
+        let capped = sanitize_decided_actions(vec![
+            Action::Wait { millis: 1 },
+            Action::Wait { millis: 2 },
+            Action::Wait { millis: 3 },
+            Action::Wait { millis: 4 },
+            Action::Wait { millis: 5 },
+            Action::Wait { millis: 6 },
+        ]);
+        assert_eq!(capped.len(), MAX_DECIDED_BATCH_ACTIONS);
+        assert_eq!(
+            capped.last(),
+            Some(&Action::Wait {
+                millis: MAX_DECIDED_BATCH_ACTIONS as u64
+            })
+        );
+
+        let goto = goto_action("https://example.com/next");
+        let truncated = sanitize_decided_actions(vec![
+            Action::Wait { millis: 1 },
+            goto.clone(),
+            click("stale-after-navigation"),
+        ]);
+        assert_eq!(truncated, vec![Action::Wait { millis: 1 }, goto]);
+    }
+
+    #[tokio::test]
+    async fn decided_loop_journals_sanitized_model_decision() -> TestResult {
+        let (root, journal_path) = journal_root("decided-sanitized-journal")?;
+        let goto = goto_action("https://example.com/next");
+        let mut driver = CountingDriver::new(vec![button("submit")]);
+        let runner = AgentRunner::new_plaintext_unsafe(
+            &journal_path,
+            AgentRunIds::new("run-decided-sanitized", "session-decided-sanitized"),
+        )
+        .with_confirmation_mode(ConfirmationMode::AutoConfirmAll);
+        let mut decider =
+            ScriptedDecider::new(vec![vec![goto.clone(), click("stale-after-navigation")]]);
+        let spec = DecidedTaskSpec::new("https://example.com", "navigate once");
+
+        let report = runner
+            .run_decided_task(&mut driver, &mut decider, &spec)
+            .await?;
+
+        assert_eq!(report.status, DecidedRunStatus::Completed);
+        assert_eq!(report.actions_completed, 1);
+        assert_eq!(report.rounds[0].actions, 1);
+
+        let decisions = decision_actions(&read_journal_entries(&journal_path)?);
+        assert_eq!(decisions[0], vec![goto]);
+        assert_eq!(decisions[1], Vec::<Action>::new());
         remove_dir_if_exists(&root)?;
         Ok(())
     }
@@ -2636,6 +2744,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn decided_resume_truncates_legacy_pending_decision_after_terminator() -> TestResult {
+        let (root, journal_path) = journal_root("decided-resume-sanitized")?;
+        let ids = AgentRunIds::new(
+            "run-decided-resume-sanitized",
+            "session-decided-resume-sanitized",
+        );
+        let goto = goto_action("https://example.com/next");
+        {
+            // A prior binary could journal a stale tail after navigation before
+            // crashing. Resume must not replay that tail against the new page.
+            let mut journal = SessionJournal::open(
+                &journal_path,
+                RunId(ids.run_id.0.clone()),
+                SessionId(ids.session_id.0.clone()),
+            )?;
+            journal.append(JournalEvent::SessionStarted {
+                url: "https://example.com".into(),
+            })?;
+            journal.append(JournalEvent::Observation {
+                observation: observation("https://example.com", 0),
+            })?;
+            journal.append(JournalEvent::ModelDecision {
+                actions: vec![goto.clone(), click("stale-after-navigation")],
+                rationale: Some("legacy over-batched navigation".into()),
+                input_tokens: 10,
+                output_tokens: 5,
+                cache_read_input_tokens: 0,
+            })?;
+        }
+
+        let mut driver = CountingDriver::new(vec![button("submit")]);
+        driver.goto("https://example.com").await?;
+        let runner = AgentRunner::new_plaintext_unsafe(&journal_path, ids)
+            .with_confirmation_mode(ConfirmationMode::AutoConfirmAll)
+            .with_token_budget(TokenBudget::new(100));
+        let mut decider = FixedUsageDecider {
+            actions: Vec::new(),
+            usage: DecisionUsage::default(),
+            calls: 0,
+        };
+        let spec = DecidedTaskSpec::new("https://example.com", "navigate once");
+
+        let report = runner
+            .run_decided_task(&mut driver, &mut decider, &spec)
+            .await?;
+
+        assert_eq!(report.status, DecidedRunStatus::Completed);
+        assert_eq!(report.actions_completed, 1);
+        assert_eq!(report.rounds[0].actions, 1);
+        assert!(report.rounds[0].resumed);
+        assert_eq!(decider.calls, 1);
+
+        let planned: Vec<Action> = read_journal_entries(&journal_path)?
+            .into_iter()
+            .filter_map(|entry| match entry.event {
+                JournalEvent::ActionPlanned { action } => Some(action),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(planned, vec![goto]);
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn decided_resume_refuses_to_repeat_planned_but_unjournaled_step() -> TestResult {
         let (root, journal_path) = journal_root("decided-interrupt")?;
         let ids = AgentRunIds::new("run-decided-interrupt", "session-decided-interrupt");
@@ -2909,6 +3082,19 @@ mod tests {
         assert!(batch.actions.is_empty());
         assert_eq!(batch.usage.cache_read_input_tokens, 1);
         Ok(())
+    }
+
+    #[test]
+    fn decide_tool_advertises_decided_batch_cap() {
+        let schema = tempo_schema::action_json_schema();
+        let tool = decide_tool(&schema);
+
+        assert_eq!(
+            tool["input_schema"]["properties"]["actions"]["maxItems"],
+            serde_json::json!(MAX_DECIDED_BATCH_ACTIONS)
+        );
+        assert!(decider_system_text("finish the task")
+            .contains(&format!("at most {MAX_DECIDED_BATCH_ACTIONS} actions")));
     }
 
     /// Reverted-fix sentinel (issue #522, decided-loop side): a typed
