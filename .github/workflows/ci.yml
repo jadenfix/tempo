@@ -155,6 +155,26 @@ jobs:
       - name: cargo test (engine-host peer credentials)
         run: cargo test --locked -p tempo-engine-host
 
+  human-window:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.96.1
+      - name: install window system deps
+        run: >
+          sudo apt-get update &&
+          sudo apt-get install -y --no-install-recommends
+          pkg-config
+          libgl1-mesa-dev
+          libwayland-dev
+          libx11-dev
+          libxcursor-dev
+          libxi-dev
+          libxkbcommon-dev
+          libxrandr-dev
+      - name: cargo check (human window)
+        run: cargo check --locked -p tempo-shell --features window --bin tempo-window
+
   bench-smoke:
     runs-on: ubuntu-latest
     steps:
