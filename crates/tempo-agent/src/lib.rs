@@ -892,7 +892,7 @@ impl ConfirmationMode {
                         decision.side_effect,
                         SideEffect::Send | SideEffect::Purchase | SideEffect::Delete
                     )
-                    && !matches!(decision.gate, ConfirmationGate::ConfirmWithTaintReview)
+                    && !decision.gate.requires_human()
             }
             #[cfg(test)]
             Self::AutoConfirmAll => true,
@@ -2956,13 +2956,24 @@ mod tests {
     }
 
     #[test]
-    fn auto_confirm_clean_never_waives_high_risk_or_tainted_gates() {
+    fn auto_confirm_clean_never_waives_high_risk_or_tainted_gates() -> TestResult {
         let mode = ConfirmationMode::AutoConfirmClean;
 
         assert!(mode.permits(tempo_policy::decide_effect(
             SideEffect::Write,
             InputTaint::CLEAN
         )));
+        let confirm_origin = Origin::parse("https://confirm.example")?;
+        let origin_policy = OriginPolicy::new(vec![OriginRule::new(
+            confirm_origin.clone(),
+            SideEffect::Write,
+            OriginRuleMode::RequireConfirmation,
+        )]);
+        assert!(!mode.permits(
+            origin_policy
+                .decide_effect(Some(&confirm_origin), SideEffect::Write, InputTaint::CLEAN)
+                .decision
+        ));
         assert!(!mode.permits(tempo_policy::decide_effect(
             SideEffect::Write,
             InputTaint::TAINTED
@@ -2979,6 +2990,7 @@ mod tests {
             SideEffect::Delete,
             InputTaint::CLEAN
         )));
+        Ok(())
     }
 
     #[tokio::test]
@@ -3977,6 +3989,63 @@ mod tests {
             report.steps[0].policy.origin_rule_mode,
             OriginRuleMode::RequireConfirmation
         );
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runner_auto_confirm_clean_denies_origin_confirmation_gate() -> TestResult {
+        let root = unique_dir("runner-origin-gate-auto-clean")?;
+        remove_dir_if_exists(&root)?;
+        fs::create_dir_all(&root)?;
+        let journal_path = root.join("session.jsonl");
+        let origin = Origin::parse("https://example.com")?;
+        let task = DriverTask::new(
+            "https://example.com",
+            vec![Action::Click {
+                node: NodeId("submit".into()),
+            }],
+        );
+        let mut driver = TestDriver::new().with_elements(vec![button("submit")]);
+        let runner = AgentRunner::new_plaintext_unsafe(
+            &journal_path,
+            AgentRunIds::new(
+                "run-origin-gate-auto-clean",
+                "session-origin-gate-auto-clean",
+            ),
+        )
+        .with_confirmation_mode(ConfirmationMode::AutoConfirmClean)
+        .with_origin_policy(OriginPolicy::new(vec![OriginRule::new(
+            origin,
+            SideEffect::Write,
+            OriginRuleMode::RequireConfirmation,
+        )]));
+
+        let report = runner.run_driver_task(&mut driver, &task).await?;
+
+        assert!(matches!(report.status, AgentRunStatus::PolicyDenied { .. }));
+        assert_eq!(
+            report.steps[0].policy.origin.as_deref(),
+            Some("https://example.com:443")
+        );
+        assert_eq!(
+            report.steps[0].policy.confirmation_gate,
+            ConfirmationGate::Confirm
+        );
+        assert!(!report.steps[0].policy.confirmed);
+        assert!(!report.steps[0].policy.denied);
+        assert_eq!(
+            report.steps[0].policy.origin_rule_mode,
+            OriginRuleMode::RequireConfirmation
+        );
+        assert!(matches!(
+            report.steps[0].triple.outcome,
+            StepTripleOutcome::StepError { .. }
+        ));
+        assert!(!read_journal_entries(&journal_path)?
+            .iter()
+            .any(|entry| matches!(entry.event, JournalEvent::StepApplied { .. })));
 
         remove_dir_if_exists(&root)?;
         Ok(())
