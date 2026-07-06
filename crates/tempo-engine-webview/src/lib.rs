@@ -444,6 +444,12 @@ impl DriverTrait for WebViewDriver {
         Ok(self.diff_from_base(since_seq, current.as_ref()))
     }
 
+    fn cached_observation(&self, seq: u64) -> Option<CompiledObservation> {
+        self.history
+            .get(&seq)
+            .map(|observation| observation.as_ref().clone())
+    }
+
     async fn act(&mut self, action: &Action) -> Result<StepOutcome, TransportError> {
         let previous_seq = self.latest_seq();
         match action {

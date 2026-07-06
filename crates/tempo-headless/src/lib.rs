@@ -916,6 +916,13 @@ impl AttachedEngineDriver {
         }
     }
 
+    fn request_cached_observation(&self, seq: u64) -> Option<CompiledObservation> {
+        match self.request(HostDriverCommand::CachedObservation { seq }) {
+            Ok(DriverResponse::CachedObservation { observation }) => observation,
+            _ => None,
+        }
+    }
+
     fn request_step(
         &self,
         command: HostDriverCommand,
@@ -1086,6 +1093,10 @@ impl DriverTrait for AttachedEngineDriver {
 
     async fn observe_diff(&mut self, since_seq: u64) -> Result<ObservationDiff, TransportError> {
         self.request_diff(HostDriverCommand::ObserveDiff { since_seq }, "observe_diff")
+    }
+
+    fn cached_observation(&self, seq: u64) -> Option<CompiledObservation> {
+        self.request_cached_observation(seq)
     }
 
     async fn act(&mut self, action: &Action) -> Result<StepOutcome, TransportError> {

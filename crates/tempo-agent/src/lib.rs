@@ -7,6 +7,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
+use std::io;
 use std::path::{Path, PathBuf};
 use tempo_act::{execute_action, execute_batch, ExecutionStatus};
 use tempo_driver::{DriverTrait, Engine, StepOutcome, TransportError};
@@ -844,7 +845,7 @@ impl ObservationBudgetLimit {
         self,
         observation: &CompiledObservation,
     ) -> Result<ObservationBudget, AgentError> {
-        let bytes = serde_json::to_vec(observation)?.len();
+        let bytes = serialized_json_len(observation)?;
         let estimated_tokens = estimate_tokens(bytes);
         if bytes > self.max_observation_bytes || estimated_tokens > self.max_observation_tokens {
             return Err(AgentError::ObservationBudgetExceeded {
@@ -859,6 +860,28 @@ impl ObservationBudgetLimit {
             estimated_tokens,
         })
     }
+}
+
+#[derive(Default)]
+struct CountingSink {
+    bytes: usize,
+}
+
+impl io::Write for CountingSink {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.bytes = self.bytes.saturating_add(buf.len());
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialized_json_len<T: Serialize>(value: &T) -> Result<usize, serde_json::Error> {
+    let mut sink = CountingSink::default();
+    serde_json::to_writer(&mut sink, value)?;
+    Ok(sink.bytes)
 }
 
 /// Measured observation size for evals and budget reports.
@@ -1005,6 +1028,7 @@ impl AgentRunner {
         }
 
         let mut current_origin;
+        let mut observation;
         if !has_session_started(&initial_entries) {
             if let Some(decision) = self.structured_fast_path.probe_target(&task.start_url)
                 && decision.skips_render()
@@ -1016,20 +1040,23 @@ impl AgentRunner {
                     .await;
             }
 
-            let observation = driver
+            let initial_observation = driver
                 .goto(&task.start_url)
                 .await
                 .map_err(|source| journal_transport_error(&mut agent, "initial goto", source))?;
-            current_origin = self.origin_for_url("initial observation", &observation.url)?;
+            current_origin =
+                self.origin_for_url("initial observation", &initial_observation.url)?;
             agent.record_session_started(task.start_url.clone())?;
-            self.record_observation(&mut agent, &mut report, observation)?;
+            self.record_observation(&mut agent, &mut report, initial_observation.clone())?;
+            observation = initial_observation;
         } else {
-            let observation = driver
+            let resumed = driver
                 .observe()
                 .await
                 .map_err(|source| journal_transport_error(&mut agent, "resume observe", source))?;
-            current_origin = self.origin_for_url("resume observation", &observation.url)?;
-            self.record_observation(&mut agent, &mut report, observation)?;
+            current_origin = self.origin_for_url("resume observation", &resumed.url)?;
+            self.record_observation(&mut agent, &mut report, resumed.clone())?;
+            observation = resumed;
         }
 
         while let Some(planned) = agent.next_step().cloned() {
@@ -1108,18 +1135,20 @@ impl AgentRunner {
             // execution is detected — rather than silently repeated — on resume.
             agent.plan_next_step()?;
 
+            let since_seq = observation.seq;
             let execution = match &compiled_skill {
-                Some(skill) => execute_batch(driver, &skill.batch)
+                Some(skill) => execute_batch(driver, &skill.batch, since_seq)
                     .await
                     .map_err(|source| {
                         journal_transport_error(&mut agent, "execute skill", source)
                     })?,
-                None => execute_action(driver, &planned.action)
+                None => execute_action(driver, &planned.action, since_seq)
                     .await
                     .map_err(|source| {
                         journal_transport_error(&mut agent, "execute action", source)
                     })?,
             };
+            let post_action_seq = execution.seq;
             // A batch StepError still fails the step. `PartiallyApplied` is a
             // StepError whose earlier actions already grounded — it must fail
             // the step exactly like a plain StepError (never a replayable no-op),
@@ -1135,12 +1164,17 @@ impl AgentRunner {
             let triple = agent.record_next_outcome(outcome)?;
             report.actions_completed += 1;
 
-            let observation = driver.observe().await.map_err(|source| {
-                journal_transport_error(&mut agent, "post-action observe", source)
-            })?;
-            current_origin = self.origin_for_url("post-action observation", &observation.url)?;
+            let next_observation = match driver.cached_observation(post_action_seq) {
+                Some(observation) => observation,
+                None => driver.observe().await.map_err(|source| {
+                    journal_transport_error(&mut agent, "post-action observe", source)
+                })?,
+            };
+            current_origin =
+                self.origin_for_url("post-action observation", &next_observation.url)?;
             let observation_budget =
-                self.record_observation(&mut agent, &mut report, observation)?;
+                self.record_observation(&mut agent, &mut report, next_observation.clone())?;
+            observation = next_observation;
             let step_error = match &triple.outcome {
                 StepTripleOutcome::StepError { reason } => Some(reason.clone()),
                 StepTripleOutcome::Applied { .. } => None,
@@ -3628,10 +3662,13 @@ mod tests {
 
         let error = runner.run_driver_task(&mut driver, &task).await.err();
 
-        assert!(matches!(
-            error,
-            Some(AgentError::Transport { context, .. }) if context == "post-action observe"
-        ));
+        assert!(
+            matches!(
+                error,
+                Some(AgentError::Transport { ref context, .. }) if context == "post-action observe"
+            ),
+            "unexpected error: {error:?}"
+        );
         let entries = read_journal_entries(&journal_path)?;
         let applied_pos = entries
             .iter()
@@ -5359,7 +5396,7 @@ mod tests {
 
         async fn observe(&mut self) -> Result<CompiledObservation, TransportError> {
             self.observe_calls += 1;
-            if self.failure == TransportFailurePoint::PostActionObserve && self.observe_calls == 2 {
+            if self.failure == TransportFailurePoint::PostActionObserve && self.observe_calls == 1 {
                 return Err(TransportError::EngineGone);
             }
             self.inner.observe().await
@@ -5370,6 +5407,13 @@ mod tests {
             since_seq: u64,
         ) -> Result<ObservationDiff, TransportError> {
             self.inner.observe_diff(since_seq).await
+        }
+
+        fn cached_observation(&self, seq: u64) -> Option<CompiledObservation> {
+            if self.failure == TransportFailurePoint::PostActionObserve {
+                return None;
+            }
+            self.inner.cached_observation(seq)
         }
 
         async fn act(&mut self, action: &Action) -> Result<StepOutcome, TransportError> {

@@ -106,11 +106,12 @@ enum Grounding {
 pub async fn execute_action<D>(
     driver: &mut D,
     action: &Action,
+    since_seq: u64,
 ) -> Result<ActionExecution, TransportError>
 where
     D: DriverTrait + ?Sized,
 {
-    execute_action_grounded(driver, action, Grounding::TrustMatchingDiff).await
+    execute_action_grounded(driver, action, since_seq, Grounding::TrustMatchingDiff).await
 }
 
 /// [`execute_action`], but the grounding diff always comes from an independent
@@ -119,27 +120,28 @@ where
 pub async fn execute_action_verified<D>(
     driver: &mut D,
     action: &Action,
+    since_seq: u64,
 ) -> Result<ActionExecution, TransportError>
 where
     D: DriverTrait + ?Sized,
 {
-    execute_action_grounded(driver, action, Grounding::IndependentRediff).await
+    execute_action_grounded(driver, action, since_seq, Grounding::IndependentRediff).await
 }
 
 async fn execute_action_grounded<D>(
     driver: &mut D,
     action: &Action,
+    since_seq: u64,
     grounding: Grounding,
 ) -> Result<ActionExecution, TransportError>
 where
     D: DriverTrait + ?Sized,
 {
-    let before = driver.observe().await?;
     let outcome = driver.act(action).await?;
     finish_execution(
         driver,
         outcome,
-        before.seq,
+        since_seq,
         1,
         action.side_effect(),
         driver.engine(),
@@ -153,11 +155,12 @@ where
 pub async fn execute_batch<D>(
     driver: &mut D,
     batch: &ActionBatch,
+    since_seq: u64,
 ) -> Result<ActionExecution, TransportError>
 where
     D: DriverTrait + ?Sized,
 {
-    execute_batch_grounded(driver, batch, Grounding::TrustMatchingDiff).await
+    execute_batch_grounded(driver, batch, since_seq, Grounding::TrustMatchingDiff).await
 }
 
 /// [`execute_batch`], but the grounding diff always comes from an independent
@@ -166,27 +169,28 @@ where
 pub async fn execute_batch_verified<D>(
     driver: &mut D,
     batch: &ActionBatch,
+    since_seq: u64,
 ) -> Result<ActionExecution, TransportError>
 where
     D: DriverTrait + ?Sized,
 {
-    execute_batch_grounded(driver, batch, Grounding::IndependentRediff).await
+    execute_batch_grounded(driver, batch, since_seq, Grounding::IndependentRediff).await
 }
 
 async fn execute_batch_grounded<D>(
     driver: &mut D,
     batch: &ActionBatch,
+    since_seq: u64,
     grounding: Grounding,
 ) -> Result<ActionExecution, TransportError>
 where
     D: DriverTrait + ?Sized,
 {
-    let before = driver.observe().await?;
     let outcome = driver.act_batch(batch).await?;
     finish_execution(
         driver,
         outcome,
-        before.seq,
+        since_seq,
         batch.actions.len(),
         max_side_effect(&batch.actions),
         driver.engine(),
@@ -653,8 +657,8 @@ mod tests {
         let action = Action::Click {
             node: NodeId("button".into()),
         };
-        let execution =
-            block_on(execute_action(&mut driver, &action)).map_err(|error| error.to_string())?;
+        let execution = block_on(execute_action(&mut driver, &action, 10))
+            .map_err(|error| error.to_string())?;
         assert!(execution.applied());
         assert_eq!(execution.engine, Engine::Cdp);
         assert_eq!(execution.action_count, 1);
@@ -664,6 +668,7 @@ mod tests {
         assert_eq!(execution.diff.changed.len(), 1);
         // The action's embedded diff was computed against exactly the
         // pre-action base (since_seq 10), so no forced re-diff is issued.
+        assert_eq!(driver.observe_calls, 0);
         assert!(driver.observe_diff_calls.is_empty());
         Ok(())
     }
@@ -678,11 +683,12 @@ mod tests {
             quiescence: QuiescencePolicy::Composite,
         };
         let execution =
-            block_on(execute_batch(&mut driver, &batch)).map_err(|error| error.to_string())?;
+            block_on(execute_batch(&mut driver, &batch, 10)).map_err(|error| error.to_string())?;
         assert!(execution.applied());
         assert_eq!(execution.since_seq, 10);
         assert_eq!(execution.seq, 11);
         assert_eq!(execution.diff.changed.len(), 1);
+        assert_eq!(driver.observe_calls, 0);
         assert!(driver.observe_diff_calls.is_empty());
         Ok(())
     }
@@ -693,7 +699,7 @@ mod tests {
         let action = Action::Click {
             node: NodeId("button".into()),
         };
-        let execution = block_on(execute_action_verified(&mut driver, &action))
+        let execution = block_on(execute_action_verified(&mut driver, &action, 10))
             .map_err(|error| error.to_string())?;
         assert!(execution.applied());
         // The embedded diff matches the base, but verification callers must
@@ -720,7 +726,7 @@ mod tests {
             quiescence: QuiescencePolicy::Composite,
         };
         let execution =
-            block_on(execute_batch(&mut driver, &batch)).map_err(|error| error.to_string())?;
+            block_on(execute_batch(&mut driver, &batch, 10)).map_err(|error| error.to_string())?;
         assert!(execution.applied());
         assert_eq!(execution.since_seq, 10);
         assert_eq!(driver.observe_diff_calls, vec![10]);
@@ -733,8 +739,8 @@ mod tests {
         let action = Action::Click {
             node: NodeId("missing".into()),
         };
-        let execution =
-            block_on(execute_action(&mut driver, &action)).map_err(|error| error.to_string())?;
+        let execution = block_on(execute_action(&mut driver, &action, 10))
+            .map_err(|error| error.to_string())?;
         assert!(execution.step_error());
         assert_eq!(
             execution.status,
@@ -764,7 +770,7 @@ mod tests {
             quiescence: QuiescencePolicy::Composite,
         };
         let execution =
-            block_on(execute_batch(&mut driver, &batch)).map_err(|error| error.to_string())?;
+            block_on(execute_batch(&mut driver, &batch, 10)).map_err(|error| error.to_string())?;
         assert!(execution.applied());
         assert!(execution.applied_side_effects());
         assert!(!execution.partially_applied());
@@ -791,7 +797,7 @@ mod tests {
             quiescence: QuiescencePolicy::Composite,
         };
         let execution =
-            block_on(execute_batch(&mut driver, &batch)).map_err(|error| error.to_string())?;
+            block_on(execute_batch(&mut driver, &batch, 10)).map_err(|error| error.to_string())?;
 
         assert!(!execution.applied());
         assert!(execution.step_error());
@@ -825,7 +831,7 @@ mod tests {
             quiescence: QuiescencePolicy::Composite,
         };
         let execution =
-            block_on(execute_batch(&mut driver, &batch)).map_err(|error| error.to_string())?;
+            block_on(execute_batch(&mut driver, &batch, 10)).map_err(|error| error.to_string())?;
 
         assert!(!execution.applied());
         assert!(execution.step_error());
@@ -846,6 +852,7 @@ mod tests {
     #[derive(Debug)]
     struct ContractDriver {
         seq: u64,
+        observe_calls: usize,
         observe_diff_calls: Vec<u64>,
     }
 
@@ -853,6 +860,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 seq: 10,
+                observe_calls: 0,
                 observe_diff_calls: Vec::new(),
             }
         }
@@ -881,6 +889,7 @@ mod tests {
         }
 
         async fn observe(&mut self) -> Result<CompiledObservation, TransportError> {
+            self.observe_calls += 1;
             Ok(self.observation())
         }
 

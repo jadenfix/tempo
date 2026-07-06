@@ -151,6 +151,16 @@ pub trait DriverTrait: Send + Sync {
     /// Diff-based re-observation: only what changed since `since_seq` (final.md §2.3).
     async fn observe_diff(&mut self, since_seq: u64) -> Result<ObservationDiff, TransportError>;
 
+    /// Return a previously recorded observation without touching the browser.
+    ///
+    /// Drivers that already observe as part of `act`/`act_batch` can expose that
+    /// post-action snapshot here so agent loops do not re-run the full observe
+    /// pipeline just to feed the next decision. Remote or stateless adapters may
+    /// keep the default and let callers fall back to `observe()`.
+    fn cached_observation(&self, _seq: u64) -> Option<CompiledObservation> {
+        None
+    }
+
     /// Execute a single semantic action.
     async fn act(&mut self, action: &Action) -> Result<StepOutcome, TransportError>;
 
@@ -285,6 +295,10 @@ impl DriverTrait for TestDriver {
             removed: vec![],
             changed: vec![],
         })
+    }
+
+    fn cached_observation(&self, seq: u64) -> Option<CompiledObservation> {
+        (seq == self.seq).then(|| self.snapshot())
     }
 
     async fn act(&mut self, action: &Action) -> Result<StepOutcome, TransportError> {
@@ -763,6 +777,10 @@ mod tests {
             since_seq: u64,
         ) -> Result<ObservationDiff, TransportError> {
             self.0.observe_diff(since_seq).await
+        }
+
+        fn cached_observation(&self, seq: u64) -> Option<CompiledObservation> {
+            self.0.cached_observation(seq)
         }
 
         async fn act(&mut self, action: &Action) -> Result<StepOutcome, TransportError> {
