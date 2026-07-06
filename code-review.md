@@ -53,6 +53,9 @@ needs a concrete traced failure, not a preference for more code.
   results. Send narrow local deltas for fields the UI actually owns.
 - A local convenience cache is not authoritative once the daemon, engine, or
   worker can mutate the same domain object.
+- Client disconnect does not cancel already-started blocking work. Engine-driving
+  `spawn_blocking` routes need cancellation before dispatch or their own
+  live-work quota; an HTTP connection cap alone is not enough.
 - Tests for async reconciliation should queue at least two operations with an
   intervening local mutation, so stale-result and stale-input paths are both
   covered.
