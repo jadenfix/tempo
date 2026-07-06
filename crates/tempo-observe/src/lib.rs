@@ -380,7 +380,13 @@ impl ObservationCompiler {
 
         self.mapper.evict_stale();
 
-        let observation = finalize_observation(input.url, self.seq, elements, self.options);
+        let observation = finalize_observation_with_stable_marks(
+            input.url,
+            self.seq,
+            elements,
+            self.options,
+            &mut self.mapper,
+        );
         if track_identities {
             let emitted_ids: HashSet<&str> = observation
                 .elements
@@ -429,6 +435,12 @@ struct MappedId {
     last_seen: u64,
 }
 
+#[derive(Debug, Clone)]
+struct MappedMarkLabel {
+    label: u32,
+    last_seen: u64,
+}
+
 /// Map source IDs and stable fingerprints to schema NodeIds.
 ///
 /// Mappings are generation-stamped with the snapshot sequence they were last seen
@@ -440,6 +452,7 @@ struct MappedId {
 pub struct StableIdMapper {
     by_source: HashMap<String, MappedId>,
     by_fingerprint: HashMap<String, MappedId>,
+    mark_labels: HashMap<NodeId, MappedMarkLabel>,
     allocated: HashSet<String>,
     seq: u64,
     occurrences: HashMap<String, usize>,
@@ -450,6 +463,7 @@ impl fmt::Debug for StableIdMapper {
         f.debug_struct("StableIdMapper")
             .field("by_source", &self.by_source.len())
             .field("by_fingerprint", &self.by_fingerprint.len())
+            .field("mark_labels", &self.mark_labels.len())
             .field("allocated", &self.allocated.len())
             .field("seq", &self.seq)
             .field("occurrences", &self.occurrences.len())
@@ -518,6 +532,14 @@ impl StableIdMapper {
             let _ = write!(fingerprint, "{base_fingerprint}#{occurrence}");
         }
 
+        if raw.stable_hint.is_some() {
+            return self.node_id_for_stable_hint(
+                source_key,
+                base_fingerprint.as_str(),
+                fingerprint,
+            );
+        }
+
         if let Some(source_key) = &source_key
             && let Some(entry) = self.by_source.get_mut(source_key)
         {
@@ -572,6 +594,95 @@ impl StableIdMapper {
         node_id
     }
 
+    fn node_id_for_stable_hint(
+        &mut self,
+        source_key: Option<String>,
+        base_fingerprint: &str,
+        fingerprint: String,
+    ) -> NodeId {
+        let seq = self.seq;
+
+        if let Some(entry) = self.by_fingerprint.get_mut(&fingerprint) {
+            entry.last_seen = seq;
+            let node_id = entry.node_id.clone();
+            if let Some(source_key) = source_key {
+                self.by_source.insert(
+                    source_key,
+                    MappedId {
+                        node_id: node_id.clone(),
+                        last_seen: seq,
+                    },
+                );
+            }
+            return node_id;
+        }
+
+        let node_id = self.allocate(base_fingerprint);
+        if let Some(source_key) = source_key {
+            self.by_source.insert(
+                source_key,
+                MappedId {
+                    node_id: node_id.clone(),
+                    last_seen: seq,
+                },
+            );
+        }
+        self.by_fingerprint.insert(
+            fingerprint,
+            MappedId {
+                node_id: node_id.clone(),
+                last_seen: seq,
+            },
+        );
+        node_id
+    }
+
+    pub fn mark_labels_for(
+        &mut self,
+        elements: &[InteractiveElement],
+        max_marks: usize,
+    ) -> Vec<(NodeId, u32)> {
+        elements
+            .iter()
+            .take(max_marks)
+            .map(|element| {
+                let label = self.mark_label_for(&element.node_id);
+                (element.node_id.clone(), label)
+            })
+            .collect()
+    }
+
+    fn mark_label_for(&mut self, node_id: &NodeId) -> u32 {
+        if let Some(entry) = self.mark_labels.get_mut(node_id) {
+            entry.last_seen = self.seq;
+            return entry.label;
+        }
+
+        let label = self.next_free_mark_label();
+        self.mark_labels.insert(
+            node_id.clone(),
+            MappedMarkLabel {
+                label,
+                last_seen: self.seq,
+            },
+        );
+        label
+    }
+
+    fn next_free_mark_label(&self) -> u32 {
+        let used: HashSet<u32> = self.mark_labels.values().map(|entry| entry.label).collect();
+        let mut label = 1_u32;
+        loop {
+            if !used.contains(&label) {
+                return label;
+            }
+            if label == u32::MAX {
+                return u32::MAX;
+            }
+            label = label.saturating_add(1);
+        }
+    }
+
     /// Drop mappings not seen within the last [`RETENTION_SNAPSHOTS`] snapshots and
     /// rebuild the allocated-id set from the survivors so it never grows without
     /// bound (issue #107).
@@ -581,6 +692,8 @@ impl StableIdMapper {
         let retained = |entry: &MappedId| seq.saturating_sub(entry.last_seen) < RETENTION_SNAPSHOTS;
         self.by_source.retain(|_, entry| retained(entry));
         self.by_fingerprint.retain(|_, entry| retained(entry));
+        self.mark_labels
+            .retain(|_, entry| seq.saturating_sub(entry.last_seen) < RETENTION_SNAPSHOTS);
 
         // `allocated` equals the union of live node ids whenever no entry was
         // evicted (allocate() inserts into both), so the steady-state snapshot
@@ -760,8 +873,7 @@ pub fn observation_corpus_report(
         if let Some(previous) = &previous_observation {
             diff_snapshots += 1;
             let diff = diff_observations(previous, &snapshot.observation);
-            if diff_reconstructs_current(previous, &snapshot.observation, &diff, options.max_marks)
-            {
+            if diff_reconstructs_current(previous, &snapshot.observation, &diff) {
                 diff_reconstructable_snapshots += 1;
             }
         }
@@ -812,7 +924,6 @@ fn diff_reconstructs_current(
     previous: &CompiledObservation,
     current: &CompiledObservation,
     diff: &ObservationDiff,
-    max_marks: usize,
 ) -> bool {
     if diff.since_seq != previous.seq || diff.seq != current.seq {
         return false;
@@ -872,7 +983,8 @@ fn diff_reconstructs_current(
         elements.push(added.clone());
     }
 
-    let reconstructed = make_observation(&previous.url, diff.seq, elements, max_marks);
+    let mut reconstructed = make_observation(&previous.url, diff.seq, elements, 0);
+    reconstructed.marks = current.marks.clone();
     serialized_observations_equal(&reconstructed, current)
 }
 
@@ -1074,10 +1186,27 @@ pub fn finalize_observation(
     apply_budget(url, seq, elements, options)
 }
 
-fn apply_budget(
+pub fn finalize_observation_with_stable_marks(
     url: String,
     seq: u64,
     mut elements: Vec<InteractiveElement>,
+    options: CompileOptions,
+    mapper: &mut StableIdMapper,
+) -> CompiledObservation {
+    elements.sort_by(|left, right| {
+        right
+            .rank
+            .total_cmp(&left.rank)
+            .then_with(|| left.node_id.0.cmp(&right.node_id.0))
+    });
+    let full_marks = mapper.mark_labels_for(&elements, options.max_marks);
+    apply_budget_with_marks(url, seq, elements, options, full_marks)
+}
+
+fn apply_budget(
+    url: String,
+    seq: u64,
+    elements: Vec<InteractiveElement>,
     options: CompileOptions,
 ) -> CompiledObservation {
     // Elements are pre-sorted by rank descending, so the kept set is always a
@@ -1087,8 +1216,18 @@ fn apply_budget(
     // serializations, each computed once and reused for both the byte and token
     // gate. Every probe serializes a *borrowed* prefix through a counting sink,
     // so the search allocates nothing and copies no elements.
-    let total_elements = elements.len();
     let full_marks = mark_labels(&elements, options.max_marks);
+    apply_budget_with_marks(url, seq, elements, options, full_marks)
+}
+
+fn apply_budget_with_marks(
+    url: String,
+    seq: u64,
+    mut elements: Vec<InteractiveElement>,
+    options: CompileOptions,
+    full_marks: Vec<(NodeId, u32)>,
+) -> CompiledObservation {
+    let total_elements = elements.len();
     if elements.is_empty() || prefix_within_budget(&url, seq, &elements, 0, &full_marks, &options) {
         return assemble_observation(url, seq, elements, 0, full_marks);
     }
@@ -2160,12 +2299,7 @@ mod tests {
             changed: Vec::new(),
         };
 
-        assert!(!diff_reconstructs_current(
-            &previous,
-            &current,
-            &lossy_diff,
-            2
-        ));
+        assert!(!diff_reconstructs_current(&previous, &current, &lossy_diff));
     }
 
     #[test]
@@ -2213,6 +2347,63 @@ mod tests {
             ],
         ));
         assert_ne!(next.elements[0].node_id, next.elements[1].node_id);
+    }
+
+    #[test]
+    fn stable_mark_labels_survive_rank_insertion() {
+        let mut compiler = ObservationCompiler::new();
+        let first = compiler.compile(ObservationInput::new(
+            "https://shop.example/cart",
+            vec![
+                RawElement::new("button", "Pay now")
+                    .stable_hint("pay")
+                    .bounds([0.0, 0.0, 80.0, 24.0]),
+                RawElement::new("textbox", "Search")
+                    .stable_hint("search")
+                    .bounds([0.0, 32.0, 160.0, 24.0]),
+            ],
+        ));
+        let search_node = first
+            .elements
+            .iter()
+            .find(|element| element.name[0].text == "Search")
+            .map(|element| element.node_id.clone());
+        let Some(search_node) = search_node else {
+            panic!("search element should be retained");
+        };
+        let search_label = first
+            .marks
+            .iter()
+            .find(|(node_id, _)| node_id == &search_node)
+            .map(|(_, label)| *label);
+        let Some(search_label) = search_label else {
+            panic!("search element should be marked");
+        };
+
+        let second = compiler.compile(ObservationInput::new(
+            "https://shop.example/cart",
+            vec![
+                RawElement::new("button", "Pay now")
+                    .stable_hint("pay")
+                    .bounds([0.0, 0.0, 80.0, 24.0]),
+                RawElement::new("button", "Apply coupon")
+                    .stable_hint("coupon")
+                    .bounds([0.0, 28.0, 120.0, 24.0]),
+                RawElement::new("textbox", "Search")
+                    .stable_hint("search")
+                    .bounds([0.0, 64.0, 160.0, 24.0]),
+            ],
+        ));
+        let next_search_label = second
+            .marks
+            .iter()
+            .find(|(node_id, _)| node_id == &search_node)
+            .map(|(_, label)| *label);
+        let Some(next_search_label) = next_search_label else {
+            panic!("search element should remain marked");
+        };
+
+        assert_eq!(next_search_label, search_label);
     }
 
     #[test]

@@ -41,7 +41,8 @@ use tempo_driver::{
 };
 use tempo_net::UrlPolicy;
 use tempo_observe::{
-    diff_observations, finalize_observation, CompileOptions, RawElement, StableIdMapper,
+    diff_observations, finalize_observation_with_stable_marks, CompileOptions, RawElement,
+    StableIdMapper,
 };
 use tempo_schema::{
     Action, ActionBatch, CompiledObservation, InteractiveElement, NodeId, ObservationDiff,
@@ -541,11 +542,12 @@ impl CdpTempoDriver {
         // Run after enrichment so the budget accounts for enriched AX names/values.
         // Without this the CDP lane shipped the full, unranked, unbudgeted
         // document-order element dump with no marks (#477).
-        let compiled = finalize_observation(
+        let compiled = finalize_observation_with_stable_marks(
             compiled.url,
             compiled.seq,
             compiled.elements,
             CompileOptions::default(),
+            &mut self.stable_id_mapper,
         );
         Ok(retain_observation_history(&mut self.history, compiled))
     }
@@ -2717,10 +2719,52 @@ fn raw_element_from_selector_element(element: &InteractiveElement) -> RawElement
         .source_id(element.node_id.0.clone())
         .name_spans(element.name.clone())
         .value_spans(element.value.clone());
+    if let Some(stable_hint) = stable_hint_for_selector_element(element) {
+        raw = raw.stable_hint(stable_hint);
+    }
     if let Some(bounds) = element.bounds {
         raw = raw.bounds(bounds);
     }
     raw
+}
+
+fn stable_hint_for_selector_element(element: &InteractiveElement) -> Option<String> {
+    let selector = element.node_id.0.as_str();
+    if !selector.contains(":nth-of-type(") && !selector.starts_with("[id=") {
+        return Some(format!("selector:{selector}"));
+    }
+
+    accessible_stable_hint_for_element(element)
+}
+
+fn accessible_stable_hint_for_element(element: &InteractiveElement) -> Option<String> {
+    let mut name = String::new();
+    let mut value = String::new();
+    append_normalized_spans(&mut name, &element.name);
+    append_normalized_spans(&mut value, &element.value);
+    if name.is_empty() && value.is_empty() {
+        return None;
+    }
+
+    Some(format!(
+        "fallback:{}:{}:{}",
+        normalize_hint_part(&element.role),
+        name,
+        value
+    ))
+}
+
+fn append_normalized_spans(output: &mut String, spans: &[TaintSpan]) {
+    for span in spans {
+        if !output.is_empty() {
+            output.push(' ');
+        }
+        output.push_str(&normalize_hint_part(&span.text));
+    }
+}
+
+fn normalize_hint_part(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3373,6 +3417,9 @@ fn selector_for(tag: &str, attrs: &BTreeMap<String, String>) -> Option<String> {
     if let Some(id) = attrs.get("id").filter(|value| !value.is_empty()) {
         return Some(format!("[id=\"{}\"]", css_attr_escape(id)));
     }
+    if let Some(test_id) = attrs.get("data-testid").filter(|value| !value.is_empty()) {
+        return Some(format!("[data-testid=\"{}\"]", css_attr_escape(test_id)));
+    }
     if let Some(name) = attrs.get("name").filter(|value| !value.is_empty()) {
         return Some(format!("{tag}[name=\"{}\"]", css_attr_escape(name)));
     }
@@ -3658,6 +3705,105 @@ mod tests {
     }
 
     #[test]
+    fn extracts_data_testid_as_stable_selector() {
+        let html = r#"<main><button data-testid="submit-order">Submit</button></main>"#;
+        let elements = extract_interactive_elements(html);
+
+        assert_eq!(elements.len(), 1);
+        assert_eq!(
+            elements[0].node_id,
+            NodeId("[data-testid=\"submit-order\"]".into())
+        );
+    }
+
+    #[test]
+    fn anonymous_fallback_node_ids_survive_inserted_sibling() {
+        let mut mapper = StableIdMapper::new();
+        let (first, _) = compile_observation(
+            &mut mapper,
+            "https://example.test/".into(),
+            "<main><button>Save</button></main>".into(),
+            1,
+        );
+        let save_node = match first
+            .elements
+            .iter()
+            .find(|element| element.name[0].text == "Save")
+        {
+            Some(element) => element.node_id.clone(),
+            None => panic!("Save element should be present in first snapshot"),
+        };
+
+        let (second, selectors) = compile_observation(
+            &mut mapper,
+            "https://example.test/".into(),
+            "<main><button>New</button><button>Save</button></main>".into(),
+            2,
+        );
+        let next_save = match second
+            .elements
+            .iter()
+            .find(|element| element.name[0].text == "Save")
+        {
+            Some(element) => element,
+            None => panic!("Save element should be present in second snapshot"),
+        };
+
+        assert_eq!(next_save.node_id, save_node);
+        assert_eq!(
+            selectors.get(&save_node).map(String::as_str),
+            Some("main:nth-of-type(1) > button:nth-of-type(2)")
+        );
+        assert!(
+            second
+                .elements
+                .iter()
+                .any(|element| element.name[0].text == "New" && element.node_id != save_node),
+            "inserted sibling must not steal the old Save NodeId"
+        );
+    }
+
+    #[test]
+    fn id_selector_mutation_keeps_node_id_and_refreshes_selector() {
+        let mut mapper = StableIdMapper::new();
+        let (first, _) = compile_observation(
+            &mut mapper,
+            "https://example.test/".into(),
+            r#"<main><button id="save">Save</button></main>"#.into(),
+            1,
+        );
+        let save_node = match first
+            .elements
+            .iter()
+            .find(|element| element.name[0].text == "Save")
+        {
+            Some(element) => element.node_id.clone(),
+            None => panic!("Save element should be present in first snapshot"),
+        };
+
+        let (second, selectors) = compile_observation(
+            &mut mapper,
+            "https://example.test/".into(),
+            r#"<main><button id="renamed-save">Save</button></main>"#.into(),
+            2,
+        );
+        let next_save = match second
+            .elements
+            .iter()
+            .find(|element| element.name[0].text == "Save")
+        {
+            Some(element) => element,
+            None => panic!("Save element should be present in second snapshot"),
+        };
+
+        assert_eq!(next_save.node_id, save_node);
+        assert_eq!(
+            selectors.get(&save_node).map(String::as_str),
+            Some("[id=\"renamed-save\"]")
+        );
+    }
+
+    #[test]
     fn find_close_tag_matches_case_insensitively_in_one_pass() {
         // Case-insensitive, returns the byte offset of the '<' of "</tag".
         assert_eq!(find_close_tag(b"hi</A>", b"a"), Some(2));
@@ -3701,8 +3847,12 @@ mod tests {
             compile_observation(&mut mapper, "https://example.test/".into(), html.into(), 1);
         // Raw extractor emits document order and no marks.
         assert!(raw.marks.is_empty());
-        let finished =
-            finalize_observation(raw.url, raw.seq, raw.elements, CompileOptions::default());
+        let finished = tempo_observe::finalize_observation(
+            raw.url,
+            raw.seq,
+            raw.elements,
+            CompileOptions::default(),
+        );
         // Rank-sorted: ranks are non-increasing.
         assert!(finished
             .elements
@@ -3719,7 +3869,7 @@ mod tests {
         let (raw_big, _) = compile_observation(&mut mapper, "https://example.test/".into(), big, 2);
         let raw_count = raw_big.elements.len();
         assert!(raw_count > 200, "fixture should extract all 400 buttons");
-        let finished_big = finalize_observation(
+        let finished_big = tempo_observe::finalize_observation(
             raw_big.url,
             raw_big.seq,
             raw_big.elements,
@@ -3799,7 +3949,7 @@ mod tests {
         let layouts = BTreeMap::from([(NodeId("node:visible".into()), [4.0, 8.0, 40.0, 20.0])]);
 
         apply_layout_bounds(&mut elements, &layouts);
-        let observation = finalize_observation(
+        let observation = tempo_observe::finalize_observation(
             "https://example.test/".into(),
             1,
             elements,
