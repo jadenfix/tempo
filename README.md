@@ -98,6 +98,10 @@ cargo test --workspace   # contracts, conformance, runtime, protocol, and shell 
   Replay cassette imports default to encrypted durable retention; plaintext
   cassettes are available only through explicitly named unsafe compatibility
   helpers or `TEMPO_DURABLE_RETENTION=plaintext-unsafe`.
+  Taint-to-beatbox dispatch is scoped in
+  [`docs/TAINT_SANDBOX_ADR.md`](docs/TAINT_SANDBOX_ADR.md):
+  the local preview has taint-aware browser-action gates, while mandatory
+  tainted-compute sandboxing remains a beta/remote-operation gate.
   Stealth mode prevents Tempo from intentionally retaining session-event
   history, OTLP/JSONL telemetry, Prometheus metrics exposition, idempotency
   replay cache, durable journals, and replay cassettes. It does not erase

@@ -11,6 +11,9 @@ needs a concrete traced failure, not a preference for more code.
 - Cassette and replay-fork import defaults must fail closed to authenticated
   durable retention. Plaintext replay helpers are compatibility/test fixtures
   only and must be explicitly named unsafe.
+- Do not treat a tested bridge crate as shipped product composition. If a
+  security claim depends on runtime wiring, require a production-path sentinel
+  or keep the docs explicitly deferred.
 - Untrusted OpenAPI or remote-tool descriptors must not become executable policy
   or secret material. Side-effect classes need trusted provenance, and
   Authorization, cookie, API-key, token, secret, or credential fields need
@@ -23,6 +26,10 @@ needs a concrete traced failure, not a preference for more code.
 - Security/privacy docs cannot rely on one top-level disclaimer to narrow later
   absolute claims. Wording such as "all", "every", "owns", "guarantees", or
   "resistance" needs local shipped-vs-roadmap scope where it appears.
+- Taint-to-beatbox security is not proven by `tempo-toolexec` helpers alone. A
+  shipped claim needs an agent-facing runtime path that preserves page
+  provenance to the execution boundary and a live beatbox canary proving
+  `net:Deny`, `secrets:[]`, and no egress.
 
 ## Async State Ownership
 
