@@ -210,6 +210,89 @@ fn live_structured_fast_path_probe(
     StructuredFastPathDecision::from_lane_decision(run.origin, decision)
 }
 
+/// Trust provenance for an OpenAPI descriptor before it can drive direct HTTP
+/// execution. Untrusted descriptors are discovery data, not policy authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpenApiDescriptorTrust {
+    Trusted,
+    Untrusted,
+}
+
+/// OpenAPI parameter location as it appears in a request template.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpenApiParameterLocation {
+    Query,
+    Header,
+    Path,
+    Cookie,
+    Body,
+}
+
+/// Apply the minimum side-effect class for direct OpenAPI execution.
+///
+/// Untrusted descriptors cannot classify an operation as a safe read. GET can
+/// mutate server state, and description/vendor metadata is not trusted policy
+/// input, so the floor is `Send` unless a signed/allowlisted descriptor model
+/// says otherwise. Higher local inference is preserved.
+pub fn openapi_direct_execution_side_effect(
+    inferred: SideEffect,
+    trust: OpenApiDescriptorTrust,
+) -> SideEffect {
+    match trust {
+        OpenApiDescriptorTrust::Trusted => inferred,
+        OpenApiDescriptorTrust::Untrusted => inferred.max(SideEffect::Send),
+    }
+}
+
+/// Return whether model/input-provided OpenAPI parameter values may be copied
+/// into an outbound request without an explicit secret binding.
+pub fn openapi_allows_model_supplied_parameter(
+    location: OpenApiParameterLocation,
+    name: &str,
+) -> bool {
+    if matches!(location, OpenApiParameterLocation::Cookie) {
+        return false;
+    }
+    !is_secret_like_openapi_parameter_name(name)
+}
+
+fn is_secret_like_openapi_parameter_name(name: &str) -> bool {
+    let lower = name.trim().to_ascii_lowercase();
+    let compact: String = lower
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect();
+    if matches!(
+        compact.as_str(),
+        "authorization" | "proxyauthorization" | "cookie" | "setcookie"
+    ) {
+        return true;
+    }
+    if compact.contains("apikey")
+        || compact.contains("accesstoken")
+        || compact.contains("refreshtoken")
+        || compact.contains("authtoken")
+    {
+        return true;
+    }
+
+    lower
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .any(|part| {
+            matches!(
+                part,
+                "token"
+                    | "secret"
+                    | "credential"
+                    | "credentials"
+                    | "password"
+                    | "passwd"
+                    | "apikey"
+            )
+        })
+}
+
 /// Stable key for retrying a planned step without duplicating side effects.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct IdempotencyKey(pub String);
@@ -3227,6 +3310,113 @@ mod tests {
             !decision.supports_driver_task(&task),
             "untrusted OpenAPI descriptors require a trust and secret-binding model before direct execution"
         );
+    }
+
+    #[test]
+    fn openapi_fast_path_rejects_safe_looking_operations_and_model_supplied_secrets() {
+        let decision = StructuredFastPathDecision::new(
+            "https://api.example",
+            StructuredLane::Api,
+            StructuredSignal::OpenApi,
+            "/openapi.json",
+        );
+
+        for (label, task) in [
+            (
+                "read-only get with header secrets",
+                DriverTask::new(
+                    "https://api.example/app",
+                    vec![Action::Skill {
+                        name: "GET /v1/profile".into(),
+                        input: serde_json::json!({
+                            "Authorization": "scanner-safe-fixture",
+                            "X-API-Key": "scanner-safe-fixture",
+                        }),
+                    }],
+                ),
+            ),
+            (
+                "safe metadata get with cookie secrets",
+                DriverTask::new(
+                    "https://api.example/app",
+                    vec![Action::Skill {
+                        name: "GET /v1/metadata".into(),
+                        input: serde_json::json!({
+                            "Cookie": "scanner-safe-fixture",
+                            "access_token": "scanner-safe-fixture",
+                        }),
+                    }],
+                ),
+            ),
+        ] {
+            assert!(
+                !decision.supports_driver_task(&task),
+                "untrusted OpenAPI operation {label} must not execute from a descriptor without trusted provenance and explicit secret bindings"
+            );
+        }
+    }
+
+    #[test]
+    fn untrusted_openapi_side_effects_floor_to_send() {
+        assert_eq!(
+            openapi_direct_execution_side_effect(
+                SideEffect::Read,
+                OpenApiDescriptorTrust::Untrusted,
+            ),
+            SideEffect::Send,
+            "untrusted GET-style OpenAPI operations must still require confirmation"
+        );
+        assert_eq!(
+            openapi_direct_execution_side_effect(
+                SideEffect::Draft,
+                OpenApiDescriptorTrust::Untrusted,
+            ),
+            SideEffect::Send
+        );
+        assert_eq!(
+            openapi_direct_execution_side_effect(
+                SideEffect::Purchase,
+                OpenApiDescriptorTrust::Untrusted,
+            ),
+            SideEffect::Purchase,
+            "the untrusted floor must preserve stronger local inference"
+        );
+        assert_eq!(
+            openapi_direct_execution_side_effect(SideEffect::Read, OpenApiDescriptorTrust::Trusted),
+            SideEffect::Read,
+            "trusted descriptors may keep a locally accepted read classification"
+        );
+    }
+
+    #[test]
+    fn openapi_secret_like_parameters_require_explicit_binding() {
+        for (location, name) in [
+            (OpenApiParameterLocation::Header, "Authorization"),
+            (OpenApiParameterLocation::Header, "authorization"),
+            (OpenApiParameterLocation::Header, "Proxy-Authorization"),
+            (OpenApiParameterLocation::Header, "X-API-Key"),
+            (OpenApiParameterLocation::Header, "x-auth-token"),
+            (OpenApiParameterLocation::Header, "client_secret"),
+            (OpenApiParameterLocation::Query, "access_token"),
+            (OpenApiParameterLocation::Path, "credential_id"),
+            (OpenApiParameterLocation::Body, "password"),
+            (OpenApiParameterLocation::Header, "Cookie"),
+            (OpenApiParameterLocation::Cookie, "session"),
+        ] {
+            assert!(
+                !openapi_allows_model_supplied_parameter(location, name),
+                "{location:?} parameter {name:?} must come from an explicit secret binding"
+            );
+        }
+
+        assert!(openapi_allows_model_supplied_parameter(
+            OpenApiParameterLocation::Query,
+            "invoice_id"
+        ));
+        assert!(openapi_allows_model_supplied_parameter(
+            OpenApiParameterLocation::Header,
+            "Idempotency-Key"
+        ));
     }
 
     #[tokio::test]

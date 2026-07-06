@@ -62,7 +62,7 @@ What an agent needs from a browser that Chrome, Firefox, and Arc were never buil
 6. **Determinism, journal, replay.** Agents crash, get killed, need audit. → every step journaled (reuse beater-agent's crash-safe SQLite journal); full session replay from cassettes (beater-replay); deterministic re-execution where possible.
 7. **A hard trust boundary.** Page content is *data*, never *instructions* — the lesson of every Comet/Atlas injection. → **taint labels** on every observation span (page-derived / system / user), carried end-to-end into the prompt serializer, plus a **side-effect policy gate**.
 8. **Agent identity on the wire.** The web is deploying cryptographic bot verification right now. → Web Bot Auth HTTP message signatures in selected preview paths, with universal network-layer signing and dual-mode identity (agent-declared vs user-driven) per origin as roadmap gates.
-9. **The structured-web fast path.** If a site exposes agent tools/APIs, rendering it is wasted work. → probe `.well-known/beater.json`, agent-card, `llms.txt`, OpenAPI, and WebMCP *before* rendering; when present, **skip pixels entirely** and call tools.
+9. **The structured-web fast path.** If a site exposes agent tools/APIs, rendering it is wasted work. → probe `.well-known/beater.json`, agent-card, `llms.txt`, OpenAPI, and WebMCP *before* rendering; only trusted executable surfaces may skip pixels and call tools. OpenAPI is discovery-only until direct execution has a descriptor-trust model, confirmation-required defaults, and explicit secret bindings.
 10. **Parallelism & remote management.** Agents run many sessions, often on remote fleets and sometimes on constrained mobile devices. → headless-first daemon, session pool, per-session ephemeral profiles, portable journals, OTLP observability, and thin platform adapters so Android/mobile support does not inherit desktop-only IPC, RAM, or windowing assumptions. Remote/fleet operation is gated beyond the local CDP preview.
 
 ---
@@ -128,7 +128,7 @@ Layer → crate → responsibility (beater reuse in italics).
 
 **L4 — Network & fast path**
 - `tempo-net` — the destination interceptor-backed network layer that owns engine traffic: re-issues requests; Web Bot Auth HTTP message signatures (RFC 9421, Ed25519); dual-mode identity (agent-declared vs user-driven, per origin); per-session ephemeral profiles (cookie jar + storage partition); SSRF at the socket level (*beater `UrlPolicy` semantics*); request/response audit; quiescence counters; fork-replay cache; proxy/egress policy. In the local CDP preview, Web Bot Auth and network ownership are implemented only on selected `tempo-net` paths, not as a blanket guarantee for every engine/API/MCP request.
-- `tempo-handshake` — pre-render structured-web probe: parallel fetch of `.well-known/beater.json`, `agent-card.json`, `openapi.json`, `llms.txt`, `/mcp/catalog.json`; WebMCP (`navigator.modelContext`) detection; **lane decision — API/MCP (skip pixels) vs render.** The client counterpart to *beater-connect*.
+- `tempo-handshake` — pre-render structured-web probe: parallel fetch of `.well-known/beater.json`, `agent-card.json`, `openapi.json`, `llms.txt`, `/mcp/catalog.json`; WebMCP (`navigator.modelContext`) detection; **lane decision — trusted executable MCP/API surfaces may skip pixels; OpenAPI discovery alone remains non-executable.** The client counterpart to *beater-connect*.
 
 **L5 — Runtime & protocol surface**
 - `tempo-session` — session lifecycle, ephemeral profiles, journaling (*reuse `beater.js/crates/beater-agent/src/journal.rs` — runs/steps/resume*), cassette recording (*beater-replay*), deterministic re-execution.
@@ -400,7 +400,7 @@ otherwise.
 ### 7.3 Integrations
 
 - **Inbound (any agent drives tempo):** MCP server (`tempo-mcp`), WebDriver BiDi (`tempo-bidi`, standard tooling), REST. Claude Code and beater agents are first-class clients on day one.
-- **Outbound (tempo speaks the machine-web):** WebMCP client (`navigator.modelContext` tools), the beater-connect handshake (agent-card / `llms.txt` / OpenAPI / `.well-known/beater.json`) for the pixel-skipping API lane, beatbox for sandboxed tool execution, and the full beater-agents observability/eval stack.
+- **Outbound (tempo speaks the machine-web):** WebMCP client (`navigator.modelContext` tools), the beater-connect handshake (agent-card / `llms.txt` / OpenAPI / `.well-known/beater.json`) for discovery and trusted pixel-skipping lanes, beatbox for sandboxed tool execution, and the full beater-agents observability/eval stack. OpenAPI direct execution stays gated on descriptor trust, confirmation-required side effects, and explicit secret bindings.
 - **The web of the future:** tempo publishes its *own* A2A agent card (a tempo instance is itself an addressable agent resource), and payment rails (AP2 / x402 / agent-toolkit) sit behind the **Purchase-level policy gate** — so "the agent bought the thing" is always an explicit, confirmable, audited side effect, never an accident.
 
 ---

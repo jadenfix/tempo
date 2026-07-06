@@ -18,6 +18,9 @@ SENTINELS=(
   "tempo-headless|tests::bidi_endpoint_denies_unconfirmed_tainted_script_before_driver_execution|BiDi no driver IPC before script denial"
   "tempo-agent|decider::tests::decided_goto_recomputes_page_text_taint_and_denies_before_driver_execution|decided loop no driver execution before denial"
   "tempo-agent|tests::openapi_fast_path_decision_is_not_executable_for_driver_tasks|OpenAPI descriptor cannot execute driver task"
+  "tempo-agent|tests::openapi_fast_path_rejects_safe_looking_operations_and_model_supplied_secrets|OpenAPI descriptor cannot execute safe-looking secret-bearing operations"
+  "tempo-agent|tests::untrusted_openapi_side_effects_floor_to_send|OpenAPI untrusted operations confirm by default"
+  "tempo-agent|tests::openapi_secret_like_parameters_require_explicit_binding|OpenAPI secret-like parameters need explicit binding"
   "tempo-agent|tests::runner_openapi_fast_path_falls_through_to_browser_for_skill_actions|OpenAPI fast path falls through to browser"
   "tempo-agent|tests::run_structured_task_rejects_openapi_decisions|OpenAPI structured execution rejected"
 )
