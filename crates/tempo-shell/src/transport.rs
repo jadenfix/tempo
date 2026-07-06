@@ -212,10 +212,15 @@ impl TransportClient {
         {
             return Enqueued::Coalesced;
         }
+        let local_state = self.synced_local_state();
+        let local_version = self.local_version;
+        if matches!(action, UiAction::ResumeTakeover) {
+            self.apply_local(action.clone());
+        }
         let request = WorkerRequest::Dispatch(Box::new(WorkerDispatch {
             action: action.clone(),
-            local_state: self.synced_local_state(),
-            local_version: self.local_version,
+            local_state,
+            local_version,
             base_url: self.base_url.clone(),
             open_url: self.open_url.clone(),
             omnibox: self.omnibox.clone(),
@@ -383,12 +388,15 @@ fn run_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tab::ScreenshotImage;
+    use crate::tab::{ScreenshotImage, Tab};
     use crate::{HealthResponse, ShellError};
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
-    use tempo_headless::{TempodSession, TempodSessionEvents, TempodSessionId, TempodSessionState};
-    use tempo_schema::ConfirmationGrant;
+    use tempo_headless::{
+        TempodSession, TempodSessionEvent, TempodSessionEventKind, TempodSessionEvents,
+        TempodSessionId, TempodSessionState,
+    };
+    use tempo_schema::{ConfirmationGrant, HumanTakeover, TakeoverKind};
 
     /// A fake transport with no socket: records the calls it receives and returns
     /// canned health/sessions. `delay` lets a test hold a request "in flight" to
@@ -503,6 +511,9 @@ mod tests {
             session_id: &str,
             _after_seq: Option<u64>,
         ) -> Result<TempodSessionEvents, ShellError> {
+            if !self.delay.is_zero() {
+                thread::sleep(self.delay);
+            }
             self.record(&format!("events:{session_id}"));
             Ok(TempodSessionEvents {
                 events: Vec::new(),
@@ -522,6 +533,21 @@ mod tests {
                 issued_ms: 1,
                 expires_ms: 2,
             })
+        }
+    }
+
+    fn takeover_event(session_id: &str, seq: u64) -> TempodSessionEvent {
+        TempodSessionEvent {
+            session_id: TempodSessionId(session_id.to_string()),
+            seq,
+            timestamp_ms: 0,
+            event: TempodSessionEventKind::HumanTakeoverRequired {
+                takeover: HumanTakeover {
+                    kind: TakeoverKind::Captcha,
+                    reason: "turnstile challenge".to_string(),
+                    url: "https://a.test/verify".to_string(),
+                },
+            },
         }
     }
 
@@ -657,6 +683,40 @@ mod tests {
             client.model.tabs[0].current_url(),
             Some("https://navigated.test"),
             "later worker actions must not replay stale tab snapshots"
+        );
+    }
+
+    #[test]
+    fn resume_takeover_local_action_survives_stale_poll_update() {
+        let fake = FakeService {
+            delay: Duration::from_millis(400),
+            ..FakeService::default()
+        };
+        let mut client = TransportClient::spawn("127.0.0.1:0", fake.factory(), || {});
+        client.model.tabs = vec![Tab::new("session-0", None, "https://a.test")];
+        client.model.active_tab = Some(0);
+        client.model.tabs[0].surface.active_run_id = Some("run-0".into());
+        client.model.journal.follow("session-0");
+        client
+            .model
+            .journal
+            .ingest(&[takeover_event("session-0", 1)]);
+        assert!(client.model.journal.takeover().is_blocking());
+
+        assert_eq!(client.enqueue(UiAction::PollEvents), Enqueued::Sent);
+        assert_eq!(client.enqueue(UiAction::ResumeTakeover), Enqueued::Sent);
+        assert!(
+            !client.model.journal.takeover().is_blocking(),
+            "Resume should clear the local takeover banner immediately"
+        );
+
+        assert_eq!(
+            client.wait_and_apply(Duration::from_secs(5)),
+            Some(UiAction::PollEvents)
+        );
+        assert!(
+            !client.model.journal.takeover().is_blocking(),
+            "a stale poll snapshot must not restore the pre-resume banner"
         );
     }
 
