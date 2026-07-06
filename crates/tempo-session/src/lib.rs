@@ -544,8 +544,37 @@ struct CassetteIndex {
 }
 
 impl CassetteStore {
+    /// Open a cassette store using the production durable retention policy.
+    ///
+    /// This fails closed unless `TEMPO_DURABLE_ENCRYPTION_KEY_HEX` provides an
+    /// encryption key or `TEMPO_DURABLE_RETENTION=plaintext-unsafe` explicitly
+    /// opts into unauthenticated local fixtures.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, JournalError> {
+        Self::open_with_env_values(
+            path,
+            std::env::var_os(TEMPO_DURABLE_RETENTION_ENV),
+            std::env::var_os(TEMPO_DURABLE_ENCRYPTION_KEY_HEX_ENV),
+        )
+    }
+
+    /// Open an unauthenticated plaintext cassette store.
+    ///
+    /// This is intentionally explicit because plaintext cassettes can be
+    /// replay-poisoned when imported from an untrusted source. Use only for
+    /// local fixtures, tests, and backwards-compatibility tooling.
+    pub fn open_plaintext_unsafe(path: impl AsRef<Path>) -> Result<Self, JournalError> {
         Self::open_with_retention_policy(path, DurableRetentionPolicy::PlaintextUnsafe)
+    }
+
+    fn open_with_env_values(
+        path: impl AsRef<Path>,
+        retention_value: Option<OsString>,
+        key_hex_value: Option<OsString>,
+    ) -> Result<Self, JournalError> {
+        Self::open_with_retention_policy(
+            path,
+            durable_retention_policy_from_env_values(retention_value, key_hex_value)?,
+        )
     }
 
     pub fn open_with_retention_policy(
@@ -829,6 +858,7 @@ impl CassetteStore {
         let request_body = request_body.as_ref();
         let key = CassetteKey::from_request(method, url, request_body);
         if let Some(cassette) = self.replay(&key)? {
+            validate_cassette_request_identity(&cassette, method, url)?;
             return Ok(Some(cassette));
         }
 
@@ -840,6 +870,7 @@ impl CassetteStore {
         let Some(legacy_cassette) = self.replay(&legacy_key)? else {
             return Ok(None);
         };
+        validate_cassette_request_identity(&legacy_cassette, method, url)?;
 
         let migrated_cassette = ResponseCassette {
             key,
@@ -856,6 +887,23 @@ impl CassetteStore {
     pub fn path(&self) -> &Path {
         &self.path
     }
+}
+
+fn validate_cassette_request_identity(
+    cassette: &ResponseCassette,
+    expected_method: &str,
+    expected_url: &str,
+) -> Result<(), JournalError> {
+    if cassette.method == expected_method && cassette.url == expected_url {
+        return Ok(());
+    }
+    Err(JournalError::CassetteRequestMismatch {
+        key: cassette.key.clone(),
+        expected_method: expected_method.into(),
+        expected_url: expected_url.into(),
+        actual_method: cassette.method.clone(),
+        actual_url: cassette.url.clone(),
+    })
 }
 
 #[derive(Debug, Error)]
@@ -923,6 +971,16 @@ pub enum JournalError {
     DecryptionFailed,
     #[error("cassette key conflict for {key:?}")]
     CassetteConflict { key: CassetteKey },
+    #[error(
+        "cassette request identity mismatch for {key:?}: expected {expected_method} {expected_url}, got {actual_method} {actual_url}"
+    )]
+    CassetteRequestMismatch {
+        key: CassetteKey,
+        expected_method: String,
+        expected_url: String,
+        actual_method: String,
+        actual_url: String,
+    },
     #[error("system clock is before unix epoch")]
     ClockBeforeEpoch,
     #[error(
@@ -1026,6 +1084,13 @@ pub fn read_journal_entries_with_retention_policy(
 }
 
 pub fn read_cassettes(path: impl AsRef<Path>) -> Result<Vec<ResponseCassette>, JournalError> {
+    let retention_policy = durable_retention_policy_from_env()?;
+    read_cassettes_with_retention_policy(path, &retention_policy)
+}
+
+pub fn read_cassettes_plaintext_unsafe(
+    path: impl AsRef<Path>,
+) -> Result<Vec<ResponseCassette>, JournalError> {
     read_cassettes_with_retention_policy(path, &DurableRetentionPolicy::PlaintextUnsafe)
 }
 
@@ -2006,12 +2071,12 @@ mod tests {
             b"created".to_vec(),
         );
 
-        let store_a = CassetteStore::open(&path_a)?;
+        let store_a = CassetteStore::open_plaintext_unsafe(&path_a)?;
         store_a.record(&first)?;
         store_a.record(&second)?;
         let bytes_a = fs::read_to_string(&path_a)?;
 
-        let store_b = CassetteStore::open(&path_b)?;
+        let store_b = CassetteStore::open_plaintext_unsafe(&path_b)?;
         for cassette in store_a.all()? {
             store_b.record(&cassette)?;
         }
@@ -2038,7 +2103,7 @@ mod tests {
             br#"{"ok":true}"#.to_vec(),
         );
 
-        let store = CassetteStore::open(&path)?;
+        let store = CassetteStore::open_plaintext_unsafe(&path)?;
         store.record(&cassette)?;
         store.record(&cassette)?;
 
@@ -2064,7 +2129,7 @@ mod tests {
         conflicting.status = 500;
         conflicting.body = br#"{"ok":false}"#.to_vec();
 
-        let store = CassetteStore::open(&path)?;
+        let store = CassetteStore::open_plaintext_unsafe(&path)?;
         store.record(&first)?;
         let result = store.record(&conflicting);
 
@@ -2102,7 +2167,7 @@ mod tests {
             ..legacy.clone()
         };
 
-        let store = CassetteStore::open(&path)?;
+        let store = CassetteStore::open_plaintext_unsafe(&path)?;
         store.record(&legacy)?;
         assert_eq!(store.replay(&current_key)?, None);
 
@@ -2150,7 +2215,7 @@ mod tests {
             body: b"current".to_vec(),
         };
 
-        let store = CassetteStore::open(&path)?;
+        let store = CassetteStore::open_plaintext_unsafe(&path)?;
         store.record(&legacy)?;
         store.record(&current)?;
 
@@ -2159,6 +2224,45 @@ mod tests {
             Some(current.clone())
         );
         assert_eq!(store.all()?, vec![legacy, current]);
+
+        remove_if_exists(&path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn cassette_replay_request_rejects_stored_request_identity_mismatch() -> TestResult {
+        let path = unique_path("cassette-request-identity-mismatch")?;
+        remove_if_exists(&path)?;
+        let method = "GET";
+        let url = "https://example.com/api";
+        let key = CassetteKey::from_request(method, url, &[]);
+        let cassette = ResponseCassette {
+            key: key.clone(),
+            method: "POST".into(),
+            url: "https://attacker.example/poison".into(),
+            status: 200,
+            headers: Vec::new(),
+            body: b"poisoned".to_vec(),
+        };
+
+        let store = CassetteStore::open_plaintext_unsafe(&path)?;
+        store.record(&cassette)?;
+        assert_eq!(store.replay(&key)?, Some(cassette));
+
+        assert!(matches!(
+            store.replay_request(method, url, []),
+            Err(JournalError::CassetteRequestMismatch {
+                key: mismatch_key,
+                expected_method,
+                expected_url,
+                actual_method,
+                actual_url,
+            }) if mismatch_key == key
+                && expected_method == method
+                && expected_url == url
+                && actual_method == "POST"
+                && actual_url == "https://attacker.example/poison"
+        ));
 
         remove_if_exists(&path)?;
         Ok(())
@@ -2183,7 +2287,7 @@ mod tests {
             b"created".to_vec(),
         );
 
-        let store = CassetteStore::open(&path)?;
+        let store = CassetteStore::open_plaintext_unsafe(&path)?;
         store.record(&first)?;
         {
             let mut file = OpenOptions::new().append(true).open(&path)?;
@@ -2241,7 +2345,7 @@ mod tests {
         );
 
         {
-            let store = CassetteStore::open(&path)?;
+            let store = CassetteStore::open_plaintext_unsafe(&path)?;
             store.record(&first)?;
             store.record(&second)?;
         }
@@ -2260,7 +2364,7 @@ mod tests {
         }
 
         // Cold store instance: the index rebuild must quarantine, not poison.
-        let store = CassetteStore::open(&path)?;
+        let store = CassetteStore::open_plaintext_unsafe(&path)?;
         let len_before = fs::metadata(&path)?.len();
         assert_eq!(store.replay(&first.key)?, Some(first.clone()));
         assert_eq!(store.replay(&second.key)?, Some(second.clone()));
@@ -2325,12 +2429,12 @@ mod tests {
         );
 
         {
-            let store = CassetteStore::open(&path)?;
+            let store = CassetteStore::open_plaintext_unsafe(&path)?;
             store.record(&first)?;
         }
         let prefix_len = fs::metadata(&path)?.len();
         {
-            let store = CassetteStore::open(&path)?;
+            let store = CassetteStore::open_plaintext_unsafe(&path)?;
             store.record(&second)?;
             let second_end = fs::metadata(&path)?.len();
             store.record(&third)?;
@@ -2343,14 +2447,14 @@ mod tests {
         let full_len = fs::metadata(&path)?.len();
 
         // Instance A observes the corruption and quarantines.
-        let store_a = CassetteStore::open(&path)?;
+        let store_a = CassetteStore::open_plaintext_unsafe(&path)?;
         assert_eq!(store_a.replay(&first.key)?, Some(first.clone()));
         assert_eq!(store_a.replay(&second.key)?, None);
 
         // Instance B heals under its own append lock and re-records the lost
         // payloads. Length-deterministic encoding brings the file back to
         // exactly the length A quarantined at.
-        let store_b = CassetteStore::open(&path)?;
+        let store_b = CassetteStore::open_plaintext_unsafe(&path)?;
         store_b.record(&second)?;
         store_b.record(&third)?;
         assert_eq!(fs::metadata(&path)?.len(), full_len);
@@ -2360,7 +2464,7 @@ mod tests {
         assert_eq!(store_a.replay(&third.key)?, Some(third.clone()));
         // ...and A's next record() must append, never truncate B's records.
         store_a.record(&fourth)?;
-        let verify = CassetteStore::open(&path)?;
+        let verify = CassetteStore::open_plaintext_unsafe(&path)?;
         assert_eq!(verify.all()?, vec![first, second, third, fourth]);
 
         remove_if_exists(&path)?;
@@ -2468,7 +2572,7 @@ mod tests {
             file.write_all(b"\n")?;
         }
 
-        let store = CassetteStore::open(&path)?;
+        let store = CassetteStore::open_plaintext_unsafe(&path)?;
         let len_before = fs::metadata(&path)?.len();
         assert!(store.replay(&good.key).is_err());
         assert!(store.record(&good).is_err());
@@ -2509,7 +2613,7 @@ mod tests {
             b"three".to_vec(),
         );
 
-        let store = CassetteStore::open(&path)?;
+        let store = CassetteStore::open_plaintext_unsafe(&path)?;
         store.record(&first)?;
 
         let torn_exactly_one_chunk = {
@@ -2544,7 +2648,7 @@ mod tests {
     fn cassette_index_replay_matches_all_across_tail_repair() -> TestResult {
         let path = unique_path("cassette-index-tail-repair")?;
         remove_if_exists(&path)?;
-        let store = CassetteStore::open(&path)?;
+        let store = CassetteStore::open_plaintext_unsafe(&path)?;
         let first = test_cassette(1);
         let second = test_cassette(2);
         let complete_unterminated = test_cassette(3);
@@ -2605,8 +2709,8 @@ mod tests {
     fn cassette_index_catches_up_across_instances_and_rebuilds_after_shrink() -> TestResult {
         let path = unique_path("cassette-index-multi-instance")?;
         remove_if_exists(&path)?;
-        let writer = CassetteStore::open(&path)?;
-        let reader = CassetteStore::open(&path)?;
+        let writer = CassetteStore::open_plaintext_unsafe(&path)?;
+        let reader = CassetteStore::open_plaintext_unsafe(&path)?;
         let first = test_cassette(10);
         let second = test_cassette(11);
         let third = test_cassette(12);
@@ -2638,7 +2742,7 @@ mod tests {
     fn cassette_index_poison_resets_before_replay() -> TestResult {
         let path = unique_path("cassette-index-poison")?;
         remove_if_exists(&path)?;
-        let store = CassetteStore::open(&path)?;
+        let store = CassetteStore::open_plaintext_unsafe(&path)?;
         let cassette = test_cassette(20);
         store.record(&cassette)?;
 
@@ -3148,6 +3252,83 @@ mod tests {
     }
 
     #[test]
+    fn cassette_open_defaults_to_secure_retention_policy() -> TestResult {
+        let path = unique_path("cassette-default-secure")?;
+        remove_if_exists(&path)?;
+
+        assert!(matches!(
+            CassetteStore::open_with_env_values(&path, None, None),
+            Err(JournalError::SecureRetentionPolicyRequired)
+        ));
+        assert!(!path.exists());
+
+        let store = CassetteStore::open_with_env_values(
+            &path,
+            Some(OsString::from("plaintext-unsafe")),
+            None,
+        )?;
+        let cassette = ResponseCassette::new(
+            "GET",
+            "https://example.com/plaintext-opt-in",
+            200,
+            Vec::new(),
+            b"fixture".to_vec(),
+        );
+        store.record(&cassette)?;
+        assert_eq!(store.replay(&cassette.key)?, Some(cassette));
+
+        remove_if_exists(&path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn default_encrypted_cassette_open_rejects_tampered_plaintext_import_on_replay() -> TestResult {
+        let path = unique_path("cassette-default-rejects-plaintext")?;
+        remove_if_exists(&path)?;
+        let cassette = ResponseCassette::new(
+            "GET",
+            "https://example.com/imported",
+            200,
+            vec![("content-type".into(), "text/plain".into())],
+            b"attacker-controlled".to_vec(),
+        );
+        let plaintext_store = CassetteStore::open_plaintext_unsafe(&path)?;
+        plaintext_store.record(&cassette)?;
+        drop(plaintext_store);
+
+        let mut tampered = read_cassettes_plaintext_unsafe(&path)?
+            .pop()
+            .ok_or("cassette fixture missing")?;
+        tampered.status = 502;
+        tampered.headers = vec![("x-attacker".into(), "poisoned".into())];
+        tampered.body = b"poisoned".to_vec();
+        let mut tampered_line = encode_durable_record_bytes(
+            &serde_json::to_vec(&tampered)?,
+            &DurableRetentionPolicy::PlaintextUnsafe,
+            cassette_aad(),
+        )?;
+        tampered_line.push(b'\n');
+        fs::write(&path, tampered_line)?;
+
+        assert_eq!(
+            CassetteStore::open_plaintext_unsafe(&path)?.replay(&cassette.key)?,
+            Some(tampered)
+        );
+
+        let key_hex = "0b".repeat(DURABLE_ENCRYPTION_KEY_BYTES);
+        let encrypted_store =
+            CassetteStore::open_with_env_values(&path, None, Some(OsString::from(key_hex)))?;
+
+        assert!(matches!(
+            encrypted_store.replay(&cassette.key),
+            Err(JournalError::PlaintextRecordRejected)
+        ));
+
+        remove_if_exists(&path)?;
+        Ok(())
+    }
+
+    #[test]
     fn encrypted_journal_hides_event_bytes_and_requires_key() -> TestResult {
         let path = unique_path("encrypted-journal")?;
         remove_if_exists(&path)?;
@@ -3224,7 +3405,7 @@ mod tests {
         assert!(!contains_bytes(&bytes, b"response-body-secret"));
         assert_eq!(store.replay(&cassette.key)?, Some(cassette.clone()));
         assert!(matches!(
-            read_cassettes(&path),
+            read_cassettes_plaintext_unsafe(&path),
             Err(JournalError::EncryptedRecordRequiresKey)
         ));
 
@@ -3314,7 +3495,7 @@ mod tests {
             vec![("x-mode".into(), "plaintext".into())],
             b"plaintext-body".to_vec(),
         );
-        let store = CassetteStore::open(&cassette_path)?;
+        let store = CassetteStore::open_plaintext_unsafe(&cassette_path)?;
         store.record(&cassette)?;
         let encrypted_store =
             CassetteStore::open_with_retention_policy(&cassette_path, encrypted_test_policy(14))?;
@@ -3447,7 +3628,7 @@ mod tests {
             Vec::new(),
             b"ok".to_vec(),
         );
-        let store = CassetteStore::open(&cassette_path)?;
+        let store = CassetteStore::open_plaintext_unsafe(&cassette_path)?;
         store.record(&cassette)?;
         assert_eq!(file_mode(&cassette_path)?, 0o600);
 
@@ -3533,7 +3714,7 @@ mod tests {
         assert!(!contains_bytes(&bytes, b"set-cookie"));
         assert_eq!(store.replay(&cassette.key)?, Some(cassette));
         assert!(matches!(
-            read_cassettes(&path),
+            read_cassettes_plaintext_unsafe(&path),
             Err(JournalError::EncryptedRecordRequiresKey)
         ));
 

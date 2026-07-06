@@ -26,7 +26,9 @@ fn bench_record(c: &mut Criterion) {
             b.iter_batched(
                 || {
                     let dir = tempfile::tempdir().unwrap();
-                    let store = CassetteStore::open(dir.path().join("cassettes.jsonl")).unwrap();
+                    let store =
+                        CassetteStore::open_plaintext_unsafe(dir.path().join("cassettes.jsonl"))
+                            .unwrap();
                     (dir, store)
                 },
                 |(dir, store)| {
@@ -46,7 +48,7 @@ fn bench_record(c: &mut Criterion) {
 /// the file and a guaranteed miss.
 fn bench_replay(c: &mut Criterion) {
     let dir = tempfile::tempdir().unwrap();
-    let store = CassetteStore::open(dir.path().join("cassettes.jsonl")).unwrap();
+    let store = CassetteStore::open_plaintext_unsafe(dir.path().join("cassettes.jsonl")).unwrap();
     for index in 0..500 {
         store.record(&cassette(index)).unwrap();
     }

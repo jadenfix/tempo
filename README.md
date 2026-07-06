@@ -95,6 +95,9 @@ cargo test --workspace   # contracts, conformance, runtime, protocol, and shell 
 - Privacy/security claims are scoped to the code path that enforces them.
   Today, Web Bot Auth signing is opt-in and limited to selected `tempo-net`
   paths; it is not a blanket signature on every engine, OpenAPI, or MCP request.
+  Replay cassette imports default to encrypted durable retention; plaintext
+  cassettes are available only through explicitly named unsafe compatibility
+  helpers or `TEMPO_DURABLE_RETENTION=plaintext-unsafe`.
   Stealth mode prevents Tempo from intentionally retaining session-event
   history, OTLP/JSONL telemetry, Prometheus metrics exposition, idempotency
   replay cache, durable journals, and replay cassettes. It does not erase
