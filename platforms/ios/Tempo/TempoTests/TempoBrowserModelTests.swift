@@ -3,6 +3,14 @@ import XCTest
 
 @MainActor
 final class TempoBrowserModelTests: XCTestCase {
+    func testUnlinkedRustBridgeDoesNotAdvertiseStaticLibrary() {
+        let capabilities = TempoRustBridge().capabilities()
+
+        XCTAssertEqual(capabilities.engineLane, "wkwebview_t2")
+        XCTAssertFalse(capabilities.staticLibrary)
+        XCTAssertFalse(capabilities.nativeFork)
+    }
+
     func testAdoptCreatesHumanOwnedTabForSession() {
         let model = TempoBrowserModel(seedPreview: false)
         let session = TempoSessionSummary(

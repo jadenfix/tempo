@@ -38,7 +38,7 @@ struct TempoRustBridge {
         TempoCoreCapabilities(
             schemaVersion: "2.0.0",
             engineLane: "wkwebview_t2",
-            staticLibrary: true,
+            staticLibrary: false,
             nativeFork: false
         )
     }
