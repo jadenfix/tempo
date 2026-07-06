@@ -925,14 +925,20 @@ impl AttachedEngineDriver {
         command: HostDriverCommand,
         expected: &'static str,
         cancel: &RequestCancel,
-    ) -> Result<StepOutcome, TransportError> {
+    ) -> Result<StepOutcome, CancellableDriverError> {
         match self
             .request_cancellable(command, Some(cancel))
-            .map_err(driver_client_transport_error)?
-        {
+            .map_err(|error| match error {
+                DriverClientError::Cancelled => CancellableDriverError::CancelledBeforeDispatch,
+                other => CancellableDriverError::Transport(driver_client_transport_error(other)),
+            })? {
             DriverResponse::Step { outcome } => Ok(outcome.into()),
-            DriverResponse::Error { error } => Err(driver_wire_transport_error(error)),
-            other => Err(unexpected_driver_response(other, expected)),
+            DriverResponse::Error { error } => Err(CancellableDriverError::Transport(
+                driver_wire_transport_error(error),
+            )),
+            other => Err(CancellableDriverError::Transport(
+                unexpected_driver_response(other, expected),
+            )),
         }
     }
 
@@ -1030,8 +1036,9 @@ impl AttachedEngineDriver {
         &self,
         batch: &ActionBatch,
         cancel: &RequestCancel,
-    ) -> Result<StepOutcome, TransportError> {
-        enforce_batch_navigation_url_policy_transport(&self.url_policy, batch)?;
+    ) -> Result<StepOutcome, CancellableDriverError> {
+        enforce_batch_navigation_url_policy_transport(&self.url_policy, batch)
+            .map_err(CancellableDriverError::Transport)?;
         self.request_step_cancellable(
             HostDriverCommand::ActBatch {
                 batch: batch.clone(),
@@ -1140,6 +1147,11 @@ enum DriverClientError {
     Busy,
     #[error("engine host failed: {0}")]
     Host(#[from] EngineHostError),
+}
+
+enum CancellableDriverError {
+    CancelledBeforeDispatch,
+    Transport(TransportError),
 }
 
 /// In-memory session pool for a tempod process.
@@ -5713,13 +5725,13 @@ fn route_session_act_batch(
             status: 200,
             body: step_outcome_response(outcome, policy),
         },
-        Err(_) if cancel.is_cancelled() => {
+        Err(CancellableDriverError::CancelledBeforeDispatch) => {
             if let Some(key) = idempotency_key.as_deref() {
                 lock_pool(pool)?.clear_session_act_batch_response(&id, key, &request_fingerprint);
             }
             return Err(TempodError::RequestCancelled);
         }
-        Err(error) => CachedSessionActBatchResponse {
+        Err(CancellableDriverError::Transport(error)) => CachedSessionActBatchResponse {
             status: 500,
             body: json!({ "error": error.to_string() }),
         },
