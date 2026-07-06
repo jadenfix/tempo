@@ -799,12 +799,10 @@ fn act_to_settled_samples(records: &[EvalRecord]) -> Vec<u64> {
             continue;
         }
         if !record.step_breakdowns.is_empty() {
-            samples.extend(
-                record
-                    .step_breakdowns
-                    .iter()
-                    .map(|step| step.act_ms.saturating_add(step.settle_ms)),
-            );
+            samples.extend(record.step_breakdowns.iter().filter_map(|step| {
+                let sample = step.act_ms.saturating_add(step.settle_ms);
+                (sample != 0).then_some(sample)
+            }));
             continue;
         }
         if record.settle_latencies_ms.is_empty() {
@@ -2420,8 +2418,66 @@ mod tests {
         assert_eq!(observe.total_ms, 0);
         assert_eq!(decode.samples, 0);
         assert_eq!(decode.total_ms, 0);
+        assert_eq!(report.act_to_settled_ms_p50, 0);
         assert_eq!(report.input_tokens, 100);
         assert_eq!(report.step_breakdowns.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn e2e_budget_report_ignores_missing_act_to_settled_step_samples() -> TestResult {
+        let mut missing = record(
+            "missing",
+            "https://e2e.test",
+            Lane::Cdp,
+            true,
+            false,
+            1_000,
+            0,
+        );
+        missing.action_latencies_ms = Vec::new();
+        missing.settle_latencies_ms = Vec::new();
+        missing.step_breakdowns = vec![E2eStepBreakdown {
+            step_index: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_input_tokens: 0,
+            prefill_ms: 0,
+            decode_ms: 0,
+            observe_ms: 0,
+            act_ms: 0,
+            settle_ms: 0,
+            act_to_settled_ms: 0,
+        }];
+
+        let mut measured = record(
+            "measured",
+            "https://e2e.test",
+            Lane::Cdp,
+            true,
+            false,
+            1_000,
+            0,
+        );
+        measured.action_latencies_ms = Vec::new();
+        measured.settle_latencies_ms = Vec::new();
+        measured.step_breakdowns = vec![E2eStepBreakdown {
+            step_index: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_input_tokens: 0,
+            prefill_ms: 0,
+            decode_ms: 0,
+            observe_ms: 0,
+            act_ms: 120,
+            settle_ms: 30,
+            act_to_settled_ms: 0,
+        }];
+
+        let report =
+            E2eBudgetReport::from_records(&[missing, measured], &E2eLatencyBudget::default())?;
+
+        assert_eq!(report.act_to_settled_ms_p50, 150);
         Ok(())
     }
 
