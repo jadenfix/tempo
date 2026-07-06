@@ -50,6 +50,15 @@ Priority = measured cost × feasibility, from final.md §12. Every item lands wi
 5. **Engine µs work (the 6%):** IPC framing ≤50 µs (PLATFORMS.md:152), observe compile ≤1 ms/200 elements (PLATFORMS.md:151), allocation cuts. Ratcheted by the existing criterion benches; optimized when profiles say so, not before.
 6. **Measure-it first (#481):** the per-step token+latency Amdahl table on the live lane is itself a deliverable — every priority above re-ranks on its output.
 
+`main` now has a live-CDP measurement path for this: the CI live lane runs a
+real `run-decided-task`, converts its durable session journal through
+`tempo-cli session-eval`, then feeds that JSONL record to `tempo-cli e2e-budget`.
+That proves real browser observations/actions produce eval-compatible
+`step_count`, `round_trips`, token totals, observe/action latency samples, and
+wall time. Provider `prefill_ms` and `decode_ms` remain explicit pending
+instrumentation: current `DecisionUsage` records token counts and cache reads,
+but not provider latency splits.
+
 ## 4. Memory doctrine (the "most efficient" half of the claim)
 
 RAM discipline today is structural — buffer reuse, offset indexes, ring eviction, bounded pools (`MAX_TEMPOD_SESSIONS = 1024`, headless lib.rs:102; per-session event/idempotency caps lib.rs:85-87; OTLP queue 256, lib.rs:3243). PLATFORMS.md:160 marks per-tier byte-bounding "to enforce." The doctrine makes it enforced and ratcheted:

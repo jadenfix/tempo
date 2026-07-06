@@ -298,7 +298,7 @@ impl Command {
                     descriptor,
                     &retention_policy,
                 )?;
-                write_json(&output, &record, stdout)
+                write_json_line(&output, &record, stdout)
             }
             Self::CompatLanes {
                 input,
@@ -1004,6 +1004,43 @@ fn write_json<T: Serialize>(
                 source,
             })?;
             serde_json::to_writer_pretty(file, value).map_err(|source| CliError::JsonWrite {
+                path: path.clone(),
+                source,
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn write_json_line<T: Serialize>(
+    output: &Output,
+    value: &T,
+    stdout: &mut dyn Write,
+) -> Result<(), CliError> {
+    match output {
+        Output::Stdout => {
+            serde_json::to_writer(&mut *stdout, value)?;
+            stdout.write_all(b"\n")?;
+        }
+        Output::Path(path) => {
+            if let Some(parent) = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+            {
+                std::fs::create_dir_all(parent).map_err(|source| CliError::Io {
+                    path: parent.to_path_buf(),
+                    source,
+                })?;
+            }
+            let mut file = File::create(path).map_err(|source| CliError::Io {
+                path: path.clone(),
+                source,
+            })?;
+            serde_json::to_writer(&mut file, value).map_err(|source| CliError::JsonWrite {
+                path: path.clone(),
+                source,
+            })?;
+            file.write_all(b"\n").map_err(|source| CliError::Io {
                 path: path.clone(),
                 source,
             })?;
@@ -2414,6 +2451,11 @@ mod tests {
         assert_eq!(record.output_tokens, 24);
         assert_eq!(record.cache_read_input_tokens, 80);
         assert!(record.max_observation_bytes > 0);
+
+        let record_lines = std::fs::read_to_string(&output)?;
+        assert_eq!(record_lines.lines().count(), 1);
+        let records = read_eval_records(&output)?;
+        assert_eq!(records, vec![record]);
         remove_dir(&dir)?;
         Ok(())
     }
@@ -2980,6 +3022,7 @@ mod tests {
                     prefill_latencies_ms: Vec::new(),
                     decode_latencies_ms: Vec::new(),
                     round_trips: 0,
+                    step_breakdowns: Vec::new(),
                     wall_clock_ms: 100,
                     baseline_wall_clock_ms: None,
                     unconfirmed_high_risk_actions: 0,

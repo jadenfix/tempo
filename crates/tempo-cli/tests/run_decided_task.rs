@@ -21,6 +21,8 @@ fn run_decided_task_binary_drives_live_cdp_with_scripted_decider() -> TestResult
     let decisions = dir.join("decisions.json");
     let journal = dir.join("session.jsonl");
     let output = dir.join("report.json");
+    let eval_record = dir.join("eval-record.jsonl");
+    let e2e_budget = dir.join("e2e-budget.json");
     write_json(
         &decisions,
         &serde_json::json!([
@@ -86,6 +88,64 @@ fn run_decided_task_binary_drives_live_cdp_with_scripted_decider() -> TestResult
         entries.last().map(|entry| &entry.event),
         Some(JournalEvent::SessionClosed)
     ));
+
+    let status = Command::new(env!("CARGO_BIN_EXE_tempo-cli"))
+        .args([
+            "session-eval",
+            "--journal",
+            &path_string(&journal),
+            "--suite",
+            "live-cdp",
+            "--case-id",
+            "run-decided-task",
+            "--origin",
+            &url,
+            "--lane",
+            "cdp",
+            "--success",
+            "true",
+            "--fallback-used",
+            "false",
+            "--output",
+            &path_string(&eval_record),
+        ])
+        .env("TEMPO_DURABLE_RETENTION", "plaintext-unsafe")
+        .status()?;
+    assert!(status.success(), "session-eval exited with {status}");
+
+    let eval: Value = serde_json::from_reader(File::open(&eval_record)?)?;
+    assert_eq!(eval["lane"], "cdp");
+    assert_eq!(eval["step_count"], 2);
+    assert_eq!(eval["round_trips"], 2);
+    assert!(eval["observe_latencies_ms"]
+        .as_array()
+        .is_some_and(|samples| !samples.is_empty()));
+    assert!(eval["action_latencies_ms"]
+        .as_array()
+        .is_some_and(|samples| !samples.is_empty()));
+    assert!(eval["wall_clock_ms"].as_u64().is_some_and(|ms| ms > 0));
+
+    let status = Command::new(env!("CARGO_BIN_EXE_tempo-cli"))
+        .args([
+            "e2e-budget",
+            "--input",
+            &path_string(&eval_record),
+            "--output",
+            &path_string(&e2e_budget),
+            "--max-observe-p50-ms",
+            "10000",
+            "--max-act-to-settled-p50-ms",
+            "10000",
+        ])
+        .status()?;
+    assert!(status.success(), "e2e-budget exited with {status}");
+    let budget: Value = serde_json::from_reader(File::open(&e2e_budget)?)?;
+    assert_eq!(budget["total_cases"], 1);
+    assert_eq!(budget["total_steps"], 2);
+    assert_eq!(budget["total_round_trips"], 2);
+    assert!(budget["violations"]
+        .as_array()
+        .is_some_and(|violations| violations.is_empty()));
     fs::remove_dir_all(dir)?;
     Ok(())
 }
