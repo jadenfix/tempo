@@ -10233,6 +10233,136 @@ mod tests {
     }
 
     #[test]
+    fn session_run_create_replays_decided_events_in_order_until_human_takeover() -> TestResult {
+        let mut pool = SessionPool::default();
+        pool.next_run_id = current_time_ms();
+        let handle = attach_driver_handler_seq(&mut pool, 4, |request| match request.command {
+            HostDriverCommand::Goto { url } => {
+                assert_eq!(url, "https://runs.test/verify");
+                DriverResponse::Observation {
+                    observation: observation("https://runs.test/verify", 1),
+                }
+            }
+            HostDriverCommand::Act { action } => {
+                assert_eq!(action, Action::Scroll { x: 0.0, y: 4.0 });
+                DriverResponse::Step {
+                    outcome: StepOutcome::Applied {
+                        diff: ObservationDiff {
+                            since_seq: 1,
+                            seq: 2,
+                            omitted: 0,
+                            marks: Vec::new(),
+                            added: Vec::new(),
+                            removed: Vec::new(),
+                            changed: Vec::new(),
+                        },
+                    }
+                    .into(),
+                }
+            }
+            HostDriverCommand::CachedObservation { seq } => {
+                assert_eq!(seq, 2);
+                DriverResponse::CachedObservation {
+                    observation: Some(captcha_observation("https://runs.test/verify", 2)),
+                }
+            }
+            HostDriverCommand::Close => DriverResponse::Closed,
+            unexpected => panic!("unexpected takeover-order driver request: {unexpected:?}"),
+        })?;
+        let session_driver = pool
+            .driver
+            .clone()
+            .ok_or("attached engine driver should be present")?;
+        let session = pool.finish_create("https://runs.test/verify".into(), Some(session_driver));
+
+        let response = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: format!("/sessions/{}/runs", session.id.0),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: serde_json::to_vec(&json!({
+                    "goal": "scroll once, then stop for human verification",
+                    "actions": [{"kind": "scroll", "x": 0.0, "y": 4.0}],
+                    "max_rounds": 2
+                }))?,
+            },
+        )?;
+        assert_eq!(response.status, 201);
+        let run: AgentRun = serde_json::from_slice(&response.body)?;
+        assert_eq!(run.session_id, session.id.0);
+        assert_eq!(run.state, AgentRunState::WaitingForHuman);
+        assert_eq!(pool.active_runs.get(&session.id), Some(&run.run_id));
+        assert_eq!(
+            pool.session_owner(&session.id),
+            ControlOwner::Agent {
+                run_id: Some(run.run_id.clone())
+            }
+        );
+
+        let events_response = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "GET".into(),
+                path: format!("/sessions/{}/events", session.id.0),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: Vec::new(),
+            },
+        )?;
+        assert_eq!(events_response.status, 200);
+        let events: TempodSessionEvents = serde_json::from_slice(&events_response.body)?;
+        let producer_events: Vec<_> = events
+            .events
+            .iter()
+            .filter_map(|event| match &event.event {
+                TempodSessionEventKind::ModelDecision { .. }
+                | TempodSessionEventKind::StepTriple { .. }
+                | TempodSessionEventKind::HumanTakeoverRequired { .. } => Some(&event.event),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(producer_events.len(), 3, "{producer_events:#?}");
+
+        match producer_events[0] {
+            TempodSessionEventKind::ModelDecision { decision } => {
+                assert_eq!(decision.actions, vec![Action::Scroll { x: 0.0, y: 4.0 }]);
+            }
+            event => return Err(format!("first producer event was {event:?}").into()),
+        }
+        match producer_events[1] {
+            TempodSessionEventKind::StepTriple { triple } => {
+                assert_eq!(triple.action, Action::Scroll { x: 0.0, y: 4.0 });
+                match &triple.outcome {
+                    StepTripleOutcome::Applied { diff } => {
+                        assert_eq!(diff.since_seq, 1);
+                        assert_eq!(diff.seq, 2);
+                    }
+                    outcome => {
+                        return Err(format!("step event outcome was {outcome:?}").into());
+                    }
+                }
+            }
+            event => return Err(format!("second producer event was {event:?}").into()),
+        }
+        match producer_events[2] {
+            TempodSessionEventKind::HumanTakeoverRequired { takeover } => {
+                assert_eq!(takeover.kind, tempo_schema::TakeoverKind::Captcha);
+                assert_eq!(takeover.url, "https://runs.test/verify");
+                assert!(takeover.reason.contains("not a robot"));
+            }
+            event => return Err(format!("third producer event was {event:?}").into()),
+        }
+
+        pool.kill(&session.id)?;
+        join_driver_handler(handle)?;
+        Ok(())
+    }
+
+    #[test]
     fn session_run_create_emits_live_human_takeover_event() -> TestResult {
         let mut pool = SessionPool::default();
         pool.next_run_id = current_time_ms();
