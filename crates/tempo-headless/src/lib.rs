@@ -2578,9 +2578,7 @@ impl SessionPool {
         id: &TempodSessionId,
         takeover: HumanTakeover,
     ) -> Result<TempodSessionEvent, TempodError> {
-        if !self.sessions.contains_key(id) {
-            return Err(TempodError::SessionNotFound(id.clone()));
-        }
+        self.live_session_for_producer(id)?;
         Ok(self.record_event(
             id,
             TempodSessionEventKind::HumanTakeoverRequired { takeover },
@@ -12065,10 +12063,15 @@ mod tests {
         assert_eq!(json["kind"], "human_takeover_required");
         assert_eq!(json["takeover"]["kind"], "captcha");
 
-        // Unknown session id is rejected, like record_step.
+        // Producer events reject unknown and killed sessions.
         assert!(matches!(
-            pool.record_human_takeover(&TempodSessionId("missing".into()), takeover),
+            pool.record_human_takeover(&TempodSessionId("missing".into()), takeover.clone()),
             Err(TempodError::SessionNotFound(_))
+        ));
+        pool.kill(&session.id)?;
+        assert!(matches!(
+            pool.record_human_takeover(&session.id, takeover),
+            Err(TempodError::Conflict(_))
         ));
         Ok(())
     }
