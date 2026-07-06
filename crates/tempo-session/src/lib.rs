@@ -91,6 +91,16 @@ pub struct SessionId(pub String);
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunId(pub String);
 
+/// A failed decided action that a later model decision is explicitly
+/// correcting. Stored inside [`JournalEvent::ModelDecision`] so replay can
+/// distinguish ordinary decisions from bounded self-healing rounds without
+/// requiring a second serialized copy of the decision.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ModelDecisionCorrection {
+    pub action: Action,
+    pub reason: String,
+}
+
 /// One durable session event.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -112,6 +122,10 @@ pub enum JournalEvent {
     /// decision so cache-hit rate stays observable (`cache_read_input_tokens`,
     /// #218).
     ModelDecision {
+        /// Present when this decision is the one bounded corrective round for a
+        /// prior recoverable [`JournalEvent::StepError`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correction: Option<ModelDecisionCorrection>,
         actions: Vec<Action>,
         rationale: Option<String>,
         input_tokens: u64,

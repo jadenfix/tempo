@@ -8991,6 +8991,7 @@ fn replay_decided_journal_events(
     for entry in entries {
         match &entry.event {
             tempo_session::JournalEvent::ModelDecision {
+                correction: _,
                 actions,
                 rationale,
                 input_tokens,
@@ -10507,6 +10508,7 @@ mod tests {
             seq: 0,
             timestamp_ms: u128::from(current_time_ms()),
             event: tempo_session::JournalEvent::ModelDecision {
+                correction: None,
                 actions: Vec::new(),
                 rationale: None,
                 input_tokens: 1,
