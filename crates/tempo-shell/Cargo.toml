@@ -10,7 +10,7 @@ name = "tempo"
 path = "src/main.rs"
 
 # The GUI binary only builds when the `window` feature is on, so the default
-# `cargo build/check --workspace` (and CI's display-less `check` job) skip it.
+# `cargo build/check --workspace` and CI's display-less workspace check skip it.
 [[bin]]
 name = "tempo-window"
 path = "src/bin/tempo-window.rs"
