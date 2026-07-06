@@ -392,6 +392,7 @@ mod tests {
         ObservationDiff {
             since_seq: 0,
             seq: 1,
+            url: None,
             omitted: 0,
             marks: Vec::new(),
             added,
@@ -408,6 +409,7 @@ mod tests {
         ObservationDiff {
             since_seq: 0,
             seq: 1,
+            url: None,
             omitted: 0,
             marks: Vec::new(),
             added,

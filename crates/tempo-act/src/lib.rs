@@ -987,6 +987,7 @@ mod tests {
                 return Ok(ObservationDiff {
                     since_seq,
                     seq: self.seq,
+                    url: None,
                     omitted: 0,
                     marks: Vec::new(),
                     added: Vec::new(),
@@ -997,6 +998,7 @@ mod tests {
             Ok(ObservationDiff {
                 since_seq,
                 seq: self.seq,
+                url: None,
                 omitted: 0,
                 marks: Vec::new(),
                 added: Vec::new(),
@@ -1016,6 +1018,7 @@ mod tests {
                 diff: ObservationDiff {
                     since_seq: self.seq - 1,
                     seq: self.seq,
+                    url: None,
                     omitted: 0,
                     marks: Vec::new(),
                     added: Vec::new(),
@@ -1034,6 +1037,7 @@ mod tests {
                 diff: ObservationDiff {
                     since_seq: self.seq,
                     seq: self.seq,
+                    url: None,
                     omitted: 0,
                     marks: Vec::new(),
                     added: Vec::new(),

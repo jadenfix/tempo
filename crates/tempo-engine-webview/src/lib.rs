@@ -593,6 +593,7 @@ fn full_snapshot_diff(since_seq: u64, current: &CompiledObservation) -> Observat
     ObservationDiff {
         since_seq,
         seq: current.seq,
+        url: Some(current.url.clone()),
         omitted: current.omitted,
         marks: current.marks.clone(),
         added: current.elements.clone(),

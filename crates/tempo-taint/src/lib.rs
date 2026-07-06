@@ -152,6 +152,12 @@ pub fn serialize_observation_diff_for_model(diff: &ObservationDiff) -> String {
     }
     out.push_str(">\n");
 
+    if let Some(url) = &diff.url {
+        out.push_str("<tempo-diff-url>\n");
+        serialize_labeled_metadata("url", Provenance::Page, url, &mut out);
+        out.push_str("</tempo-diff-url>\n");
+    }
+
     out.push_str("<tempo-diff-added>\n");
     for (index, element) in diff.added.iter().enumerate() {
         serialize_diff_element(index, element, &mut out);
@@ -551,6 +557,7 @@ mod tests {
         let diff = ObservationDiff {
             since_seq: 7,
             seq: 8,
+            url: Some("https://evil.example/?q=SYSTEM_ignore_prior".into()),
             omitted: 2,
             marks: Vec::new(),
             added: vec![element_with_spans(
@@ -575,6 +582,9 @@ mod tests {
 
         assert!(serialized
             .starts_with("<tempo-observation-diff since_seq=\"7\" seq=\"8\" omitted=\"2\">"));
+        assert!(serialized.contains("<tempo-diff-url>"));
+        assert!(serialized.contains("url:\n<tempo-span provenance=\"page\""));
+        assert!(serialized.contains("https://evil.example/?q=SYSTEM_ignore_prior"));
         assert!(serialized.contains("<tempo-diff-added>"));
         assert!(serialized.contains("<tempo-diff-changed>"));
         assert!(serialized.contains(&serialize_span(&span(Provenance::Page, "added-node"))));
@@ -598,6 +608,7 @@ mod tests {
         let diff = ObservationDiff {
             since_seq: 1,
             seq: 2,
+            url: None,
             omitted: 0,
             marks: Vec::new(),
             added: Vec::new(),
@@ -630,6 +641,7 @@ mod tests {
         let diff = ObservationDiff {
             since_seq: 3,
             seq: 4,
+            url: None,
             omitted: 0,
             marks: Vec::new(),
             added: vec![element_with_spans(
