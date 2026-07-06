@@ -413,6 +413,9 @@ pub enum DriverCommand {
     ObserveDiff {
         since_seq: u64,
     },
+    CachedObservation {
+        seq: u64,
+    },
     Act {
         action: Action,
     },
@@ -515,6 +518,9 @@ pub enum DriverResponse {
     },
     Diff {
         diff: ObservationDiff,
+    },
+    CachedObservation {
+        observation: Option<CompiledObservation>,
     },
     Step {
         outcome: WireStepOutcome,
@@ -1271,6 +1277,9 @@ where
         DriverCommand::ObserveDiff { since_seq } => match driver.observe_diff(since_seq).await {
             Ok(diff) => DriverResponse::Diff { diff },
             Err(error) => driver_error(error),
+        },
+        DriverCommand::CachedObservation { seq } => DriverResponse::CachedObservation {
+            observation: driver.cached_observation(seq),
         },
         DriverCommand::Act { action } => match driver.act(&action).await {
             Ok(outcome) => DriverResponse::Step {
@@ -2456,6 +2465,57 @@ mod tests {
 
         let response = join_client(handle)?;
         assert_eq!(response, DriverResponse::Diff { diff });
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn ipc_client_round_trips_cached_observation_command_over_uds() -> TestResult {
+        let root = unique_dir("uds-cached-observation")?;
+        remove_dir_if_exists(&root)?;
+        create_private_dir(&root)?;
+        let socket_path = root.join("engine.sock");
+        let server = EngineIpcServer::bind(&socket_path)?;
+        let client_path = socket_path.clone();
+        let auth_token = server.auth_token().to_string();
+
+        let handle = thread::spawn(move || -> Result<DriverResponse, EngineHostError> {
+            let mut client = EngineIpcClient::connect_with_token(client_path, &auth_token)?;
+            client.request(DriverCommand::CachedObservation { seq: 42 })
+        });
+
+        let mut connection = server.accept()?;
+        let request = connection.read_driver_request()?;
+        assert_eq!(request.id, 1);
+        assert_eq!(request.driver_id, None);
+        assert_eq!(
+            request.command,
+            DriverCommand::CachedObservation { seq: 42 }
+        );
+
+        let observation = CompiledObservation {
+            schema_version: tempo_schema::SCHEMA_VERSION.into(),
+            url: "https://example.test/".into(),
+            seq: 42,
+            elements: Vec::new(),
+            omitted: 0,
+            marks: Vec::new(),
+        };
+        connection.write_driver_response(
+            request.id,
+            DriverResponse::CachedObservation {
+                observation: Some(observation.clone()),
+            },
+        )?;
+
+        let response = join_client(handle)?;
+        assert_eq!(
+            response,
+            DriverResponse::CachedObservation {
+                observation: Some(observation)
+            }
+        );
 
         remove_dir_if_exists(&root)?;
         Ok(())

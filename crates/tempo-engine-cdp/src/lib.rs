@@ -1417,6 +1417,12 @@ impl DriverTrait for CdpTempoDriver {
         ))
     }
 
+    fn cached_observation(&self, seq: u64) -> Option<CompiledObservation> {
+        self.history
+            .get(&seq)
+            .map(|observation| observation.as_ref().clone())
+    }
+
     async fn act(&mut self, action: &Action) -> Result<StepOutcome, TransportError> {
         self.run_one(action).await
     }

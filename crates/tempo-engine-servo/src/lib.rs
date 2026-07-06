@@ -331,6 +331,17 @@ impl DriverTrait for ServoIpcDriver {
         }
     }
 
+    fn cached_observation(&self, seq: u64) -> Option<CompiledObservation> {
+        let mut client = self.client.lock().ok()?;
+        match client.request_for(
+            self.driver_id.as_deref(),
+            DriverCommand::CachedObservation { seq },
+        ) {
+            Ok(DriverResponse::CachedObservation { observation }) => observation,
+            _ => None,
+        }
+    }
+
     async fn act(&mut self, action: &Action) -> Result<StepOutcome, TransportError> {
         match self
             .request(DriverCommand::Act {

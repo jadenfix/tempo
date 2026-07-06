@@ -9,7 +9,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use tempo_act::{
-    execute_action_verified, execute_batch_verified, ActionExecution, ExecutionStatus,
+    execute_action_verified_from_seq, execute_batch_verified_from_seq, ActionExecution,
+    ExecutionStatus,
 };
 use tempo_driver::{DriverTrait, Engine, TransportError, Unsupported};
 use tempo_schema::{Action, ActionBatch, ObservationDiff};
@@ -344,25 +345,27 @@ where
     D: DriverTrait + ?Sized,
 {
     let engine = driver.engine();
-    driver
+    let mut base_seq = driver
         .goto(&plan.start_url)
         .await
         .map_err(|source| SpeculateError::DriverTransport {
             context: "replay goto",
             source,
-        })?;
+        })?
+        .seq;
 
     let mut prefix = Vec::with_capacity(branch.prefix.len());
     for expected in &branch.prefix {
         // Replay verification needs the diff as an independent witness: the
         // verified variant always re-grounds with its own observe_diff instead
         // of trusting the act path it is checking.
-        let execution = execute_action_verified(driver, expected.action())
+        let execution = execute_action_verified_from_seq(driver, expected.action(), base_seq)
             .await
             .map_err(|source| SpeculateError::DriverTransport {
                 context: "replay action",
                 source,
             })?;
+        base_seq = execution.seq;
         let actual = replay_outcome_from_execution(execution);
         let expected_outcome = expected.outcome();
         if !replay_outcomes_match(&actual, &expected_outcome) {
@@ -378,7 +381,7 @@ where
         });
     }
 
-    let branch_execution = execute_batch_verified(driver, &branch.batch)
+    let branch_execution = execute_batch_verified_from_seq(driver, &branch.batch, base_seq)
         .await
         .map_err(|source| SpeculateError::DriverTransport {
             context: "branch batch",

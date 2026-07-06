@@ -17,8 +17,9 @@
 //!   ceiling is a typed, journal-derived stop, never a panic.
 
 use crate::{
-    is_policy_denial_reason, policy_denied_reason, read_body_capped, AgentError, AgentRunner,
-    CappedBodyError, DriverStep, IdempotencyKey, TokenBudget, RESUME_INTERRUPTED_REASON,
+    cached_observation_for_seq, is_policy_denial_reason, policy_denied_reason, read_body_capped,
+    AgentError, AgentRunner, CappedBodyError, DriverStep, IdempotencyKey, TokenBudget,
+    RESUME_INTERRUPTED_REASON,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -1045,6 +1046,7 @@ impl AgentRunner {
                 .map_err(|source| {
                     decided_transport_error(&mut state.journal, "decided execute action", source)
                 })?;
+            let execution_diff = execution.diff.clone();
             let (outcome, step_error) = match execution.status {
                 ExecutionStatus::Applied => (
                     JournalEvent::StepApplied {
@@ -1068,7 +1070,7 @@ impl AgentRunner {
             state.steps_executed += 1;
 
             *observation = self
-                .reobserve_after_action(driver, state, observation, action)
+                .reobserve_after_action(driver, state, observation, action, &execution_diff)
                 .await?;
 
             // Hard-pause on a CAPTCHA / auth-wall / login state before running
@@ -1124,21 +1126,19 @@ impl AgentRunner {
     /// decision (and the #343 takeover detector and #254 origin/taint
     /// recomputation) will run on.
     ///
-    /// Incremental fast path (#235): for a same-document action, ask the driver
-    /// for an [`ObservationDiff`] relative to the pre-action observation and
-    /// reconstruct the full observation locally, instead of paying a full
-    /// re-observe. This shrinks the post-action re-observation (only the delta
-    /// crosses the driver transport) without changing what the consumers see:
-    /// [`reconstruct_observation`] rebuilds a byte-equivalent observation, or
-    /// declines (and we full-observe) when it cannot.
+    /// Fast path (#431): prefer the driver's cached post-action observation
+    /// produced by `act` itself. If the driver cannot expose that snapshot,
+    /// same-document actions can still reconstruct from the action diff; all
+    /// other cases fall back to a full observe.
     ///
     /// Correctness gates (any failure falls back to a full `observe()`):
-    ///   * navigating actions (`Goto`/`Click`/`Type`/`Select`/`Skill`) always
-    ///     full-observe — a diff carries no URL, and `Type`/`Select` can trigger
-    ///     an input/`onchange` navigation, so the post-action origin (#254) and
-    ///     URL-keyed takeover detection (#343) must read the URL fresh;
-    ///   * a diff that adds an element, was not computed against our exact base,
-    ///     or that a marked page cannot reproduce is declined by
+    ///   * a matching-sequence cached observation is accepted for any action
+    ///     because it carries the driver's fresh URL and canonical element
+    ///     order;
+    ///   * without cache, navigating actions (`Goto`/`Click`/`Type`/`Select`/
+    ///     `Skill`) still full-observe because a diff carries no URL;
+    ///   * without cache, a diff that adds an element, was not computed against
+    ///     our exact base, or that a marked page cannot reproduce is declined by
     ///     [`reconstruct_observation`] and full-observed instead.
     async fn reobserve_after_action<D>(
         &self,
@@ -1146,29 +1146,32 @@ impl AgentRunner {
         state: &mut DecidedRunState,
         base: &CompiledObservation,
         action: &Action,
+        diff: &ObservationDiff,
     ) -> Result<CompiledObservation, AgentError>
     where
         D: DriverTrait + ?Sized,
     {
-        if !action_may_navigate(action) {
-            let diff = driver.observe_diff(base.seq).await.map_err(|source| {
-                decided_transport_error(
-                    &mut state.journal,
-                    "decided post-action observe_diff",
-                    source,
-                )
-            })?;
-            if let Some(observation) = reconstruct_observation(base, &diff) {
-                return self.record_decided_observation(
-                    state,
-                    observation,
-                    "decided post-action observation (diff)",
-                );
-            }
-            // The diff could not be applied equivalently: fall back to a full
-            // observe (correctness > latency).
+        if let Some(observation) = cached_observation_for_seq(driver, diff.seq) {
+            return self.record_decided_observation(
+                state,
+                observation,
+                "decided post-action observation (cached)",
+            );
         }
 
+        if !action_may_navigate(action)
+            && diff.since_seq == base.seq
+            && let Some(observation) = reconstruct_observation(base, diff)
+        {
+            return self.record_decided_observation(
+                state,
+                observation,
+                "decided post-action observation (diff)",
+            );
+        }
+
+        // The diff could not be applied equivalently: fall back to a full
+        // observe (correctness > latency).
         let next = driver.observe().await.map_err(|source| {
             decided_transport_error(&mut state.journal, "decided post-action observe", source)
         })?;
@@ -1736,6 +1739,10 @@ mod tests {
             self.inner.observe_diff(since_seq).await
         }
 
+        fn cached_observation(&self, seq: u64) -> Option<CompiledObservation> {
+            self.inner.cached_observation(seq)
+        }
+
         async fn act(
             &mut self,
             action: &Action,
@@ -1802,7 +1809,7 @@ mod tests {
         assert!(!report.rounds[0].resumed);
         assert_eq!(report.usage, DecisionUsage::default());
         assert_eq!(driver.goto_calls, 1);
-        assert_eq!(driver.observe_calls, 1);
+        assert_eq!(driver.observe_calls, 0);
         assert_eq!(driver.observe_diff_calls, 0);
         assert_eq!(driver.act_calls, 1);
 
@@ -1871,6 +1878,40 @@ mod tests {
         assert!(!entries
             .iter()
             .any(|entry| matches!(entry.event, JournalEvent::StepApplied { .. })));
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn decided_step_reuses_post_action_cached_observation() -> TestResult {
+        let (root, journal_path) = journal_root("decided-cached-post-action")?;
+        let mut driver = CountingDriver::new(vec![button("submit")]);
+        let runner = AgentRunner::new(
+            &journal_path,
+            AgentRunIds::new("run-decided-cached", "session-decided-cached"),
+        )
+        .with_confirmation_mode(ConfirmationMode::AutoConfirmAll);
+        let mut decider = ScriptedDecider::new(vec![vec![click("submit")], vec![]]);
+        let spec = DecidedTaskSpec::new("https://example.com", "click submit");
+
+        let report = runner
+            .run_decided_task(&mut driver, &mut decider, &spec)
+            .await?;
+
+        assert_eq!(report.status, DecidedRunStatus::Completed);
+        assert_eq!(report.actions_completed, 1);
+        assert_eq!(driver.goto_calls, 1);
+        assert_eq!(driver.act_calls, 1);
+        assert_eq!(driver.observe_calls, 0);
+        assert_eq!(driver.observe_diff_calls, 0);
+
+        let observations = observation_events(&read_journal_entries(&journal_path)?);
+        assert_eq!(
+            observations.len(),
+            2,
+            "initial and post-action observations should both be journaled"
+        );
 
         remove_dir_if_exists(&root)?;
         Ok(())
@@ -2799,6 +2840,8 @@ mod tests {
         pages: VecDeque<Vec<tempo_schema::InteractiveElement>>,
         history: std::collections::HashMap<u64, CompiledObservation>,
         reject_diff: bool,
+        cache_observations: bool,
+        stale_cached_observations: bool,
         /// When set, the next `act` navigates the page to this URL — models a
         /// `<select onchange=location=…>` / input-handler redirect.
         navigate_on_act: Option<String>,
@@ -2818,9 +2861,21 @@ mod tests {
                 pages: pages.into(),
                 history: std::collections::HashMap::new(),
                 reject_diff,
+                cache_observations: true,
+                stale_cached_observations: false,
                 navigate_on_act: None,
                 calls: Arc::new(Mutex::new(Vec::new())),
             }
+        }
+
+        fn without_cached_observations(mut self) -> Self {
+            self.cache_observations = false;
+            self
+        }
+
+        fn with_stale_cached_observations(mut self) -> Self {
+            self.stale_cached_observations = true;
+            self
         }
 
         /// A real engine lays elements out in a canonical (here, `node_id`) order
@@ -2953,6 +3008,21 @@ mod tests {
             Ok(self.true_diff(since_seq))
         }
 
+        fn cached_observation(&self, seq: u64) -> Option<CompiledObservation> {
+            if let Ok(mut calls) = self.calls.lock() {
+                calls.push("cached_observation");
+            }
+            if !self.cache_observations {
+                return None;
+            }
+            if self.stale_cached_observations {
+                return seq
+                    .checked_sub(1)
+                    .and_then(|base| self.history.get(&base).cloned());
+            }
+            self.history.get(&seq).cloned()
+        }
+
         async fn act(
             &mut self,
             _action: &Action,
@@ -2963,17 +3033,11 @@ mod tests {
             if let Some(url) = self.navigate_on_act.take() {
                 self.url = url;
             }
+            let since_seq = self.seq;
             self.seq += 1;
             let _ = self.snapshot();
             Ok(tempo_driver::StepOutcome::Applied {
-                diff: ObservationDiff {
-                    since_seq: self.seq - 1,
-                    seq: self.seq,
-                    omitted: 0,
-                    added: Vec::new(),
-                    removed: Vec::new(),
-                    changed: Vec::new(),
-                },
+                diff: self.true_diff(since_seq),
             })
         }
 
@@ -3038,17 +3102,15 @@ mod tests {
             .collect()
     }
 
-    /// (a) Equivalence, non-circular: the driver lays elements out in a canonical
-    /// order like a real engine, so a step that adds an element would be
-    /// mis-ordered by a tail-append reconstruction. A run that reconstructs from
-    /// `observe_diff` on the diff-safe (change-only) step must still journal
-    /// byte-identical observations and decisions to one forced onto full observe,
-    /// and must fall back — not reconstruct — on the add step.
+    /// (a) Equivalence, non-circular: a driver-owned cached post-action
+    /// observation must feed the next decision with the same settled page that a
+    /// conservative full observe would have returned, including canonical
+    /// element ordering for added nodes.
     #[tokio::test]
-    async fn decided_incremental_observe_matches_full_observe() -> TestResult {
-        // Step 1 changes "b" (diff-safe). Step 2 adds "a", which sorts *before*
-        // "b" in the canonical order, so a tail-append would produce ["b","a"]
-        // while a full observe yields ["a","b"]: the add step must full-observe.
+    async fn decided_cached_observation_matches_full_observe() -> TestResult {
+        // Step 1 changes "b". Step 2 adds "a", which sorts *before* "b" in the
+        // canonical order. A stale or reconstructed observation would make the
+        // next decision diverge from the full-observe fallback.
         let script = || {
             (
                 vec![el("b", 0.9)],
@@ -3073,7 +3135,7 @@ mod tests {
 
         let (root_full, journal_full) = journal_root("incremental-observe-full")?;
         let (init, pages) = script();
-        let mut full_driver = DiffDriver::new(init, pages, true);
+        let mut full_driver = DiffDriver::new(init, pages, true).without_cached_observations();
         let full_calls = Arc::clone(&full_driver.calls);
         let mut full_decider = ScriptedDecider::new(batches());
         AgentRunner::new(&journal_full, AgentRunIds::new("run-full", "session-full"))
@@ -3081,8 +3143,8 @@ mod tests {
             .await?;
         let full_entries = read_journal_entries(&journal_full)?;
 
-        // The add step's observation must contain "a" *before* "b" — the proof
-        // the reconstruction did not tail-append.
+        // The add step's observation must contain "a" *before* "b" — proof the
+        // cached path carried the driver's canonical post-action observation.
         let inc_obs = observation_events(&inc_entries);
         let last = inc_obs.last().ok_or("no observation journaled")?;
         let ids: Vec<&str> = last.elements.iter().map(|e| e.node_id.0.as_str()).collect();
@@ -3092,11 +3154,11 @@ mod tests {
             "add step was mis-ordered (tail-appended)"
         );
 
-        // Reconstructed observations and decisions match the full-observe run.
+        // Cached observations and decisions match the full-observe run.
         assert_eq!(
             inc_obs,
             observation_events(&full_entries),
-            "reconstructed observations diverged from full observe"
+            "cached observations diverged from full observe"
         );
         assert_eq!(
             decision_actions(&inc_entries),
@@ -3104,13 +3166,17 @@ mod tests {
             "decisions diverged"
         );
 
-        // The change-only step took the diff path, so the incremental run paid
-        // fewer full observes than the forced-fallback run.
+        // The cached run does not perform a post-action observe or observe_diff;
+        // the no-cache control falls back to full observe.
         let inc_calls = inc_calls.lock().map_err(|_| "poisoned")?.clone();
         let full_calls = full_calls.lock().map_err(|_| "poisoned")?.clone();
         assert!(
-            inc_calls.contains(&"observe_diff"),
-            "incremental run never issued observe_diff"
+            inc_calls.contains(&"cached_observation"),
+            "cached run never asked for cached post-action observation"
+        );
+        assert!(
+            !inc_calls.contains(&"observe_diff"),
+            "cached run should not re-run observe_diff after the action"
         );
         let inc_full = inc_calls.iter().filter(|c| **c == "observe").count();
         let fallback_full = full_calls.iter().filter(|c| **c == "observe").count();
@@ -3124,15 +3190,12 @@ mod tests {
         Ok(())
     }
 
-    /// (b/c) A CAPTCHA that an existing element turns into (a same-`NodeId`
-    /// `changed` diff entry, which stays on the diff path) is still detected: the
-    /// takeover detector runs on the reconstructed observation, so the run
-    /// hard-pauses through the diff path without a full re-observe.
+    /// (b/c) A CAPTCHA that appears in the driver's post-action observation is
+    /// still detected without a full re-observe.
     #[tokio::test]
     async fn decided_incremental_observe_still_detects_takeover_mid_run() -> TestResult {
         let (root, journal) = journal_root("incremental-observe-takeover")?;
-        // "frame" starts benign, then becomes a reCAPTCHA in place (changed, not
-        // added) so the diff path carries it.
+        // "frame" starts benign, then becomes a reCAPTCHA in place.
         let mut driver = DiffDriver::new(
             vec![el("frame", 0.9)],
             vec![vec![captcha_with_id("frame")]],
@@ -3150,21 +3213,19 @@ mod tests {
             return Err(format!("expected HumanTakeoverRequired, got {:?}", report.status).into());
         };
         assert_eq!(takeover.kind, tempo_schema::TakeoverKind::Captcha);
-        // Surfaced from the diff path (no fallback full observe was needed).
+        // Surfaced from the cached post-action observation.
         let calls = calls.lock().map_err(|_| "poisoned")?.clone();
-        assert!(calls.contains(&"observe_diff"));
+        assert!(calls.contains(&"cached_observation"));
+        assert!(!calls.contains(&"observe_diff"));
 
         remove_dir_if_exists(&root)?;
         Ok(())
     }
 
-    /// A navigating `Select`/`Type` (an `onchange`/input redirect) must take the
-    /// full-observe path so the post-action origin is recomputed from the FRESH
-    /// URL — never carried stale from a diff (which would gate the next action
-    /// against the wrong origin, a silent policy bypass, and miss URL-keyed
-    /// takeover detection).
+    /// A navigating `Select`/`Type` (an `onchange`/input redirect) must use a
+    /// fresh post-action observation URL — never stale base URL state.
     #[tokio::test]
-    async fn decided_navigating_select_full_observes_fresh_url() -> TestResult {
+    async fn decided_navigating_select_uses_fresh_post_action_url() -> TestResult {
         let (root, journal) = journal_root("incremental-observe-navigate")?;
         let mut driver = DiffDriver::new(vec![el("sel", 0.9)], vec![], false);
         // The Select navigates cross-origin; the page's elements do not change,
@@ -3185,6 +3246,43 @@ mod tests {
         assert_eq!(
             last.url, "https://evil.example.net/",
             "post-navigation observation carried a stale URL (origin not recomputed)"
+        );
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn decided_rejects_stale_cached_observation_before_policy_recompute() -> TestResult {
+        let (root, journal) = journal_root("incremental-observe-stale-cache")?;
+        let mut driver =
+            DiffDriver::new(vec![el("sel", 0.9)], vec![], false).with_stale_cached_observations();
+        driver.navigate_on_act = Some("https://evil.example.net/".into());
+        let calls = Arc::clone(&driver.calls);
+        let mut decider = ScriptedDecider::new(vec![vec![select_action("sel")], vec![]]);
+        let spec = DecidedTaskSpec::new("https://example.com", "select a jump menu");
+
+        AgentRunner::new(
+            &journal,
+            AgentRunIds::new("run-stale-cache", "session-stale-cache"),
+        )
+        .with_confirmation_mode(ConfirmationMode::AutoConfirmAll)
+        .run_decided_task(&mut driver, &mut decider, &spec)
+        .await?;
+
+        let entries = read_journal_entries(&journal)?;
+        let last = observation_events(&entries)
+            .pop()
+            .ok_or("no observation journaled")?;
+        assert_eq!(
+            last.url, "https://evil.example.net/",
+            "stale cached observation was accepted before origin recompute"
+        );
+        let calls = calls.lock().map_err(|_| "poisoned")?.clone();
+        assert!(calls.contains(&"cached_observation"));
+        assert!(
+            calls.contains(&"observe"),
+            "stale cache should fall back to a full post-action observe"
         );
 
         remove_dir_if_exists(&root)?;
