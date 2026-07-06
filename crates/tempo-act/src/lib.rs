@@ -114,8 +114,9 @@ where
     execute_action_from_seq(driver, action, before.seq).await
 }
 
-/// [`execute_action`], but skip the pre-action observe when the caller already
-/// has the current observation sequence.
+/// Execute a single action when the caller already holds the pre-action
+/// observation sequence. This avoids re-running the full observation pipeline
+/// solely to recover `before.seq`.
 pub async fn execute_action_from_seq<D>(
     driver: &mut D,
     action: &Action,
@@ -737,6 +738,22 @@ mod tests {
         assert_eq!(execution.since_seq, 10);
         assert_eq!(execution.seq, 11);
         assert_eq!(driver.observe_calls, 1);
+        assert!(driver.observe_diff_calls.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn executor_uses_caller_base_seq_without_pre_observe() -> Result<(), String> {
+        let mut driver = ContractDriver::new();
+        let action = Action::Click {
+            node: NodeId("button".into()),
+        };
+        let execution = block_on(execute_action_from_seq(&mut driver, &action, 10))
+            .map_err(|error| error.to_string())?;
+        assert!(execution.applied());
+        assert_eq!(execution.since_seq, 10);
+        assert_eq!(execution.seq, 11);
+        assert_eq!(driver.observe_calls, 0);
         assert!(driver.observe_diff_calls.is_empty());
         Ok(())
     }
