@@ -3341,7 +3341,7 @@ pub fn run_tempod_with_auto_cdp_engine_config_and_navigation_url_policy(
     engine_binary: impl AsRef<Path>,
     url_policy: UrlPolicy,
 ) -> Result<(), TempodError> {
-    let config = config.with_bind_addr_host(addr);
+    let config = ensure_runtime_auth(config.with_bind_addr_host(addr))?;
     config.validate_bind_addr(addr)?;
     let listener = TcpListener::bind(addr)?;
     let runtime_dir = AutoCdpRuntimeDir::create()?;
@@ -14354,6 +14354,38 @@ mod tests {
     #[cfg(not(unix))]
     #[test]
     fn auto_started_cdp_engine_waits_for_socket_and_attaches() -> TestResult {
+        Ok(())
+    }
+
+    #[test]
+    fn auto_started_cdp_remote_bind_resolves_runtime_auth_before_validation() -> TestResult {
+        let root = unique_dir("auto-cdp-remote-runtime-auth")?;
+        remove_dir_if_exists(&root)?;
+        let token_path = root.join("tempod.token");
+        let missing_engine = root.join("missing-tempo-engined-cdp");
+        let _runtime_auth_path = scoped_test_runtime_auth_token_path(token_path.clone());
+
+        let error = match run_tempod_with_auto_cdp_engine_config_and_navigation_url_policy(
+            "0.0.0.0:0",
+            TempodServerConfig::new().allow_remote_binds(),
+            &missing_engine,
+            UrlPolicy::block_private(),
+        ) {
+            Ok(()) => return Err("missing auto-started engine binary should fail".into()),
+            Err(error) => error,
+        };
+
+        let message = error.to_string();
+        assert!(
+            !message.contains("non-loopback tempod bind"),
+            "auto-started CDP should synthesize runtime auth before remote bind validation: {message}"
+        );
+        assert!(
+            load_tempod_runtime_auth_token_at(&token_path)?.is_some(),
+            "auto-started CDP should create the runtime auth token before engine spawn"
+        );
+
+        remove_dir_if_exists(&root)?;
         Ok(())
     }
 
