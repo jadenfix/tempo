@@ -17,11 +17,13 @@ You are an independent, non-author reviewer for `jadenfix/tempo`. The argument i
 ## Procedure
 
 1. `gh pr view <N> -R jadenfix/tempo --json title,body,author,files,mergeStateStatus,statusCheckRollup`
+   - Confirm the PR body begins with the `1.) agent <number>` and `2.) purpose:` metadata required by `pr-scope`; if it was fixed by body edit only, require a push or close/reopen-triggered rerun before treating the check as fresh.
 2. `gh pr diff <N> -R jadenfix/tempo` — all of it.
 3. `gh issue view <issue> -R jadenfix/tempo` for every referenced issue; the issue defines the intended scope (did the PR do more or less than it needs?).
 4. **Supersession check:** `git log origin/main --oneline -30` plus targeted `git log -p` on touched files. Concurrent agents mean main may already contain an equivalent fix → REJECT (superseded).
 5. **Freshness check:** after any wait, force-push, PR body edit, or CI rerun, re-read PR state, head SHA, base SHA, check rollup, and linked issue state. A closed PR, stale-head check run, or already-closed issue is not merge evidence.
 6. **Overlap check:** `gh pr list -R jadenfix/tempo --state open` — flag open PRs touching the same paths and whether merge order matters.
+   - Green per-PR CI is not combined-tree proof when main or overlapping PRs moved since branching; call out local current-main merge/test evidence needed before merge-ready claims.
 7. Hunt for bugs using the method below.
 8. Post the review (format at the bottom) and return a structured verdict.
 
@@ -45,8 +47,10 @@ Correctness & honesty of the contract:
 - [ ] Tool and model result envelopes do not duplicate large structured payloads across text and structured channels; text fallbacks summarize, while binary artifacts use native media content blocks.
 - [ ] Handles/IDs the caller reuses across calls are stable, or their churn is handled rather than silently breaking multi-step callers.
 - [ ] Docs, comments, and declared schemas/types match what the code actually does — no present-tense claims for a stub, no `{"type":"object"}` standing in for a real schema.
+- [ ] Public enum-valued fields advertise the exact serde/runtime wire names. Generated clients must accept every value the server can emit, ideally by reusing the same schema helper or by a contract test that pins the full enum.
 - [ ] Model-facing tool schemas are self-contained and match the runtime parser — no opaque object placeholders, unresolved `$ref`s, or ambiguous aliases where the caller needs one canonical shape.
 - [ ] Runtime-visible contract changes update every public description in the same slice: OpenAPI paths/statuses/schemas, agent cards, SDK-facing docs, and compatibility fixtures. A route or response field that exists at runtime but is absent from the contract is a blocker for SDK workflows.
+- [ ] Clients that convert structured operation envelopes into `Result`-style APIs parse the authoritative payload status before mutating local state. HTTP 2xx alone is not success when the body can report `step_error`, unknown, missing, or non-applied outcomes.
 - [ ] When a caller starts trusting callee-embedded data it previously re-derived (a returned diff, status, or measurement), the callee's contract (trait docs, schema comments) is tightened in the same slice to require what the caller now assumes — otherwise a future implementation silently weakens the guarantee.
 - [ ] Public Rust schema struct changes update source callers too: `serde(default)` preserves old JSON compatibility, but it does not make existing struct literals compile. Scan/update workspace literals and downstream crates.
 - [ ] Compact wire-format changes that omit default, empty, or optional fields preserve both directions of compatibility: compact serialization, populated serialization, and default-filled deserialization all have reverted-fix-sensitive tests.
@@ -59,6 +63,10 @@ Resource, lifecycle & availability:
 - [ ] Stateful protocol handlers enforce live-state quotas in addition to per-message size caps; repeated valid commands must not grow maps, vectors, or dispatch scans without bound.
 - [ ] Moving blocking work onto std threads or blocking pools is not itself a bound; client-triggered thread fan-out needs a shared in-flight cap and an immediate structured rejection path.
 - [ ] Every engine/remote/subprocess round-trip has a timeout **and** a recovery path — a crash or hang is detected and healed (restart/reconnect, with backoff), not permanently terminal.
+- [ ] `timeout` around a create-style browser/remote call is not cancellation; dropped futures can still create remote resources, so timeout paths need a reap, track, or cleanup strategy.
+- [ ] Deadline fixes bound the whole path, including setup and cleanup awaits introduced by the fix; timeout values are derived from the caller's deadline with recovery margin, not just from test silence.
+- [ ] Auto-started child processes cannot outlive the daemon on signal death or abrupt exit; daemon-side drops are insufficient without a child-side parent-death watch or equivalent owner check.
+- [ ] Daemons that own both a child supervisor and an IPC reconnect loop document and test who restarts, who re-attaches, and how either side gives up without stranding the other.
 
 Security boundaries & auth:
 - [ ] Loopback, Host, and Origin checks are not authentication. Control planes that drive sessions, tools, or browser state require an unguessable same-user capability even on `127.0.0.1`.
@@ -66,6 +74,7 @@ Security boundaries & auth:
 - [ ] Operational metadata routes that expose dependency health, capacity, policy, or topology are guarded like control-plane routes unless they intentionally return only static liveness.
 - [ ] Locks are narrow, consistently ordered, released on panic (poison recovered, not fatal), and never held across `.await`, navigation, or subprocess I/O — the pool lock especially, so `/health` and `/drain` stay responsive.
 - [ ] UI-local state transitions and teardown/cancel paths stay bounded independently of backend health. Moving I/O off-thread is not enough if local controls or shutdown still serialize behind blocking transport work.
+- [ ] Async UI/worker reconciliation preserves ownership boundaries. A stale UI snapshot must not replay a whole domain object into a worker or over a completed worker result when backend actions can mutate fields inside that object; send narrow local deltas.
 - [ ] Durable/journal writes use a batched single-writer path (e.g. WAL + a dedicated writer), not per-write open + full fsync; a crash or kill mid-write must be recoverable on restart with no torn or lost committed state.
 - [ ] Removing per-write fsync from a durable file comes with an integrity story, not just a recency argument: checksummed records, or detection-plus-self-heal for interior corruption (a well-terminated garbage line from out-of-order writeback), not only torn-tail repair. Heal-by-truncation is gated so a misconfigured key/policy on a healthy store can never trigger it.
 - [ ] A cached verdict about a shared mutable file (known-corrupt region, known-good prefix, parsed snapshot) is not revalidated by length or mtime equality once another writer can heal, truncate-and-re-append, or re-record in contract: identical payloads re-encode to identical lengths. The verdict is re-derived from content on use, or scoped to a single exclusive-lock hold.
@@ -73,6 +82,7 @@ Security boundaries & auth:
 Trust boundaries & security:
 - [ ] Caller-supplied trust/policy/side-effect classifications (`taint`, `confirmed`, …) are recomputed server-side, never trusted.
 - [ ] Untrusted data is size-checked, provenance-tracked, and cannot cause side effects or leak secret headers; a policy (URL, egress, redaction) is enforced across the whole path — redirects, retries, interception — not just the entrypoint.
+- [ ] Per-resource policy hooks are installed before the resource's first navigation or use, and block attribution stays with the resource that caused it.
 - [ ] Egress and proxy policy is bound to the concrete endpoint actually used after DNS, proxy resolution, redirects, and retries; validating a hostname, URL string, or only one candidate address is not enough when another resolved socket can be selected later.
 - [ ] Untrusted remote tool descriptors without trusted side-effect metadata are classified at the strongest supported side effect before threshold origin rules run; never flatten unknown remote tools to a weaker class.
 - [ ] Security or taint gates assert the production call path, not only the helper intended to be safe; model-facing page metadata is provenance-framed, not left as escaped-but-bare prompt attributes.
@@ -81,6 +91,8 @@ Trust boundaries & security:
 - [ ] Tests and docs that verify redaction do not commit realistic secret, token, password, API-key, or credential literals. Use scanner-safe inert fragments while still proving the sensitive value never appears in debug/display/error/export output.
 - [ ] Secret-bearing clients parse and validate configured base URLs before constructing requests: reject userinfo/query/fragment/path injection, require a pinned secure production origin, and make loopback/insecure fixtures use an explicitly named test opt-in.
 - [ ] A detector or guard runs on data that actually reaches it: check that upstream filtering/compilation didn't strip the very signal the check needs.
+- [ ] Observation filters explicitly preserve or reject earlier detector carve-outs; visibility/layout pruning distinguishes "not rendered" from single-axis or fill-later geometry that remains an action/extract target.
+- [ ] Rules enforced in injected page JavaScript are mirrored in the host-side parser as the trust backstop, with reverted-fix-sensitive tests on both sides.
 - [ ] A change that removes or shortens a wait, grace window, or recheck on a trust-boundary path names the exact window losing coverage and cites the mechanism that still enforces the invariant inside that window — "already covered elsewhere" without the covering mechanism is not a justification.
 
 Performance on hot paths (a regression here is a correctness bug for this project):
@@ -90,11 +102,13 @@ Performance on hot paths (a regression here is a correctness bug for this projec
 Fit & simplicity (more code is not better):
 - [ ] The change does exactly what its issue needs — no speculative abstraction, dead branch, unused config knob, second way to do an existing thing, or new crate/feature with no caller.
 - [ ] It fits `final.md`: crate-layer direction is respected (a lower-layer contract crate must not depend upward on a higher-layer one), the driver contract stays engine-agnostic, observe/policy/taint stay pure, and public contracts stay versioned to evolve independently.
+- [ ] Cross-platform and shell changes keep Android/mobile constraints in the shared layers: no desktop-only IPC, filesystem, process, RAM, or windowing assumptions above the engine/transport boundary; platform-specific work stays in thin adapters.
 
 Tests:
 - [ ] A test exercises the actual failure mode (survives the reverted-fix question above); new caps/timeouts/limits are tested at the boundary — at, below, above.
 - [ ] Local verification ran in an isolated worktree/target. If multiple Cargo commands share one fresh `CARGO_TARGET_DIR` concurrently, missing rlibs/object files/temp dirs are local harness races until reproduced sequentially.
 - [ ] CI filters that skip expensive security or engine build gates are conservative: workflow files, lockfiles, manifests, gate scripts, the gated crate, and direct local dependency crates still trigger the gate unless the PR documents a narrower proof.
+- [ ] Curated security-sentinel test lists are append-only; guards that pin test presence do not replace human review of trust-boundary or `*_denies_*` / `*_blocks_*` assertion changes.
 
 ## tempo hard rules (standing invariants — treat a violation as a blocker)
 
