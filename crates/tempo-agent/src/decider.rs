@@ -27,7 +27,7 @@ use std::collections::{HashSet, VecDeque};
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::time::Duration;
-use tempo_act::{detect_human_takeover, execute_action, ExecutionStatus};
+use tempo_act::{detect_human_takeover, execute_action_from_seq, ExecutionStatus};
 use tempo_driver::{DriverTrait, TransportError};
 use tempo_policy::{
     trust::{action_caller_texts, observation_text_taint},
@@ -1041,7 +1041,7 @@ impl AgentRunner {
             state.journal.append(JournalEvent::ActionPlanned {
                 action: action.clone(),
             })?;
-            let execution = execute_action(driver, action, observation.seq)
+            let execution = execute_action_from_seq(driver, action, observation.seq)
                 .await
                 .map_err(|source| {
                     decided_transport_error(&mut state.journal, "decided execute action", source)

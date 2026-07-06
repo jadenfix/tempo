@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::io;
 use std::path::{Path, PathBuf};
-use tempo_act::{execute_action, execute_batch, ExecutionStatus};
+use tempo_act::{execute_action_from_seq, execute_batch_from_seq, ExecutionStatus};
 use tempo_driver::{DriverTrait, Engine, StepOutcome, TransportError};
 use tempo_handshake::{probe_http_origin, LaneDecision, ProbeHit};
 pub use tempo_handshake::{HttpProbeConfig, Lane as StructuredLane, StructuredSignal};
@@ -1146,12 +1146,12 @@ impl AgentRunner {
 
             let since_seq = observation.seq;
             let execution = match &compiled_skill {
-                Some(skill) => execute_batch(driver, &skill.batch, since_seq)
+                Some(skill) => execute_batch_from_seq(driver, &skill.batch, since_seq)
                     .await
                     .map_err(|source| {
                         journal_transport_error(&mut agent, "execute skill", source)
                     })?,
-                None => execute_action(driver, &planned.action, since_seq)
+                None => execute_action_from_seq(driver, &planned.action, since_seq)
                     .await
                     .map_err(|source| {
                         journal_transport_error(&mut agent, "execute action", source)
