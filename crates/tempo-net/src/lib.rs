@@ -1587,11 +1587,14 @@ pub struct ContentUsagePolicy {
 
 impl ContentUsagePolicy {
     pub fn parse_header_values<'a>(values: impl IntoIterator<Item = &'a str>) -> Self {
-        let mut policy = Self::default();
+        let mut combined = String::new();
         for value in values {
-            policy.apply_directives(value);
+            if !combined.is_empty() {
+                combined.push(',');
+            }
+            combined.push_str(value);
         }
-        policy
+        parse_content_usage_dictionary(&combined).unwrap_or_default()
     }
 
     pub fn allows(&self, category: CrawlUsageCategory) -> bool {
@@ -1608,20 +1611,157 @@ impl ContentUsagePolicy {
         }
     }
 
-    fn apply_directives(&mut self, value: &str) {
-        for token in value.split([',', ';']) {
-            let Some((name, raw_decision)) = token.split_once('=') else {
-                continue;
-            };
-            let Some(decision) = parse_content_usage_decision(raw_decision) else {
-                continue;
-            };
-            match normalize_content_usage_name(name).as_str() {
-                "search" => self.search = Some(decision),
-                "train-ai" => self.train_ai = Some(decision),
-                _ => {}
-            }
+    fn is_empty(&self) -> bool {
+        self.search.is_none() && self.train_ai.is_none()
+    }
+
+    fn merge_most_restrictive(&mut self, source: Self) {
+        if let Some(search) = source.search {
+            self.search = Some(
+                self.search
+                    .map(|current| current && search)
+                    .unwrap_or(search),
+            );
         }
+        if let Some(train_ai) = source.train_ai {
+            self.train_ai = Some(
+                self.train_ai
+                    .map(|current| current && train_ai)
+                    .unwrap_or(train_ai),
+            );
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ContentUsageRule {
+    path: String,
+    policy: ContentUsagePolicy,
+}
+
+impl ContentUsageRule {
+    fn parse(value: &str) -> Option<Self> {
+        let value = value.trim();
+        if value.is_empty() {
+            return None;
+        }
+        let (path, preferences) = if value.starts_with('/') {
+            match value.find([' ', '\t']) {
+                Some(index) => (&value[..index], value[index..].trim()),
+                None => (value, ""),
+            }
+        } else {
+            ("", value)
+        };
+        let policy = parse_content_usage_dictionary(preferences)?;
+        (!policy.is_empty()).then(|| Self {
+            path: normalize_robots_pattern(path),
+            policy,
+        })
+    }
+
+    fn applies_to(&self, path: &str) -> bool {
+        self.path.is_empty() || robots_path_matches(&self.path, path)
+    }
+}
+
+fn path_content_usage<'a>(
+    rules: impl IntoIterator<Item = &'a ContentUsageRule>,
+    path: &str,
+) -> ContentUsagePolicy {
+    let mut best_specificity = None;
+    let mut policy = ContentUsagePolicy::default();
+    for rule in rules {
+        if !rule.applies_to(path) {
+            continue;
+        }
+        let specificity = robots_specificity(&rule.path);
+        match best_specificity {
+            Some(best) if specificity < best => continue,
+            Some(best) if specificity > best => {
+                policy = ContentUsagePolicy::default();
+                best_specificity = Some(specificity);
+            }
+            None => best_specificity = Some(specificity),
+            Some(_) => {}
+        }
+        policy.merge_most_restrictive(rule.policy.clone());
+    }
+    policy
+}
+
+fn origin_content_usage<'a>(
+    rules: impl IntoIterator<Item = &'a ContentUsageRule>,
+) -> ContentUsagePolicy {
+    let mut policy = ContentUsagePolicy::default();
+    for rule in rules {
+        if rule.path.is_empty() {
+            policy.merge_most_restrictive(rule.policy.clone());
+        }
+    }
+    policy
+}
+
+fn parse_content_usage_name(name: &str) -> Option<CrawlUsageCategory> {
+    match name.trim() {
+        "search" => Some(CrawlUsageCategory::Search),
+        "train-ai" => Some(CrawlUsageCategory::TrainAi),
+        _ => None,
+    }
+}
+
+fn parse_content_usage_dictionary(value: &str) -> Option<ContentUsagePolicy> {
+    let mut policy = ContentUsagePolicy::default();
+    if value.trim().is_empty() {
+        return Some(policy);
+    }
+    for member in value.split(',') {
+        let member = member.trim();
+        if member.is_empty() {
+            return None;
+        }
+        let (raw_key, raw_value) = member
+            .split_once('=')
+            .map(|(key, value)| (key, Some(value)))
+            .unwrap_or((member, None));
+        let key = raw_key
+            .split_once(';')
+            .map(|(key, _)| key)
+            .unwrap_or(raw_key)
+            .trim();
+        if !is_content_usage_dictionary_key(key) {
+            return None;
+        }
+        let decision = raw_value.and_then(parse_content_usage_decision);
+        match parse_content_usage_name(key) {
+            Some(CrawlUsageCategory::Search) => policy.search = decision,
+            Some(CrawlUsageCategory::TrainAi) => policy.train_ai = decision,
+            None => {}
+        }
+    }
+    Some(policy)
+}
+
+fn is_content_usage_dictionary_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.bytes().all(|byte| {
+            matches!(
+                byte,
+                b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-' | b'.' | b'*'
+            )
+        })
+}
+
+fn parse_content_usage_decision(value: &str) -> Option<bool> {
+    let value = value.trim();
+    let value = value
+        .split_once(';')
+        .map(|(value, _)| value)
+        .unwrap_or(value);
+    match value.trim() {
+        "y" => Some(true),
+        "n" => Some(false),
+        _ => None,
     }
 }
 
@@ -1727,6 +1867,7 @@ pub struct RobotsRules {
     directives: Vec<RobotsDirective>,
     crawl_delay_ticks: Option<u64>,
     content_usage: ContentUsagePolicy,
+    content_usage_rules: Vec<ContentUsageRule>,
 }
 
 impl RobotsRules {
@@ -1742,6 +1883,7 @@ impl RobotsRules {
             }],
             crawl_delay_ticks: None,
             content_usage: ContentUsagePolicy::default(),
+            content_usage_rules: Vec::new(),
         }
     }
 
@@ -1819,7 +1961,9 @@ impl RobotsRules {
                     current_group_has_rules = true;
                 }
                 "content-usage" => {
-                    current_group.content_usage.apply_directives(value);
+                    if let Some(rule) = ContentUsageRule::parse(value) {
+                        current_group.content_usage_rules.push(rule);
+                    }
                     current_group_has_rules = true;
                 }
                 _ => {}
@@ -1864,6 +2008,14 @@ impl RobotsRules {
     pub fn allows_usage(&self, category: CrawlUsageCategory) -> bool {
         self.content_usage.allows(category)
     }
+
+    pub fn content_usage_for_path(&self, path: &str) -> ContentUsagePolicy {
+        path_content_usage(&self.content_usage_rules, path)
+    }
+
+    pub fn allows_usage_for_path(&self, path: &str, category: CrawlUsageCategory) -> bool {
+        self.allows_path(path) && self.content_usage_for_path(path).allows(category)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1883,7 +2035,7 @@ struct RobotsGroup {
     agents: Vec<String>,
     directives: Vec<RobotsDirective>,
     crawl_delay_ticks: Option<u64>,
-    content_usage: ContentUsagePolicy,
+    content_usage_rules: Vec<ContentUsageRule>,
 }
 
 impl RobotsGroup {
@@ -1891,7 +2043,7 @@ impl RobotsGroup {
         if self.agents.is_empty() {
             self.directives.clear();
             self.crawl_delay_ticks = None;
-            self.content_usage = ContentUsagePolicy::default();
+            self.content_usage_rules.clear();
             return;
         }
         groups.push(std::mem::take(self));
@@ -1928,7 +2080,8 @@ fn select_robots_rules(target: &str, groups: Vec<RobotsGroup>) -> RobotsRules {
                     .unwrap_or(delay),
             );
         }
-        merge_content_usage(&mut rules.content_usage, group.content_usage);
+        rules.content_usage_rules.extend(group.content_usage_rules);
+        rules.content_usage = origin_content_usage(&rules.content_usage_rules);
     }
     rules
 }
@@ -3973,40 +4126,6 @@ fn header_value_count(headers: &BTreeMap<String, Vec<String>>) -> usize {
     headers.values().map(Vec::len).sum()
 }
 
-fn normalize_content_usage_name(name: &str) -> String {
-    name.trim()
-        .trim_matches('"')
-        .to_ascii_lowercase()
-        .replace('_', "-")
-}
-
-fn parse_content_usage_decision(value: &str) -> Option<bool> {
-    match value.trim().trim_matches('"').to_ascii_lowercase().as_str() {
-        "y" | "yes" | "true" | "1" | "allow" | "allowed" => Some(true),
-        "n" | "no" | "false" | "0" | "deny" | "denied" | "disallow" | "disallowed" => Some(false),
-        _ => None,
-    }
-}
-
-fn merge_content_usage(target: &mut ContentUsagePolicy, source: ContentUsagePolicy) {
-    if let Some(search) = source.search {
-        target.search = Some(
-            target
-                .search
-                .map(|current| current && search)
-                .unwrap_or(search),
-        );
-    }
-    if let Some(train_ai) = source.train_ai {
-        target.train_ai = Some(
-            target
-                .train_ai
-                .map(|current| current && train_ai)
-                .unwrap_or(train_ai),
-        );
-    }
-}
-
 fn nonempty_header_value(value: &str) -> Option<String> {
     let value = value.trim();
     (!value.is_empty()).then(|| value.to_string())
@@ -5830,7 +5949,7 @@ Crawl-delay: 3
     fn content_usage_response_headers_parse_per_category() {
         let response = NetworkResponseRecord::new("r1", "https://example.com/page", 200)
             .with_header("Content-Usage", "search=n, train-ai=y")
-            .with_header("Content-Usage", "unknown=n; train_ai=no");
+            .with_header("Content-Usage", "unknown=n, train-ai=n");
 
         let policy = content_usage_from_response(&response);
 
@@ -5838,6 +5957,39 @@ Crawl-delay: 3
         assert_eq!(policy.explicit(CrawlUsageCategory::TrainAi), Some(false));
         assert!(!policy.allows(CrawlUsageCategory::Search));
         assert!(!policy.allows(CrawlUsageCategory::TrainAi));
+    }
+
+    #[test]
+    fn content_usage_response_headers_follow_structured_dictionary_semantics() {
+        let duplicate_unknown = ContentUsagePolicy::parse_header_values([
+            "train-ai=y, train-ai, search=n, search=\"n\"",
+        ]);
+        assert_eq!(
+            duplicate_unknown.explicit(CrawlUsageCategory::TrainAi),
+            None
+        );
+        assert_eq!(duplicate_unknown.explicit(CrawlUsageCategory::Search), None);
+
+        let invalid_dictionary = ContentUsagePolicy::parse_header_values(["Search=n, train-ai=n"]);
+        assert_eq!(
+            invalid_dictionary.explicit(CrawlUsageCategory::TrainAi),
+            None
+        );
+        assert_eq!(
+            invalid_dictionary.explicit(CrawlUsageCategory::Search),
+            None
+        );
+
+        let parameterized =
+            ContentUsagePolicy::parse_header_values(["train-ai=n; source=test, search=y"]);
+        assert_eq!(
+            parameterized.explicit(CrawlUsageCategory::TrainAi),
+            Some(false)
+        );
+        assert_eq!(
+            parameterized.explicit(CrawlUsageCategory::Search),
+            Some(true)
+        );
     }
 
     #[test]
@@ -5864,6 +6016,37 @@ Content-Usage: search=y, train-ai=n
         assert_eq!(
             robots.content_usage().explicit(CrawlUsageCategory::TrainAi),
             Some(false)
+        );
+    }
+
+    #[test]
+    fn robots_rules_apply_path_scoped_content_usage() {
+        let robots = RobotsRules::parse_for_agent(
+            "OtherBot",
+            r#"
+User-agent: *
+Allow: /
+Disallow: /never/
+Content-Usage: train-ai=n
+Content-Usage: /ai-ok/ train-ai=y
+Content-Usage: /same/ train-ai=y
+Content-Usage: /same/ train-ai=n
+
+User-agent: ExampleBot
+Allow: /
+Content-Usage: train-ai=y
+"#,
+        );
+
+        assert!(!robots.allows_usage_for_path("/test", CrawlUsageCategory::TrainAi));
+        assert!(robots.allows_usage_for_path("/ai-ok/test", CrawlUsageCategory::TrainAi));
+        assert!(!robots.allows_usage_for_path("/same/test", CrawlUsageCategory::TrainAi));
+        assert!(!robots.allows_usage_for_path("/never/test", CrawlUsageCategory::TrainAi));
+        assert_eq!(
+            robots
+                .content_usage_for_path("/ai-ok/test")
+                .explicit(CrawlUsageCategory::TrainAi),
+            Some(true)
         );
     }
 
