@@ -11,6 +11,9 @@ license.workspace = true
 name = "tempo-engined-cdp"
 path = "src/bin/tempo-engined-cdp.rs"
 
+[features]
+bench-internals = []
+
 [dependencies]
 async-trait = { workspace = true }
 chromiumoxide = { version = "0.7", default-features = false, features = ["tokio-runtime"] }
@@ -26,7 +29,13 @@ tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-threa
 url = "2"
 
 [dev-dependencies]
+criterion.workspace = true
 tempo-driver = { path = "../tempo-driver", features = ["test-driver"] }
+
+[[bench]]
+name = "request_policy"
+harness = false
+required-features = ["bench-internals"]
 
 [lints]
 workspace = true
