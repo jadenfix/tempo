@@ -1103,9 +1103,7 @@ impl CdpTempoDriver {
                 });
             }
 
-            if let Some(refreshed) = self.refresh_selector_for_node(node).await?
-                && refreshed != selector
-            {
+            if let Some(refreshed) = self.refresh_selector_for_node(node).await? {
                 let element = self.resolve_action_element(&refreshed).await?;
                 return Ok(ActionElementGrounding {
                     target: refreshed,
@@ -6019,6 +6017,61 @@ mod tests {
             .evaluate_script("Promise.resolve(document.body.dataset.clicked)", true)
             .await?;
         assert_eq!(clicked, serde_json::json!("yes"));
+        driver.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_cdp_action_grounding_retries_same_selector_after_document_replacement(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(chrome) = live_cdp_chrome_executable() else {
+            eprintln!(
+                "skipping live CDP stale document-root grounding test; TEMPO_CDP_CHROME is unset"
+            );
+            return Ok(());
+        };
+        let url = serve_fixture()?;
+        let config = CdpConfig::default()
+            .with_executable(chrome)
+            .with_no_sandbox_env_opt_in();
+        let mut driver = CdpTempoDriver::launch_with(config)
+            .await?
+            .allow_private_network_access();
+
+        let observation = driver.goto(&url).await?;
+        let save_node = observation
+            .elements
+            .iter()
+            .find(|element| {
+                element.role == "button"
+                    && element.name.first().map(|span| span.text.as_str()) == Some("Save")
+            })
+            .map(|element| element.node_id.clone())
+            .ok_or_else(|| std::io::Error::other("missing save button"))?;
+
+        driver
+            .evaluate_script(
+                r#"(() => {
+                    document.open();
+                    document.write(`<!doctype html><html><body>
+                        <button id="save" onclick="document.body.dataset.clicked='after-replace'">
+                          <span>Save</span>
+                        </button>
+                    </body></html>`);
+                    document.close();
+                    return true;
+                })()"#,
+                true,
+            )
+            .await?;
+
+        let outcome = driver.act(&Action::Click { node: save_node }).await?;
+        assert!(matches!(outcome, StepOutcome::Applied { .. }));
+        let clicked = driver
+            .evaluate_script("Promise.resolve(document.body.dataset.clicked)", true)
+            .await?;
+        assert_eq!(clicked, serde_json::json!("after-replace"));
+
         driver.close().await?;
         Ok(())
     }
