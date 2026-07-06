@@ -2582,7 +2582,7 @@ fn top_ranked_indices(elements: &[InteractiveElement], limit: usize) -> Vec<usiz
 
 fn visual_extraction_taint(value: &str) -> Vec<TaintSpan> {
     vec![TaintSpan {
-        provenance: Provenance::VisualExtraction,
+        provenance: Provenance::Page,
         text: value.to_string(),
     }]
 }
@@ -3762,9 +3762,9 @@ mod tests {
 
         assert_eq!(element.role, "textbox");
         assert_eq!(element.name[0].text, "Email Address");
-        assert_eq!(element.name[0].provenance, Provenance::VisualExtraction);
+        assert_eq!(element.name[0].provenance, Provenance::Page);
         assert_eq!(element.value[0].text, "me@example.com");
-        assert_eq!(element.value[0].provenance, Provenance::VisualExtraction);
+        assert_eq!(element.value[0].provenance, Provenance::Page);
         Ok(())
     }
 
