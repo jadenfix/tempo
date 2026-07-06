@@ -9,6 +9,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde_json::value::RawValue;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;
@@ -348,8 +349,15 @@ struct WireFrameRef<'a, T: Serialize> {
 #[derive(Deserialize)]
 struct WireFramePayload<T> {
     id: u64,
-    method: String,
     payload: T,
+}
+
+#[derive(Deserialize)]
+struct WireFrameEnvelope<'a> {
+    id: u64,
+    method: String,
+    #[serde(borrow)]
+    payload: &'a RawValue,
 }
 
 /// Read one length-prefixed JSON frame.
@@ -371,6 +379,14 @@ fn read_frame_payload_with<T: DeserializeOwned>(
     reader: &mut impl Read,
     scratch: &mut Vec<u8>,
 ) -> Result<T, EngineHostError> {
+    read_frame_bytes_with(reader, scratch)?;
+    Ok(serde_json::from_slice(scratch)?)
+}
+
+fn read_frame_bytes_with(
+    reader: &mut impl Read,
+    scratch: &mut Vec<u8>,
+) -> Result<(), EngineHostError> {
     let mut len = [0_u8; 4];
     reader.read_exact(&mut len)?;
     let len = u32::from_be_bytes(len) as usize;
@@ -383,7 +399,7 @@ fn read_frame_payload_with<T: DeserializeOwned>(
     scratch.clear();
     scratch.resize(len, 0);
     reader.read_exact(scratch)?;
-    Ok(serde_json::from_slice(scratch)?)
+    Ok(())
 }
 
 /// Driver command payload carried inside a `driver.request` frame.
@@ -1547,14 +1563,18 @@ fn read_expected_frame_payload_with<T: DeserializeOwned>(
     expected_method: &'static str,
     scratch: &mut Vec<u8>,
 ) -> Result<WireFramePayload<T>, EngineHostError> {
-    let frame: WireFramePayload<T> = read_frame_payload_with(reader, scratch)?;
+    read_frame_bytes_with(reader, scratch)?;
+    let frame: WireFrameEnvelope<'_> = serde_json::from_slice(scratch)?;
     if frame.method != expected_method {
         return Err(EngineHostError::UnexpectedFrameMethod {
             expected: expected_method,
             actual: frame.method,
         });
     }
-    Ok(frame)
+    Ok(WireFramePayload {
+        id: frame.id,
+        payload: serde_json::from_str(frame.payload.get())?,
+    })
 }
 
 fn driver_error(error: TransportError) -> DriverResponse {
@@ -1952,6 +1972,19 @@ mod tests {
             read_expected_frame(&mut Cursor::new(bytes), DRIVER_REQUEST_METHOD),
             Err(EngineHostError::UnexpectedFrameMethod { .. })
         ));
+
+        let mut bytes = Vec::new();
+        write_frame(
+            &mut bytes,
+            &WireFrame::new(1, DRIVER_RESPONSE_METHOD, json!({})),
+        )?;
+        assert!(matches!(
+            read_expected_frame_payload::<DriverRequestPayload>(
+                &mut Cursor::new(bytes),
+                DRIVER_REQUEST_METHOD
+            ),
+            Err(EngineHostError::UnexpectedFrameMethod { .. })
+        ));
         Ok(())
     }
 
@@ -1971,6 +2004,37 @@ mod tests {
         assert!(matches!(
             connection.read_driver_request(),
             Err(EngineHostError::Json(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn driver_request_wrong_method_is_rejected_before_payload_decode() -> TestResult {
+        let (mut client_stream, server_stream) = UnixStream::pair()?;
+        let mut connection = EngineIpcConnection::from_stream(server_stream);
+        write_frame(
+            &mut client_stream,
+            &WireFrame::new(1, DRIVER_RESPONSE_METHOD, json!({})),
+        )?;
+
+        assert!(matches!(
+            connection.read_driver_request(),
+            Err(EngineHostError::UnexpectedFrameMethod { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn auth_wrong_method_is_rejected_before_payload_decode() -> TestResult {
+        let mut bytes = Vec::new();
+        write_frame(
+            &mut bytes,
+            &WireFrame::new(0, DRIVER_REQUEST_METHOD, json!({})),
+        )?;
+
+        assert!(matches!(
+            verify_control_token(&mut Cursor::new(bytes), "server-token"),
+            Err(EngineHostError::UnexpectedFrameMethod { .. })
         ));
         Ok(())
     }
