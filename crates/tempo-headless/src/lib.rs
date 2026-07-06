@@ -4688,28 +4688,125 @@ async fn instrument_requests(request: AxumRequest, next: Next) -> Response {
         return next.run(request).await;
     }
     let route = metrics_route_class(method, path);
-    let timer = tempo_telemetry::global()
-        .histogram(
-            "tempod_http_request_seconds",
-            "Latency of HTTP requests that reached the route handler",
-            &[("route", route)],
-            None,
-        )
-        .start_timer();
+    let metrics = tempod_http_metrics().route(route);
+    let timer = metrics.latency.start_timer();
     let response = next.run(request).await;
     drop(timer);
-    tempo_telemetry::global()
-        .counter(
-            "tempod_http_requests_total",
-            "HTTP requests that reached the route handler, by route and status class \
-             (connection-limit rejections and WebSocket upgrades are not counted)",
-            &[
-                ("route", route),
-                ("status", status_class(response.status().as_u16())),
-            ],
-        )
+    metrics
+        .counter(status_class(response.status().as_u16()))
         .inc();
     response
+}
+
+const TEMPOD_HTTP_METRIC_ROUTES: [&str; 11] = [
+    "health",
+    "ready",
+    "metrics",
+    "mcp",
+    "bidi",
+    "sessions",
+    "runs",
+    "drain",
+    "session",
+    "run",
+    "agent_card",
+];
+const TEMPOD_HTTP_METRIC_OTHER_ROUTE: &str = "other";
+const TEMPOD_HTTP_METRIC_STATUS_CLASSES: [&str; 6] = ["1xx", "2xx", "3xx", "4xx", "5xx", "other"];
+
+#[derive(Clone)]
+struct TempodHttpStatusCounter {
+    status: &'static str,
+    counter: tempo_telemetry::Counter,
+}
+
+struct TempodHttpRouteMetrics {
+    route: &'static str,
+    latency: tempo_telemetry::Histogram,
+    counters: Vec<TempodHttpStatusCounter>,
+}
+
+impl TempodHttpRouteMetrics {
+    fn counter(&self, status: &'static str) -> &tempo_telemetry::Counter {
+        let mut other = None;
+        let mut first = None;
+        for counter in &self.counters {
+            first.get_or_insert(&counter.counter);
+            if counter.status == status {
+                return &counter.counter;
+            }
+            if counter.status == "other" {
+                other = Some(&counter.counter);
+            }
+        }
+        match other.or(first) {
+            Some(counter) => counter,
+            None => unreachable!("tempod HTTP metric route has no counters"),
+        }
+    }
+}
+
+struct TempodHttpMetrics {
+    routes: Vec<TempodHttpRouteMetrics>,
+}
+
+impl TempodHttpMetrics {
+    fn new() -> Self {
+        let routes = TEMPOD_HTTP_METRIC_ROUTES
+            .into_iter()
+            .chain(std::iter::once(TEMPOD_HTTP_METRIC_OTHER_ROUTE))
+            .map(|route| {
+                let latency = tempo_telemetry::global().histogram(
+                    "tempod_http_request_seconds",
+                    "Latency of HTTP requests that reached the route handler",
+                    &[("route", route)],
+                    None,
+                );
+                let counters = TEMPOD_HTTP_METRIC_STATUS_CLASSES
+                    .into_iter()
+                    .map(|status| TempodHttpStatusCounter {
+                        status,
+                        counter: tempo_telemetry::global().counter(
+                            "tempod_http_requests_total",
+                            "HTTP requests that reached the route handler, by route and status class \
+                             (connection-limit rejections and WebSocket upgrades are not counted)",
+                            &[("route", route), ("status", status)],
+                        ),
+                    })
+                    .collect();
+                TempodHttpRouteMetrics {
+                    route,
+                    latency,
+                    counters,
+                }
+            })
+            .collect();
+        Self { routes }
+    }
+
+    fn route(&self, route: &'static str) -> &TempodHttpRouteMetrics {
+        let mut other = None;
+        let mut first = None;
+        for metrics in &self.routes {
+            first.get_or_insert(metrics);
+            if metrics.route == route {
+                return metrics;
+            }
+            if metrics.route == TEMPOD_HTTP_METRIC_OTHER_ROUTE {
+                other = Some(metrics);
+            }
+        }
+        match other.or(first) {
+            Some(metrics) => metrics,
+            None => unreachable!("tempod HTTP metrics cache has no route handles"),
+        }
+    }
+}
+
+static TEMPOD_HTTP_METRICS: OnceLock<TempodHttpMetrics> = OnceLock::new();
+
+fn tempod_http_metrics() -> &'static TempodHttpMetrics {
+    TEMPOD_HTTP_METRICS.get_or_init(TempodHttpMetrics::new)
 }
 
 /// Route label with bounded cardinality: per-session paths collapse into one
