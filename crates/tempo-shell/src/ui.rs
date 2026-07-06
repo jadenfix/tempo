@@ -235,8 +235,9 @@ pub enum UiAction {
     /// Toggle the set-of-marks overlay for the page-state screenshot.
     ToggleMarks,
     /// Human clicked Resume on the blocking takeover banner (#354): hand control
-    /// back to the agent and resume the paused run. If the challenge persists,
-    /// the agent's next observation re-journals takeover and the banner returns.
+    /// back to the agent and mark the paused run runnable. If the challenge
+    /// persists, the agent's next observation re-journals takeover and the
+    /// banner returns.
     ResumeTakeover,
     /// Mint a server-side grant for the active native confirmation request.
     ConfirmPendingConfirmation,
@@ -627,9 +628,12 @@ impl ShellUiModel {
                 if let Some(tab) = self.tabs.get_mut(active) {
                     tab.surface.handed_off_to_agent();
                     tab.surface.active_run_id = Some(run.run_id.0.clone());
-                    tab.status = format!("Handed off and resumed {}", run.run_id.0);
+                    tab.status = format!("Run {} is ready for agent control", run.run_id.0);
                 }
-                self.status = format!("Handed off {session_id} and resumed {}", run.run_id.0);
+                self.status = format!(
+                    "Handed off {session_id}; run {} is ready for agent control",
+                    run.run_id.0
+                );
                 self.last_error = None;
             }
             Err(err) => self.set_error("resume", &err),
@@ -1821,8 +1825,9 @@ mod tests {
         assert!(model.tabs[0].surface.pending_takeover.is_some());
 
         // The human clicks Resume: the shell hands the session back to the
-        // agent and resumes the same paused run. If the page is still blocked,
-        // the next agent observation will journal another takeover event.
+        // agent and marks the same paused run runnable. If the page is still
+        // blocked, the next agent observation will journal another takeover
+        // event.
         model.dispatch(UiAction::ResumeTakeover, &service);
         assert_eq!(
             service.calls(),
@@ -1838,7 +1843,10 @@ mod tests {
             model.tabs[0].surface.run_state,
             SurfaceRunState::AgentControl
         );
-        assert!(model.status.contains("resumed run-0"));
+        assert!(model
+            .status
+            .contains("run run-0 is ready for agent control"));
+        assert!(!model.status.contains("resumed"));
     }
 
     #[test]
