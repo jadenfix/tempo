@@ -110,6 +110,16 @@ impl JournalEntry {
             TempodSessionEventKind::StepTriple { triple } => {
                 ("step", step_detail(triple), step_is_tainted(triple))
             }
+            TempodSessionEventKind::ModelDecision { decision } => (
+                "model_decision",
+                format!(
+                    "{} actions, {} input tokens, {} output tokens",
+                    decision.actions.len(),
+                    decision.input_tokens,
+                    decision.output_tokens
+                ),
+                false,
+            ),
             TempodSessionEventKind::HumanTakeoverRequired { takeover } => (
                 "human_takeover_required",
                 format!("{} — {}", takeover.kind.label(), takeover.url),

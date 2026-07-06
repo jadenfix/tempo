@@ -1,0 +1,12 @@
+[package]
+name = "tempo-urlpolicy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+url = "2"
+
+[lints]
+workspace = true

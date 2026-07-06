@@ -38,7 +38,7 @@ use std::sync::mpsc::TrySendError;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
-use tempo_agent::{StepTriple, StepTripleOutcome};
+use tempo_agent::{IdempotencyKey, StepTriple, StepTripleOutcome};
 // Re-exported so consumers of `TempodSessionEventKind::StepTriple` (e.g. the
 // shell agent panel) can name the event payload without a direct tempo-agent dep.
 use futures::StreamExt;
@@ -72,8 +72,8 @@ use tempo_policy::ConfirmationGate;
 use tempo_schema::{
     Action, ActionBatch, AdoptionLease, AgentRun, AgentRunId, AgentRunState, BrowserEngineTier,
     CompiledObservation, ConfirmationGrant, ConfirmationRequest, ControlOwner, HumanTakeover,
-    ManagerEvent, ManagerSessionState, NodeId, ObservationDiff, SessionAttachment, ShellSurfaceId,
-    SideEffect, StorageContinuityMode,
+    ManagerEvent, ManagerSessionState, NodeId, ObservationDiff, QuiescencePolicy,
+    SessionAttachment, ShellSurfaceId, SideEffect, StorageContinuityMode,
 };
 use thiserror::Error;
 use tokio::sync::{broadcast, OwnedSemaphorePermit, Semaphore};
@@ -87,6 +87,8 @@ const MAX_SESSION_IDEMPOTENCY_RECORDS: usize = 1024;
 const MAX_SESSION_EVENTS_PER_SESSION: usize = 1024;
 const MAX_SESSION_EVENT_STREAM_BACKLOG: usize = MAX_SESSION_EVENTS_PER_SESSION;
 const MAX_TERMINAL_SESSIONS: usize = 256;
+const DEFAULT_IDLE_SESSION_TTL_MS: u64 = 30 * 60 * 1000;
+const IDLE_SESSION_REAPER_INTERVAL: Duration = Duration::from_secs(60);
 const CONFIRMATION_TTL_MS: u64 = 5 * 60 * 1000;
 const CONFIRMATION_ID_BYTES: usize = 16;
 const CONFIRMATION_TOKEN_BYTES: usize = 32;
@@ -97,9 +99,8 @@ const MAX_HTTP_CONNECTIONS: usize = 128;
 /// disconnects before the response is delivered. This caps engine-side work
 /// that `spawn_blocking` cannot cancel once started.
 const MAX_BLOCKING_ROUTE_TASKS: usize = 64;
-/// Maximum retained tempod sessions. Killed sessions stay in the in-memory
-/// session map until the reaper lands (#412), so cap the retained map, not just
-/// currently-running sessions.
+/// Maximum retained tempod sessions. Terminal sessions have their own retention
+/// cap, so this bounds the full retained map, not just currently-running sessions.
 const MAX_TEMPOD_SESSIONS: usize = 1024;
 /// Maximum upgraded BiDi WebSocket sessions held concurrently.
 const MAX_WEBSOCKET_CONNECTIONS: usize = 32;
@@ -504,6 +505,17 @@ pub struct TempodSessionEvents {
     pub truncated_before_seq: Option<u64>,
 }
 
+/// One model decision emitted from a decided-loop journal into tempod's
+/// session event stream.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TempodModelDecision {
+    pub actions: Vec<Action>,
+    pub rationale: Option<String>,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_input_tokens: u64,
+}
+
 /// Typed events clients can attach to for session logs and StepTriple telemetry.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -520,6 +532,9 @@ pub enum TempodSessionEventKind {
     },
     StepTriple {
         triple: StepTriple,
+    },
+    ModelDecision {
+        decision: TempodModelDecision,
     },
     /// A hard pause: the agent loop detected a CAPTCHA / auth-wall / login state
     /// ([`tempo_schema::HumanTakeover`], #244/#343) and stopped so a human can
@@ -1195,6 +1210,7 @@ fn cancellable_driver_error(error: DriverClientError) -> CancellableDriverError 
 pub struct SessionPool {
     sessions: BTreeMap<TempodSessionId, TempodSession>,
     session_drivers: BTreeMap<TempodSessionId, AttachedEngineDriver>,
+    session_last_activity_ms: BTreeMap<TempodSessionId, u64>,
     session_act_batch_idempotency:
         BTreeMap<TempodSessionId, BTreeMap<String, SessionActBatchIdempotencyEntry>>,
     events: BTreeMap<TempodSessionId, SessionEventLog>,
@@ -1225,6 +1241,7 @@ pub struct SessionPool {
     next_surface_id: u64,
     next_lease_id: u64,
     max_sessions: usize,
+    idle_session_ttl_ms: Option<u64>,
     draining: bool,
 }
 
@@ -1234,6 +1251,7 @@ impl Default for SessionPool {
         Self {
             sessions: BTreeMap::new(),
             session_drivers: BTreeMap::new(),
+            session_last_activity_ms: BTreeMap::new(),
             session_act_batch_idempotency: BTreeMap::new(),
             events: BTreeMap::new(),
             volatile_event_seq: BTreeMap::new(),
@@ -1262,6 +1280,7 @@ impl Default for SessionPool {
             next_surface_id: 0,
             next_lease_id: 0,
             max_sessions: MAX_TEMPOD_SESSIONS,
+            idle_session_ttl_ms: Some(DEFAULT_IDLE_SESSION_TTL_MS),
             draining: false,
         }
     }
@@ -1278,6 +1297,10 @@ impl fmt::Debug for SessionPool {
             .debug_struct("SessionPool")
             .field("sessions", &self.sessions)
             .field("session_drivers", &self.session_drivers.keys())
+            .field(
+                "session_last_activity_sessions",
+                &self.session_last_activity_ms.len(),
+            )
             .field(
                 "session_act_batch_idempotency",
                 &session_act_batch_idempotency_records,
@@ -1416,6 +1439,12 @@ impl SessionPool {
         self
     }
 
+    #[cfg(test)]
+    fn with_idle_session_ttl_ms(mut self, idle_session_ttl_ms: Option<u64>) -> Self {
+        self.idle_session_ttl_ms = idle_session_ttl_ms;
+        self
+    }
+
     pub fn privacy_mode(&self) -> PrivacyMode {
         self.privacy_mode
     }
@@ -1473,13 +1502,15 @@ impl SessionPool {
     ) -> TempodSession {
         let id = TempodSessionId(format!("session-{}", self.next_id));
         self.next_id = self.next_id.saturating_add(1);
+        let created_ms = current_time_ms();
         let session = TempodSession {
             id: id.clone(),
             url,
             state: TempodSessionState::Running,
-            created_ms: current_time_ms(),
+            created_ms,
         };
         self.sessions.insert(id, session.clone());
+        self.touch_session_at(&session.id, created_ms);
         self.owners.insert(
             session.id.clone(),
             ControlOwner::Agent {
@@ -1955,12 +1986,8 @@ impl SessionPool {
         if self.draining {
             return Err(TempodError::Draining);
         }
+        let session = self.live_session_for_producer(id)?.clone();
         self.ensure_agent_writer_available(id)?;
-        let session = self
-            .sessions
-            .get(id)
-            .ok_or_else(|| TempodError::SessionNotFound(id.clone()))?
-            .clone();
         let driver = self.session_driver(id)?;
         let now = current_time_ms();
         let run_id = AgentRunId(format!("run-{}", self.next_run_id));
@@ -2184,6 +2211,7 @@ impl SessionPool {
             .retain(|_, stored| stored.request.session_id != id.0);
         self.confirmation_grants
             .retain(|_, stored| stored.session_id != *id);
+        self.session_last_activity_ms.remove(id);
         self.clear_session_idempotency(id);
         self.record_event(id, TempodSessionEventKind::SessionKilled);
         self.enforce_terminal_session_retention();
@@ -2203,6 +2231,7 @@ impl SessionPool {
         for id in drained {
             self.owners.remove(&id);
             self.active_runs.remove(&id);
+            self.session_last_activity_ms.remove(&id);
             self.record_event(&id, TempodSessionEventKind::SessionDrained);
         }
         self.session_act_batch_idempotency.clear();
@@ -2529,6 +2558,32 @@ impl SessionPool {
         Ok(self.record_event(id, TempodSessionEventKind::StepTriple { triple }))
     }
 
+    fn live_session_for_producer(
+        &self,
+        id: &TempodSessionId,
+    ) -> Result<&TempodSession, TempodError> {
+        let session = self
+            .sessions
+            .get(id)
+            .ok_or_else(|| TempodError::SessionNotFound(id.clone()))?;
+        if session.state == TempodSessionState::Killed {
+            return Err(TempodError::Conflict(format!(
+                "session {} is killed and cannot accept producer events",
+                id.0
+            )));
+        }
+        Ok(session)
+    }
+
+    fn record_model_decision(
+        &mut self,
+        id: &TempodSessionId,
+        decision: TempodModelDecision,
+    ) -> Result<TempodSessionEvent, TempodError> {
+        self.live_session_for_producer(id)?;
+        Ok(self.record_event(id, TempodSessionEventKind::ModelDecision { decision }))
+    }
+
     /// Record a human-takeover pause onto the session's event stream (#244/#343):
     /// the typed signal a windowed client turns into a blocking takeover banner.
     ///
@@ -2542,9 +2597,7 @@ impl SessionPool {
         id: &TempodSessionId,
         takeover: HumanTakeover,
     ) -> Result<TempodSessionEvent, TempodError> {
-        if !self.sessions.contains_key(id) {
-            return Err(TempodError::SessionNotFound(id.clone()));
-        }
+        self.live_session_for_producer(id)?;
         Ok(self.record_event(
             id,
             TempodSessionEventKind::HumanTakeoverRequired { takeover },
@@ -2659,16 +2712,21 @@ impl SessionPool {
         self.session_act_batch_idempotency.remove(id);
     }
 
-    fn session_driver(&self, id: &TempodSessionId) -> Result<AttachedEngineDriver, TempodError> {
+    fn session_driver(
+        &mut self,
+        id: &TempodSessionId,
+    ) -> Result<AttachedEngineDriver, TempodError> {
         if !self.sessions.contains_key(id) {
             return Err(TempodError::SessionNotFound(id.clone()));
         }
-        self.session_drivers.get(id).cloned().ok_or_else(|| {
+        let driver = self.session_drivers.get(id).cloned().ok_or_else(|| {
             TempodError::DriverUnavailable(format!(
                 "session {} has no attached engine driver",
                 id.0
             ))
-        })
+        })?;
+        self.touch_session(id);
+        Ok(driver)
     }
 
     /// Recovers the true creation order encoded in a session id minted by
@@ -2710,6 +2768,7 @@ impl SessionPool {
         for id in terminal.into_iter().take(excess) {
             self.events.remove(&id);
             self.volatile_event_seq.remove(&id);
+            self.session_last_activity_ms.remove(&id);
             self.clear_session_idempotency(&id);
             self.owners.remove(&id);
             self.attachments.remove(&id);
@@ -2733,6 +2792,80 @@ impl SessionPool {
             TempodSessionState::Adopted => !self.session_drivers.contains_key(id),
             TempodSessionState::Running => false,
         }
+    }
+
+    fn touch_session(&mut self, id: &TempodSessionId) {
+        self.touch_session_at(id, current_time_ms());
+    }
+
+    fn touch_session_at(&mut self, id: &TempodSessionId, timestamp_ms: u64) {
+        if self.sessions.contains_key(id) {
+            self.session_last_activity_ms
+                .insert(id.clone(), timestamp_ms);
+        }
+    }
+
+    fn idle_session_reap_candidates(&self, now_ms: u64) -> Vec<TempodSessionId> {
+        let Some(ttl_ms) = self.idle_session_ttl_ms else {
+            return Vec::new();
+        };
+        self.sessions
+            .iter()
+            .filter(|(id, session)| {
+                self.session_record_can_be_idle_reaped(id, session, now_ms, ttl_ms)
+            })
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    fn session_record_can_be_idle_reaped(
+        &self,
+        id: &TempodSessionId,
+        session: &TempodSession,
+        now_ms: u64,
+        ttl_ms: u64,
+    ) -> bool {
+        if session.state == TempodSessionState::Killed {
+            return false;
+        }
+        if self.active_runs.contains_key(id) {
+            return false;
+        }
+        if matches!(self.owners.get(id), Some(ControlOwner::Human { .. })) {
+            return false;
+        }
+        if self
+            .attachments
+            .get(id)
+            .is_some_and(|surfaces| !surfaces.is_empty())
+        {
+            return false;
+        }
+        let last_activity_ms = self
+            .session_last_activity_ms
+            .get(id)
+            .copied()
+            .unwrap_or(session.created_ms);
+        now_ms.saturating_sub(last_activity_ms) >= ttl_ms
+    }
+
+    fn reap_idle_sessions_at(
+        &mut self,
+        now_ms: u64,
+    ) -> Vec<(
+        TempodSessionId,
+        AttachedEngineDriver,
+        Option<AttachedEngineDriver>,
+    )> {
+        let mut detached = Vec::new();
+        for id in self.idle_session_reap_candidates(now_ms) {
+            match self.begin_kill(&id) {
+                Ok((_session, Some(driver), root)) => detached.push((id, driver, root)),
+                Ok((_session, None, _root)) => {}
+                Err(error) => log_tempod_error("idle session reaper failed to kill session", error),
+            }
+        }
+        detached
     }
 
     pub fn events(
@@ -2783,6 +2916,13 @@ impl SessionPool {
         } else {
             self.events.entry(id.clone()).or_default().push(id, event)
         };
+        if self
+            .sessions
+            .get(id)
+            .is_some_and(|session| session.state != TempodSessionState::Killed)
+        {
+            self.touch_session_at(id, record.timestamp_ms);
+        }
         let _ = self.event_broadcast.send(record.clone());
         record
     }
@@ -4302,6 +4442,7 @@ fn serve_forever_trusted(
 ) -> Result<(), TempodError> {
     let _ = process_start();
     let runtime = transport_runtime()?;
+    spawn_idle_session_reaper(Arc::clone(&pool));
     runtime.block_on(async move {
         let listener = tokio_listener(listener)?;
         let router = tempod_router(TempodAppState {
@@ -4329,6 +4470,31 @@ fn serve_forever_trusted(
             }
         }
     })
+}
+
+fn spawn_idle_session_reaper(pool: Arc<Mutex<SessionPool>>) {
+    thread::spawn(move || loop {
+        if Arc::strong_count(&pool) <= 1 {
+            return;
+        }
+        thread::sleep(IDLE_SESSION_REAPER_INTERVAL);
+        let detached = match pool.lock() {
+            Ok(mut guard) => guard.reap_idle_sessions_at(current_time_ms()),
+            Err(error) => {
+                log_tempod_error("idle session reaper could not lock session pool", error);
+                return;
+            }
+        };
+        for (id, driver, root) in detached {
+            if close_detached_session_driver(id.0.clone(), driver, root)
+                && let Ok(mut guard) = pool.lock()
+            {
+                guard.abandon_attached_engine_after_teardown_timeout(
+                    "idle session engine context Close",
+                );
+            }
+        }
+    });
 }
 
 /// Serve exactly one connection. Tests use this against a real TCP listener;
@@ -5732,7 +5898,9 @@ fn route_session_observe(
     pool: &Arc<Mutex<SessionPool>>,
     id: &TempodSessionId,
 ) -> Result<CompiledObservation, TempodError> {
-    let mut driver = lock_pool(pool)?.session_driver(id)?;
+    let mut pool = lock_pool(pool)?;
+    let mut driver = pool.session_driver(id)?;
+    drop(pool);
     futures::executor::block_on(driver.observe())
         .map_err(|error| TempodError::Driver(error.to_string()))
 }
@@ -5764,7 +5932,9 @@ fn session_batch_policy_observation(
     cancel.check_tempod()?;
     // Clone the driver handle under a brief lock, then observe with NO pool lock
     // held (engine round-trip, #230). observe carries the existing IPC timeout.
-    let driver = lock_pool(pool)?.session_driver(id)?;
+    let mut pool = lock_pool(pool)?;
+    let driver = pool.session_driver(id)?;
+    drop(pool);
     let observation = driver.observe_with_cancel(cancel).map_err(|error| {
         TempodError::Driver(format!(
             "policy taint recomputation requires an observation, but observe failed: {error}"
@@ -6843,6 +7013,76 @@ pub fn tempod_openapi(base_url: &str) -> JsonValue {
                     }
                 },
                 "Action": openapi_component_schema(tempo_schema::action_json_schema()),
+                "ObservationDiff": openapi_component_schema(tempo_schema::observation_diff_json_schema()),
+                "AgentStepTripleOutcome": {
+                    "oneOf": [
+                        {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["kind", "diff"],
+                            "properties": {
+                                "kind": {"const": "applied"},
+                                "diff": {"$ref": "#/components/schemas/ObservationDiff"}
+                            }
+                        },
+                        {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["kind", "reason"],
+                            "properties": {
+                                "kind": {"const": "step_error"},
+                                "reason": {"type": "string"}
+                            }
+                        }
+                    ]
+                },
+                "AgentStepTriple": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["key", "seq", "action", "outcome"],
+                    "properties": {
+                        "key": {"type": "string"},
+                        "seq": {"type": "integer", "minimum": 0},
+                        "action": {"$ref": "#/components/schemas/Action"},
+                        "outcome": {"$ref": "#/components/schemas/AgentStepTripleOutcome"}
+                    }
+                },
+                "TempodModelDecision": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                        "actions",
+                        "rationale",
+                        "input_tokens",
+                        "output_tokens",
+                        "cache_read_input_tokens"
+                    ],
+                    "properties": {
+                        "actions": {
+                            "type": "array",
+                            "items": {"$ref": "#/components/schemas/Action"}
+                        },
+                        "rationale": {
+                            "anyOf": [
+                                {"type": "string"},
+                                {"type": "null"}
+                            ]
+                        },
+                        "input_tokens": {"type": "integer", "minimum": 0},
+                        "output_tokens": {"type": "integer", "minimum": 0},
+                        "cache_read_input_tokens": {"type": "integer", "minimum": 0}
+                    }
+                },
+                "HumanTakeover": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["kind", "reason", "url"],
+                    "properties": {
+                        "kind": {"type": "string", "enum": ["captcha", "auth_wall", "login_required"]},
+                        "reason": {"type": "string"},
+                        "url": {"type": "string"}
+                    }
+                },
                 "NodeId": {"type": "string"},
                 "TempodSessionId": {
                     "type": "string"
@@ -7193,15 +7433,88 @@ pub fn tempod_openapi(base_url: &str) -> JsonValue {
                         "last_event_seq": {"type": "integer", "minimum": 0}
                     }
                 },
+                "TempodSessionEventKind": {
+                    "oneOf": [
+                        {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["kind", "url"],
+                            "properties": {
+                                "kind": {"const": "session_created"},
+                                "url": {"type": "string"}
+                            }
+                        },
+                        {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["kind"],
+                            "properties": {"kind": {"const": "session_adopted"}}
+                        },
+                        {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["kind"],
+                            "properties": {"kind": {"const": "session_handoff"}}
+                        },
+                        {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["kind"],
+                            "properties": {"kind": {"const": "session_killed"}}
+                        },
+                        {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["kind"],
+                            "properties": {"kind": {"const": "session_drained"}}
+                        },
+                        {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["kind", "event"],
+                            "properties": {
+                                "kind": {"const": "manager"},
+                                "event": {"$ref": "#/components/schemas/ManagerEvent"}
+                            }
+                        },
+                        {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["kind", "triple"],
+                            "properties": {
+                                "kind": {"const": "step_triple"},
+                                "triple": {"$ref": "#/components/schemas/AgentStepTriple"}
+                            }
+                        },
+                        {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["kind", "decision"],
+                            "properties": {
+                                "kind": {"const": "model_decision"},
+                                "decision": {"$ref": "#/components/schemas/TempodModelDecision"}
+                            }
+                        },
+                        {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["kind", "takeover"],
+                            "properties": {
+                                "kind": {"const": "human_takeover_required"},
+                                "takeover": {"$ref": "#/components/schemas/HumanTakeover"}
+                            }
+                        }
+                    ]
+                },
                 "TempodSessionEvent": {
                     "type": "object",
-                    "additionalProperties": true,
+                    "additionalProperties": false,
                     "required": ["session_id", "seq", "timestamp_ms", "event"],
                     "properties": {
                         "session_id": {"type": "string"},
                         "seq": {"type": "integer", "minimum": 0},
                         "timestamp_ms": {"type": "integer", "minimum": 0},
-                        "event": {"type": "object"}
+                        "event": {"$ref": "#/components/schemas/TempodSessionEventKind"}
                     }
                 },
                 "TempodSessionEvents": {
@@ -8034,17 +8347,269 @@ fn route_session_mcp(
     origin: Option<&str>,
     body: &[u8],
 ) -> HttpResponse {
-    let driver = match lock_pool(pool).and_then(|pool| {
+    let driver = match lock_pool(pool).and_then(|mut pool| {
         pool.ensure_foreground_writer_available(id)?;
         pool.session_driver(id)
     }) {
         Ok(driver) => driver,
         Err(error) => return tempod_error_response(&error),
     };
+    if let Some(response) = route_session_mcp_shared_session_tool(pool, id, origin, body) {
+        return response;
+    }
     let server = tempo_mcp::TempoMcpServer::new(driver).without_fork_tools();
     HttpResponse::from_mcp(futures::executor::block_on(
         server.handle_post(origin, body),
     ))
+}
+
+fn route_session_mcp_shared_session_tool(
+    pool: &Arc<Mutex<SessionPool>>,
+    id: &TempodSessionId,
+    origin: Option<&str>,
+    body: &[u8],
+) -> Option<HttpResponse> {
+    if !tempo_mcp::origin_allowed(origin) {
+        return Some(session_mcp_json_rpc_error(
+            403,
+            JsonValue::Null,
+            -32600,
+            "origin not allowed",
+        ));
+    }
+    let message: JsonValue = match serde_json::from_slice(body) {
+        Ok(value) => value,
+        Err(error) => {
+            return Some(session_mcp_json_rpc_error(
+                400,
+                JsonValue::Null,
+                -32700,
+                format!("parse error: {error}"),
+            ))
+        }
+    };
+    let rpc_id = match session_mcp_response_id(&message) {
+        Ok(Some(id)) => id,
+        Ok(None) => {
+            return Some(HttpResponse::new(
+                202,
+                "application/octet-stream",
+                Vec::new(),
+            ))
+        }
+        Err(response) => return Some(response),
+    };
+    let Some(method) = message.get("method").and_then(JsonValue::as_str) else {
+        return Some(session_mcp_json_rpc_error(
+            200,
+            rpc_id,
+            -32600,
+            "JSON-RPC method is required",
+        ));
+    };
+    if method == "tools/list" {
+        return Some(session_mcp_json_rpc_success(
+            rpc_id,
+            json!({"tools": session_mcp_tools()}),
+        ));
+    }
+    if method != "tools/call" {
+        return None;
+    }
+    let params = match message.get("params") {
+        Some(params) => params,
+        None => {
+            return Some(session_mcp_json_rpc_error(
+                200,
+                rpc_id,
+                -32602,
+                "tools/call requires params.name",
+            ))
+        }
+    };
+    let Some(name) = params.get("name").and_then(JsonValue::as_str) else {
+        return Some(session_mcp_json_rpc_error(
+            200,
+            rpc_id,
+            -32602,
+            "tools/call requires params.name",
+        ));
+    };
+    if name != "act" && name != "act_batch" {
+        return None;
+    }
+    let arguments = params
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let batch_request = match session_mcp_act_batch_request(name, arguments) {
+        Ok(request) => request,
+        Err(message) => {
+            return Some(session_mcp_json_rpc_error(200, rpc_id, -32602, message));
+        }
+    };
+    let response =
+        match route_session_act_batch(pool, id.clone(), batch_request, &RequestCancel::default()) {
+            Ok(response) => response,
+            Err(error) => {
+                return Some(session_mcp_tool_response(rpc_id, true, error.body()));
+            }
+        };
+    let structured = serde_json::from_slice::<JsonValue>(&response.body).unwrap_or_else(|error| {
+        json!({
+            "error": format!("session MCP act response was not JSON: {error}")
+        })
+    });
+    Some(session_mcp_tool_response(
+        rpc_id,
+        !(200..300).contains(&response.status),
+        structured,
+    ))
+}
+
+fn session_mcp_act_batch_request(
+    name: &str,
+    arguments: JsonValue,
+) -> Result<SessionActBatchRequest, String> {
+    match name {
+        "act" => serde_json::from_value::<SessionMcpActArgs>(arguments)
+            .map_err(|error| error.to_string())
+            .and_then(SessionMcpActArgs::into_session_batch),
+        "act_batch" => serde_json::from_value::<SessionMcpActBatchArgs>(arguments)
+            .map_err(|error| error.to_string())
+            .and_then(SessionMcpActBatchArgs::into_session_batch),
+        _ => Err(format!("unsupported session MCP tool: {name}")),
+    }
+}
+
+fn session_mcp_response_id(message: &JsonValue) -> Result<Option<JsonValue>, HttpResponse> {
+    let Some(id) = message.get("id") else {
+        return Ok(None);
+    };
+    if !(id.is_null() || id.is_string() || id.is_number()) {
+        return Err(session_mcp_json_rpc_error(
+            400,
+            JsonValue::Null,
+            -32600,
+            "id must be a string, number, or null",
+        ));
+    }
+    if id.is_null() {
+        return Ok(None);
+    }
+    Ok(Some(id.clone()))
+}
+
+fn session_mcp_json_rpc_success(id: JsonValue, result: JsonValue) -> HttpResponse {
+    HttpResponse::json(200, json!({"jsonrpc": "2.0", "id": id, "result": result}))
+}
+
+fn session_mcp_json_rpc_error(
+    status: u16,
+    id: JsonValue,
+    code: i64,
+    message: impl Into<String>,
+) -> HttpResponse {
+    HttpResponse::json(
+        status,
+        json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message.into()}}),
+    )
+}
+
+fn session_mcp_tool_response(id: JsonValue, is_error: bool, structured: JsonValue) -> HttpResponse {
+    let summary = session_mcp_tool_summary(&structured, is_error);
+    session_mcp_json_rpc_success(
+        id,
+        json!({
+            "content": [{"type": "text", "text": summary}],
+            "structuredContent": structured,
+            "isError": is_error,
+        }),
+    )
+}
+
+fn session_mcp_tool_summary(value: &JsonValue, is_error: bool) -> String {
+    let prefix = if is_error { "error: " } else { "" };
+    let text = value
+        .get("reason")
+        .and_then(JsonValue::as_str)
+        .or_else(|| value.get("status").and_then(JsonValue::as_str))
+        .or_else(|| value.get("error").and_then(JsonValue::as_str))
+        .or_else(|| {
+            value
+                .get("error")
+                .and_then(|error| error.get("message"))
+                .and_then(JsonValue::as_str)
+        })
+        .map(str::to_owned)
+        .unwrap_or_else(|| value.to_string());
+    format!("{prefix}{}", truncate_session_mcp_summary(&text))
+}
+
+fn truncate_session_mcp_summary(value: &str) -> String {
+    const MAX_SUMMARY_CHARS: usize = 220;
+    let mut summary = String::new();
+    for ch in value.chars().take(MAX_SUMMARY_CHARS) {
+        summary.push(ch);
+    }
+    if value.chars().count() > MAX_SUMMARY_CHARS {
+        summary.push_str("...");
+    }
+    summary
+}
+
+fn session_mcp_tools() -> Vec<JsonValue> {
+    tempo_mcp::tools()
+        .into_iter()
+        .filter(|tool| tool.name != "fork" && tool.name != "close_fork")
+        .map(|tool| {
+            let mut input_schema = tool.input_schema;
+            if tool.name == "act" || tool.name == "act_batch" {
+                input_schema = session_mcp_action_input_schema(input_schema);
+            }
+            json!({
+                "name": tool.name,
+                "description": tool.description,
+                "inputSchema": input_schema,
+            })
+        })
+        .collect()
+}
+
+fn session_mcp_action_input_schema(mut input_schema: JsonValue) -> JsonValue {
+    if let Some(properties) = input_schema
+        .get_mut("properties")
+        .and_then(JsonValue::as_object_mut)
+    {
+        properties.remove("driver_id");
+        properties.insert(
+            "idempotency_key".into(),
+            json!({
+                "type": "string",
+                "description": "Stable retry key for idempotent replay of high-risk or confirmation-gated session actions."
+            }),
+        );
+        properties.insert(
+            "confirmation_grant".into(),
+            session_mcp_confirmation_grant_schema(),
+        );
+    }
+    input_schema
+}
+
+fn session_mcp_confirmation_grant_schema() -> JsonValue {
+    json!({
+        "type": "object",
+        "description": "Server-minted grant returned by POST /sessions/{session_id}/confirmations/{confirmation_id}. Required to replay a matching native-confirmed session action.",
+        "required": ["confirmation_id", "grant_token", "issued_ms", "expires_ms"],
+        "additionalProperties": false,
+        "properties": {
+            "confirmation_id": {"type": "string"},
+            "grant_token": {"type": "string"},
+            "issued_ms": {"type": "integer", "minimum": 0},
+            "expires_ms": {"type": "integer", "minimum": 0}
+        }
+    })
 }
 
 fn route_session_bidi(
@@ -8088,7 +8653,7 @@ fn session_bidi_driver_handle(
     pool: &Arc<Mutex<SessionPool>>,
     id: &TempodSessionId,
 ) -> Result<AttachedEngineDriver, TempodError> {
-    let pool = lock_pool(pool)?;
+    let mut pool = lock_pool(pool)?;
     pool.ensure_foreground_writer_available(id)?;
     pool.session_driver(id)
 }
@@ -8295,7 +8860,9 @@ fn route_session_screenshot(
     id: &TempodSessionId,
     set_of_marks: bool,
 ) -> Result<HttpResponse, TempodError> {
-    let mut driver = lock_pool(pool)?.session_driver(id)?;
+    let mut pool = lock_pool(pool)?;
+    let mut driver = pool.session_driver(id)?;
+    drop(pool);
     let observation = if set_of_marks {
         Some(
             futures::executor::block_on(driver.observe())
@@ -8341,40 +8908,49 @@ fn route_session_run_create(
         pool.begin_agent_run(&session_id, Some(goal.clone()))?
     };
 
-    let run_result: Result<(AgentRunState, Option<String>, Option<HumanTakeover>), TempodError> =
-        (|| {
-            let journal_dir = tempod_runtime_dir().join("runs");
-            std::fs::create_dir_all(&journal_dir)?;
-            let journal_path = journal_dir.join(format!("{}.jsonl", run.run_id.0));
-            let ids = tempo_agent::AgentRunIds::new(run.run_id.0.clone(), session_id.0.clone());
-            let mut runner = tempo_agent::AgentRunner::new_plaintext_unsafe(&journal_path, ids);
-            if let Some(max_tokens) = request.token_budget {
-                runner = runner.with_token_budget(tempo_agent::TokenBudget::new(max_tokens));
+    let run_result: Result<
+        (
+            AgentRunState,
+            Option<String>,
+            Vec<tempo_session::JournalEntry>,
+        ),
+        TempodError,
+    > = (|| {
+        let journal_dir = tempod_runtime_dir().join("runs");
+        std::fs::create_dir_all(&journal_dir)?;
+        let journal_path = journal_dir.join(format!("{}.jsonl", run.run_id.0));
+        let ids = tempo_agent::AgentRunIds::new(run.run_id.0.clone(), session_id.0.clone());
+        let mut runner = tempo_agent::AgentRunner::new_plaintext_unsafe(&journal_path, ids);
+        if let Some(max_tokens) = request.token_budget {
+            runner = runner.with_token_budget(tempo_agent::TokenBudget::new(max_tokens));
+        }
+        let mut decider =
+            tempo_agent::decider::ScriptedDecider::new(vec![request.actions, Vec::new()]);
+        let spec = tempo_agent::decider::DecidedTaskSpec::new(start_url, goal)
+            .with_max_rounds(request.max_rounds.unwrap_or(2));
+        let report =
+            futures::executor::block_on(runner.run_decided_task(&mut driver, &mut decider, &spec))
+                .map_err(|error| TempodError::Driver(error.to_string()))?;
+        let entries = tempo_session::read_journal_entries_with_retention_policy(
+            &journal_path,
+            &tempo_session::DurableRetentionPolicy::PlaintextUnsafe,
+        )
+        .map_err(|error| TempodError::Driver(error.to_string()))?;
+
+        let (state, error) = match report.status {
+            tempo_agent::decider::DecidedRunStatus::Completed
+            | tempo_agent::decider::DecidedRunStatus::AlreadyComplete => {
+                (AgentRunState::Completed, None)
             }
-            let mut decider =
-                tempo_agent::decider::ScriptedDecider::new(vec![request.actions, Vec::new()]);
-            let spec = tempo_agent::decider::DecidedTaskSpec::new(start_url, goal)
-                .with_max_rounds(request.max_rounds.unwrap_or(2));
-            let report = futures::executor::block_on(runner.run_decided_task(
-                &mut driver,
-                &mut decider,
-                &spec,
-            ))
-            .map_err(|error| TempodError::Driver(error.to_string()))?;
+            tempo_agent::decider::DecidedRunStatus::HumanTakeoverRequired { .. } => {
+                (AgentRunState::WaitingForHuman, None)
+            }
+            other => (AgentRunState::Failed, Some(format!("{other:?}"))),
+        };
+        Ok((state, error, entries))
+    })();
 
-            Ok(match report.status {
-                tempo_agent::decider::DecidedRunStatus::Completed
-                | tempo_agent::decider::DecidedRunStatus::AlreadyComplete => {
-                    (AgentRunState::Completed, None, None)
-                }
-                tempo_agent::decider::DecidedRunStatus::HumanTakeoverRequired { takeover } => {
-                    (AgentRunState::WaitingForHuman, None, Some(takeover))
-                }
-                other => (AgentRunState::Failed, Some(format!("{other:?}")), None),
-            })
-        })();
-
-    let (state, error, takeover) = match run_result {
+    let (state, error, entries) = match run_result {
         Ok(result) => result,
         Err(error) => {
             let error_message = error.to_string();
@@ -8385,13 +8961,86 @@ fn route_session_run_create(
 
     let finished = {
         let mut pool = lock_pool(pool)?;
-        let finished = pool.finish_agent_run(&run.run_id, state, error)?;
-        if let Some(takeover) = takeover {
-            pool.record_human_takeover(&session_id, takeover)?;
+        if let Err(error) = replay_decided_journal_events(&mut pool, &session_id, &entries) {
+            let error_message = error.to_string();
+            let _ = pool.finish_agent_run(&run.run_id, AgentRunState::Failed, Some(error_message));
+            return Err(error);
         }
-        finished
+        pool.finish_agent_run(&run.run_id, state, error)?
     };
     Ok(HttpResponse::json(201, finished))
+}
+
+fn replay_decided_journal_events(
+    pool: &mut SessionPool,
+    session_id: &TempodSessionId,
+    entries: &[tempo_session::JournalEntry],
+) -> Result<(), TempodError> {
+    pool.live_session_for_producer(session_id)?;
+    let mut step_index = 0_usize;
+    for entry in entries {
+        match &entry.event {
+            tempo_session::JournalEvent::ModelDecision {
+                actions,
+                rationale,
+                input_tokens,
+                output_tokens,
+                cache_read_input_tokens,
+            } => {
+                pool.record_model_decision(
+                    session_id,
+                    TempodModelDecision {
+                        actions: actions.clone(),
+                        rationale: rationale.clone(),
+                        input_tokens: *input_tokens,
+                        output_tokens: *output_tokens,
+                        cache_read_input_tokens: *cache_read_input_tokens,
+                    },
+                )?;
+            }
+            tempo_session::JournalEvent::StepApplied { action, diff } => {
+                let key = IdempotencyKey::for_action(step_index, action)
+                    .map_err(|error| TempodError::Driver(error.to_string()))?;
+                pool.record_step(
+                    session_id,
+                    StepTriple {
+                        key,
+                        seq: entry.seq,
+                        action: action.clone(),
+                        outcome: StepTripleOutcome::Applied { diff: diff.clone() },
+                    },
+                )?;
+                step_index += 1;
+            }
+            tempo_session::JournalEvent::StepError { action, reason, .. } => {
+                let key = IdempotencyKey::for_action(step_index, action)
+                    .map_err(|error| TempodError::Driver(error.to_string()))?;
+                pool.record_step(
+                    session_id,
+                    StepTriple {
+                        key,
+                        seq: entry.seq,
+                        action: action.clone(),
+                        outcome: StepTripleOutcome::StepError {
+                            reason: reason.clone(),
+                        },
+                    },
+                )?;
+                step_index += 1;
+            }
+            tempo_session::JournalEvent::HumanTakeoverRequired { takeover } => {
+                pool.record_human_takeover(session_id, takeover.clone())?;
+            }
+            tempo_session::JournalEvent::SessionStarted { .. }
+            | tempo_session::JournalEvent::StructuredFastPathSelected { .. }
+            | tempo_session::JournalEvent::Observation { .. }
+            | tempo_session::JournalEvent::ActionPlanned { .. }
+            | tempo_session::JournalEvent::TransportError { .. }
+            | tempo_session::JournalEvent::CassetteRecorded { .. }
+            | tempo_session::JournalEvent::SessionClosed => {}
+        }
+    }
+    Ok(())
 }
 
 fn finish_failed_session_run(
@@ -8570,6 +9219,69 @@ struct SessionActBatchRequest {
     idempotency_key: Option<String>,
     #[serde(default)]
     confirmation_grant: Option<ConfirmationGrant>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionMcpActArgs {
+    #[serde(default)]
+    driver_id: Option<String>,
+    action: Action,
+    input_tainted: Option<bool>,
+    #[serde(default)]
+    confirmed: bool,
+    #[serde(default)]
+    idempotency_key: Option<String>,
+    #[serde(default)]
+    confirmation_grant: Option<ConfirmationGrant>,
+}
+
+impl SessionMcpActArgs {
+    fn into_session_batch(self) -> Result<SessionActBatchRequest, String> {
+        if self.driver_id.is_some() {
+            return Err("session-scoped MCP act does not accept driver_id".into());
+        }
+        Ok(SessionActBatchRequest {
+            batch: ActionBatch {
+                actions: vec![self.action],
+                quiescence: QuiescencePolicy::Composite,
+            },
+            input_tainted: self.input_tainted,
+            confirmed: self.confirmed,
+            idempotency_key: self.idempotency_key,
+            confirmation_grant: self.confirmation_grant,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionMcpActBatchArgs {
+    #[serde(default)]
+    driver_id: Option<String>,
+    batch: ActionBatch,
+    input_tainted: Option<bool>,
+    #[serde(default)]
+    confirmed: bool,
+    #[serde(default)]
+    idempotency_key: Option<String>,
+    #[serde(default)]
+    confirmation_grant: Option<ConfirmationGrant>,
+}
+
+impl SessionMcpActBatchArgs {
+    fn into_session_batch(self) -> Result<SessionActBatchRequest, String> {
+        if self.driver_id.is_some() {
+            return Err("session-scoped MCP act_batch does not accept driver_id".into());
+        }
+        Ok(SessionActBatchRequest {
+            batch: self.batch,
+            input_tainted: self.input_tainted,
+            confirmed: self.confirmed,
+            idempotency_key: self.idempotency_key,
+            confirmation_grant: self.confirmation_grant,
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -9480,15 +10192,113 @@ mod tests {
         );
         let runs = pool.list_runs(Some(&session.id));
         assert_eq!(runs, vec![run.clone()]);
-        let events = pool.events(&session.id, None)?;
+        let events_response = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "GET".into(),
+                path: format!("/sessions/{}/events", session.id.0),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: Vec::new(),
+            },
+        )?;
+        assert_eq!(events_response.status, 200);
+        let events: TempodSessionEvents = serde_json::from_slice(&events_response.body)?;
         assert!(events.events.iter().any(|event| matches!(
             event.event,
             TempodSessionEventKind::Manager {
                 event: ManagerEvent::RunStateChanged { .. }
             }
         )));
+        assert!(events.events.iter().any(|event| matches!(
+            &event.event,
+            TempodSessionEventKind::ModelDecision { decision }
+                if decision.actions == vec![Action::Scroll { x: 0.0, y: 4.0 }]
+        )));
+        assert!(events.events.iter().any(|event| matches!(
+            &event.event,
+            TempodSessionEventKind::ModelDecision { decision } if decision.actions.is_empty()
+        )));
+        assert!(events.events.iter().any(|event| matches!(
+            &event.event,
+            TempodSessionEventKind::StepTriple { triple }
+                if triple.action == (Action::Scroll { x: 0.0, y: 4.0 })
+        )));
         pool.kill(&session.id)?;
         join_driver_handler(handle)?;
+        Ok(())
+    }
+
+    #[test]
+    fn session_run_create_rejects_unknown_or_killed_session_before_producer_events() -> TestResult {
+        let mut pool = SessionPool::default();
+        let unknown = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/sessions/missing/runs".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: serde_json::to_vec(&json!({"actions": []}))?,
+            },
+        )?;
+        assert_eq!(unknown.status, 404);
+
+        let session = pool.create("https://killed-run.test")?;
+        pool.kill(&session.id)?;
+        let killed = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: format!("/sessions/{}/runs", session.id.0),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: serde_json::to_vec(&json!({"actions": []}))?,
+            },
+        )?;
+        assert_eq!(killed.status, 409);
+        assert!(!pool.events(&session.id, None)?.events.iter().any(|event| {
+            matches!(
+                event.event,
+                TempodSessionEventKind::ModelDecision { .. }
+                    | TempodSessionEventKind::StepTriple { .. }
+            )
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn decided_journal_producer_rejects_unknown_or_killed_sessions() -> TestResult {
+        let entries = vec![tempo_session::JournalEntry {
+            schema_version: tempo_schema::SCHEMA_VERSION.to_string(),
+            run_id: tempo_session::RunId("run-producer-test".into()),
+            session_id: tempo_session::SessionId("session-producer-test".into()),
+            seq: 0,
+            timestamp_ms: u128::from(current_time_ms()),
+            event: tempo_session::JournalEvent::ModelDecision {
+                actions: Vec::new(),
+                rationale: None,
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_read_input_tokens: 0,
+            },
+        }];
+
+        let mut pool = SessionPool::default();
+        assert!(matches!(
+            replay_decided_journal_events(&mut pool, &TempodSessionId("missing".into()), &entries),
+            Err(TempodError::SessionNotFound(_))
+        ));
+
+        let session = pool.create("https://producer-killed.test")?;
+        pool.kill(&session.id)?;
+        assert!(matches!(
+            replay_decided_journal_events(&mut pool, &session.id, &entries),
+            Err(TempodError::Conflict(_))
+        ));
         Ok(())
     }
 
@@ -9899,6 +10709,177 @@ mod tests {
         assert!(replay["error"]
             .as_str()
             .ok_or("replay should include an error string")?
+            .contains("already used"));
+        Ok(())
+    }
+
+    #[test]
+    fn session_mcp_act_batch_accepts_server_minted_confirmation_grant() -> TestResult {
+        let mut pool = SessionPool::default();
+        let handle = attach_driver_handler(&mut pool, |request| match request.command {
+            HostDriverCommand::ActBatch { batch } => {
+                assert_eq!(batch.actions.len(), 1);
+                DriverResponse::Step {
+                    outcome: StepOutcome::Applied {
+                        diff: ObservationDiff {
+                            since_seq: 1,
+                            seq: 2,
+                            omitted: 0,
+                            added: Vec::new(),
+                            removed: Vec::new(),
+                            changed: Vec::new(),
+                        },
+                    }
+                    .into(),
+                }
+            }
+            _ => DriverResponse::Closed,
+        })?;
+        let session_driver = pool
+            .driver
+            .clone()
+            .ok_or("attached engine driver should be present")?;
+        let session = pool.finish_create(
+            "https://session-mcp-confirm.test".into(),
+            Some(session_driver),
+        );
+
+        let tools_response = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: format!("/sessions/{}/mcp", session.id.0),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: Some("http://127.0.0.1".into()),
+                body: serde_json::to_vec(&json!({
+                    "jsonrpc": "2.0",
+                    "id": 30,
+                    "method": "tools/list"
+                }))?,
+            },
+        )?;
+        assert_eq!(tools_response.status, 200);
+        let tools: Value = serde_json::from_slice(&tools_response.body)?;
+        let act_batch_schema = tools["result"]["tools"]
+            .as_array()
+            .ok_or("tools/list should return tools")?
+            .iter()
+            .find(|tool| tool["name"] == "act_batch")
+            .ok_or("session MCP tools should include act_batch")?;
+        assert!(
+            act_batch_schema["inputSchema"]["properties"]
+                .get("confirmation_grant")
+                .is_some(),
+            "session MCP act_batch schema must advertise confirmation grants"
+        );
+        assert!(
+            act_batch_schema["inputSchema"]["properties"]
+                .get("driver_id")
+                .is_none(),
+            "session MCP must not advertise root/fork driver ids"
+        );
+
+        let batch = json!({
+            "actions": [{"kind": "click", "node": "purchase"}],
+            "quiescence": "composite"
+        });
+        let mut denied_request = mcp_tool_request(
+            31,
+            "act_batch",
+            json!({
+                "batch": batch,
+                "input_tainted": false,
+                "confirmed": true,
+                "idempotency_key": "mcp-purchase-1"
+            }),
+        )?;
+        denied_request.path = format!("/sessions/{}/mcp", session.id.0);
+        let denied = route_http_request(&mut pool, denied_request.clone())?;
+        assert_eq!(denied.status, 200);
+        let denied: Value = serde_json::from_slice(&denied.body)?;
+        assert_eq!(denied["result"]["isError"], true);
+        let denied_structured = &denied["result"]["structuredContent"];
+        assert_eq!(denied_structured["policy"]["confirmed"], true);
+        assert_eq!(denied_structured["policy"]["confirmed_effective"], false);
+        assert_eq!(
+            denied_structured["confirmation_request"]["session_id"],
+            session.id.0.as_str()
+        );
+        let confirmation_id = denied_structured["confirmation_request"]["confirmation_id"]
+            .as_str()
+            .ok_or("MCP denial should include confirmation id")?;
+
+        let duplicate_denied = route_http_request(&mut pool, denied_request)?;
+        assert_eq!(duplicate_denied.status, 200);
+        let duplicate_denied: Value = serde_json::from_slice(&duplicate_denied.body)?;
+        assert_eq!(
+            duplicate_denied["result"]["structuredContent"]["confirmation_request"]
+                ["confirmation_id"],
+            confirmation_id
+        );
+        assert_eq!(
+            pool.manager_state(&session.id)?.pending_confirmations.len(),
+            1
+        );
+
+        let grant_response = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: format!("/sessions/{}/confirmations/{confirmation_id}", session.id.0),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: Vec::new(),
+            },
+        )?;
+        assert_eq!(grant_response.status, 200);
+        let grant: ConfirmationGrant = serde_json::from_slice(&grant_response.body)?;
+
+        let mut granted_request = mcp_tool_request(
+            32,
+            "act_batch",
+            json!({
+                "batch": batch,
+                "input_tainted": false,
+                "idempotency_key": "mcp-purchase-1",
+                "confirmation_grant": grant.clone()
+            }),
+        )?;
+        granted_request.path = format!("/sessions/{}/mcp", session.id.0);
+        let executed = route_http_request(&mut pool, granted_request)?;
+        join_driver_handler(handle)?;
+        assert_eq!(executed.status, 200);
+        let executed: Value = serde_json::from_slice(&executed.body)?;
+        assert_eq!(executed["result"]["isError"], false);
+        assert_eq!(
+            executed["result"]["structuredContent"]["policy"]["confirmed_effective"],
+            true
+        );
+        assert!(pool
+            .manager_state(&session.id)?
+            .pending_confirmations
+            .is_empty());
+
+        let mut replay_request = mcp_tool_request(
+            33,
+            "act_batch",
+            json!({
+                "batch": batch,
+                "input_tainted": false,
+                "idempotency_key": "mcp-purchase-replay",
+                "confirmation_grant": grant
+            }),
+        )?;
+        replay_request.path = format!("/sessions/{}/mcp", session.id.0);
+        let replay = route_http_request(&mut pool, replay_request)?;
+        assert_eq!(replay.status, 200);
+        let replay: Value = serde_json::from_slice(&replay.body)?;
+        assert_eq!(replay["result"]["isError"], true);
+        assert!(replay["result"]["structuredContent"]["error"]
+            .as_str()
+            .ok_or("replay should include error string")?
             .contains("already used"));
         Ok(())
     }
@@ -11706,10 +12687,15 @@ mod tests {
         assert_eq!(json["kind"], "human_takeover_required");
         assert_eq!(json["takeover"]["kind"], "captcha");
 
-        // Unknown session id is rejected, like record_step.
+        // Producer events reject unknown and killed sessions.
         assert!(matches!(
-            pool.record_human_takeover(&TempodSessionId("missing".into()), takeover),
+            pool.record_human_takeover(&TempodSessionId("missing".into()), takeover.clone()),
             Err(TempodError::SessionNotFound(_))
+        ));
+        pool.kill(&session.id)?;
+        assert!(matches!(
+            pool.record_human_takeover(&session.id, takeover),
+            Err(TempodError::Conflict(_))
         ));
         Ok(())
     }
@@ -11807,16 +12793,158 @@ mod tests {
 
         assert_eq!(pool.sessions.len(), MAX_TERMINAL_SESSIONS);
         assert_eq!(pool.events.len(), MAX_TERMINAL_SESSIONS);
+        assert!(pool.session_last_activity_ms.is_empty());
         assert!(!pool
             .sessions
             .contains_key(&TempodSessionId("session-0".into())));
         assert!(!pool
             .events
             .contains_key(&TempodSessionId("session-0".into())));
+        assert!(!pool
+            .session_last_activity_ms
+            .contains_key(&TempodSessionId("session-0".into())));
         assert!(pool.sessions.contains_key(&TempodSessionId(format!(
             "session-{}",
             MAX_TERMINAL_SESSIONS + 1
         ))));
+        Ok(())
+    }
+
+    #[test]
+    fn idle_session_reaper_kills_stale_sessions_without_public_schema_state() -> TestResult {
+        let mut pool = SessionPool::default().with_idle_session_ttl_ms(Some(10));
+        let session = pool.create("https://idle.test")?;
+        pool.touch_session_at(&session.id, 100);
+
+        assert!(pool.reap_idle_sessions_at(109).is_empty());
+        assert_eq!(
+            pool.sessions.get(&session.id).map(|session| session.state),
+            Some(TempodSessionState::Running)
+        );
+
+        assert!(pool.reap_idle_sessions_at(110).is_empty());
+        assert_eq!(
+            pool.sessions.get(&session.id).map(|session| session.state),
+            Some(TempodSessionState::Killed)
+        );
+        assert!(!pool.session_last_activity_ms.contains_key(&session.id));
+        let events = pool.events(&session.id, None)?.events;
+        assert_eq!(
+            events.last().map(|event| event.event.clone()),
+            Some(TempodSessionEventKind::SessionKilled)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn idle_session_reaper_preserves_active_runs_and_attached_surfaces() -> TestResult {
+        let mut pool = SessionPool::default().with_idle_session_ttl_ms(Some(10));
+        let active = pool.create("https://active-run.test")?;
+        let attached = pool.create("https://attached.test")?;
+        let human_owned = pool.create("https://human-owned.test")?;
+        pool.touch_session_at(&active.id, 100);
+        pool.touch_session_at(&attached.id, 100);
+        pool.touch_session_at(&human_owned.id, 100);
+        pool.active_runs
+            .insert(active.id.clone(), AgentRunId("run-active".into()));
+        pool.register_surface(&attached.id, RegisterSurfaceRequest::default())?;
+        pool.owners.insert(
+            human_owned.id.clone(),
+            ControlOwner::Human {
+                surface_id: ShellSurfaceId("surface-missing".into()),
+            },
+        );
+
+        assert!(pool.reap_idle_sessions_at(10_000).is_empty());
+        assert_eq!(
+            pool.sessions.get(&active.id).map(|session| session.state),
+            Some(TempodSessionState::Running)
+        );
+        assert_eq!(
+            pool.sessions.get(&attached.id).map(|session| session.state),
+            Some(TempodSessionState::Running)
+        );
+        assert_eq!(
+            pool.sessions
+                .get(&human_owned.id)
+                .map(|session| session.state),
+            Some(TempodSessionState::Running)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn idle_session_reaper_detaches_and_closes_engine_context() -> TestResult {
+        let (client_stream, server_stream) = UnixStream::pair()?;
+        let engine = thread::spawn(move || -> Result<(), EngineHostError> {
+            let mut connection = EngineIpcConnection::from_stream(server_stream);
+
+            let create = connection.read_driver_request()?;
+            assert!(create.driver_id.is_none());
+            assert!(matches!(
+                create.command,
+                HostDriverCommand::CreateBrowsingContext { .. }
+            ));
+            connection.write_driver_response(
+                create.id,
+                DriverResponse::BrowsingContextCreated {
+                    driver_id: "idle-context".into(),
+                },
+            )?;
+
+            let goto = connection.read_driver_request()?;
+            assert_eq!(goto.driver_id.as_deref(), Some("idle-context"));
+            assert!(matches!(goto.command, HostDriverCommand::Goto { .. }));
+            connection.write_driver_response(
+                goto.id,
+                DriverResponse::Observation {
+                    observation: observation("https://idle-engine.test", 1),
+                },
+            )?;
+
+            let close = connection.read_driver_request()?;
+            assert_eq!(close.driver_id.as_deref(), Some("idle-context"));
+            assert_eq!(close.command, HostDriverCommand::Close);
+            connection.write_driver_response(close.id, DriverResponse::Closed)?;
+            Ok(())
+        });
+
+        let mut pool = SessionPool::default().with_idle_session_ttl_ms(Some(10));
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream))?;
+        let response = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/sessions".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: br#"{"url":"https://idle-engine.test"}"#.to_vec(),
+            },
+        )?;
+        assert_eq!(response.status, 201);
+        let session: TempodSession = serde_json::from_slice(&response.body)?;
+        assert!(pool.session_drivers.contains_key(&session.id));
+
+        pool.touch_session_at(&session.id, 100);
+        let detached = pool.reap_idle_sessions_at(110);
+        assert_eq!(detached.len(), 1);
+        assert_eq!(
+            pool.sessions.get(&session.id).map(|session| session.state),
+            Some(TempodSessionState::Killed)
+        );
+        assert!(!pool.session_drivers.contains_key(&session.id));
+
+        let (id, driver, root) = detached
+            .into_iter()
+            .next()
+            .ok_or("idle reaper should return the detached engine driver")?;
+        assert_eq!(id, session.id);
+        assert!(
+            !close_detached_session_driver(id.0, driver, root),
+            "a prompt idle-session context close must not abandon the shared engine"
+        );
+        join_driver_handler(engine)?;
         Ok(())
     }
 
@@ -12555,6 +13683,32 @@ mod tests {
             openapi["components"]["schemas"]["TempodSessionEvents"]["properties"]
                 ["truncated_before_seq"]["anyOf"][1]["type"],
             "null"
+        );
+        assert_eq!(
+            openapi["components"]["schemas"]["TempodSessionEvent"]["additionalProperties"],
+            false
+        );
+        assert_eq!(
+            openapi["components"]["schemas"]["TempodSessionEvent"]["properties"]["event"]["$ref"],
+            "#/components/schemas/TempodSessionEventKind"
+        );
+        assert!(
+            openapi["components"]["schemas"]["TempodSessionEventKind"]["oneOf"]
+                .as_array()
+                .is_some_and(|variants| variants.iter().any(|variant| {
+                    variant["properties"]["kind"]["const"] == "model_decision"
+                        && variant["properties"]["decision"]["$ref"]
+                            == "#/components/schemas/TempodModelDecision"
+                }))
+        );
+        assert_eq!(
+            openapi["components"]["schemas"]["TempodModelDecision"]["properties"]["actions"]
+                ["items"]["$ref"],
+            "#/components/schemas/Action"
+        );
+        assert_eq!(
+            openapi["components"]["schemas"]["AgentStepTriple"]["properties"]["outcome"]["$ref"],
+            "#/components/schemas/AgentStepTripleOutcome"
         );
         assert_eq!(
             openapi["components"]["schemas"]["CreateSessionRequest"]["properties"]["driverless"]

@@ -11,7 +11,7 @@ test-driver = []
 
 [dependencies]
 tempo-schema = { path = "../tempo-schema" }
-tempo-net = { path = "../tempo-net" }
+tempo-urlpolicy = { path = "../tempo-urlpolicy" }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }

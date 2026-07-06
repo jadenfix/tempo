@@ -12,9 +12,9 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::ops::Deref;
-#[cfg(any(test, feature = "test-driver"))]
-use tempo_net::UrlPolicy;
 use tempo_schema::{Action, ActionBatch, CompiledObservation, NodeId, ObservationDiff, Provenance};
+#[cfg(any(test, feature = "test-driver"))]
+use tempo_urlpolicy::UrlPolicy;
 use thiserror::Error;
 
 const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";

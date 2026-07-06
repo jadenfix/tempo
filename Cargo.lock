@@ -8525,8 +8525,8 @@ dependencies = [
  "futures",
  "serde",
  "serde_json",
- "tempo-net",
  "tempo-schema",
+ "tempo-urlpolicy",
  "thiserror 2.0.18",
 ]
 
@@ -8701,6 +8701,7 @@ dependencies = [
  "httpdate",
  "sha2",
  "tempo-schema",
+ "tempo-urlpolicy",
  "url",
 ]
 
@@ -8827,6 +8828,13 @@ dependencies = [
  "tempo-schema",
  "thiserror 2.0.18",
  "tokio",
+ "url",
+]
+
+[[package]]
+name = "tempo-urlpolicy"
+version = "0.1.0"
+dependencies = [
  "url",
 ]
 

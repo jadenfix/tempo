@@ -394,6 +394,12 @@ impl BrowserSurface {
                     self.run_state = SurfaceRunState::AgentControl;
                 }
             }
+            TempodSessionEventKind::ModelDecision { .. } => {
+                if self.owner != ControlOwner::Human {
+                    self.owner = ControlOwner::Agent;
+                    self.run_state = SurfaceRunState::AgentControl;
+                }
+            }
             TempodSessionEventKind::HumanTakeoverRequired { takeover } => {
                 self.owner = ControlOwner::Agent;
                 self.run_state = SurfaceRunState::HumanTakeoverRequired;
