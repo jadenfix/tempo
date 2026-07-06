@@ -48,6 +48,33 @@ pub struct EvalRecord {
     pub observe_latencies_ms: Vec<u64>,
     /// Raw per-action apply latencies (ms), retained for the same reason.
     pub action_latencies_ms: Vec<u64>,
+    /// Raw post-action settle latencies (ms), measured after the action is
+    /// accepted until the page reaches the lane's settled/quiescent state.
+    #[serde(default)]
+    pub settle_latencies_ms: Vec<u64>,
+    /// Direct act-to-settled samples (ms) when the live lane can measure the
+    /// end-to-end action interval as one span. Older records may omit it; the
+    /// Amdahl report falls back to action+settle samples when possible.
+    #[serde(default)]
+    pub act_to_settled_latencies_ms: Vec<u64>,
+    /// Model input tokens charged for this task, excluding cache-read tokens.
+    #[serde(default)]
+    pub input_tokens: u64,
+    /// Model output tokens generated for this task.
+    #[serde(default)]
+    pub output_tokens: u64,
+    /// Provider-reported cache-read input tokens, if any.
+    #[serde(default)]
+    pub cache_read_input_tokens: u64,
+    /// Provider-reported prefill/input-processing latency samples (ms).
+    #[serde(default)]
+    pub prefill_latencies_ms: Vec<u64>,
+    /// Provider-reported decode/output-generation latency samples (ms).
+    #[serde(default)]
+    pub decode_latencies_ms: Vec<u64>,
+    /// Model/API round trips taken for the task.
+    #[serde(default)]
+    pub round_trips: u64,
     pub wall_clock_ms: u64,
     #[serde(default)]
     pub baseline_wall_clock_ms: Option<u64>,
@@ -55,6 +82,107 @@ pub struct EvalRecord {
     pub unconfirmed_high_risk_actions: u64,
     #[serde(default)]
     pub step_count: u64,
+}
+
+/// E2E latency gates for LLM-inclusive eval traces (#481).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct E2eLatencyBudget {
+    #[serde(default)]
+    pub max_observe_latency_ms_p50: Option<u64>,
+    #[serde(default)]
+    pub max_act_to_settled_ms_p50: Option<u64>,
+}
+
+/// A measured subsystem's contribution to task wall time.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct E2eSubsystemShare {
+    pub subsystem: String,
+    pub total_ms: u64,
+    pub share: f64,
+    pub samples: usize,
+    pub p50_ms: u64,
+}
+
+/// A typed E2E latency-budget violation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "gate", rename_all = "snake_case")]
+pub enum E2eLatencyViolation {
+    ObserveLatencyP50 { observed: u64, max: u64 },
+    ActToSettledP50 { observed: u64, max: u64 },
+}
+
+/// LLM-inclusive E2E latency/token report. This is the Amdahl table for #481:
+/// rank measured subsystems by wall-time share so optimization work targets the
+/// real limiting factor instead of isolated microbenchmarks.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct E2eBudgetReport {
+    pub total_cases: usize,
+    pub total_steps: u64,
+    pub total_round_trips: u64,
+    pub wall_clock_ms_total: u64,
+    pub wall_clock_ms_p50: u64,
+    pub observe_latency_ms_p50: u64,
+    pub act_to_settled_ms_p50: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_input_tokens: u64,
+    pub cache_read_input_token_ratio: f64,
+    pub subsystems: Vec<E2eSubsystemShare>,
+    pub violations: Vec<E2eLatencyViolation>,
+}
+
+impl E2eBudgetReport {
+    pub fn from_records(
+        records: &[EvalRecord],
+        budget: &E2eLatencyBudget,
+    ) -> Result<Self, EvalError> {
+        if records.is_empty() {
+            return Err(EvalError::EmptyRun);
+        }
+
+        let total_steps: u64 = records.iter().map(|record| record.step_count).sum();
+        let total_round_trips: u64 = records.iter().map(|record| record.round_trips).sum();
+        let wall_clock_ms_total: u64 = records.iter().map(|record| record.wall_clock_ms).sum();
+        let wall_clock_ms_p50 =
+            percentile_u64(records.iter().map(|record| record.wall_clock_ms), 0.50);
+        let observe_samples = pooled_samples(records, |record| &record.observe_latencies_ms);
+        let act_to_settled_samples = act_to_settled_samples(records);
+        let observe_latency_ms_p50 = percentile_u64(observe_samples.iter().copied(), 0.50);
+        let act_to_settled_ms_p50 = percentile_u64(act_to_settled_samples.iter().copied(), 0.50);
+        let input_tokens: u64 = records.iter().map(|record| record.input_tokens).sum();
+        let output_tokens: u64 = records.iter().map(|record| record.output_tokens).sum();
+        let cache_read_input_tokens: u64 = records
+            .iter()
+            .map(|record| record.cache_read_input_tokens)
+            .sum();
+        let cache_read_input_token_ratio = token_ratio(
+            cache_read_input_tokens,
+            input_tokens.saturating_add(cache_read_input_tokens),
+        );
+        let subsystems = amdahl_table(records, wall_clock_ms_total);
+        let violations =
+            e2e_latency_violations(observe_latency_ms_p50, act_to_settled_ms_p50, budget);
+
+        Ok(Self {
+            total_cases: records.len(),
+            total_steps,
+            total_round_trips,
+            wall_clock_ms_total,
+            wall_clock_ms_p50,
+            observe_latency_ms_p50,
+            act_to_settled_ms_p50,
+            input_tokens,
+            output_tokens,
+            cache_read_input_tokens,
+            cache_read_input_token_ratio,
+            subsystems,
+            violations,
+        })
+    }
+
+    pub fn passes(&self) -> bool {
+        self.violations.is_empty()
+    }
 }
 
 /// Metadata needed to convert a durable session journal into one eval record.
@@ -342,6 +470,10 @@ pub fn read_eval_records(path: impl AsRef<Path>) -> Result<Vec<EvalRecord>, Eval
 
 /// Write a scorecard JSON artifact to disk.
 pub fn write_scorecard(path: impl AsRef<Path>, scorecard: &Scorecard) -> Result<(), EvalError> {
+    write_json_artifact(path, scorecard)
+}
+
+fn write_json_artifact<T: Serialize>(path: impl AsRef<Path>, value: &T) -> Result<(), EvalError> {
     let path = path.as_ref().to_path_buf();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|source| EvalError::Io {
@@ -353,8 +485,16 @@ pub fn write_scorecard(path: impl AsRef<Path>, scorecard: &Scorecard) -> Result<
         path: path.clone(),
         source,
     })?;
-    serde_json::to_writer_pretty(file, scorecard)
+    serde_json::to_writer_pretty(file, value)
         .map_err(|source| EvalError::JsonWrite { path, source })
+}
+
+/// Write an E2E budget report JSON artifact to disk.
+pub fn write_e2e_budget_report(
+    path: impl AsRef<Path>,
+    report: &E2eBudgetReport,
+) -> Result<(), EvalError> {
+    write_json_artifact(path, report)
 }
 
 /// Convert a real session journal into one eval record.
@@ -389,6 +529,10 @@ fn eval_record_from_journal_entries(
     let mut observe_latencies = Vec::new();
     let mut action_latencies = Vec::new();
     let mut step_count = 0_u64;
+    let mut input_tokens = 0_u64;
+    let mut output_tokens = 0_u64;
+    let mut cache_read_input_tokens = 0_u64;
+    let mut round_trips = 0_u64;
     let mut session_start_ms = None;
     let mut last_observe_start_ms = None;
     let mut last_action_start_ms = None;
@@ -421,8 +565,19 @@ fn eval_record_from_journal_entries(
                 }
                 last_observe_start_ms = Some(entry.timestamp_ms);
             }
+            JournalEvent::ModelDecision {
+                input_tokens: decision_input_tokens,
+                output_tokens: decision_output_tokens,
+                cache_read_input_tokens: decision_cache_read_input_tokens,
+                ..
+            } => {
+                input_tokens = input_tokens.saturating_add(*decision_input_tokens);
+                output_tokens = output_tokens.saturating_add(*decision_output_tokens);
+                cache_read_input_tokens =
+                    cache_read_input_tokens.saturating_add(*decision_cache_read_input_tokens);
+                round_trips = round_trips.saturating_add(1);
+            }
             JournalEvent::TransportError { .. }
-            | JournalEvent::ModelDecision { .. }
             | JournalEvent::StructuredFastPathSelected { .. }
             | JournalEvent::HumanTakeoverRequired { .. }
             | JournalEvent::CassetteRecorded { .. }
@@ -450,11 +605,151 @@ fn eval_record_from_journal_entries(
         // Retain every raw sample; percentiles are computed downstream.
         observe_latencies_ms: observe_latencies,
         action_latencies_ms: action_latencies,
+        settle_latencies_ms: Vec::new(),
+        act_to_settled_latencies_ms: Vec::new(),
+        input_tokens,
+        output_tokens,
+        cache_read_input_tokens,
+        prefill_latencies_ms: Vec::new(),
+        decode_latencies_ms: Vec::new(),
+        round_trips,
         wall_clock_ms,
         baseline_wall_clock_ms: descriptor.baseline_wall_clock_ms,
         unconfirmed_high_risk_actions: descriptor.unconfirmed_high_risk_actions,
         step_count,
     })
+}
+
+fn amdahl_table(records: &[EvalRecord], wall_clock_ms_total: u64) -> Vec<E2eSubsystemShare> {
+    let mut rows = vec![
+        subsystem_share(
+            "prefill",
+            pooled_samples(records, |record| &record.prefill_latencies_ms),
+            wall_clock_ms_total,
+        ),
+        subsystem_share(
+            "decode",
+            pooled_samples(records, |record| &record.decode_latencies_ms),
+            wall_clock_ms_total,
+        ),
+        subsystem_share(
+            "observe",
+            pooled_samples(records, |record| &record.observe_latencies_ms),
+            wall_clock_ms_total,
+        ),
+        subsystem_share(
+            "act",
+            pooled_samples(records, |record| &record.action_latencies_ms),
+            wall_clock_ms_total,
+        ),
+        subsystem_share(
+            "settle",
+            pooled_samples(records, |record| &record.settle_latencies_ms),
+            wall_clock_ms_total,
+        ),
+    ];
+    let measured_ms: u64 = rows.iter().map(|row| row.total_ms).sum();
+    let unattributed_ms = wall_clock_ms_total.saturating_sub(measured_ms);
+    rows.push(E2eSubsystemShare {
+        subsystem: "unattributed".into(),
+        total_ms: unattributed_ms,
+        share: share(unattributed_ms, wall_clock_ms_total),
+        samples: records.len(),
+        p50_ms: 0,
+    });
+    rows.sort_by(compare_subsystem_shares);
+    rows
+}
+
+fn subsystem_share(
+    subsystem: &str,
+    samples: Vec<u64>,
+    wall_clock_ms_total: u64,
+) -> E2eSubsystemShare {
+    let total_ms = samples.iter().sum();
+    let sample_count = samples.len();
+    E2eSubsystemShare {
+        subsystem: subsystem.into(),
+        total_ms,
+        share: share(total_ms, wall_clock_ms_total),
+        samples: sample_count,
+        p50_ms: percentile_u64(samples, 0.50),
+    }
+}
+
+fn compare_subsystem_shares(left: &E2eSubsystemShare, right: &E2eSubsystemShare) -> Ordering {
+    right
+        .total_ms
+        .cmp(&left.total_ms)
+        .then_with(|| left.subsystem.cmp(&right.subsystem))
+}
+
+fn pooled_samples(records: &[EvalRecord], field: fn(&EvalRecord) -> &Vec<u64>) -> Vec<u64> {
+    records
+        .iter()
+        .flat_map(|record| field(record).iter().copied())
+        .collect()
+}
+
+fn act_to_settled_samples(records: &[EvalRecord]) -> Vec<u64> {
+    let direct = pooled_samples(records, |record| &record.act_to_settled_latencies_ms);
+    if !direct.is_empty() {
+        return direct;
+    }
+
+    let mut samples = Vec::new();
+    for record in records {
+        if record.settle_latencies_ms.is_empty() {
+            samples.extend(record.action_latencies_ms.iter().copied());
+            continue;
+        }
+        for (index, action_ms) in record.action_latencies_ms.iter().copied().enumerate() {
+            let settle_ms = record.settle_latencies_ms.get(index).copied().unwrap_or(0);
+            samples.push(action_ms.saturating_add(settle_ms));
+        }
+    }
+    samples
+}
+
+fn e2e_latency_violations(
+    observe_latency_ms_p50: u64,
+    act_to_settled_ms_p50: u64,
+    budget: &E2eLatencyBudget,
+) -> Vec<E2eLatencyViolation> {
+    let mut violations = Vec::new();
+    if let Some(max) = budget.max_observe_latency_ms_p50
+        && observe_latency_ms_p50 > max
+    {
+        violations.push(E2eLatencyViolation::ObserveLatencyP50 {
+            observed: observe_latency_ms_p50,
+            max,
+        });
+    }
+    if let Some(max) = budget.max_act_to_settled_ms_p50
+        && act_to_settled_ms_p50 > max
+    {
+        violations.push(E2eLatencyViolation::ActToSettledP50 {
+            observed: act_to_settled_ms_p50,
+            max,
+        });
+    }
+    violations
+}
+
+fn token_ratio(numerator: u64, denominator: u64) -> f64 {
+    if denominator == 0 {
+        0.0
+    } else {
+        numerator as f64 / denominator as f64
+    }
+}
+
+fn share(total_ms: u64, wall_clock_ms_total: u64) -> f64 {
+    if wall_clock_ms_total == 0 {
+        0.0
+    } else {
+        total_ms as f64 / wall_clock_ms_total as f64
+    }
 }
 
 fn suite_table(records: &[EvalRecord]) -> Vec<SuiteScore> {
@@ -1826,6 +2121,81 @@ mod tests {
     }
 
     #[test]
+    fn e2e_budget_report_ranks_subsystems_by_measured_share() -> TestResult {
+        let mut eval_record = record("one", "https://e2e.test", Lane::Cdp, true, false, 1_000, 10);
+        eval_record.wall_clock_ms = 1_000;
+        eval_record.step_count = 2;
+        eval_record.round_trips = 2;
+        eval_record.input_tokens = 600;
+        eval_record.output_tokens = 120;
+        eval_record.cache_read_input_tokens = 200;
+        eval_record.observe_latencies_ms = vec![100, 100];
+        eval_record.action_latencies_ms = vec![100, 100];
+        eval_record.settle_latencies_ms = vec![50, 50];
+        eval_record.act_to_settled_latencies_ms = vec![150, 150];
+        eval_record.prefill_latencies_ms = vec![80, 120];
+        eval_record.decode_latencies_ms = vec![200, 300];
+        let budget = E2eLatencyBudget {
+            max_observe_latency_ms_p50: Some(100),
+            max_act_to_settled_ms_p50: Some(150),
+        };
+
+        let report = E2eBudgetReport::from_records(&[eval_record], &budget)?;
+
+        assert!(report.passes());
+        assert_eq!(report.total_cases, 1);
+        assert_eq!(report.total_steps, 2);
+        assert_eq!(report.total_round_trips, 2);
+        assert_eq!(report.input_tokens, 600);
+        assert_eq!(report.output_tokens, 120);
+        assert_eq!(report.cache_read_input_tokens, 200);
+        assert!((report.cache_read_input_token_ratio - 0.25).abs() < f64::EPSILON);
+        assert_eq!(report.observe_latency_ms_p50, 100);
+        assert_eq!(report.act_to_settled_ms_p50, 150);
+        assert_eq!(report.subsystems[0].subsystem, "decode");
+        assert_eq!(report.subsystems[0].total_ms, 500);
+        assert!((report.subsystems[0].share - 0.5).abs() < f64::EPSILON);
+        Ok(())
+    }
+
+    #[test]
+    fn e2e_budget_report_enforces_live_lane_p50_budgets() -> TestResult {
+        let mut eval_record = record(
+            "slow",
+            "https://e2e.test",
+            Lane::Cdp,
+            true,
+            false,
+            1_000,
+            10,
+        );
+        eval_record.observe_latencies_ms = vec![200];
+        eval_record.act_to_settled_latencies_ms = vec![700];
+        let budget = E2eLatencyBudget {
+            max_observe_latency_ms_p50: Some(150),
+            max_act_to_settled_ms_p50: Some(600),
+        };
+
+        let report = E2eBudgetReport::from_records(&[eval_record], &budget)?;
+
+        assert!(!report.passes());
+        assert_eq!(
+            report.violations,
+            vec![
+                E2eLatencyViolation::ObserveLatencyP50 {
+                    observed: 200,
+                    max: 150,
+                },
+                E2eLatencyViolation::ActToSettledP50 {
+                    observed: 700,
+                    max: 600,
+                },
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
     fn suite_summary_uses_real_baselines_and_high_risk_counts() -> TestResult {
         let mut fast = with_suite(
             record(
@@ -1897,6 +2267,13 @@ mod tests {
         let action = Action::Click {
             node: NodeId("submit".into()),
         };
+        journal.append(JournalEvent::ModelDecision {
+            actions: vec![action.clone()],
+            rationale: Some("click submit".into()),
+            input_tokens: 1_000,
+            output_tokens: 80,
+            cache_read_input_tokens: 250,
+        })?;
         journal.append(JournalEvent::ActionPlanned {
             action: action.clone(),
         })?;
@@ -1932,6 +2309,10 @@ mod tests {
         assert!(record.max_observation_bytes > 0);
         assert!(record.max_observation_tokens > 0);
         assert_eq!(record.step_count, 1);
+        assert_eq!(record.round_trips, 1);
+        assert_eq!(record.input_tokens, 1_000);
+        assert_eq!(record.output_tokens, 80);
+        assert_eq!(record.cache_read_input_tokens, 250);
 
         remove_dir_if_exists(&root)?;
         Ok(())
@@ -2199,6 +2580,14 @@ mod tests {
             max_observation_tokens: estimated_tokens(max_observation_bytes),
             observe_latencies_ms: vec![latency],
             action_latencies_ms: vec![latency],
+            settle_latencies_ms: Vec::new(),
+            act_to_settled_latencies_ms: Vec::new(),
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_input_tokens: 0,
+            prefill_latencies_ms: Vec::new(),
+            decode_latencies_ms: Vec::new(),
+            round_trips: 0,
             wall_clock_ms: latency.saturating_mul(2),
             baseline_wall_clock_ms: None,
             unconfirmed_high_risk_actions: 0,
