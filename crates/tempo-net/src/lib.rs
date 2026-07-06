@@ -2389,7 +2389,14 @@ impl Default for CrawlScheduler {
     }
 }
 
-/// A scheduled crawl request ready for network dispatch.
+/// A scheduled crawl request ready for scheduler-owned dispatch.
+///
+/// This raw value has not by itself pinned a connection or proven that the
+/// eventual network client will use the same socket that policy checked. SDK and
+/// network-execution paths should use [`CheckedCrawlDispatch`] values produced by
+/// [`CrawlFrontier::dispatch_checked_ready`]. Raw dispatch remains available for
+/// scheduler internals and compatibility while #255's connection-pinned
+/// execution capability is still open.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CrawlDispatch {
     pub request: NetworkRequest,
@@ -2397,7 +2404,16 @@ pub struct CrawlDispatch {
 }
 
 impl CrawlDispatch {
-    /// Validate this dispatch against socket SSRF, egress, and audit policy.
+    /// Validate this raw scheduler dispatch against socket SSRF, egress, and audit policy.
+    ///
+    /// This helper proves the caller-supplied socket is policy-allowed, but it
+    /// does not force an HTTP client to connect to that socket. Prefer
+    /// [`CrawlFrontier::dispatch_checked_ready`] for SDK-facing crawl dispatch,
+    /// and treat the returned [`CheckedCrawlDispatch::resolved_socket`] as the
+    /// only socket the network execution path may use.
+    #[deprecated(
+        note = "scheduler-only raw dispatch check; use CrawlFrontier::dispatch_checked_ready and execute only against CheckedCrawlDispatch::resolved_socket"
+    )]
     pub fn check(
         &self,
         url_policy: &UrlPolicy,
@@ -2407,7 +2423,14 @@ impl CrawlDispatch {
         checked_crawl_dispatch(self, url_policy, egress_policy, resolved_socket, None)
     }
 
-    /// Validate this dispatch and attach Tempo's default Web Bot Auth signature.
+    /// Validate this raw scheduler dispatch and attach Tempo's default Web Bot Auth signature.
+    ///
+    /// This has the same socket-pinning caveat as [`CrawlDispatch::check`].
+    /// It is compatibility glue for scheduler internals, not the final
+    /// SDK-facing network execution capability.
+    #[deprecated(
+        note = "scheduler-only raw dispatch check; use CrawlFrontier::dispatch_checked_ready and execute only against CheckedCrawlDispatch::resolved_socket"
+    )]
     pub fn check_signed(
         &self,
         url_policy: &UrlPolicy,
@@ -2426,7 +2449,12 @@ impl CrawlDispatch {
     }
 }
 
-/// Crawl dispatch after all mandatory network policy checks have passed.
+/// Crawl dispatch after mandatory network policy checks have passed.
+///
+/// This is the only crawl dispatch type SDK-facing network execution should
+/// accept. The request must be executed against [`Self::resolved_socket`];
+/// re-resolving [`Self::dispatch`]'s URL reopens the DNS rebinding/TOCTOU gap
+/// tracked in #255.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CheckedCrawlDispatch {
     pub dispatch: CrawlDispatch,
@@ -2548,6 +2576,10 @@ impl From<SignatureError> for CrawlDispatchError {
 }
 
 /// Result of one deterministic frontier scheduling pass.
+///
+/// This raw batch is scheduler-only. Its [`CrawlDispatch`] values have not
+/// passed connect-time URL/socket/egress checks and must not be used as an
+/// SDK-facing network execution surface.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CrawlBatch {
     pub dispatches: Vec<CrawlDispatch>,
@@ -2688,6 +2720,15 @@ impl CrawlFrontier {
     /// Dispatch at most `max_requests` pending requests in deterministic request
     /// identity order, subject to global, per-origin, delay, robots, and backoff
     /// gates.
+    ///
+    /// Scheduler-only raw dispatch. The returned [`CrawlBatch`] has not passed
+    /// connect-time URL/socket/egress checks, and callers must not hand its URLs
+    /// to an HTTP client that can re-resolve them. SDK-facing network execution
+    /// should use [`Self::dispatch_checked_ready`] and execute only against each
+    /// [`CheckedCrawlDispatch::resolved_socket`].
+    #[deprecated(
+        note = "scheduler-only raw dispatch; use dispatch_checked_ready before network execution"
+    )]
     pub fn dispatch_ready(
         &mut self,
         tick: u64,
@@ -2731,6 +2772,11 @@ impl CrawlFrontier {
     /// egress, `resolve_socket` must return the target URL socket. For proxied
     /// egress, it must return the selected proxy endpoint socket; Tempo validates
     /// that socket against the proxy endpoint without resolving the target host.
+    ///
+    /// Until #255's connection-pinned execution capability lands, callers that
+    /// perform network I/O are responsible for pinning their HTTP client to each
+    /// returned [`CheckedCrawlDispatch::resolved_socket`]. Re-resolving the URL
+    /// after this method returns invalidates the checked-dispatch guarantee.
     pub fn dispatch_checked_ready<F>(
         &mut self,
         tick: u64,
@@ -4158,6 +4204,7 @@ fn parse_retry_after_delta_ticks(value: &str, response: &NetworkResponseRecord) 
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
 
