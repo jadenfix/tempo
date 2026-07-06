@@ -6891,7 +6891,7 @@ pub fn tempod_openapi(base_url: &str) -> JsonValue {
                     "parameters": [{"$ref": "#/components/parameters/RunId"}],
                     "responses": {
                         "200": {
-                            "description": "Resumed agent run after human handoff",
+                            "description": "Marked the agent run runnable after human handoff",
                             "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AgentRun"}}}
                         },
                         "409": {"description": "Session is owned by a human surface"}
@@ -10226,6 +10226,91 @@ mod tests {
             TempodSessionEventKind::StepTriple { triple }
                 if triple.action == (Action::Scroll { x: 0.0, y: 4.0 })
         )));
+        pool.kill(&session.id)?;
+        join_driver_handler(handle)?;
+        Ok(())
+    }
+
+    #[test]
+    fn session_run_create_emits_live_human_takeover_event() -> TestResult {
+        let mut pool = SessionPool::default();
+        pool.next_run_id = current_time_ms();
+        let handle = attach_driver_handler_seq(&mut pool, 2, |request| match request.command {
+            HostDriverCommand::Goto { url } => {
+                assert_eq!(url, "https://runs.test/verify");
+                DriverResponse::Observation {
+                    observation: captcha_observation("https://runs.test/verify", 1),
+                }
+            }
+            HostDriverCommand::Close => DriverResponse::Closed,
+            unexpected => panic!("unexpected takeover run-create driver request: {unexpected:?}"),
+        })?;
+        let session_driver = pool
+            .driver
+            .clone()
+            .ok_or("attached engine driver should be present")?;
+        let session = pool.finish_create("https://runs.test/verify".into(), Some(session_driver));
+
+        let response = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: format!("/sessions/{}/runs", session.id.0),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: serde_json::to_vec(&json!({
+                    "goal": "stop for human verification",
+                    "actions": [{"kind": "scroll", "x": 0.0, "y": 4.0}],
+                    "max_rounds": 2
+                }))?,
+            },
+        )?;
+        assert_eq!(response.status, 201);
+        let run: AgentRun = serde_json::from_slice(&response.body)?;
+        assert_eq!(run.session_id, session.id.0);
+        assert_eq!(run.state, AgentRunState::WaitingForHuman);
+        assert_eq!(pool.active_runs.get(&session.id), Some(&run.run_id));
+        assert_eq!(
+            pool.session_owner(&session.id),
+            ControlOwner::Agent {
+                run_id: Some(run.run_id.clone())
+            }
+        );
+
+        let events_response = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "GET".into(),
+                path: format!("/sessions/{}/events", session.id.0),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: Vec::new(),
+            },
+        )?;
+        assert_eq!(events_response.status, 200);
+        let events: TempodSessionEvents = serde_json::from_slice(&events_response.body)?;
+        assert!(events.events.iter().any(|event| matches!(
+            &event.event,
+            TempodSessionEventKind::Manager {
+                event: ManagerEvent::RunStateChanged { run: seen }
+            } if seen.run_id == run.run_id && seen.state == AgentRunState::WaitingForHuman
+        )));
+        let Some(takeover) = events.events.iter().find_map(|event| match &event.event {
+            TempodSessionEventKind::HumanTakeoverRequired { takeover } => Some(takeover),
+            _ => None,
+        }) else {
+            return Err("real decided run did not emit a human takeover event".into());
+        };
+        assert_eq!(takeover.kind, tempo_schema::TakeoverKind::Captcha);
+        assert_eq!(takeover.url, "https://runs.test/verify");
+        assert!(takeover.reason.contains("not a robot"));
+        assert!(!events
+            .events
+            .iter()
+            .any(|event| matches!(event.event, TempodSessionEventKind::StepTriple { .. })));
+
         pool.kill(&session.id)?;
         join_driver_handler(handle)?;
         Ok(())
@@ -13817,6 +13902,10 @@ mod tests {
             json!(["read", "draft", "write", "send", "purchase", "delete"])
         );
         assert_eq!(openapi["paths"]["/runs"]["get"]["operationId"], "listRuns");
+        assert_eq!(
+            openapi["paths"]["/runs/{run_id}/resume"]["post"]["responses"]["200"]["description"],
+            "Marked the agent run runnable after human handoff"
+        );
         assert_eq!(
             openapi["paths"]["/runs/{run_id}/resume"]["post"]["responses"]["409"]["description"],
             "Session is owned by a human surface"
@@ -18643,6 +18732,22 @@ mod tests {
             omitted: 0,
             marks: Vec::new(),
         }
+    }
+
+    fn captcha_observation(url: &str, seq: u64) -> CompiledObservation {
+        let mut observation = observation(url, seq);
+        observation.elements = vec![tempo_schema::InteractiveElement {
+            node_id: NodeId("captcha.checkbox".into()),
+            role: "checkbox".into(),
+            name: vec![tempo_schema::TaintSpan {
+                provenance: tempo_schema::Provenance::Page,
+                text: "I'm not a robot".into(),
+            }],
+            value: Vec::new(),
+            bounds: None,
+            rank: 1.0,
+        }];
+        observation
     }
 
     /// An observation carrying one page-provenance span, for #254 taint

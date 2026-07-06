@@ -180,11 +180,11 @@ fn action_kind(action: &Action) -> &'static str {
 /// the human has actually cleared the challenge in the page — it never silently
 /// waves the agent past an unresolved CAPTCHA/auth-wall.
 ///
-/// **Resume transport is a documented seam:** there is no tempod resume endpoint
-/// and no `ShellClient::resume` today (checked against the whole `ShellClient`
-/// surface), so Resume cannot yet POST a "continue this run" to the backend.
-/// Wiring that call is a follow-up on the same deferred agent↔tempod bridge that
-/// gates step-event production; see the crate PR for #354.
+/// **Resume transport marks readiness, not progress:** tempod exposes a resume
+/// endpoint and the shell calls it after handoff, but that endpoint only moves
+/// the paused run back to the runnable state. It does not itself drive another
+/// decided-loop turn, so the next live observation is still responsible for
+/// re-emitting takeover if the human has not cleared the challenge.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TakeoverBanner {
     /// The latched takeover the human must resolve, if any.
@@ -229,8 +229,8 @@ impl TakeoverBanner {
     }
 
     /// Human clicked Resume: clear the local block. See the type docs — this does
-    /// not auto-continue past an unresolved challenge, and the actual run-resume
-    /// wire call is a documented follow-up.
+    /// not auto-continue past an unresolved challenge, and the wire resume only
+    /// marks the run runnable after handoff.
     pub fn resume(&mut self) {
         self.pending = None;
     }
@@ -292,7 +292,8 @@ impl JournalLog {
 
     /// Human clicked Resume: clear the blocking takeover banner. See
     /// [`TakeoverBanner::resume`] — this never auto-continues past an unresolved
-    /// challenge, and the run-resume wire call is a documented follow-up.
+    /// challenge, and the run-resume wire call only marks the run runnable after
+    /// handoff.
     pub fn resume_takeover(&mut self) {
         self.takeover.resume();
     }
