@@ -3045,6 +3045,7 @@ mod tests {
             observation: observation(0),
         })?;
         journal.append(JournalEvent::ModelDecision {
+            correction: None,
             actions: vec![action.clone()],
             rationale: Some("scroll down".into()),
             input_tokens: 320,

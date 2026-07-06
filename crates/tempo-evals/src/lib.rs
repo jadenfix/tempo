@@ -2268,6 +2268,7 @@ mod tests {
             node: NodeId("submit".into()),
         };
         journal.append(JournalEvent::ModelDecision {
+            correction: None,
             actions: vec![action.clone()],
             rationale: Some("click submit".into()),
             input_tokens: 1_000,
