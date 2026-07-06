@@ -677,7 +677,9 @@ pub fn diff_observations(
     for element in &current.elements {
         match previous_by_id.get(element.node_id.0.as_str()) {
             None => added.push(element.clone()),
-            Some(previous_element) if *previous_element != element => changed.push(element.clone()),
+            Some(previous_element) if element_changed(previous_element, element) => {
+                changed.push(element.clone())
+            }
             Some(_) => {}
         }
     }
@@ -697,6 +699,28 @@ pub fn diff_observations(
         removed,
         changed,
     }
+}
+
+const DIFF_BOUNDS_BUCKET_PX: f32 = 8.0;
+
+fn element_changed(previous: &InteractiveElement, current: &InteractiveElement) -> bool {
+    previous.role != current.role
+        || previous.name != current.name
+        || previous.value != current.value
+        || bounds_bucket(previous.bounds) != bounds_bucket(current.bounds)
+}
+
+fn bounds_bucket(bounds: Option<[f32; 4]>) -> Option<[i32; 4]> {
+    bounds.map(|bounds| bounds.map(quantize_bound))
+}
+
+fn quantize_bound(value: f32) -> i32 {
+    if !value.is_finite() {
+        return 0;
+    }
+    (value / DIFF_BOUNDS_BUCKET_PX)
+        .floor()
+        .clamp(i32::MIN as f32, i32::MAX as f32) as i32
 }
 
 /// Compile a recorded fixture corpus and emit budget, stable-ID, and diff evidence.
@@ -1885,6 +1909,54 @@ mod tests {
         assert_eq!(diff.removed.len(), 1);
         assert_eq!(diff.changed.len(), 1);
         assert_eq!(diff.changed[0].name[0].text, "Email address");
+    }
+
+    #[test]
+    fn diff_ignores_rank_and_same_bucket_bounds_churn() {
+        let previous = make_observation(
+            "https://layout.example",
+            1,
+            vec![test_element("node:stable", "button", 0.7)],
+            1,
+        );
+        let mut current_element = test_element("node:stable", "button", 1.1);
+        current_element.bounds = Some([7.9, 7.9, 15.9, 15.9]);
+        let current = make_observation("https://layout.example", 2, vec![current_element], 1);
+
+        let diff = diff_observations(&previous, &current);
+
+        assert!(diff.added.is_empty());
+        assert!(diff.removed.is_empty());
+        assert!(diff.changed.is_empty());
+    }
+
+    #[test]
+    fn diff_reports_bounds_bucket_and_content_changes() {
+        let previous = make_observation(
+            "https://layout.example",
+            1,
+            vec![
+                test_element("node:moved", "button", 0.7),
+                test_element("node:renamed", "link", 0.6),
+            ],
+            2,
+        );
+        let mut moved = test_element("node:moved", "button", 0.7);
+        moved.bounds = Some([8.0, 0.0, 10.0, 10.0]);
+        let mut renamed = test_element("node:renamed", "link", 0.6);
+        renamed.name = vec![page_span("Different label")];
+        let current = make_observation("https://layout.example", 2, vec![moved, renamed], 2);
+
+        let diff = diff_observations(&previous, &current);
+
+        let changed_ids: HashSet<&str> = diff
+            .changed
+            .iter()
+            .map(|element| element.node_id.0.as_str())
+            .collect();
+        assert_eq!(changed_ids.len(), 2);
+        assert!(changed_ids.contains("node:moved"));
+        assert!(changed_ids.contains("node:renamed"));
     }
 
     #[test]

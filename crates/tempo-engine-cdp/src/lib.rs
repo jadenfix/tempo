@@ -30,7 +30,7 @@ use chromiumoxide::error::CdpError;
 use chromiumoxide::handler::HandlerConfig;
 use chromiumoxide::page::{Page, ScreenshotParams};
 use futures::{future::join_all, StreamExt};
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -40,7 +40,9 @@ use tempo_driver::{
     Unsupported, MAX_SCREENSHOT_BYTES, MAX_SCREENSHOT_HEIGHT, MAX_SCREENSHOT_WIDTH,
 };
 use tempo_net::UrlPolicy;
-use tempo_observe::{finalize_observation, CompileOptions, RawElement, StableIdMapper};
+use tempo_observe::{
+    diff_observations, finalize_observation, CompileOptions, RawElement, StableIdMapper,
+};
 use tempo_schema::{
     Action, ActionBatch, CompiledObservation, InteractiveElement, NodeId, ObservationDiff,
     Provenance, QuiescencePolicy, TaintSpan,
@@ -3055,45 +3057,8 @@ fn diff_from_base(
         };
     };
 
-    let before: HashMap<_, _> = base
-        .elements
-        .iter()
-        .map(|element| (element.node_id.0.clone(), element))
-        .collect();
-    let after: HashMap<_, _> = current
-        .elements
-        .iter()
-        .map(|element| (element.node_id.0.clone(), element))
-        .collect();
-
-    let added = after
-        .iter()
-        .filter(|(node, _)| !before.contains_key(*node))
-        .map(|(_, element)| (*element).clone())
-        .collect();
-    let removed = before
-        .iter()
-        .filter(|(node, _)| !after.contains_key(*node))
-        .map(|(_, element)| element.node_id.clone())
-        .collect();
-    let changed = after
-        .iter()
-        .filter_map(|(node, element)| {
-            before
-                .get(node)
-                .filter(|previous| *previous != element)
-                .map(|_| (*element).clone())
-        })
-        .collect();
-
-    ObservationDiff {
-        since_seq,
-        seq: current.seq,
-        omitted: current.omitted,
-        added,
-        removed,
-        changed,
-    }
+    debug_assert_eq!(base.seq, since_seq);
+    diff_observations(base, current)
 }
 
 fn extract_interactive_elements(html: &str) -> Vec<InteractiveElement> {
@@ -4039,6 +4004,46 @@ mod tests {
         assert_eq!(diff.removed, vec![NodeId("a[href=\"/a\"]".into())]);
         assert_eq!(diff.changed.len(), 1);
         assert_eq!(diff.changed[0].node_id, NodeId("[id=\"save\"]".into()));
+    }
+
+    #[test]
+    fn cdp_diff_uses_shared_layout_churn_comparison() {
+        let before = CompiledObservation {
+            schema_version: tempo_schema::SCHEMA_VERSION.into(),
+            url: "https://example.com".into(),
+            seq: 1,
+            elements: vec![InteractiveElement {
+                node_id: NodeId("node:stable".into()),
+                role: "button".into(),
+                name: page_taint("Stable"),
+                value: Vec::new(),
+                bounds: Some([0.0, 0.0, 10.0, 10.0]),
+                rank: 0.5,
+            }],
+            omitted: 0,
+            marks: Vec::new(),
+        };
+        let after = CompiledObservation {
+            schema_version: tempo_schema::SCHEMA_VERSION.into(),
+            url: "https://example.com".into(),
+            seq: 2,
+            elements: vec![InteractiveElement {
+                node_id: NodeId("node:stable".into()),
+                role: "button".into(),
+                name: page_taint("Stable"),
+                value: Vec::new(),
+                bounds: Some([7.9, 7.9, 15.9, 15.9]),
+                rank: 1.1,
+            }],
+            omitted: 0,
+            marks: Vec::new(),
+        };
+
+        let diff = diff_from_base(Some(&before), &after, before.seq);
+
+        assert!(diff.added.is_empty());
+        assert!(diff.removed.is_empty());
+        assert!(diff.changed.is_empty());
     }
 
     #[test]
