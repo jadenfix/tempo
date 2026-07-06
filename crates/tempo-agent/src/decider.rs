@@ -1891,7 +1891,7 @@ mod tests {
             &journal_path,
             AgentRunIds::new("run-decided-cached", "session-decided-cached"),
         )
-        .with_confirmation_mode(ConfirmationMode::AutoConfirmClean);
+        .with_confirmation_mode(ConfirmationMode::AutoConfirmAll);
         let mut decider = ScriptedDecider::new(vec![vec![click("submit")], vec![]]);
         let spec = DecidedTaskSpec::new("https://example.com", "click submit");
 
@@ -3266,7 +3266,7 @@ mod tests {
             &journal,
             AgentRunIds::new("run-stale-cache", "session-stale-cache"),
         )
-        .with_confirmation_mode(ConfirmationMode::AutoConfirmClean)
+        .with_confirmation_mode(ConfirmationMode::AutoConfirmAll)
         .run_decided_task(&mut driver, &mut decider, &spec)
         .await?;
 
