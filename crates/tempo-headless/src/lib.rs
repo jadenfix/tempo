@@ -9410,6 +9410,104 @@ mod tests {
     }
 
     #[test]
+    fn agent_runner_uses_attached_driver_cached_observation_after_skill_batch() -> TestResult {
+        let root = unique_dir("attached-driver-cached-observation")?;
+        remove_dir_if_exists(&root)?;
+        std::fs::create_dir_all(&root)?;
+        let skills_root = root.join("skills");
+        let store = tempo_skills::SkillStore::open(&skills_root)?;
+        store.put(&tempo_skills::SkillDefinition {
+            name: "cached_scroll".into(),
+            version: "1".into(),
+            description: "scroll without re-observing".into(),
+            side_effect: SideEffect::Read,
+            inputs: Vec::new(),
+            quiescence: QuiescencePolicy::Composite,
+            steps: vec![tempo_skills::ActionTemplate::Scroll { x: 0.0, y: 4.0 }],
+        })?;
+
+        let mut pool = SessionPool::default();
+        let handle = attach_driver_handler_seq(&mut pool, 3, |request| match request.command {
+            HostDriverCommand::Goto { url } => {
+                assert_eq!(url, "https://attached-cache.test");
+                DriverResponse::Observation {
+                    observation: observation("https://attached-cache.test", 1),
+                }
+            }
+            HostDriverCommand::ActBatch { batch } => {
+                assert_eq!(
+                    batch,
+                    ActionBatch {
+                        actions: vec![Action::Scroll { x: 0.0, y: 4.0 }],
+                        quiescence: QuiescencePolicy::Composite,
+                    }
+                );
+                DriverResponse::Step {
+                    outcome: StepOutcome::Applied {
+                        diff: ObservationDiff {
+                            since_seq: 1,
+                            seq: 2,
+                            omitted: 0,
+                            added: Vec::new(),
+                            removed: Vec::new(),
+                            changed: Vec::new(),
+                        },
+                    }
+                    .into(),
+                }
+            }
+            HostDriverCommand::CachedObservation { seq } => {
+                assert_eq!(seq, 2);
+                DriverResponse::CachedObservation {
+                    observation: Some(observation("https://attached-cache.test", 2)),
+                }
+            }
+            unexpected => {
+                panic!("unexpected driver request after cached batch path: {unexpected:?}")
+            }
+        })?;
+        let mut driver = pool
+            .driver
+            .clone()
+            .ok_or("attached engine driver should be present")?;
+        let journal_path = root.join("run.jsonl");
+        let task = tempo_agent::DriverTask::new(
+            "https://attached-cache.test",
+            vec![Action::Skill {
+                name: "cached_scroll".into(),
+                input: json!({}),
+            }],
+        );
+
+        let report = futures::executor::block_on(
+            tempo_agent::AgentRunner::new_plaintext_unsafe(
+                &journal_path,
+                tempo_agent::AgentRunIds::new("run-attached-cache", "session-attached-cache"),
+            )
+            .with_skill_store(&skills_root)
+            .run_driver_task(&mut driver, &task),
+        )?;
+
+        join_driver_handler(handle)?;
+        assert_eq!(report.status, tempo_agent::AgentRunStatus::Completed);
+        let observations: Vec<CompiledObservation> =
+            tempo_session::read_journal_entries(&journal_path)?
+                .into_iter()
+                .filter_map(|entry| match entry.event {
+                    tempo_session::JournalEvent::Observation { observation } => Some(observation),
+                    _ => None,
+                })
+                .collect();
+        let last = observations
+            .last()
+            .ok_or("attached runner should journal post-action observation")?;
+        assert_eq!(last.seq, 2);
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[test]
     fn adopted_waiting_run_allows_foreground_session_act_batch() -> TestResult {
         let mut pool = SessionPool::default();
         let handle = attach_driver_handler(&mut pool, |request| match request.command {

@@ -8645,6 +8645,8 @@ dependencies = [
  "tempo-observe",
  "tempo-policy",
  "tempo-schema",
+ "tempo-session",
+ "tempo-skills",
  "tempo-telemetry",
  "thiserror 2.0.18",
  "tokio",

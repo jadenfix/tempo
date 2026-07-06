@@ -884,6 +884,15 @@ fn serialized_json_len<T: Serialize>(value: &T) -> Result<usize, serde_json::Err
     Ok(sink.bytes)
 }
 
+pub(crate) fn cached_observation_for_seq<D>(driver: &D, seq: u64) -> Option<CompiledObservation>
+where
+    D: DriverTrait + ?Sized,
+{
+    driver
+        .cached_observation(seq)
+        .filter(|observation| observation.seq == seq)
+}
+
 /// Measured observation size for evals and budget reports.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObservationBudget {
@@ -1164,7 +1173,7 @@ impl AgentRunner {
             let triple = agent.record_next_outcome(outcome)?;
             report.actions_completed += 1;
 
-            let next_observation = match driver.cached_observation(post_action_seq) {
+            let next_observation = match cached_observation_for_seq(driver, post_action_seq) {
                 Some(observation) => observation,
                 None => driver.observe().await.map_err(|source| {
                     journal_transport_error(&mut agent, "post-action observe", source)
@@ -3693,6 +3702,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runner_rejects_stale_cached_observation_before_next_context() -> TestResult {
+        let root = unique_dir("runner-stale-cache")?;
+        remove_dir_if_exists(&root)?;
+        fs::create_dir_all(&root)?;
+        let journal_path = root.join("session.jsonl");
+        let task = DriverTask::new(
+            "https://example.com",
+            vec![Action::Click {
+                node: NodeId("submit".into()),
+            }],
+        );
+        let mut driver = StaleCacheRunnerDriver::new();
+        let runner = AgentRunner::new_plaintext_unsafe(
+            &journal_path,
+            AgentRunIds::new("run-stale-cache", "session-stale-cache"),
+        )
+        .with_confirmation_mode(ConfirmationMode::AutoConfirmAll);
+
+        let report = runner.run_driver_task(&mut driver, &task).await?;
+
+        assert_eq!(report.status, AgentRunStatus::Completed);
+        assert_eq!(driver.post_action_observe_calls, 1);
+        let observations: Vec<CompiledObservation> = read_journal_entries(&journal_path)?
+            .into_iter()
+            .filter_map(|entry| match entry.event {
+                JournalEvent::Observation { observation } => Some(observation),
+                _ => None,
+            })
+            .collect();
+        let last = observations.last().ok_or("no observation journaled")?;
+        assert_eq!(last.seq, 2, "stale seq=1 cache entry was journaled");
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn runner_expands_persisted_skill_and_journals_original_action() -> TestResult {
         let root = unique_dir("runner-skill")?;
         remove_dir_if_exists(&root)?;
@@ -5352,6 +5398,86 @@ mod tests {
             ))
         } else {
             None
+        }
+    }
+
+    struct StaleCacheRunnerDriver {
+        inner: TestDriver,
+        stale_observation: Option<CompiledObservation>,
+        post_action_observe_calls: usize,
+    }
+
+    impl StaleCacheRunnerDriver {
+        fn new() -> Self {
+            Self {
+                inner: TestDriver::new().with_elements(vec![button("submit")]),
+                stale_observation: None,
+                post_action_observe_calls: 0,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl DriverTrait for StaleCacheRunnerDriver {
+        fn engine(&self) -> Engine {
+            Engine::Test
+        }
+
+        async fn goto(&mut self, url: &str) -> Result<CompiledObservation, TransportError> {
+            let observation = self.inner.goto(url).await?;
+            self.stale_observation = Some(observation.clone());
+            Ok(observation)
+        }
+
+        async fn observe(&mut self) -> Result<CompiledObservation, TransportError> {
+            self.post_action_observe_calls += 1;
+            self.inner.observe().await
+        }
+
+        async fn observe_diff(
+            &mut self,
+            since_seq: u64,
+        ) -> Result<ObservationDiff, TransportError> {
+            self.inner.observe_diff(since_seq).await
+        }
+
+        fn cached_observation(&self, _seq: u64) -> Option<CompiledObservation> {
+            self.stale_observation.clone()
+        }
+
+        async fn act(&mut self, action: &Action) -> Result<StepOutcome, TransportError> {
+            self.inner.act(action).await
+        }
+
+        async fn act_batch(&mut self, batch: &ActionBatch) -> Result<StepOutcome, TransportError> {
+            self.inner.act_batch(batch).await
+        }
+
+        async fn fork(&mut self) -> Result<Box<dyn DriverTrait>, tempo_driver::Unsupported> {
+            self.inner.fork().await
+        }
+
+        async fn extract(
+            &mut self,
+            node: &NodeId,
+        ) -> Result<tempo_driver::TaintedValue, TransportError> {
+            self.inner.extract(node).await
+        }
+
+        async fn evaluate_script(
+            &mut self,
+            expression: &str,
+            await_promise: bool,
+        ) -> Result<tempo_driver::TaintedValue, TransportError> {
+            self.inner.evaluate_script(expression, await_promise).await
+        }
+
+        async fn screenshot(&mut self) -> Result<Vec<u8>, TransportError> {
+            self.inner.screenshot().await
+        }
+
+        async fn close(&mut self) -> Result<(), TransportError> {
+            self.inner.close().await
         }
     }
 

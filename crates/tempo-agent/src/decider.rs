@@ -17,8 +17,9 @@
 //!   ceiling is a typed, journal-derived stop, never a panic.
 
 use crate::{
-    is_policy_denial_reason, policy_denied_reason, read_body_capped, AgentError, AgentRunner,
-    CappedBodyError, DriverStep, IdempotencyKey, TokenBudget, RESUME_INTERRUPTED_REASON,
+    cached_observation_for_seq, is_policy_denial_reason, policy_denied_reason, read_body_capped,
+    AgentError, AgentRunner, CappedBodyError, DriverStep, IdempotencyKey, TokenBudget,
+    RESUME_INTERRUPTED_REASON,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -1131,8 +1132,9 @@ impl AgentRunner {
     /// other cases fall back to a full observe.
     ///
     /// Correctness gates (any failure falls back to a full `observe()`):
-    ///   * a cached observation is accepted for any action because it carries
-    ///     the driver's fresh URL and canonical element order;
+    ///   * a matching-sequence cached observation is accepted for any action
+    ///     because it carries the driver's fresh URL and canonical element
+    ///     order;
     ///   * without cache, navigating actions (`Goto`/`Click`/`Type`/`Select`/
     ///     `Skill`) still full-observe because a diff carries no URL;
     ///   * without cache, a diff that adds an element, was not computed against
@@ -1149,7 +1151,7 @@ impl AgentRunner {
     where
         D: DriverTrait + ?Sized,
     {
-        if let Some(observation) = driver.cached_observation(diff.seq) {
+        if let Some(observation) = cached_observation_for_seq(driver, diff.seq) {
             return self.record_decided_observation(
                 state,
                 observation,
@@ -2835,6 +2837,7 @@ mod tests {
         history: std::collections::HashMap<u64, CompiledObservation>,
         reject_diff: bool,
         cache_observations: bool,
+        stale_cached_observations: bool,
         /// When set, the next `act` navigates the page to this URL — models a
         /// `<select onchange=location=…>` / input-handler redirect.
         navigate_on_act: Option<String>,
@@ -2855,6 +2858,7 @@ mod tests {
                 history: std::collections::HashMap::new(),
                 reject_diff,
                 cache_observations: true,
+                stale_cached_observations: false,
                 navigate_on_act: None,
                 calls: Arc::new(Mutex::new(Vec::new())),
             }
@@ -2862,6 +2866,11 @@ mod tests {
 
         fn without_cached_observations(mut self) -> Self {
             self.cache_observations = false;
+            self
+        }
+
+        fn with_stale_cached_observations(mut self) -> Self {
+            self.stale_cached_observations = true;
             self
         }
 
@@ -3001,6 +3010,11 @@ mod tests {
             }
             if !self.cache_observations {
                 return None;
+            }
+            if self.stale_cached_observations {
+                return seq
+                    .checked_sub(1)
+                    .and_then(|base| self.history.get(&base).cloned());
             }
             self.history.get(&seq).cloned()
         }
@@ -3228,6 +3242,43 @@ mod tests {
         assert_eq!(
             last.url, "https://evil.example.net/",
             "post-navigation observation carried a stale URL (origin not recomputed)"
+        );
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn decided_rejects_stale_cached_observation_before_policy_recompute() -> TestResult {
+        let (root, journal) = journal_root("incremental-observe-stale-cache")?;
+        let mut driver =
+            DiffDriver::new(vec![el("sel", 0.9)], vec![], false).with_stale_cached_observations();
+        driver.navigate_on_act = Some("https://evil.example.net/".into());
+        let calls = Arc::clone(&driver.calls);
+        let mut decider = ScriptedDecider::new(vec![vec![select_action("sel")], vec![]]);
+        let spec = DecidedTaskSpec::new("https://example.com", "select a jump menu");
+
+        AgentRunner::new(
+            &journal,
+            AgentRunIds::new("run-stale-cache", "session-stale-cache"),
+        )
+        .with_confirmation_mode(ConfirmationMode::AutoConfirmClean)
+        .run_decided_task(&mut driver, &mut decider, &spec)
+        .await?;
+
+        let entries = read_journal_entries(&journal)?;
+        let last = observation_events(&entries)
+            .pop()
+            .ok_or("no observation journaled")?;
+        assert_eq!(
+            last.url, "https://evil.example.net/",
+            "stale cached observation was accepted before origin recompute"
+        );
+        let calls = calls.lock().map_err(|_| "poisoned")?.clone();
+        assert!(calls.contains(&"cached_observation"));
+        assert!(
+            calls.contains(&"observe"),
+            "stale cache should fall back to a full post-action observe"
         );
 
         remove_dir_if_exists(&root)?;

@@ -44,6 +44,8 @@ url = "2"
 
 [dev-dependencies]
 tempo-driver = { path = "../tempo-driver", features = ["test-driver"] }
+tempo-session = { path = "../tempo-session" }
+tempo-skills = { path = "../tempo-skills" }
 # In-process router tests drive the axum Router directly via ServiceExt::oneshot.
 tower = { version = "0.5", features = ["util"] }
 
