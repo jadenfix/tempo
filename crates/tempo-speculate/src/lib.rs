@@ -754,7 +754,7 @@ mod tests {
             vec![("content-type".into(), "application/json".into())],
             br#"{"ok":true}"#.to_vec(),
         );
-        let cassette_store = CassetteStore::open(&cassette_path)?;
+        let cassette_store = CassetteStore::open_plaintext_unsafe(&cassette_path)?;
         cassette_store.record(&cassette)?;
 
         let mut journal = SessionJournal::open(
@@ -859,7 +859,7 @@ mod tests {
         fs::create_dir_all(&root)?;
         let journal_path = root.join("session.jsonl");
         let cassette_path = root.join("cassettes.jsonl");
-        CassetteStore::open(&cassette_path)?;
+        CassetteStore::open_plaintext_unsafe(&cassette_path)?;
 
         let key = CassetteKey("required".into());
         let mut journal = SessionJournal::open(
@@ -890,7 +890,7 @@ mod tests {
         fs::create_dir_all(&root)?;
         let journal_path = root.join("session.jsonl");
         let cassette_path = root.join("cassettes.jsonl");
-        CassetteStore::open(&cassette_path)?;
+        CassetteStore::open_plaintext_unsafe(&cassette_path)?;
 
         let mut journal = SessionJournal::open(
             &journal_path,
