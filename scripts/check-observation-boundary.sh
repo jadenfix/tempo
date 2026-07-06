@@ -38,6 +38,8 @@ violations="$(
     crates/tempo-bidi/src \
     crates/tempo-agent/src \
     crates/tempo-engine-host/src \
+    crates/tempo-session/src \
+    crates/tempo-driver/src \
     crates/tempo-schema/src \
     || true
 )"
