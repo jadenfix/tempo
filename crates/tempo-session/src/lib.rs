@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::fs::{File, OpenOptions, TryLockError};
-use std::io::{Read as _, Seek as _, SeekFrom, Write};
+use std::io::{BufRead as _, BufReader, Read as _, Seek as _, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -735,25 +735,28 @@ impl CassetteStore {
 
         let base = index.indexed_bytes;
         file.seek(SeekFrom::Start(base))?;
-        let mut tail = Vec::with_capacity((file_len - base) as usize);
-        file.read_to_end(&mut tail)?;
-
-        let mut cursor = 0usize;
-        while cursor < tail.len() {
-            let newline = tail[cursor..].iter().position(|byte| *byte == b'\n');
-            let (line_end, terminated) = match newline {
-                Some(relative) => (cursor + relative, true),
-                None => (tail.len(), false),
-            };
-            let raw = &tail[cursor..line_end];
+        let mut reader = BufReader::new(file);
+        let mut line = Vec::new();
+        let mut cursor = 0_u64;
+        loop {
+            line.clear();
+            let bytes_read = reader.read_until(b'\n', &mut line)?;
+            if bytes_read == 0 {
+                break;
+            }
+            let terminated = line.last() == Some(&b'\n');
+            if terminated {
+                line.pop();
+            }
+            let raw = line.as_slice();
             let line_number = index.indexed_lines + 1;
 
             if raw.iter().all(u8::is_ascii_whitespace) {
                 if !terminated {
                     break;
                 }
-                cursor = line_end + 1;
-                index.indexed_bytes = base + cursor as u64;
+                cursor += bytes_read as u64;
+                index.indexed_bytes = base + cursor;
                 index.indexed_lines = line_number;
                 continue;
             }
@@ -804,15 +807,15 @@ impl CassetteStore {
                 }
             };
             let span = CassetteSpan {
-                offset: base + cursor as u64,
+                offset: base + cursor,
                 len: raw.len(),
             };
             // First writer wins, matching the whole-file scan which returned
             // the earliest record for a key.
             index.by_key.entry(record.key).or_insert(span);
             if terminated {
-                cursor = line_end + 1;
-                index.indexed_bytes = base + cursor as u64;
+                cursor += bytes_read as u64;
+                index.indexed_bytes = base + cursor;
                 index.indexed_lines = line_number;
             } else {
                 // Complete record without a trailing newline (crash between
