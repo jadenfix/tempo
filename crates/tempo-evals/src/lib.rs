@@ -773,6 +773,7 @@ fn metric_samples(
                     .step_breakdowns
                     .iter()
                     .map(step_field)
+                    .filter(|sample| *sample != 0)
                     .collect::<Vec<_>>()
             } else {
                 direct.clone()
@@ -2374,6 +2375,53 @@ mod tests {
         assert_eq!(report.step_breakdowns[1].decode_ms, 220);
         assert_eq!(report.subsystems[0].subsystem, "decode");
         assert_eq!(report.subsystems[0].total_ms, 400);
+        Ok(())
+    }
+
+    #[test]
+    fn e2e_budget_report_does_not_count_missing_step_metrics_as_zero_samples() -> TestResult {
+        let mut eval_record = record(
+            "missing",
+            "https://e2e.test",
+            Lane::Cdp,
+            true,
+            false,
+            1_000,
+            0,
+        );
+        eval_record.observe_latencies_ms = Vec::new();
+        eval_record.action_latencies_ms = Vec::new();
+        eval_record.step_breakdowns = vec![E2eStepBreakdown {
+            step_index: 0,
+            input_tokens: 100,
+            output_tokens: 20,
+            cache_read_input_tokens: 10,
+            prefill_ms: 0,
+            decode_ms: 0,
+            observe_ms: 0,
+            act_ms: 0,
+            settle_ms: 0,
+            act_to_settled_ms: 0,
+        }];
+
+        let report = E2eBudgetReport::from_records(&[eval_record], &E2eLatencyBudget::default())?;
+
+        let observe = report
+            .subsystems
+            .iter()
+            .find(|row| row.subsystem == "observe")
+            .ok_or("missing observe subsystem")?;
+        let decode = report
+            .subsystems
+            .iter()
+            .find(|row| row.subsystem == "decode")
+            .ok_or("missing decode subsystem")?;
+        assert_eq!(observe.samples, 0);
+        assert_eq!(observe.total_ms, 0);
+        assert_eq!(decode.samples, 0);
+        assert_eq!(decode.total_ms, 0);
+        assert_eq!(report.input_tokens, 100);
+        assert_eq!(report.step_breakdowns.len(), 1);
         Ok(())
     }
 
