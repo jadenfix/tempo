@@ -6,14 +6,20 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tempo_headless::{TempodSession, TempodSessionEvents, TempodSessionId};
-use tempo_schema::AdoptionLease;
+use tempo_schema::{
+    Action, ActionBatch, AdoptionLease, AgentRun, ConfirmationGrant, QuiescencePolicy,
+};
 use thiserror::Error;
 
 pub mod agent;
+pub mod surface;
 pub mod tab;
 pub mod transport;
 pub mod ui;
@@ -31,6 +37,7 @@ const MCP_SCREENSHOT_RESPONSE_OVERHEAD_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_MAX_MCP_RESPONSE_BYTES: usize =
     ENGINE_HOST_MAX_SCREENSHOT_BYTES.div_ceil(3) * 4 + MCP_SCREENSHOT_RESPONSE_OVERHEAD_BYTES;
 const MAX_RESPONSE_HEADER_BYTES: usize = 64 * 1024;
+static NEXT_NAVIGATION_ATTEMPT: AtomicU64 = AtomicU64::new(1);
 
 const USAGE: &str = "\
 tempo-shell
@@ -40,6 +47,8 @@ Commands:
   sessions
   open URL
   adopt SESSION_ID
+  handoff SESSION_ID
+  resume RUN_ID
   events SESSION_ID [AFTER_SEQ]
   close SESSION_ID
   agent-card
@@ -143,6 +152,12 @@ pub enum ShellCommand {
     Adopt {
         session_id: String,
     },
+    Handoff {
+        session_id: String,
+    },
+    Resume {
+        run_id: String,
+    },
     Events {
         session_id: String,
         after_seq: Option<u64>,
@@ -176,6 +191,8 @@ impl ShellCommand {
             Self::Sessions => write_json(stdout, &client.sessions()?),
             Self::Open { url } => write_json(stdout, &client.open(url)?),
             Self::Adopt { session_id } => write_json(stdout, &client.adopt(session_id)?),
+            Self::Handoff { session_id } => write_json(stdout, &client.handoff(session_id)?),
+            Self::Resume { run_id } => write_json(stdout, &client.resume_run(run_id)?),
             Self::Events {
                 session_id,
                 after_seq,
@@ -280,6 +297,16 @@ impl ShellClient {
         self.session_by_id(&lease.session_id)
     }
 
+    pub fn handoff(&self, session_id: &str) -> Result<TempodSession, ShellError> {
+        let path = format!("/sessions/{}/handoff", safe_path_segment(session_id)?);
+        self.request_json("POST", &path, None::<serde_json::Value>)
+    }
+
+    pub fn resume_run(&self, run_id: &str) -> Result<AgentRun, ShellError> {
+        let path = format!("/runs/{}/resume", safe_path_segment(run_id)?);
+        self.request_json("POST", &path, None::<serde_json::Value>)
+    }
+
     pub fn events(
         &self,
         session_id: &str,
@@ -291,6 +318,19 @@ impl ShellClient {
             path.push_str(&after_seq.to_string());
         }
         self.request_json("GET", &path, None::<serde_json::Value>)
+    }
+
+    pub fn confirm(
+        &self,
+        session_id: &str,
+        confirmation_id: &str,
+    ) -> Result<ConfirmationGrant, ShellError> {
+        let path = format!(
+            "/sessions/{}/confirmations/{}",
+            safe_path_segment(session_id)?,
+            safe_path_segment(confirmation_id)?
+        );
+        self.request_json("POST", &path, None::<serde_json::Value>)
     }
 
     pub fn close(&self, session_id: &str) -> Result<TempodSession, ShellError> {
@@ -318,9 +358,9 @@ impl ShellClient {
     }
 
     /// Navigate `driver_id` (or the default attached driver) to `url` via the
-    /// `act` MCP tool with an [`Action::Goto`]. This is the omnibox/back/forward
-    /// primitive: there is no native history in `DriverTrait`, so the shell
-    /// re-issues a `goto` for every navigation.
+    /// root `act` MCP tool. This remains for the CLI/legacy attached-driver
+    /// path; foreground browser tabs should use [`Self::goto_session`] so they
+    /// are isolated to their shared tempod session.
     pub fn goto(&self, driver_id: Option<&str>, url: &str) -> Result<(), ShellError> {
         let action = serde_json::to_value(tempo_schema::Action::Goto {
             url: url.to_string(),
@@ -331,6 +371,71 @@ impl ShellClient {
         }
         self.mcp_tool("act", arguments)?;
         Ok(())
+    }
+
+    /// Navigate one managed session. This is the foreground-shell primitive:
+    /// humans and agents share the same tempod session object, so tab actions
+    /// must be scoped by session id instead of a process-global MCP driver id.
+    /// Foreground navigation uses REST `act_batch`, not MCP, because `act_batch`
+    /// is the protocol route with server-minted confirmation grants.
+    pub fn goto_session(&self, session_id: &str, url: &str) -> Result<(), ShellError> {
+        self.goto_session_with_confirmation_grant(session_id, url, None)
+    }
+
+    pub fn goto_session_confirmed(
+        &self,
+        session_id: &str,
+        url: &str,
+        grant: &ConfirmationGrant,
+    ) -> Result<(), ShellError> {
+        self.goto_session_with_confirmation_grant(session_id, url, Some(grant))
+    }
+
+    fn goto_session_with_confirmation_grant(
+        &self,
+        session_id: &str,
+        url: &str,
+        grant: Option<&ConfirmationGrant>,
+    ) -> Result<(), ShellError> {
+        let batch = ActionBatch {
+            actions: vec![Action::Goto {
+                url: url.to_string(),
+            }],
+            quiescence: QuiescencePolicy::Composite,
+        };
+        let outcome = self.session_act_batch(
+            session_id,
+            &batch,
+            Some(false),
+            Some(&foreground_navigation_idempotency_key(session_id, url)),
+            grant,
+        )?;
+        ensure_session_act_batch_applied(&outcome)?;
+        Ok(())
+    }
+
+    fn session_act_batch(
+        &self,
+        session_id: &str,
+        batch: &ActionBatch,
+        input_tainted: Option<bool>,
+        idempotency_key: Option<&str>,
+        confirmation_grant: Option<&ConfirmationGrant>,
+    ) -> Result<Value, ShellError> {
+        let mut body = json!({
+            "batch": batch,
+        });
+        if let Some(input_tainted) = input_tainted {
+            body["input_tainted"] = json!(input_tainted);
+        }
+        if let Some(idempotency_key) = idempotency_key {
+            body["idempotency_key"] = json!(idempotency_key);
+        }
+        if let Some(confirmation_grant) = confirmation_grant {
+            body["confirmation_grant"] = serde_json::to_value(confirmation_grant)?;
+        }
+        let path = format!("/sessions/{}/act_batch", safe_path_segment(session_id)?);
+        self.request_json("POST", &path, Some(body))
     }
 
     /// Fetch a single-shot page snapshot from `driver_id` (or the default
@@ -354,10 +459,43 @@ impl ShellClient {
         tab::ScreenshotImage::from_structured(&structured)
     }
 
+    /// Fetch a screenshot for one managed session via session-scoped MCP.
+    pub fn screenshot_session(
+        &self,
+        session_id: &str,
+        set_of_marks: bool,
+    ) -> Result<tab::ScreenshotImage, ShellError> {
+        let mut arguments = json!({});
+        if set_of_marks {
+            arguments["set_of_marks"] = json!(true);
+        }
+        let structured = self.session_mcp_tool(session_id, "screenshot", arguments)?;
+        tab::ScreenshotImage::from_structured(&structured)
+    }
+
     pub fn mcp_tool(&self, name: &str, arguments: Value) -> Result<Value, ShellError> {
+        self.mcp_tool_at_path("/mcp", name, arguments)
+    }
+
+    pub fn session_mcp_tool(
+        &self,
+        session_id: &str,
+        name: &str,
+        arguments: Value,
+    ) -> Result<Value, ShellError> {
+        let path = format!("/sessions/{}/mcp", safe_path_segment(session_id)?);
+        self.mcp_tool_at_path(&path, name, arguments)
+    }
+
+    fn mcp_tool_at_path(
+        &self,
+        path: &str,
+        name: &str,
+        arguments: Value,
+    ) -> Result<Value, ShellError> {
         let envelope: Value = self.request_json_with_max_response_bytes(
             "POST",
-            "/mcp",
+            path,
             Some(json!({
                 "jsonrpc": "2.0",
                 "id": "tempo-shell",
@@ -489,6 +627,12 @@ fn parse_command(args: &[String]) -> Result<ShellCommand, ShellError> {
         "open" => one_arg(rest, "open URL", |url| ShellCommand::Open { url }),
         "adopt" => one_arg(rest, "adopt SESSION_ID", |session_id| ShellCommand::Adopt {
             session_id,
+        }),
+        "handoff" => one_arg(rest, "handoff SESSION_ID", |session_id| {
+            ShellCommand::Handoff { session_id }
+        }),
+        "resume" => one_arg(rest, "resume RUN_ID", |run_id| ShellCommand::Resume {
+            run_id,
         }),
         "events" => parse_events_command(rest),
         "close" => one_arg(rest, "close SESSION_ID", |session_id| ShellCommand::Close {
@@ -770,6 +914,47 @@ fn safe_path_segment(segment: &str) -> Result<&str, ShellError> {
     } else {
         Err(ShellError::Usage(format!("invalid session id: {segment}")))
     }
+}
+
+fn ensure_session_act_batch_applied(outcome: &Value) -> Result<(), ShellError> {
+    match outcome.get("status").and_then(Value::as_str) {
+        Some("applied") => Ok(()),
+        Some("step_error") => {
+            let reason = outcome
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("step error");
+            Err(ShellError::Protocol(format!(
+                "session act_batch step_error: {reason}"
+            )))
+        }
+        Some(status) => Err(ShellError::Protocol(format!(
+            "session act_batch returned unexpected status: {status}"
+        ))),
+        None => Err(ShellError::Protocol(
+            "session act_batch response missing status".into(),
+        )),
+    }
+}
+
+fn foreground_navigation_idempotency_key(session_id: &str, url: &str) -> String {
+    let attempt = NEXT_NAVIGATION_ATTEMPT.fetch_add(1, Ordering::Relaxed);
+    let now_nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let mut hasher = DefaultHasher::new();
+    "tempo-shell-goto-v2".hash(&mut hasher);
+    session_id.hash(&mut hasher);
+    url.hash(&mut hasher);
+    std::process::id().hash(&mut hasher);
+    now_nanos.hash(&mut hasher);
+    attempt.hash(&mut hasher);
+    format!(
+        "shell-goto-{}-{now_nanos:x}-{attempt:x}-{:016x}",
+        std::process::id(),
+        hasher.finish()
+    )
 }
 
 pub(crate) fn validate_auth_token(token: &str) -> Result<(), ShellError> {
@@ -1066,7 +1251,7 @@ mod tests {
 
     #[test]
     fn client_reads_real_tempod_agent_card() -> TestResult {
-        let pool = Arc::new(Mutex::new(SessionPool::default()));
+        let pool = test_session_pool();
         let card = with_tempod(&pool, |addr| {
             ShellClient::new(addr.to_string()).agent_card()
         })?;
@@ -1118,7 +1303,7 @@ mod tests {
 
     #[test]
     fn client_runs_driverless_handshake_through_real_tempod_mcp() -> TestResult {
-        let pool = Arc::new(Mutex::new(SessionPool::default()));
+        let pool = test_session_pool();
         let result = with_tempod(&pool, |addr| {
             ShellClient::new(addr.to_string()).mcp_tool(
                 "handshake",
@@ -1289,6 +1474,145 @@ mod tests {
             Err(_) => return Err("server thread failed".into()),
         }
         Ok(())
+    }
+
+    #[test]
+    fn session_screenshot_posts_to_session_scoped_mcp_route() -> TestResult {
+        let body = serde_json::to_vec(&json!({
+            "jsonrpc": "2.0",
+            "id": "tempo-shell",
+            "result": {
+                "structuredContent": {
+                    "mime_type": "image/png",
+                    "encoding": "base64",
+                    "set_of_marks": true,
+                    "data": "QUJD",
+                }
+            }
+        }))?;
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
+        let handle = thread::spawn(move || -> Result<(), std::io::Error> {
+            let (mut stream, _) = listener.accept()?;
+            let mut request = Vec::new();
+            stream.read_to_end(&mut request)?;
+            let _ = request_tx.send(String::from_utf8_lossy(&request).to_string());
+            let header = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            write_fixture_response(&mut stream, header.as_bytes())?;
+            write_fixture_response(&mut stream, &body)
+        });
+
+        let image = ShellClient::new(addr.to_string()).screenshot_session("session-123", true)?;
+        let request = request_rx.recv_timeout(Duration::from_secs(1))?;
+
+        assert!(request.starts_with("POST /sessions/session-123/mcp HTTP/1.1"));
+        assert!(request.contains("\"name\":\"screenshot\""));
+        assert!(request.contains("\"set_of_marks\":true"));
+        assert!(image.set_of_marks);
+        match handle.join() {
+            Ok(result) => result?,
+            Err(_) => return Err("server thread failed".into()),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn session_goto_posts_to_confirmable_session_act_batch_route() -> TestResult {
+        let body = serde_json::to_vec(&json!({
+            "status": "applied",
+            "diff": {
+                "since_seq": 1,
+                "seq": 2,
+                "omitted": 0,
+                "added": [],
+                "removed": [],
+                "changed": []
+            },
+            "policy": {}
+        }))?;
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
+        let handle = thread::spawn(move || -> Result<(), std::io::Error> {
+            let (mut stream, _) = listener.accept()?;
+            let mut request = Vec::new();
+            stream.read_to_end(&mut request)?;
+            let _ = request_tx.send(String::from_utf8_lossy(&request).to_string());
+            let header = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            write_fixture_response(&mut stream, header.as_bytes())?;
+            write_fixture_response(&mut stream, &body)
+        });
+
+        ShellClient::new(addr.to_string()).goto_session("session-123", "https://pay.test")?;
+        let request = request_rx.recv_timeout(Duration::from_secs(1))?;
+
+        assert!(request.starts_with("POST /sessions/session-123/act_batch HTTP/1.1"));
+        assert!(request.contains("\"kind\":\"goto\""));
+        assert!(request.contains("\"url\":\"https://pay.test\""));
+        assert!(request.contains("\"input_tainted\":false"));
+        assert!(request.contains("\"idempotency_key\":\"shell-goto-"));
+        match handle.join() {
+            Ok(result) => result?,
+            Err(_) => return Err("server thread failed".into()),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn session_goto_rejects_step_error_act_batch_outcome() -> TestResult {
+        let body = serde_json::to_vec(&json!({
+            "status": "step_error",
+            "reason": "node not reachable",
+            "policy": {}
+        }))?;
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let handle = thread::spawn(move || -> Result<(), std::io::Error> {
+            let (mut stream, _) = listener.accept()?;
+            let mut request = Vec::new();
+            stream.read_to_end(&mut request)?;
+            let header = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            write_fixture_response(&mut stream, header.as_bytes())?;
+            write_fixture_response(&mut stream, &body)
+        });
+
+        let error = match ShellClient::new(addr.to_string())
+            .goto_session("session-123", "https://pay.test")
+        {
+            Ok(()) => return Err("step_error must not be treated as successful navigation".into()),
+            Err(error) => error,
+        };
+
+        assert!(
+            matches!(error, ShellError::Protocol(message) if message.contains("node not reachable"))
+        );
+        match handle.join() {
+            Ok(result) => result?,
+            Err(_) => return Err("server thread failed".into()),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn foreground_navigation_idempotency_key_is_per_attempt() {
+        let first = foreground_navigation_idempotency_key("session-123", "https://pay.test");
+        let second = foreground_navigation_idempotency_key("session-123", "https://pay.test");
+
+        assert!(first.starts_with("shell-goto-"));
+        assert!(second.starts_with("shell-goto-"));
+        assert_ne!(first, second);
+        assert!(first.len() <= 256);
+        assert!(second.len() <= 256);
     }
 
     #[test]

@@ -12,11 +12,13 @@
 //! a mock without a network.
 
 use crate::agent::JournalLog;
+use crate::surface::PendingConfirmationReplay;
 use crate::tab::{ScreenshotImage, Tab};
 use crate::{HealthResponse, ShellClient, ShellError};
 #[cfg(test)]
 use tempo_headless::TempodSessionEvent;
 use tempo_headless::{TempodSession, TempodSessionEvents, TempodSessionState};
+use tempo_schema::{AgentRun, ConfirmationGrant};
 
 /// One session row as shown in the list: the id/state/url triple the DoD asks
 /// for, flattened to display strings so the render layer stays trivial.
@@ -54,14 +56,23 @@ pub trait SessionService {
     fn sessions(&self) -> Result<Vec<TempodSession>, ShellError>;
     fn open(&self, url: &str) -> Result<TempodSession, ShellError>;
     fn adopt(&self, session_id: &str) -> Result<TempodSession, ShellError>;
+    fn handoff(&self, session_id: &str) -> Result<TempodSession, ShellError>;
+    fn resume_run(&self, run_id: &str) -> Result<AgentRun, ShellError>;
     fn close(&self, session_id: &str) -> Result<TempodSession, ShellError>;
-    /// Navigate a tab's driver to `url` (omnibox / back / forward).
-    fn goto(&self, driver_id: Option<&str>, url: &str) -> Result<(), ShellError>;
-    /// Fetch a single-shot page snapshot for a tab's driver, optionally with the
-    /// set-of-marks overlay drawn on it.
+    /// Navigate a tab's shared tempod session to `url` (omnibox / back / forward).
+    fn goto(&self, session_id: &str, url: &str) -> Result<(), ShellError>;
+    /// Replay a previously gated foreground navigation with a server grant.
+    fn goto_confirmed(
+        &self,
+        session_id: &str,
+        url: &str,
+        grant: &ConfirmationGrant,
+    ) -> Result<(), ShellError>;
+    /// Fetch a single-shot page snapshot for a tab's shared session, optionally
+    /// with the set-of-marks overlay drawn on it.
     fn screenshot(
         &self,
-        driver_id: Option<&str>,
+        session_id: &str,
         set_of_marks: bool,
     ) -> Result<ScreenshotImage, ShellError>;
     /// Poll the session's journal/event stream after `after_seq` (the agent panel).
@@ -70,6 +81,12 @@ pub trait SessionService {
         session_id: &str,
         after_seq: Option<u64>,
     ) -> Result<TempodSessionEvents, ShellError>;
+    /// Mint a server-side grant for a native confirmation request.
+    fn confirm(
+        &self,
+        session_id: &str,
+        confirmation_id: &str,
+    ) -> Result<ConfirmationGrant, ShellError>;
 }
 
 impl SessionService for ShellClient {
@@ -89,20 +106,37 @@ impl SessionService for ShellClient {
         ShellClient::adopt(self, session_id)
     }
 
+    fn handoff(&self, session_id: &str) -> Result<TempodSession, ShellError> {
+        ShellClient::handoff(self, session_id)
+    }
+
+    fn resume_run(&self, run_id: &str) -> Result<AgentRun, ShellError> {
+        ShellClient::resume_run(self, run_id)
+    }
+
     fn close(&self, session_id: &str) -> Result<TempodSession, ShellError> {
         ShellClient::close(self, session_id)
     }
 
-    fn goto(&self, driver_id: Option<&str>, url: &str) -> Result<(), ShellError> {
-        ShellClient::goto(self, driver_id, url)
+    fn goto(&self, session_id: &str, url: &str) -> Result<(), ShellError> {
+        ShellClient::goto_session(self, session_id, url)
+    }
+
+    fn goto_confirmed(
+        &self,
+        session_id: &str,
+        url: &str,
+        grant: &ConfirmationGrant,
+    ) -> Result<(), ShellError> {
+        ShellClient::goto_session_confirmed(self, session_id, url, grant)
     }
 
     fn screenshot(
         &self,
-        driver_id: Option<&str>,
+        session_id: &str,
         set_of_marks: bool,
     ) -> Result<ScreenshotImage, ShellError> {
-        ShellClient::screenshot(self, driver_id, set_of_marks)
+        ShellClient::screenshot_session(self, session_id, set_of_marks)
     }
 
     fn events(
@@ -111,6 +145,14 @@ impl SessionService for ShellClient {
         after_seq: Option<u64>,
     ) -> Result<TempodSessionEvents, ShellError> {
         ShellClient::events(self, session_id, after_seq)
+    }
+
+    fn confirm(
+        &self,
+        session_id: &str,
+        confirmation_id: &str,
+    ) -> Result<ConfirmationGrant, ShellError> {
+        ShellClient::confirm(self, session_id, confirmation_id)
     }
 }
 
@@ -145,11 +187,14 @@ pub enum UiAction {
     PollEvents,
     /// Toggle the set-of-marks overlay for the page-state screenshot.
     ToggleMarks,
-    /// Human clicked Resume on the blocking takeover banner (#354): clear the
-    /// local block. Never auto-continues past an unresolved challenge; the actual
-    /// run-resume wire call is a documented follow-up (no tempod resume endpoint /
-    /// `ShellClient::resume` yet).
+    /// Human clicked Resume on the blocking takeover banner (#354): hand control
+    /// back to the agent and resume the paused run. If the challenge persists,
+    /// the agent's next observation re-journals takeover and the banner returns.
     ResumeTakeover,
+    /// Mint a server-side grant for the active native confirmation request.
+    ConfirmPendingConfirmation,
+    /// Dismiss the native confirmation panel without minting a grant.
+    DismissConfirmation,
 }
 
 impl UiAction {
@@ -159,7 +204,7 @@ impl UiAction {
     pub fn is_local(&self) -> bool {
         matches!(
             self,
-            Self::SelectTab(_) | Self::ToggleMarks | Self::ResumeTakeover
+            Self::SelectTab(_) | Self::ToggleMarks | Self::DismissConfirmation
         )
     }
 }
@@ -252,7 +297,9 @@ impl ShellUiModel {
             UiAction::RefreshScreenshot => self.refresh_screenshot(service),
             UiAction::PollEvents => self.poll_events(service),
             UiAction::ToggleMarks => self.toggle_marks(),
-            UiAction::ResumeTakeover => self.resume_takeover(),
+            UiAction::ResumeTakeover => self.resume_takeover(service),
+            UiAction::ConfirmPendingConfirmation => self.confirm_pending_confirmation(service),
+            UiAction::DismissConfirmation => self.dismiss_confirmation(),
         }
     }
 
@@ -263,7 +310,7 @@ impl ShellUiModel {
         match action {
             UiAction::SelectTab(index) => self.select_tab(index),
             UiAction::ToggleMarks => self.toggle_marks(),
-            UiAction::ResumeTakeover => self.resume_takeover(),
+            UiAction::DismissConfirmation => self.dismiss_confirmation(),
             _ => return false,
         }
         true
@@ -283,8 +330,8 @@ impl ShellUiModel {
         match service.open(&url) {
             Ok(session) => {
                 let row = SessionRow::from(&session);
-                // A new tab targets the default attached driver (`None`);
-                // per-tab drivers are the shared-session work deferred to #246.
+                // A new tab targets its tempod session; root MCP is reserved for
+                // CLI/legacy attached-driver calls.
                 let tab = Tab::new(row.id.clone(), None, session.url.clone());
                 self.status = format!("Opened tab {} → {}", row.id, row.url);
                 self.upsert(row);
@@ -300,6 +347,7 @@ impl ShellUiModel {
         if let Some(tab) = self.tabs.get(index) {
             self.status = format!("Switched to tab {}", tab.session_id);
             self.active_tab = Some(index);
+            self.marks_overlay = tab.surface.marks_overlay;
         } else {
             self.status = format!("No tab at index {index}");
         }
@@ -320,6 +368,10 @@ impl ShellUiModel {
                     Some(active) => Some(active.min(self.tabs.len() - 1)),
                     None => None,
                 };
+                self.marks_overlay = self
+                    .active_tab()
+                    .map(|tab| tab.surface.marks_overlay)
+                    .unwrap_or(false);
                 self.status = format!("Closed tab {session_id}");
             }
             Err(err) => self.set_error("close tab", &err),
@@ -343,13 +395,23 @@ impl ShellUiModel {
                 return;
             }
             let session_id = tab.session_id.clone();
-            match service.goto(tab.driver_id.as_deref(), &url) {
+            tab.surface.begin_navigation(url.clone());
+            match service.goto(&session_id, &url) {
                 Ok(()) => {
                     tab.history.push(url.clone());
+                    tab.surface.navigation_applied(url.clone());
                     tab.status = format!("Navigated to {url}");
                     Ok((session_id, url))
                 }
                 Err(err) => {
+                    tab.surface.navigation_failed_with_replay(
+                        "goto",
+                        &err,
+                        Some(PendingConfirmationReplay::Navigate {
+                            session_id: session_id.clone(),
+                            url: url.clone(),
+                        }),
+                    );
                     tab.status = format!("goto failed: {err}");
                     Err(err)
                 }
@@ -380,12 +442,22 @@ impl ShellUiModel {
             };
             let session_id = tab.session_id.clone();
             tab.omnibox = url.clone();
-            match service.goto(tab.driver_id.as_deref(), &url) {
+            tab.surface.begin_navigation(url.clone());
+            match service.goto(&session_id, &url) {
                 Ok(()) => {
+                    tab.surface.navigation_applied(url.clone());
                     tab.status = format!("{} to {url}", step.label_capitalized());
                     Ok(session_id)
                 }
                 Err(err) => {
+                    tab.surface.navigation_failed_with_replay(
+                        step.label(),
+                        &err,
+                        Some(PendingConfirmationReplay::Navigate {
+                            session_id: session_id.clone(),
+                            url: url.clone(),
+                        }),
+                    );
                     tab.status = format!("goto failed: {err}");
                     Err(err)
                 }
@@ -409,10 +481,14 @@ impl ShellUiModel {
                 return;
             };
             let session_id = tab.session_id.clone();
-            match service.screenshot(tab.driver_id.as_deref(), self.marks_overlay) {
+            match service.screenshot(&session_id, self.marks_overlay) {
                 Ok(image) => {
                     tab.screenshot = Some(image);
                     tab.screenshot_seq += 1;
+                    if let Some(image) = tab.screenshot.as_ref() {
+                        tab.surface
+                            .record_snapshot(image.set_of_marks, tab.screenshot_seq);
+                    }
                     tab.status = "Screenshot refreshed.".to_string();
                     Ok(session_id)
                 }
@@ -438,24 +514,126 @@ impl ShellUiModel {
         };
         let after_seq = self.journal.follow(&session_id);
         match service.events(&session_id, after_seq) {
-            Ok(events) => self.journal.ingest(&events.events),
+            Ok(events) => {
+                self.journal.ingest(&events.events);
+                if let Some(active) = self.active_tab
+                    && let Some(tab) = self.tabs.get_mut(active)
+                {
+                    tab.surface.ingest_events(&events.events);
+                }
+            }
             Err(err) => self.set_error("events", &err),
         }
     }
 
-    /// Resume from the blocking human-takeover banner (#354). Clears the local
-    /// block only; because takeover detection is pure over the observation, a
-    /// resumed run that re-observes an unresolved challenge re-journals the
-    /// takeover, which re-raises the banner on the next poll — it never
-    /// auto-continues past an unresolved CAPTCHA/auth-wall. The actual run-resume
-    /// wire call is a documented follow-up: there is no tempod resume endpoint or
-    /// `ShellClient::resume` today, so there is nothing to POST yet.
-    fn resume_takeover(&mut self) {
-        if self.journal.takeover().is_blocking() {
-            self.journal.resume_takeover();
-            self.status =
-                "Challenge dismissed locally — this build has no resume signal to the agent yet (follow-up)."
-                    .to_string();
+    /// Resume from the blocking human-takeover banner (#354). The runtime owns
+    /// the actual safety check: resume rejects human-owned sessions, so the shell
+    /// first hands the session back, then resumes the same waiting run. If the
+    /// challenge is still present, the agent loop will re-observe it and emit a
+    /// fresh takeover event; the UI must not auto-suppress that next event.
+    fn resume_takeover(&mut self, service: &dyn SessionService) {
+        if !self.journal.takeover().is_blocking() {
+            return;
+        }
+        let Some(active) = self.active_tab else {
+            self.status = "No active tab to resume.".to_string();
+            return;
+        };
+        let Some(tab) = self.tabs.get(active) else {
+            self.status = "No active tab to resume.".to_string();
+            return;
+        };
+        let session_id = tab.session_id.clone();
+        let Some(run_id) = tab.surface.active_run_id.clone() else {
+            self.status = "Cannot resume: active agent run id is unknown.".to_string();
+            return;
+        };
+
+        if let Err(err) = service.handoff(&session_id) {
+            self.set_error("handoff", &err);
+            return;
+        }
+        match service.resume_run(&run_id) {
+            Ok(run) => {
+                self.journal.resume_takeover();
+                if let Some(tab) = self.tabs.get_mut(active) {
+                    tab.surface.handed_off_to_agent();
+                    tab.surface.active_run_id = Some(run.run_id.0.clone());
+                    tab.status = format!("Handed off and resumed {}", run.run_id.0);
+                }
+                self.status = format!("Handed off {session_id} and resumed {}", run.run_id.0);
+            }
+            Err(err) => self.set_error("resume", &err),
+        }
+    }
+
+    fn dismiss_confirmation(&mut self) {
+        let Some(active) = self.active_tab else {
+            return;
+        };
+        let Some(tab) = self.tabs.get_mut(active) else {
+            return;
+        };
+        if tab.surface.pending_confirmation.is_some() {
+            tab.surface.dismiss_confirmation();
+            tab.status = "Confirmation dismissed; action was not resubmitted.".to_string();
+            self.status = "Confirmation dismissed; no advisory confirmation was sent.".to_string();
+        }
+    }
+
+    fn confirm_pending_confirmation(&mut self, service: &dyn SessionService) {
+        let Some(active) = self.active_tab else {
+            self.status = "No active tab.".to_string();
+            return;
+        };
+        let Some(tab) = self.tabs.get(active) else {
+            self.status = "No active tab.".to_string();
+            return;
+        };
+        let Some(confirmation) = tab.surface.pending_confirmation.clone() else {
+            self.status = "No pending confirmation.".to_string();
+            return;
+        };
+        let replay = confirmation.replay.clone();
+        let Some(request) = confirmation.request else {
+            self.status = "Pending confirmation has no server request.".to_string();
+            return;
+        };
+
+        match service.confirm(&request.session_id, &request.confirmation_id) {
+            Ok(grant) => {
+                if let Some(PendingConfirmationReplay::Navigate { session_id, url }) = replay {
+                    match service.goto_confirmed(&session_id, &url, &grant) {
+                        Ok(()) => {
+                            if let Some(tab) = self.tabs.get_mut(active) {
+                                tab.history.push(url.clone());
+                                tab.surface.navigation_applied(url.clone());
+                                tab.surface.dismiss_confirmation();
+                                tab.status =
+                                    format!("Confirmed {} and navigated", grant.confirmation_id);
+                            }
+                            self.status = format!(
+                                "Confirmed {} and replayed navigation",
+                                grant.confirmation_id
+                            );
+                        }
+                        Err(err) => {
+                            if let Some(tab) = self.tabs.get_mut(active) {
+                                tab.surface.dismiss_confirmation();
+                                tab.status = format!("confirmed replay failed: {err}");
+                            }
+                            self.set_error("confirmed replay", &err);
+                        }
+                    }
+                    return;
+                }
+                if let Some(tab) = self.tabs.get_mut(active) {
+                    tab.surface.dismiss_confirmation();
+                    tab.status = format!("Confirmed {}", grant.confirmation_id);
+                }
+                self.status = format!("Confirmed {}", grant.confirmation_id);
+            }
+            Err(err) => self.set_error("confirm", &err),
         }
     }
 
@@ -463,6 +641,11 @@ impl ShellUiModel {
     /// the overlaid image; this only touches request state (no I/O here).
     fn toggle_marks(&mut self) {
         self.marks_overlay = !self.marks_overlay;
+        if let Some(active) = self.active_tab
+            && let Some(tab) = self.tabs.get_mut(active)
+        {
+            tab.surface.set_marks_overlay(self.marks_overlay);
+        }
         self.status = if self.marks_overlay {
             "Set-of-marks overlay ON — refresh page to apply.".to_string()
         } else {
@@ -511,6 +694,7 @@ impl ShellUiModel {
                 let row = SessionRow::from(&session);
                 self.status = format!("Adopted {}", row.id);
                 self.upsert(row);
+                self.ensure_adopted_tab(&session);
             }
             Err(err) => self.set_error("adopt", &err),
         }
@@ -522,9 +706,60 @@ impl ShellUiModel {
                 let row = SessionRow::from(&session);
                 self.status = format!("Closed {}", row.id);
                 self.upsert(row);
+                self.remove_tab_for_session(session_id);
             }
             Err(err) => self.set_error("close", &err),
         }
+    }
+
+    fn ensure_adopted_tab(&mut self, session: &TempodSession) {
+        let session_id = session.id.0.as_str();
+        if let Some(index) = self
+            .tabs
+            .iter()
+            .position(|tab| tab.session_id == session_id)
+        {
+            if let Some(tab) = self.tabs.get_mut(index) {
+                tab.surface.adopted_by_human();
+                tab.surface.current_url = session.url.clone();
+                tab.omnibox = session.url.clone();
+                if tab.history.current() != Some(session.url.as_str()) {
+                    tab.history.push(session.url.clone());
+                }
+                tab.status = "Adopted for human control.".to_string();
+                self.marks_overlay = tab.surface.marks_overlay;
+            }
+            self.active_tab = Some(index);
+            return;
+        }
+
+        let mut tab = Tab::new(session.id.0.clone(), None, session.url.clone());
+        tab.surface.adopted_by_human();
+        tab.status = "Adopted for human control.".to_string();
+        self.tabs.push(tab);
+        self.active_tab = Some(self.tabs.len() - 1);
+        self.marks_overlay = false;
+    }
+
+    fn remove_tab_for_session(&mut self, session_id: &str) {
+        let Some(index) = self
+            .tabs
+            .iter()
+            .position(|tab| tab.session_id == session_id)
+        else {
+            return;
+        };
+        self.tabs.remove(index);
+        self.active_tab = match self.active_tab {
+            _ if self.tabs.is_empty() => None,
+            Some(active) if active > index => Some(active - 1),
+            Some(active) => Some(active.min(self.tabs.len() - 1)),
+            None => None,
+        };
+        self.marks_overlay = self
+            .active_tab()
+            .map(|tab| tab.surface.marks_overlay)
+            .unwrap_or(false);
     }
 
     /// Replace the row with the same id, or append it. Keeps the list a faithful
@@ -549,6 +784,7 @@ impl ShellUiModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::surface::{ControlOwner, SurfaceRunState};
     use std::cell::RefCell;
     use std::error::Error;
     use std::net::TcpListener;
@@ -590,6 +826,33 @@ mod tests {
         }
     }
 
+    fn run_state_event(
+        session_id: &str,
+        seq: u64,
+        run_id: &str,
+        state: tempo_schema::AgentRunState,
+    ) -> TempodSessionEvent {
+        TempodSessionEvent {
+            session_id: TempodSessionId(session_id.to_string()),
+            seq,
+            timestamp_ms: 0,
+            event: TempodSessionEventKind::Manager {
+                event: tempo_schema::ManagerEvent::RunStateChanged {
+                    run: AgentRun {
+                        run_id: tempo_schema::AgentRunId(run_id.to_string()),
+                        session_id: session_id.to_string(),
+                        state,
+                        goal: None,
+                        created_ms: 0,
+                        updated_ms: seq,
+                        completed_ms: None,
+                        last_error: None,
+                    },
+                },
+            },
+        }
+    }
+
     fn session(id: &str, url: &str, state: TempodSessionState) -> TempodSession {
         TempodSession {
             id: TempodSessionId(id.to_string()),
@@ -607,6 +870,7 @@ mod tests {
         canned_sessions: Vec<TempodSession>,
         canned_events: Vec<TempodSessionEvent>,
         fail: Option<&'static str>,
+        confirm_on_goto: bool,
     }
 
     impl MockService {
@@ -659,6 +923,31 @@ mod tests {
             ))
         }
 
+        fn handoff(&self, session_id: &str) -> Result<TempodSession, ShellError> {
+            self.record(format!("handoff:{session_id}"));
+            self.maybe_fail("handoff")?;
+            Ok(session(
+                session_id,
+                "https://handoff.test",
+                TempodSessionState::Running,
+            ))
+        }
+
+        fn resume_run(&self, run_id: &str) -> Result<AgentRun, ShellError> {
+            self.record(format!("resume:{run_id}"));
+            self.maybe_fail("resume")?;
+            Ok(AgentRun {
+                run_id: tempo_schema::AgentRunId(run_id.to_string()),
+                session_id: "session-0".to_string(),
+                state: tempo_schema::AgentRunState::Running,
+                goal: None,
+                created_ms: 1,
+                updated_ms: 2,
+                completed_ms: None,
+                last_error: None,
+            })
+        }
+
         fn close(&self, session_id: &str) -> Result<TempodSession, ShellError> {
             self.record(format!("close:{session_id}"));
             self.maybe_fail("close")?;
@@ -669,21 +958,61 @@ mod tests {
             ))
         }
 
-        fn goto(&self, driver_id: Option<&str>, url: &str) -> Result<(), ShellError> {
-            self.record(format!("goto:{}:{url}", driver_id.unwrap_or("-")));
+        fn goto(&self, session_id: &str, url: &str) -> Result<(), ShellError> {
+            self.record(format!("goto:{session_id}:{url}"));
+            if self.confirm_on_goto {
+                return Err(ShellError::Http {
+                    status: 403,
+                    body: serde_json::json!({
+                        "error": "policy denied",
+                        "reason": "purchase requires native confirmation",
+                        "denied_action_index": 0,
+                        "denied_action_kind": "goto",
+                        "policy": {
+                            "confirmation_required": true,
+                            "confirmed_claim_ignored": true,
+                            "strongest_gate": "confirm_purchase",
+                            "input_tainted_effective": false
+                        },
+                        "confirmation_request": {
+                            "confirmation_id": "confirmation-1",
+                            "session_id": session_id,
+                            "side_effect": "purchase",
+                            "gate": "confirm_purchase",
+                            "action_index": 0,
+                            "action_kind": "goto",
+                            "reason": "purchase requires native confirmation",
+                            "created_ms": 10,
+                            "expires_ms": 20
+                        }
+                    })
+                    .to_string(),
+                });
+            }
             self.maybe_fail("goto")?;
+            Ok(())
+        }
+
+        fn goto_confirmed(
+            &self,
+            session_id: &str,
+            url: &str,
+            grant: &ConfirmationGrant,
+        ) -> Result<(), ShellError> {
+            self.record(format!(
+                "goto_confirmed:{session_id}:{url}:{}",
+                grant.confirmation_id
+            ));
+            self.maybe_fail("goto_confirmed")?;
             Ok(())
         }
 
         fn screenshot(
             &self,
-            driver_id: Option<&str>,
+            session_id: &str,
             set_of_marks: bool,
         ) -> Result<ScreenshotImage, ShellError> {
-            self.record(format!(
-                "screenshot:{}:marks={set_of_marks}",
-                driver_id.unwrap_or("-")
-            ));
+            self.record(format!("screenshot:{session_id}:marks={set_of_marks}"));
             self.maybe_fail("screenshot")?;
             Ok(ScreenshotImage {
                 mime_type: "image/png".to_string(),
@@ -711,6 +1040,21 @@ mod tests {
                     .cloned()
                     .collect(),
                 truncated_before_seq: None,
+            })
+        }
+
+        fn confirm(
+            &self,
+            session_id: &str,
+            confirmation_id: &str,
+        ) -> Result<ConfirmationGrant, ShellError> {
+            self.record(format!("confirm:{session_id}:{confirmation_id}"));
+            self.maybe_fail("confirm")?;
+            Ok(ConfirmationGrant {
+                confirmation_id: confirmation_id.to_string(),
+                grant_token: "grant-token-test".to_string(),
+                issued_ms: 1,
+                expires_ms: 2,
             })
         }
     }
@@ -796,7 +1140,30 @@ mod tests {
 
         assert_eq!(service.calls(), vec!["adopt:session-0"]);
         assert_eq!(model.sessions[0].state, "adopted");
+        assert_eq!(model.tabs.len(), 1);
+        assert_eq!(model.active_tab, Some(0));
+        assert_eq!(model.tabs[0].session_id, "session-0");
+        assert_eq!(model.tabs[0].surface.owner, ControlOwner::Human);
         assert!(model.status.contains("Adopted"));
+    }
+
+    #[test]
+    fn adopting_existing_tab_selects_it_without_duplicating_surface() {
+        let service = MockService::default();
+        let mut model = ShellUiModel {
+            tabs: vec![Tab::new("session-0", None, "https://old.test")],
+            active_tab: Some(0),
+            ..ShellUiModel::default()
+        };
+
+        model.dispatch(UiAction::Adopt("session-0".into()), &service);
+
+        assert_eq!(service.calls(), vec!["adopt:session-0"]);
+        assert_eq!(model.tabs.len(), 1);
+        assert_eq!(model.active_tab, Some(0));
+        assert_eq!(model.tabs[0].current_url(), Some("https://adopted.test"));
+        assert_eq!(model.tabs[0].surface.current_url, "https://adopted.test");
+        assert_eq!(model.tabs[0].surface.owner, ControlOwner::Human);
     }
 
     #[test]
@@ -816,6 +1183,29 @@ mod tests {
         assert_eq!(service.calls(), vec!["close:session-0"]);
         assert_eq!(model.sessions[0].state, "killed");
         assert!(model.status.contains("Closed"));
+    }
+
+    #[test]
+    fn closing_session_removes_matching_managed_tab() {
+        let service = MockService::default();
+        let mut model = ShellUiModel {
+            sessions: vec![SessionRow {
+                id: "session-0".into(),
+                state: "adopted".into(),
+                url: "https://a.test".into(),
+            }],
+            tabs: vec![Tab::new("session-0", None, "https://a.test")],
+            active_tab: Some(0),
+            marks_overlay: true,
+            ..ShellUiModel::default()
+        };
+
+        model.dispatch(UiAction::Close("session-0".into()), &service);
+
+        assert_eq!(service.calls(), vec!["close:session-0"]);
+        assert!(model.tabs.is_empty());
+        assert_eq!(model.active_tab, None);
+        assert!(!model.marks_overlay);
     }
 
     #[test]
@@ -924,17 +1314,25 @@ mod tests {
 
         model.dispatch(UiAction::Navigate, &service);
 
-        assert_eq!(service.calls(), vec!["goto:-:https://b.test"]);
+        assert_eq!(service.calls(), vec!["goto:session-0:https://b.test"]);
         assert_eq!(model.tabs[0].current_url(), Some("https://b.test"));
+        assert_eq!(model.tabs[0].surface.current_url, "https://b.test");
+        assert_eq!(
+            model.tabs[0].surface.run_state,
+            SurfaceRunState::HumanControl
+        );
         assert!(model.tabs[0].history.can_back());
         assert!(model.status.contains("session-0"));
     }
 
     #[test]
-    fn navigate_targets_each_tabs_own_driver() {
-        let service = MockService::default();
-        let mut tab = Tab::new("session-1", Some("fork-7".into()), "https://a.test");
-        tab.omnibox = "https://c.test".into();
+    fn navigate_confirmation_gate_sets_native_confirmation_without_resubmit() -> TestResult {
+        let service = MockService {
+            confirm_on_goto: true,
+            ..MockService::default()
+        };
+        let mut tab = Tab::new("session-0", None, "https://a.test");
+        tab.omnibox = "https://pay.test".into();
         let mut model = ShellUiModel {
             tabs: vec![tab],
             active_tab: Some(0),
@@ -943,8 +1341,99 @@ mod tests {
 
         model.dispatch(UiAction::Navigate, &service);
 
-        // The tab's driver_id is forwarded, so goto hits the right session.
-        assert_eq!(service.calls(), vec!["goto:fork-7:https://c.test"]);
+        assert_eq!(service.calls(), vec!["goto:session-0:https://pay.test"]);
+        assert_eq!(
+            model.tabs[0].surface.run_state,
+            SurfaceRunState::AwaitingConfirmation
+        );
+        let Some(pending) = model.tabs[0].surface.pending_confirmation.as_ref() else {
+            return Err("navigation gate should create pending confirmation".into());
+        };
+        assert!(matches!(
+            pending.replay,
+            Some(PendingConfirmationReplay::Navigate { ref session_id, ref url })
+                if session_id == "session-0" && url == "https://pay.test"
+        ));
+
+        model.dispatch(UiAction::DismissConfirmation, &service);
+
+        assert!(
+            model.tabs[0].surface.pending_confirmation.is_none(),
+            "dismiss must only clear local native state"
+        );
+        assert_eq!(
+            service.calls(),
+            vec!["goto:session-0:https://pay.test"],
+            "dismiss must not resubmit with advisory confirmation"
+        );
+        assert!(model.status.contains("no advisory confirmation"));
+        Ok(())
+    }
+
+    #[test]
+    fn confirm_pending_confirmation_mints_grant_and_replays_blocked_navigation() {
+        let service = MockService::default();
+        let request = tempo_schema::ConfirmationRequest {
+            confirmation_id: "confirmation-1".to_string(),
+            session_id: "session-0".to_string(),
+            side_effect: tempo_schema::SideEffect::Purchase,
+            gate: "confirm_purchase".to_string(),
+            action_index: 0,
+            action_kind: "click".to_string(),
+            reason: "purchase requires native confirmation".to_string(),
+            created_ms: 10,
+            expires_ms: 20,
+        };
+        let mut tab = Tab::new("session-0", None, "https://pay.test");
+        tab.surface.pending_confirmation = Some(
+            crate::surface::PendingConfirmation::from_request(request.clone(), Some(false))
+                .with_replay(PendingConfirmationReplay::Navigate {
+                    session_id: "session-0".to_string(),
+                    url: "https://pay.test/confirmed".to_string(),
+                }),
+        );
+        let mut model = ShellUiModel {
+            tabs: vec![tab],
+            active_tab: Some(0),
+            ..ShellUiModel::default()
+        };
+
+        model.dispatch(UiAction::ConfirmPendingConfirmation, &service);
+
+        assert_eq!(
+            service.calls(),
+            vec![
+                "confirm:session-0:confirmation-1",
+                "goto_confirmed:session-0:https://pay.test/confirmed:confirmation-1"
+            ],
+            "confirm must mint a server grant before replaying the original action"
+        );
+        assert!(model.tabs[0].surface.pending_confirmation.is_none());
+        assert_eq!(
+            model.tabs[0].surface.current_url,
+            "https://pay.test/confirmed"
+        );
+        assert!(model.status.contains("replayed navigation"));
+    }
+
+    #[test]
+    fn navigate_targets_each_tabs_own_session() {
+        let service = MockService::default();
+        let mut first = Tab::new("session-0", Some("fork-0".into()), "https://a.test");
+        first.omnibox = "https://wrong.test".into();
+        let mut second = Tab::new("session-1", Some("fork-7".into()), "https://b.test");
+        second.omnibox = "https://c.test".into();
+        let mut model = ShellUiModel {
+            tabs: vec![first, second],
+            active_tab: Some(1),
+            ..ShellUiModel::default()
+        };
+
+        model.dispatch(UiAction::Navigate, &service);
+
+        // The active tab's session id is forwarded, so foreground browsing does
+        // not escape to root MCP or another tab's attached driver.
+        assert_eq!(service.calls(), vec!["goto:session-1:https://c.test"]);
     }
 
     #[test]
@@ -971,10 +1460,10 @@ mod tests {
         assert_eq!(
             service.calls(),
             vec![
-                "goto:-:https://b.test", // navigate to b
-                "goto:-:https://c.test", // navigate to c
-                "goto:-:https://b.test", // back to b
-                "goto:-:https://c.test", // forward to c
+                "goto:session-0:https://b.test", // navigate to b
+                "goto:session-0:https://c.test", // navigate to c
+                "goto:session-0:https://b.test", // back to b
+                "goto:session-0:https://c.test", // forward to c
             ]
         );
     }
@@ -998,7 +1487,7 @@ mod tests {
     }
 
     #[test]
-    fn refresh_screenshot_requests_active_tabs_driver_and_stores_image() {
+    fn refresh_screenshot_requests_active_tabs_session_and_stores_image() {
         let service = MockService::default();
         let mut model = ShellUiModel {
             tabs: vec![Tab::new(
@@ -1012,13 +1501,14 @@ mod tests {
 
         model.dispatch(UiAction::RefreshScreenshot, &service);
 
-        assert_eq!(service.calls(), vec!["screenshot:fork-2:marks=false"]);
+        assert_eq!(service.calls(), vec!["screenshot:session-9:marks=false"]);
         let shot = model.tabs[0].screenshot.as_ref();
         assert_eq!(
             shot.map(|image| image.mime_type.as_str()),
             Some("image/png")
         );
         assert_eq!(model.tabs[0].screenshot_seq, 1);
+        assert_eq!(model.tabs[0].surface.last_snapshot_seq, 1);
     }
 
     #[test]
@@ -1052,11 +1542,12 @@ mod tests {
         // Toggling flips the flag with no I/O.
         model.dispatch(UiAction::ToggleMarks, &service);
         assert!(model.marks_overlay);
+        assert!(model.tabs[0].surface.marks_overlay);
         assert!(service.calls().is_empty());
 
         // The next screenshot refresh requests the set-of-marks overlay.
         model.dispatch(UiAction::RefreshScreenshot, &service);
-        assert_eq!(service.calls(), vec!["screenshot:-:marks=true"]);
+        assert_eq!(service.calls(), vec!["screenshot:session-0:marks=true"]);
         assert!(model.tabs[0]
             .screenshot
             .as_ref()
@@ -1065,11 +1556,35 @@ mod tests {
         // Toggling back requests the plain image again.
         model.dispatch(UiAction::ToggleMarks, &service);
         assert!(!model.marks_overlay);
+        assert!(!model.tabs[0].surface.marks_overlay);
         model.dispatch(UiAction::RefreshScreenshot, &service);
         assert_eq!(
             service.calls(),
-            vec!["screenshot:-:marks=true", "screenshot:-:marks=false",]
+            vec![
+                "screenshot:session-0:marks=true",
+                "screenshot:session-0:marks=false",
+            ]
         );
+    }
+
+    #[test]
+    fn selecting_tab_restores_that_tabs_marks_state() {
+        let service = MockService::default();
+        let mut first = Tab::new("session-0", None, "https://a.test");
+        first.surface.set_marks_overlay(true);
+        let second = Tab::new("session-1", None, "https://b.test");
+        let mut model = ShellUiModel {
+            tabs: vec![first, second],
+            active_tab: Some(0),
+            marks_overlay: true,
+            ..ShellUiModel::default()
+        };
+
+        model.dispatch(UiAction::SelectTab(1), &service);
+        assert!(!model.marks_overlay);
+
+        model.dispatch(UiAction::SelectTab(0), &service);
+        assert!(model.marks_overlay);
     }
 
     #[test]
@@ -1120,7 +1635,13 @@ mod tests {
         let service = MockService {
             canned_events: vec![
                 created_event("session-0", 0, "https://a.test"),
-                takeover_event("session-0", 1),
+                run_state_event(
+                    "session-0",
+                    1,
+                    "run-0",
+                    tempo_schema::AgentRunState::WaitingForHuman,
+                ),
+                takeover_event("session-0", 2),
             ],
             ..MockService::default()
         };
@@ -1141,16 +1662,59 @@ mod tests {
         assert_eq!(pending.kind, TakeoverKind::Captcha);
         assert_eq!(pending.url, "https://a.test/verify");
         assert_eq!(banner.reason_label(), Some("captcha"));
+        assert_eq!(
+            model.tabs[0].surface.active_run_id.as_deref(),
+            Some("run-0")
+        );
+        assert_eq!(
+            model.tabs[0].surface.run_state,
+            SurfaceRunState::HumanTakeoverRequired
+        );
+        assert_eq!(model.tabs[0].surface.owner, ControlOwner::Agent);
+        assert!(model.tabs[0].surface.pending_takeover.is_some());
 
-        // The human clicks Resume: the local block clears, and the status is
-        // truthful that the agent is not yet signalled (no resume RPC exists).
+        // The human clicks Resume: the shell hands the session back to the
+        // agent and resumes the same paused run. If the page is still blocked,
+        // the next agent observation will journal another takeover event.
         model.dispatch(UiAction::ResumeTakeover, &service);
+        assert_eq!(
+            service.calls(),
+            vec!["events:session-0:-", "handoff:session-0", "resume:run-0"]
+        );
         assert!(
             !model.journal.takeover().is_blocking(),
             "Resume clears the local block"
         );
-        assert!(model.status.contains("dismissed locally"));
-        assert!(model.status.contains("no resume signal to the agent"));
+        assert!(model.tabs[0].surface.pending_takeover.is_none());
+        assert_eq!(model.tabs[0].surface.owner, ControlOwner::Agent);
+        assert_eq!(
+            model.tabs[0].surface.run_state,
+            SurfaceRunState::AgentControl
+        );
+        assert!(model.status.contains("resumed run-0"));
+    }
+
+    #[test]
+    fn resume_takeover_without_run_id_keeps_banner_and_does_not_handoff() {
+        let service = MockService {
+            canned_events: vec![
+                created_event("session-0", 0, "https://a.test"),
+                takeover_event("session-0", 1),
+            ],
+            ..MockService::default()
+        };
+        let mut model = ShellUiModel {
+            tabs: vec![Tab::new("session-0", None, "https://a.test")],
+            active_tab: Some(0),
+            ..ShellUiModel::default()
+        };
+
+        model.dispatch(UiAction::PollEvents, &service);
+        model.dispatch(UiAction::ResumeTakeover, &service);
+
+        assert_eq!(service.calls(), vec!["events:session-0:-"]);
+        assert!(model.journal.takeover().is_blocking());
+        assert!(model.status.contains("run id is unknown"));
     }
 
     #[test]
@@ -1240,11 +1804,11 @@ mod tests {
         assert_eq!(model.healthy, Some(true));
         assert!(model.sessions.is_empty());
 
-        model.open_url = "https://tempo.test".into();
+        model.open_url = "https://example.com/tempo".into();
         model.dispatch(UiAction::Open, &client);
         assert_eq!(model.sessions.len(), 1);
         let session_id = model.sessions[0].id.clone();
-        assert_eq!(model.sessions[0].url, "https://tempo.test");
+        assert_eq!(model.sessions[0].url, "https://example.com/tempo");
 
         model.dispatch(UiAction::Adopt(session_id.clone()), &client);
         assert_eq!(model.sessions[0].state, "adopted");
@@ -1269,6 +1833,15 @@ mod tests {
         }))
     }
 
+    fn join_driver(
+        handle: thread::JoinHandle<Result<(), EngineHostError>>,
+    ) -> Result<(), Box<dyn Error>> {
+        match handle.join() {
+            Ok(result) => Ok(result?),
+            Err(_) => Err("driver thread failed".into()),
+        }
+    }
+
     fn detach_test_driver(
         pool: &Arc<Mutex<SessionPool>>,
         handle: thread::JoinHandle<Result<(), EngineHostError>>,
@@ -1276,9 +1849,6 @@ mod tests {
         pool.lock()
             .map_err(|_| "session pool lock failed")?
             .detach_engine_driver();
-        match handle.join() {
-            Ok(result) => Ok(result?),
-            Err(_) => Err("driver thread failed".into()),
-        }
+        join_driver(handle)
     }
 }
