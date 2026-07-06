@@ -92,6 +92,8 @@ cargo test --workspace   # contracts, conformance, runtime, protocol, and shell 
   binding. `TEMPO_STEALTH_MODE` suppresses tempod's in-memory history,
   telemetry, and idempotency cache; it does not promise OS, filesystem, or
   Chromium artifact erasure.
+- The operator-facing `TEMPO_*` registry is in
+  [`docs/ENVIRONMENT.md`](./docs/ENVIRONMENT.md).
 - Privacy/security claims are scoped to the code path that enforces them.
   Today, Web Bot Auth signing is opt-in and limited to selected `tempo-net`
   paths; it is not a blanket signature on every engine, OpenAPI, or MCP request.

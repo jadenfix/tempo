@@ -466,6 +466,14 @@ mod tests {
     }
 
     #[test]
+    fn environment_docs_cover_registered_tempo_vars() {
+        let docs = include_str!("../../../docs/ENVIRONMENT.md");
+        for (var, _, _) in documented_env_registry() {
+            assert!(docs.contains(var), "docs/ENVIRONMENT.md is missing {var}");
+        }
+    }
+
+    #[test]
     fn defaults_are_valid_and_loopback() -> Result<(), ConfigError> {
         let config = TempodConfig::load_with(None, &no_env)?;
         assert_eq!(config.bind_addr, "127.0.0.1:8787");
