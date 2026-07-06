@@ -27,6 +27,9 @@ needs a concrete traced failure, not a preference for more code.
   or secret material. Side-effect classes need trusted provenance, and
   Authorization, cookie, API-key, token, secret, or credential fields need
   explicit secret bindings rather than model-provided request values.
+- Direct OpenAPI execution remains a blocker unless untrusted operations are
+  confirmation-required by default and secret-like header/cookie/query/path/body
+  parameters are rejected before request construction.
 - Public enum-valued fields must advertise the exact runtime wire names. Generated
   clients must accept every value the server can emit.
 - HTTP success is not operation success when the response body carries a status
