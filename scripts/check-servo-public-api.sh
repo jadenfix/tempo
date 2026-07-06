@@ -2,8 +2,8 @@
 set -euo pipefail
 
 # final.md requires Servo embedder types to stay behind tempo-engine-servo.
-# This grep guard catches public Rust item signatures outside that crate that
-# expose Servo/private embedder names.
+# The T2 system-webview adapter owns generic WebView vocabulary, so this guard
+# scans every other public Rust item signature for Servo/private embedder names.
 pattern='^[[:space:]]*pub(\([^)]*\))?[[:space:]]+(async[[:space:]]+)?(struct|enum|trait|type|fn|const|static|use)[^[:cntrl:]]*([^[:alnum:]_]|::)(servo::|libservo|WebView|WebViewDelegate|WebResource|WebResourceLoad|RenderingContext|Constellation|Compositor|Embedder|ServoUrl)'
 
 scan_public_rust_api() {
@@ -13,6 +13,7 @@ scan_public_rust_api() {
     while IFS= read -r -d '' file; do
       case "$file" in
         crates/tempo-engine-servo/*|*/crates/tempo-engine-servo/*) continue ;;
+        crates/tempo-engine-webview/*|*/crates/tempo-engine-webview/*) continue ;;
       esac
       if matches="$(grep -nE "$pattern" "$file")"; then
         while IFS= read -r line; do

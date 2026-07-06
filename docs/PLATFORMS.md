@@ -97,10 +97,11 @@ boundary.** Platform code lives in two thin layers only:
 
 T2 is not a compromise to apologize for — on iOS it is the only lawful lane,
 and it is how tempo ships on all four platforms fast. The driver trait already
-abstracts CDP vs Servo; a `tempo-engine-webview` adapter is the third
-implementation of the same trait, with the observation compiler fed by an
-injected accessibility/DOM extraction runtime (same contract as the CDP lane's
-extraction script).
+abstracts CDP vs Servo; `crates/tempo-engine-webview` is the T2 adapter shape
+for host-owned WKWebView/WebView2/Android WebView surfaces. It feeds
+`tempo-observe` from an injected accessibility/DOM extraction runtime and
+keeps the private WebView locator map outside the agent-visible `NodeId`
+contract.
 
 ## 4. Platform shells
 
@@ -122,9 +123,11 @@ extraction script).
   shared core and thin transport/shell adapters, not by special-case logic in
   contracts, observation, policy, or agent crates.
 - **iOS**: target state is tempo-core as a static lib behind a Swift shell,
-  WKWebView T2, and localhost MCP for on-device agent apps. Network Extension
-  should remain unnecessary unless a future issue proves an out-of-process net
-  layer is required.
+  WKWebView T2, and localhost MCP for on-device agent apps. The scaffold lives
+  in `crates/tempo-ios-core` and `platforms/ios/Tempo`; it deliberately excludes
+  CDP, Servo, `tempo-engine-host`, `tempod`, the CLI, and the desktop shell from
+  the normal iOS dependency graph. Network Extension should remain unnecessary
+  unless a future issue proves an out-of-process net layer is required.
 
 Milestone gates (same style as final.md §8): a platform "exists" when (1) the
 conformance suite passes on-device, (2) the observe fixture gate passes, (3)

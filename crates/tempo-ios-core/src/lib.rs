@@ -1,0 +1,357 @@
+//! iOS static-library boundary for Tempo's portable core.
+//!
+//! This crate deliberately excludes process-host and desktop engine crates. The
+//! Swift shell owns WKWebView and calls into Rust for schema contracts,
+//! observation compilation, policy-facing provenance, and WebView T2 adapter
+//! types.
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::ffi::{c_char, CStr, CString};
+use tempo_observe::{CompileOptions, ObservationCompiler, ObservationInput, RawElement};
+use tempo_schema::CompiledObservation;
+use thiserror::Error;
+
+pub use tempo_engine_webview::{
+    WebViewDriver, WebViewElement, WebViewHost, WebViewHostError, WebViewLocator, WebViewSnapshot,
+    WEBVIEW_OBSERVATION_SCRIPT,
+};
+
+/// Engine lane exposed by the iOS shell.
+pub const IOS_ENGINE_LANE: &str = "wkwebview_t2";
+
+/// Static capability summary consumed by Swift at startup and by CI smoke tests.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IosCoreCapabilities {
+    pub schema_version: String,
+    pub engine_lane: String,
+    pub static_library: bool,
+    pub native_fork: bool,
+    pub observation_script_bytes: usize,
+    pub desktop_engines_excluded: Vec<String>,
+}
+
+impl Default for IosCoreCapabilities {
+    fn default() -> Self {
+        Self {
+            schema_version: tempo_schema::SCHEMA_VERSION.into(),
+            engine_lane: IOS_ENGINE_LANE.into(),
+            static_library: true,
+            native_fork: false,
+            observation_script_bytes: WEBVIEW_OBSERVATION_SCRIPT.len(),
+            desktop_engines_excluded: vec![
+                "tempo-engine-host".into(),
+                "tempo-engine-cdp".into(),
+                "tempo-engine-servo".into(),
+            ],
+        }
+    }
+}
+
+/// Errors returned by the safe Rust API boundary.
+#[derive(Debug, Error)]
+pub enum IosCoreError {
+    #[error("invalid observation input JSON: {0}")]
+    InvalidObservationInput(serde_json::Error),
+    #[error("failed to serialize observation JSON: {0}")]
+    SerializeObservation(serde_json::Error),
+}
+
+/// Stateful observation session for one WKWebView tab.
+#[derive(Debug)]
+pub struct IosObservationSession {
+    compiler: ObservationCompiler,
+}
+
+impl IosObservationSession {
+    pub fn new() -> Self {
+        Self {
+            compiler: ObservationCompiler::new(),
+        }
+    }
+
+    pub fn with_options(options: CompileOptions) -> Self {
+        Self {
+            compiler: ObservationCompiler::with_options(options),
+        }
+    }
+
+    pub fn compile(&mut self, input: ObservationInput) -> CompiledObservation {
+        self.compiler.compile(input)
+    }
+
+    pub fn compile_json(&mut self, input_json: &str) -> Result<String, IosCoreError> {
+        let input: ObservationInput =
+            serde_json::from_str(input_json).map_err(IosCoreError::InvalidObservationInput)?;
+        let observation = self.compile(input);
+        serde_json::to_string(&observation).map_err(IosCoreError::SerializeObservation)
+    }
+}
+
+impl Default for IosObservationSession {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub fn capabilities() -> IosCoreCapabilities {
+    IosCoreCapabilities::default()
+}
+
+pub fn capabilities_json() -> Result<String, IosCoreError> {
+    serde_json::to_string(&capabilities()).map_err(IosCoreError::SerializeObservation)
+}
+
+pub fn observation_script() -> &'static str {
+    WEBVIEW_OBSERVATION_SCRIPT
+}
+
+pub fn compile_observation_json(input_json: &str) -> Result<String, IosCoreError> {
+    IosObservationSession::new().compile_json(input_json)
+}
+
+pub fn compile_webview_snapshot_json(input_json: &str) -> Result<String, IosCoreError> {
+    let snapshot: WebViewSnapshot =
+        serde_json::from_str(input_json).map_err(IosCoreError::InvalidObservationInput)?;
+    let input = ObservationInput::new(
+        snapshot.url,
+        snapshot
+            .elements
+            .into_iter()
+            .map(|element| RawElement {
+                source_id: element.source_id,
+                stable_hint: element.stable_hint,
+                role: element.role,
+                name: element.name,
+                value: element.value,
+                bounds: element.bounds,
+                visible: element.visible,
+                enabled: element.enabled,
+                interactive: element.interactive,
+            })
+            .collect(),
+    );
+    compile_observation_json(
+        &serde_json::to_string(&input).map_err(IosCoreError::SerializeObservation)?,
+    )
+}
+
+pub fn describe() -> &'static str {
+    "iOS staticlib core for WKWebView T2: schema, observation compiler, policy-safe provenance, and WebView adapter types"
+}
+
+/// Parse a JSON value emitted by the Swift bridge without losing the safe Rust
+/// error boundary. This is intentionally small until the C/Swift ABI layer is
+/// generated in a dedicated FFI slice.
+pub fn parse_bridge_json(value: &str) -> Result<Value, IosCoreError> {
+    serde_json::from_str(value).map_err(IosCoreError::InvalidObservationInput)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn tempo_ios_core_capabilities_json() -> *mut c_char {
+    match capabilities_json()
+        .ok()
+        .and_then(|json| CString::new(json).ok())
+    {
+        Some(json) => json.into_raw(),
+        None => std::ptr::null_mut(),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn tempo_ios_core_observation_script() -> *mut c_char {
+    match CString::new(observation_script()) {
+        Ok(script) => script.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// # Safety
+///
+/// `value` must be either null or a pointer previously returned by a
+/// Rust-to-NSString bridge allocation in this crate, and must not have been freed
+/// before this call.
+#[unsafe(no_mangle)]
+/// Compile one WKWebView observation snapshot JSON payload through the Rust
+/// observation compiler and return an owned C string.
+///
+/// # Safety
+///
+/// `input` must either be null or point to a valid, NUL-terminated UTF-8 string
+/// for the duration of the call. The returned pointer must be released with
+/// [`tempo_ios_core_string_free`] exactly once.
+pub unsafe extern "C" fn tempo_ios_core_compile_webview_snapshot_json(
+    input: *const c_char,
+) -> *mut c_char {
+    if input.is_null() {
+        return std::ptr::null_mut();
+    }
+    let input = match unsafe { CStr::from_ptr(input) }.to_str() {
+        Ok(input) => input,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    match compile_webview_snapshot_json(input)
+        .ok()
+        .and_then(|json| CString::new(json).ok())
+    {
+        Some(json) => json.into_raw(),
+        None => std::ptr::null_mut(),
+    }
+}
+
+#[unsafe(no_mangle)]
+/// Free a C string returned by a `tempo_ios_core_*` FFI function.
+///
+/// # Safety
+///
+/// `value` must be null or a pointer previously returned by this library via
+/// `CString::into_raw`. Passing any other pointer, or freeing the same pointer
+/// more than once, is undefined behavior.
+pub unsafe extern "C" fn tempo_ios_core_string_free(value: *mut c_char) {
+    if !value.is_null() {
+        drop(unsafe { CString::from_raw(value) });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempo_observe::RawElement;
+    use tempo_schema::Provenance;
+
+    #[test]
+    fn capabilities_name_wkwebview_lane_and_exclusions() {
+        let capabilities = capabilities();
+
+        assert_eq!(capabilities.schema_version, tempo_schema::SCHEMA_VERSION);
+        assert_eq!(capabilities.engine_lane, IOS_ENGINE_LANE);
+        assert!(capabilities.static_library);
+        assert!(!capabilities.native_fork);
+        assert!(capabilities.observation_script_bytes > 0);
+        assert!(capabilities
+            .desktop_engines_excluded
+            .contains(&"tempo-engine-host".to_string()));
+    }
+
+    #[test]
+    fn compile_observation_json_uses_page_taint() -> Result<(), Box<dyn std::error::Error>> {
+        let input = ObservationInput::new(
+            "https://example.com",
+            vec![RawElement::new("button", "Continue").stable_hint("continue")],
+        );
+        let input_json = serde_json::to_string(&input)?;
+
+        let output = compile_observation_json(&input_json)?;
+        let observation: CompiledObservation = serde_json::from_str(&output)?;
+
+        assert_eq!(observation.schema_version, tempo_schema::SCHEMA_VERSION);
+        assert_eq!(observation.elements.len(), 1);
+        assert_eq!(observation.elements[0].name[0].provenance, Provenance::Page);
+        Ok(())
+    }
+
+    #[test]
+    fn compile_webview_snapshot_json_accepts_injected_runtime_shape(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let snapshot = serde_json::json!({
+            "url": "https://example.com/form",
+            "elements": [{
+                "locator": "#email",
+                "source_id": "email-source",
+                "stable_hint": "email|textbox|Email",
+                "role": "textbox",
+                "name": [{ "provenance": "page", "text": "Email" }],
+                "value": [{ "provenance": "page", "text": "person@example.com" }],
+                "bounds": [0.0, 0.0, 120.0, 24.0],
+                "visible": true,
+                "enabled": true,
+                "interactive": true
+            }]
+        });
+
+        let output = compile_webview_snapshot_json(&snapshot.to_string())?;
+        let observation: CompiledObservation = serde_json::from_str(&output)?;
+
+        assert_eq!(observation.url, "https://example.com/form");
+        assert_eq!(observation.elements.len(), 1);
+        assert_eq!(observation.elements[0].name[0].provenance, Provenance::Page);
+        Ok(())
+    }
+
+    #[test]
+    fn manifest_does_not_directly_reference_desktop_engine_crates() {
+        let manifest = include_str!("../Cargo.toml");
+
+        for blocked in [
+            "tempo-engine-host",
+            "tempo-engine-cdp",
+            "tempo-engine-servo",
+            "tempo-headless",
+            "tempo-shell",
+            "tempo-cli",
+        ] {
+            assert!(
+                !manifest.contains(blocked),
+                "iOS core manifest must not depend on {blocked}"
+            );
+        }
+    }
+
+    #[test]
+    fn bundled_observation_script_has_collector_entrypoint() {
+        assert!(observation_script().contains("__tempoCollectObservation"));
+    }
+
+    #[test]
+    fn c_abi_exports_capabilities_json_string() -> Result<(), Box<dyn std::error::Error>> {
+        let ptr = tempo_ios_core_capabilities_json();
+        assert!(!ptr.is_null());
+        let text = unsafe { std::ffi::CStr::from_ptr(ptr) }
+            .to_str()?
+            .to_string();
+        unsafe { tempo_ios_core_string_free(ptr) };
+
+        let value: serde_json::Value = serde_json::from_str(&text)?;
+        assert_eq!(value["engine_lane"], IOS_ENGINE_LANE);
+        Ok(())
+    }
+
+    #[test]
+    fn c_abi_exports_observation_script_string() -> Result<(), Box<dyn std::error::Error>> {
+        let ptr = tempo_ios_core_observation_script();
+        assert!(!ptr.is_null());
+        let text = unsafe { std::ffi::CStr::from_ptr(ptr) }.to_str()?;
+        assert!(text.contains("__tempoCollectObservation"));
+        unsafe { tempo_ios_core_string_free(ptr) };
+        Ok(())
+    }
+
+    #[test]
+    fn c_abi_compiles_webview_snapshot_json() -> Result<(), Box<dyn std::error::Error>> {
+        let input = CString::new(
+            serde_json::json!({
+                "url": "https://example.com/form",
+                "elements": [{
+                    "locator": "#submit",
+                    "role": "button",
+                    "name": [{ "provenance": "page", "text": "Submit" }],
+                    "visible": true,
+                    "enabled": true,
+                    "interactive": true
+                }]
+            })
+            .to_string(),
+        )?;
+        let ptr = unsafe { tempo_ios_core_compile_webview_snapshot_json(input.as_ptr()) };
+        assert!(!ptr.is_null());
+        let text = unsafe { std::ffi::CStr::from_ptr(ptr) }
+            .to_str()?
+            .to_string();
+        unsafe { tempo_ios_core_string_free(ptr) };
+
+        let observation: CompiledObservation = serde_json::from_str(&text)?;
+        assert_eq!(observation.elements.len(), 1);
+        assert_eq!(observation.elements[0].role, "button");
+        Ok(())
+    }
+}
