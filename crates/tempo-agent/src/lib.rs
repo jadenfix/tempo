@@ -2321,6 +2321,7 @@ fn empty_structured_diff(since_seq: u64) -> ObservationDiff {
     ObservationDiff {
         since_seq,
         seq: since_seq.saturating_add(1),
+        url: None,
         omitted: 0,
         marks: Vec::new(),
         added: Vec::new(),
@@ -5754,6 +5755,7 @@ mod tests {
         ObservationDiff {
             since_seq,
             seq,
+            url: None,
             omitted: 0,
             marks: Vec::new(),
             added: vec![],

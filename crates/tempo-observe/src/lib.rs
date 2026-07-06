@@ -807,6 +807,7 @@ pub fn diff_observations(
     ObservationDiff {
         since_seq: previous.seq,
         seq: current.seq,
+        url: (previous.url != current.url).then(|| current.url.clone()),
         omitted: current.omitted,
         marks: current.marks.clone(),
         added,
@@ -929,7 +930,11 @@ fn diff_reconstructs_current(
     if diff.since_seq != previous.seq || diff.seq != current.seq {
         return false;
     }
-    if previous.schema_version != current.schema_version || previous.url != current.url {
+    if previous.schema_version != current.schema_version {
+        return false;
+    }
+    let diff_url = diff.url.as_deref().unwrap_or(previous.url.as_str());
+    if diff_url != current.url {
         return false;
     }
 
@@ -987,7 +992,7 @@ fn diff_reconstructs_current(
 
     let reconstructed = CompiledObservation {
         schema_version: previous.schema_version.clone(),
-        url: previous.url.clone(),
+        url: diff_url.to_string(),
         seq: diff.seq,
         elements,
         omitted: diff.omitted,
@@ -2101,11 +2106,36 @@ mod tests {
         assert_eq!(diff.since_seq, previous.seq);
         assert_eq!(diff.seq, current.seq);
         assert_eq!(diff.omitted, 2);
+        assert_eq!(diff.url, None);
         assert_eq!(diff.added.len(), 1);
         assert_eq!(diff.added[0].name[0].text, "Apply coupon");
         assert_eq!(diff.removed.len(), 1);
         assert_eq!(diff.changed.len(), 1);
         assert_eq!(diff.changed[0].name[0].text, "Email address");
+    }
+
+    #[test]
+    fn diff_carries_url_only_for_navigation_boundary() {
+        let previous = make_observation(
+            "https://shop.example/start",
+            1,
+            vec![test_element("node:stable", "button", 0.7)],
+            1,
+        );
+        let current = make_observation(
+            "https://shop.example/done",
+            2,
+            vec![test_element("node:stable", "button", 0.7)],
+            1,
+        );
+
+        let diff = diff_observations(&previous, &current);
+
+        assert_eq!(diff.url.as_deref(), Some("https://shop.example/done"));
+        assert!(diff.added.is_empty());
+        assert!(diff.removed.is_empty());
+        assert!(diff.changed.is_empty());
+        assert!(diff_reconstructs_current(&previous, &current, &diff));
     }
 
     #[test]
@@ -2351,6 +2381,7 @@ mod tests {
         let lossy_diff = ObservationDiff {
             since_seq: previous.seq,
             seq: current.seq,
+            url: None,
             omitted: 0,
             marks: current.marks.clone(),
             added: Vec::new(),

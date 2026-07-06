@@ -10142,6 +10142,7 @@ mod tests {
                         diff: ObservationDiff {
                             since_seq: 1,
                             seq: 2,
+                            url: None,
                             omitted: 0,
                             marks: Vec::new(),
                             added: Vec::new(),
@@ -10426,6 +10427,7 @@ mod tests {
                         diff: ObservationDiff {
                             since_seq: 1,
                             seq: 2,
+                            url: None,
                             omitted: 0,
                             marks: Vec::new(),
                             added: Vec::new(),
@@ -10504,6 +10506,7 @@ mod tests {
                         diff: ObservationDiff {
                             since_seq: 1,
                             seq: 2,
+                            url: None,
                             omitted: 0,
                             marks: Vec::new(),
                             added: Vec::new(),
@@ -10604,6 +10607,7 @@ mod tests {
                         diff: ObservationDiff {
                             since_seq: 1,
                             seq: 2,
+                            url: None,
                             omitted: 0,
                             marks: Vec::new(),
                             added: Vec::new(),
@@ -10813,6 +10817,7 @@ mod tests {
                         diff: ObservationDiff {
                             since_seq: 1,
                             seq: 2,
+                            url: None,
                             omitted: 0,
                             marks: Vec::new(),
                             added: Vec::new(),
@@ -11094,6 +11099,7 @@ mod tests {
                     diff: ObservationDiff {
                         since_seq: 1,
                         seq: 2,
+                        url: None,
                         omitted: 0,
                         marks: Vec::new(),
                         added: Vec::new(),
@@ -14809,6 +14815,7 @@ mod tests {
                 diff: ObservationDiff {
                     since_seq: 7,
                     seq: 9,
+                    url: None,
                     omitted: 0,
                     marks: Vec::new(),
                     added: Vec::new(),
@@ -14851,6 +14858,7 @@ mod tests {
                     diff: ObservationDiff {
                         since_seq: 1,
                         seq: 2,
+                        url: None,
                         omitted: 0,
                         marks: Vec::new(),
                         added: Vec::new(),
@@ -15000,6 +15008,7 @@ mod tests {
                     diff: ObservationDiff {
                         since_seq: 1,
                         seq: 2,
+                        url: None,
                         omitted: 0,
                         marks: Vec::new(),
                         added: Vec::new(),
@@ -15720,6 +15729,7 @@ mod tests {
                 diff: ObservationDiff {
                     since_seq: 0,
                     seq: 1,
+                    url: None,
                     omitted: 0,
                     marks: Vec::new(),
                     added: vec![],
@@ -15808,6 +15818,7 @@ mod tests {
                 diff: ObservationDiff {
                     since_seq: 4,
                     seq: 5,
+                    url: None,
                     omitted: 0,
                     marks: Vec::new(),
                     added: vec![],
@@ -15898,6 +15909,7 @@ mod tests {
                 diff: ObservationDiff {
                     since_seq: 6,
                     seq: 7,
+                    url: None,
                     omitted: 0,
                     marks: Vec::new(),
                     added: vec![],
@@ -17715,6 +17727,7 @@ mod tests {
                         diff: ObservationDiff {
                             since_seq: 1,
                             seq: 2,
+                            url: None,
                             omitted: 0,
                             marks: Vec::new(),
                             added: Vec::new(),
@@ -18777,6 +18790,7 @@ mod tests {
                 diff: ObservationDiff {
                     since_seq: seq.saturating_sub(1),
                     seq,
+                    url: None,
                     omitted: 0,
                     marks: Vec::new(),
                     added: vec![],

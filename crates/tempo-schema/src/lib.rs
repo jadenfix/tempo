@@ -98,6 +98,10 @@ fn u32_is_zero(value: &u32) -> bool {
 pub struct ObservationDiff {
     pub since_seq: u64,
     pub seq: u64,
+    /// Current page URL when the diff crosses a URL boundary. Omitted for the
+    /// common same-URL case so older peers keep seeing the compact shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
     /// Ranked elements omitted from the current observation after applying the
     /// diff. Zero means the current observation contains every candidate the
     /// compiler considered.
@@ -970,6 +974,7 @@ pub fn observation_diff_json_schema() -> Value {
         "properties": {
             "since_seq": { "type": "integer", "minimum": 0 },
             "seq": { "type": "integer", "minimum": 0 },
+            "url": { "type": "string", "format": "uri-reference" },
             "omitted": { "type": "integer", "minimum": 0, "maximum": u32::MAX },
             "marks": {
                 "type": "array",
@@ -1872,6 +1877,11 @@ mod tests {
             .collect();
         assert!(!diff_required.contains(&"omitted"));
         assert!(!diff_required.contains(&"marks"));
+        assert!(!diff_required.contains(&"url"));
+        assert_eq!(
+            diff["properties"]["url"]["format"],
+            Value::String("uri-reference".into())
+        );
 
         let grounding = grounding_json_schema();
         let grounding_required: Vec<&str> = grounding["required"]
@@ -2250,6 +2260,7 @@ mod tests {
             diff: Some(ObservationDiff {
                 since_seq: 2,
                 seq: 3,
+                url: None,
                 omitted: 0,
                 marks: Vec::new(),
                 added: vec![],

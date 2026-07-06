@@ -2455,6 +2455,7 @@ mod tests {
         let diff = ObservationDiff {
             since_seq: 41,
             seq: 42,
+            url: None,
             omitted: 0,
             marks: Vec::new(),
             added: vec![],
@@ -2545,6 +2546,7 @@ mod tests {
         let diff = ObservationDiff {
             since_seq: 7,
             seq: 8,
+            url: None,
             omitted: 0,
             marks: Vec::new(),
             added: vec![],

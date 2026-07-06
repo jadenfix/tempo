@@ -330,6 +330,7 @@ impl ToolStepStatus {
                 diff: ObservationDiff {
                     since_seq,
                     seq,
+                    url: None,
                     omitted: 0,
                     marks: Vec::new(),
                     added: Vec::new(),

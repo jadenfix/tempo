@@ -1239,7 +1239,8 @@ impl AgentRunner {
     ///     because it carries the driver's fresh URL and canonical element
     ///     order;
     ///   * without cache, navigating actions (`Goto`/`Click`/`Type`/`Select`/
-    ///     `Skill`) still full-observe because a diff carries no URL;
+    ///     `Skill`) still full-observe because a URL-carrying diff is not a
+    ///     same-document reconstruction proof;
     ///   * without cache, a diff that adds an element, was not computed against
     ///     our exact base, or carries ambiguous/malformed marks is declined by
     ///     [`reconstruct_observation`] and full-observed instead.
@@ -1312,11 +1313,12 @@ impl AgentRunner {
 /// the page to a new URL/origin.
 ///
 /// These actions force a full post-action re-observe (#235): an
-/// [`ObservationDiff`] carries element deltas + `seq` but not the URL, and the
-/// tracked policy origin (#254 taint / policy gating) plus the URL-keyed
-/// takeover detection (#343) both read `observation.url`. A diff that carries a
-/// stale URL would recompute the origin against the *old* page — a silent policy
-/// bypass — so anything that can navigate must read the URL fresh.
+/// [`ObservationDiff`] can carry the post-action URL, but URL presence means the
+/// diff crossed a navigation boundary rather than proving same-document
+/// equivalence. The tracked policy origin (#254 taint / policy gating) plus the
+/// URL-keyed takeover detection (#343) both read `observation.url`; anything
+/// that can navigate must still read the page fresh instead of reconstructing
+/// locally.
 ///
 /// `Type` and `Select` are treated as navigating: a `<select onchange>`
 /// jump-menu or an input handler can assign `location`, swapping the document
@@ -1381,15 +1383,17 @@ fn prompt_context_after_action(
 /// With `added` empty, the reconstructed vector is exactly the survivors of
 /// `base.elements` (content-updated in place) in their original order — what a
 /// full observe of the same page yields. `seq`, `omitted`, and `marks` come from
-/// the diff; `url` and `schema_version` are carried from `base`, unchanged
-/// because the caller only takes this path for same-document actions
-/// (URL/origin #254). The takeover detector (#343) and taint recomputation read
-/// this preserved element set / URL.
+/// the diff; `url` and `schema_version` are carried from `base`. A diff that
+/// explicitly carries a different URL is declined because this helper is only a
+/// same-document reconstruction path (URL/origin #254). The takeover detector
+/// (#343) and taint recomputation read this preserved element set / URL.
 ///
 /// Fallback conditions (return `None`):
 ///   * `diff.since_seq != base.seq` — the diff was not computed against our base
 ///     (a stale/evicted base or a diff-unsupported engine), so applying it is
 ///     unsound;
+///   * `diff.url` names a URL other than `base.url` — the diff crossed a URL
+///     boundary and needs a full observe;
 ///   * `!diff.added.is_empty()` — an addition's position is not recoverable from
 ///     the diff, so a full observe is required to place it;
 ///   * the delta is structurally inconsistent with `base` (a `changed`/`removed`
@@ -1401,6 +1405,9 @@ fn reconstruct_observation(
     diff: &ObservationDiff,
 ) -> Option<CompiledObservation> {
     if diff.since_seq != base.seq {
+        return None;
+    }
+    if diff.url.as_deref().is_some_and(|url| url != base.url) {
         return None;
     }
     // An addition has no recoverable position in `base`'s element order, so it
@@ -2198,6 +2205,7 @@ mod tests {
             tempo_schema::ObservationDiff {
                 since_seq,
                 seq: self.seq,
+                url: None,
                 omitted: 0,
                 marks: Vec::new(),
                 added: Vec::new(),
@@ -3003,6 +3011,7 @@ mod tests {
         let diff = ObservationDiff {
             since_seq: base.seq,
             seq: 8,
+            url: None,
             omitted: 0,
             marks: Vec::new(),
             added: Vec::new(),
@@ -3337,6 +3346,7 @@ mod tests {
             ObservationDiff {
                 since_seq,
                 seq: self.seq,
+                url: None,
                 omitted: current.omitted,
                 marks: Vec::new(),
                 added,
@@ -3381,6 +3391,7 @@ mod tests {
                 return Ok(ObservationDiff {
                     since_seq,
                     seq: self.seq,
+                    url: None,
                     omitted: 0,
                     marks: Vec::new(),
                     added: self.elements.clone(),
@@ -3812,6 +3823,7 @@ mod tests {
         let diff = ObservationDiff {
             since_seq: 4,
             seq: 5,
+            url: None,
             omitted: 2,
             marks: vec![(NodeId("a".into()), 1), (NodeId("c".into()), 3)],
             added: vec![],
@@ -3848,6 +3860,7 @@ mod tests {
         let ok = ObservationDiff {
             since_seq: 4,
             seq: 5,
+            url: None,
             omitted: 0,
             marks: Vec::new(),
             added: vec![],
@@ -3936,6 +3949,17 @@ mod tests {
             }
         )
         .is_none());
+        assert!(
+            reconstruct_observation(
+                &base,
+                &ObservationDiff {
+                    url: Some("https://example.net/elsewhere".into()),
+                    ..ok
+                }
+            )
+            .is_none(),
+            "URL-boundary diffs require a full observe"
+        );
     }
 
     #[test]
@@ -3951,6 +3975,7 @@ mod tests {
         let changed = ObservationDiff {
             since_seq: 4,
             seq: 5,
+            url: None,
             omitted: 0,
             marks: Vec::new(),
             added: vec![],
