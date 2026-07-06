@@ -38,7 +38,7 @@ use std::sync::mpsc::TrySendError;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
-use tempo_agent::{StepTriple, StepTripleOutcome};
+use tempo_agent::{IdempotencyKey, StepTriple, StepTripleOutcome};
 // Re-exported so consumers of `TempodSessionEventKind::StepTriple` (e.g. the
 // shell agent panel) can name the event payload without a direct tempo-agent dep.
 use futures::StreamExt;
@@ -504,6 +504,17 @@ pub struct TempodSessionEvents {
     pub truncated_before_seq: Option<u64>,
 }
 
+/// One model decision emitted from a decided-loop journal into tempod's
+/// session event stream.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TempodModelDecision {
+    pub actions: Vec<Action>,
+    pub rationale: Option<String>,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_input_tokens: u64,
+}
+
 /// Typed events clients can attach to for session logs and StepTriple telemetry.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -520,6 +531,9 @@ pub enum TempodSessionEventKind {
     },
     StepTriple {
         triple: StepTriple,
+    },
+    ModelDecision {
+        decision: TempodModelDecision,
     },
     /// A hard pause: the agent loop detected a CAPTCHA / auth-wall / login state
     /// ([`tempo_schema::HumanTakeover`], #244/#343) and stopped so a human can
@@ -1955,12 +1969,8 @@ impl SessionPool {
         if self.draining {
             return Err(TempodError::Draining);
         }
+        let session = self.live_session_for_producer(id)?.clone();
         self.ensure_agent_writer_available(id)?;
-        let session = self
-            .sessions
-            .get(id)
-            .ok_or_else(|| TempodError::SessionNotFound(id.clone()))?
-            .clone();
         let driver = self.session_driver(id)?;
         let now = current_time_ms();
         let run_id = AgentRunId(format!("run-{}", self.next_run_id));
@@ -2527,6 +2537,32 @@ impl SessionPool {
             }
         }
         Ok(self.record_event(id, TempodSessionEventKind::StepTriple { triple }))
+    }
+
+    fn live_session_for_producer(
+        &self,
+        id: &TempodSessionId,
+    ) -> Result<&TempodSession, TempodError> {
+        let session = self
+            .sessions
+            .get(id)
+            .ok_or_else(|| TempodError::SessionNotFound(id.clone()))?;
+        if session.state == TempodSessionState::Killed {
+            return Err(TempodError::Conflict(format!(
+                "session {} is killed and cannot accept producer events",
+                id.0
+            )));
+        }
+        Ok(session)
+    }
+
+    fn record_model_decision(
+        &mut self,
+        id: &TempodSessionId,
+        decision: TempodModelDecision,
+    ) -> Result<TempodSessionEvent, TempodError> {
+        self.live_session_for_producer(id)?;
+        Ok(self.record_event(id, TempodSessionEventKind::ModelDecision { decision }))
     }
 
     /// Record a human-takeover pause onto the session's event stream (#244/#343):
@@ -6843,6 +6879,76 @@ pub fn tempod_openapi(base_url: &str) -> JsonValue {
                     }
                 },
                 "Action": openapi_component_schema(tempo_schema::action_json_schema()),
+                "ObservationDiff": openapi_component_schema(tempo_schema::observation_diff_json_schema()),
+                "AgentStepTripleOutcome": {
+                    "oneOf": [
+                        {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["kind", "diff"],
+                            "properties": {
+                                "kind": {"const": "applied"},
+                                "diff": {"$ref": "#/components/schemas/ObservationDiff"}
+                            }
+                        },
+                        {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["kind", "reason"],
+                            "properties": {
+                                "kind": {"const": "step_error"},
+                                "reason": {"type": "string"}
+                            }
+                        }
+                    ]
+                },
+                "AgentStepTriple": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["key", "seq", "action", "outcome"],
+                    "properties": {
+                        "key": {"type": "string"},
+                        "seq": {"type": "integer", "minimum": 0},
+                        "action": {"$ref": "#/components/schemas/Action"},
+                        "outcome": {"$ref": "#/components/schemas/AgentStepTripleOutcome"}
+                    }
+                },
+                "TempodModelDecision": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                        "actions",
+                        "rationale",
+                        "input_tokens",
+                        "output_tokens",
+                        "cache_read_input_tokens"
+                    ],
+                    "properties": {
+                        "actions": {
+                            "type": "array",
+                            "items": {"$ref": "#/components/schemas/Action"}
+                        },
+                        "rationale": {
+                            "anyOf": [
+                                {"type": "string"},
+                                {"type": "null"}
+                            ]
+                        },
+                        "input_tokens": {"type": "integer", "minimum": 0},
+                        "output_tokens": {"type": "integer", "minimum": 0},
+                        "cache_read_input_tokens": {"type": "integer", "minimum": 0}
+                    }
+                },
+                "HumanTakeover": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["kind", "reason", "url"],
+                    "properties": {
+                        "kind": {"type": "string", "enum": ["captcha", "auth_wall", "login_required"]},
+                        "reason": {"type": "string"},
+                        "url": {"type": "string"}
+                    }
+                },
                 "NodeId": {"type": "string"},
                 "TempodSessionId": {
                     "type": "string"
@@ -7193,15 +7299,88 @@ pub fn tempod_openapi(base_url: &str) -> JsonValue {
                         "last_event_seq": {"type": "integer", "minimum": 0}
                     }
                 },
+                "TempodSessionEventKind": {
+                    "oneOf": [
+                        {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["kind", "url"],
+                            "properties": {
+                                "kind": {"const": "session_created"},
+                                "url": {"type": "string"}
+                            }
+                        },
+                        {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["kind"],
+                            "properties": {"kind": {"const": "session_adopted"}}
+                        },
+                        {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["kind"],
+                            "properties": {"kind": {"const": "session_handoff"}}
+                        },
+                        {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["kind"],
+                            "properties": {"kind": {"const": "session_killed"}}
+                        },
+                        {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["kind"],
+                            "properties": {"kind": {"const": "session_drained"}}
+                        },
+                        {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["kind", "event"],
+                            "properties": {
+                                "kind": {"const": "manager"},
+                                "event": {"$ref": "#/components/schemas/ManagerEvent"}
+                            }
+                        },
+                        {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["kind", "triple"],
+                            "properties": {
+                                "kind": {"const": "step_triple"},
+                                "triple": {"$ref": "#/components/schemas/AgentStepTriple"}
+                            }
+                        },
+                        {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["kind", "decision"],
+                            "properties": {
+                                "kind": {"const": "model_decision"},
+                                "decision": {"$ref": "#/components/schemas/TempodModelDecision"}
+                            }
+                        },
+                        {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["kind", "takeover"],
+                            "properties": {
+                                "kind": {"const": "human_takeover_required"},
+                                "takeover": {"$ref": "#/components/schemas/HumanTakeover"}
+                            }
+                        }
+                    ]
+                },
                 "TempodSessionEvent": {
                     "type": "object",
-                    "additionalProperties": true,
+                    "additionalProperties": false,
                     "required": ["session_id", "seq", "timestamp_ms", "event"],
                     "properties": {
                         "session_id": {"type": "string"},
                         "seq": {"type": "integer", "minimum": 0},
                         "timestamp_ms": {"type": "integer", "minimum": 0},
-                        "event": {"type": "object"}
+                        "event": {"$ref": "#/components/schemas/TempodSessionEventKind"}
                     }
                 },
                 "TempodSessionEvents": {
@@ -8341,40 +8520,49 @@ fn route_session_run_create(
         pool.begin_agent_run(&session_id, Some(goal.clone()))?
     };
 
-    let run_result: Result<(AgentRunState, Option<String>, Option<HumanTakeover>), TempodError> =
-        (|| {
-            let journal_dir = tempod_runtime_dir().join("runs");
-            std::fs::create_dir_all(&journal_dir)?;
-            let journal_path = journal_dir.join(format!("{}.jsonl", run.run_id.0));
-            let ids = tempo_agent::AgentRunIds::new(run.run_id.0.clone(), session_id.0.clone());
-            let mut runner = tempo_agent::AgentRunner::new_plaintext_unsafe(&journal_path, ids);
-            if let Some(max_tokens) = request.token_budget {
-                runner = runner.with_token_budget(tempo_agent::TokenBudget::new(max_tokens));
+    let run_result: Result<
+        (
+            AgentRunState,
+            Option<String>,
+            Vec<tempo_session::JournalEntry>,
+        ),
+        TempodError,
+    > = (|| {
+        let journal_dir = tempod_runtime_dir().join("runs");
+        std::fs::create_dir_all(&journal_dir)?;
+        let journal_path = journal_dir.join(format!("{}.jsonl", run.run_id.0));
+        let ids = tempo_agent::AgentRunIds::new(run.run_id.0.clone(), session_id.0.clone());
+        let mut runner = tempo_agent::AgentRunner::new_plaintext_unsafe(&journal_path, ids);
+        if let Some(max_tokens) = request.token_budget {
+            runner = runner.with_token_budget(tempo_agent::TokenBudget::new(max_tokens));
+        }
+        let mut decider =
+            tempo_agent::decider::ScriptedDecider::new(vec![request.actions, Vec::new()]);
+        let spec = tempo_agent::decider::DecidedTaskSpec::new(start_url, goal)
+            .with_max_rounds(request.max_rounds.unwrap_or(2));
+        let report =
+            futures::executor::block_on(runner.run_decided_task(&mut driver, &mut decider, &spec))
+                .map_err(|error| TempodError::Driver(error.to_string()))?;
+        let entries = tempo_session::read_journal_entries_with_retention_policy(
+            &journal_path,
+            &tempo_session::DurableRetentionPolicy::PlaintextUnsafe,
+        )
+        .map_err(|error| TempodError::Driver(error.to_string()))?;
+
+        let (state, error) = match report.status {
+            tempo_agent::decider::DecidedRunStatus::Completed
+            | tempo_agent::decider::DecidedRunStatus::AlreadyComplete => {
+                (AgentRunState::Completed, None)
             }
-            let mut decider =
-                tempo_agent::decider::ScriptedDecider::new(vec![request.actions, Vec::new()]);
-            let spec = tempo_agent::decider::DecidedTaskSpec::new(start_url, goal)
-                .with_max_rounds(request.max_rounds.unwrap_or(2));
-            let report = futures::executor::block_on(runner.run_decided_task(
-                &mut driver,
-                &mut decider,
-                &spec,
-            ))
-            .map_err(|error| TempodError::Driver(error.to_string()))?;
+            tempo_agent::decider::DecidedRunStatus::HumanTakeoverRequired { .. } => {
+                (AgentRunState::WaitingForHuman, None)
+            }
+            other => (AgentRunState::Failed, Some(format!("{other:?}"))),
+        };
+        Ok((state, error, entries))
+    })();
 
-            Ok(match report.status {
-                tempo_agent::decider::DecidedRunStatus::Completed
-                | tempo_agent::decider::DecidedRunStatus::AlreadyComplete => {
-                    (AgentRunState::Completed, None, None)
-                }
-                tempo_agent::decider::DecidedRunStatus::HumanTakeoverRequired { takeover } => {
-                    (AgentRunState::WaitingForHuman, None, Some(takeover))
-                }
-                other => (AgentRunState::Failed, Some(format!("{other:?}")), None),
-            })
-        })();
-
-    let (state, error, takeover) = match run_result {
+    let (state, error, entries) = match run_result {
         Ok(result) => result,
         Err(error) => {
             let error_message = error.to_string();
@@ -8385,13 +8573,86 @@ fn route_session_run_create(
 
     let finished = {
         let mut pool = lock_pool(pool)?;
-        let finished = pool.finish_agent_run(&run.run_id, state, error)?;
-        if let Some(takeover) = takeover {
-            pool.record_human_takeover(&session_id, takeover)?;
+        if let Err(error) = replay_decided_journal_events(&mut pool, &session_id, &entries) {
+            let error_message = error.to_string();
+            let _ = pool.finish_agent_run(&run.run_id, AgentRunState::Failed, Some(error_message));
+            return Err(error);
         }
-        finished
+        pool.finish_agent_run(&run.run_id, state, error)?
     };
     Ok(HttpResponse::json(201, finished))
+}
+
+fn replay_decided_journal_events(
+    pool: &mut SessionPool,
+    session_id: &TempodSessionId,
+    entries: &[tempo_session::JournalEntry],
+) -> Result<(), TempodError> {
+    pool.live_session_for_producer(session_id)?;
+    let mut step_index = 0_usize;
+    for entry in entries {
+        match &entry.event {
+            tempo_session::JournalEvent::ModelDecision {
+                actions,
+                rationale,
+                input_tokens,
+                output_tokens,
+                cache_read_input_tokens,
+            } => {
+                pool.record_model_decision(
+                    session_id,
+                    TempodModelDecision {
+                        actions: actions.clone(),
+                        rationale: rationale.clone(),
+                        input_tokens: *input_tokens,
+                        output_tokens: *output_tokens,
+                        cache_read_input_tokens: *cache_read_input_tokens,
+                    },
+                )?;
+            }
+            tempo_session::JournalEvent::StepApplied { action, diff } => {
+                let key = IdempotencyKey::for_action(step_index, action)
+                    .map_err(|error| TempodError::Driver(error.to_string()))?;
+                pool.record_step(
+                    session_id,
+                    StepTriple {
+                        key,
+                        seq: entry.seq,
+                        action: action.clone(),
+                        outcome: StepTripleOutcome::Applied { diff: diff.clone() },
+                    },
+                )?;
+                step_index += 1;
+            }
+            tempo_session::JournalEvent::StepError { action, reason, .. } => {
+                let key = IdempotencyKey::for_action(step_index, action)
+                    .map_err(|error| TempodError::Driver(error.to_string()))?;
+                pool.record_step(
+                    session_id,
+                    StepTriple {
+                        key,
+                        seq: entry.seq,
+                        action: action.clone(),
+                        outcome: StepTripleOutcome::StepError {
+                            reason: reason.clone(),
+                        },
+                    },
+                )?;
+                step_index += 1;
+            }
+            tempo_session::JournalEvent::HumanTakeoverRequired { takeover } => {
+                pool.record_human_takeover(session_id, takeover.clone())?;
+            }
+            tempo_session::JournalEvent::SessionStarted { .. }
+            | tempo_session::JournalEvent::StructuredFastPathSelected { .. }
+            | tempo_session::JournalEvent::Observation { .. }
+            | tempo_session::JournalEvent::ActionPlanned { .. }
+            | tempo_session::JournalEvent::TransportError { .. }
+            | tempo_session::JournalEvent::CassetteRecorded { .. }
+            | tempo_session::JournalEvent::SessionClosed => {}
+        }
+    }
+    Ok(())
 }
 
 fn finish_failed_session_run(
@@ -9480,15 +9741,113 @@ mod tests {
         );
         let runs = pool.list_runs(Some(&session.id));
         assert_eq!(runs, vec![run.clone()]);
-        let events = pool.events(&session.id, None)?;
+        let events_response = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "GET".into(),
+                path: format!("/sessions/{}/events", session.id.0),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: Vec::new(),
+            },
+        )?;
+        assert_eq!(events_response.status, 200);
+        let events: TempodSessionEvents = serde_json::from_slice(&events_response.body)?;
         assert!(events.events.iter().any(|event| matches!(
             event.event,
             TempodSessionEventKind::Manager {
                 event: ManagerEvent::RunStateChanged { .. }
             }
         )));
+        assert!(events.events.iter().any(|event| matches!(
+            &event.event,
+            TempodSessionEventKind::ModelDecision { decision }
+                if decision.actions == vec![Action::Scroll { x: 0.0, y: 4.0 }]
+        )));
+        assert!(events.events.iter().any(|event| matches!(
+            &event.event,
+            TempodSessionEventKind::ModelDecision { decision } if decision.actions.is_empty()
+        )));
+        assert!(events.events.iter().any(|event| matches!(
+            &event.event,
+            TempodSessionEventKind::StepTriple { triple }
+                if triple.action == (Action::Scroll { x: 0.0, y: 4.0 })
+        )));
         pool.kill(&session.id)?;
         join_driver_handler(handle)?;
+        Ok(())
+    }
+
+    #[test]
+    fn session_run_create_rejects_unknown_or_killed_session_before_producer_events() -> TestResult {
+        let mut pool = SessionPool::default();
+        let unknown = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/sessions/missing/runs".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: serde_json::to_vec(&json!({"actions": []}))?,
+            },
+        )?;
+        assert_eq!(unknown.status, 404);
+
+        let session = pool.create("https://killed-run.test")?;
+        pool.kill(&session.id)?;
+        let killed = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: format!("/sessions/{}/runs", session.id.0),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: serde_json::to_vec(&json!({"actions": []}))?,
+            },
+        )?;
+        assert_eq!(killed.status, 409);
+        assert!(!pool.events(&session.id, None)?.events.iter().any(|event| {
+            matches!(
+                event.event,
+                TempodSessionEventKind::ModelDecision { .. }
+                    | TempodSessionEventKind::StepTriple { .. }
+            )
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn decided_journal_producer_rejects_unknown_or_killed_sessions() -> TestResult {
+        let entries = vec![tempo_session::JournalEntry {
+            schema_version: tempo_schema::SCHEMA_VERSION.to_string(),
+            run_id: tempo_session::RunId("run-producer-test".into()),
+            session_id: tempo_session::SessionId("session-producer-test".into()),
+            seq: 0,
+            timestamp_ms: u128::from(current_time_ms()),
+            event: tempo_session::JournalEvent::ModelDecision {
+                actions: Vec::new(),
+                rationale: None,
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_read_input_tokens: 0,
+            },
+        }];
+
+        let mut pool = SessionPool::default();
+        assert!(matches!(
+            replay_decided_journal_events(&mut pool, &TempodSessionId("missing".into()), &entries),
+            Err(TempodError::SessionNotFound(_))
+        ));
+
+        let session = pool.create("https://producer-killed.test")?;
+        pool.kill(&session.id)?;
+        assert!(matches!(
+            replay_decided_journal_events(&mut pool, &session.id, &entries),
+            Err(TempodError::Conflict(_))
+        ));
         Ok(())
     }
 
@@ -12555,6 +12914,32 @@ mod tests {
             openapi["components"]["schemas"]["TempodSessionEvents"]["properties"]
                 ["truncated_before_seq"]["anyOf"][1]["type"],
             "null"
+        );
+        assert_eq!(
+            openapi["components"]["schemas"]["TempodSessionEvent"]["additionalProperties"],
+            false
+        );
+        assert_eq!(
+            openapi["components"]["schemas"]["TempodSessionEvent"]["properties"]["event"]["$ref"],
+            "#/components/schemas/TempodSessionEventKind"
+        );
+        assert!(
+            openapi["components"]["schemas"]["TempodSessionEventKind"]["oneOf"]
+                .as_array()
+                .is_some_and(|variants| variants.iter().any(|variant| {
+                    variant["properties"]["kind"]["const"] == "model_decision"
+                        && variant["properties"]["decision"]["$ref"]
+                            == "#/components/schemas/TempodModelDecision"
+                }))
+        );
+        assert_eq!(
+            openapi["components"]["schemas"]["TempodModelDecision"]["properties"]["actions"]
+                ["items"]["$ref"],
+            "#/components/schemas/Action"
+        );
+        assert_eq!(
+            openapi["components"]["schemas"]["AgentStepTriple"]["properties"]["outcome"]["$ref"],
+            "#/components/schemas/AgentStepTripleOutcome"
         );
         assert_eq!(
             openapi["components"]["schemas"]["CreateSessionRequest"]["properties"]["driverless"]
