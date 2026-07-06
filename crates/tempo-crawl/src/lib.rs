@@ -16,17 +16,18 @@
 //! surface.
 
 pub use tempo_net::{
-    AuditRecord, BlockCode, BlockReason, CheckedCrawlDispatch, ConnectionPinnedCrawlDispatch,
-    CrawlCheckedBatch, CrawlConnectError, CrawlDecision, CrawlDispatchError, CrawlDispatchGuard,
-    CrawlDispatchSigner, CrawlError, CrawlFrontierSnapshot, CrawlPinnedBatch, CrawlPolicy,
-    CrawlScheduler, DomainRule, EgressDenied, EgressPolicy, EgressRecord, IdentityMode,
-    NetworkRequest, NetworkResponseRecord, OriginCrawlSnapshot, PinnedCrawlConnection, ProfileId,
-    ProxyRoute, RejectedCrawlDispatch, RejectedPinnedCrawlDispatch, RequestId, RobotsRules,
-    SignatureError, SignatureHeaders, UrlBlocked, UrlPolicy, WebBotAuthSigningKey,
-    DEFAULT_CRAWL_MAX_CONCURRENT_PER_ORIGIN, DEFAULT_CRAWL_MAX_GLOBAL_INFLIGHT,
-    DEFAULT_CRAWL_MAX_GLOBAL_PENDING, DEFAULT_CRAWL_MAX_GLOBAL_PENDING_BYTES,
-    DEFAULT_CRAWL_MAX_PENDING_BYTES_PER_ORIGIN, DEFAULT_CRAWL_MAX_PENDING_PER_ORIGIN,
-    DEFAULT_CRAWL_MIN_DELAY_TICKS,
+    classify_crawl_response, content_usage_from_response, AuditRecord, BlockCode, BlockReason,
+    CheckedCrawlDispatch, ConnectionPinnedCrawlDispatch, ContentUsagePolicy, CrawlCheckedBatch,
+    CrawlConnectError, CrawlDecision, CrawlDispatchError, CrawlDispatchGuard, CrawlDispatchSigner,
+    CrawlError, CrawlFrontierSnapshot, CrawlPinnedBatch, CrawlPolicy, CrawlResponseClassification,
+    CrawlScheduler, CrawlUsageCategory, DomainRule, EgressDenied, EgressPolicy, EgressRecord,
+    IdentityMode, NetworkRequest, NetworkResponseRecord, OriginCrawlSnapshot,
+    PinnedCrawlConnection, ProfileId, ProxyRoute, RejectedCrawlDispatch,
+    RejectedPinnedCrawlDispatch, RequestId, RobotsRules, SignatureError, SignatureHeaders,
+    UrlBlocked, UrlPolicy, WebBotAuthSigningKey, DEFAULT_CRAWL_MAX_CONCURRENT_PER_ORIGIN,
+    DEFAULT_CRAWL_MAX_GLOBAL_INFLIGHT, DEFAULT_CRAWL_MAX_GLOBAL_PENDING,
+    DEFAULT_CRAWL_MAX_GLOBAL_PENDING_BYTES, DEFAULT_CRAWL_MAX_PENDING_BYTES_PER_ORIGIN,
+    DEFAULT_CRAWL_MAX_PENDING_PER_ORIGIN, DEFAULT_CRAWL_MIN_DELAY_TICKS,
 };
 
 #[deprecated(
