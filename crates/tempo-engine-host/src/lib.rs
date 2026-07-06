@@ -7,6 +7,7 @@
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -305,6 +306,14 @@ fn write_frame_serializable<T: Serialize>(
     frame: &T,
     scratch: &mut Vec<u8>,
 ) -> Result<(), EngineHostError> {
+    encode_frame_serializable(frame, scratch)?;
+    write_encoded_frame(writer, scratch)
+}
+
+fn encode_frame_serializable<T: Serialize>(
+    frame: &T,
+    scratch: &mut Vec<u8>,
+) -> Result<(), EngineHostError> {
     scratch.clear();
     scratch.extend_from_slice(&[0_u8; 4]);
     serde_json::to_writer(&mut *scratch, frame)?;
@@ -317,7 +326,11 @@ fn write_frame_serializable<T: Serialize>(
     }
     let prefix = (len as u32).to_be_bytes();
     scratch[..4].copy_from_slice(&prefix);
-    writer.write_all(scratch)?;
+    Ok(())
+}
+
+fn write_encoded_frame(writer: &mut impl Write, frame: &[u8]) -> Result<(), EngineHostError> {
+    writer.write_all(frame)?;
     writer.flush()?;
     Ok(())
 }
@@ -332,6 +345,13 @@ struct WireFrameRef<'a, T: Serialize> {
     payload: &'a T,
 }
 
+#[derive(Deserialize)]
+struct WireFramePayload<T> {
+    id: u64,
+    method: String,
+    payload: T,
+}
+
 /// Read one length-prefixed JSON frame.
 pub fn read_frame(reader: &mut impl Read) -> Result<WireFrame, EngineHostError> {
     read_frame_with(reader, &mut Vec::new())
@@ -344,6 +364,13 @@ pub fn read_frame_with(
     reader: &mut impl Read,
     scratch: &mut Vec<u8>,
 ) -> Result<WireFrame, EngineHostError> {
+    read_frame_payload_with(reader, scratch)
+}
+
+fn read_frame_payload_with<T: DeserializeOwned>(
+    reader: &mut impl Read,
+    scratch: &mut Vec<u8>,
+) -> Result<T, EngineHostError> {
     let mut len = [0_u8; 4];
     reader.read_exact(&mut len)?;
     let len = u32::from_be_bytes(len) as usize;
@@ -808,18 +835,6 @@ impl SharedEngineIpcClient {
         command: DriverCommand,
         timeout: Duration,
     ) -> Result<DriverResponse, EngineIpcRequestError> {
-        let payload = serde_json::to_value(DriverRequestPayload {
-            driver_id: driver_id.map(str::to_string),
-            command,
-        })
-        .map_err(EngineHostError::from)
-        .map_err(EngineIpcRequestError::NotDispatched)?;
-        let (tx, rx) = mpsc::channel();
-
-        // Lock order is writer -> pending everywhere; the reader takes only
-        // `pending`, so no cycle exists. Registration happens before the frame
-        // is written so the reader can never see a response for an id that is
-        // not yet registered.
         let id = {
             let mut writer = self.inner.writer.lock().map_err(|_| {
                 EngineIpcRequestError::NotDispatched(EngineHostError::IpcClosed {
@@ -832,6 +847,29 @@ impl SharedEngineIpcClient {
                 .checked_add(1)
                 .ok_or(EngineHostError::RequestIdExhausted)
                 .map_err(EngineIpcRequestError::NotDispatched)?;
+            id
+        };
+        let payload = DriverRequestPayload {
+            driver_id: driver_id.map(str::to_string),
+            command,
+        };
+        let mut encoded = Vec::with_capacity(256);
+        encode_frame_serializable(
+            &WireFrameRef {
+                id,
+                method: DRIVER_REQUEST_METHOD,
+                payload: &payload,
+            },
+            &mut encoded,
+        )
+        .map_err(EngineIpcRequestError::NotDispatched)?;
+        let (tx, rx) = mpsc::channel();
+
+        // Registration happens before the frame is written so the reader can
+        // never see a response for an id that is not yet registered. No nested
+        // writer/pending locks are held here, so the reader cannot deadlock
+        // behind a sender while JSON encoding happens outside the writer lock.
+        {
             {
                 let mut pending = self.inner.pending.lock().map_err(|_| {
                     EngineIpcRequestError::NotDispatched(EngineHostError::IpcClosed {
@@ -847,17 +885,25 @@ impl SharedEngineIpcClient {
                 }
                 pending.waiters.insert(id, tx);
             }
+            let mut writer = match self.inner.writer.lock() {
+                Ok(writer) => writer,
+                Err(_) => {
+                    self.forget_waiter(id);
+                    return Err(EngineIpcRequestError::NotDispatched(
+                        EngineHostError::IpcClosed {
+                            reason: "engine IPC writer lock poisoned".into(),
+                        },
+                    ));
+                }
+            };
             // The write is bounded by the stream's write timeout and never
-            // overlaps a response wait.
-            if let Err(error) = write_frame(
-                &mut writer.stream,
-                &WireFrame::new(id, DRIVER_REQUEST_METHOD, payload),
-            ) {
+            // overlaps a response wait. Serialization happened before taking
+            // this lock, so concurrent callers do not queue behind JSON work.
+            if let Err(error) = write_encoded_frame(&mut writer.stream, &encoded) {
                 self.forget_waiter(id);
                 return Err(EngineIpcRequestError::NotDispatched(error));
             }
-            id
-        };
+        }
 
         match rx.recv_timeout(timeout) {
             Ok(Ok(response)) => Ok(response),
@@ -974,24 +1020,28 @@ impl EngineIpcConnection {
     }
 
     pub fn read_driver_request(&mut self) -> Result<DriverRequest, EngineHostError> {
-        let request = read_expected_frame(&mut self.stream, DRIVER_REQUEST_METHOD)?;
-        let payload: DriverRequestPayload = serde_json::from_value(request.payload)?;
+        let request = read_expected_frame_payload::<DriverRequestPayload>(
+            &mut self.stream,
+            DRIVER_REQUEST_METHOD,
+        )?;
         Ok(DriverRequest {
             id: request.id,
-            driver_id: payload.driver_id,
-            command: payload.command,
+            driver_id: request.payload.driver_id,
+            command: request.payload.command,
         })
     }
 
     pub async fn read_driver_request_async(&mut self) -> Result<DriverRequest, EngineHostError> {
         let mut stream = self.stream.try_clone()?;
         run_blocking_ipc(move || {
-            let request = read_expected_frame(&mut stream, DRIVER_REQUEST_METHOD)?;
-            let payload: DriverRequestPayload = serde_json::from_value(request.payload)?;
+            let request = read_expected_frame_payload::<DriverRequestPayload>(
+                &mut stream,
+                DRIVER_REQUEST_METHOD,
+            )?;
             Ok(DriverRequest {
                 id: request.id,
-                driver_id: payload.driver_id,
-                command: payload.command,
+                driver_id: request.payload.driver_id,
+                command: request.payload.command,
             })
         })
         .await
@@ -1005,10 +1055,14 @@ impl EngineIpcConnection {
         if let DriverResponse::Screenshot { bytes } = response {
             return write_screenshot_response(&mut self.stream, request_id, bytes);
         }
-        let payload = serde_json::to_value(response)?;
-        write_frame(
+        write_frame_serializable(
             &mut self.stream,
-            &WireFrame::new(request_id, DRIVER_RESPONSE_METHOD, payload),
+            &WireFrameRef {
+                id: request_id,
+                method: DRIVER_RESPONSE_METHOD,
+                payload: &response,
+            },
+            &mut Vec::with_capacity(256),
         )
     }
 
@@ -1022,10 +1076,14 @@ impl EngineIpcConnection {
             if let DriverResponse::Screenshot { bytes } = response {
                 return write_screenshot_response(&mut stream, request_id, bytes);
             }
-            let payload = serde_json::to_value(response)?;
-            write_frame(
+            write_frame_serializable(
                 &mut stream,
-                &WireFrame::new(request_id, DRIVER_RESPONSE_METHOD, payload),
+                &WireFrameRef {
+                    id: request_id,
+                    method: DRIVER_RESPONSE_METHOD,
+                    payload: &response,
+                },
+                &mut Vec::with_capacity(256),
             )
         })
         .await
@@ -1477,6 +1535,28 @@ fn read_expected_frame_with(
     Ok(frame)
 }
 
+fn read_expected_frame_payload<T: DeserializeOwned>(
+    reader: &mut impl Read,
+    expected_method: &'static str,
+) -> Result<WireFramePayload<T>, EngineHostError> {
+    read_expected_frame_payload_with(reader, expected_method, &mut Vec::new())
+}
+
+fn read_expected_frame_payload_with<T: DeserializeOwned>(
+    reader: &mut impl Read,
+    expected_method: &'static str,
+    scratch: &mut Vec<u8>,
+) -> Result<WireFramePayload<T>, EngineHostError> {
+    let frame: WireFramePayload<T> = read_frame_payload_with(reader, scratch)?;
+    if frame.method != expected_method {
+        return Err(EngineHostError::UnexpectedFrameMethod {
+            expected: expected_method,
+            actual: frame.method,
+        });
+    }
+    Ok(frame)
+}
+
 fn driver_error(error: TransportError) -> DriverResponse {
     DriverResponse::Error {
         error: DriverWireError::transport(&error),
@@ -1535,9 +1615,8 @@ fn verify_control_token(
     reader: &mut impl Read,
     expected_token: &str,
 ) -> Result<(), EngineHostError> {
-    let frame = read_expected_frame(reader, DRIVER_AUTH_METHOD)?;
-    let payload: AuthPayload = serde_json::from_value(frame.payload)?;
-    if !constant_time_eq(payload.token.as_bytes(), expected_token.as_bytes()) {
+    let frame = read_expected_frame_payload::<AuthPayload>(reader, DRIVER_AUTH_METHOD)?;
+    if !constant_time_eq(frame.payload.token.as_bytes(), expected_token.as_bytes()) {
         return Err(EngineHostError::ControlAuthFailed);
     }
     Ok(())
