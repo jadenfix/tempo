@@ -4019,12 +4019,14 @@ pub fn serve_forever_with_config(
 ) -> Result<(), TempodError> {
     let config = ensure_runtime_auth(config)?;
     config.validate_listener(&listener)?;
+    let metadata_auth_required = !listener.local_addr()?.ip().is_loopback();
     let host_guard = TempodHostGuard::from_listener(&listener, &config.allowed_hosts)?;
     serve_forever_trusted(
         listener,
         pool,
         config.auth,
         host_guard,
+        metadata_auth_required,
         ConnectionLimiter::default(),
     )
 }
@@ -4036,7 +4038,14 @@ fn serve_forever_without_auth_for_tests_with_limits(
     limiter: ConnectionLimiter,
 ) -> Result<(), TempodError> {
     let host_guard = TempodHostGuard::from_listener(&listener, &BTreeSet::new())?;
-    serve_forever_trusted(listener, pool, TempodAuth::disabled(), host_guard, limiter)
+    serve_forever_trusted(
+        listener,
+        pool,
+        TempodAuth::disabled(),
+        host_guard,
+        false,
+        limiter,
+    )
 }
 
 #[cfg(test)]
@@ -4052,6 +4061,7 @@ fn serve_forever_trusted(
     pool: Arc<Mutex<SessionPool>>,
     auth: TempodAuth,
     host_guard: TempodHostGuard,
+    metadata_auth_required: bool,
     limiter: ConnectionLimiter,
 ) -> Result<(), TempodError> {
     let _ = process_start();
@@ -4062,6 +4072,7 @@ fn serve_forever_trusted(
             pool,
             auth,
             host_guard,
+            metadata_auth_required,
             limiter: limiter.clone(),
         });
         loop {
@@ -4106,12 +4117,14 @@ pub fn serve_one_with_config(
 ) -> Result<(), TempodError> {
     let config = ensure_runtime_auth(config)?;
     config.validate_listener(&listener)?;
+    let metadata_auth_required = !listener.local_addr()?.ip().is_loopback();
     let host_guard = TempodHostGuard::from_listener(&listener, &config.allowed_hosts)?;
     serve_one_trusted(
         listener,
         pool,
         config.auth,
         host_guard,
+        metadata_auth_required,
         ConnectionLimiter::default(),
     )
 }
@@ -4127,6 +4140,7 @@ fn serve_one_without_auth_for_tests(
         pool,
         TempodAuth::disabled(),
         host_guard,
+        false,
         ConnectionLimiter::default(),
     )
 }
@@ -4151,6 +4165,7 @@ fn serve_one_trusted(
     pool: Arc<Mutex<SessionPool>>,
     auth: TempodAuth,
     host_guard: TempodHostGuard,
+    metadata_auth_required: bool,
     limiter: ConnectionLimiter,
 ) -> Result<(), TempodError> {
     let _ = process_start();
@@ -4168,6 +4183,7 @@ fn serve_one_trusted(
             pool,
             auth,
             host_guard,
+            metadata_auth_required,
             limiter: limiter.clone(),
         });
         serve_tcp_connection(stream, router, permit).await;
@@ -4256,6 +4272,7 @@ struct TempodAppState {
     pool: Arc<Mutex<SessionPool>>,
     auth: TempodAuth,
     host_guard: TempodHostGuard,
+    metadata_auth_required: bool,
     limiter: ConnectionLimiter,
 }
 
@@ -4382,7 +4399,7 @@ async fn guard_control_plane(
 ) -> Response {
     let method = request.method().as_str();
     let path = request.uri().path();
-    if route_requires_host_check(method, path)
+    if route_requires_host_check(method, path, state.metadata_auth_required)
         && !state
             .host_guard
             .allows(header_str(request.headers(), header::HOST))
@@ -4390,7 +4407,7 @@ async fn guard_control_plane(
         return tempod_error_response(&TempodError::Forbidden("host not allowed".into()))
             .into_response();
     }
-    if route_requires_auth(method, path)
+    if route_requires_auth(method, path, state.metadata_auth_required)
         && let Err(err) = state
             .auth
             .authorize(header_str(request.headers(), header::AUTHORIZATION))
@@ -5902,7 +5919,11 @@ pub fn tempod_openapi(base_url: &str) -> JsonValue {
             "/health": {
                 "get": {
                     "operationId": "health",
-                    "responses": {"200": {"description": "tempod is reachable"}}
+                    "security": [{"TempodBearer": []}],
+                    "responses": {
+                        "200": {"description": "tempod is reachable"},
+                        "401": {"description": "Bearer auth is required on non-loopback tempod binds"}
+                    }
                 }
             },
             "/ready": {
@@ -5924,12 +5945,17 @@ pub fn tempod_openapi(base_url: &str) -> JsonValue {
             TEMPOD_OPENAPI_PATH: {
                 "get": {
                     "operationId": "openapi",
-                    "responses": {"200": {"description": "OpenAPI 3.1 document"}}
+                    "security": [{"TempodBearer": []}],
+                    "responses": {
+                        "200": {"description": "OpenAPI 3.1 document"},
+                        "401": {"description": "Bearer auth is required on non-loopback tempod binds"}
+                    }
                 }
             },
             tempo_mcp::A2A_AGENT_CARD_PATH: {
                 "get": {
                     "operationId": "agentCard",
+                    "security": [{"TempodBearer": []}],
                     "responses": {
                         "200": {
                             "description": "A2A agent card metadata for this tempod control plane",
@@ -5938,13 +5964,15 @@ pub fn tempod_openapi(base_url: &str) -> JsonValue {
                                     "schema": {"type": "object", "additionalProperties": true}
                                 }
                             }
-                        }
+                        },
+                        "401": {"description": "Bearer auth is required on non-loopback tempod binds"}
                     }
                 }
             },
             tempo_mcp::A2A_AGENT_JSON_PATH: {
                 "get": {
                     "operationId": "agentJson",
+                    "security": [{"TempodBearer": []}],
                     "responses": {
                         "200": {
                             "description": "A2A agent metadata alias for this tempod control plane",
@@ -5953,7 +5981,8 @@ pub fn tempod_openapi(base_url: &str) -> JsonValue {
                                     "schema": {"type": "object", "additionalProperties": true}
                                 }
                             }
-                        }
+                        },
+                        "401": {"description": "Bearer auth is required on non-loopback tempod binds"}
                     }
                 }
             },
@@ -6912,9 +6941,10 @@ fn session_id_query(query: Option<&str>) -> Result<Option<String>, TempodError> 
 
 /// Whether a route must pass the loopback-Origin guard. Session/control-plane routes (create, drain, adopt, delete, list,
 /// session events, and any unrecognised — hence potentially state-changing —
-/// route) are guarded. Exempt are the public idempotent metadata routes
-/// (`/health`, the A2A agent card, `GET /mcp`) and the routes that already run
-/// their own Origin check (`POST /mcp` via `route_mcp`, `POST /bidi`, and the
+/// route) are guarded. Exempt are loopback discovery metadata routes
+/// (`/health`, OpenAPI, the A2A agent card, `GET /mcp`); public metadata routes
+/// require bearer auth when the listener is bound on a non-loopback address.
+/// Also exempt are routes that already run their own Origin check (`POST /mcp` via `route_mcp`, `POST /bidi`, and the
 /// `GET /bidi` WebSocket upgrade handler). The guard relies
 /// on `origin_allowed` returning `true` when no Origin header is present, so
 /// non-browser/CLI clients keep working.
@@ -6932,15 +6962,26 @@ fn control_route_requires_origin_check(method: &str, path: &str) -> bool {
     )
 }
 
-fn route_requires_auth(method: &str, path: &str) -> bool {
+fn route_requires_auth(method: &str, path: &str, metadata_auth_required: bool) -> bool {
     matches!(
         (method, path),
         ("GET", "/mcp") | ("POST", "/mcp") | ("GET", "/bidi") | ("POST", "/bidi")
     ) || control_route_requires_origin_check(method, path)
+        || (metadata_auth_required && public_metadata_route(method, path))
 }
 
-fn route_requires_host_check(method: &str, path: &str) -> bool {
-    route_requires_auth(method, path)
+fn route_requires_host_check(method: &str, path: &str, metadata_auth_required: bool) -> bool {
+    route_requires_auth(method, path, metadata_auth_required)
+}
+
+fn public_metadata_route(method: &str, path: &str) -> bool {
+    matches!(
+        (method, path),
+        ("GET", "/health")
+            | ("GET", TEMPOD_OPENAPI_PATH)
+            | ("GET", tempo_mcp::A2A_AGENT_CARD_PATH)
+            | ("GET", tempo_mcp::A2A_AGENT_JSON_PATH)
+    )
 }
 
 fn bind_addr_is_loopback(addr: &str) -> Result<bool, TempodError> {
@@ -8370,7 +8411,7 @@ mod tests {
     /// it through the production axum router (`tempod_router`) via
     /// `tower::ServiceExt::oneshot`, so every in-process test exercises the
     /// same routing, guards, and handlers as a real socket connection.
-    #[derive(Debug)]
+    #[derive(Clone, Debug)]
     struct HttpRequest {
         method: String,
         path: String,
@@ -8393,11 +8434,29 @@ mod tests {
         auth: &TempodAuth,
         request: HttpRequest,
     ) -> Result<TestResponse, TempodError> {
+        oneshot_response_with_metadata_auth(shared, auth, request, false)
+    }
+
+    fn oneshot_response_with_metadata_auth(
+        shared: &Arc<Mutex<SessionPool>>,
+        auth: &TempodAuth,
+        request: HttpRequest,
+        metadata_auth_required: bool,
+    ) -> Result<TestResponse, TempodError> {
         use tower::ServiceExt as _;
+        let host_guard = if metadata_auth_required {
+            TempodHostGuard {
+                allowed_hosts: BTreeSet::new(),
+                allow_any_valid_host: true,
+            }
+        } else {
+            TempodHostGuard::loopback()
+        };
         let router = tempod_router(TempodAppState {
             pool: Arc::clone(shared),
             auth: auth.clone(),
-            host_guard: TempodHostGuard::loopback(),
+            host_guard,
+            metadata_auth_required,
             limiter: ConnectionLimiter::default(),
         });
         let mut builder = axum::http::Request::builder()
@@ -8457,6 +8516,26 @@ mod tests {
         auth: &TempodAuth,
     ) -> TestResponse {
         match with_shared_pool(pool, |shared| oneshot_response(shared, auth, request)) {
+            Ok(response) => response,
+            Err(error) => {
+                let response = tempod_error_response(&error);
+                TestResponse {
+                    status: response.status,
+                    content_type: response.content_type.to_string(),
+                    body: response.body,
+                }
+            }
+        }
+    }
+
+    fn handle_remote_metadata_request_with_auth(
+        pool: &mut SessionPool,
+        request: HttpRequest,
+        auth: &TempodAuth,
+    ) -> TestResponse {
+        match with_shared_pool(pool, |shared| {
+            oneshot_response_with_metadata_auth(shared, auth, request, true)
+        }) {
             Ok(response) => response,
             Err(error) => {
                 let response = tempod_error_response(&error);
@@ -11833,6 +11912,22 @@ mod tests {
             openapi["paths"]["/mcp"]["post"]["security"],
             json!([{"TempodBearer": []}])
         );
+        for path in [
+            "/health",
+            TEMPOD_OPENAPI_PATH,
+            tempo_mcp::A2A_AGENT_CARD_PATH,
+            tempo_mcp::A2A_AGENT_JSON_PATH,
+        ] {
+            assert_eq!(
+                openapi["paths"][path]["get"]["security"],
+                json!([{"TempodBearer": []}]),
+                "{path} must advertise bearer auth for non-loopback clients"
+            );
+            assert_eq!(
+                openapi["paths"][path]["get"]["responses"]["401"]["description"],
+                "Bearer auth is required on non-loopback tempod binds"
+            );
+        }
         assert_eq!(
             openapi["paths"]["/ready"]["get"]["responses"]["503"]["content"]["application/json"]
                 ["schema"]["$ref"],
@@ -15407,6 +15502,43 @@ mod tests {
             })?;
 
         assert!(config.validate_listener(&listener).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn remote_metadata_routes_require_bearer_auth() -> TestResult {
+        let auth = TempodAuth::bearer("secret-token")?;
+        let mut pool = SessionPool::default();
+        let routes = [
+            "/health",
+            TEMPOD_OPENAPI_PATH,
+            tempo_mcp::A2A_AGENT_CARD_PATH,
+            tempo_mcp::A2A_AGENT_JSON_PATH,
+        ];
+
+        for path in routes {
+            let request = with_host(
+                control_request("GET", path, None, b""),
+                "remote.example:8787",
+            );
+            let missing =
+                handle_remote_metadata_request_with_auth(&mut pool, request.clone(), &auth);
+            assert_eq!(missing.status, 401, "missing auth should reject {path}");
+
+            let wrong = handle_remote_metadata_request_with_auth(
+                &mut pool,
+                with_bearer(request.clone(), "wrong-token"),
+                &auth,
+            );
+            assert_eq!(wrong.status, 401, "wrong auth should reject {path}");
+
+            let allowed = handle_remote_metadata_request_with_auth(
+                &mut pool,
+                with_bearer(request, "secret-token"),
+                &auth,
+            );
+            assert_eq!(allowed.status, 200, "valid auth should allow {path}");
+        }
         Ok(())
     }
 
