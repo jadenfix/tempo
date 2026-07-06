@@ -9,7 +9,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 use std::fmt::Write as _;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
+use std::io;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -1857,6 +1858,12 @@ pub const DEFAULT_CRAWL_MAX_GLOBAL_PENDING: usize = 4096;
 /// Default pending queue cap for one origin within a crawler frontier.
 pub const DEFAULT_CRAWL_MAX_PENDING_PER_ORIGIN: usize = 256;
 
+/// Default global pending request metadata cap for one crawler frontier.
+pub const DEFAULT_CRAWL_MAX_GLOBAL_PENDING_BYTES: usize = 4 * 1024 * 1024;
+
+/// Default pending request metadata cap for one origin within a crawler frontier.
+pub const DEFAULT_CRAWL_MAX_PENDING_BYTES_PER_ORIGIN: usize = 512 * 1024;
+
 /// Default minimum spacing between starts for one origin, expressed in caller
 /// supplied deterministic ticks.
 pub const DEFAULT_CRAWL_MIN_DELAY_TICKS: u64 = 1;
@@ -2464,6 +2471,182 @@ pub struct CheckedCrawlDispatch {
     pub web_bot_auth_headers: Option<SignatureHeaders>,
 }
 
+impl CheckedCrawlDispatch {
+    /// Consume this checked dispatch into a capability that carries the checked
+    /// socket and HTTP request parts without exposing the raw URL for
+    /// re-resolution.
+    pub fn into_connection_pinned(
+        self,
+    ) -> Result<ConnectionPinnedCrawlDispatch, CrawlDispatchError> {
+        ConnectionPinnedCrawlDispatch::from_checked(self)
+    }
+}
+
+/// Checked crawl request metadata prepared for connection-pinned execution.
+///
+/// The original URL is intentionally not exposed. Transport adapters can build
+/// HTTP/TLS request state from the scheme, authority, host, path/query, headers,
+/// and already-approved socket without giving an HTTP client a hostname to
+/// resolve again.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ConnectionPinnedCrawlDispatch {
+    request_id: RequestId,
+    method: String,
+    profile_id: ProfileId,
+    identity_mode: IdentityMode,
+    headers: BTreeMap<String, Vec<String>>,
+    body_size: u64,
+    body_sha256: Option<[u8; 32]>,
+    scheme: String,
+    authority: String,
+    host: String,
+    path_and_query: String,
+    origin: String,
+    resolved_socket: SocketAddr,
+    audit: AuditRecord,
+    egress: EgressRecord,
+    web_bot_auth_headers: Option<SignatureHeaders>,
+}
+
+impl fmt::Debug for ConnectionPinnedCrawlDispatch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConnectionPinnedCrawlDispatch")
+            .field("request_id", &self.request_id)
+            .field("method", &self.method)
+            .field("profile_id", &self.profile_id)
+            .field("identity_mode", &self.identity_mode)
+            .field("header_count", &header_value_count(&self.headers))
+            .field("body_size", &self.body_size)
+            .field("body_sha256_present", &self.body_sha256.is_some())
+            .field("scheme", &self.scheme)
+            .field("authority", &"[redacted]")
+            .field("host", &"[redacted]")
+            .field("path_and_query", &"[redacted]")
+            .field("origin", &self.origin)
+            .field("resolved_socket", &self.resolved_socket)
+            .field("audit", &self.audit)
+            .field("egress", &self.egress)
+            .field(
+                "web_bot_auth_headers_present",
+                &self.web_bot_auth_headers.is_some(),
+            )
+            .finish()
+    }
+}
+
+impl ConnectionPinnedCrawlDispatch {
+    fn from_checked(checked: CheckedCrawlDispatch) -> Result<Self, CrawlDispatchError> {
+        let parts = UrlParts::parse(&checked.dispatch.request.url)
+            .map_err(|reason| CrawlDispatchError::Url(UrlBlocked { reason }))?;
+        let mut path_and_query = parts.path.clone();
+        if let Some(query) = &parts.query {
+            path_and_query.push_str(query);
+        }
+        let authority = parts.authority_component();
+        Ok(Self {
+            request_id: checked.dispatch.request.id,
+            method: checked.dispatch.request.method,
+            profile_id: checked.dispatch.request.profile_id,
+            identity_mode: checked.dispatch.request.identity_mode,
+            headers: checked.dispatch.request.headers,
+            body_size: checked.dispatch.request.body_size,
+            body_sha256: checked.dispatch.request.body_sha256,
+            scheme: parts.scheme,
+            authority,
+            host: parts.host,
+            path_and_query,
+            origin: checked.dispatch.origin,
+            resolved_socket: checked.resolved_socket,
+            audit: checked.audit,
+            egress: checked.egress,
+            web_bot_auth_headers: checked.web_bot_auth_headers,
+        })
+    }
+
+    pub fn request_id(&self) -> &RequestId {
+        &self.request_id
+    }
+
+    pub fn method(&self) -> &str {
+        &self.method
+    }
+
+    pub fn profile_id(&self) -> &ProfileId {
+        &self.profile_id
+    }
+
+    pub fn identity_mode(&self) -> IdentityMode {
+        self.identity_mode
+    }
+
+    pub fn headers(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.headers.iter().flat_map(|(name, values)| {
+            values
+                .iter()
+                .map(move |value| (name.as_str(), value.as_str()))
+        })
+    }
+
+    pub fn header_values(&self, name: &str) -> Option<&[String]> {
+        self.headers
+            .get(&name.to_ascii_lowercase())
+            .map(Vec::as_slice)
+    }
+
+    pub fn body_size(&self) -> u64 {
+        self.body_size
+    }
+
+    pub fn body_sha256(&self) -> Option<[u8; 32]> {
+        self.body_sha256
+    }
+
+    pub fn scheme(&self) -> &str {
+        &self.scheme
+    }
+
+    pub fn authority(&self) -> &str {
+        &self.authority
+    }
+
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    pub fn path_and_query(&self) -> &str {
+        &self.path_and_query
+    }
+
+    pub fn origin(&self) -> &str {
+        &self.origin
+    }
+
+    pub fn resolved_socket(&self) -> SocketAddr {
+        self.resolved_socket
+    }
+
+    pub fn audit(&self) -> &AuditRecord {
+        &self.audit
+    }
+
+    pub fn egress(&self) -> &EgressRecord {
+        &self.egress
+    }
+
+    pub fn web_bot_auth_headers(&self) -> Option<&SignatureHeaders> {
+        self.web_bot_auth_headers.as_ref()
+    }
+
+    pub fn connect_tcp(&self, connect_timeout: Duration) -> io::Result<TcpStream> {
+        TcpStream::connect_timeout(&self.resolved_socket, connect_timeout)
+    }
+
+    #[cfg(test)]
+    fn connect_with<T>(&self, connect: impl FnOnce(SocketAddr) -> io::Result<T>) -> io::Result<T> {
+        connect(self.resolved_socket)
+    }
+}
+
 /// Policy bundle used by checked frontier dispatch.
 #[derive(Clone, Copy)]
 pub struct CrawlDispatchGuard<'a> {
@@ -2575,6 +2758,53 @@ impl From<SignatureError> for CrawlDispatchError {
     }
 }
 
+/// Failure while creating a connection-pinned checked crawl dispatch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CrawlConnectError {
+    Dispatch(CrawlDispatchError),
+    Resolve(ResolveUrlTargetError),
+    Connect {
+        resolved_socket: SocketAddr,
+        reason: String,
+    },
+}
+
+impl fmt::Display for CrawlConnectError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Dispatch(error) => write!(f, "{error}"),
+            Self::Resolve(error) => write!(f, "{error}"),
+            Self::Connect {
+                resolved_socket,
+                reason,
+            } => write!(
+                f,
+                "failed to connect to checked socket {resolved_socket}: {reason}"
+            ),
+        }
+    }
+}
+
+impl Error for CrawlConnectError {}
+
+impl From<CrawlDispatchError> for CrawlConnectError {
+    fn from(value: CrawlDispatchError) -> Self {
+        Self::Dispatch(value)
+    }
+}
+
+impl From<ResolveUrlTargetError> for CrawlConnectError {
+    fn from(value: ResolveUrlTargetError) -> Self {
+        Self::Resolve(value)
+    }
+}
+
+impl From<UrlBlocked> for CrawlConnectError {
+    fn from(value: UrlBlocked) -> Self {
+        Self::Dispatch(CrawlDispatchError::Url(value))
+    }
+}
+
 /// Result of one deterministic frontier scheduling pass.
 ///
 /// This raw batch is scheduler-only. Its [`CrawlDispatch`] values have not
@@ -2618,6 +2848,57 @@ pub struct RejectedCrawlDispatch {
     pub error: CrawlDispatchError,
 }
 
+/// A checked crawl dispatch paired with the TCP connection tempo-net opened to
+/// the same socket that URL/socket policy approved.
+#[derive(Debug)]
+pub struct PinnedCrawlConnection {
+    pinned: ConnectionPinnedCrawlDispatch,
+    stream: TcpStream,
+}
+
+impl PinnedCrawlConnection {
+    pub fn pinned(&self) -> &ConnectionPinnedCrawlDispatch {
+        &self.pinned
+    }
+
+    pub fn stream(&self) -> &TcpStream {
+        &self.stream
+    }
+
+    pub fn stream_mut(&mut self) -> &mut TcpStream {
+        &mut self.stream
+    }
+
+    pub fn into_parts(self) -> (ConnectionPinnedCrawlDispatch, TcpStream) {
+        (self.pinned, self.stream)
+    }
+}
+
+/// Result of a connection-pinned frontier scheduling pass.
+#[derive(Debug, Default)]
+pub struct CrawlPinnedBatch {
+    pub connections: Vec<PinnedCrawlConnection>,
+    pub waiting: Vec<CrawlDecision>,
+    pub blocked: Vec<CrawlDecision>,
+    pub rejected: Vec<RejectedPinnedCrawlDispatch>,
+}
+
+impl CrawlPinnedBatch {
+    pub fn is_empty(&self) -> bool {
+        self.connections.is_empty()
+            && self.waiting.is_empty()
+            && self.blocked.is_empty()
+            && self.rejected.is_empty()
+    }
+}
+
+/// A ready crawl request rejected before a pinned connection became active.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RejectedPinnedCrawlDispatch {
+    pub dispatch: CrawlDispatch,
+    pub error: CrawlConnectError,
+}
+
 /// Public frontier snapshot for SDKs and fleet schedulers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CrawlFrontierSnapshot {
@@ -2628,19 +2909,26 @@ pub struct CrawlFrontierSnapshot {
 
 /// Deterministic crawl frontier backed by [`CrawlScheduler`].
 ///
-/// The frontier never performs network I/O. It canonicalizes URL targets, but
-/// deduplicates by crawl request identity: method, canonical target URI, profile,
-/// declared identity mode, caller-supplied headers, and body identity. Empty
-/// GET/HEAD bodies dedupe by target; digest-bearing bodies dedupe by size+SHA-256;
-/// opaque bodies without a digest stay request-id scoped regardless of declared
-/// size so distinct POST/form submissions are not collapsed accidentally.
+/// The raw and checked dispatch paths only schedule requests. The pinned TCP
+/// path additionally performs DNS resolution and opens the socket inside
+/// tempo-net so network execution cannot re-resolve a checked URL. All paths
+/// canonicalize URL targets and deduplicate by crawl request identity: method,
+/// canonical target URI, profile, declared identity mode, caller-supplied
+/// headers, and body identity. Empty GET/HEAD bodies dedupe by target;
+/// digest-bearing bodies dedupe by size+SHA-256; opaque bodies without a digest
+/// stay request-id scoped regardless of declared size so distinct POST/form
+/// submissions are not collapsed accidentally.
 #[derive(Clone, PartialEq, Eq)]
 pub struct CrawlFrontier {
     scheduler: CrawlScheduler,
     pending: BTreeMap<CrawlRequestKey, NetworkRequest>,
     pending_origins: BTreeMap<String, usize>,
+    pending_bytes: usize,
+    pending_origin_bytes: BTreeMap<String, usize>,
     max_global_pending: usize,
     max_pending_per_origin: usize,
+    max_global_pending_bytes: usize,
+    max_pending_bytes_per_origin: usize,
 }
 
 impl fmt::Debug for CrawlFrontier {
@@ -2649,8 +2937,15 @@ impl fmt::Debug for CrawlFrontier {
             .field("scheduler", &self.scheduler)
             .field("pending", &self.pending.len())
             .field("pending_origins", &self.pending_origins.len())
+            .field("pending_bytes", &self.pending_bytes)
+            .field("pending_origin_bytes", &self.pending_origin_bytes.len())
             .field("max_global_pending", &self.max_global_pending)
             .field("max_pending_per_origin", &self.max_pending_per_origin)
+            .field("max_global_pending_bytes", &self.max_global_pending_bytes)
+            .field(
+                "max_pending_bytes_per_origin",
+                &self.max_pending_bytes_per_origin,
+            )
             .finish()
     }
 }
@@ -2661,8 +2956,12 @@ impl CrawlFrontier {
             scheduler: CrawlScheduler::new(policy),
             pending: BTreeMap::new(),
             pending_origins: BTreeMap::new(),
+            pending_bytes: 0,
+            pending_origin_bytes: BTreeMap::new(),
             max_global_pending: DEFAULT_CRAWL_MAX_GLOBAL_PENDING,
             max_pending_per_origin: DEFAULT_CRAWL_MAX_PENDING_PER_ORIGIN,
+            max_global_pending_bytes: DEFAULT_CRAWL_MAX_GLOBAL_PENDING_BYTES,
+            max_pending_bytes_per_origin: DEFAULT_CRAWL_MAX_PENDING_BYTES_PER_ORIGIN,
         }
     }
 
@@ -2675,6 +2974,18 @@ impl CrawlFrontier {
     /// Bound pending queue entries for any one origin before dispatch.
     pub fn with_max_pending_per_origin(mut self, max_pending: usize) -> Self {
         self.max_pending_per_origin = max_pending.max(1);
+        self
+    }
+
+    /// Bound retained pending request metadata bytes for this frontier before dispatch.
+    pub fn with_max_global_pending_bytes(mut self, max_bytes: usize) -> Self {
+        self.max_global_pending_bytes = max_bytes.max(1);
+        self
+    }
+
+    /// Bound retained pending request metadata bytes for any one origin before dispatch.
+    pub fn with_max_pending_bytes_per_origin(mut self, max_bytes: usize) -> Self {
+        self.max_pending_bytes_per_origin = max_bytes.max(1);
         self
     }
 
@@ -2712,8 +3023,29 @@ impl CrawlFrontier {
                 target.origin, origin_pending, self.max_pending_per_origin
             )));
         }
+        let estimated_bytes = estimated_pending_request_bytes(&request);
+        if self.pending_bytes.saturating_add(estimated_bytes) > self.max_global_pending_bytes {
+            return Err(crawl_limit_error(format!(
+                "global pending crawl byte cap reached: {} + {} > {}",
+                self.pending_bytes, estimated_bytes, self.max_global_pending_bytes
+            )));
+        }
+        let origin_bytes = self
+            .pending_origin_bytes
+            .get(&target.origin)
+            .copied()
+            .unwrap_or_default();
+        if origin_bytes.saturating_add(estimated_bytes) > self.max_pending_bytes_per_origin {
+            return Err(crawl_limit_error(format!(
+                "per-origin pending crawl byte cap reached for {}: {} + {} > {}",
+                target.origin, origin_bytes, estimated_bytes, self.max_pending_bytes_per_origin
+            )));
+        }
+        let origin = target.origin;
         self.pending.insert(key, request);
-        *self.pending_origins.entry(target.origin).or_default() += 1;
+        *self.pending_origins.entry(origin.clone()).or_default() += 1;
+        self.pending_bytes = self.pending_bytes.saturating_add(estimated_bytes);
+        *self.pending_origin_bytes.entry(origin).or_default() += estimated_bytes;
         Ok(true)
     }
 
@@ -2773,10 +3105,11 @@ impl CrawlFrontier {
     /// egress, it must return the selected proxy endpoint socket; Tempo validates
     /// that socket against the proxy endpoint without resolving the target host.
     ///
-    /// Until #255's connection-pinned execution capability lands, callers that
-    /// perform network I/O are responsible for pinning their HTTP client to each
-    /// returned [`CheckedCrawlDispatch::resolved_socket`]. Re-resolving the URL
-    /// after this method returns invalidates the checked-dispatch guarantee.
+    /// Callers that perform their own network I/O are responsible for pinning
+    /// their HTTP client to each returned [`CheckedCrawlDispatch::resolved_socket`].
+    /// Re-resolving the URL after this method returns invalidates the
+    /// checked-dispatch guarantee. Prefer [`Self::dispatch_pinned_tcp_ready`]
+    /// when the SDK can layer HTTP/TLS over a tempo-net-owned TCP stream.
     pub fn dispatch_checked_ready<F>(
         &mut self,
         tick: u64,
@@ -2865,6 +3198,97 @@ impl CrawlFrontier {
         Ok(batch)
     }
 
+    /// Dispatch at most `max_requests` requests as already-open TCP streams.
+    ///
+    /// This is the SDK-facing network execution path for crawlers. tempo-net
+    /// resolves the direct target or selected proxy endpoint, rejects the whole
+    /// candidate set unless every socket passes the same URL/socket policy, and
+    /// opens the TCP stream itself. Callers can layer HTTP/TLS over the returned
+    /// stream without re-resolving the URL.
+    pub fn dispatch_pinned_tcp_ready(
+        &mut self,
+        tick: u64,
+        max_requests: usize,
+        guard: CrawlDispatchGuard<'_>,
+        connect_timeout: Duration,
+    ) -> Result<CrawlPinnedBatch, CrawlError> {
+        let mut batch = CrawlPinnedBatch::default();
+        if max_requests == 0 {
+            return Ok(batch);
+        }
+
+        let keys = self.pending.keys().cloned().collect::<Vec<_>>();
+        let mut attempted = 0usize;
+        for key in keys {
+            if attempted >= max_requests {
+                break;
+            }
+            let Some(request) = self.pending.get(&key).cloned() else {
+                continue;
+            };
+            if self.scheduler.active_requests.contains_key(&request.id) {
+                let target = CrawlTarget::parse_request(&request)?;
+                self.remove_pending(&key);
+                batch.blocked.push(CrawlDecision::Block {
+                    origin: target.origin,
+                    reason: "request id is already active".into(),
+                });
+                continue;
+            }
+
+            match self.scheduler.decide(&request, tick)? {
+                CrawlDecision::Allow { origin } => {
+                    let dispatch = CrawlDispatch { request, origin };
+                    attempted += 1;
+                    let egress_decision = match guard.precheck(&dispatch) {
+                        Ok(egress_decision) => egress_decision,
+                        Err(error) => {
+                            self.remove_pending(&key);
+                            batch.rejected.push(RejectedPinnedCrawlDispatch {
+                                dispatch,
+                                error: error.into(),
+                            });
+                            continue;
+                        }
+                    };
+                    let pinned = match connect_checked_crawl_dispatch(
+                        &dispatch,
+                        guard,
+                        egress_decision,
+                        connect_timeout,
+                    ) {
+                        Ok(pinned) => pinned,
+                        Err(error) => {
+                            self.remove_pending(&key);
+                            batch
+                                .rejected
+                                .push(RejectedPinnedCrawlDispatch { dispatch, error });
+                            continue;
+                        }
+                    };
+
+                    match self.scheduler.begin(&dispatch.request, tick)? {
+                        CrawlDecision::Allow { .. } => {
+                            self.remove_pending(&key);
+                            batch.connections.push(pinned);
+                        }
+                        decision @ CrawlDecision::Wait { .. } => batch.waiting.push(decision),
+                        decision @ CrawlDecision::Block { .. } => {
+                            self.remove_pending(&key);
+                            batch.blocked.push(decision);
+                        }
+                    }
+                }
+                decision @ CrawlDecision::Wait { .. } => batch.waiting.push(decision),
+                decision @ CrawlDecision::Block { .. } => {
+                    self.remove_pending(&key);
+                    batch.blocked.push(decision);
+                }
+            }
+        }
+        Ok(batch)
+    }
+
     pub fn finish(&mut self, response: &NetworkResponseRecord, tick: u64) -> bool {
         self.scheduler.finish(response, tick)
     }
@@ -2879,11 +3303,20 @@ impl CrawlFrontier {
 
     fn remove_pending(&mut self, key: &CrawlRequestKey) -> Option<NetworkRequest> {
         let request = self.pending.remove(key)?;
+        let estimated_bytes = estimated_pending_request_bytes(&request);
+        self.pending_bytes = self.pending_bytes.saturating_sub(estimated_bytes);
         if let Ok(target) = CrawlTarget::parse_request(&request) {
             match self.pending_origins.get_mut(&target.origin) {
                 Some(count) if *count > 1 => *count -= 1,
                 Some(_) => {
                     self.pending_origins.remove(&target.origin);
+                }
+                None => {}
+            }
+            match self.pending_origin_bytes.get_mut(&target.origin) {
+                Some(bytes) if *bytes > estimated_bytes => *bytes -= estimated_bytes,
+                Some(_) => {
+                    self.pending_origin_bytes.remove(&target.origin);
                 }
                 None => {}
             }
@@ -2902,6 +3335,26 @@ fn crawl_limit_error(detail: impl Into<String>) -> CrawlError {
     CrawlError {
         reason: BlockReason::new(BlockCode::CrawlLimit, detail),
     }
+}
+
+fn estimated_pending_request_bytes(request: &NetworkRequest) -> usize {
+    let headers = request
+        .headers
+        .iter()
+        .map(|(name, values)| {
+            name.len()
+                + values
+                    .iter()
+                    .map(|value| value.len())
+                    .fold(0usize, usize::saturating_add)
+        })
+        .fold(0usize, usize::saturating_add);
+    std::mem::size_of::<NetworkRequest>()
+        .saturating_add(request.id.0.len())
+        .saturating_add(request.method.len())
+        .saturating_add(request.url.len())
+        .saturating_add(request.profile_id.0.len())
+        .saturating_add(headers)
 }
 
 fn checked_crawl_dispatch(
@@ -3140,6 +3593,79 @@ fn checked_crawl_dispatch_from_records(
         egress,
         web_bot_auth_headers,
     })
+}
+
+fn connect_checked_crawl_dispatch(
+    dispatch: &CrawlDispatch,
+    guard: CrawlDispatchGuard<'_>,
+    egress_decision: EgressDecision,
+    connect_timeout: Duration,
+) -> Result<PinnedCrawlConnection, CrawlConnectError> {
+    let sockets = resolve_crawl_dispatch_sockets(dispatch, guard, &egress_decision)?;
+    let mut last_connect_error = None;
+    for resolved_socket in sockets {
+        let checked =
+            guard.check_with_egress_decision(dispatch, resolved_socket, egress_decision.clone())?;
+        let pinned = checked.into_connection_pinned()?;
+        match pinned.connect_tcp(connect_timeout) {
+            Ok(stream) => return Ok(PinnedCrawlConnection { pinned, stream }),
+            Err(error) => {
+                last_connect_error = Some(CrawlConnectError::Connect {
+                    resolved_socket,
+                    reason: error.to_string(),
+                });
+            }
+        }
+    }
+    Err(last_connect_error.unwrap_or_else(|| {
+        CrawlConnectError::Resolve(ResolveUrlTargetError::EmptyResolution {
+            host: dispatch.request.url.clone(),
+            port: 0,
+        })
+    }))
+}
+
+fn resolve_crawl_dispatch_sockets(
+    dispatch: &CrawlDispatch,
+    guard: CrawlDispatchGuard<'_>,
+    egress_decision: &EgressDecision,
+) -> Result<Vec<SocketAddr>, CrawlConnectError> {
+    match egress_decision {
+        EgressDecision::Direct { .. } => {
+            let url = url::Url::parse(&dispatch.request.url).map_err(|error| {
+                CrawlDispatchError::Url(UrlBlocked {
+                    reason: BlockReason::new(BlockCode::InvalidUrl, error.to_string()),
+                })
+            })?;
+            Ok(resolve_url_target(&url, guard.url_policy)?
+                .sockets()
+                .to_vec())
+        }
+        EgressDecision::Proxied { proxy, .. } => {
+            let target = guard.egress_policy.proxy_endpoint_target(proxy)?;
+            let sockets = (target.host.as_str(), target.port)
+                .to_socket_addrs()
+                .map_err(|error| ResolveUrlTargetError::ResolveFailed {
+                    host: target.host.clone(),
+                    port: target.port,
+                    reason: error.to_string(),
+                })?
+                .collect::<Vec<_>>();
+            if sockets.is_empty() {
+                return Err(ResolveUrlTargetError::EmptyResolution {
+                    host: target.host,
+                    port: target.port,
+                }
+                .into());
+            }
+            for socket in &sockets {
+                guard
+                    .egress_policy
+                    .enforce_proxy_endpoint_resolved_socket(proxy, *socket)?;
+            }
+            Ok(sockets)
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -6153,6 +6679,67 @@ Disallow: /private
     }
 
     #[test]
+    fn crawl_frontier_caps_global_pending_bytes_without_counting_duplicates(
+    ) -> Result<(), CrawlError> {
+        let request = crawl_request("a", "https://a.example/one")
+            .with_header("x-large-frontier-header", "x".repeat(512));
+        let duplicate = crawl_request("a-dup", "https://a.example/one")
+            .with_header("x-large-frontier-header", "x".repeat(512));
+        let second = crawl_request("b", "https://b.example/one")
+            .with_header("x-large-frontier-header", "y".repeat(512));
+        let first_bytes = estimated_pending_request_bytes(&request);
+
+        let mut frontier = CrawlFrontier::new(CrawlPolicy::default().without_robots_txt())
+            .with_max_global_pending(8)
+            .with_max_pending_per_origin(8)
+            .with_max_global_pending_bytes(first_bytes)
+            .with_max_pending_bytes_per_origin(first_bytes.saturating_mul(2));
+
+        assert!(frontier.enqueue(request)?);
+        assert!(!frontier.enqueue(duplicate)?);
+        let Err(error) = frontier.enqueue(second) else {
+            panic!("global pending byte cap should reject new identities");
+        };
+        assert_eq!(error.reason.code, BlockCode::CrawlLimit);
+        assert!(error
+            .reason
+            .detail
+            .contains("global pending crawl byte cap"));
+        assert_eq!(frontier.snapshot().pending, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn crawl_frontier_caps_pending_bytes_per_origin() -> Result<(), CrawlError> {
+        let first = crawl_request("a1", "https://a.example/one")
+            .with_header("x-large-frontier-header", "x".repeat(512));
+        let second = crawl_request("a2", "https://a.example/two")
+            .with_header("x-large-frontier-header", "y".repeat(512));
+        let other_origin = crawl_request("b1", "https://b.example/one")
+            .with_header("x-large-frontier-header", "z".repeat(512));
+        let first_bytes = estimated_pending_request_bytes(&first);
+
+        let mut frontier = CrawlFrontier::new(CrawlPolicy::default().without_robots_txt())
+            .with_max_global_pending(8)
+            .with_max_pending_per_origin(8)
+            .with_max_global_pending_bytes(first_bytes.saturating_mul(3))
+            .with_max_pending_bytes_per_origin(first_bytes);
+
+        assert!(frontier.enqueue(first)?);
+        let Err(error) = frontier.enqueue(second) else {
+            panic!("per-origin pending byte cap should reject new identities");
+        };
+        assert_eq!(error.reason.code, BlockCode::CrawlLimit);
+        assert!(error
+            .reason
+            .detail
+            .contains("per-origin pending crawl byte cap"));
+        assert!(frontier.enqueue(other_origin)?);
+        assert_eq!(frontier.snapshot().pending, 2);
+        Ok(())
+    }
+
+    #[test]
     fn crawl_scheduler_honors_retry_after_backoff() -> Result<(), CrawlError> {
         let mut scheduler = CrawlScheduler::new(
             CrawlPolicy::default()
@@ -6650,6 +7237,89 @@ Disallow: /private
     }
 
     #[test]
+    fn connection_pinned_dispatch_exposes_only_socket_safe_request_parts(
+    ) -> Result<(), Box<dyn Error>> {
+        let dispatch = CrawlDispatch {
+            request: NetworkRequest::new(
+                "r1",
+                "POST",
+                "https://example.com:8443/a/../page?query=1#fragment",
+                "profile-a",
+                IdentityMode::AgentDeclared,
+            )
+            .with_header("x-tempo", "yes")
+            .with_body_bytes(b"body"),
+            origin: "https://example.com:8443".into(),
+        };
+        let checked = dispatch.check(
+            &UrlPolicy::block_private(),
+            &EgressPolicy::allow_all(),
+            SocketAddr::from(([93, 184, 216, 34], 8443)),
+        )?;
+        let pinned = checked.into_connection_pinned()?;
+        let connected = pinned.connect_with(|socket| Ok(format!("connected to {socket}")))?;
+
+        assert_eq!(connected, "connected to 93.184.216.34:8443");
+        assert_eq!(pinned.request_id().0.as_str(), "r1");
+        assert_eq!(pinned.method(), "POST");
+        assert_eq!(pinned.scheme(), "https");
+        assert_eq!(pinned.authority(), "example.com:8443");
+        assert_eq!(pinned.host(), "example.com");
+        assert_eq!(pinned.path_and_query(), "/page?query=1");
+        assert_eq!(pinned.origin(), "https://example.com:8443");
+        assert_eq!(
+            pinned.resolved_socket(),
+            SocketAddr::from(([93, 184, 216, 34], 8443))
+        );
+        assert_eq!(
+            pinned
+                .header_values("x-tempo")
+                .map(|values| values[0].as_str()),
+            Some("yes")
+        );
+        assert_eq!(pinned.body_size(), 4);
+        assert!(pinned.body_sha256().is_some());
+        assert_eq!(pinned.audit().origin, "https://example.com:8443");
+        assert_eq!(pinned.egress().domain, "example.com");
+        Ok(())
+    }
+
+    #[test]
+    fn connection_pinned_debug_redacts_headers_query_and_signatures() -> Result<(), Box<dyn Error>>
+    {
+        let key = WebBotAuthSigningKey::from_seed("tempo-agent", &[8u8; 32])?;
+        let dispatch = CrawlDispatch {
+            request: NetworkRequest::new(
+                "r1",
+                "GET",
+                "https://secret.example/path?token=query-secret",
+                "profile-a",
+                IdentityMode::AgentDeclared,
+            )
+            .with_header("authorization", "Bearer header-secret")
+            .with_header("cookie", "session=cookie-secret"),
+            origin: "https://secret.example".into(),
+        };
+        let checked = dispatch.check_signed(
+            &UrlPolicy::block_private(),
+            &EgressPolicy::allow_all(),
+            SocketAddr::from(([93, 184, 216, 34], 443)),
+            &key,
+            1_800_000_000,
+        )?;
+        let pinned = checked.into_connection_pinned()?;
+        let debug = format!("{pinned:?}");
+
+        assert!(!debug.contains("query-secret"), "{debug}");
+        assert!(!debug.contains("header-secret"), "{debug}");
+        assert!(!debug.contains("cookie-secret"), "{debug}");
+        assert!(!debug.contains("Signature-Input"), "{debug}");
+        assert!(debug.contains("header_count"));
+        assert!(debug.contains("web_bot_auth_headers_present"));
+        Ok(())
+    }
+
+    #[test]
     fn checked_frontier_rejection_does_not_activate_request() -> Result<(), CrawlError> {
         let mut frontier = CrawlFrontier::new(
             CrawlPolicy::default()
@@ -6680,6 +7350,123 @@ Disallow: /private
             .scheduler()
             .is_url_active("https://public.example/page")?);
         assert!(frontier.enqueue(crawl_request("r2", "https://public.example/page"))?);
+        Ok(())
+    }
+
+    #[test]
+    fn pinned_frontier_activates_only_after_connecting_checked_socket() -> Result<(), Box<dyn Error>>
+    {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let accepted = std::thread::spawn(move || listener.accept().map(|(stream, _)| stream));
+
+        let mut frontier = CrawlFrontier::new(
+            CrawlPolicy::default()
+                .without_robots_txt()
+                .with_min_delay_ticks_per_origin(0),
+        );
+        frontier.enqueue(crawl_request(
+            "r1",
+            &format!("http://127.0.0.1:{}/page", addr.port()),
+        ))?;
+
+        let url_policy = UrlPolicy::allow_all();
+        let egress_policy = EgressPolicy::allow_all();
+        let guard = CrawlDispatchGuard::new(&url_policy, &egress_policy);
+        let batch = frontier.dispatch_pinned_tcp_ready(1, 1, guard, Duration::from_secs(1))?;
+
+        assert!(batch.rejected.is_empty());
+        assert_eq!(batch.connections.len(), 1);
+        assert_eq!(batch.connections[0].pinned().resolved_socket(), addr);
+        assert_eq!(batch.connections[0].pinned().scheme(), "http");
+        assert_eq!(batch.connections[0].pinned().authority(), &addr.to_string());
+        assert_eq!(batch.connections[0].pinned().path_and_query(), "/page");
+        assert_eq!(batch.connections[0].stream().peer_addr()?, addr);
+        assert_eq!(frontier.snapshot().pending, 0);
+        assert_eq!(frontier.snapshot().inflight, 1);
+
+        drop(batch);
+        let accepted_stream = accepted.join().map_err(|_| "accept thread panicked")??;
+        assert_eq!(
+            accepted_stream.peer_addr()?.ip(),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn pinned_frontier_rejects_private_url_before_connection_or_activation(
+    ) -> Result<(), Box<dyn Error>> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
+        let addr = listener.local_addr()?;
+
+        let mut frontier = CrawlFrontier::new(
+            CrawlPolicy::default()
+                .without_robots_txt()
+                .with_min_delay_ticks_per_origin(0),
+        );
+        frontier.enqueue(crawl_request(
+            "r1",
+            &format!("http://127.0.0.1:{}/private", addr.port()),
+        ))?;
+
+        let url_policy = UrlPolicy::block_private();
+        let egress_policy = EgressPolicy::allow_all();
+        let guard = CrawlDispatchGuard::new(&url_policy, &egress_policy);
+        let batch = frontier.dispatch_pinned_tcp_ready(1, 1, guard, Duration::from_millis(50))?;
+
+        assert!(batch.connections.is_empty());
+        assert_eq!(batch.rejected.len(), 1);
+        assert!(matches!(
+            &batch.rejected[0].error,
+            CrawlConnectError::Dispatch(CrawlDispatchError::Url(UrlBlocked { reason }))
+                if reason.code == BlockCode::BlockedIp
+        ));
+        assert_eq!(frontier.snapshot().pending, 0);
+        assert_eq!(frontier.snapshot().inflight, 0);
+        assert!(matches!(
+            listener.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn pinned_frontier_proxied_dispatch_connects_proxy_socket() -> Result<(), Box<dyn Error>> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let proxy_addr = listener.local_addr()?;
+        let accepted = std::thread::spawn(move || listener.accept().map(|(stream, _)| stream));
+
+        let mut frontier = CrawlFrontier::new(
+            CrawlPolicy::default()
+                .without_robots_txt()
+                .with_min_delay_ticks_per_origin(0),
+        );
+        frontier.enqueue(crawl_request("r1", "https://proxied.example/page"))?;
+
+        let url_policy = UrlPolicy::block_private();
+        let egress_policy = EgressPolicy::block_by_default()
+            .allow_insecure_local_proxy_endpoints()
+            .proxy_domain(
+                DomainRule::exact("proxied.example"),
+                ProxyRoute::new("local-proxy", format!("http://{proxy_addr}")),
+            );
+        let guard = CrawlDispatchGuard::new(&url_policy, &egress_policy);
+        let batch = frontier.dispatch_pinned_tcp_ready(1, 1, guard, Duration::from_secs(1))?;
+
+        assert!(batch.rejected.is_empty());
+        assert_eq!(batch.connections.len(), 1);
+        let pinned = batch.connections[0].pinned();
+        assert_eq!(pinned.resolved_socket(), proxy_addr);
+        assert_eq!(pinned.host(), "proxied.example");
+        assert_eq!(pinned.path_and_query(), "/page");
+        assert_eq!(pinned.egress().proxy_id.as_deref(), Some("local-proxy"));
+        assert_eq!(batch.connections[0].stream().peer_addr()?, proxy_addr);
+        assert_eq!(frontier.snapshot().inflight, 1);
+
+        drop(batch);
+        let _accepted_stream = accepted.join().map_err(|_| "accept thread panicked")??;
         Ok(())
     }
 

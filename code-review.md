@@ -9,8 +9,10 @@ needs a concrete traced failure, not a preference for more code.
 - Runtime-visible changes must update OpenAPI, schema docs, SDK-facing docs, and
   compatibility fixtures in the same slice.
 - Raw crawl dispatch is a scheduler primitive, not a network execution
-  capability. SDK/client paths should accept checked dispatch values and pin the
-  connection to the checked socket instead of re-resolving the URL.
+  capability. SDK/client paths should prefer connection-pinned capabilities that
+  expose socket-safe request parts and an already-open stream. Any checked
+  dispatch fallback must pin the connection to the checked socket instead of
+  re-resolving the URL.
 - Cassette and replay-fork import defaults must fail closed to authenticated
   durable retention. Plaintext replay helpers are compatibility/test fixtures
   only and must be explicitly named unsafe.
