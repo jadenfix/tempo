@@ -331,6 +331,7 @@ impl ToolStepStatus {
                     since_seq,
                     seq,
                     omitted: 0,
+                    marks: Vec::new(),
                     added: Vec::new(),
                     removed: Vec::new(),
                     changed: Vec::new(),

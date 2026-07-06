@@ -1470,6 +1470,7 @@ mod tests {
             since_seq,
             seq,
             omitted: 0,
+            marks: Vec::new(),
             added: vec![],
             removed: vec![],
             changed: vec![],

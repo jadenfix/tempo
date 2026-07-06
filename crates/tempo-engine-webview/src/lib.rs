@@ -594,6 +594,7 @@ fn full_snapshot_diff(since_seq: u64, current: &CompiledObservation) -> Observat
         since_seq,
         seq: current.seq,
         omitted: current.omitted,
+        marks: current.marks.clone(),
         added: current.elements.clone(),
         removed: Vec::new(),
         changed: Vec::new(),
