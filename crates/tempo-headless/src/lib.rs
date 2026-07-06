@@ -4019,12 +4019,14 @@ pub fn serve_forever_with_config(
 ) -> Result<(), TempodError> {
     let config = ensure_runtime_auth(config)?;
     config.validate_listener(&listener)?;
+    let metadata_auth_required = !listener.local_addr()?.ip().is_loopback();
     let host_guard = TempodHostGuard::from_listener(&listener, &config.allowed_hosts)?;
     serve_forever_trusted(
         listener,
         pool,
         config.auth,
         host_guard,
+        metadata_auth_required,
         ConnectionLimiter::default(),
     )
 }
@@ -4036,7 +4038,14 @@ fn serve_forever_without_auth_for_tests_with_limits(
     limiter: ConnectionLimiter,
 ) -> Result<(), TempodError> {
     let host_guard = TempodHostGuard::from_listener(&listener, &BTreeSet::new())?;
-    serve_forever_trusted(listener, pool, TempodAuth::disabled(), host_guard, limiter)
+    serve_forever_trusted(
+        listener,
+        pool,
+        TempodAuth::disabled(),
+        host_guard,
+        false,
+        limiter,
+    )
 }
 
 #[cfg(test)]
@@ -4052,6 +4061,7 @@ fn serve_forever_trusted(
     pool: Arc<Mutex<SessionPool>>,
     auth: TempodAuth,
     host_guard: TempodHostGuard,
+    metadata_auth_required: bool,
     limiter: ConnectionLimiter,
 ) -> Result<(), TempodError> {
     let _ = process_start();
@@ -4062,6 +4072,7 @@ fn serve_forever_trusted(
             pool,
             auth,
             host_guard,
+            metadata_auth_required,
             limiter: limiter.clone(),
         });
         loop {
@@ -4106,12 +4117,14 @@ pub fn serve_one_with_config(
 ) -> Result<(), TempodError> {
     let config = ensure_runtime_auth(config)?;
     config.validate_listener(&listener)?;
+    let metadata_auth_required = !listener.local_addr()?.ip().is_loopback();
     let host_guard = TempodHostGuard::from_listener(&listener, &config.allowed_hosts)?;
     serve_one_trusted(
         listener,
         pool,
         config.auth,
         host_guard,
+        metadata_auth_required,
         ConnectionLimiter::default(),
     )
 }
@@ -4127,6 +4140,7 @@ fn serve_one_without_auth_for_tests(
         pool,
         TempodAuth::disabled(),
         host_guard,
+        false,
         ConnectionLimiter::default(),
     )
 }
@@ -4151,6 +4165,7 @@ fn serve_one_trusted(
     pool: Arc<Mutex<SessionPool>>,
     auth: TempodAuth,
     host_guard: TempodHostGuard,
+    metadata_auth_required: bool,
     limiter: ConnectionLimiter,
 ) -> Result<(), TempodError> {
     let _ = process_start();
@@ -4168,6 +4183,7 @@ fn serve_one_trusted(
             pool,
             auth,
             host_guard,
+            metadata_auth_required,
             limiter: limiter.clone(),
         });
         serve_tcp_connection(stream, router, permit).await;
@@ -4256,6 +4272,7 @@ struct TempodAppState {
     pool: Arc<Mutex<SessionPool>>,
     auth: TempodAuth,
     host_guard: TempodHostGuard,
+    metadata_auth_required: bool,
     limiter: ConnectionLimiter,
 }
 
@@ -4382,7 +4399,7 @@ async fn guard_control_plane(
 ) -> Response {
     let method = request.method().as_str();
     let path = request.uri().path();
-    if route_requires_host_check(method, path)
+    if route_requires_host_check(method, path, state.metadata_auth_required)
         && !state
             .host_guard
             .allows(header_str(request.headers(), header::HOST))
@@ -4390,7 +4407,7 @@ async fn guard_control_plane(
         return tempod_error_response(&TempodError::Forbidden("host not allowed".into()))
             .into_response();
     }
-    if route_requires_auth(method, path)
+    if route_requires_auth(method, path, state.metadata_auth_required)
         && let Err(err) = state
             .auth
             .authorize(header_str(request.headers(), header::AUTHORIZATION))
@@ -6862,15 +6879,26 @@ fn control_route_requires_origin_check(method: &str, path: &str) -> bool {
     )
 }
 
-fn route_requires_auth(method: &str, path: &str) -> bool {
+fn route_requires_auth(method: &str, path: &str, metadata_auth_required: bool) -> bool {
     matches!(
         (method, path),
         ("GET", "/mcp") | ("POST", "/mcp") | ("GET", "/bidi") | ("POST", "/bidi")
     ) || control_route_requires_origin_check(method, path)
+        || (metadata_auth_required && public_metadata_route(method, path))
 }
 
-fn route_requires_host_check(method: &str, path: &str) -> bool {
-    route_requires_auth(method, path)
+fn route_requires_host_check(method: &str, path: &str, metadata_auth_required: bool) -> bool {
+    route_requires_auth(method, path, metadata_auth_required)
+}
+
+fn public_metadata_route(method: &str, path: &str) -> bool {
+    matches!(
+        (method, path),
+        ("GET", "/health")
+            | ("GET", TEMPOD_OPENAPI_PATH)
+            | ("GET", tempo_mcp::A2A_AGENT_CARD_PATH)
+            | ("GET", tempo_mcp::A2A_AGENT_JSON_PATH)
+    )
 }
 
 fn bind_addr_is_loopback(addr: &str) -> Result<bool, TempodError> {
@@ -8300,7 +8328,7 @@ mod tests {
     /// it through the production axum router (`tempod_router`) via
     /// `tower::ServiceExt::oneshot`, so every in-process test exercises the
     /// same routing, guards, and handlers as a real socket connection.
-    #[derive(Debug)]
+    #[derive(Clone, Debug)]
     struct HttpRequest {
         method: String,
         path: String,
@@ -8323,11 +8351,29 @@ mod tests {
         auth: &TempodAuth,
         request: HttpRequest,
     ) -> Result<TestResponse, TempodError> {
+        oneshot_response_with_metadata_auth(shared, auth, request, false)
+    }
+
+    fn oneshot_response_with_metadata_auth(
+        shared: &Arc<Mutex<SessionPool>>,
+        auth: &TempodAuth,
+        request: HttpRequest,
+        metadata_auth_required: bool,
+    ) -> Result<TestResponse, TempodError> {
         use tower::ServiceExt as _;
+        let host_guard = if metadata_auth_required {
+            TempodHostGuard {
+                allowed_hosts: BTreeSet::new(),
+                allow_any_valid_host: true,
+            }
+        } else {
+            TempodHostGuard::loopback()
+        };
         let router = tempod_router(TempodAppState {
             pool: Arc::clone(shared),
             auth: auth.clone(),
-            host_guard: TempodHostGuard::loopback(),
+            host_guard,
+            metadata_auth_required,
             limiter: ConnectionLimiter::default(),
         });
         let mut builder = axum::http::Request::builder()
@@ -8387,6 +8433,26 @@ mod tests {
         auth: &TempodAuth,
     ) -> TestResponse {
         match with_shared_pool(pool, |shared| oneshot_response(shared, auth, request)) {
+            Ok(response) => response,
+            Err(error) => {
+                let response = tempod_error_response(&error);
+                TestResponse {
+                    status: response.status,
+                    content_type: response.content_type.to_string(),
+                    body: response.body,
+                }
+            }
+        }
+    }
+
+    fn handle_remote_metadata_request_with_auth(
+        pool: &mut SessionPool,
+        request: HttpRequest,
+        auth: &TempodAuth,
+    ) -> TestResponse {
+        match with_shared_pool(pool, |shared| {
+            oneshot_response_with_metadata_auth(shared, auth, request, true)
+        }) {
             Ok(response) => response,
             Err(error) => {
                 let response = tempod_error_response(&error);
@@ -15314,6 +15380,43 @@ mod tests {
             })?;
 
         assert!(config.validate_listener(&listener).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn remote_metadata_routes_require_bearer_auth() -> TestResult {
+        let auth = TempodAuth::bearer("secret-token")?;
+        let mut pool = SessionPool::default();
+        let routes = [
+            "/health",
+            TEMPOD_OPENAPI_PATH,
+            tempo_mcp::A2A_AGENT_CARD_PATH,
+            tempo_mcp::A2A_AGENT_JSON_PATH,
+        ];
+
+        for path in routes {
+            let request = with_host(
+                control_request("GET", path, None, b""),
+                "remote.example:8787",
+            );
+            let missing =
+                handle_remote_metadata_request_with_auth(&mut pool, request.clone(), &auth);
+            assert_eq!(missing.status, 401, "missing auth should reject {path}");
+
+            let wrong = handle_remote_metadata_request_with_auth(
+                &mut pool,
+                with_bearer(request.clone(), "wrong-token"),
+                &auth,
+            );
+            assert_eq!(wrong.status, 401, "wrong auth should reject {path}");
+
+            let allowed = handle_remote_metadata_request_with_auth(
+                &mut pool,
+                with_bearer(request, "secret-token"),
+                &auth,
+            );
+            assert_eq!(allowed.status, 200, "valid auth should allow {path}");
+        }
         Ok(())
     }
 
