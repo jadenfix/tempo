@@ -5286,11 +5286,14 @@ async fn session_run_create(
     UrlPath(id): UrlPath<String>,
     body: Bytes,
 ) -> Response {
-    run_blocking(move || -> Result<HttpResponse, TempodError> {
-        let request: CreateRunRequest = serde_json::from_slice(&body)
-            .map_err(|err| TempodError::BadRequest(format!("invalid run request: {err}")))?;
-        route_session_run_create(&state.pool, TempodSessionId(id), request)
-    })
+    run_limited_blocking(
+        state.limiter.clone(),
+        move |_| -> Result<HttpResponse, TempodError> {
+            let request: CreateRunRequest = serde_json::from_slice(&body)
+                .map_err(|err| TempodError::BadRequest(format!("invalid run request: {err}")))?;
+            route_session_run_create(&state.pool, TempodSessionId(id), request)
+        },
+    )
     .await
 }
 
@@ -9721,6 +9724,86 @@ mod tests {
             .last_error
             .as_deref()
             .is_some_and(|error| error.contains("injected run failure")));
+        Ok(())
+    }
+
+    #[test]
+    fn session_run_create_drives_attached_driver_through_router() -> TestResult {
+        let mut pool = SessionPool::default();
+        pool.next_run_id = current_time_ms();
+        let handle = attach_driver_handler_seq(&mut pool, 4, |request| match request.command {
+            HostDriverCommand::Goto { url } => {
+                assert_eq!(url, "https://runs.test");
+                DriverResponse::Observation {
+                    observation: observation("https://runs.test", 1),
+                }
+            }
+            HostDriverCommand::Act { action } => {
+                assert_eq!(action, Action::Scroll { x: 0.0, y: 4.0 });
+                DriverResponse::Step {
+                    outcome: StepOutcome::Applied {
+                        diff: ObservationDiff {
+                            since_seq: 1,
+                            seq: 2,
+                            omitted: 0,
+                            added: Vec::new(),
+                            removed: Vec::new(),
+                            changed: Vec::new(),
+                        },
+                    }
+                    .into(),
+                }
+            }
+            HostDriverCommand::CachedObservation { seq } => {
+                assert_eq!(seq, 2);
+                DriverResponse::CachedObservation {
+                    observation: Some(observation("https://runs.test", 2)),
+                }
+            }
+            HostDriverCommand::Close => DriverResponse::Closed,
+            unexpected => panic!("unexpected run-create driver request: {unexpected:?}"),
+        })?;
+        let session_driver = pool
+            .driver
+            .clone()
+            .ok_or("attached engine driver should be present")?;
+        let session = pool.finish_create("https://runs.test".into(), Some(session_driver));
+
+        let response = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: format!("/sessions/{}/runs", session.id.0),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: serde_json::to_vec(&json!({
+                    "goal": "scroll once, then stop",
+                    "actions": [{"kind": "scroll", "x": 0.0, "y": 4.0}],
+                    "max_rounds": 2
+                }))?,
+            },
+        )?;
+        assert_eq!(response.status, 201);
+        let run: AgentRun = serde_json::from_slice(&response.body)?;
+        assert_eq!(run.session_id, session.id.0);
+        assert_eq!(run.state, AgentRunState::Completed);
+        assert!(!pool.active_runs.contains_key(&session.id));
+        assert_eq!(
+            pool.session_owner(&session.id),
+            ControlOwner::Agent { run_id: None }
+        );
+        let runs = pool.list_runs(Some(&session.id));
+        assert_eq!(runs, vec![run.clone()]);
+        let events = pool.events(&session.id, None)?;
+        assert!(events.events.iter().any(|event| matches!(
+            event.event,
+            TempodSessionEventKind::Manager {
+                event: ManagerEvent::RunStateChanged { .. }
+            }
+        )));
+        pool.kill(&session.id)?;
+        join_driver_handler(handle)?;
         Ok(())
     }
 

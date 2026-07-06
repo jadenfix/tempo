@@ -8479,6 +8479,7 @@ dependencies = [
  "serde_json",
  "tempo-agent",
  "tempo-compat",
+ "tempo-config",
  "tempo-driver",
  "tempo-engine-cdp",
  "tempo-evals",

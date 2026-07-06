@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 use tempo_act::{execute_action_from_seq, execute_batch_from_seq, ExecutionStatus};
 use tempo_driver::{DriverTrait, Engine, StepOutcome, TransportError};
 use tempo_handshake::{probe_http_origin, LaneDecision, ProbeHit};
@@ -893,6 +894,10 @@ where
         .filter(|observation| observation.seq == seq)
 }
 
+fn elapsed_ms(started: Instant) -> u64 {
+    started.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
+}
+
 /// Measured observation size for evals and budget reports.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObservationBudget {
@@ -1104,6 +1109,7 @@ impl AgentRunner {
                     policy,
                     triple,
                     observation_budget: None,
+                    timing: None,
                 });
                 report.status = AgentRunStatus::Interrupted {
                     action_index: index,
@@ -1140,6 +1146,7 @@ impl AgentRunner {
                     policy,
                     triple,
                     observation_budget: None,
+                    timing: None,
                 });
                 report.status = AgentRunStatus::PolicyDenied {
                     action_index: index,
@@ -1155,6 +1162,7 @@ impl AgentRunner {
             agent.plan_next_step()?;
 
             let since_seq = observation.seq;
+            let action_started = Instant::now();
             let execution = match &compiled_skill {
                 Some(skill) => execute_batch_from_seq(driver, &skill.batch, since_seq)
                     .await
@@ -1167,6 +1175,7 @@ impl AgentRunner {
                         journal_transport_error(&mut agent, "execute action", source)
                     })?,
             };
+            let action_latency_ms = elapsed_ms(action_started);
             let post_action_seq = execution.seq;
             // A batch StepError still fails the step. `PartiallyApplied` is a
             // StepError whose earlier actions already grounded — it must fail
@@ -1183,11 +1192,23 @@ impl AgentRunner {
             let triple = agent.record_next_outcome(outcome)?;
             report.actions_completed += 1;
 
-            let next_observation = match cached_observation_for_seq(driver, post_action_seq) {
-                Some(observation) => observation,
-                None => driver.observe().await.map_err(|source| {
-                    journal_transport_error(&mut agent, "post-action observe", source)
-                })?,
+            let post_action_observe_started = Instant::now();
+            let (next_observation, post_action_observe_latency_ms) =
+                match cached_observation_for_seq(driver, post_action_seq) {
+                    Some(cached_observation) => (cached_observation, None),
+                    None => {
+                        let observed = driver.observe().await.map_err(|source| {
+                            journal_transport_error(&mut agent, "post-action observe", source)
+                        })?;
+                        (observed, Some(elapsed_ms(post_action_observe_started)))
+                    }
+                };
+            let post_action_observe_ms = post_action_observe_latency_ms.unwrap_or(0);
+            let timing = AgentStepTiming {
+                action_latency_ms,
+                post_action_observe_latency_ms,
+                act_to_observed_latency_ms: action_latency_ms
+                    .saturating_add(post_action_observe_ms),
             };
             current_origin =
                 self.origin_for_url("post-action observation", &next_observation.url)?;
@@ -1203,6 +1224,7 @@ impl AgentRunner {
                 policy,
                 triple,
                 observation_budget: Some(observation_budget),
+                timing: Some(timing),
             });
 
             if let Some(reason) = step_error {
@@ -1341,6 +1363,7 @@ impl AgentRunner {
                     policy,
                     triple,
                     observation_budget: None,
+                    timing: None,
                 });
                 report.status = AgentRunStatus::Interrupted {
                     action_index: index,
@@ -1364,6 +1387,7 @@ impl AgentRunner {
                     policy,
                     triple,
                     observation_budget: None,
+                    timing: None,
                 });
                 report.status = AgentRunStatus::PolicyDenied {
                     action_index: index,
@@ -1415,6 +1439,7 @@ impl AgentRunner {
                 policy,
                 triple,
                 observation_budget: None,
+                timing: None,
             });
 
             if let Some(reason) = step_error {
@@ -1780,6 +1805,22 @@ pub struct AgentStepReport {
     pub policy: StepPolicyReport,
     pub triple: StepTriple,
     pub observation_budget: Option<ObservationBudget>,
+    pub timing: Option<AgentStepTiming>,
+}
+
+/// Runtime-only latency samples for one live driver step.
+///
+/// `action_latency_ms` measures `tempo-act` execution, which includes the
+/// driver action and grounding/quiescence work performed inside the engine.
+/// `post_action_observe_latency_ms` is present only when the runner had to read
+/// a fresh observation instead of reusing the engine's cached post-action
+/// snapshot. `act_to_observed_latency_ms` is the end-to-end span the user sees
+/// before the next step has a usable observation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AgentStepTiming {
+    pub action_latency_ms: u64,
+    pub post_action_observe_latency_ms: Option<u64>,
+    pub act_to_observed_latency_ms: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3062,6 +3103,11 @@ mod tests {
         assert!(report.max_observation_bytes > 0);
         assert_eq!(report.steps[0].policy.idempotency_key.0.len(), 64);
         assert!(is_lower_hex(&report.steps[0].policy.idempotency_key.0));
+        let timing = report.steps[0]
+            .timing
+            .ok_or_else(|| io::Error::other("completed live driver step should include timing"))?;
+        assert_eq!(timing.post_action_observe_latency_ms, None);
+        assert_eq!(timing.act_to_observed_latency_ms, timing.action_latency_ms);
 
         let entries = read_journal_entries(&journal_path)?;
         assert!(matches!(
