@@ -384,11 +384,11 @@ fn run_worker(
 mod tests {
     use super::*;
     use crate::tab::ScreenshotImage;
-    use crate::tab::Tab;
     use crate::{HealthResponse, ShellError};
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
-    use tempo_headless::{TempodSession, TempodSessionEvents};
+    use tempo_headless::{TempodSession, TempodSessionEvents, TempodSessionId, TempodSessionState};
+    use tempo_schema::ConfirmationGrant;
 
     /// A fake transport with no socket: records the calls it receives and returns
     /// canned health/sessions. `delay` lets a test hold a request "in flight" to
@@ -436,7 +436,12 @@ mod tests {
 
         fn open(&self, url: &str) -> Result<TempodSession, ShellError> {
             self.record(&format!("open:{url}"));
-            Err(ShellError::Usage("open unused in transport tests".into()))
+            Ok(TempodSession {
+                id: TempodSessionId(format!("session-{url}")),
+                url: url.to_string(),
+                state: TempodSessionState::Running,
+                created_ms: 1,
+            })
         }
 
         fn adopt(&self, session_id: &str) -> Result<TempodSession, ShellError> {
@@ -444,25 +449,50 @@ mod tests {
             Err(ShellError::Usage("adopt unused in transport tests".into()))
         }
 
+        fn handoff(&self, session_id: &str) -> Result<TempodSession, ShellError> {
+            self.record(&format!("handoff:{session_id}"));
+            Err(ShellError::Usage(
+                "handoff unused in transport tests".into(),
+            ))
+        }
+
+        fn resume_run(&self, run_id: &str) -> Result<tempo_schema::AgentRun, ShellError> {
+            self.record(&format!("resume:{run_id}"));
+            Err(ShellError::Usage("resume unused in transport tests".into()))
+        }
+
         fn close(&self, session_id: &str) -> Result<TempodSession, ShellError> {
             self.record(&format!("close:{session_id}"));
             Err(ShellError::Usage("close unused in transport tests".into()))
         }
 
-        fn goto(&self, driver_id: Option<&str>, url: &str) -> Result<(), ShellError> {
-            self.record(&format!("goto:{}:{url}", driver_id.unwrap_or("-")));
+        fn goto(&self, session_id: &str, url: &str) -> Result<(), ShellError> {
+            if !self.delay.is_zero() {
+                thread::sleep(self.delay);
+            }
+            self.record(&format!("goto:{session_id}:{url}"));
+            Ok(())
+        }
+
+        fn goto_confirmed(
+            &self,
+            session_id: &str,
+            url: &str,
+            grant: &ConfirmationGrant,
+        ) -> Result<(), ShellError> {
+            self.record(&format!(
+                "goto_confirmed:{session_id}:{url}:{}",
+                grant.confirmation_id
+            ));
             Ok(())
         }
 
         fn screenshot(
             &self,
-            driver_id: Option<&str>,
+            session_id: &str,
             set_of_marks: bool,
         ) -> Result<ScreenshotImage, ShellError> {
-            self.record(&format!(
-                "screenshot:{}:marks={set_of_marks}",
-                driver_id.unwrap_or("-")
-            ));
+            self.record(&format!("screenshot:{session_id}:marks={set_of_marks}"));
             Err(ShellError::Usage(
                 "screenshot unused in transport tests".into(),
             ))
@@ -477,6 +507,20 @@ mod tests {
             Ok(TempodSessionEvents {
                 events: Vec::new(),
                 truncated_before_seq: None,
+            })
+        }
+
+        fn confirm(
+            &self,
+            session_id: &str,
+            confirmation_id: &str,
+        ) -> Result<tempo_schema::ConfirmationGrant, ShellError> {
+            self.record(&format!("confirm:{session_id}:{confirmation_id}"));
+            Ok(tempo_schema::ConfirmationGrant {
+                confirmation_id: confirmation_id.to_string(),
+                grant_token: "grant-token-test".to_string(),
+                issued_ms: 1,
+                expires_ms: 2,
             })
         }
     }
@@ -563,30 +607,56 @@ mod tests {
             ..FakeService::default()
         };
         let mut client = TransportClient::spawn("127.0.0.1:0", fake.factory(), || {});
-        client
-            .model
-            .tabs
-            .push(Tab::new("session-0", None, "https://one.test"));
-        client
-            .model
-            .tabs
-            .push(Tab::new("session-1", None, "https://two.test"));
-        client.model.active_tab = Some(0);
-        client.omnibox = "https://one.test".into();
+        client.open_url = "https://one.test".into();
+        assert_eq!(client.enqueue(UiAction::NewTab), Enqueued::Sent);
+        assert_eq!(
+            client.wait_and_apply(Duration::from_secs(5)),
+            Some(UiAction::NewTab)
+        );
+        client.open_url = "https://two.test".into();
+        assert_eq!(client.enqueue(UiAction::NewTab), Enqueued::Sent);
+        assert_eq!(
+            client.wait_and_apply(Duration::from_secs(5)),
+            Some(UiAction::NewTab)
+        );
+        assert_eq!(client.model.tabs.len(), 2);
 
-        assert_eq!(client.enqueue(UiAction::Refresh), Enqueued::Sent);
+        assert_eq!(client.enqueue(UiAction::SelectTab(0)), Enqueued::Sent);
+        client.omnibox = "https://navigated.test".into();
+
+        assert_eq!(client.enqueue(UiAction::Navigate), Enqueued::Sent);
         assert_eq!(client.enqueue(UiAction::SelectTab(1)), Enqueued::Sent);
+        assert_eq!(client.enqueue(UiAction::RefreshScreenshot), Enqueued::Sent);
         assert_eq!(client.model.active_tab, Some(1));
         assert_eq!(client.omnibox, "https://two.test");
 
         assert_eq!(
             client.wait_and_apply(Duration::from_secs(5)),
-            Some(UiAction::Refresh)
+            Some(UiAction::Navigate)
         );
         assert_eq!(
             client.model.active_tab,
             Some(1),
             "stale worker results must not undo local tab selection"
+        );
+        assert_eq!(
+            client.model.tabs.len(),
+            2,
+            "stale worker results must not drop locally managed tabs"
+        );
+        assert_eq!(
+            client.model.tabs[0].current_url(),
+            Some("https://navigated.test"),
+            "stale worker results must keep completed remote tab mutations"
+        );
+        assert_eq!(
+            client.wait_and_apply(Duration::from_secs(5)),
+            Some(UiAction::RefreshScreenshot)
+        );
+        assert_eq!(
+            client.model.tabs[0].current_url(),
+            Some("https://navigated.test"),
+            "later worker actions must not replay stale tab snapshots"
         );
     }
 

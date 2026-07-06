@@ -3,3 +3,4 @@
 .DS_Store
 *.db
 *.sqlite
+platforms/ios/Tempo/.build/

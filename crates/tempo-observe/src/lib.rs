@@ -210,6 +210,22 @@ impl ObservationInput {
     }
 }
 
+/// Assigned identity for a raw observation candidate after stable-ID mapping.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RawNodeId {
+    /// Index in the original [`ObservationInput::elements`] vector.
+    pub raw_index: usize,
+    pub node_id: NodeId,
+}
+
+/// A compiled observation plus the raw-to-stable-ID assignments for elements
+/// that survived the observation budget.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CompiledObservationWithNodeIds {
+    pub observation: CompiledObservation,
+    pub node_ids: Vec<RawNodeId>,
+}
+
 /// Evidence summary for a recorded observation fixture corpus.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ObservationCorpusReport {
@@ -299,31 +315,57 @@ impl ObservationCompiler {
     pub fn compile(&mut self, input: ObservationInput) -> CompiledObservation {
         // The live observe path never reads identity evidence; skipping it
         // saves one key String and one NodeId clone per element.
-        self.compile_snapshot(input, false).observation
+        self.compile_snapshot(input, false, false).observation
     }
 
     fn compile_with_identities(&mut self, input: ObservationInput) -> CompiledSnapshot {
-        self.compile_snapshot(input, true)
+        self.compile_snapshot(input, true, false)
+    }
+
+    /// Compile one raw snapshot and return the stable `NodeId` assigned to each
+    /// retained raw element.
+    ///
+    /// Host-owned WebView adapters need this to translate agent-visible
+    /// `NodeId`s back to page-local handles produced by their injected runtime.
+    pub fn compile_with_node_ids(
+        &mut self,
+        input: ObservationInput,
+    ) -> CompiledObservationWithNodeIds {
+        let snapshot = self.compile_snapshot(input, false, true);
+        CompiledObservationWithNodeIds {
+            observation: snapshot.observation,
+            node_ids: snapshot.node_ids,
+        }
     }
 
     fn compile_snapshot(
         &mut self,
         input: ObservationInput,
         track_identities: bool,
+        track_node_ids: bool,
     ) -> CompiledSnapshot {
         self.seq += 1;
         self.mapper.begin_snapshot(self.seq);
 
         let mut identities = Vec::new();
+        let mut node_ids = Vec::new();
         let mut elements = Vec::with_capacity(input.elements.len());
         for raw in input
             .elements
             .into_iter()
-            .filter(|raw| raw.visible && raw.interactive)
+            .enumerate()
+            .filter(|(_, raw)| raw.visible && raw.interactive)
         {
+            let (raw_index, raw) = raw;
             let node_id = self.mapper.node_id_for(&raw);
             if track_identities {
                 identities.push((corpus_identity_key(&raw), node_id.clone()));
+            }
+            if track_node_ids {
+                node_ids.push(RawNodeId {
+                    raw_index,
+                    node_id: node_id.clone(),
+                });
             }
             let rank = rank_raw_element(&raw);
             elements.push(InteractiveElement {
@@ -347,10 +389,19 @@ impl ObservationCompiler {
                 .collect();
             identities.retain(|(_, node_id)| emitted_ids.contains(node_id.0.as_str()));
         }
+        if track_node_ids {
+            let emitted_ids: HashSet<&str> = observation
+                .elements
+                .iter()
+                .map(|element| element.node_id.0.as_str())
+                .collect();
+            node_ids.retain(|raw_node| emitted_ids.contains(raw_node.node_id.0.as_str()));
+        }
 
         CompiledSnapshot {
             observation,
             identities,
+            node_ids,
         }
     }
 
@@ -362,6 +413,7 @@ impl ObservationCompiler {
 struct CompiledSnapshot {
     observation: CompiledObservation,
     identities: Vec<(String, NodeId)>,
+    node_ids: Vec<RawNodeId>,
 }
 
 /// Number of snapshots an unseen mapping is retained before eviction. Keeps the

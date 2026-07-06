@@ -83,10 +83,10 @@ cargo test --workspace   # contracts, conformance, runtime, protocol, and shell 
   observability and configuration backbones; tempod serves Prometheus
   exposition at `GET /metrics`.
 - `tempod` requires bearer auth on loopback and remote binds. Set
-  `TEMPO_TEMPOD_AUTH_TOKEN` or `--auth-token` explicitly, or let the daemon
-  create an owner-only runtime token file; shell clients read the same file by
-  default. Loopback, Host, and Origin checks defend binding/CSRF edges, but they
-  are not authentication on shared machines.
+  `TEMPO_TEMPOD_AUTH_TOKEN` or `--auth-token` explicitly, or let the daemon and
+  public Rust serving helpers create an owner-only runtime token file; shell
+  clients read the same file by default. Loopback, Host, and Origin checks
+  defend binding/CSRF edges, but they are not authentication on shared machines.
 - `--allow-remote` is a preview escape hatch, not production fleet support.
   Keep local preview runs on loopback unless you are explicitly testing remote
   binding. `TEMPO_STEALTH_MODE` suppresses tempod's in-memory history,

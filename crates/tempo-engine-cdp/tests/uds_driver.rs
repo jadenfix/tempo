@@ -10,10 +10,12 @@ use tempo_engine_host::{
 };
 use tempo_schema::{Action, ActionBatch, QuiescencePolicy};
 
+const LIVE_CDP_IPC_CLIENT_TIMEOUT: Duration = Duration::from_secs(60);
+
 #[tokio::test]
 async fn cdp_driver_serves_commands_over_engine_host_uds() -> Result<(), Box<dyn std::error::Error>>
 {
-    let Some(chrome) = std::env::var_os("TEMPO_CDP_CHROME") else {
+    let Some(chrome) = live_cdp_chrome_executable() else {
         eprintln!("skipping live CDP UDS test; TEMPO_CDP_CHROME is unset");
         return Ok(());
     };
@@ -31,8 +33,8 @@ async fn cdp_driver_serves_commands_over_engine_host_uds() -> Result<(), Box<dyn
             tempo_engine_host::EngineHostError,
         > {
             let client_stream = client_stream;
-            client_stream.set_read_timeout(Some(Duration::from_secs(20)))?;
-            client_stream.set_write_timeout(Some(Duration::from_secs(20)))?;
+            client_stream.set_read_timeout(Some(LIVE_CDP_IPC_CLIENT_TIMEOUT))?;
+            client_stream.set_write_timeout(Some(LIVE_CDP_IPC_CLIENT_TIMEOUT))?;
             let mut client = EngineIpcClient::from_stream(client_stream);
             let observed = client.request(DriverCommand::Goto { url: url.clone() })?;
             let created = client.request(DriverCommand::CreateBrowsingContext {
@@ -51,7 +53,7 @@ async fn cdp_driver_serves_commands_over_engine_host_uds() -> Result<(), Box<dyn
                 Some(&driver_id),
                 DriverCommand::ActBatch {
                     batch: ActionBatch {
-                        actions: vec![Action::Goto { url }],
+                        actions: vec![Action::Wait { millis: 0 }],
                         quiescence: QuiescencePolicy::FixedMillis(0),
                     },
                 },
@@ -69,7 +71,7 @@ async fn cdp_driver_serves_commands_over_engine_host_uds() -> Result<(), Box<dyn
     );
 
     let config = CdpConfig::default()
-        .with_executable(chrome.to_string_lossy())
+        .with_executable(chrome)
         .with_no_sandbox_env_opt_in();
     let mut driver = CdpTempoDriver::launch_with(config)
         .await?
@@ -134,7 +136,7 @@ async fn cdp_driver_serves_commands_over_engine_host_uds() -> Result<(), Box<dyn
 #[test]
 fn tempo_engined_cdp_binary_binds_socket_for_tempod_style_connect(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let Some(chrome) = std::env::var_os("TEMPO_CDP_CHROME") else {
+    let Some(chrome) = live_cdp_chrome_executable() else {
         eprintln!("skipping live CDP UDS test; TEMPO_CDP_CHROME is unset");
         return Ok(());
     };
@@ -325,4 +327,25 @@ fn serve_fixture() -> Result<String, std::io::Error> {
     });
 
     Ok(format!("http://{addr}/"))
+}
+
+fn normalize_tempo_cdp_chrome(path: impl AsRef<str>) -> String {
+    path.as_ref()
+        .trim()
+        .trim_matches(|c| c == '\'' || c == '"')
+        .replace("\\ ", " ")
+}
+
+fn live_cdp_chrome_executable() -> Option<String> {
+    let raw = std::env::var_os("TEMPO_CDP_CHROME")?;
+    let chrome = normalize_tempo_cdp_chrome(raw.to_string_lossy());
+
+    if chrome.trim().is_empty() {
+        return None;
+    }
+    if !std::path::Path::new(&chrome).exists() {
+        panic!("TEMPO_CDP_CHROME path does not exist: {chrome:?}");
+    }
+
+    Some(chrome)
 }

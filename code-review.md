@@ -24,6 +24,15 @@ needs a concrete traced failure, not a preference for more code.
   intervening local mutation, so stale-result and stale-input paths are both
   covered.
 
+## Launch And Path Inputs
+
+- Environment-provided executable paths are not shell snippets. Do not preserve
+  escape characters that only make sense in a shell; normalize and validate the
+  path before handing it to process launch code.
+- Live-engine tests should fail with a clear configuration error when a configured
+  browser binary is missing, rather than falling through to a lower-level spawn
+  error.
+
 ## Platform Discipline
 
 - Shared crates must remain Android/mobile friendly: no desktop-only IPC,
