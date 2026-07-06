@@ -12,12 +12,14 @@ use chromiumoxide::cdp::browser_protocol::accessibility::{
 };
 use chromiumoxide::cdp::browser_protocol::browser::BrowserContextId;
 use chromiumoxide::cdp::browser_protocol::dom::{
-    GetDocumentParams, NodeId as DomNodeId, QuerySelectorParams,
+    GetContentQuadsParams, GetDocumentParams, NodeId as DomNodeId, QuerySelectorParams,
+    ResolveNodeParams, ScrollIntoViewIfNeededParams,
 };
 use chromiumoxide::cdp::browser_protocol::fetch::{
     ContinueRequestParams, EnableParams as FetchEnableParams, EventRequestPaused,
     FailRequestParams, RequestPattern, RequestStage,
 };
+use chromiumoxide::cdp::browser_protocol::input::InsertTextParams;
 use chromiumoxide::cdp::browser_protocol::network::ErrorReason;
 use chromiumoxide::cdp::browser_protocol::page::{
     CaptureScreenshotFormat, CreateIsolatedWorldParams, Viewport,
@@ -25,9 +27,12 @@ use chromiumoxide::cdp::browser_protocol::page::{
 use chromiumoxide::cdp::browser_protocol::target::{
     CloseTargetParams, CreateBrowserContextParams, CreateTargetParams,
 };
-use chromiumoxide::cdp::js_protocol::runtime::{EvaluateParams, ExecutionContextId};
+use chromiumoxide::cdp::js_protocol::runtime::{
+    CallFunctionOnParams, EvaluateParams, ExecutionContextId, RemoteObjectId,
+};
 use chromiumoxide::error::CdpError;
 use chromiumoxide::handler::HandlerConfig;
+use chromiumoxide::layout::ElementQuad;
 use chromiumoxide::page::{Page, ScreenshotParams};
 use futures::{future::join_all, StreamExt};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -223,6 +228,10 @@ pub struct CdpTempoDriver {
     url_policy: Arc<Mutex<UrlPolicy>>,
     blocked_request_url: Arc<Mutex<Option<String>>>,
     request_policy_tracker: Arc<RequestPolicyTracker>,
+    /// Root DOM node id fetched during observation enrichment. Navigation
+    /// invalidates DOM node ids; direct action grounding falls back to fetching
+    /// a fresh root if no observed root is cached.
+    document_root: Mutex<Option<DomNodeId>>,
     /// Cached isolated-world execution context for the stability probe.
     /// Invalidated by navigation; recreated on demand.
     probe_context: Mutex<Option<ExecutionContextId>>,
@@ -317,6 +326,7 @@ impl CdpTempoDriver {
             url_policy,
             blocked_request_url,
             request_policy_tracker,
+            document_root: Mutex::new(None),
             probe_context: Mutex::new(None),
         })
     }
@@ -367,6 +377,47 @@ impl CdpTempoDriver {
 
     fn request_policy_cursor(&self) -> u64 {
         self.request_policy_tracker.cursor()
+    }
+
+    fn cached_document_root(&self) -> Result<Option<DomNodeId>, TransportError> {
+        self.document_root
+            .lock()
+            .map(|root| *root)
+            .map_err(|_error| TransportError::Other("CDP document root lock poisoned".into()))
+    }
+
+    fn cache_document_root(&self, root: DomNodeId) -> Result<(), TransportError> {
+        *self
+            .document_root
+            .lock()
+            .map_err(|_error| TransportError::Other("CDP document root lock poisoned".into()))? =
+            Some(root);
+        Ok(())
+    }
+
+    fn clear_document_root(&self) -> Result<(), TransportError> {
+        *self
+            .document_root
+            .lock()
+            .map_err(|_error| TransportError::Other("CDP document root lock poisoned".into()))? =
+            None;
+        Ok(())
+    }
+
+    async fn document_root(&self) -> Result<DomNodeId, TransportError> {
+        if let Some(root) = self.cached_document_root()? {
+            return Ok(root);
+        }
+        let root = self
+            .page()?
+            .execute(GetDocumentParams::default())
+            .await
+            .map_err(map_cdp_error)?
+            .result
+            .root
+            .node_id;
+        self.cache_document_root(root)?;
+        Ok(root)
     }
 
     fn enforce_current_url_policy_value(&self, url: &str) -> Result<(), TransportError> {
@@ -592,6 +643,7 @@ impl CdpTempoDriver {
     ) -> Result<Arc<CompiledObservation>, TransportError> {
         self.enforce_url_policy(url)?;
         self.clear_blocked_request()?;
+        self.clear_document_root()?;
         let cursor = self.request_policy_cursor();
         if self.should_recreate_child_page_for_navigation() {
             self.recreate_child_page_for_navigation(url, cursor).await?;
@@ -725,6 +777,7 @@ impl CdpTempoDriver {
         if let Ok(mut guard) = self.probe_context.lock() {
             *guard = None;
         }
+        self.clear_document_root()?;
         if let Some(old_page) = old_page {
             close_child_page_bounded(old_page).await;
         }
@@ -790,6 +843,7 @@ impl CdpTempoDriver {
             .result
             .root
             .node_id;
+        self.cache_document_root(root)?;
 
         // Bound the expensive AX round-trips to the highest-ranked elements so a
         // hostile page cannot pin the driver with an unbounded element list
@@ -910,24 +964,119 @@ impl CdpTempoDriver {
         Ok(sole_ax_summary(&ax_nodes))
     }
 
-    async fn with_element<F, Fut>(&self, selector: &str, op: F) -> Result<bool, TransportError>
-    where
-        F: FnOnce(chromiumoxide::Element) -> Fut,
-        Fut: std::future::Future<Output = Result<(), TransportError>>,
-    {
+    async fn resolve_action_element(
+        &self,
+        selector: &str,
+    ) -> Result<Option<ResolvedActionElement>, TransportError> {
         self.enforce_current_url_policy().await?;
-        match self.page()?.find_element(selector).await {
-            Ok(element) => match op(element).await {
-                Ok(()) => Ok(true),
-                Err(TransportError::Other(message)) if is_selector_grounding_miss_msg(&message) => {
-                    Ok(false)
-                }
-                Err(other) => Err(other),
-            },
-            Err(CdpError::NotFound) => Ok(false),
-            Err(error) if is_selector_grounding_miss_msg(&error.to_string()) => Ok(false),
-            Err(error) => Err(map_cdp_error(error)),
+        let page = self.page()?;
+        let root = self.document_root().await?;
+        let queried = match page.execute(QuerySelectorParams::new(root, selector)).await {
+            Ok(response) => response.result,
+            Err(CdpError::NotFound) => return Ok(None),
+            Err(error) if is_selector_grounding_miss_msg(&error.to_string()) => return Ok(None),
+            Err(error) => return Err(map_cdp_error(error)),
+        };
+        if *queried.node_id.inner() == 0 {
+            return Ok(None);
         }
+
+        let resolved = match page
+            .execute(
+                ResolveNodeParams::builder()
+                    .node_id(queried.node_id)
+                    .build(),
+            )
+            .await
+        {
+            Ok(response) => response.result.object,
+            Err(CdpError::NotFound) => return Ok(None),
+            Err(error) if is_selector_grounding_miss_msg(&error.to_string()) => return Ok(None),
+            Err(error) => return Err(map_cdp_error(error)),
+        };
+        let remote_object_id = resolved
+            .object_id
+            .ok_or_else(|| TransportError::Other(format!("No object Id found for {selector:?}")))?;
+        Ok(Some(ResolvedActionElement {
+            node_id: queried.node_id,
+            remote_object_id,
+        }))
+    }
+
+    async fn call_action_element(
+        &self,
+        element: &ResolvedActionElement,
+        function_declaration: impl Into<String>,
+        await_promise: bool,
+    ) -> Result<(), TransportError> {
+        self.page()?
+            .execute(
+                CallFunctionOnParams::builder()
+                    .object_id(element.remote_object_id.clone())
+                    .function_declaration(function_declaration)
+                    .await_promise(await_promise)
+                    .build()
+                    .map_err(TransportError::Other)?,
+            )
+            .await
+            .map_err(map_cdp_error)?;
+        Ok(())
+    }
+
+    async fn click_action_element(
+        &self,
+        element: &ResolvedActionElement,
+    ) -> Result<(), TransportError> {
+        let page = self.page()?;
+        page.execute(
+            ScrollIntoViewIfNeededParams::builder()
+                .node_id(element.node_id)
+                .build(),
+        )
+        .await
+        .map_err(map_cdp_error)?;
+        let content_quads = page
+            .execute(
+                GetContentQuadsParams::builder()
+                    .node_id(element.node_id)
+                    .build(),
+            )
+            .await
+            .map_err(map_cdp_error)?
+            .result;
+        let point = content_quads
+            .quads
+            .iter()
+            .filter(|quad| quad.inner().len() == 8)
+            .map(ElementQuad::from_quad)
+            .filter(|quad| quad.quad_area() > 1.0)
+            .map(|quad| quad.quad_center())
+            .next()
+            .ok_or_else(|| {
+                TransportError::Other("Node is either not visible or not an HTMLElement".into())
+            })?;
+        page.click(point).await.map_err(map_cdp_error)?;
+        Ok(())
+    }
+
+    async fn focus_action_element(
+        &self,
+        element: &ResolvedActionElement,
+    ) -> Result<(), TransportError> {
+        self.call_action_element(element, "function() { this.focus(); }", true)
+            .await
+    }
+
+    async fn select_action_element(
+        &self,
+        element: &ResolvedActionElement,
+        encoded_value: &str,
+    ) -> Result<(), TransportError> {
+        let function = format!(
+            "function() {{ this.value = {encoded_value}; \
+             this.dispatchEvent(new Event('change', {{ bubbles: true }})); }}"
+        );
+        self.call_action_element(element, function, false).await
     }
 
     fn selector_for_node(&self, node: &NodeId) -> Option<String> {
@@ -942,50 +1091,43 @@ impl CdpTempoDriver {
         Ok(self.selectors_by_node.get(node).cloned())
     }
 
-    async fn with_node_element<F, Fut>(
+    async fn resolve_node_action_element(
         &mut self,
         node: &NodeId,
-        mut op: F,
-    ) -> Result<NodeGrounding, TransportError>
-    where
-        F: FnMut(chromiumoxide::Element) -> Fut,
-        Fut: std::future::Future<Output = Result<(), TransportError>>,
-    {
+    ) -> Result<ActionElementGrounding, TransportError> {
         if let Some(selector) = self.selector_for_node(node) {
-            if self.with_element(&selector, &mut op).await? {
-                return Ok(NodeGrounding {
+            if let Some(element) = self.resolve_action_element(&selector).await? {
+                return Ok(ActionElementGrounding {
                     target: selector,
-                    grounded: true,
+                    element: Some(element),
                 });
             }
 
-            if let Some(refreshed) = self.refresh_selector_for_node(node).await?
-                && refreshed != selector
-            {
-                let grounded = self.with_element(&refreshed, &mut op).await?;
-                return Ok(NodeGrounding {
+            if let Some(refreshed) = self.refresh_selector_for_node(node).await? {
+                let element = self.resolve_action_element(&refreshed).await?;
+                return Ok(ActionElementGrounding {
                     target: refreshed,
-                    grounded,
+                    element,
                 });
             }
 
-            return Ok(NodeGrounding {
+            return Ok(ActionElementGrounding {
                 target: selector,
-                grounded: false,
+                element: None,
             });
         }
 
         let refreshed = self.refresh_selector_for_node(node).await?;
         let Some(selector) = refreshed else {
-            return Ok(NodeGrounding {
+            return Ok(ActionElementGrounding {
                 target: node.0.clone(),
-                grounded: false,
+                element: None,
             });
         };
-        let grounded = self.with_element(&selector, op).await?;
-        Ok(NodeGrounding {
+        let element = self.resolve_action_element(&selector).await?;
+        Ok(ActionElementGrounding {
             target: selector,
-            grounded,
+            element,
         })
     }
 
@@ -1040,56 +1182,55 @@ impl CdpTempoDriver {
             }
             Action::Click { node } => {
                 let cursor = self.request_policy_cursor();
-                let grounding = self
-                    .with_node_element(node, |element| async move {
-                        element.click().await.map_err(map_cdp_error)?;
-                        Ok(())
-                    })
-                    .await?;
+                let grounding = self.resolve_node_action_element(node).await?;
+                if let Some(element) = grounding.element.as_ref() {
+                    self.click_action_element(element).await?;
+                }
                 self.enforce_no_blocked_request_soon_since(cursor).await?;
-                self.node_outcome_since(previous_seq, &grounding.target, grounding.grounded, cursor)
-                    .await
+                self.node_outcome_since(
+                    previous_seq,
+                    &grounding.target,
+                    grounding.element.is_some(),
+                    cursor,
+                )
+                .await
             }
             Action::Type { node, text } => {
                 let cursor = self.request_policy_cursor();
                 let text = text.clone();
-                let grounding = self
-                    .with_node_element(node, |element| {
-                        let text = text.clone();
-                        async move {
-                            element.focus().await.map_err(map_cdp_error)?;
-                            element.type_str(&text).await.map_err(map_cdp_error)?;
-                            Ok(())
-                        }
-                    })
-                    .await?;
+                let grounding = self.resolve_node_action_element(node).await?;
+                if let Some(element) = grounding.element.as_ref() {
+                    self.focus_action_element(element).await?;
+                    self.page()?
+                        .execute(InsertTextParams::new(text))
+                        .await
+                        .map_err(map_cdp_error)?;
+                }
                 self.enforce_no_blocked_request_soon_since(cursor).await?;
-                self.node_outcome_since(previous_seq, &grounding.target, grounding.grounded, cursor)
-                    .await
+                self.node_outcome_since(
+                    previous_seq,
+                    &grounding.target,
+                    grounding.element.is_some(),
+                    cursor,
+                )
+                .await
             }
             Action::Select { node, value } => {
                 let cursor = self.request_policy_cursor();
                 let encoded = serde_json::to_string(value)
                     .map_err(|error| TransportError::Other(error.to_string()))?;
-                let grounding = self
-                    .with_node_element(node, |element| {
-                        let encoded = encoded.clone();
-                        async move {
-                            let function = format!(
-                                "function() {{ this.value = {encoded}; \
-                             this.dispatchEvent(new Event('change', {{ bubbles: true }})); }}"
-                            );
-                            element
-                                .call_js_fn(function, false)
-                                .await
-                                .map_err(map_cdp_error)?;
-                            Ok(())
-                        }
-                    })
-                    .await?;
+                let grounding = self.resolve_node_action_element(node).await?;
+                if let Some(element) = grounding.element.as_ref() {
+                    self.select_action_element(element, &encoded).await?;
+                }
                 self.enforce_no_blocked_request_soon_since(cursor).await?;
-                self.node_outcome_since(previous_seq, &grounding.target, grounding.grounded, cursor)
-                    .await
+                self.node_outcome_since(
+                    previous_seq,
+                    &grounding.target,
+                    grounding.element.is_some(),
+                    cursor,
+                )
+                .await
             }
             Action::Scroll { x, y } => {
                 self.enforce_current_url_policy().await?;
@@ -1123,12 +1264,15 @@ impl CdpTempoDriver {
             }
             Action::Extract { node } => {
                 let cursor = self.request_policy_cursor();
-                let grounding = self
-                    .with_node_element(node, |_element| async move { Ok(()) })
-                    .await?;
+                let grounding = self.resolve_node_action_element(node).await?;
                 self.enforce_no_blocked_request_soon_since(cursor).await?;
-                self.node_outcome_since(previous_seq, &grounding.target, grounding.grounded, cursor)
-                    .await
+                self.node_outcome_since(
+                    previous_seq,
+                    &grounding.target,
+                    grounding.element.is_some(),
+                    cursor,
+                )
+                .await
             }
             Action::Skill { name, .. } => Ok(StepOutcome::StepError {
                 reason: format!("skill action {name:?} is handled by tempo-skills, not CDP"),
@@ -1564,6 +1708,7 @@ impl DriverTrait for CdpTempoDriver {
             url_policy: self.url_policy.clone(),
             blocked_request_url,
             request_policy_tracker,
+            document_root: Mutex::new(None),
             probe_context: Mutex::new(None),
         }))
     }
@@ -2458,10 +2603,16 @@ fn is_uninteresting_ax_node_msg(message: &str) -> bool {
     message.to_lowercase().contains("uninteresting")
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct NodeGrounding {
+#[derive(Clone, Debug)]
+struct ResolvedActionElement {
+    node_id: DomNodeId,
+    remote_object_id: RemoteObjectId,
+}
+
+#[derive(Clone, Debug)]
+struct ActionElementGrounding {
     target: String,
-    grounded: bool,
+    element: Option<ResolvedActionElement>,
 }
 
 fn grounded_selector(
@@ -4470,6 +4621,17 @@ mod tests {
     }
 
     #[test]
+    fn action_grounding_uses_direct_cdp_without_element_describe_node() {
+        let source = include_str!("lib.rs");
+
+        assert!(source.contains("ResolveNodeParams::builder()"));
+        assert!(source.contains(".node_id(queried.node_id)"));
+        assert!(source.contains("GetContentQuadsParams::builder()"));
+        assert!(!source.contains(concat!("chromiumoxide::", "Element")));
+        assert!(!source.contains(concat!("find", "_element(")));
+    }
+
+    #[test]
     fn compiled_observation_uses_stable_ids_with_private_selector_lookup() {
         let mut mapper = StableIdMapper::new();
         let (first, first_lookup) = compile_observation(
@@ -5612,7 +5774,7 @@ mod tests {
         Ok(())
     }
 
-    /// Unmasked guard coverage for `with_element` and `Action::Scroll` (#321),
+    /// Unmasked guard coverage for direct action grounding and `Action::Scroll` (#321),
     /// complementing `live_cdp_current_url_guard_rejects_redirected_private_url_before_snapshot`
     /// above (which never issues a Click or Scroll).
     ///
@@ -5622,7 +5784,7 @@ mod tests {
     /// `enforce_current_url_policy_value` also returns `UrlBlocked`. So a test
     /// that only asserts the final `Err(UrlBlocked)` cannot tell "blocked
     /// before touching the page" apart from "clicked/scrolled the page, then
-    /// blocked afterward" — reverting the guard at the top of `with_element`
+    /// blocked afterward" — reverting the guard at the top of action grounding
     /// or in the `Action::Scroll` arm would keep such a test green while the
     /// interaction silently lands on the blocked page.
     ///
@@ -5664,7 +5826,7 @@ mod tests {
         // the *current* page blocked without any further navigation.
         driver = driver.with_url_policy(UrlPolicy::block_private());
 
-        // Click through with_element: must fail AND must not have clicked.
+        // Click through direct action grounding: must fail AND must not have clicked.
         let click_result = driver
             .act(&Action::Click {
                 node: save_node.clone(),
@@ -5704,7 +5866,7 @@ mod tests {
                 )
                 .await?,
             serde_json::json!("unset"),
-            "blocked-policy click still landed on the page: with_element's own \
+            "blocked-policy click still landed on the page: action grounding's own \
              URL-policy guard did not fire before the click"
         );
         let blocked_scroll_y = driver
@@ -5855,6 +6017,61 @@ mod tests {
             .evaluate_script("Promise.resolve(document.body.dataset.clicked)", true)
             .await?;
         assert_eq!(clicked, serde_json::json!("yes"));
+        driver.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_cdp_action_grounding_retries_same_selector_after_document_replacement(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(chrome) = live_cdp_chrome_executable() else {
+            eprintln!(
+                "skipping live CDP stale document-root grounding test; TEMPO_CDP_CHROME is unset"
+            );
+            return Ok(());
+        };
+        let url = serve_fixture()?;
+        let config = CdpConfig::default()
+            .with_executable(chrome)
+            .with_no_sandbox_env_opt_in();
+        let mut driver = CdpTempoDriver::launch_with(config)
+            .await?
+            .allow_private_network_access();
+
+        let observation = driver.goto(&url).await?;
+        let save_node = observation
+            .elements
+            .iter()
+            .find(|element| {
+                element.role == "button"
+                    && element.name.first().map(|span| span.text.as_str()) == Some("Save")
+            })
+            .map(|element| element.node_id.clone())
+            .ok_or_else(|| std::io::Error::other("missing save button"))?;
+
+        driver
+            .evaluate_script(
+                r#"(() => {
+                    document.open();
+                    document.write(`<!doctype html><html><body>
+                        <button id="save" onclick="document.body.dataset.clicked='after-replace'">
+                          <span>Save</span>
+                        </button>
+                    </body></html>`);
+                    document.close();
+                    return true;
+                })()"#,
+                true,
+            )
+            .await?;
+
+        let outcome = driver.act(&Action::Click { node: save_node }).await?;
+        assert!(matches!(outcome, StepOutcome::Applied { .. }));
+        let clicked = driver
+            .evaluate_script("Promise.resolve(document.body.dataset.clicked)", true)
+            .await?;
+        assert_eq!(clicked, serde_json::json!("after-replace"));
+
         driver.close().await?;
         Ok(())
     }
