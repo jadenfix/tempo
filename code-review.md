@@ -30,6 +30,10 @@ needs a concrete traced failure, not a preference for more code.
   shipped claim needs an agent-facing runtime path that preserves page
   provenance to the execution boundary and a live beatbox canary proving
   `net:Deny`, `secrets:[]`, and no egress.
+- Raw accessibility/AX trees and `tempo-observe` compiler inputs must not cross
+  into `tempod`-side runtime crates or public wire structs. Engine adapters own
+  raw-to-compiled conversion; runtime surfaces consume `CompiledObservation` and
+  `ObservationDiff`.
 
 ## Async State Ownership
 

@@ -42,6 +42,8 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings -D clippy::unwrap_used -D clippy::expect_used
       - name: servo public API boundary
         run: bash scripts/check-servo-public-api.sh
+      - name: observation boundary (#421)
+        run: bash scripts/check-observation-boundary.sh
       - name: no CAPTCHA solving service (#244)
         run: bash scripts/check-no-solver.sh
       - name: denial sentinel guard (#332)
