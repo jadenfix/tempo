@@ -87,6 +87,8 @@ const MAX_SESSION_IDEMPOTENCY_RECORDS: usize = 1024;
 const MAX_SESSION_EVENTS_PER_SESSION: usize = 1024;
 const MAX_SESSION_EVENT_STREAM_BACKLOG: usize = MAX_SESSION_EVENTS_PER_SESSION;
 const MAX_TERMINAL_SESSIONS: usize = 256;
+const DEFAULT_IDLE_SESSION_TTL_MS: u64 = 30 * 60 * 1000;
+const IDLE_SESSION_REAPER_INTERVAL: Duration = Duration::from_secs(60);
 const CONFIRMATION_TTL_MS: u64 = 5 * 60 * 1000;
 const CONFIRMATION_ID_BYTES: usize = 16;
 const CONFIRMATION_TOKEN_BYTES: usize = 32;
@@ -97,9 +99,8 @@ const MAX_HTTP_CONNECTIONS: usize = 128;
 /// disconnects before the response is delivered. This caps engine-side work
 /// that `spawn_blocking` cannot cancel once started.
 const MAX_BLOCKING_ROUTE_TASKS: usize = 64;
-/// Maximum retained tempod sessions. Killed sessions stay in the in-memory
-/// session map until the reaper lands (#412), so cap the retained map, not just
-/// currently-running sessions.
+/// Maximum retained tempod sessions. Terminal sessions have their own retention
+/// cap, so this bounds the full retained map, not just currently-running sessions.
 const MAX_TEMPOD_SESSIONS: usize = 1024;
 /// Maximum upgraded BiDi WebSocket sessions held concurrently.
 const MAX_WEBSOCKET_CONNECTIONS: usize = 32;
@@ -1195,6 +1196,7 @@ fn cancellable_driver_error(error: DriverClientError) -> CancellableDriverError 
 pub struct SessionPool {
     sessions: BTreeMap<TempodSessionId, TempodSession>,
     session_drivers: BTreeMap<TempodSessionId, AttachedEngineDriver>,
+    session_last_activity_ms: BTreeMap<TempodSessionId, u64>,
     session_act_batch_idempotency:
         BTreeMap<TempodSessionId, BTreeMap<String, SessionActBatchIdempotencyEntry>>,
     events: BTreeMap<TempodSessionId, SessionEventLog>,
@@ -1225,6 +1227,7 @@ pub struct SessionPool {
     next_surface_id: u64,
     next_lease_id: u64,
     max_sessions: usize,
+    idle_session_ttl_ms: Option<u64>,
     draining: bool,
 }
 
@@ -1234,6 +1237,7 @@ impl Default for SessionPool {
         Self {
             sessions: BTreeMap::new(),
             session_drivers: BTreeMap::new(),
+            session_last_activity_ms: BTreeMap::new(),
             session_act_batch_idempotency: BTreeMap::new(),
             events: BTreeMap::new(),
             volatile_event_seq: BTreeMap::new(),
@@ -1262,6 +1266,7 @@ impl Default for SessionPool {
             next_surface_id: 0,
             next_lease_id: 0,
             max_sessions: MAX_TEMPOD_SESSIONS,
+            idle_session_ttl_ms: Some(DEFAULT_IDLE_SESSION_TTL_MS),
             draining: false,
         }
     }
@@ -1278,6 +1283,10 @@ impl fmt::Debug for SessionPool {
             .debug_struct("SessionPool")
             .field("sessions", &self.sessions)
             .field("session_drivers", &self.session_drivers.keys())
+            .field(
+                "session_last_activity_sessions",
+                &self.session_last_activity_ms.len(),
+            )
             .field(
                 "session_act_batch_idempotency",
                 &session_act_batch_idempotency_records,
@@ -1416,6 +1425,12 @@ impl SessionPool {
         self
     }
 
+    #[cfg(test)]
+    fn with_idle_session_ttl_ms(mut self, idle_session_ttl_ms: Option<u64>) -> Self {
+        self.idle_session_ttl_ms = idle_session_ttl_ms;
+        self
+    }
+
     pub fn privacy_mode(&self) -> PrivacyMode {
         self.privacy_mode
     }
@@ -1473,13 +1488,15 @@ impl SessionPool {
     ) -> TempodSession {
         let id = TempodSessionId(format!("session-{}", self.next_id));
         self.next_id = self.next_id.saturating_add(1);
+        let created_ms = current_time_ms();
         let session = TempodSession {
             id: id.clone(),
             url,
             state: TempodSessionState::Running,
-            created_ms: current_time_ms(),
+            created_ms,
         };
         self.sessions.insert(id, session.clone());
+        self.touch_session_at(&session.id, created_ms);
         self.owners.insert(
             session.id.clone(),
             ControlOwner::Agent {
@@ -2184,6 +2201,7 @@ impl SessionPool {
             .retain(|_, stored| stored.request.session_id != id.0);
         self.confirmation_grants
             .retain(|_, stored| stored.session_id != *id);
+        self.session_last_activity_ms.remove(id);
         self.clear_session_idempotency(id);
         self.record_event(id, TempodSessionEventKind::SessionKilled);
         self.enforce_terminal_session_retention();
@@ -2203,6 +2221,7 @@ impl SessionPool {
         for id in drained {
             self.owners.remove(&id);
             self.active_runs.remove(&id);
+            self.session_last_activity_ms.remove(&id);
             self.record_event(&id, TempodSessionEventKind::SessionDrained);
         }
         self.session_act_batch_idempotency.clear();
@@ -2659,16 +2678,21 @@ impl SessionPool {
         self.session_act_batch_idempotency.remove(id);
     }
 
-    fn session_driver(&self, id: &TempodSessionId) -> Result<AttachedEngineDriver, TempodError> {
+    fn session_driver(
+        &mut self,
+        id: &TempodSessionId,
+    ) -> Result<AttachedEngineDriver, TempodError> {
         if !self.sessions.contains_key(id) {
             return Err(TempodError::SessionNotFound(id.clone()));
         }
-        self.session_drivers.get(id).cloned().ok_or_else(|| {
+        let driver = self.session_drivers.get(id).cloned().ok_or_else(|| {
             TempodError::DriverUnavailable(format!(
                 "session {} has no attached engine driver",
                 id.0
             ))
-        })
+        })?;
+        self.touch_session(id);
+        Ok(driver)
     }
 
     /// Recovers the true creation order encoded in a session id minted by
@@ -2710,6 +2734,7 @@ impl SessionPool {
         for id in terminal.into_iter().take(excess) {
             self.events.remove(&id);
             self.volatile_event_seq.remove(&id);
+            self.session_last_activity_ms.remove(&id);
             self.clear_session_idempotency(&id);
             self.owners.remove(&id);
             self.attachments.remove(&id);
@@ -2733,6 +2758,80 @@ impl SessionPool {
             TempodSessionState::Adopted => !self.session_drivers.contains_key(id),
             TempodSessionState::Running => false,
         }
+    }
+
+    fn touch_session(&mut self, id: &TempodSessionId) {
+        self.touch_session_at(id, current_time_ms());
+    }
+
+    fn touch_session_at(&mut self, id: &TempodSessionId, timestamp_ms: u64) {
+        if self.sessions.contains_key(id) {
+            self.session_last_activity_ms
+                .insert(id.clone(), timestamp_ms);
+        }
+    }
+
+    fn idle_session_reap_candidates(&self, now_ms: u64) -> Vec<TempodSessionId> {
+        let Some(ttl_ms) = self.idle_session_ttl_ms else {
+            return Vec::new();
+        };
+        self.sessions
+            .iter()
+            .filter(|(id, session)| {
+                self.session_record_can_be_idle_reaped(id, session, now_ms, ttl_ms)
+            })
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    fn session_record_can_be_idle_reaped(
+        &self,
+        id: &TempodSessionId,
+        session: &TempodSession,
+        now_ms: u64,
+        ttl_ms: u64,
+    ) -> bool {
+        if session.state == TempodSessionState::Killed {
+            return false;
+        }
+        if self.active_runs.contains_key(id) {
+            return false;
+        }
+        if matches!(self.owners.get(id), Some(ControlOwner::Human { .. })) {
+            return false;
+        }
+        if self
+            .attachments
+            .get(id)
+            .is_some_and(|surfaces| !surfaces.is_empty())
+        {
+            return false;
+        }
+        let last_activity_ms = self
+            .session_last_activity_ms
+            .get(id)
+            .copied()
+            .unwrap_or(session.created_ms);
+        now_ms.saturating_sub(last_activity_ms) >= ttl_ms
+    }
+
+    fn reap_idle_sessions_at(
+        &mut self,
+        now_ms: u64,
+    ) -> Vec<(
+        TempodSessionId,
+        AttachedEngineDriver,
+        Option<AttachedEngineDriver>,
+    )> {
+        let mut detached = Vec::new();
+        for id in self.idle_session_reap_candidates(now_ms) {
+            match self.begin_kill(&id) {
+                Ok((_session, Some(driver), root)) => detached.push((id, driver, root)),
+                Ok((_session, None, _root)) => {}
+                Err(error) => log_tempod_error("idle session reaper failed to kill session", error),
+            }
+        }
+        detached
     }
 
     pub fn events(
@@ -2783,6 +2882,13 @@ impl SessionPool {
         } else {
             self.events.entry(id.clone()).or_default().push(id, event)
         };
+        if self
+            .sessions
+            .get(id)
+            .is_some_and(|session| session.state != TempodSessionState::Killed)
+        {
+            self.touch_session_at(id, record.timestamp_ms);
+        }
         let _ = self.event_broadcast.send(record.clone());
         record
     }
@@ -4302,6 +4408,7 @@ fn serve_forever_trusted(
 ) -> Result<(), TempodError> {
     let _ = process_start();
     let runtime = transport_runtime()?;
+    spawn_idle_session_reaper(Arc::clone(&pool));
     runtime.block_on(async move {
         let listener = tokio_listener(listener)?;
         let router = tempod_router(TempodAppState {
@@ -4329,6 +4436,31 @@ fn serve_forever_trusted(
             }
         }
     })
+}
+
+fn spawn_idle_session_reaper(pool: Arc<Mutex<SessionPool>>) {
+    thread::spawn(move || loop {
+        if Arc::strong_count(&pool) <= 1 {
+            return;
+        }
+        thread::sleep(IDLE_SESSION_REAPER_INTERVAL);
+        let detached = match pool.lock() {
+            Ok(mut guard) => guard.reap_idle_sessions_at(current_time_ms()),
+            Err(error) => {
+                log_tempod_error("idle session reaper could not lock session pool", error);
+                return;
+            }
+        };
+        for (id, driver, root) in detached {
+            if close_detached_session_driver(id.0.clone(), driver, root)
+                && let Ok(mut guard) = pool.lock()
+            {
+                guard.abandon_attached_engine_after_teardown_timeout(
+                    "idle session engine context Close",
+                );
+            }
+        }
+    });
 }
 
 /// Serve exactly one connection. Tests use this against a real TCP listener;
@@ -5732,7 +5864,9 @@ fn route_session_observe(
     pool: &Arc<Mutex<SessionPool>>,
     id: &TempodSessionId,
 ) -> Result<CompiledObservation, TempodError> {
-    let mut driver = lock_pool(pool)?.session_driver(id)?;
+    let mut pool = lock_pool(pool)?;
+    let mut driver = pool.session_driver(id)?;
+    drop(pool);
     futures::executor::block_on(driver.observe())
         .map_err(|error| TempodError::Driver(error.to_string()))
 }
@@ -5764,7 +5898,9 @@ fn session_batch_policy_observation(
     cancel.check_tempod()?;
     // Clone the driver handle under a brief lock, then observe with NO pool lock
     // held (engine round-trip, #230). observe carries the existing IPC timeout.
-    let driver = lock_pool(pool)?.session_driver(id)?;
+    let mut pool = lock_pool(pool)?;
+    let driver = pool.session_driver(id)?;
+    drop(pool);
     let observation = driver.observe_with_cancel(cancel).map_err(|error| {
         TempodError::Driver(format!(
             "policy taint recomputation requires an observation, but observe failed: {error}"
@@ -8034,7 +8170,7 @@ fn route_session_mcp(
     origin: Option<&str>,
     body: &[u8],
 ) -> HttpResponse {
-    let driver = match lock_pool(pool).and_then(|pool| {
+    let driver = match lock_pool(pool).and_then(|mut pool| {
         pool.ensure_foreground_writer_available(id)?;
         pool.session_driver(id)
     }) {
@@ -8088,7 +8224,7 @@ fn session_bidi_driver_handle(
     pool: &Arc<Mutex<SessionPool>>,
     id: &TempodSessionId,
 ) -> Result<AttachedEngineDriver, TempodError> {
-    let pool = lock_pool(pool)?;
+    let mut pool = lock_pool(pool)?;
     pool.ensure_foreground_writer_available(id)?;
     pool.session_driver(id)
 }
@@ -8295,7 +8431,9 @@ fn route_session_screenshot(
     id: &TempodSessionId,
     set_of_marks: bool,
 ) -> Result<HttpResponse, TempodError> {
-    let mut driver = lock_pool(pool)?.session_driver(id)?;
+    let mut pool = lock_pool(pool)?;
+    let mut driver = pool.session_driver(id)?;
+    drop(pool);
     let observation = if set_of_marks {
         Some(
             futures::executor::block_on(driver.observe())
@@ -11807,16 +11945,83 @@ mod tests {
 
         assert_eq!(pool.sessions.len(), MAX_TERMINAL_SESSIONS);
         assert_eq!(pool.events.len(), MAX_TERMINAL_SESSIONS);
+        assert!(pool.session_last_activity_ms.is_empty());
         assert!(!pool
             .sessions
             .contains_key(&TempodSessionId("session-0".into())));
         assert!(!pool
             .events
             .contains_key(&TempodSessionId("session-0".into())));
+        assert!(!pool
+            .session_last_activity_ms
+            .contains_key(&TempodSessionId("session-0".into())));
         assert!(pool.sessions.contains_key(&TempodSessionId(format!(
             "session-{}",
             MAX_TERMINAL_SESSIONS + 1
         ))));
+        Ok(())
+    }
+
+    #[test]
+    fn idle_session_reaper_kills_stale_sessions_without_public_schema_state() -> TestResult {
+        let mut pool = SessionPool::default().with_idle_session_ttl_ms(Some(10));
+        let session = pool.create("https://idle.test")?;
+        pool.touch_session_at(&session.id, 100);
+
+        assert!(pool.reap_idle_sessions_at(109).is_empty());
+        assert_eq!(
+            pool.sessions.get(&session.id).map(|session| session.state),
+            Some(TempodSessionState::Running)
+        );
+
+        assert!(pool.reap_idle_sessions_at(110).is_empty());
+        assert_eq!(
+            pool.sessions.get(&session.id).map(|session| session.state),
+            Some(TempodSessionState::Killed)
+        );
+        assert!(!pool.session_last_activity_ms.contains_key(&session.id));
+        let events = pool.events(&session.id, None)?.events;
+        assert_eq!(
+            events.last().map(|event| event.event.clone()),
+            Some(TempodSessionEventKind::SessionKilled)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn idle_session_reaper_preserves_active_runs_and_attached_surfaces() -> TestResult {
+        let mut pool = SessionPool::default().with_idle_session_ttl_ms(Some(10));
+        let active = pool.create("https://active-run.test")?;
+        let attached = pool.create("https://attached.test")?;
+        let human_owned = pool.create("https://human-owned.test")?;
+        pool.touch_session_at(&active.id, 100);
+        pool.touch_session_at(&attached.id, 100);
+        pool.touch_session_at(&human_owned.id, 100);
+        pool.active_runs
+            .insert(active.id.clone(), AgentRunId("run-active".into()));
+        pool.register_surface(&attached.id, RegisterSurfaceRequest::default())?;
+        pool.owners.insert(
+            human_owned.id.clone(),
+            ControlOwner::Human {
+                surface_id: ShellSurfaceId("surface-missing".into()),
+            },
+        );
+
+        assert!(pool.reap_idle_sessions_at(10_000).is_empty());
+        assert_eq!(
+            pool.sessions.get(&active.id).map(|session| session.state),
+            Some(TempodSessionState::Running)
+        );
+        assert_eq!(
+            pool.sessions.get(&attached.id).map(|session| session.state),
+            Some(TempodSessionState::Running)
+        );
+        assert_eq!(
+            pool.sessions
+                .get(&human_owned.id)
+                .map(|session| session.state),
+            Some(TempodSessionState::Running)
+        );
         Ok(())
     }
 
