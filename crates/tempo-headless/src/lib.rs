@@ -72,8 +72,8 @@ use tempo_policy::ConfirmationGate;
 use tempo_schema::{
     Action, ActionBatch, AdoptionLease, AgentRun, AgentRunId, AgentRunState, BrowserEngineTier,
     CompiledObservation, ConfirmationGrant, ConfirmationRequest, ControlOwner, HumanTakeover,
-    ManagerEvent, ManagerSessionState, NodeId, ObservationDiff, SessionAttachment, ShellSurfaceId,
-    SideEffect, StorageContinuityMode,
+    ManagerEvent, ManagerSessionState, NodeId, ObservationDiff, QuiescencePolicy,
+    SessionAttachment, ShellSurfaceId, SideEffect, StorageContinuityMode,
 };
 use thiserror::Error;
 use tokio::sync::{broadcast, OwnedSemaphorePermit, Semaphore};
@@ -8218,10 +8218,262 @@ fn route_session_mcp(
         Ok(driver) => driver,
         Err(error) => return tempod_error_response(&error),
     };
+    if let Some(response) = route_session_mcp_shared_session_tool(pool, id, origin, body) {
+        return response;
+    }
     let server = tempo_mcp::TempoMcpServer::new(driver).without_fork_tools();
     HttpResponse::from_mcp(futures::executor::block_on(
         server.handle_post(origin, body),
     ))
+}
+
+fn route_session_mcp_shared_session_tool(
+    pool: &Arc<Mutex<SessionPool>>,
+    id: &TempodSessionId,
+    origin: Option<&str>,
+    body: &[u8],
+) -> Option<HttpResponse> {
+    if !tempo_mcp::origin_allowed(origin) {
+        return Some(session_mcp_json_rpc_error(
+            403,
+            JsonValue::Null,
+            -32600,
+            "origin not allowed",
+        ));
+    }
+    let message: JsonValue = match serde_json::from_slice(body) {
+        Ok(value) => value,
+        Err(error) => {
+            return Some(session_mcp_json_rpc_error(
+                400,
+                JsonValue::Null,
+                -32700,
+                format!("parse error: {error}"),
+            ))
+        }
+    };
+    let rpc_id = match session_mcp_response_id(&message) {
+        Ok(Some(id)) => id,
+        Ok(None) => {
+            return Some(HttpResponse::new(
+                202,
+                "application/octet-stream",
+                Vec::new(),
+            ))
+        }
+        Err(response) => return Some(response),
+    };
+    let Some(method) = message.get("method").and_then(JsonValue::as_str) else {
+        return Some(session_mcp_json_rpc_error(
+            200,
+            rpc_id,
+            -32600,
+            "JSON-RPC method is required",
+        ));
+    };
+    if method == "tools/list" {
+        return Some(session_mcp_json_rpc_success(
+            rpc_id,
+            json!({"tools": session_mcp_tools()}),
+        ));
+    }
+    if method != "tools/call" {
+        return None;
+    }
+    let params = match message.get("params") {
+        Some(params) => params,
+        None => {
+            return Some(session_mcp_json_rpc_error(
+                200,
+                rpc_id,
+                -32602,
+                "tools/call requires params.name",
+            ))
+        }
+    };
+    let Some(name) = params.get("name").and_then(JsonValue::as_str) else {
+        return Some(session_mcp_json_rpc_error(
+            200,
+            rpc_id,
+            -32602,
+            "tools/call requires params.name",
+        ));
+    };
+    if name != "act" && name != "act_batch" {
+        return None;
+    }
+    let arguments = params
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let batch_request = match session_mcp_act_batch_request(name, arguments) {
+        Ok(request) => request,
+        Err(message) => {
+            return Some(session_mcp_json_rpc_error(200, rpc_id, -32602, message));
+        }
+    };
+    let response =
+        match route_session_act_batch(pool, id.clone(), batch_request, &RequestCancel::default()) {
+            Ok(response) => response,
+            Err(error) => {
+                return Some(session_mcp_tool_response(rpc_id, true, error.body()));
+            }
+        };
+    let structured = serde_json::from_slice::<JsonValue>(&response.body).unwrap_or_else(|error| {
+        json!({
+            "error": format!("session MCP act response was not JSON: {error}")
+        })
+    });
+    Some(session_mcp_tool_response(
+        rpc_id,
+        !(200..300).contains(&response.status),
+        structured,
+    ))
+}
+
+fn session_mcp_act_batch_request(
+    name: &str,
+    arguments: JsonValue,
+) -> Result<SessionActBatchRequest, String> {
+    match name {
+        "act" => serde_json::from_value::<SessionMcpActArgs>(arguments)
+            .map_err(|error| error.to_string())
+            .and_then(SessionMcpActArgs::into_session_batch),
+        "act_batch" => serde_json::from_value::<SessionMcpActBatchArgs>(arguments)
+            .map_err(|error| error.to_string())
+            .and_then(SessionMcpActBatchArgs::into_session_batch),
+        _ => Err(format!("unsupported session MCP tool: {name}")),
+    }
+}
+
+fn session_mcp_response_id(message: &JsonValue) -> Result<Option<JsonValue>, HttpResponse> {
+    let Some(id) = message.get("id") else {
+        return Ok(None);
+    };
+    if !(id.is_null() || id.is_string() || id.is_number()) {
+        return Err(session_mcp_json_rpc_error(
+            400,
+            JsonValue::Null,
+            -32600,
+            "id must be a string, number, or null",
+        ));
+    }
+    if id.is_null() {
+        return Ok(None);
+    }
+    Ok(Some(id.clone()))
+}
+
+fn session_mcp_json_rpc_success(id: JsonValue, result: JsonValue) -> HttpResponse {
+    HttpResponse::json(200, json!({"jsonrpc": "2.0", "id": id, "result": result}))
+}
+
+fn session_mcp_json_rpc_error(
+    status: u16,
+    id: JsonValue,
+    code: i64,
+    message: impl Into<String>,
+) -> HttpResponse {
+    HttpResponse::json(
+        status,
+        json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message.into()}}),
+    )
+}
+
+fn session_mcp_tool_response(id: JsonValue, is_error: bool, structured: JsonValue) -> HttpResponse {
+    let summary = session_mcp_tool_summary(&structured, is_error);
+    session_mcp_json_rpc_success(
+        id,
+        json!({
+            "content": [{"type": "text", "text": summary}],
+            "structuredContent": structured,
+            "isError": is_error,
+        }),
+    )
+}
+
+fn session_mcp_tool_summary(value: &JsonValue, is_error: bool) -> String {
+    let prefix = if is_error { "error: " } else { "" };
+    let text = value
+        .get("reason")
+        .and_then(JsonValue::as_str)
+        .or_else(|| value.get("status").and_then(JsonValue::as_str))
+        .or_else(|| value.get("error").and_then(JsonValue::as_str))
+        .or_else(|| {
+            value
+                .get("error")
+                .and_then(|error| error.get("message"))
+                .and_then(JsonValue::as_str)
+        })
+        .map(str::to_owned)
+        .unwrap_or_else(|| value.to_string());
+    format!("{prefix}{}", truncate_session_mcp_summary(&text))
+}
+
+fn truncate_session_mcp_summary(value: &str) -> String {
+    const MAX_SUMMARY_CHARS: usize = 220;
+    let mut summary = String::new();
+    for ch in value.chars().take(MAX_SUMMARY_CHARS) {
+        summary.push(ch);
+    }
+    if value.chars().count() > MAX_SUMMARY_CHARS {
+        summary.push_str("...");
+    }
+    summary
+}
+
+fn session_mcp_tools() -> Vec<JsonValue> {
+    tempo_mcp::tools()
+        .into_iter()
+        .filter(|tool| tool.name != "fork" && tool.name != "close_fork")
+        .map(|tool| {
+            let mut input_schema = tool.input_schema;
+            if tool.name == "act" || tool.name == "act_batch" {
+                input_schema = session_mcp_action_input_schema(input_schema);
+            }
+            json!({
+                "name": tool.name,
+                "description": tool.description,
+                "inputSchema": input_schema,
+            })
+        })
+        .collect()
+}
+
+fn session_mcp_action_input_schema(mut input_schema: JsonValue) -> JsonValue {
+    if let Some(properties) = input_schema
+        .get_mut("properties")
+        .and_then(JsonValue::as_object_mut)
+    {
+        properties.remove("driver_id");
+        properties.insert(
+            "idempotency_key".into(),
+            json!({
+                "type": "string",
+                "description": "Stable retry key for idempotent replay of high-risk or confirmation-gated session actions."
+            }),
+        );
+        properties.insert(
+            "confirmation_grant".into(),
+            session_mcp_confirmation_grant_schema(),
+        );
+    }
+    input_schema
+}
+
+fn session_mcp_confirmation_grant_schema() -> JsonValue {
+    json!({
+        "type": "object",
+        "description": "Server-minted grant returned by POST /sessions/{session_id}/confirmations/{confirmation_id}. Required to replay a matching native-confirmed session action.",
+        "required": ["confirmation_id", "grant_token", "issued_ms", "expires_ms"],
+        "additionalProperties": false,
+        "properties": {
+            "confirmation_id": {"type": "string"},
+            "grant_token": {"type": "string"},
+            "issued_ms": {"type": "integer", "minimum": 0},
+            "expires_ms": {"type": "integer", "minimum": 0}
+        }
+    })
 }
 
 fn route_session_bidi(
@@ -8829,6 +9081,69 @@ struct SessionActBatchRequest {
     idempotency_key: Option<String>,
     #[serde(default)]
     confirmation_grant: Option<ConfirmationGrant>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionMcpActArgs {
+    #[serde(default)]
+    driver_id: Option<String>,
+    action: Action,
+    input_tainted: Option<bool>,
+    #[serde(default)]
+    confirmed: bool,
+    #[serde(default)]
+    idempotency_key: Option<String>,
+    #[serde(default)]
+    confirmation_grant: Option<ConfirmationGrant>,
+}
+
+impl SessionMcpActArgs {
+    fn into_session_batch(self) -> Result<SessionActBatchRequest, String> {
+        if self.driver_id.is_some() {
+            return Err("session-scoped MCP act does not accept driver_id".into());
+        }
+        Ok(SessionActBatchRequest {
+            batch: ActionBatch {
+                actions: vec![self.action],
+                quiescence: QuiescencePolicy::Composite,
+            },
+            input_tainted: self.input_tainted,
+            confirmed: self.confirmed,
+            idempotency_key: self.idempotency_key,
+            confirmation_grant: self.confirmation_grant,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionMcpActBatchArgs {
+    #[serde(default)]
+    driver_id: Option<String>,
+    batch: ActionBatch,
+    input_tainted: Option<bool>,
+    #[serde(default)]
+    confirmed: bool,
+    #[serde(default)]
+    idempotency_key: Option<String>,
+    #[serde(default)]
+    confirmation_grant: Option<ConfirmationGrant>,
+}
+
+impl SessionMcpActBatchArgs {
+    fn into_session_batch(self) -> Result<SessionActBatchRequest, String> {
+        if self.driver_id.is_some() {
+            return Err("session-scoped MCP act_batch does not accept driver_id".into());
+        }
+        Ok(SessionActBatchRequest {
+            batch: self.batch,
+            input_tainted: self.input_tainted,
+            confirmed: self.confirmed,
+            idempotency_key: self.idempotency_key,
+            confirmation_grant: self.confirmation_grant,
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -10256,6 +10571,177 @@ mod tests {
         assert!(replay["error"]
             .as_str()
             .ok_or("replay should include an error string")?
+            .contains("already used"));
+        Ok(())
+    }
+
+    #[test]
+    fn session_mcp_act_batch_accepts_server_minted_confirmation_grant() -> TestResult {
+        let mut pool = SessionPool::default();
+        let handle = attach_driver_handler(&mut pool, |request| match request.command {
+            HostDriverCommand::ActBatch { batch } => {
+                assert_eq!(batch.actions.len(), 1);
+                DriverResponse::Step {
+                    outcome: StepOutcome::Applied {
+                        diff: ObservationDiff {
+                            since_seq: 1,
+                            seq: 2,
+                            omitted: 0,
+                            added: Vec::new(),
+                            removed: Vec::new(),
+                            changed: Vec::new(),
+                        },
+                    }
+                    .into(),
+                }
+            }
+            _ => DriverResponse::Closed,
+        })?;
+        let session_driver = pool
+            .driver
+            .clone()
+            .ok_or("attached engine driver should be present")?;
+        let session = pool.finish_create(
+            "https://session-mcp-confirm.test".into(),
+            Some(session_driver),
+        );
+
+        let tools_response = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: format!("/sessions/{}/mcp", session.id.0),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: Some("http://127.0.0.1".into()),
+                body: serde_json::to_vec(&json!({
+                    "jsonrpc": "2.0",
+                    "id": 30,
+                    "method": "tools/list"
+                }))?,
+            },
+        )?;
+        assert_eq!(tools_response.status, 200);
+        let tools: Value = serde_json::from_slice(&tools_response.body)?;
+        let act_batch_schema = tools["result"]["tools"]
+            .as_array()
+            .ok_or("tools/list should return tools")?
+            .iter()
+            .find(|tool| tool["name"] == "act_batch")
+            .ok_or("session MCP tools should include act_batch")?;
+        assert!(
+            act_batch_schema["inputSchema"]["properties"]
+                .get("confirmation_grant")
+                .is_some(),
+            "session MCP act_batch schema must advertise confirmation grants"
+        );
+        assert!(
+            act_batch_schema["inputSchema"]["properties"]
+                .get("driver_id")
+                .is_none(),
+            "session MCP must not advertise root/fork driver ids"
+        );
+
+        let batch = json!({
+            "actions": [{"kind": "click", "node": "purchase"}],
+            "quiescence": "composite"
+        });
+        let mut denied_request = mcp_tool_request(
+            31,
+            "act_batch",
+            json!({
+                "batch": batch,
+                "input_tainted": false,
+                "confirmed": true,
+                "idempotency_key": "mcp-purchase-1"
+            }),
+        )?;
+        denied_request.path = format!("/sessions/{}/mcp", session.id.0);
+        let denied = route_http_request(&mut pool, denied_request.clone())?;
+        assert_eq!(denied.status, 200);
+        let denied: Value = serde_json::from_slice(&denied.body)?;
+        assert_eq!(denied["result"]["isError"], true);
+        let denied_structured = &denied["result"]["structuredContent"];
+        assert_eq!(denied_structured["policy"]["confirmed"], true);
+        assert_eq!(denied_structured["policy"]["confirmed_effective"], false);
+        assert_eq!(
+            denied_structured["confirmation_request"]["session_id"],
+            session.id.0.as_str()
+        );
+        let confirmation_id = denied_structured["confirmation_request"]["confirmation_id"]
+            .as_str()
+            .ok_or("MCP denial should include confirmation id")?;
+
+        let duplicate_denied = route_http_request(&mut pool, denied_request)?;
+        assert_eq!(duplicate_denied.status, 200);
+        let duplicate_denied: Value = serde_json::from_slice(&duplicate_denied.body)?;
+        assert_eq!(
+            duplicate_denied["result"]["structuredContent"]["confirmation_request"]
+                ["confirmation_id"],
+            confirmation_id
+        );
+        assert_eq!(
+            pool.manager_state(&session.id)?.pending_confirmations.len(),
+            1
+        );
+
+        let grant_response = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: format!("/sessions/{}/confirmations/{confirmation_id}", session.id.0),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: Vec::new(),
+            },
+        )?;
+        assert_eq!(grant_response.status, 200);
+        let grant: ConfirmationGrant = serde_json::from_slice(&grant_response.body)?;
+
+        let mut granted_request = mcp_tool_request(
+            32,
+            "act_batch",
+            json!({
+                "batch": batch,
+                "input_tainted": false,
+                "idempotency_key": "mcp-purchase-1",
+                "confirmation_grant": grant.clone()
+            }),
+        )?;
+        granted_request.path = format!("/sessions/{}/mcp", session.id.0);
+        let executed = route_http_request(&mut pool, granted_request)?;
+        join_driver_handler(handle)?;
+        assert_eq!(executed.status, 200);
+        let executed: Value = serde_json::from_slice(&executed.body)?;
+        assert_eq!(executed["result"]["isError"], false);
+        assert_eq!(
+            executed["result"]["structuredContent"]["policy"]["confirmed_effective"],
+            true
+        );
+        assert!(pool
+            .manager_state(&session.id)?
+            .pending_confirmations
+            .is_empty());
+
+        let mut replay_request = mcp_tool_request(
+            33,
+            "act_batch",
+            json!({
+                "batch": batch,
+                "input_tainted": false,
+                "idempotency_key": "mcp-purchase-replay",
+                "confirmation_grant": grant
+            }),
+        )?;
+        replay_request.path = format!("/sessions/{}/mcp", session.id.0);
+        let replay = route_http_request(&mut pool, replay_request)?;
+        assert_eq!(replay.status, 200);
+        let replay: Value = serde_json::from_slice(&replay.body)?;
+        assert_eq!(replay["result"]["isError"], true);
+        assert!(replay["result"]["structuredContent"]["error"]
+            .as_str()
+            .ok_or("replay should include error string")?
             .contains("already used"));
         Ok(())
     }
