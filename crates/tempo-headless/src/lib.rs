@@ -12025,6 +12025,81 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn idle_session_reaper_detaches_and_closes_engine_context() -> TestResult {
+        let (client_stream, server_stream) = UnixStream::pair()?;
+        let engine = thread::spawn(move || -> Result<(), EngineHostError> {
+            let mut connection = EngineIpcConnection::from_stream(server_stream);
+
+            let create = connection.read_driver_request()?;
+            assert!(create.driver_id.is_none());
+            assert!(matches!(
+                create.command,
+                HostDriverCommand::CreateBrowsingContext { .. }
+            ));
+            connection.write_driver_response(
+                create.id,
+                DriverResponse::BrowsingContextCreated {
+                    driver_id: "idle-context".into(),
+                },
+            )?;
+
+            let goto = connection.read_driver_request()?;
+            assert_eq!(goto.driver_id.as_deref(), Some("idle-context"));
+            assert!(matches!(goto.command, HostDriverCommand::Goto { .. }));
+            connection.write_driver_response(
+                goto.id,
+                DriverResponse::Observation {
+                    observation: observation("https://idle-engine.test", 1),
+                },
+            )?;
+
+            let close = connection.read_driver_request()?;
+            assert_eq!(close.driver_id.as_deref(), Some("idle-context"));
+            assert_eq!(close.command, HostDriverCommand::Close);
+            connection.write_driver_response(close.id, DriverResponse::Closed)?;
+            Ok(())
+        });
+
+        let mut pool = SessionPool::default().with_idle_session_ttl_ms(Some(10));
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream))?;
+        let response = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/sessions".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: br#"{"url":"https://idle-engine.test"}"#.to_vec(),
+            },
+        )?;
+        assert_eq!(response.status, 201);
+        let session: TempodSession = serde_json::from_slice(&response.body)?;
+        assert!(pool.session_drivers.contains_key(&session.id));
+
+        pool.touch_session_at(&session.id, 100);
+        let detached = pool.reap_idle_sessions_at(110);
+        assert_eq!(detached.len(), 1);
+        assert_eq!(
+            pool.sessions.get(&session.id).map(|session| session.state),
+            Some(TempodSessionState::Killed)
+        );
+        assert!(!pool.session_drivers.contains_key(&session.id));
+
+        let (id, driver, root) = detached
+            .into_iter()
+            .next()
+            .ok_or("idle reaper should return the detached engine driver")?;
+        assert_eq!(id, session.id);
+        assert!(
+            !close_detached_session_driver(id.0, driver, root),
+            "a prompt idle-session context close must not abandon the shared engine"
+        );
+        join_driver_handler(engine)?;
+        Ok(())
+    }
+
     /// Regression test for the ordering bug flagged in review of #519:
     /// `enforce_terminal_session_retention` must evict the *oldest* terminal
     /// sessions, not whichever sort first as `TempodSessionId` strings.
