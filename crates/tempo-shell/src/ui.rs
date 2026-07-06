@@ -362,6 +362,7 @@ impl ShellUiModel {
         match action {
             UiAction::SelectTab(index) => self.select_tab(index),
             UiAction::ToggleMarks => self.toggle_marks(),
+            UiAction::ResumeTakeover => return self.resume_takeover_locally(),
             UiAction::DismissConfirmation => self.dismiss_confirmation(),
             _ => return false,
         }
@@ -638,6 +639,25 @@ impl ShellUiModel {
             }
             Err(err) => self.set_error("resume", &err),
         }
+    }
+
+    fn resume_takeover_locally(&mut self) -> bool {
+        if !self.journal.takeover().is_blocking() {
+            return false;
+        }
+        let Some(active) = self.active_tab else {
+            return false;
+        };
+        let Some(tab) = self.tabs.get(active) else {
+            return false;
+        };
+        if tab.surface.active_run_id.is_none() {
+            return false;
+        }
+        self.journal.resume_takeover();
+        self.status = "Resuming human takeover...".to_string();
+        self.last_error = None;
+        true
     }
 
     fn dismiss_confirmation(&mut self) {
