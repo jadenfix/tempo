@@ -6,24 +6,27 @@
 //! enforcement logic.
 //!
 //! SDKs should pass [`NetworkRequest`] values into [`CrawlFrontier`]. The
-//! facade delegates canonical crawl request identity, scheduler state, and
-//! checked dispatch to tempo-net, but does not expose raw `dispatch_ready()` as a
-//! normal method. Only [`CheckedCrawlDispatch`] values returned by
-//! [`CrawlFrontier::dispatch_checked_ready`] have passed URL, resolved-socket,
-//! egress, audit, and optional Web Bot Auth checks. Raw scheduler dispatch
-//! types are kept as deprecated compatibility aliases because they have not
-//! passed SSRF/egress checks and are not safe as a direct network execution
+//! facade delegates canonical crawl request identity, scheduler state, checked
+//! dispatch, and connection-pinned TCP dispatch to tempo-net, but does not expose
+//! raw `dispatch_ready()` as a normal method. SDK network execution should prefer
+//! [`CrawlFrontier::dispatch_pinned_tcp_ready`], which returns already-open
+//! streams connected to the same sockets that Tempo policy checked. Raw scheduler
+//! dispatch types are kept as deprecated compatibility aliases because they have
+//! not passed SSRF/egress checks and are not safe as a direct network execution
 //! surface.
 
 pub use tempo_net::{
-    AuditRecord, BlockCode, BlockReason, CheckedCrawlDispatch, CrawlCheckedBatch, CrawlDecision,
-    CrawlDispatchError, CrawlDispatchGuard, CrawlDispatchSigner, CrawlError, CrawlFrontierSnapshot,
-    CrawlPolicy, CrawlScheduler, DomainRule, EgressDenied, EgressPolicy, EgressRecord,
-    IdentityMode, NetworkRequest, NetworkResponseRecord, OriginCrawlSnapshot, ProfileId,
-    ProxyRoute, RejectedCrawlDispatch, RequestId, RobotsRules, SignatureError, SignatureHeaders,
-    UrlBlocked, UrlPolicy, WebBotAuthSigningKey, DEFAULT_CRAWL_MAX_CONCURRENT_PER_ORIGIN,
-    DEFAULT_CRAWL_MAX_GLOBAL_INFLIGHT, DEFAULT_CRAWL_MAX_GLOBAL_PENDING,
-    DEFAULT_CRAWL_MAX_PENDING_PER_ORIGIN, DEFAULT_CRAWL_MIN_DELAY_TICKS,
+    AuditRecord, BlockCode, BlockReason, CheckedCrawlDispatch, ConnectionPinnedCrawlDispatch,
+    CrawlCheckedBatch, CrawlConnectError, CrawlDecision, CrawlDispatchError, CrawlDispatchGuard,
+    CrawlDispatchSigner, CrawlError, CrawlFrontierSnapshot, CrawlPinnedBatch, CrawlPolicy,
+    CrawlScheduler, DomainRule, EgressDenied, EgressPolicy, EgressRecord, IdentityMode,
+    NetworkRequest, NetworkResponseRecord, OriginCrawlSnapshot, PinnedCrawlConnection, ProfileId,
+    ProxyRoute, RejectedCrawlDispatch, RejectedPinnedCrawlDispatch, RequestId, RobotsRules,
+    SignatureError, SignatureHeaders, UrlBlocked, UrlPolicy, WebBotAuthSigningKey,
+    DEFAULT_CRAWL_MAX_CONCURRENT_PER_ORIGIN, DEFAULT_CRAWL_MAX_GLOBAL_INFLIGHT,
+    DEFAULT_CRAWL_MAX_GLOBAL_PENDING, DEFAULT_CRAWL_MAX_GLOBAL_PENDING_BYTES,
+    DEFAULT_CRAWL_MAX_PENDING_BYTES_PER_ORIGIN, DEFAULT_CRAWL_MAX_PENDING_PER_ORIGIN,
+    DEFAULT_CRAWL_MIN_DELAY_TICKS,
 };
 
 #[deprecated(
@@ -38,13 +41,13 @@ pub type CrawlDispatch = tempo_net::CrawlDispatch;
 
 /// Human-readable crate summary for smoke tests and package metadata.
 pub fn describe() -> &'static str {
-    "crawler facade over tempo-net: scheduler primitives plus checked dispatch for network execution"
+    "crawler facade over tempo-net: scheduler primitives plus connection-pinned dispatch"
 }
 
 /// SDK-facing crawl frontier.
 ///
 /// This wrapper intentionally omits tempo-net's raw `dispatch_ready()` method so
-/// callers use checked dispatch before network execution.
+/// callers use checked or connection-pinned dispatch before network execution.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CrawlFrontier {
     inner: tempo_net::CrawlFrontier,
@@ -66,6 +69,18 @@ impl CrawlFrontier {
     /// Bound pending queue entries for any one origin before dispatch.
     pub fn with_max_pending_per_origin(mut self, max_pending: usize) -> Self {
         self.inner = self.inner.with_max_pending_per_origin(max_pending);
+        self
+    }
+
+    /// Bound retained pending request metadata bytes for this frontier before dispatch.
+    pub fn with_max_global_pending_bytes(mut self, max_bytes: usize) -> Self {
+        self.inner = self.inner.with_max_global_pending_bytes(max_bytes);
+        self
+    }
+
+    /// Bound retained pending request metadata bytes for any one origin before dispatch.
+    pub fn with_max_pending_bytes_per_origin(mut self, max_bytes: usize) -> Self {
+        self.inner = self.inner.with_max_pending_bytes_per_origin(max_bytes);
         self
     }
 
@@ -97,6 +112,19 @@ impl CrawlFrontier {
     {
         self.inner
             .dispatch_checked_ready(tick, max_requests, guard, resolve_socket)
+    }
+
+    /// Dispatch ready requests as already-open TCP streams pinned to the
+    /// policy-checked target or proxy socket.
+    pub fn dispatch_pinned_tcp_ready(
+        &mut self,
+        tick: u64,
+        max_requests: usize,
+        guard: CrawlDispatchGuard<'_>,
+        connect_timeout: std::time::Duration,
+    ) -> Result<CrawlPinnedBatch, CrawlError> {
+        self.inner
+            .dispatch_pinned_tcp_ready(tick, max_requests, guard, connect_timeout)
     }
 
     pub fn finish(&mut self, response: &NetworkResponseRecord, tick: u64) -> bool {
@@ -278,6 +306,41 @@ mod tests {
     }
 
     #[test]
+    fn facade_exposes_connection_pinned_dispatch_contract() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let accepted = std::thread::spawn(move || listener.accept().map(|(stream, _)| stream));
+
+        let mut frontier = frontier(
+            CrawlPolicy::default()
+                .without_robots_txt()
+                .with_min_delay_ticks_per_origin(0),
+        );
+        frontier.enqueue(crawl_request(
+            "r1",
+            &format!("http://127.0.0.1:{}/page", addr.port()),
+        ))?;
+
+        let url_policy = UrlPolicy::allow_all();
+        let egress_policy = EgressPolicy::allow_all();
+        let guard = checked_dispatch_guard(&url_policy, &egress_policy);
+        let batch =
+            frontier.dispatch_pinned_tcp_ready(1, 1, guard, std::time::Duration::from_secs(1))?;
+
+        assert_eq!(batch.connections.len(), 1);
+        let pinned: &ConnectionPinnedCrawlDispatch = batch.connections[0].pinned();
+        assert_eq!(pinned.scheme(), "http");
+        assert_eq!(batch.connections[0].pinned().resolved_socket(), addr);
+        assert_eq!(batch.connections[0].stream().peer_addr()?, addr);
+        assert_eq!(frontier.snapshot().inflight, 1);
+
+        drop(batch);
+        let _accepted_stream = accepted.join().map_err(|_| "accept thread panicked")??;
+        Ok(())
+    }
+
+    #[test]
     fn facade_checked_dispatch_rejection_is_not_activated() -> Result<(), CrawlError> {
         let mut frontier = frontier(
             CrawlPolicy::default()
@@ -313,7 +376,9 @@ mod tests {
     fn facade_frontier_enforces_pending_caps() -> Result<(), CrawlError> {
         let mut frontier = frontier(CrawlPolicy::default().without_robots_txt())
             .with_max_global_pending(4)
-            .with_max_pending_per_origin(2);
+            .with_max_pending_per_origin(2)
+            .with_max_global_pending_bytes(DEFAULT_CRAWL_MAX_GLOBAL_PENDING_BYTES)
+            .with_max_pending_bytes_per_origin(DEFAULT_CRAWL_MAX_PENDING_BYTES_PER_ORIGIN);
 
         assert!(frontier.enqueue(crawl_request("a1", "https://a.example/one"))?);
         assert!(frontier.enqueue(crawl_request("a2", "https://a.example/two"))?);
