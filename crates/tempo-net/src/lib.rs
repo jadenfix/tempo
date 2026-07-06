@@ -1669,25 +1669,44 @@ fn path_content_usage<'a>(
     rules: impl IntoIterator<Item = &'a ContentUsageRule>,
     path: &str,
 ) -> ContentUsagePolicy {
+    let rules: Vec<_> = rules.into_iter().collect();
+    ContentUsagePolicy {
+        search: path_content_usage_category(&rules, path, CrawlUsageCategory::Search),
+        train_ai: path_content_usage_category(&rules, path, CrawlUsageCategory::TrainAi),
+    }
+}
+
+fn path_content_usage_category(
+    rules: &[&ContentUsageRule],
+    path: &str,
+    category: CrawlUsageCategory,
+) -> Option<bool> {
     let mut best_specificity = None;
-    let mut policy = ContentUsagePolicy::default();
+    let mut decision = None;
     for rule in rules {
         if !rule.applies_to(path) {
             continue;
         }
+        let Some(value) = rule.policy.explicit(category) else {
+            continue;
+        };
         let specificity = robots_specificity(&rule.path);
         match best_specificity {
             Some(best) if specificity < best => continue,
             Some(best) if specificity > best => {
-                policy = ContentUsagePolicy::default();
                 best_specificity = Some(specificity);
+                decision = Some(value);
             }
-            None => best_specificity = Some(specificity),
-            Some(_) => {}
+            None => {
+                best_specificity = Some(specificity);
+                decision = Some(value);
+            }
+            Some(_) => {
+                decision = Some(decision.map(|current| current && value).unwrap_or(value));
+            }
         }
-        policy.merge_most_restrictive(rule.policy.clone());
     }
-    policy
+    decision
 }
 
 fn origin_content_usage<'a>(
@@ -6031,6 +6050,7 @@ Content-Usage: train-ai=n
 Content-Usage: /ai-ok/ train-ai=y
 Content-Usage: /same/ train-ai=y
 Content-Usage: /same/ train-ai=n
+Content-Usage: /search-only/ search=y
 
 User-agent: ExampleBot
 Allow: /
@@ -6041,11 +6061,25 @@ Content-Usage: train-ai=y
         assert!(!robots.allows_usage_for_path("/test", CrawlUsageCategory::TrainAi));
         assert!(robots.allows_usage_for_path("/ai-ok/test", CrawlUsageCategory::TrainAi));
         assert!(!robots.allows_usage_for_path("/same/test", CrawlUsageCategory::TrainAi));
+        assert!(!robots.allows_usage_for_path("/search-only/test", CrawlUsageCategory::TrainAi));
+        assert!(robots.allows_usage_for_path("/search-only/test", CrawlUsageCategory::Search));
         assert!(!robots.allows_usage_for_path("/never/test", CrawlUsageCategory::TrainAi));
         assert_eq!(
             robots
                 .content_usage_for_path("/ai-ok/test")
                 .explicit(CrawlUsageCategory::TrainAi),
+            Some(true)
+        );
+        assert_eq!(
+            robots
+                .content_usage_for_path("/search-only/test")
+                .explicit(CrawlUsageCategory::TrainAi),
+            Some(false)
+        );
+        assert_eq!(
+            robots
+                .content_usage_for_path("/search-only/test")
+                .explicit(CrawlUsageCategory::Search),
             Some(true)
         );
     }
