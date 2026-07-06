@@ -8455,6 +8455,7 @@ dependencies = [
  "tempo-schema",
  "tempo-session",
  "tempo-skills",
+ "tempo-taint",
  "thiserror 2.0.18",
  "tokio",
 ]
@@ -8502,6 +8503,7 @@ dependencies = [
 name = "tempo-config"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "serde",
  "serde_json",
  "tempfile",
@@ -8539,6 +8541,7 @@ dependencies = [
  "tempfile",
  "tempo-driver",
  "tempo-engine-host",
+ "tempo-headless",
  "tempo-net",
  "tempo-observe",
  "tempo-schema",
@@ -8613,6 +8616,7 @@ dependencies = [
  "async-trait",
  "axum",
  "base64",
+ "ed25519-dalek",
  "futures",
  "getrandom 0.3.4",
  "hyper",
@@ -8620,6 +8624,8 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
+ "tempo-act",
  "tempo-agent",
  "tempo-bidi",
  "tempo-config",
@@ -8684,6 +8690,7 @@ dependencies = [
 name = "tempo-policy"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "criterion",
  "proptest",
  "serde_json",
@@ -8789,6 +8796,7 @@ dependencies = [
  "tempo-schema",
  "thiserror 2.0.18",
  "tokio",
+ "url",
 ]
 
 [[package]]

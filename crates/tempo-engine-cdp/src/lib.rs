@@ -39,7 +39,7 @@ use tempo_driver::{
     BrowsingContextCreateOptions, DriverTrait, Engine, StepOutcome, TransportError, Unsupported,
     MAX_SCREENSHOT_BYTES, MAX_SCREENSHOT_HEIGHT, MAX_SCREENSHOT_WIDTH,
 };
-use tempo_net::UrlPolicy;
+use tempo_net::{BrowserHardeningPolicy, UrlPolicy};
 use tempo_observe::{finalize_observation, CompileOptions, RawElement, StableIdMapper};
 use tempo_schema::{
     Action, ActionBatch, CompiledObservation, InteractiveElement, NodeId, ObservationDiff,
@@ -86,6 +86,10 @@ const CDP_POLICY_PROXY_ARGS: [&str; 6] = [
     "--proxy-server",
 ];
 const CDP_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// Keep the navigation await below tempod's 30s engine IPC bound so Tempo's
+/// own ready-state recovery can return a useful result before attached callers
+/// give up on the UDS round-trip.
+const CDP_NAVIGATION_AWAIT_TIMEOUT: Duration = Duration::from_secs(5);
 const TIMED_OUT_NAVIGATION_RECOVERY_TIMEOUT: Duration = Duration::from_secs(5);
 const TIMED_OUT_NAVIGATION_RECOVERY_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -199,6 +203,7 @@ pub struct CdpTempoDriver {
     stable_id_mapper: StableIdMapper,
     selectors_by_node: BTreeMap<NodeId, String>,
     url_policy: Arc<Mutex<UrlPolicy>>,
+    browser_hardening_policy: Arc<Mutex<BrowserHardeningPolicy>>,
     blocked_request_url: Arc<Mutex<Option<String>>>,
     request_policy_tracker: Arc<RequestPolicyTracker>,
     /// Cached isolated-world execution context for the stability probe.
@@ -222,10 +227,11 @@ impl CdpTempoDriver {
                 TransportError::Other(format!("failed to create private CDP profile: {error}"))
             })?;
         let url_policy = Arc::new(Mutex::new(UrlPolicy::block_private()));
+        let browser_hardening_policy = Arc::new(Mutex::new(BrowserHardeningPolicy::standard()));
         let blocked_request_url = Arc::new(Mutex::new(None));
         let request_policy_tracker = Arc::new(RequestPolicyTracker::new());
         let policy_proxy = PolicyProxy::start(
-            url_policy.clone(),
+            browser_hardening_policy.clone(),
             blocked_request_url.clone(),
             request_policy_tracker.clone(),
         )
@@ -254,7 +260,7 @@ impl CdpTempoDriver {
         };
         let request_policy_task = match install_request_policy(
             &page,
-            url_policy.clone(),
+            browser_hardening_policy.clone(),
             blocked_request_url.clone(),
             request_policy_tracker.clone(),
         )
@@ -283,6 +289,7 @@ impl CdpTempoDriver {
             stable_id_mapper: StableIdMapper::new(),
             selectors_by_node: BTreeMap::new(),
             url_policy,
+            browser_hardening_policy,
             blocked_request_url,
             request_policy_tracker,
             probe_context: Mutex::new(None),
@@ -302,20 +309,42 @@ impl CdpTempoDriver {
     }
 
     fn set_url_policy(&mut self, url_policy: UrlPolicy) {
+        if let Ok(mut active_policy) = self.browser_hardening_policy.lock() {
+            *active_policy = active_policy.clone().with_url_policy(url_policy.clone());
+        }
         if let Ok(mut active_policy) = self.url_policy.lock() {
             *active_policy = url_policy;
         }
     }
 
-    fn current_url_policy(&self) -> Result<UrlPolicy, TransportError> {
-        self.url_policy
+    pub fn with_browser_hardening_policy(
+        mut self,
+        browser_hardening_policy: BrowserHardeningPolicy,
+    ) -> Self {
+        self.set_browser_hardening_policy(browser_hardening_policy);
+        self
+    }
+
+    fn set_browser_hardening_policy(&mut self, browser_hardening_policy: BrowserHardeningPolicy) {
+        if let Ok(mut active_policy) = self.url_policy.lock() {
+            *active_policy = browser_hardening_policy.url_policy().clone();
+        }
+        if let Ok(mut active_policy) = self.browser_hardening_policy.lock() {
+            *active_policy = browser_hardening_policy;
+        }
+    }
+
+    fn current_browser_hardening_policy(&self) -> Result<BrowserHardeningPolicy, TransportError> {
+        self.browser_hardening_policy
             .lock()
             .map(|policy| policy.clone())
-            .map_err(|_error| TransportError::Other("CDP URL policy lock poisoned".into()))
+            .map_err(|_error| {
+                TransportError::Other("CDP browser hardening policy lock poisoned".into())
+            })
     }
 
     fn enforce_url_policy(&self, url: &str) -> Result<(), TransportError> {
-        enforce_url_policy(url, &self.current_url_policy()?)
+        enforce_browser_hardening_policy(url, &self.current_browser_hardening_policy()?)
     }
 
     fn clear_blocked_request(&self) -> Result<(), TransportError> {
@@ -513,12 +542,15 @@ impl CdpTempoDriver {
         self.enforce_url_policy(url)?;
         self.clear_blocked_request()?;
         let cursor = self.request_policy_cursor();
-        match self.page()?.goto(url).await {
-            Ok(_page) => {}
-            Err(CdpError::Timeout) => {
+        if self.should_recreate_child_page_for_navigation() {
+            self.recreate_child_page_for_navigation().await?;
+        }
+        match tokio::time::timeout(CDP_NAVIGATION_AWAIT_TIMEOUT, self.page()?.goto(url)).await {
+            Ok(Ok(_page)) => {}
+            Ok(Err(CdpError::Timeout)) | Err(_) => {
                 self.recover_timed_out_navigation_since(cursor, url).await?;
             }
-            Err(error) => {
+            Ok(Err(error)) => {
                 self.enforce_no_blocked_request_soon_since(cursor).await?;
                 return Err(map_cdp_error(error));
             }
@@ -536,6 +568,54 @@ impl CdpTempoDriver {
         let (final_url, dom_html) = self.snapshot_since(cursor).await?;
         self.record_snapshot_since(cursor, final_url, dom_html)
             .await
+    }
+
+    fn should_recreate_child_page_for_navigation(&self) -> bool {
+        self.browser_context_id.is_some()
+    }
+
+    async fn recreate_child_page_for_navigation(&mut self) -> Result<(), TransportError> {
+        let browser_context_id = self
+            .browser_context_id
+            .clone()
+            .ok_or_else(|| TransportError::Other("missing CDP browser context".into()))?;
+        let page_params = CreateTargetParams::builder()
+            .url("about:blank")
+            .browser_context_id(browser_context_id)
+            .build()
+            .map_err(|error| TransportError::Other(error.to_string()))?;
+        let new_page = self
+            .browser
+            .new_page(page_params)
+            .await
+            .map_err(map_cdp_error)?;
+        let new_policy_task = match install_request_policy(
+            &new_page,
+            self.browser_hardening_policy.clone(),
+            self.blocked_request_url.clone(),
+            self.request_policy_tracker.clone(),
+        )
+        .await
+        {
+            Ok(task) => task,
+            Err(error) => {
+                let _ = new_page.close().await;
+                return Err(error);
+            }
+        };
+
+        if let Some(task) = self.request_policy_task.take() {
+            task.abort();
+        }
+        let old_page = self.page.replace(new_page);
+        self.request_policy_task = Some(new_policy_task);
+        if let Ok(mut guard) = self.probe_context.lock() {
+            *guard = None;
+        }
+        if let Some(old_page) = old_page {
+            let _ = old_page.close().await;
+        }
+        Ok(())
     }
 
     async fn enrich_observation_from_ax_tree(
@@ -1246,7 +1326,7 @@ impl DriverTrait for CdpTempoDriver {
         let request_policy_tracker = Arc::new(RequestPolicyTracker::new());
         let request_policy_task = match install_request_policy(
             &page,
-            self.url_policy.clone(),
+            self.browser_hardening_policy.clone(),
             blocked_request_url.clone(),
             request_policy_tracker.clone(),
         )
@@ -1277,6 +1357,7 @@ impl DriverTrait for CdpTempoDriver {
             stable_id_mapper: StableIdMapper::new(),
             selectors_by_node: BTreeMap::new(),
             url_policy: self.url_policy.clone(),
+            browser_hardening_policy: self.browser_hardening_policy.clone(),
             blocked_request_url,
             request_policy_tracker,
             probe_context: Mutex::new(None),
@@ -1514,7 +1595,7 @@ async fn wait_for_no_blocked_request_with_grace(
 
 async fn install_request_policy(
     page: &Page,
-    url_policy: Arc<Mutex<UrlPolicy>>,
+    browser_hardening_policy: Arc<Mutex<BrowserHardeningPolicy>>,
     blocked_request_url: Arc<Mutex<Option<String>>>,
     request_policy_tracker: Arc<RequestPolicyTracker>,
 ) -> Result<JoinHandle<()>, TransportError> {
@@ -1540,13 +1621,13 @@ async fn install_request_policy(
         request_paused,
         move |event| {
             let page = page.clone();
-            let url_policy = url_policy.clone();
+            let browser_hardening_policy = browser_hardening_policy.clone();
             let blocked_request_url = blocked_request_url.clone();
             let request_policy_tracker = request_policy_tracker.clone();
             async move {
                 resume_paused_request(
                     &page,
-                    &url_policy,
+                    &browser_hardening_policy,
                     &blocked_request_url,
                     &request_policy_tracker,
                     &event,
@@ -1597,18 +1678,18 @@ where
 /// errors.
 async fn resume_paused_request(
     page: &Page,
-    url_policy: &Arc<Mutex<UrlPolicy>>,
+    browser_hardening_policy: &Arc<Mutex<BrowserHardeningPolicy>>,
     blocked_request_url: &Arc<Mutex<Option<String>>>,
     request_policy_tracker: &RequestPolicyTracker,
     event: &EventRequestPaused,
 ) {
     let request_url = event.request.url.clone();
-    let policy = match url_policy.lock() {
+    let policy = match browser_hardening_policy.lock() {
         Ok(policy) => Some(policy.clone()),
         Err(_error) => None,
     };
     let allowed = match policy {
-        Some(policy) => enforce_url_policy(&request_url, &policy).is_ok(),
+        Some(policy) => enforce_browser_hardening_policy(&request_url, &policy).is_ok(),
         None => false,
     };
 
@@ -1663,7 +1744,7 @@ struct PolicyProxy {
 
 impl PolicyProxy {
     async fn start(
-        url_policy: Arc<Mutex<UrlPolicy>>,
+        browser_hardening_policy: Arc<Mutex<BrowserHardeningPolicy>>,
         blocked_request_url: Arc<Mutex<Option<String>>>,
         request_policy_tracker: Arc<RequestPolicyTracker>,
     ) -> Result<Self, TransportError> {
@@ -1677,13 +1758,13 @@ impl PolicyProxy {
         })?;
         let task = tokio::spawn(async move {
             while let Ok((stream, _peer)) = listener.accept().await {
-                let url_policy = url_policy.clone();
+                let browser_hardening_policy = browser_hardening_policy.clone();
                 let blocked_request_url = blocked_request_url.clone();
                 let request_policy_tracker = request_policy_tracker.clone();
                 tokio::spawn(async move {
                     handle_policy_proxy_connection(
                         stream,
-                        url_policy,
+                        browser_hardening_policy,
                         blocked_request_url,
                         request_policy_tracker,
                     )
@@ -1711,7 +1792,7 @@ struct ProxyRequest {
 
 async fn handle_policy_proxy_connection(
     mut client: TcpStream,
-    url_policy: Arc<Mutex<UrlPolicy>>,
+    browser_hardening_policy: Arc<Mutex<BrowserHardeningPolicy>>,
     blocked_request_url: Arc<Mutex<Option<String>>>,
     request_policy_tracker: Arc<RequestPolicyTracker>,
 ) {
@@ -1723,7 +1804,7 @@ async fn handle_policy_proxy_connection(
         }
     };
     let policy = {
-        match url_policy.lock() {
+        match browser_hardening_policy.lock() {
             Ok(policy) => Some(policy.clone()),
             Err(_error) => None,
         }
@@ -1803,7 +1884,7 @@ fn find_header_end(buffer: &[u8]) -> Option<usize> {
 async fn handle_connect_proxy_request(
     mut client: TcpStream,
     request: ProxyRequest,
-    policy: &UrlPolicy,
+    policy: &BrowserHardeningPolicy,
     blocked_request_url: Arc<Mutex<Option<String>>>,
     request_policy_tracker: Arc<RequestPolicyTracker>,
 ) {
@@ -1836,7 +1917,7 @@ async fn handle_connect_proxy_request(
 async fn handle_http_proxy_request(
     mut client: TcpStream,
     request: ProxyRequest,
-    policy: &UrlPolicy,
+    policy: &BrowserHardeningPolicy,
     blocked_request_url: Arc<Mutex<Option<String>>>,
     request_policy_tracker: Arc<RequestPolicyTracker>,
 ) {
@@ -1955,9 +2036,10 @@ async fn connect_policy_target(
     url: &str,
     host: &str,
     port: u16,
-    policy: &UrlPolicy,
+    policy: &BrowserHardeningPolicy,
 ) -> Result<TcpStream, PolicyProxyConnectError> {
-    enforce_url_policy(url, policy).map_err(|_error| PolicyProxyConnectError::PolicyBlocked)?;
+    enforce_browser_hardening_policy(url, policy)
+        .map_err(|_error| PolicyProxyConnectError::PolicyBlocked)?;
     let mut addrs = tokio::net::lookup_host((host, port))
         .await
         .map_err(|_error| PolicyProxyConnectError::UpstreamUnavailable)?
@@ -1968,7 +2050,7 @@ async fn connect_policy_target(
     addrs.sort_unstable();
     addrs.dedup();
     for resolved_socket in &addrs {
-        enforce_url_policy_with_resolved_socket(url, policy, *resolved_socket)
+        enforce_url_policy_with_resolved_socket(url, policy.url_policy(), *resolved_socket)
             .map_err(|_error| PolicyProxyConnectError::PolicyBlocked)?;
     }
     for resolved_socket in addrs {
@@ -2117,9 +2199,20 @@ fn node_not_found_extraction(node: &NodeId) -> serde_json::Value {
     })
 }
 
+#[cfg(test)]
 fn enforce_url_policy(url: &str, policy: &UrlPolicy) -> Result<(), TransportError> {
     policy
         .enforce(url)
+        .map_err(|_error| TransportError::UrlBlocked)
+}
+
+fn enforce_browser_hardening_policy(
+    url: &str,
+    policy: &BrowserHardeningPolicy,
+) -> Result<(), TransportError> {
+    policy
+        .check_url(url)
+        .map(|_| ())
         .map_err(|_error| TransportError::UrlBlocked)
 }
 
@@ -2424,10 +2517,10 @@ fn apply_ax_summary(element: &mut InteractiveElement, summary: &AxSummary) {
         element.rank = element.rank.max(rank_for_ax_role(role));
     }
     if let Some(name) = &summary.name {
-        element.name = page_taint(name);
+        element.name = visual_extraction_taint(name);
     }
     if let Some(value) = &summary.value {
-        element.value = page_taint(value);
+        element.value = visual_extraction_taint(value);
     }
 }
 
@@ -2487,9 +2580,9 @@ fn top_ranked_indices(elements: &[InteractiveElement], limit: usize) -> Vec<usiz
     indices
 }
 
-fn page_taint(value: &str) -> Vec<TaintSpan> {
+fn visual_extraction_taint(value: &str) -> Vec<TaintSpan> {
     vec![TaintSpan {
-        provenance: Provenance::Page,
+        provenance: Provenance::VisualExtraction,
         text: value.to_string(),
     }]
 }
@@ -3669,7 +3762,9 @@ mod tests {
 
         assert_eq!(element.role, "textbox");
         assert_eq!(element.name[0].text, "Email Address");
+        assert_eq!(element.name[0].provenance, Provenance::VisualExtraction);
         assert_eq!(element.value[0].text, "me@example.com");
+        assert_eq!(element.value[0].provenance, Provenance::VisualExtraction);
         Ok(())
     }
 
@@ -4080,6 +4175,28 @@ mod tests {
     }
 
     #[test]
+    fn cdp_browser_hardening_blocks_risky_download_urls() {
+        let policy = BrowserHardeningPolicy::standard().with_url_policy(UrlPolicy::allow_all());
+
+        assert!(matches!(
+            enforce_browser_hardening_policy("https://example.com/download/tool.exe", &policy),
+            Err(TransportError::UrlBlocked)
+        ));
+    }
+
+    #[test]
+    fn cdp_browser_hardening_allows_downloads_when_explicitly_overridden() {
+        let policy = BrowserHardeningPolicy::standard()
+            .with_url_policy(UrlPolicy::allow_all())
+            .allow_risky_downloads();
+
+        assert!(
+            enforce_browser_hardening_policy("https://example.com/download/tool.exe", &policy)
+                .is_ok()
+        );
+    }
+
+    #[test]
     fn blocks_public_hostname_when_resolved_socket_is_private(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let policy = UrlPolicy::block_private();
@@ -4124,7 +4241,9 @@ mod tests {
         let request_policy_tracker = Arc::new(RequestPolicyTracker::new());
         let cursor = request_policy_tracker.cursor();
         let proxy = PolicyProxy::start(
-            Arc::new(Mutex::new(UrlPolicy::block_private())),
+            Arc::new(Mutex::new(
+                BrowserHardeningPolicy::standard().with_url_policy(UrlPolicy::block_private()),
+            )),
             blocked_request_url.clone(),
             request_policy_tracker.clone(),
         )
@@ -4161,7 +4280,9 @@ mod tests {
         let request_policy_tracker = Arc::new(RequestPolicyTracker::new());
         let cursor = request_policy_tracker.cursor();
         let proxy = PolicyProxy::start(
-            Arc::new(Mutex::new(UrlPolicy::block_private())),
+            Arc::new(Mutex::new(
+                BrowserHardeningPolicy::standard().with_url_policy(UrlPolicy::block_private()),
+            )),
             blocked_request_url.clone(),
             request_policy_tracker.clone(),
         )
@@ -4190,6 +4311,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn policy_proxy_blocks_browser_hardening_risky_downloads(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let origin = TokioTcpListener::bind(("127.0.0.1", 0)).await?;
+        let origin_addr = origin.local_addr()?;
+        let blocked_request_url = Arc::new(Mutex::new(None));
+        let request_policy_tracker = Arc::new(RequestPolicyTracker::new());
+        let cursor = request_policy_tracker.cursor();
+        let proxy = PolicyProxy::start(
+            Arc::new(Mutex::new(
+                BrowserHardeningPolicy::standard().with_url_policy(UrlPolicy::allow_all()),
+            )),
+            blocked_request_url.clone(),
+            request_policy_tracker.clone(),
+        )
+        .await?;
+        let mut client = TcpStream::connect(proxy.addr).await?;
+        let request = format!(
+            "GET http://{origin_addr}/download/tool.exe HTTP/1.1\r\nHost: {origin_addr}\r\nConnection: close\r\n\r\n"
+        );
+        client.write_all(request.as_bytes()).await?;
+        let mut response = [0_u8; 128];
+        let read = client.read(&mut response).await?;
+        let response = std::str::from_utf8(&response[..read])?;
+        let expected_blocked_url = format!("http://{origin_addr}/download/tool.exe");
+
+        assert!(response.starts_with("HTTP/1.1 403 Forbidden"));
+        assert_eq!(
+            blocked_request_url
+                .lock()
+                .map_err(|_error| std::io::Error::other("blocked URL lock poisoned"))?
+                .as_deref(),
+            Some(expected_blocked_url.as_str())
+        );
+        assert!(request_policy_tracker.has_blocked_since(cursor));
+        drop(origin);
+        drop(proxy);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn policy_proxy_keeps_upstream_failures_out_of_block_mapping(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let reserved = TokioTcpListener::bind(("127.0.0.1", 0)).await?;
@@ -4200,7 +4361,9 @@ mod tests {
         let request_policy_tracker = Arc::new(RequestPolicyTracker::new());
         let cursor = request_policy_tracker.cursor();
         let proxy = PolicyProxy::start(
-            Arc::new(Mutex::new(UrlPolicy::allow_all())),
+            Arc::new(Mutex::new(
+                BrowserHardeningPolicy::standard().with_url_policy(UrlPolicy::allow_all()),
+            )),
             blocked_request_url.clone(),
             request_policy_tracker.clone(),
         )
@@ -4868,6 +5031,28 @@ mod tests {
 
         assert_eq!(child_value, serde_json::json!("__missing__"));
         assert_eq!(child_cookie, serde_json::json!(""));
+        let child_observe = tokio::time::timeout(Duration::from_secs(10), child.observe())
+            .await
+            .map_err(|_| std::io::Error::other("child observe timed out"))??;
+        assert_eq!(child_observe.url, url);
+        let child_next_url = format!("{url}again");
+        let child_second_goto =
+            tokio::time::timeout(Duration::from_secs(10), child.goto(&child_next_url))
+                .await
+                .map_err(|_| std::io::Error::other("child second goto timed out"))??;
+        assert_eq!(child_second_goto.url, child_next_url);
+        let child_batch = tokio::time::timeout(
+            Duration::from_secs(10),
+            child.act_batch(&ActionBatch {
+                actions: vec![Action::Goto {
+                    url: format!("{url}batch"),
+                }],
+                quiescence: QuiescencePolicy::FixedMillis(0),
+            }),
+        )
+        .await
+        .map_err(|_| std::io::Error::other("child act_batch timed out"))??;
+        assert!(matches!(child_batch, StepOutcome::Applied { .. }));
 
         child.close().await?;
         driver.close().await?;

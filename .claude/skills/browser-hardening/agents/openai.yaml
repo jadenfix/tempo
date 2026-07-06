@@ -1,0 +1,4 @@
+interface:
+  display_name: "Browser Hardening"
+  short_description: "Safe browser security hardening workflow"
+  default_prompt: "Use $browser-hardening to plan or implement Tempo browser security hardening without anti-bot bypass."

@@ -16,9 +16,9 @@ use tempo_engine_host::{
     DriverCommand, DriverResponse, DriverWireError, EngineHostError, EngineIpcClient,
 };
 use tempo_net::{
-    AuditRecord, EgressDecision, EgressDenied, EgressPolicy, EgressRecord, IdentityMode,
-    NetworkRequest, ProfileId, ProxyEndpointTarget, SignatureError, UrlBlocked, UrlPolicy,
-    WebBotAuthSigningKey,
+    user_agent_for_identity_mode, AuditRecord, BrowserHardeningBlocked, BrowserHardeningPolicy,
+    EgressDecision, EgressDenied, EgressPolicy, EgressRecord, IdentityMode, NetworkRequest,
+    ProfileId, ProxyEndpointTarget, SignatureError, UrlBlocked, UrlPolicy, WebBotAuthSigningKey,
 };
 use tempo_schema::{Action, ActionBatch, CompiledObservation, NodeId, ObservationDiff};
 use thiserror::Error;
@@ -591,6 +591,7 @@ pub struct ServoNetworkAdapter {
     profile_id: ProfileId,
     identity_mode: IdentityMode,
     url_policy: UrlPolicy,
+    browser_hardening_policy: BrowserHardeningPolicy,
     egress_policy: EgressPolicy,
     signing: Option<ServoSigningConfig>,
     timeout: Duration,
@@ -603,6 +604,7 @@ impl ServoNetworkAdapter {
             profile_id: profile_id.into(),
             identity_mode,
             url_policy: UrlPolicy::block_private(),
+            browser_hardening_policy: BrowserHardeningPolicy::standard(),
             egress_policy: EgressPolicy::allow_all(),
             signing: None,
             timeout: Duration::from_secs(30),
@@ -611,7 +613,20 @@ impl ServoNetworkAdapter {
     }
 
     pub fn with_url_policy(mut self, url_policy: UrlPolicy) -> Self {
+        self.browser_hardening_policy = self
+            .browser_hardening_policy
+            .clone()
+            .with_url_policy(url_policy.clone());
         self.url_policy = url_policy;
+        self
+    }
+
+    pub fn with_browser_hardening_policy(
+        mut self,
+        browser_hardening_policy: BrowserHardeningPolicy,
+    ) -> Self {
+        self.url_policy = browser_hardening_policy.url_policy().clone();
+        self.browser_hardening_policy = browser_hardening_policy;
         self
     }
 
@@ -664,7 +679,8 @@ impl ServoNetworkAdapter {
         request: &ServoNetworkRequest,
     ) -> Result<ServoNetworkFetch, ServoNetworkError> {
         let network_request = request.to_network_request(&self.profile_id, self.identity_mode)?;
-        self.url_policy.enforce(&network_request.url)?;
+        self.browser_hardening_policy
+            .check_request(&network_request)?;
         let resolved_target = ResolvedTarget::from_url(&network_request.url)?;
         self.fetch_with_resolved_target(request, network_request, resolved_target)
     }
@@ -700,7 +716,8 @@ impl ServoNetworkAdapter {
                 request = next_request;
                 network_request =
                     request.to_network_request(&self.profile_id, self.identity_mode)?;
-                self.url_policy.enforce(&network_request.url)?;
+                self.browser_hardening_policy
+                    .check_request(&network_request)?;
                 resolved_target = ResolvedTarget::from_url(&network_request.url)?;
                 continue;
             }
@@ -727,10 +744,10 @@ impl ServoNetworkAdapter {
         resolved_target: &ResolvedTarget,
     ) -> Result<AuditRecord, ServoNetworkError> {
         // Keep Servo in parity with CDP and tempo-net: every DNS candidate must
-        // satisfy URL policy before reqwest receives the resolved set.
+        // satisfy browser hardening before reqwest receives the resolved set.
         for socket in &resolved_target.sockets {
-            self.url_policy
-                .enforce_resolved_socket(&network_request.url, *socket)?;
+            self.browser_hardening_policy
+                .check_request_with_resolved_socket(network_request, *socket)?;
         }
         Ok(AuditRecord::from_request_with_resolved_socket(
             network_request,
@@ -820,8 +837,14 @@ impl ServoNetworkAdapter {
     ) -> Result<ServoNetworkResponse, ServoNetworkError> {
         let method = reqwest::Method::from_bytes(request.method.as_bytes())
             .map_err(|error| ServoNetworkError::InvalidMethod(error.to_string()))?;
-        let mut builder = client.request(method, &request.url);
+        let mut builder = client.request(method, &request.url).header(
+            reqwest::header::USER_AGENT,
+            user_agent_for_identity_mode(self.identity_mode),
+        );
         for (name, value) in request.headers.iter().chain(signed_headers.iter()) {
+            if name.eq_ignore_ascii_case(reqwest::header::USER_AGENT.as_str()) {
+                continue;
+            }
             builder = builder.header(
                 reqwest::header::HeaderName::from_bytes(name.as_bytes()).map_err(|error| {
                     ServoNetworkError::InvalidHeader {
@@ -1114,6 +1137,8 @@ pub enum ServoEngineError {
 pub enum ServoNetworkError {
     #[error(transparent)]
     Url(#[from] UrlBlocked),
+    #[error(transparent)]
+    BrowserHardening(#[from] BrowserHardeningBlocked),
     #[error("egress denied for {domain}:{port}: {reason}")]
     EgressDenied {
         domain: String,
@@ -1477,7 +1502,45 @@ mod tests {
             .err()
             .ok_or_else(|| io::Error::other("expected URL policy failure"))?;
 
-        assert!(matches!(error, ServoNetworkError::Url(_)));
+        assert!(matches!(
+            error,
+            ServoNetworkError::Url(_) | ServoNetworkError::BrowserHardening(_)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn servo_network_adapter_blocks_risky_downloads_before_network() -> TestResult {
+        let adapter = ServoNetworkAdapter::new("profile-a", IdentityMode::AgentDeclared)
+            .with_url_policy(UrlPolicy::allow_all());
+        let request =
+            ServoNetworkRequest::new("req-1", "GET", "https://example.test/download/tool.exe");
+
+        let error = adapter
+            .fetch(&request)
+            .err()
+            .ok_or_else(|| io::Error::other("expected browser hardening failure"))?;
+
+        assert!(matches!(error, ServoNetworkError::BrowserHardening(_)));
+        Ok(())
+    }
+
+    #[test]
+    fn servo_network_adapter_blocks_threat_domains_before_network() -> TestResult {
+        let adapter = ServoNetworkAdapter::new("profile-a", IdentityMode::AgentDeclared)
+            .with_browser_hardening_policy(
+                BrowserHardeningPolicy::standard()
+                    .with_url_policy(UrlPolicy::allow_all())
+                    .with_threat_domain(tempo_net::DomainRule::suffix("bad.test")),
+            );
+        let request = ServoNetworkRequest::new("req-1", "GET", "https://cdn.bad.test/script.js");
+
+        let error = adapter
+            .fetch(&request)
+            .err()
+            .ok_or_else(|| io::Error::other("expected browser hardening failure"))?;
+
+        assert!(matches!(error, ServoNetworkError::BrowserHardening(_)));
         Ok(())
     }
 
@@ -1500,7 +1563,10 @@ mod tests {
             .err()
             .ok_or_else(|| io::Error::other("expected resolved socket policy failure"))?;
 
-        assert!(matches!(error, ServoNetworkError::Url(_)));
+        assert!(matches!(
+            error,
+            ServoNetworkError::Url(_) | ServoNetworkError::BrowserHardening(_)
+        ));
         Ok(())
     }
 
@@ -1524,7 +1590,10 @@ mod tests {
             .err()
             .ok_or_else(|| io::Error::other("expected resolved socket policy failure"))?;
 
-        assert!(matches!(error, ServoNetworkError::Url(_)));
+        assert!(matches!(
+            error,
+            ServoNetworkError::Url(_) | ServoNetworkError::BrowserHardening(_)
+        ));
         Ok(())
     }
 
@@ -1555,7 +1624,10 @@ mod tests {
             .err()
             .ok_or_else(|| io::Error::other("expected resolved socket policy failure"))?;
 
-        assert!(matches!(error, ServoNetworkError::Url(_)));
+        assert!(matches!(
+            error,
+            ServoNetworkError::Url(_) | ServoNetworkError::BrowserHardening(_)
+        ));
         Ok(())
     }
 
@@ -1703,7 +1775,10 @@ mod tests {
             .err()
             .ok_or_else(|| io::Error::other("expected URL policy failure"))?;
 
-        assert!(matches!(error, ServoNetworkError::Url(_)));
+        assert!(matches!(
+            error,
+            ServoNetworkError::Url(_) | ServoNetworkError::BrowserHardening(_)
+        ));
         Ok(())
     }
 
@@ -1757,7 +1832,10 @@ mod tests {
             .err()
             .ok_or_else(|| io::Error::other("expected proxy socket policy failure"))?;
 
-        assert!(matches!(error, ServoNetworkError::Url(_)));
+        assert!(matches!(
+            error,
+            ServoNetworkError::Url(_) | ServoNetworkError::BrowserHardening(_)
+        ));
         Ok(())
     }
 
@@ -1923,6 +2001,42 @@ mod tests {
         assert!(captured.contains("expires=423"));
         assert!(captured.contains("tag=\"web-bot-auth\""));
         assert!(captured.contains("\r\nsignature:"));
+        Ok(())
+    }
+
+    #[test]
+    fn servo_network_adapter_sets_honest_user_agent_and_drops_mimic() -> TestResult {
+        let (origin, captured_request, server) = serve_http_once(b"ok".to_vec())?;
+        let adapter = ServoNetworkAdapter::new("profile-a", IdentityMode::AgentDeclared)
+            .with_url_policy(UrlPolicy::allow_all());
+        let request = ServoNetworkRequest::new("req-1", "GET", format!("{origin}/ua"))
+            .with_header("User-Agent", "Mozilla/5.0 Chrome/999 Safari/999")
+            .with_header("accept", "text/plain");
+
+        adapter.fetch(&request)?;
+        join_server(server)?;
+        let captured = captured_request.recv_timeout(StdDuration::from_secs(1))?;
+        let expected = user_agent_for_identity_mode(IdentityMode::AgentDeclared);
+
+        assert!(captured.contains(&format!("\r\nuser-agent: {expected}\r\n")));
+        assert!(!captured.contains("Chrome/999"));
+        assert!(captured.contains("\r\naccept: text/plain\r\n"));
+        Ok(())
+    }
+
+    #[test]
+    fn servo_network_adapter_uses_user_driven_user_agent_when_selected() -> TestResult {
+        let (origin, captured_request, server) = serve_http_once(b"ok".to_vec())?;
+        let adapter = ServoNetworkAdapter::new("profile-a", IdentityMode::UserDriven)
+            .with_url_policy(UrlPolicy::allow_all());
+        let request = ServoNetworkRequest::new("req-1", "GET", format!("{origin}/ua"));
+
+        adapter.fetch(&request)?;
+        join_server(server)?;
+        let captured = captured_request.recv_timeout(StdDuration::from_secs(1))?;
+        let expected = user_agent_for_identity_mode(IdentityMode::UserDriven);
+
+        assert!(captured.contains(&format!("\r\nuser-agent: {expected}\r\n")));
         Ok(())
     }
 

@@ -14,6 +14,7 @@ tempo-schema = { path = "../tempo-schema" }
 tempo-agent = { path = "../tempo-agent" }
 tempo-bidi = { path = "../tempo-bidi" }
 tempo-driver = { path = "../tempo-driver" }
+tempo-act = { path = "../tempo-act" }
 tempo-engine-host = { path = "../tempo-engine-host" }
 tempo-mcp = { path = "../tempo-mcp" }
 tempo-net = { path = "../tempo-net" }
@@ -26,6 +27,7 @@ async-trait.workspace = true
 # implementation that replaces the previous hand-rolled framing.
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "ws"] }
 base64 = "0.22"
+ed25519-dalek = "2"
 futures = "0.3"
 getrandom = "0.3"
 # hyper/hyper-util are already in axum's dependency tree; direct deps only to
@@ -37,6 +39,7 @@ hyper-util = { version = "0.1", features = ["service", "tokio"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 tokio = { version = "1", features = ["macros", "net", "rt", "sync", "time"] }
 url = "2"

@@ -12,7 +12,7 @@ use std::fmt::Write as _;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::engine::general_purpose::{STANDARD as BASE64, URL_SAFE_NO_PAD};
 use base64::Engine as _;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use sha2::{Digest, Sha256};
@@ -25,6 +25,12 @@ pub const DEFAULT_WEB_BOT_AUTH_MAX_SIGNATURE_AGE: Duration = Duration::from_secs
 
 /// Default allowance for small verifier/signer clock skew.
 pub const DEFAULT_WEB_BOT_AUTH_CLOCK_SKEW: Duration = Duration::from_secs(60);
+
+/// Well-known path for publishing Web Bot Auth verification keys.
+pub const WEB_BOT_AUTH_KEY_DIRECTORY_PATH: &str = "/.well-known/http-message-signatures-directory";
+
+/// Public identity page referenced from Tempo's honest user-agent helpers.
+pub const TEMPO_BOT_DOCS_URL: &str = "https://tempo.dev/bots";
 
 /// Stable request identifier used by audit and quiescence records.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -79,6 +85,8 @@ impl From<String> for ProfileId {
 pub enum UrlPolicyMode {
     /// Permit every URL. Intended for trusted tests and explicit local override.
     AllowAll,
+    /// Deny every URL. Used when an operator selects fail-closed protection.
+    BlockAll,
     /// Block non-http(s), loopback, private, link-local, multicast, and metadata targets.
     BlockPrivate,
 }
@@ -97,6 +105,13 @@ impl UrlPolicy {
         }
     }
 
+    /// Deny every URL before dispatch.
+    pub const fn block_all() -> Self {
+        Self {
+            mode: UrlPolicyMode::BlockAll,
+        }
+    }
+
     /// Block private/loopback/link-local/metadata targets. This is the secure default.
     pub const fn block_private() -> Self {
         Self {
@@ -108,6 +123,12 @@ impl UrlPolicy {
     pub fn check(&self, url: &str) -> UrlPolicyVerdict {
         if self.mode == UrlPolicyMode::AllowAll {
             return UrlPolicyVerdict::Allow;
+        }
+        if self.mode == UrlPolicyMode::BlockAll {
+            return UrlPolicyVerdict::Block(BlockReason::new(
+                BlockCode::PolicyDenied,
+                "URL denied by fail-closed browser hardening policy",
+            ));
         }
 
         let Some((scheme, _)) = url.split_once("://") else {
@@ -198,6 +219,14 @@ impl UrlPolicy {
         if self.mode == UrlPolicyMode::AllowAll {
             return Ok(());
         }
+        if self.mode == UrlPolicyMode::BlockAll {
+            return Err(UrlBlocked {
+                reason: BlockReason::new(
+                    BlockCode::PolicyDenied,
+                    "URL denied by fail-closed browser hardening policy",
+                ),
+            });
+        }
 
         let parts = UrlParts::parse(url).map_err(|reason| UrlBlocked { reason })?;
         let expected_port = egress_port(&parts);
@@ -244,6 +273,7 @@ pub enum BlockCode {
     MalformedIpv6,
     Localhost,
     BlockedIp,
+    PolicyDenied,
     CrawlLimit,
 }
 
@@ -383,6 +413,275 @@ pub fn checked_url_target_from_sockets(
             .map_err(ResolveUrlTargetError::UrlBlocked)?;
     }
     Ok(ResolvedUrlTarget { host, sockets })
+}
+
+/// Browser-grade security posture for navigation and request dispatch.
+///
+/// This is intentionally a protection policy, not an anti-bot evasion layer.
+/// Challenge pages are treated as a reason to pause and hand control to a
+/// human operator; Tempo does not auto-solve or bypass them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BrowserHardeningPolicy {
+    level: BrowserHardeningLevel,
+    url_policy: UrlPolicy,
+    threat_domains: BTreeSet<DomainRule>,
+    challenge_handling: ChallengeHandling,
+    require_secure_top_level: bool,
+    block_risky_downloads: bool,
+    require_transparent_identity: bool,
+}
+
+impl Default for BrowserHardeningPolicy {
+    fn default() -> Self {
+        Self::standard()
+    }
+}
+
+impl BrowserHardeningPolicy {
+    /// Default browser-security baseline: URL-level SSRF preflight,
+    /// executable-download blocking, transparent identity, and human handoff on
+    /// challenges. Dispatchers that have a resolved socket must call
+    /// [`Self::check_request_with_resolved_socket`] before connecting to get
+    /// DNS-rebinding protection.
+    pub fn standard() -> Self {
+        Self {
+            level: BrowserHardeningLevel::Standard,
+            url_policy: UrlPolicy::block_private(),
+            threat_domains: BTreeSet::new(),
+            challenge_handling: ChallengeHandling::RequireHumanTakeover,
+            require_secure_top_level: false,
+            block_risky_downloads: true,
+            require_transparent_identity: true,
+        }
+    }
+
+    /// Strict browser-security baseline for high-risk automation: standard
+    /// checks plus HTTPS-only top-level navigation.
+    pub fn strict() -> Self {
+        Self {
+            level: BrowserHardeningLevel::Strict,
+            require_secure_top_level: true,
+            ..Self::standard()
+        }
+    }
+
+    pub fn with_url_policy(mut self, url_policy: UrlPolicy) -> Self {
+        self.url_policy = url_policy;
+        self
+    }
+
+    pub fn with_threat_domain(mut self, rule: DomainRule) -> Self {
+        self.threat_domains.insert(rule);
+        self
+    }
+
+    pub fn with_threat_domain_provider(mut self, provider: &impl ThreatDomainProvider) -> Self {
+        self.apply_threat_domain_provider(provider);
+        self
+    }
+
+    pub fn apply_threat_domain_provider(
+        &mut self,
+        provider: &impl ThreatDomainProvider,
+    ) -> ThreatDomainProviderAudit {
+        let audit = provider.audit_record();
+        for rule in provider.threat_domain_rules() {
+            self.threat_domains.insert(rule);
+        }
+        audit
+    }
+
+    pub fn threat_domain_count(&self) -> usize {
+        self.threat_domains.len()
+    }
+
+    pub fn with_challenge_handling(mut self, challenge_handling: ChallengeHandling) -> Self {
+        self.challenge_handling = challenge_handling;
+        self
+    }
+
+    pub fn allow_cleartext_top_level(mut self) -> Self {
+        self.require_secure_top_level = false;
+        self
+    }
+
+    pub fn allow_risky_downloads(mut self) -> Self {
+        self.block_risky_downloads = false;
+        self
+    }
+
+    pub fn level(&self) -> BrowserHardeningLevel {
+        self.level
+    }
+
+    pub fn url_policy(&self) -> &UrlPolicy {
+        &self.url_policy
+    }
+
+    pub fn challenge_handling(&self) -> ChallengeHandling {
+        self.challenge_handling
+    }
+
+    pub fn requires_human_takeover_on_challenge(&self) -> bool {
+        self.challenge_handling == ChallengeHandling::RequireHumanTakeover
+    }
+
+    /// Check a URL before top-level navigation. This is a pre-resolution check;
+    /// callers that resolve/connect must also enforce the selected socket.
+    pub fn check_url(
+        &self,
+        url: &str,
+    ) -> Result<BrowserHardeningDecision, BrowserHardeningBlocked> {
+        let request = NetworkRequest::new(
+            "browser-hardening-preflight",
+            "GET",
+            url,
+            "browser-hardening-profile",
+            IdentityMode::AgentDeclared,
+        );
+        self.check_request(&request)
+    }
+
+    /// Check a request before engine/network dispatch. This is a pre-resolution
+    /// check; callers that resolve/connect must also enforce the selected
+    /// socket with [`Self::check_request_with_resolved_socket`].
+    pub fn check_request(
+        &self,
+        request: &NetworkRequest,
+    ) -> Result<BrowserHardeningDecision, BrowserHardeningBlocked> {
+        self.url_policy
+            .enforce(&request.url)
+            .map_err(BrowserHardeningBlocked::from_url_blocked)?;
+
+        let parts = UrlParts::parse(&request.url)
+            .map_err(|reason| BrowserHardeningBlocked::from_block_reason(reason, None))?;
+        let domain = canonical_domain(parts.host.clone());
+        let origin = Some(parts.origin());
+
+        if self.require_secure_top_level && parts.scheme != "https" {
+            return Err(BrowserHardeningBlocked {
+                code: BrowserHardeningBlockCode::InsecureTopLevelNavigation,
+                origin,
+                reason: "strict browser hardening requires HTTPS top-level navigation".into(),
+            });
+        }
+
+        if self.threat_domains.iter().any(|rule| rule.matches(&domain)) {
+            return Err(BrowserHardeningBlocked {
+                code: BrowserHardeningBlockCode::ThreatListedDomain,
+                origin,
+                reason: format!("domain {domain} is blocked by browser threat policy"),
+            });
+        }
+
+        if self.block_risky_downloads && risky_download_path(&parts.path) {
+            return Err(BrowserHardeningBlocked {
+                code: BrowserHardeningBlockCode::RiskyDownload,
+                origin,
+                reason: "browser hardening blocked an executable-like download path".into(),
+            });
+        }
+
+        Ok(BrowserHardeningDecision {
+            level: self.level,
+            identity_mode: request.identity_mode,
+            challenge_handling: self.challenge_handling,
+            transparent_identity_required: self.require_transparent_identity,
+        })
+    }
+
+    /// Check a request and its selected socket before network dispatch.
+    pub fn check_request_with_resolved_socket(
+        &self,
+        request: &NetworkRequest,
+        resolved_socket: SocketAddr,
+    ) -> Result<BrowserHardeningDecision, BrowserHardeningBlocked> {
+        let decision = self.check_request(request)?;
+        self.url_policy
+            .enforce_resolved_socket(&request.url, resolved_socket)
+            .map_err(BrowserHardeningBlocked::from_url_blocked)?;
+        Ok(decision)
+    }
+}
+
+/// Named security posture selected by [`BrowserHardeningPolicy`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BrowserHardeningLevel {
+    Standard,
+    Strict,
+}
+
+/// Required response when a CAPTCHA, auth wall, bot check, or similar challenge
+/// is detected by the observation layer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChallengeHandling {
+    AuditOnly,
+    RequireHumanTakeover,
+}
+
+/// Successful hardening decision for a checked request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BrowserHardeningDecision {
+    pub level: BrowserHardeningLevel,
+    pub identity_mode: IdentityMode,
+    pub challenge_handling: ChallengeHandling,
+    pub transparent_identity_required: bool,
+}
+
+/// Stable machine-readable reason for a browser-hardening block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BrowserHardeningBlockCode {
+    UrlPolicy(BlockCode),
+    InsecureTopLevelNavigation,
+    ThreatListedDomain,
+    RiskyDownload,
+}
+
+/// Browser-hardening rejection safe to surface in audit/UI.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BrowserHardeningBlocked {
+    pub code: BrowserHardeningBlockCode,
+    pub origin: Option<String>,
+    pub reason: String,
+}
+
+impl BrowserHardeningBlocked {
+    fn from_url_blocked(blocked: UrlBlocked) -> Self {
+        Self::from_block_reason(blocked.reason, None)
+    }
+
+    fn from_block_reason(reason: BlockReason, origin: Option<String>) -> Self {
+        Self {
+            code: BrowserHardeningBlockCode::UrlPolicy(reason.code),
+            origin,
+            reason: reason.detail,
+        }
+    }
+}
+
+impl fmt::Display for BrowserHardeningBlocked {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "browser hardening blocked request: {}", self.reason)
+    }
+}
+
+impl Error for BrowserHardeningBlocked {}
+
+const RISKY_DOWNLOAD_EXTENSIONS: &[&str] = &[
+    "apk", "app", "bat", "cmd", "com", "crx", "dmg", "exe", "jar", "js", "msi", "pkg", "ps1",
+    "scr", "vbe", "vbs", "wsf",
+];
+
+fn risky_download_path(path: &str) -> bool {
+    let leaf = path
+        .rsplit('/')
+        .next()
+        .unwrap_or(path)
+        .trim()
+        .to_ascii_lowercase();
+    RISKY_DOWNLOAD_EXTENSIONS
+        .iter()
+        .any(|extension| leaf.ends_with(&format!(".{extension}")))
 }
 
 /// A component covered by an RFC 9421 HTTP Message Signature.
@@ -527,6 +826,14 @@ impl WebBotAuthVerifier {
     pub fn allowed_clock_skew(&self) -> Duration {
         self.allowed_clock_skew
     }
+
+    pub fn key_id(&self) -> &str {
+        &self.key_id
+    }
+
+    pub fn public_key_bytes(&self) -> [u8; 32] {
+        self.verifying_key.to_bytes()
+    }
 }
 
 impl fmt::Debug for WebBotAuthVerifier {
@@ -537,6 +844,49 @@ impl fmt::Debug for WebBotAuthVerifier {
             .field("max_signature_age", &self.max_signature_age)
             .field("allowed_clock_skew", &self.allowed_clock_skew)
             .finish()
+    }
+}
+
+/// Build the public Ed25519 JWK directory body served from
+/// `/.well-known/http-message-signatures-directory`.
+pub fn web_bot_auth_key_directory_json(verifiers: &[WebBotAuthVerifier]) -> String {
+    let keys = verifiers
+        .iter()
+        .map(|verifier| {
+            format!(
+                "{{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"kid\":\"{}\",\"x\":\"{}\",\"use\":\"sig\",\"alg\":\"EdDSA\"}}",
+                escape_json_string(verifier.key_id()),
+                URL_SAFE_NO_PAD.encode(verifier.public_key_bytes())
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{{\"keys\":[{keys}]}}")
+}
+
+/// Honest, stable UA for explicit agent traffic. It deliberately avoids
+/// claiming to be Chrome/Safari/Firefox while still giving operators a docs URL.
+pub fn agent_declared_user_agent() -> String {
+    format!(
+        "Tempo/{} AgentDeclared (+{})",
+        env!("CARGO_PKG_VERSION"),
+        TEMPO_BOT_DOCS_URL
+    )
+}
+
+/// Honest UA token for user-clicked/browser-surface navigation.
+pub fn user_driven_user_agent() -> String {
+    format!(
+        "Tempo/{} UserDriven (+{})",
+        env!("CARGO_PKG_VERSION"),
+        TEMPO_BOT_DOCS_URL
+    )
+}
+
+pub fn user_agent_for_identity_mode(identity_mode: IdentityMode) -> String {
+    match identity_mode {
+        IdentityMode::UserDriven => user_driven_user_agent(),
+        IdentityMode::AgentDeclared => agent_declared_user_agent(),
     }
 }
 
@@ -1027,20 +1377,37 @@ impl IdentityStrategyTable {
         if challenged {
             counters.challenged_requests = counters.challenged_requests.saturating_add(1);
         }
+        if counters.challenge_rate() > self.config.max_agent_challenge_rate {
+            counters.user_driven_latched = true;
+        }
         counters.last_seen = tick;
         Ok(counters.stats(origin, self.config))
     }
 
-    /// Remove the origin with the oldest `last_seen` tick (least recently recorded).
+    /// Remove the oldest unchallenged origin when possible. A challenged origin
+    /// carries identity-fallback state and should not be forgotten just because
+    /// clean origins churn through the bounded table.
     fn evict_lru(&mut self) {
         if let Some(oldest) = self
             .counters
             .iter()
+            .filter(|(_, counters)| !counters.user_driven_latched)
             .min_by_key(|(_, counters)| counters.last_seen)
+            .or_else(|| {
+                self.counters
+                    .iter()
+                    .min_by_key(|(_, counters)| counters.last_seen)
+            })
             .map(|(origin, _)| origin.clone())
         {
             self.counters.remove(&oldest);
         }
+    }
+
+    pub fn has_latched_user_driven_origin(&self, origin: &str) -> bool {
+        self.counters
+            .get(origin)
+            .is_some_and(|counters| counters.user_driven_latched)
     }
 
     /// Return the currently selected mode for a URL's origin.
@@ -1081,6 +1448,7 @@ impl IdentityStrategyTable {
 struct IdentityOriginCounters {
     total_requests: u64,
     challenged_requests: u64,
+    user_driven_latched: bool,
     /// Recency tick of the most recent `record_request` for this origin.
     last_seen: u64,
 }
@@ -1095,7 +1463,7 @@ impl IdentityOriginCounters {
     }
 
     fn selected_mode(self, config: IdentityStrategyConfig) -> IdentityMode {
-        if self.challenge_rate() > config.max_agent_challenge_rate {
+        if self.user_driven_latched || self.challenge_rate() > config.max_agent_challenge_rate {
             IdentityMode::UserDriven
         } else {
             IdentityMode::AgentDeclared
@@ -1562,6 +1930,160 @@ impl DomainRule {
             Self::Exact(domain) => domain.len() + 1_000,
             Self::Suffix(domain) => domain.len(),
         }
+    }
+}
+
+/// Source of threat-domain rules for browser hardening.
+///
+/// Providers are deliberately pure and snapshot-oriented: production code can
+/// update or replace a provider out-of-band, while enforcement consumes a
+/// bounded rule snapshot and emits an audit summary.
+pub trait ThreatDomainProvider {
+    fn provider_id(&self) -> &str;
+    fn threat_domain_rules(&self) -> Vec<DomainRule>;
+
+    fn audit_record(&self) -> ThreatDomainProviderAudit {
+        ThreatDomainProviderAudit::from_rules(self.provider_id(), &self.threat_domain_rules())
+    }
+}
+
+/// Sanitized audit summary for one threat-domain provider snapshot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ThreatDomainProviderAudit {
+    pub provider_id: String,
+    pub rule_count: usize,
+    pub exact_rules: usize,
+    pub suffix_rules: usize,
+}
+
+impl ThreatDomainProviderAudit {
+    pub fn from_rules(provider_id: impl Into<String>, rules: &[DomainRule]) -> Self {
+        let mut exact_rules = 0;
+        let mut suffix_rules = 0;
+        for rule in rules {
+            match rule {
+                DomainRule::Exact(_) => exact_rules += 1,
+                DomainRule::Suffix(_) => suffix_rules += 1,
+            }
+        }
+        Self {
+            provider_id: provider_id.into(),
+            rule_count: rules.len(),
+            exact_rules,
+            suffix_rules,
+        }
+    }
+}
+
+/// Static/offline threat-domain provider for fixtures, bundled feeds, and tests.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StaticThreatDomainProvider {
+    provider_id: String,
+    rules: BTreeSet<DomainRule>,
+}
+
+impl StaticThreatDomainProvider {
+    pub fn new(provider_id: impl Into<String>) -> Self {
+        Self {
+            provider_id: provider_id.into(),
+            rules: BTreeSet::new(),
+        }
+    }
+
+    pub fn with_rule(mut self, rule: DomainRule) -> Self {
+        self.rules.insert(rule);
+        self
+    }
+
+    pub fn rule_count(&self) -> usize {
+        self.rules.len()
+    }
+
+    /// Parse a line-oriented threat-domain feed.
+    ///
+    /// Blank lines and `#` comments are ignored. Plain domains become exact
+    /// rules; `*.example.com` and `.example.com` become suffix rules.
+    pub fn from_feed_lines(
+        provider_id: impl Into<String>,
+        contents: &str,
+    ) -> Result<Self, ThreatDomainFeedError> {
+        let mut provider = Self::new(provider_id);
+        for (index, line) in contents.lines().enumerate() {
+            let Some(rule) = parse_threat_domain_feed_line(index + 1, line)? else {
+                continue;
+            };
+            provider.rules.insert(rule);
+        }
+        Ok(provider)
+    }
+}
+
+impl ThreatDomainProvider for StaticThreatDomainProvider {
+    fn provider_id(&self) -> &str {
+        &self.provider_id
+    }
+
+    fn threat_domain_rules(&self) -> Vec<DomainRule> {
+        self.rules.iter().cloned().collect()
+    }
+}
+
+/// Parse failure for a static threat-domain feed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ThreatDomainFeedError {
+    pub line: usize,
+    pub entry: String,
+    pub reason: String,
+}
+
+impl fmt::Display for ThreatDomainFeedError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "invalid threat-domain feed entry at line {}: {} ({})",
+            self.line, self.entry, self.reason
+        )
+    }
+}
+
+impl Error for ThreatDomainFeedError {}
+
+fn parse_threat_domain_feed_line(
+    line: usize,
+    raw: &str,
+) -> Result<Option<DomainRule>, ThreatDomainFeedError> {
+    let entry = raw.split('#').next().unwrap_or_default().trim();
+    if entry.is_empty() {
+        return Ok(None);
+    }
+    if let Some(domain) = entry.strip_prefix("*.").or_else(|| entry.strip_prefix('.')) {
+        validate_threat_domain_entry(line, entry, domain)?;
+        return Ok(Some(DomainRule::suffix(domain)));
+    }
+    validate_threat_domain_entry(line, entry, entry)?;
+    Ok(Some(DomainRule::exact(entry)))
+}
+
+fn validate_threat_domain_entry(
+    line: usize,
+    entry: &str,
+    domain: &str,
+) -> Result<(), ThreatDomainFeedError> {
+    let domain = domain.trim_end_matches('.');
+    let valid = !domain.is_empty()
+        && !domain.contains("..")
+        && !domain.contains("://")
+        && domain
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'));
+    if valid {
+        Ok(())
+    } else {
+        Err(ThreatDomainFeedError {
+            line,
+            entry: entry.into(),
+            reason: "expected a domain, .suffix, or *.suffix entry".into(),
+        })
     }
 }
 
@@ -2501,6 +3023,7 @@ pub enum CrawlDispatchError {
     Url(UrlBlocked),
     Egress(EgressDenied),
     Signature(SignatureError),
+    IdentityDowngrade { identity_mode: IdentityMode },
 }
 
 impl fmt::Display for CrawlDispatchError {
@@ -2513,6 +3036,10 @@ impl fmt::Display for CrawlDispatchError {
                 error.domain, error.port, error.reason
             ),
             Self::Signature(error) => write!(f, "{error}"),
+            Self::IdentityDowngrade { identity_mode } => write!(
+                f,
+                "refusing to attach Web Bot Auth signer to {identity_mode:?} dispatch"
+            ),
         }
     }
 }
@@ -3072,7 +3599,11 @@ fn checked_crawl_dispatch_from_records(
         dispatch.request.body_size(),
         0,
     );
-    let signer = signer.filter(|_| dispatch.request.identity_mode == IdentityMode::AgentDeclared);
+    if signer.is_some() && dispatch.request.identity_mode != IdentityMode::AgentDeclared {
+        return Err(CrawlDispatchError::IdentityDowngrade {
+            identity_mode: dispatch.request.identity_mode,
+        });
+    }
     let web_bot_auth_headers = signer
         .map(|(key, created)| dispatch.request.sign_web_bot_auth(key, created))
         .transpose()?;
@@ -3524,6 +4055,24 @@ fn unix_timestamp(time: SystemTime) -> Result<u64, SignatureError> {
 
 fn escape_sf_string(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn escape_json_string(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            ch if ch.is_control() => {
+                let _ = write!(escaped, "\\u{:04x}", ch as u32);
+            }
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
 }
 
 fn unquote_sf_string(value: &str) -> Result<String, SignatureError> {
@@ -4485,6 +5034,259 @@ mod tests {
     }
 
     #[test]
+    fn browser_hardening_standard_blocks_private_network_targets() {
+        let policy = BrowserHardeningPolicy::standard();
+        let blocked = policy.check_url("http://169.254.169.254/latest/meta-data");
+
+        assert!(matches!(
+            blocked,
+            Err(BrowserHardeningBlocked {
+                code: BrowserHardeningBlockCode::UrlPolicy(BlockCode::BlockedIp),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn browser_hardening_blocks_private_resolved_sockets() {
+        let policy = BrowserHardeningPolicy::standard();
+        let request = NetworkRequest::new(
+            "r1",
+            "GET",
+            "https://public.example/page",
+            "profile-a",
+            IdentityMode::AgentDeclared,
+        );
+
+        let blocked = policy
+            .check_request_with_resolved_socket(&request, SocketAddr::from(([10, 0, 0, 7], 443)));
+
+        assert!(matches!(
+            blocked,
+            Err(BrowserHardeningBlocked {
+                code: BrowserHardeningBlockCode::UrlPolicy(BlockCode::BlockedIp),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn browser_hardening_strict_requires_https_navigation() {
+        let policy = BrowserHardeningPolicy::strict().with_url_policy(UrlPolicy::allow_all());
+        let blocked = policy.check_url("http://example.com/path");
+
+        assert!(matches!(
+            blocked,
+            Err(BrowserHardeningBlocked {
+                code: BrowserHardeningBlockCode::InsecureTopLevelNavigation,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn browser_hardening_blocks_threat_listed_domains() {
+        let policy =
+            BrowserHardeningPolicy::standard().with_threat_domain(DomainRule::suffix("bad.test"));
+        let blocked = policy.check_url("https://cdn.bad.test/script.js");
+
+        assert!(matches!(
+            blocked,
+            Err(BrowserHardeningBlocked {
+                code: BrowserHardeningBlockCode::ThreatListedDomain,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn browser_hardening_loads_threat_domains_from_provider() {
+        let provider = StaticThreatDomainProvider::new("fixture-feed")
+            .with_rule(DomainRule::exact("malware.test"))
+            .with_rule(DomainRule::suffix("phishing.test"));
+        let policy = BrowserHardeningPolicy::standard().with_threat_domain_provider(&provider);
+
+        assert_eq!(provider.rule_count(), 2);
+        assert_eq!(policy.threat_domain_count(), 2);
+        assert!(matches!(
+            policy.check_url("https://malware.test/payload"),
+            Err(BrowserHardeningBlocked {
+                code: BrowserHardeningBlockCode::ThreatListedDomain,
+                ..
+            })
+        ));
+        assert!(matches!(
+            policy.check_url("https://login.phishing.test/"),
+            Err(BrowserHardeningBlocked {
+                code: BrowserHardeningBlockCode::ThreatListedDomain,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn threat_domain_provider_audit_summarizes_rule_shape_without_urls() {
+        let provider = StaticThreatDomainProvider::new("fixture-feed")
+            .with_rule(DomainRule::exact("malware.test"))
+            .with_rule(DomainRule::suffix("phishing.test"));
+        let audit = provider.audit_record();
+
+        assert_eq!(
+            audit,
+            ThreatDomainProviderAudit {
+                provider_id: "fixture-feed".into(),
+                rule_count: 2,
+                exact_rules: 1,
+                suffix_rules: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn static_threat_domain_provider_parses_line_feed() -> Result<(), ThreatDomainFeedError> {
+        let provider = StaticThreatDomainProvider::from_feed_lines(
+            "fixture-feed",
+            r#"
+                # comments and blank lines are ignored
+                malware.test
+                *.phishing.test
+                .tracker.test
+                malware.test # duplicate exact rule is deduped
+            "#,
+        )?;
+
+        assert_eq!(provider.rule_count(), 3);
+        let policy = BrowserHardeningPolicy::standard().with_threat_domain_provider(&provider);
+        assert!(matches!(
+            policy.check_url("https://malware.test/payload"),
+            Err(BrowserHardeningBlocked {
+                code: BrowserHardeningBlockCode::ThreatListedDomain,
+                ..
+            })
+        ));
+        assert!(matches!(
+            policy.check_url("https://login.phishing.test/"),
+            Err(BrowserHardeningBlocked {
+                code: BrowserHardeningBlockCode::ThreatListedDomain,
+                ..
+            })
+        ));
+        assert!(matches!(
+            policy.check_url("https://cdn.tracker.test/pixel"),
+            Err(BrowserHardeningBlocked {
+                code: BrowserHardeningBlockCode::ThreatListedDomain,
+                ..
+            })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn static_threat_domain_provider_rejects_malformed_entries() {
+        let error = StaticThreatDomainProvider::from_feed_lines(
+            "fixture-feed",
+            "good.test\nhttps://bad.test/path\n",
+        )
+        .expect_err("URL-shaped entries must be rejected");
+
+        assert_eq!(error.line, 2);
+        assert_eq!(error.entry, "https://bad.test/path");
+    }
+
+    #[test]
+    fn browser_hardening_blocks_executable_like_downloads() {
+        let policy = BrowserHardeningPolicy::standard();
+        let blocked = policy.check_url("https://example.com/downloads/installer.dmg");
+
+        assert!(matches!(
+            blocked,
+            Err(BrowserHardeningBlocked {
+                code: BrowserHardeningBlockCode::RiskyDownload,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn browser_hardening_conformance_matrix_covers_core_security_controls() {
+        let policy = BrowserHardeningPolicy::standard()
+            .with_url_policy(UrlPolicy::block_private())
+            .with_threat_domain(DomainRule::exact("malware.test"))
+            .with_threat_domain(DomainRule::suffix("phishing.test"));
+
+        assert!(matches!(
+            policy.check_url("http://127.0.0.1/admin"),
+            Err(BrowserHardeningBlocked {
+                code: BrowserHardeningBlockCode::UrlPolicy(BlockCode::BlockedIp),
+                ..
+            })
+        ));
+        assert!(matches!(
+            policy.check_url("https://malware.test/payload"),
+            Err(BrowserHardeningBlocked {
+                code: BrowserHardeningBlockCode::ThreatListedDomain,
+                ..
+            })
+        ));
+        assert!(matches!(
+            policy.check_url("https://login.phishing.test/"),
+            Err(BrowserHardeningBlocked {
+                code: BrowserHardeningBlockCode::ThreatListedDomain,
+                ..
+            })
+        ));
+        assert!(matches!(
+            policy.check_url("https://example.com/downloads/setup.exe"),
+            Err(BrowserHardeningBlocked {
+                code: BrowserHardeningBlockCode::RiskyDownload,
+                ..
+            })
+        ));
+
+        let request = NetworkRequest::new(
+            "conformance-r1",
+            "GET",
+            "https://public.example/page",
+            "profile-a",
+            IdentityMode::AgentDeclared,
+        );
+        assert!(matches!(
+            policy.check_request_with_resolved_socket(
+                &request,
+                SocketAddr::from(([169, 254, 169, 254], 443)),
+            ),
+            Err(BrowserHardeningBlocked {
+                code: BrowserHardeningBlockCode::UrlPolicy(BlockCode::BlockedIp),
+                ..
+            })
+        ));
+
+        assert!(policy.check_url("https://example.com/page").is_ok());
+    }
+
+    #[test]
+    fn browser_hardening_keeps_transparent_identity_and_human_takeover() -> Result<(), String> {
+        let request = NetworkRequest::new(
+            "r1",
+            "GET",
+            "https://example.com/page",
+            "profile-a",
+            IdentityMode::AgentDeclared,
+        );
+        let decision = BrowserHardeningPolicy::standard()
+            .check_request(&request)
+            .map_err(|error| error.to_string())?;
+
+        assert_eq!(decision.identity_mode, IdentityMode::AgentDeclared);
+        assert_eq!(
+            decision.challenge_handling,
+            ChallengeHandling::RequireHumanTakeover
+        );
+        assert!(decision.transparent_identity_required);
+        Ok(())
+    }
+
+    #[test]
     fn profiles_isolate_cookie_jars_per_session() {
         let mut store = ProfileStore::new();
         let first = store.create_ephemeral("session-a");
@@ -4654,6 +5456,70 @@ mod tests {
 
         assert_close_f32(stats.challenge_rate, 0.5)?;
         assert_eq!(stats.selected_mode, IdentityMode::AgentDeclared);
+        Ok(())
+    }
+
+    #[test]
+    fn identity_strategy_latches_user_driven_after_challenge_threshold() -> Result<(), String> {
+        let mut table = IdentityStrategyTable::new(IdentityStrategyConfig {
+            max_agent_challenge_rate: 0.25,
+        });
+
+        let challenged = table
+            .record_request("https://shop.example/checkout", true)
+            .map_err(|error| error.to_string())?;
+        assert_eq!(challenged.selected_mode, IdentityMode::UserDriven);
+
+        for index in 0..16 {
+            table
+                .record_request(&format!("https://shop.example/clean-{index}"), false)
+                .map_err(|error| error.to_string())?;
+        }
+
+        let stats = table
+            .stats_for_url("https://shop.example/account")
+            .map_err(|error| error.to_string())?
+            .ok_or("expected stats for shop.example")?;
+        assert!(stats.challenge_rate < 0.25);
+        assert_eq!(stats.selected_mode, IdentityMode::UserDriven);
+        assert!(table.has_latched_user_driven_origin("https://shop.example"));
+        Ok(())
+    }
+
+    #[test]
+    fn identity_strategy_lru_prefers_evicting_unchallenged_origins() -> Result<(), String> {
+        let mut table = IdentityStrategyTable::with_capacity(
+            IdentityStrategyConfig {
+                max_agent_challenge_rate: 0.25,
+            },
+            2,
+        );
+
+        table
+            .record_request("https://blocked.example/path", true)
+            .map_err(|error| error.to_string())?;
+        table
+            .record_request("https://clean.example/path", false)
+            .map_err(|error| error.to_string())?;
+        table
+            .record_request("https://new.example/path", false)
+            .map_err(|error| error.to_string())?;
+
+        assert!(table.has_latched_user_driven_origin("https://blocked.example"));
+        assert_eq!(
+            table
+                .mode_for_url("https://blocked.example/again")
+                .map_err(|error| error.to_string())?,
+            IdentityMode::UserDriven
+        );
+        assert!(table
+            .stats_for_url("https://clean.example/path")
+            .map_err(|error| error.to_string())?
+            .is_none());
+        assert!(table
+            .stats_for_url("https://new.example/path")
+            .map_err(|error| error.to_string())?
+            .is_some());
         Ok(())
     }
 
@@ -5190,6 +6056,48 @@ mod tests {
 
         assert!(matches!(result, Err(SignatureError::VerificationFailed)));
         Ok(())
+    }
+
+    #[test]
+    fn web_bot_auth_key_directory_serves_ed25519_jwks() -> Result<(), SignatureError> {
+        let key = WebBotAuthSigningKey::from_seed("tempo-agent", &[7u8; 32])?;
+        let verifier = key.verifier();
+        let directory = web_bot_auth_key_directory_json(std::slice::from_ref(&verifier));
+
+        assert!(directory.starts_with("{\"keys\":["));
+        assert!(directory.contains("\"kty\":\"OKP\""));
+        assert!(directory.contains("\"crv\":\"Ed25519\""));
+        assert!(directory.contains("\"kid\":\"tempo-agent\""));
+        assert!(directory.contains("\"alg\":\"EdDSA\""));
+        assert!(directory.contains(&format!(
+            "\"x\":\"{}\"",
+            URL_SAFE_NO_PAD.encode(verifier.public_key_bytes())
+        )));
+        assert!(!directory.contains('+'));
+        assert!(!directory.contains('/'));
+        assert!(!directory.contains('='));
+        Ok(())
+    }
+
+    #[test]
+    fn tempo_user_agents_are_honest_and_mode_specific() {
+        for user_agent in [
+            agent_declared_user_agent(),
+            user_driven_user_agent(),
+            user_agent_for_identity_mode(IdentityMode::AgentDeclared),
+            user_agent_for_identity_mode(IdentityMode::UserDriven),
+        ] {
+            assert!(user_agent.contains("Tempo/"));
+            assert!(user_agent.contains(TEMPO_BOT_DOCS_URL));
+            for browser_token in ["Chrome/", "Safari/", "Firefox/", "Edg/"] {
+                assert!(
+                    !user_agent.contains(browser_token),
+                    "UA must not mimic browser token {browser_token}: {user_agent}"
+                );
+            }
+        }
+        assert!(agent_declared_user_agent().contains("AgentDeclared"));
+        assert!(user_driven_user_agent().contains("UserDriven"));
     }
 
     #[test]
@@ -6566,7 +7474,7 @@ Disallow: /private
     }
 
     #[test]
-    fn checked_crawl_dispatch_does_not_sign_user_driven_requests() -> Result<(), Box<dyn Error>> {
+    fn checked_crawl_dispatch_rejects_signed_user_driven_requests() -> Result<(), Box<dyn Error>> {
         let key = WebBotAuthSigningKey::from_seed("tempo-agent", &[7u8; 32])?;
         let dispatch = CrawlDispatch {
             request: NetworkRequest::new(
@@ -6579,16 +7487,20 @@ Disallow: /private
             origin: "https://example.com".into(),
         };
 
-        let checked = dispatch.check_signed(
+        let result = dispatch.check_signed(
             &UrlPolicy::block_private(),
             &EgressPolicy::block_by_default().allow_domain(DomainRule::exact("example.com")),
             SocketAddr::from(([93, 184, 216, 34], 443)),
             &key,
             1_800_000_000,
-        )?;
+        );
 
-        assert_eq!(checked.audit.identity_mode, IdentityMode::UserDriven);
-        assert_eq!(checked.web_bot_auth_headers, None);
+        assert!(matches!(
+            result,
+            Err(CrawlDispatchError::IdentityDowngrade {
+                identity_mode: IdentityMode::UserDriven
+            })
+        ));
         Ok(())
     }
 

@@ -18,18 +18,21 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Extension, Router};
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::service::TowerToHyperService;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as JsonValue};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::TrySendError;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread;
@@ -37,6 +40,7 @@ use std::time::{Duration, Instant};
 use tempo_agent::{StepTriple, StepTripleOutcome};
 // Re-exported so consumers of `TempodSessionEventKind::StepTriple` (e.g. the
 // shell agent panel) can name the event payload without a direct tempo-agent dep.
+use tempo_act::detect_human_takeover;
 pub use tempo_agent::{
     IdempotencyKey as SessionStepKey, StepTriple as SessionStepTriple,
     StepTripleOutcome as SessionStepOutcome,
@@ -56,7 +60,11 @@ use tempo_engine_host::{
     DriverCommand as HostDriverCommand, DriverResponse, DriverWireError, EngineHost,
     EngineHostConfig, EngineHostError, EngineIpcClient, SharedEngineIpcClient,
 };
-use tempo_net::UrlPolicy;
+use tempo_net::{
+    web_bot_auth_key_directory_json, BlockCode, BrowserHardeningBlockCode, BrowserHardeningBlocked,
+    BrowserHardeningPolicy, IdentityStrategyTable, StaticThreatDomainProvider,
+    ThreatDomainProviderAudit, UrlPolicy, WebBotAuthVerifier, WEB_BOT_AUTH_KEY_DIRECTORY_PATH,
+};
 use tempo_policy::trust::{
     action_caller_texts, gate_boundary_action, gate_boundary_effect, requires_observation_evidence,
     CallerPolicyClaims,
@@ -83,6 +91,8 @@ const MAX_HTTP_CONNECTIONS: usize = 128;
 const MAX_TEMPOD_SESSIONS: usize = 1024;
 /// Maximum upgraded BiDi WebSocket sessions held concurrently.
 const MAX_WEBSOCKET_CONNECTIONS: usize = 32;
+/// Best-effort post-action observations must not create unbounded OS threads.
+const MAX_POST_ACTION_IDENTITY_OBSERVERS: usize = 32;
 /// Maximum number of live BiDi browsing contexts (forked drivers) held at once.
 const MAX_BIDI_CONTEXTS: usize = 64;
 /// Bound on how long a client may take to send its request head, so a
@@ -133,15 +143,33 @@ pub const TEMPO_OTLP_JSONL_ENV: &str = "TEMPO_OTLP_JSONL";
 pub const TEMPO_OTLP_ENDPOINT_ENV: &str = "TEMPO_OTLP_ENDPOINT";
 pub const TEMPO_TEMPOD_AUTH_TOKEN_ENV: &str = "TEMPO_TEMPOD_AUTH_TOKEN";
 pub const TEMPO_TEMPOD_AUTH_TOKEN_FILE_ENV: &str = "TEMPO_TEMPOD_AUTH_TOKEN_FILE";
+pub const TEMPO_THREAT_DOMAIN_FILE_ENV: &str = "TEMPO_THREAT_DOMAIN_FILE";
+pub const TEMPO_THREAT_DOMAIN_URL_ENV: &str = "TEMPO_THREAT_DOMAIN_URL";
+pub const TEMPO_THREAT_DOMAIN_METADATA_URL_ENV: &str = "TEMPO_THREAT_DOMAIN_METADATA_URL";
+pub const TEMPO_THREAT_DOMAIN_CACHE_FILE_ENV: &str = "TEMPO_THREAT_DOMAIN_CACHE_FILE";
+pub const TEMPO_THREAT_DOMAIN_METADATA_CACHE_FILE_ENV: &str =
+    "TEMPO_THREAT_DOMAIN_METADATA_CACHE_FILE";
+pub const TEMPO_THREAT_DOMAIN_PUBLIC_KEYS_ENV: &str = "TEMPO_THREAT_DOMAIN_PUBLIC_KEYS";
+pub const TEMPO_THREAT_DOMAIN_REFRESH_INTERVAL_SECONDS_ENV: &str =
+    "TEMPO_THREAT_DOMAIN_REFRESH_INTERVAL_SECONDS";
+pub const TEMPO_THREAT_DOMAIN_SHA256_ENV: &str = "TEMPO_THREAT_DOMAIN_SHA256";
+pub const TEMPO_THREAT_DOMAIN_MAX_STALE_SECONDS_ENV: &str = "TEMPO_THREAT_DOMAIN_MAX_STALE_SECONDS";
+pub const TEMPO_THREAT_DOMAIN_FAILURE_MODE_ENV: &str = "TEMPO_THREAT_DOMAIN_FAILURE_MODE";
+pub const TEMPO_THREAT_DOMAIN_AUDIT_JSONL_ENV: &str = "TEMPO_THREAT_DOMAIN_AUDIT_JSONL";
 /// Prometheus text exposition endpoint (`GET /metrics`).
 pub const TEMPOD_METRICS_PATH: &str = "/metrics";
 pub const TEMPO_STEALTH_MODE_ENV: &str = "TEMPO_STEALTH_MODE";
 /// Machine-readable REST contract used as the source of truth for generated SDKs.
 pub const TEMPOD_OPENAPI_PATH: &str = "/openapi.json";
 const TEMPOD_OPENAPI_CONTENT_TYPE: &str = "application/vnd.oai.openapi+json;version=3.1";
+const WEB_BOT_AUTH_KEY_DIRECTORY_CONTENT_TYPE: &str = "application/jwk-set+json";
 const TEMPOD_AUTH_TOKEN_BYTES: usize = 32;
 const TEMPOD_RUNTIME_DIR_NAME: &str = "tempo";
 const TEMPOD_AUTH_TOKEN_FILE_NAME: &str = "tempod.token";
+const TEMPO_THREAT_DOMAIN_REMOTE_TIMEOUT: Duration = Duration::from_secs(10);
+const TEMPO_THREAT_DOMAIN_REMOTE_MAX_BYTES: u64 = 2 * 1024 * 1024;
+const TEMPO_THREAT_DOMAIN_DEFAULT_MAX_STALE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+const TEMPO_THREAT_DOMAIN_DEFAULT_REFRESH_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 /// Constant marker written in place of any secret-bearing field in OTLP
 /// telemetry (issue #214 review). A constant — never a hash, length, or prefix
 /// of the secret — so low-entropy secrets (PINs, OTPs, common passwords/tokens)
@@ -267,6 +295,11 @@ pub fn load_or_create_tempod_runtime_auth_token_at(
     }
 }
 
+fn runtime_auth_server_config() -> Result<TempodServerConfig, TempodError> {
+    let token = load_or_create_tempod_runtime_auth_token()?;
+    Ok(TempodServerConfig::new().with_auth(TempodAuth::bearer(token.token)?))
+}
+
 fn tempod_runtime_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR").filter(|path| !path.is_empty()) {
         return PathBuf::from(dir).join(TEMPOD_RUNTIME_DIR_NAME);
@@ -345,11 +378,12 @@ fn generate_runtime_auth_token() -> Result<String, TempodError> {
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default)]
 pub struct TempodServerConfig {
     allow_remote_binds: bool,
     auth: TempodAuth,
     allowed_hosts: BTreeSet<String>,
+    web_bot_auth_verifiers: Vec<WebBotAuthVerifier>,
 }
 
 impl TempodServerConfig {
@@ -367,8 +401,17 @@ impl TempodServerConfig {
         self
     }
 
+    pub fn with_web_bot_auth_verifiers(mut self, verifiers: Vec<WebBotAuthVerifier>) -> Self {
+        self.web_bot_auth_verifiers = verifiers;
+        self
+    }
+
     pub fn auth_is_required(&self) -> bool {
         self.auth.is_required()
+    }
+
+    pub fn web_bot_auth_verifier_count(&self) -> usize {
+        self.web_bot_auth_verifiers.len()
     }
 
     fn with_bind_addr_host(mut self, addr: &str) -> Self {
@@ -435,6 +478,24 @@ pub struct TempodSessionEvent {
     pub event: TempodSessionEventKind,
 }
 
+/// Sanitized browser-hardening block record for API errors and session events.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TempodBrowserHardeningBlock {
+    pub url: String,
+    pub code: String,
+    pub url_policy_code: Option<String>,
+    pub origin: Option<String>,
+    pub reason: String,
+    pub action: Option<String>,
+    pub action_index: Option<usize>,
+}
+
+impl fmt::Display for TempodBrowserHardeningBlock {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}", self.reason)
+    }
+}
+
 /// Typed events clients can attach to for session logs and StepTriple telemetry.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -456,6 +517,12 @@ pub enum TempodSessionEventKind {
     /// observation and never auto-solves the challenge.
     HumanTakeoverRequired {
         takeover: HumanTakeover,
+    },
+    /// A navigation or action was blocked before dispatch by Tempo's browser
+    /// hardening policy: SSRF/private-network, strict HTTPS, threat-domain, or
+    /// risky download protection. This is reporting, not bypass.
+    BrowserHardeningBlocked {
+        block: TempodBrowserHardeningBlock,
     },
 }
 
@@ -592,6 +659,7 @@ pub struct AttachedEngineDriver {
     client: SharedEngineIpcClient,
     driver_id: Option<String>,
     url_policy: UrlPolicy,
+    browser_hardening_policy: BrowserHardeningPolicy,
     gate: Arc<OpGate>,
 }
 
@@ -607,12 +675,30 @@ impl AttachedEngineDriver {
             url_policy: UrlPolicy::block_private(),
             #[cfg(test)]
             url_policy: UrlPolicy::allow_all(),
+            #[cfg(not(test))]
+            browser_hardening_policy: BrowserHardeningPolicy::standard(),
+            #[cfg(test)]
+            browser_hardening_policy: BrowserHardeningPolicy::standard()
+                .with_url_policy(UrlPolicy::allow_all()),
             gate: Arc::new(OpGate::default()),
         })
     }
 
     pub fn with_navigation_url_policy(mut self, url_policy: UrlPolicy) -> Self {
+        self.browser_hardening_policy = self
+            .browser_hardening_policy
+            .clone()
+            .with_url_policy(url_policy.clone());
         self.url_policy = url_policy;
+        self
+    }
+
+    pub fn with_browser_hardening_policy(
+        mut self,
+        browser_hardening_policy: BrowserHardeningPolicy,
+    ) -> Self {
+        self.url_policy = browser_hardening_policy.url_policy().clone();
+        self.browser_hardening_policy = browser_hardening_policy;
         self
     }
 
@@ -759,6 +845,7 @@ impl AttachedEngineDriver {
             client: self.client.clone(),
             driver_id: Some(driver_id),
             url_policy: self.url_policy.clone(),
+            browser_hardening_policy: self.browser_hardening_policy.clone(),
             gate: Arc::new(OpGate::default()),
         }
     }
@@ -792,6 +879,7 @@ impl fmt::Debug for AttachedEngineDriver {
             .field("engine", &self.engine)
             .field("driver_id", &self.driver_id)
             .field("url_policy", &self.url_policy)
+            .field("browser_hardening_policy", &self.browser_hardening_policy)
             .finish_non_exhaustive()
     }
 }
@@ -803,7 +891,7 @@ impl DriverTrait for AttachedEngineDriver {
     }
 
     async fn goto(&mut self, url: &str) -> Result<CompiledObservation, TransportError> {
-        enforce_tempod_navigation_url_transport(&self.url_policy, url)?;
+        enforce_tempod_navigation_url_transport(&self.browser_hardening_policy, url)?;
         self.request_observation(HostDriverCommand::Goto { url: url.into() }, "goto")
     }
 
@@ -816,7 +904,7 @@ impl DriverTrait for AttachedEngineDriver {
     }
 
     async fn act(&mut self, action: &Action) -> Result<StepOutcome, TransportError> {
-        enforce_action_navigation_url_policy(&self.url_policy, action)?;
+        enforce_action_navigation_url_policy(&self.browser_hardening_policy, action)?;
         self.request_step(
             HostDriverCommand::Act {
                 action: action.clone(),
@@ -826,7 +914,7 @@ impl DriverTrait for AttachedEngineDriver {
     }
 
     async fn act_batch(&mut self, batch: &ActionBatch) -> Result<StepOutcome, TransportError> {
-        enforce_batch_navigation_url_policy_transport(&self.url_policy, batch)?;
+        enforce_batch_navigation_url_policy_transport(&self.browser_hardening_policy, batch)?;
         self.request_step(
             HostDriverCommand::ActBatch {
                 batch: batch.clone(),
@@ -892,6 +980,7 @@ pub struct SessionPool {
         BTreeMap<(TempodSessionId, String), SessionActBatchIdempotencyEntry>,
     events: BTreeMap<TempodSessionId, Vec<TempodSessionEvent>>,
     otlp_exporter: Option<OtlpJsonExporter>,
+    threat_domain_audit_exporter: Option<ThreatDomainAuditJsonExporter>,
     privacy_mode: PrivacyMode,
     otlp_http_exporter: Option<OtlpHttpExporter>,
     bidi: BidiRouter,
@@ -903,10 +992,12 @@ pub struct SessionPool {
     mcp: Option<Arc<tempo_mcp::TempoMcpServer<AttachedEngineDriver>>>,
     bidi_contexts: BTreeMap<BrowsingContextId, AttachedEngineDriver>,
     url_policy: UrlPolicy,
+    browser_hardening_policy: BrowserHardeningPolicy,
     next_bidi_context_id: u64,
     next_id: u64,
     max_sessions: usize,
     draining: bool,
+    identity_strategy_table: IdentityStrategyTable,
 }
 
 impl Default for SessionPool {
@@ -917,6 +1008,7 @@ impl Default for SessionPool {
             session_act_batch_idempotency: BTreeMap::new(),
             events: BTreeMap::new(),
             otlp_exporter: None,
+            threat_domain_audit_exporter: None,
             privacy_mode: PrivacyMode::default(),
             otlp_http_exporter: None,
             bidi: BidiRouter::default(),
@@ -927,9 +1019,15 @@ impl Default for SessionPool {
             url_policy: UrlPolicy::block_private(),
             #[cfg(test)]
             url_policy: UrlPolicy::allow_all(),
+            #[cfg(not(test))]
+            browser_hardening_policy: BrowserHardeningPolicy::standard(),
+            #[cfg(test)]
+            browser_hardening_policy: BrowserHardeningPolicy::standard()
+                .with_url_policy(UrlPolicy::allow_all()),
             next_bidi_context_id: 0,
             next_id: 0,
             max_sessions: MAX_TEMPOD_SESSIONS,
+            identity_strategy_table: IdentityStrategyTable::default(),
             draining: false,
         }
     }
@@ -948,11 +1046,24 @@ impl fmt::Debug for SessionPool {
             .field("event_sessions", &self.events.len())
             .field("otlp_exporter", &self.otlp_exporter)
             .field("privacy_mode", &self.privacy_mode)
+            .field(
+                "identity_strategy_config",
+                &self.identity_strategy_table.config(),
+            )
+            .field(
+                "identity_strategy_tracked_origins",
+                &self.identity_strategy_table.tracked_origins(),
+            )
             .field("otlp_http_exporter", &self.otlp_http_exporter)
+            .field(
+                "threat_domain_audit_exporter",
+                &self.threat_domain_audit_exporter,
+            )
             .field("bidi", &self.bidi)
             .field("driver", &self.driver)
             .field("mcp_attached", &self.mcp.is_some())
             .field("url_policy", &self.url_policy)
+            .field("browser_hardening_policy", &self.browser_hardening_policy)
             .field("next_id", &self.next_id)
             .field("max_sessions", &self.max_sessions)
             .field("draining", &self.draining)
@@ -978,6 +1089,13 @@ impl SessionPool {
             std::env::var_os(TEMPO_OTLP_JSONL_ENV),
             std::env::var_os(TEMPO_OTLP_ENDPOINT_ENV),
             std::env::var_os(TEMPO_STEALTH_MODE_ENV),
+            std::env::var_os(TEMPO_THREAT_DOMAIN_FILE_ENV),
+            std::env::var_os(TEMPO_THREAT_DOMAIN_URL_ENV),
+            std::env::var_os(TEMPO_THREAT_DOMAIN_CACHE_FILE_ENV),
+            std::env::var_os(TEMPO_THREAT_DOMAIN_SHA256_ENV),
+            std::env::var_os(TEMPO_THREAT_DOMAIN_MAX_STALE_SECONDS_ENV),
+            std::env::var_os(TEMPO_THREAT_DOMAIN_FAILURE_MODE_ENV),
+            std::env::var_os(TEMPO_THREAT_DOMAIN_AUDIT_JSONL_ENV),
         )
     }
 
@@ -986,20 +1104,50 @@ impl SessionPool {
         jsonl: Option<std::ffi::OsString>,
         endpoint: Option<std::ffi::OsString>,
     ) -> Self {
-        Self::from_env_values(jsonl, endpoint, None)
+        Self::from_env_values(
+            jsonl, endpoint, None, None, None, None, None, None, None, None,
+        )
     }
 
     /// Wire the telemetry lanes from environment values: `TEMPO_OTLP_JSONL`
     /// keeps the local JSONL fallback lane, `TEMPO_OTLP_ENDPOINT` enables real
-    /// OTLP/HTTP export to a collector (issue #249), and `TEMPO_STEALTH_MODE`
-    /// disables local history and all opt-in telemetry export.
+    /// OTLP/HTTP export to a collector (issue #249), `TEMPO_STEALTH_MODE`
+    /// disables local history and all opt-in telemetry export, and
+    /// `TEMPO_THREAT_DOMAIN_FILE` loads an offline threat-domain feed into
+    /// the browser hardening policy, `TEMPO_THREAT_DOMAIN_URL` fetches an
+    /// HTTPS-only production threat-domain snapshot with SSRF and size guards,
+    /// `TEMPO_THREAT_DOMAIN_CACHE_FILE` provides an owner-only stale-cache
+    /// fallback, `TEMPO_THREAT_DOMAIN_SHA256` pins the expected snapshot digest,
+    /// `TEMPO_THREAT_DOMAIN_MAX_STALE_SECONDS` bounds cache age, and
+    /// `TEMPO_THREAT_DOMAIN_FAILURE_MODE` selects fail-closed or fail-open
+    /// behavior when configured protection cannot load, and
+    /// `TEMPO_THREAT_DOMAIN_AUDIT_JSONL` persists count-only feed-load audit
+    /// records.
     fn from_env_values(
         jsonl: Option<std::ffi::OsString>,
         endpoint: Option<std::ffi::OsString>,
         stealth_value: Option<std::ffi::OsString>,
+        threat_domain_file: Option<std::ffi::OsString>,
+        threat_domain_url: Option<std::ffi::OsString>,
+        threat_domain_cache_file: Option<std::ffi::OsString>,
+        threat_domain_sha256: Option<std::ffi::OsString>,
+        threat_domain_max_stale_seconds: Option<std::ffi::OsString>,
+        threat_domain_failure_mode: Option<std::ffi::OsString>,
+        threat_domain_audit_jsonl: Option<std::ffi::OsString>,
     ) -> Self {
         let privacy_mode = PrivacyMode::from_env_value(stealth_value);
         let mut pool = Self::default().with_privacy_mode(privacy_mode);
+        if let Some(path) = threat_domain_audit_jsonl.filter(|path| !path.is_empty()) {
+            pool.threat_domain_audit_exporter = Some(ThreatDomainAuditJsonExporter::new(path));
+        }
+        pool.apply_threat_domain_file_env(threat_domain_file);
+        pool.apply_threat_domain_url_env(
+            threat_domain_url,
+            threat_domain_cache_file,
+            threat_domain_sha256,
+            threat_domain_max_stale_seconds,
+            threat_domain_failure_mode,
+        );
         if privacy_mode.retains_history()
             && let Some(path) = jsonl
             && !path.is_empty()
@@ -1027,6 +1175,224 @@ impl SessionPool {
         pool
     }
 
+    fn apply_threat_domain_file_env(&mut self, threat_domain_file: Option<std::ffi::OsString>) {
+        let Some(path) = threat_domain_file.filter(|path| !path.is_empty()) else {
+            return;
+        };
+        let path = PathBuf::from(path);
+        let contents = match std::fs::read_to_string(&path) {
+            Ok(contents) => contents,
+            Err(error) => {
+                log_tempod_warn("ignoring unreadable threat-domain feed")
+                    .field("env", TEMPO_THREAT_DOMAIN_FILE_ENV)
+                    .field("error", error.to_string())
+                    .emit();
+                return;
+            }
+        };
+        let provider = match StaticThreatDomainProvider::from_feed_lines(
+            "tempo-threat-domain-file",
+            &contents,
+        ) {
+            Ok(provider) => provider,
+            Err(error) => {
+                log_tempod_warn("ignoring invalid threat-domain feed")
+                    .field("env", TEMPO_THREAT_DOMAIN_FILE_ENV)
+                    .field("error", error.to_string())
+                    .emit();
+                return;
+            }
+        };
+        let mut policy = self.browser_hardening_policy.clone();
+        let audit = policy.apply_threat_domain_provider(&provider);
+        self.browser_hardening_policy = policy;
+        if let Some(exporter) = &self.threat_domain_audit_exporter
+            && let Err(error) = exporter.export_audit(&audit)
+        {
+            log_tempod_error("threat-domain audit export failed", error);
+        }
+        tempo_telemetry::logger()
+            .event(
+                tempo_telemetry::Level::Info,
+                "tempod",
+                "loaded threat-domain feed",
+            )
+            .field("provider_id", audit.provider_id.clone())
+            .field("rule_count", audit.rule_count.to_string())
+            .field("exact_rules", audit.exact_rules.to_string())
+            .field("suffix_rules", audit.suffix_rules.to_string())
+            .emit();
+    }
+
+    fn apply_threat_domain_url_env(
+        &mut self,
+        threat_domain_url: Option<std::ffi::OsString>,
+        threat_domain_cache_file: Option<std::ffi::OsString>,
+        threat_domain_sha256: Option<std::ffi::OsString>,
+        threat_domain_max_stale_seconds: Option<std::ffi::OsString>,
+        threat_domain_failure_mode: Option<std::ffi::OsString>,
+    ) {
+        let Some(url) = threat_domain_url.filter(|url| !url.is_empty()) else {
+            return;
+        };
+        let url = match url.into_string() {
+            Ok(url) => url,
+            Err(_) => {
+                log_tempod_warn("ignoring non-UTF-8 threat-domain feed URL")
+                    .field("env", TEMPO_THREAT_DOMAIN_URL_ENV)
+                    .emit();
+                return;
+            }
+        };
+        let cache_file = threat_domain_cache_file
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from);
+        let failure_mode = parse_threat_domain_failure_mode_env(threat_domain_failure_mode);
+        let expected_sha256 = match parse_optional_sha256_env(threat_domain_sha256) {
+            Ok(expected) => expected,
+            Err(error) => {
+                log_tempod_warn("ignoring invalid threat-domain feed digest pin")
+                    .field("env", TEMPO_THREAT_DOMAIN_SHA256_ENV)
+                    .field("error", error)
+                    .emit();
+                if failure_mode.fail_closed() {
+                    self.browser_hardening_policy = self
+                        .browser_hardening_policy
+                        .clone()
+                        .with_url_policy(UrlPolicy::block_all());
+                }
+                return;
+            }
+        };
+        let max_stale = parse_threat_domain_max_stale_env(threat_domain_max_stale_seconds);
+        let snapshot = match fetch_threat_domain_feed_url_or_cache(
+            &url,
+            cache_file.as_deref(),
+            expected_sha256.as_deref(),
+            max_stale,
+        ) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                log_tempod_warn("ignoring unreachable threat-domain feed URL")
+                    .field("env", TEMPO_THREAT_DOMAIN_URL_ENV)
+                    .field("error", error)
+                    .field("failure_mode", failure_mode.as_str())
+                    .emit();
+                if failure_mode.fail_closed() {
+                    self.browser_hardening_policy = self
+                        .browser_hardening_policy
+                        .clone()
+                        .with_url_policy(UrlPolicy::block_all());
+                }
+                return;
+            }
+        };
+        let provider = match StaticThreatDomainProvider::from_feed_lines(
+            "tempo-threat-domain-url",
+            &snapshot.contents,
+        ) {
+            Ok(provider) => provider,
+            Err(error) => {
+                log_tempod_warn("ignoring invalid threat-domain feed URL")
+                    .field("env", TEMPO_THREAT_DOMAIN_URL_ENV)
+                    .field("error", error.to_string())
+                    .emit();
+                return;
+            }
+        };
+        let mut policy = self.browser_hardening_policy.clone();
+        let audit = policy.apply_threat_domain_provider(&provider);
+        self.browser_hardening_policy = policy;
+        if let Some(exporter) = &self.threat_domain_audit_exporter
+            && let Err(error) = exporter.export_audit_from(
+                &audit,
+                snapshot.source,
+                snapshot.env,
+                snapshot.cache_write_failed(),
+            )
+        {
+            log_tempod_error("threat-domain audit export failed", error);
+        }
+        if let Some(error) = &snapshot.cache_write_error {
+            log_tempod_warn("threat-domain cache write failed")
+                .field("env", TEMPO_THREAT_DOMAIN_CACHE_FILE_ENV)
+                .field("error", error.as_str())
+                .emit();
+        }
+        tempo_telemetry::logger()
+            .event(
+                tempo_telemetry::Level::Info,
+                "tempod",
+                "loaded threat-domain feed URL",
+            )
+            .field("provider_id", audit.provider_id.clone())
+            .field("rule_count", audit.rule_count.to_string())
+            .field("exact_rules", audit.exact_rules.to_string())
+            .field("suffix_rules", audit.suffix_rules.to_string())
+            .emit();
+    }
+
+    fn apply_verified_signed_threat_domain_policy_snapshot(
+        &mut self,
+        trusted_public_keys: &mut BTreeMap<String, String>,
+        metadata_json: &str,
+        feed_contents: &str,
+        now_ms: u64,
+    ) -> Result<ThreatDomainProviderAudit, String> {
+        let snapshot = build_verified_signed_threat_domain_policy_snapshot(
+            &self.browser_hardening_policy,
+            trusted_public_keys,
+            metadata_json,
+            feed_contents,
+            now_ms,
+        )?;
+        self.browser_hardening_policy = snapshot.policy;
+        *trusted_public_keys = snapshot.trusted_public_keys;
+        Ok(snapshot.audit)
+    }
+
+    fn refresh_signed_threat_domain_policy_once(
+        &mut self,
+        trusted_public_keys: &mut BTreeMap<String, String>,
+        metadata_url: &str,
+        feed_url: &str,
+        metadata_cache_path: Option<&Path>,
+        feed_cache_path: Option<&Path>,
+        now_ms: u64,
+    ) -> Result<SignedThreatDomainRefreshResult, String> {
+        let metadata_json = fetch_threat_domain_feed_url(metadata_url)
+            .map_err(|error| format!("failed to fetch signed threat metadata: {error}"))?;
+        let feed_contents = fetch_threat_domain_feed_url(feed_url)
+            .map_err(|error| format!("failed to fetch signed threat feed: {error}"))?;
+        let snapshot = build_verified_signed_threat_domain_policy_snapshot(
+            &self.browser_hardening_policy,
+            trusted_public_keys,
+            &metadata_json,
+            &feed_contents,
+            now_ms,
+        )?;
+        let cache_write_error = match (metadata_cache_path, feed_cache_path) {
+            (Some(metadata_cache_path), Some(feed_cache_path)) => write_signed_threat_domain_cache(
+                metadata_cache_path,
+                feed_cache_path,
+                &metadata_json,
+                &feed_contents,
+            )
+            .err(),
+            (None, None) => None,
+            _ => Some(
+                "signed threat metadata and feed cache paths must be configured together".into(),
+            ),
+        };
+        self.browser_hardening_policy = snapshot.policy;
+        *trusted_public_keys = snapshot.trusted_public_keys;
+        Ok(SignedThreatDomainRefreshResult {
+            audit: snapshot.audit,
+            metadata: snapshot.metadata,
+            cache_write_error,
+        })
+    }
+
     pub fn with_privacy_mode(mut self, privacy_mode: PrivacyMode) -> Self {
         self.privacy_mode = privacy_mode;
         if !privacy_mode.retains_history() {
@@ -1039,8 +1405,67 @@ impl SessionPool {
     }
 
     pub fn with_navigation_url_policy(mut self, url_policy: UrlPolicy) -> Self {
+        self.browser_hardening_policy = self
+            .browser_hardening_policy
+            .clone()
+            .with_url_policy(url_policy.clone());
         self.url_policy = url_policy;
+        if let Some(driver) = self.driver.take() {
+            self.driver = Some(driver.with_navigation_url_policy(self.url_policy.clone()));
+        }
         self
+    }
+
+    pub fn with_browser_hardening_policy(
+        mut self,
+        browser_hardening_policy: BrowserHardeningPolicy,
+    ) -> Self {
+        self.url_policy = browser_hardening_policy.url_policy().clone();
+        self.browser_hardening_policy = browser_hardening_policy.clone();
+        if let Some(driver) = self.driver.take() {
+            self.driver = Some(driver.with_browser_hardening_policy(browser_hardening_policy));
+        }
+        self
+    }
+
+    pub fn with_identity_strategy_table(
+        mut self,
+        identity_strategy_table: IdentityStrategyTable,
+    ) -> Self {
+        self.identity_strategy_table = identity_strategy_table;
+        self
+    }
+
+    pub fn identity_strategy_table(&self) -> &IdentityStrategyTable {
+        &self.identity_strategy_table
+    }
+
+    fn record_identity_strategy_outcome(
+        &mut self,
+        id: &TempodSessionId,
+        observation: &CompiledObservation,
+        human_takeover: Option<HumanTakeover>,
+    ) {
+        let human_driven = human_takeover.is_some();
+        if let Some(takeover) = human_takeover {
+            if let Err(error) = self.record_human_takeover(id, takeover) {
+                log_tempod_warn("failed to record human takeover")
+                    .field("session_id", id.0.clone())
+                    .field("url", observation.url.clone())
+                    .field("error", error.to_string())
+                    .emit();
+            }
+        }
+        if let Err(error) = self
+            .identity_strategy_table
+            .record_request(&observation.url, human_driven)
+        {
+            log_tempod_warn("failed to update identity strategy")
+                .field("session_id", id.0.clone())
+                .field("url", observation.url.clone())
+                .field("error", error.to_string())
+                .emit();
+        }
     }
 
     #[cfg(test)]
@@ -1091,7 +1516,7 @@ impl SessionPool {
     pub fn create(&mut self, url: impl Into<String>) -> Result<TempodSession, TempodError> {
         self.ensure_accepting_session()?;
         let url = url.into();
-        enforce_tempod_navigation_url(&self.url_policy, &url)?;
+        enforce_tempod_navigation_url(&self.browser_hardening_policy, &url)?;
         let session_driver = self.create_session_engine_context(&url)?;
         Ok(self.finish_create(url, session_driver))
     }
@@ -1264,7 +1689,7 @@ impl SessionPool {
     ) -> Result<(), TempodError> {
         self.close_engine_resources(true);
         let driver = AttachedEngineDriver::new(engine, client)?
-            .with_navigation_url_policy(self.url_policy.clone());
+            .with_browser_hardening_policy(self.browser_hardening_policy.clone());
         self.mcp = Some(Arc::new(tempo_mcp::TempoMcpServer::new(driver.clone())));
         self.bidi_contexts.clear();
         self.next_bidi_context_id = 1;
@@ -1405,9 +1830,9 @@ impl SessionPool {
             return Ok(None);
         };
         if let Some(message) =
-            tempod_resolved_navigation_url_policy_denial(&root_driver.url_policy, url)
+            tempod_resolved_navigation_url_policy_denial(&root_driver.browser_hardening_policy, url)
         {
-            return Err(TempodError::Forbidden(message));
+            return Err(TempodError::BrowserHardeningBlocked(Box::new(message)));
         }
         match run_session_context_create(root_driver.clone(), url) {
             Some(result) => result.map(Some),
@@ -1591,6 +2016,20 @@ impl SessionPool {
         Ok(self.record_event(
             id,
             TempodSessionEventKind::HumanTakeoverRequired { takeover },
+        ))
+    }
+
+    pub fn record_browser_hardening_block(
+        &mut self,
+        id: &TempodSessionId,
+        block: TempodBrowserHardeningBlock,
+    ) -> Result<TempodSessionEvent, TempodError> {
+        if !self.sessions.contains_key(id) {
+            return Err(TempodError::SessionNotFound(id.clone()));
+        }
+        Ok(self.record_event(
+            id,
+            TempodSessionEventKind::BrowserHardeningBlocked { block },
         ))
     }
 
@@ -2098,6 +2537,849 @@ impl OtlpJsonExporter {
     }
 }
 
+struct ThreatDomainFeedSnapshot {
+    contents: String,
+    source: &'static str,
+    env: &'static str,
+    cache_write_error: Option<String>,
+}
+
+impl ThreatDomainFeedSnapshot {
+    const fn cache_write_failed(&self) -> bool {
+        self.cache_write_error.is_some()
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct ThreatDomainSignedMetadata {
+    version: String,
+    issued_at_ms: u64,
+    expires_at_ms: u64,
+    feed_sha256: String,
+    key_id: String,
+    signature: String,
+    #[serde(default)]
+    next_key_id: Option<String>,
+    #[serde(default)]
+    next_public_key: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct VerifiedThreatDomainMetadata {
+    version: String,
+    key_id: String,
+    feed_sha256: String,
+    next_key_id: Option<String>,
+    next_public_key: Option<String>,
+}
+
+fn verify_signed_threat_domain_metadata(
+    metadata_json: &str,
+    feed_contents: &str,
+    trusted_public_keys: &BTreeMap<String, String>,
+    now_ms: u64,
+) -> Result<VerifiedThreatDomainMetadata, String> {
+    let metadata: ThreatDomainSignedMetadata = serde_json::from_str(metadata_json)
+        .map_err(|error| format!("invalid threat-feed metadata JSON: {error}"))?;
+    if metadata.expires_at_ms <= now_ms {
+        return Err("threat-feed metadata is expired".into());
+    }
+    if metadata.issued_at_ms > metadata.expires_at_ms {
+        return Err("threat-feed metadata issued_at is after expires_at".into());
+    }
+    let normalized_feed_sha256 = normalize_sha256_hex(&metadata.feed_sha256)?;
+    let actual_feed_sha256 = sha256_hex(feed_contents.as_bytes());
+    if !constant_time_eq(
+        actual_feed_sha256.as_bytes(),
+        normalized_feed_sha256.as_bytes(),
+    ) {
+        return Err("threat-feed metadata digest does not match feed bytes".into());
+    }
+    let public_key = trusted_public_keys
+        .get(&metadata.key_id)
+        .ok_or_else(|| "threat-feed metadata key_id is not trusted".to_string())?;
+    let public_key_bytes = BASE64_STANDARD
+        .decode(public_key)
+        .map_err(|error| format!("invalid trusted threat-feed public key: {error}"))?;
+    let public_key_bytes: [u8; 32] = public_key_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| "trusted threat-feed public key must be 32 bytes".to_string())?;
+    let verifying_key = VerifyingKey::from_bytes(&public_key_bytes)
+        .map_err(|error| format!("invalid trusted threat-feed public key: {error}"))?;
+    let signature_bytes = BASE64_STANDARD
+        .decode(metadata.signature.as_bytes())
+        .map_err(|error| format!("invalid threat-feed metadata signature: {error}"))?;
+    let signature = Signature::from_slice(&signature_bytes)
+        .map_err(|error| format!("invalid threat-feed metadata signature: {error}"))?;
+    let payload = threat_domain_metadata_signing_payload(&metadata)?;
+    verifying_key
+        .verify(&payload, &signature)
+        .map_err(|error| format!("threat-feed metadata signature verification failed: {error}"))?;
+    if metadata.next_key_id.is_some() != metadata.next_public_key.is_some() {
+        return Err("threat-feed key rotation must include next_key_id and next_public_key".into());
+    }
+    if let Some(next_public_key) = &metadata.next_public_key {
+        let next_public_key_bytes = BASE64_STANDARD
+            .decode(next_public_key)
+            .map_err(|error| format!("invalid next threat-feed public key: {error}"))?;
+        let next_public_key_bytes: [u8; 32] = next_public_key_bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| "next threat-feed public key must be 32 bytes".to_string())?;
+        VerifyingKey::from_bytes(&next_public_key_bytes)
+            .map_err(|error| format!("invalid next threat-feed public key: {error}"))?;
+    }
+    Ok(VerifiedThreatDomainMetadata {
+        version: metadata.version,
+        key_id: metadata.key_id,
+        feed_sha256: normalized_feed_sha256,
+        next_key_id: metadata.next_key_id,
+        next_public_key: metadata.next_public_key,
+    })
+}
+
+fn threat_domain_metadata_signing_payload(
+    metadata: &ThreatDomainSignedMetadata,
+) -> Result<Vec<u8>, String> {
+    let mut payload = BTreeMap::new();
+    payload.insert("expires_at_ms", json!(metadata.expires_at_ms));
+    payload.insert(
+        "feed_sha256",
+        json!(normalize_sha256_hex(&metadata.feed_sha256)?),
+    );
+    payload.insert("issued_at_ms", json!(metadata.issued_at_ms));
+    payload.insert("key_id", json!(metadata.key_id));
+    if let Some(next_key_id) = &metadata.next_key_id {
+        payload.insert("next_key_id", json!(next_key_id));
+    }
+    if let Some(next_public_key) = &metadata.next_public_key {
+        payload.insert("next_public_key", json!(next_public_key));
+    }
+    payload.insert("version", json!(metadata.version));
+    serde_json::to_vec(&payload)
+        .map_err(|error| format!("failed to encode threat-feed metadata payload: {error}"))
+}
+
+fn write_signed_threat_domain_cache(
+    metadata_path: &Path,
+    feed_path: &Path,
+    metadata_json: &str,
+    feed_contents: &str,
+) -> Result<(), String> {
+    write_threat_domain_cache(metadata_path, metadata_json)?;
+    write_threat_domain_cache(feed_path, feed_contents)
+}
+
+fn read_signed_threat_domain_cache(
+    metadata_path: &Path,
+    feed_path: &Path,
+    trusted_public_keys: &BTreeMap<String, String>,
+    now_ms: u64,
+) -> Result<(String, VerifiedThreatDomainMetadata), String> {
+    let metadata_json = read_owner_only_text_file(metadata_path)
+        .map_err(|error| format!("failed to read signed metadata cache: {error}"))?;
+    let feed_contents = read_owner_only_text_file(feed_path)
+        .map_err(|error| format!("failed to read signed feed cache: {error}"))?;
+    let verified = verify_signed_threat_domain_metadata(
+        &metadata_json,
+        &feed_contents,
+        trusted_public_keys,
+        now_ms,
+    )?;
+    Ok((feed_contents, verified))
+}
+
+fn apply_verified_threat_domain_key_rotation(
+    trusted_public_keys: &BTreeMap<String, String>,
+    verified: &VerifiedThreatDomainMetadata,
+) -> Result<BTreeMap<String, String>, String> {
+    let mut next_trusted = trusted_public_keys.clone();
+    let (Some(next_key_id), Some(next_public_key)) =
+        (&verified.next_key_id, &verified.next_public_key)
+    else {
+        return Ok(next_trusted);
+    };
+    if next_key_id.trim().is_empty() {
+        return Err("threat-feed next key id must not be empty".into());
+    }
+    if next_trusted.contains_key(next_key_id) {
+        return Err("threat-feed next key id already exists".into());
+    }
+    let next_public_key_bytes = BASE64_STANDARD
+        .decode(next_public_key)
+        .map_err(|error| format!("invalid next threat-feed public key: {error}"))?;
+    let next_public_key_bytes: [u8; 32] = next_public_key_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| "next threat-feed public key must be 32 bytes".to_string())?;
+    VerifyingKey::from_bytes(&next_public_key_bytes)
+        .map_err(|error| format!("invalid next threat-feed public key: {error}"))?;
+    next_trusted.insert(next_key_id.clone(), next_public_key.clone());
+    Ok(next_trusted)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct VerifiedThreatDomainPolicySnapshot {
+    policy: BrowserHardeningPolicy,
+    trusted_public_keys: BTreeMap<String, String>,
+    audit: ThreatDomainProviderAudit,
+    metadata: VerifiedThreatDomainMetadata,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SignedThreatDomainRefreshResult {
+    audit: ThreatDomainProviderAudit,
+    metadata: VerifiedThreatDomainMetadata,
+    cache_write_error: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SignedThreatDomainRefreshConfig {
+    metadata_url: String,
+    feed_url: String,
+    metadata_cache_path: Option<PathBuf>,
+    feed_cache_path: Option<PathBuf>,
+    trusted_public_keys: BTreeMap<String, String>,
+    interval: Duration,
+}
+
+fn signed_threat_domain_refresh_config_from_env() -> Option<SignedThreatDomainRefreshConfig> {
+    let metadata_url = std::env::var(TEMPO_THREAT_DOMAIN_METADATA_URL_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())?;
+    let feed_url = std::env::var(TEMPO_THREAT_DOMAIN_URL_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())?;
+    let trusted_public_keys = match parse_signed_threat_domain_public_keys_env(std::env::var_os(
+        TEMPO_THREAT_DOMAIN_PUBLIC_KEYS_ENV,
+    )) {
+        Ok(keys) if !keys.is_empty() => keys,
+        Ok(_) => {
+            log_tempod_warn("signed threat-feed refresh disabled without public keys")
+                .field("env", TEMPO_THREAT_DOMAIN_PUBLIC_KEYS_ENV)
+                .emit();
+            return None;
+        }
+        Err(error) => {
+            log_tempod_warn("signed threat-feed refresh disabled by invalid public keys")
+                .field("env", TEMPO_THREAT_DOMAIN_PUBLIC_KEYS_ENV)
+                .field("error", error)
+                .emit();
+            return None;
+        }
+    };
+    let interval = parse_signed_threat_domain_refresh_interval_env(std::env::var_os(
+        TEMPO_THREAT_DOMAIN_REFRESH_INTERVAL_SECONDS_ENV,
+    ));
+    Some(SignedThreatDomainRefreshConfig {
+        metadata_url,
+        feed_url,
+        metadata_cache_path: std::env::var_os(TEMPO_THREAT_DOMAIN_METADATA_CACHE_FILE_ENV)
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from),
+        feed_cache_path: std::env::var_os(TEMPO_THREAT_DOMAIN_CACHE_FILE_ENV)
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from),
+        trusted_public_keys,
+        interval,
+    })
+}
+
+fn spawn_signed_threat_domain_refresh_supervisor_from_env(pool: Arc<Mutex<SessionPool>>) {
+    let Some(config) = signed_threat_domain_refresh_config_from_env() else {
+        return;
+    };
+    spawn_signed_threat_domain_refresh_supervisor(pool, config);
+}
+
+fn spawn_signed_threat_domain_refresh_supervisor(
+    pool: Arc<Mutex<SessionPool>>,
+    config: SignedThreatDomainRefreshConfig,
+) {
+    let _ = thread::Builder::new()
+        .name("tempod-threat-feed-refresh".into())
+        .spawn(move || signed_threat_domain_refresh_worker(pool, config))
+        .map_err(|error| {
+            log_tempod_error("signed threat-feed refresh worker failed to start", error)
+        });
+}
+
+fn signed_threat_domain_refresh_worker(
+    pool: Arc<Mutex<SessionPool>>,
+    config: SignedThreatDomainRefreshConfig,
+) {
+    let mut trusted_public_keys = config.trusted_public_keys.clone();
+    loop {
+        run_signed_threat_domain_refresh_pass(&pool, &config, &mut trusted_public_keys);
+        thread::sleep(config.interval);
+    }
+}
+
+fn run_signed_threat_domain_refresh_pass(
+    pool: &Arc<Mutex<SessionPool>>,
+    config: &SignedThreatDomainRefreshConfig,
+    trusted_public_keys: &mut BTreeMap<String, String>,
+) {
+    let metadata_json = match fetch_threat_domain_feed_url(&config.metadata_url) {
+        Ok(metadata_json) => metadata_json,
+        Err(error) => {
+            log_tempod_warn("signed threat-feed metadata refresh failed")
+                .field("env", TEMPO_THREAT_DOMAIN_METADATA_URL_ENV)
+                .field("error", error)
+                .emit();
+            return;
+        }
+    };
+    let feed_contents = match fetch_threat_domain_feed_url(&config.feed_url) {
+        Ok(feed_contents) => feed_contents,
+        Err(error) => {
+            log_tempod_warn("signed threat-feed refresh failed")
+                .field("env", TEMPO_THREAT_DOMAIN_URL_ENV)
+                .field("error", error)
+                .emit();
+            return;
+        }
+    };
+    let now_ms = current_time_ms() as u64;
+    let refresh = {
+        let mut pool = match pool.lock() {
+            Ok(pool) => pool,
+            Err(_) => {
+                log_tempod_warn("signed threat-feed refresh skipped because pool lock is poisoned")
+                    .emit();
+                return;
+            }
+        };
+        pool.apply_verified_signed_threat_domain_policy_snapshot(
+            trusted_public_keys,
+            &metadata_json,
+            &feed_contents,
+            now_ms,
+        )
+    };
+    match refresh {
+        Ok(audit) => {
+            let cache_write_error = match (
+                config.metadata_cache_path.as_deref(),
+                config.feed_cache_path.as_deref(),
+            ) {
+                (Some(metadata_cache_path), Some(feed_cache_path)) => {
+                    write_signed_threat_domain_cache(
+                        metadata_cache_path,
+                        feed_cache_path,
+                        &metadata_json,
+                        &feed_contents,
+                    )
+                    .err()
+                }
+                (None, None) => None,
+                _ => Some(
+                    "signed threat metadata and feed cache paths must be configured together"
+                        .into(),
+                ),
+            };
+            if let Some(error) = cache_write_error {
+                log_tempod_warn("signed threat-feed cache write failed")
+                    .field("error", error)
+                    .emit();
+            }
+            tempo_telemetry::logger()
+                .event(
+                    tempo_telemetry::Level::Info,
+                    "tempod",
+                    "signed threat-feed refresh applied",
+                )
+                .field("provider_id", audit.provider_id)
+                .field("rule_count", audit.rule_count.to_string())
+                .field("exact_rules", audit.exact_rules.to_string())
+                .field("suffix_rules", audit.suffix_rules.to_string())
+                .emit();
+        }
+        Err(error) => {
+            log_tempod_warn("signed threat-feed refresh verification failed")
+                .field("error", error)
+                .emit();
+        }
+    }
+}
+
+fn build_verified_signed_threat_domain_policy_snapshot(
+    current_policy: &BrowserHardeningPolicy,
+    trusted_public_keys: &BTreeMap<String, String>,
+    metadata_json: &str,
+    feed_contents: &str,
+    now_ms: u64,
+) -> Result<VerifiedThreatDomainPolicySnapshot, String> {
+    let metadata = verify_signed_threat_domain_metadata(
+        metadata_json,
+        feed_contents,
+        trusted_public_keys,
+        now_ms,
+    )?;
+    let provider = StaticThreatDomainProvider::from_feed_lines(
+        "tempo-signed-threat-domain-feed",
+        feed_contents,
+    )
+    .map_err(|error| error.to_string())?;
+    let trusted_public_keys =
+        apply_verified_threat_domain_key_rotation(trusted_public_keys, &metadata)?;
+    let mut policy = current_policy.clone();
+    let audit = policy.apply_threat_domain_provider(&provider);
+    Ok(VerifiedThreatDomainPolicySnapshot {
+        policy,
+        trusted_public_keys,
+        audit,
+        metadata,
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ThreatDomainFeedFailureMode {
+    FailClosed,
+    FailOpen,
+}
+
+impl ThreatDomainFeedFailureMode {
+    const fn fail_closed(self) -> bool {
+        matches!(self, Self::FailClosed)
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::FailClosed => "fail_closed",
+            Self::FailOpen => "fail_open",
+        }
+    }
+}
+
+fn parse_threat_domain_failure_mode_env(
+    value: Option<std::ffi::OsString>,
+) -> ThreatDomainFeedFailureMode {
+    let Some(value) = value.filter(|value| !value.is_empty()) else {
+        return ThreatDomainFeedFailureMode::FailClosed;
+    };
+    let Ok(value) = value.into_string() else {
+        log_tempod_warn("using fail-closed for non-UTF-8 threat-domain failure mode")
+            .field("env", TEMPO_THREAT_DOMAIN_FAILURE_MODE_ENV)
+            .emit();
+        return ThreatDomainFeedFailureMode::FailClosed;
+    };
+    match value.trim().to_ascii_lowercase().as_str() {
+        "fail_open" | "fail-open" | "open" => ThreatDomainFeedFailureMode::FailOpen,
+        "fail_closed" | "fail-closed" | "closed" => ThreatDomainFeedFailureMode::FailClosed,
+        other => {
+            log_tempod_warn("using fail-closed for invalid threat-domain failure mode")
+                .field("env", TEMPO_THREAT_DOMAIN_FAILURE_MODE_ENV)
+                .field("value", other)
+                .emit();
+            ThreatDomainFeedFailureMode::FailClosed
+        }
+    }
+}
+
+fn fetch_threat_domain_feed_url_or_cache(
+    url: &str,
+    cache_path: Option<&Path>,
+    expected_sha256: Option<&str>,
+    max_stale: Duration,
+) -> Result<ThreatDomainFeedSnapshot, String> {
+    match fetch_threat_domain_feed_url(url)
+        .and_then(|contents| verify_threat_domain_feed_sha256(contents, expected_sha256))
+    {
+        Ok(contents) => {
+            let cache_write_error = if let Some(cache_path) = cache_path {
+                write_threat_domain_cache(cache_path, &contents).err()
+            } else {
+                None
+            };
+            Ok(ThreatDomainFeedSnapshot {
+                contents,
+                source: "env_https_url",
+                env: TEMPO_THREAT_DOMAIN_URL_ENV,
+                cache_write_error,
+            })
+        }
+        Err(remote_error) => {
+            let Some(cache_path) = cache_path else {
+                return Err(remote_error);
+            };
+            let contents = read_threat_domain_cache(cache_path, expected_sha256, max_stale)
+                .map_err(|cache_error| {
+                    format!("{remote_error}; cache unavailable: {cache_error}")
+                })?;
+            Ok(ThreatDomainFeedSnapshot {
+                contents,
+                source: "env_cache_file",
+                env: TEMPO_THREAT_DOMAIN_CACHE_FILE_ENV,
+                cache_write_error: None,
+            })
+        }
+    }
+}
+
+fn fetch_threat_domain_feed_url(url: &str) -> Result<String, String> {
+    let parsed = Url::parse(url).map_err(|error| format!("invalid URL: {error}"))?;
+    if parsed.scheme() != "https" {
+        return Err("threat-domain feed URL must use https".into());
+    }
+    UrlPolicy::block_private()
+        .enforce(parsed.as_str())
+        .map_err(|error| error.to_string())?;
+    let client = reqwest::blocking::Client::builder()
+        .timeout(TEMPO_THREAT_DOMAIN_REMOTE_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|error| format!("failed to build HTTP client: {error}"))?;
+    let response = client
+        .get(parsed.as_str())
+        .send()
+        .map_err(|error| format!("failed to fetch threat-domain feed: {error}"))?;
+    if response.status().is_redirection() {
+        return Err("threat-domain feed redirects are not followed".into());
+    }
+    if !response.status().is_success() {
+        return Err(format!(
+            "threat-domain feed returned HTTP {}",
+            response.status()
+        ));
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > TEMPO_THREAT_DOMAIN_REMOTE_MAX_BYTES)
+    {
+        return Err(format!(
+            "threat-domain feed exceeds {} bytes",
+            TEMPO_THREAT_DOMAIN_REMOTE_MAX_BYTES
+        ));
+    }
+    let bytes = response
+        .bytes()
+        .map_err(|error| format!("failed to read threat-domain feed: {error}"))?;
+    if bytes.len() > TEMPO_THREAT_DOMAIN_REMOTE_MAX_BYTES as usize {
+        return Err(format!(
+            "threat-domain feed exceeds {} bytes",
+            TEMPO_THREAT_DOMAIN_REMOTE_MAX_BYTES
+        ));
+    }
+    String::from_utf8(bytes.to_vec())
+        .map_err(|error| format!("threat-domain feed is not UTF-8: {error}"))
+}
+
+fn verify_threat_domain_feed_sha256(
+    contents: String,
+    expected_sha256: Option<&str>,
+) -> Result<String, String> {
+    let Some(expected_sha256) = expected_sha256 else {
+        return Ok(contents);
+    };
+    let actual = sha256_hex(contents.as_bytes());
+    if constant_time_eq(actual.as_bytes(), expected_sha256.as_bytes()) {
+        Ok(contents)
+    } else {
+        Err("threat-domain feed SHA-256 digest mismatch".into())
+    }
+}
+
+fn parse_optional_sha256_env(value: Option<std::ffi::OsString>) -> Result<Option<String>, String> {
+    let Some(value) = value.filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let value = value
+        .into_string()
+        .map_err(|_| "digest pin must be UTF-8".to_string())?;
+    normalize_sha256_hex(&value).map(Some)
+}
+
+fn normalize_sha256_hex(value: &str) -> Result<String, String> {
+    let value = value
+        .trim()
+        .strip_prefix("sha256:")
+        .unwrap_or(value.trim())
+        .to_ascii_lowercase();
+    let valid = value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit());
+    if valid {
+        Ok(value)
+    } else {
+        Err("digest pin must be a 64-character hexadecimal SHA-256 value".into())
+    }
+}
+
+fn parse_threat_domain_max_stale_env(value: Option<std::ffi::OsString>) -> Duration {
+    let Some(value) = value.filter(|value| !value.is_empty()) else {
+        return TEMPO_THREAT_DOMAIN_DEFAULT_MAX_STALE;
+    };
+    let Ok(value) = value.into_string() else {
+        log_tempod_warn("ignoring non-UTF-8 threat-domain stale-cache limit")
+            .field("env", TEMPO_THREAT_DOMAIN_MAX_STALE_SECONDS_ENV)
+            .emit();
+        return TEMPO_THREAT_DOMAIN_DEFAULT_MAX_STALE;
+    };
+    match value.trim().parse::<u64>() {
+        Ok(seconds) => Duration::from_secs(seconds),
+        Err(error) => {
+            log_tempod_warn("ignoring invalid threat-domain stale-cache limit")
+                .field("env", TEMPO_THREAT_DOMAIN_MAX_STALE_SECONDS_ENV)
+                .field("error", error.to_string())
+                .emit();
+            TEMPO_THREAT_DOMAIN_DEFAULT_MAX_STALE
+        }
+    }
+}
+
+fn parse_signed_threat_domain_refresh_interval_env(value: Option<std::ffi::OsString>) -> Duration {
+    let Some(value) = value.filter(|value| !value.is_empty()) else {
+        return TEMPO_THREAT_DOMAIN_DEFAULT_REFRESH_INTERVAL;
+    };
+    let Ok(value) = value.into_string() else {
+        log_tempod_warn("using default signed threat-feed refresh interval for non-UTF-8 value")
+            .field("env", TEMPO_THREAT_DOMAIN_REFRESH_INTERVAL_SECONDS_ENV)
+            .emit();
+        return TEMPO_THREAT_DOMAIN_DEFAULT_REFRESH_INTERVAL;
+    };
+    match value.trim().parse::<u64>() {
+        Ok(seconds) if seconds >= 60 => Duration::from_secs(seconds),
+        Ok(_) => {
+            log_tempod_warn("using default signed threat-feed refresh interval below minimum")
+                .field("env", TEMPO_THREAT_DOMAIN_REFRESH_INTERVAL_SECONDS_ENV)
+                .emit();
+            TEMPO_THREAT_DOMAIN_DEFAULT_REFRESH_INTERVAL
+        }
+        Err(error) => {
+            log_tempod_warn("using default signed threat-feed refresh interval for invalid value")
+                .field("env", TEMPO_THREAT_DOMAIN_REFRESH_INTERVAL_SECONDS_ENV)
+                .field("error", error.to_string())
+                .emit();
+            TEMPO_THREAT_DOMAIN_DEFAULT_REFRESH_INTERVAL
+        }
+    }
+}
+
+fn parse_signed_threat_domain_public_keys_env(
+    value: Option<std::ffi::OsString>,
+) -> Result<BTreeMap<String, String>, String> {
+    let Some(value) = value.filter(|value| !value.is_empty()) else {
+        return Ok(BTreeMap::new());
+    };
+    let value = value
+        .into_string()
+        .map_err(|_| "signed threat-feed public keys must be UTF-8".to_string())?;
+    let mut keys = BTreeMap::new();
+    for raw_entry in value.split(',') {
+        let entry = raw_entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let (key_id, public_key) = entry
+            .split_once('=')
+            .ok_or_else(|| "public key entries must be key_id=base64".to_string())?;
+        let key_id = key_id.trim();
+        let public_key = public_key.trim();
+        if key_id.is_empty() {
+            return Err("public key id must not be empty".into());
+        }
+        if keys.contains_key(key_id) {
+            return Err("duplicate public key id".into());
+        }
+        let public_key_bytes = BASE64_STANDARD
+            .decode(public_key)
+            .map_err(|error| format!("invalid signed threat-feed public key: {error}"))?;
+        let public_key_bytes: [u8; 32] = public_key_bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| "signed threat-feed public key must be 32 bytes".to_string())?;
+        VerifyingKey::from_bytes(&public_key_bytes)
+            .map_err(|error| format!("invalid signed threat-feed public key: {error}"))?;
+        keys.insert(key_id.to_string(), public_key.to_string());
+    }
+    Ok(keys)
+}
+
+fn read_threat_domain_cache(
+    path: &Path,
+    expected_sha256: Option<&str>,
+    max_stale: Duration,
+) -> Result<String, String> {
+    let metadata = validate_owner_only_cache_file(path)?;
+    let age = metadata
+        .modified()
+        .map_err(|error| format!("failed to read cache mtime: {error}"))?
+        .elapsed()
+        .map_err(|error| format!("failed to compute cache age: {error}"))?;
+    if age > max_stale {
+        return Err("cache is older than the configured stale limit".into());
+    }
+    let contents =
+        std::fs::read_to_string(path).map_err(|error| format!("failed to read cache: {error}"))?;
+    verify_threat_domain_feed_sha256(contents, expected_sha256)
+}
+
+fn read_owner_only_text_file(path: &Path) -> Result<String, String> {
+    validate_owner_only_cache_file(path)?;
+    std::fs::read_to_string(path).map_err(|error| format!("failed to read cache: {error}"))
+}
+
+fn validate_owner_only_cache_file(path: &Path) -> Result<std::fs::Metadata, String> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("failed to stat cache: {error}"))?;
+    if metadata.file_type().is_symlink() {
+        return Err("cache path must not be a symlink".into());
+    }
+    if !metadata.file_type().is_file() {
+        return Err("cache path is not a regular file".into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err("cache file must be owner-only".into());
+        }
+    }
+    Ok(metadata)
+}
+
+fn write_threat_domain_cache(path: &Path, contents: &str) -> Result<(), String> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("failed to create cache directory: {error}"))?;
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err("cache path must not be a symlink".into());
+        }
+        Ok(metadata) if !metadata.file_type().is_file() => {
+            return Err("cache path is not a regular file".into());
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("failed to stat cache: {error}")),
+    }
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|error| format!("failed to open cache: {error}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| format!("failed to secure cache permissions: {error}"))?;
+    }
+    file.write_all(contents.as_bytes())
+        .map_err(|error| format!("failed to write cache: {error}"))?;
+    file.flush()
+        .map_err(|error| format!("failed to flush cache: {error}"))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut output = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(output, "{byte:02x}");
+    }
+    output
+}
+
+/// JSONL exporter for count-only threat-domain feed audit records.
+#[derive(Clone)]
+pub struct ThreatDomainAuditJsonExporter {
+    path: PathBuf,
+    handle: Arc<Mutex<Option<File>>>,
+}
+
+impl fmt::Debug for ThreatDomainAuditJsonExporter {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ThreatDomainAuditJsonExporter")
+            .field("path", &self.path)
+            .field(
+                "open",
+                &self.handle.lock().map(|guard| guard.is_some()).ok(),
+            )
+            .finish()
+    }
+}
+
+impl ThreatDomainAuditJsonExporter {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            handle: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn open_append_file(&self) -> Result<File, TempodError> {
+        if let Some(parent) = self
+            .path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut options = OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(&self.path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        Ok(file)
+    }
+
+    pub fn export_audit(&self, audit: &ThreatDomainProviderAudit) -> Result<(), TempodError> {
+        self.export_audit_from(audit, "env_file", TEMPO_THREAT_DOMAIN_FILE_ENV, false)
+    }
+
+    pub fn export_audit_from(
+        &self,
+        audit: &ThreatDomainProviderAudit,
+        source: &'static str,
+        env: &'static str,
+        cache_write_failed: bool,
+    ) -> Result<(), TempodError> {
+        let mut bytes = serde_json::to_vec(&json!({
+            "timestamp_ms": current_time_ms(),
+            "source": source,
+            "env": env,
+            "provider_id": audit.provider_id.as_str(),
+            "rule_count": audit.rule_count,
+            "exact_rules": audit.exact_rules,
+            "suffix_rules": audit.suffix_rules,
+            "cache_write_failed": cache_write_failed,
+        }))?;
+        bytes.push(b'\n');
+
+        let mut guard = self.handle.lock().map_err(|_| TempodError::PoolLock)?;
+        if guard.is_none() {
+            *guard = Some(self.open_append_file()?);
+        }
+        if let Some(file) = guard.as_mut() {
+            file.write_all(&bytes)?;
+            file.flush()?;
+        }
+        Ok(())
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
 /// Build the redacted OTLP record written for a step (issue #214, weakness 3).
 ///
 /// We keep telemetry-useful, non-sensitive fields (seq, action kind,
@@ -2449,6 +3731,13 @@ fn current_time_ns() -> u128 {
 
 /// Run tempod forever on an address such as `127.0.0.1:8787`.
 pub fn run_tempod(addr: &str) -> Result<(), TempodError> {
+    run_tempod_with_config(addr, runtime_auth_server_config()?)
+}
+
+/// Run a tempod daemon without authentication checks.
+///
+/// This is intentionally unsafe and for test/fixture-only use.
+pub fn run_tempod_unsafe(addr: &str) -> Result<(), TempodError> {
     run_tempod_with_config(addr, TempodServerConfig::default())
 }
 
@@ -2458,6 +3747,20 @@ pub fn run_tempod_with_config(addr: &str, config: TempodServerConfig) -> Result<
 
 /// Run tempod with an explicit navigation URL policy.
 pub fn run_tempod_with_navigation_url_policy(
+    addr: &str,
+    url_policy: UrlPolicy,
+) -> Result<(), TempodError> {
+    run_tempod_with_config_and_navigation_url_policy(
+        addr,
+        runtime_auth_server_config()?,
+        url_policy,
+    )
+}
+
+/// Run tempod on an address without authentication checks.
+///
+/// This is intentionally unsafe and for test/fixture-only use.
+pub fn run_tempod_with_navigation_url_policy_unsafe(
     addr: &str,
     url_policy: UrlPolicy,
 ) -> Result<(), TempodError> {
@@ -2473,17 +3776,45 @@ pub fn run_tempod_with_config_and_navigation_url_policy(
     config: TempodServerConfig,
     url_policy: UrlPolicy,
 ) -> Result<(), TempodError> {
+    run_tempod_with_config_and_navigation_url_policy_and_identity_strategy(
+        addr,
+        config,
+        url_policy,
+        IdentityStrategyTable::default(),
+    )
+}
+
+pub fn run_tempod_with_config_and_navigation_url_policy_and_identity_strategy(
+    addr: &str,
+    config: TempodServerConfig,
+    url_policy: UrlPolicy,
+    identity_strategy_table: IdentityStrategyTable,
+) -> Result<(), TempodError> {
     let config = config.with_bind_addr_host(addr);
     config.validate_bind_addr(addr)?;
     let listener = TcpListener::bind(addr)?;
     let pool = Arc::new(Mutex::new(
-        SessionPool::from_env().with_navigation_url_policy(url_policy),
+        SessionPool::from_env()
+            .with_navigation_url_policy(url_policy)
+            .with_identity_strategy_table(identity_strategy_table),
     ));
+    spawn_signed_threat_domain_refresh_supervisor_from_env(Arc::clone(&pool));
     serve_forever_with_config(listener, pool, config)
 }
 
 /// Run tempod with an already-running engine reachable through the UDS driver protocol.
 pub fn run_tempod_with_attached_driver(
+    addr: &str,
+    engine: Engine,
+    socket_path: impl AsRef<Path>,
+) -> Result<(), TempodError> {
+    run_tempod_with_attached_driver_config(addr, runtime_auth_server_config()?, engine, socket_path)
+}
+
+/// Run a tempod daemon with a pre-attached driver and no authentication checks.
+///
+/// This is intentionally unsafe and for test/fixture-only use.
+pub fn run_tempod_with_attached_driver_unsafe(
     addr: &str,
     engine: Engine,
     socket_path: impl AsRef<Path>,
@@ -2497,12 +3828,13 @@ pub fn run_tempod_with_attached_driver_config(
     engine: Engine,
     socket_path: impl AsRef<Path>,
 ) -> Result<(), TempodError> {
-    run_tempod_with_attached_driver_config_and_navigation_url_policy(
+    run_tempod_with_attached_driver_config_and_navigation_url_policy_and_identity_strategy(
         addr,
         config,
         engine,
         socket_path,
         UrlPolicy::block_private(),
+        IdentityStrategyTable::default(),
     )
 }
 
@@ -2513,12 +3845,33 @@ pub fn run_tempod_with_attached_driver_and_navigation_url_policy(
     socket_path: impl AsRef<Path>,
     url_policy: UrlPolicy,
 ) -> Result<(), TempodError> {
-    run_tempod_with_attached_driver_config_and_navigation_url_policy(
+    run_tempod_with_attached_driver_config_and_navigation_url_policy_and_identity_strategy(
+        addr,
+        runtime_auth_server_config()?,
+        engine,
+        socket_path,
+        url_policy,
+        IdentityStrategyTable::default(),
+    )
+}
+
+/// Run a tempod daemon with a pre-attached engine and explicit URL policy,
+/// without authentication checks.
+///
+/// This is intentionally unsafe and for test/fixture-only use.
+pub fn run_tempod_with_attached_driver_and_navigation_url_policy_unsafe(
+    addr: &str,
+    engine: Engine,
+    socket_path: impl AsRef<Path>,
+    url_policy: UrlPolicy,
+) -> Result<(), TempodError> {
+    run_tempod_with_attached_driver_config_and_navigation_url_policy_and_identity_strategy(
         addr,
         TempodServerConfig::default(),
         engine,
         socket_path,
         url_policy,
+        IdentityStrategyTable::default(),
     )
 }
 
@@ -2529,13 +3882,34 @@ pub fn run_tempod_with_attached_driver_config_and_navigation_url_policy(
     socket_path: impl AsRef<Path>,
     url_policy: UrlPolicy,
 ) -> Result<(), TempodError> {
+    run_tempod_with_attached_driver_config_and_navigation_url_policy_and_identity_strategy(
+        addr,
+        config,
+        engine,
+        socket_path,
+        url_policy,
+        IdentityStrategyTable::default(),
+    )
+}
+
+pub fn run_tempod_with_attached_driver_config_and_navigation_url_policy_and_identity_strategy(
+    addr: &str,
+    config: TempodServerConfig,
+    engine: Engine,
+    socket_path: impl AsRef<Path>,
+    url_policy: UrlPolicy,
+    identity_strategy_table: IdentityStrategyTable,
+) -> Result<(), TempodError> {
     let config = config.with_bind_addr_host(addr);
     config.validate_bind_addr(addr)?;
     let listener = TcpListener::bind(addr)?;
     let socket_path = socket_path.as_ref().to_path_buf();
-    let mut pool = SessionPool::from_env().with_navigation_url_policy(url_policy);
+    let mut pool = SessionPool::from_env()
+        .with_navigation_url_policy(url_policy)
+        .with_identity_strategy_table(identity_strategy_table);
     pool.attach_engine_driver(engine, connect_engine_ipc(&socket_path)?)?;
     let pool = Arc::new(Mutex::new(pool));
+    spawn_signed_threat_domain_refresh_supervisor_from_env(Arc::clone(&pool));
     spawn_engine_liveness_monitor(
         Arc::clone(&pool),
         engine,
@@ -2855,6 +4229,16 @@ pub fn serve_forever(
     listener: TcpListener,
     pool: Arc<Mutex<SessionPool>>,
 ) -> Result<(), TempodError> {
+    serve_forever_with_config(listener, pool, runtime_auth_server_config()?)
+}
+
+/// Serve requests without authentication checks.
+///
+/// This is intentionally unsafe and for test/fixture-only use.
+pub fn serve_forever_unsafe(
+    listener: TcpListener,
+    pool: Arc<Mutex<SessionPool>>,
+) -> Result<(), TempodError> {
     serve_forever_with_config(listener, pool, TempodServerConfig::default())
 }
 
@@ -2873,12 +4257,14 @@ pub fn serve_forever_with_config(
 ) -> Result<(), TempodError> {
     config.validate_listener(&listener)?;
     let host_guard = TempodHostGuard::from_listener(&listener, &config.allowed_hosts)?;
+    let web_bot_auth_verifiers = config.web_bot_auth_verifiers.clone();
     serve_forever_trusted(
         listener,
         pool,
         config.auth,
         host_guard,
         ConnectionLimiter::default(),
+        web_bot_auth_verifiers,
     )
 }
 
@@ -2889,7 +4275,14 @@ fn serve_forever_with_limits(
     limiter: ConnectionLimiter,
 ) -> Result<(), TempodError> {
     let host_guard = TempodHostGuard::from_listener(&listener, &BTreeSet::new())?;
-    serve_forever_trusted(listener, pool, TempodAuth::disabled(), host_guard, limiter)
+    serve_forever_trusted(
+        listener,
+        pool,
+        TempodAuth::disabled(),
+        host_guard,
+        limiter,
+        Vec::new(),
+    )
 }
 
 fn serve_forever_trusted(
@@ -2898,6 +4291,7 @@ fn serve_forever_trusted(
     auth: TempodAuth,
     host_guard: TempodHostGuard,
     limiter: ConnectionLimiter,
+    web_bot_auth_verifiers: Vec<WebBotAuthVerifier>,
 ) -> Result<(), TempodError> {
     let _ = process_start();
     let runtime = transport_runtime()?;
@@ -2908,6 +4302,7 @@ fn serve_forever_trusted(
             auth,
             host_guard,
             limiter: limiter.clone(),
+            web_bot_auth_verifiers,
         });
         loop {
             match listener.accept().await {
@@ -2933,6 +4328,16 @@ fn serve_forever_trusted(
 /// every non-upgrade response carries `connection: close`, so this serves one
 /// HTTP exchange (or one whole BiDi WebSocket session).
 pub fn serve_one(listener: TcpListener, pool: Arc<Mutex<SessionPool>>) -> Result<(), TempodError> {
+    serve_one_with_config(listener, pool, runtime_auth_server_config()?)
+}
+
+/// Serve exactly one request without authentication checks.
+///
+/// This is intentionally unsafe and for test/fixture-only use.
+pub fn serve_one_unsafe(
+    listener: TcpListener,
+    pool: Arc<Mutex<SessionPool>>,
+) -> Result<(), TempodError> {
     serve_one_with_config(listener, pool, TempodServerConfig::default())
 }
 
@@ -2951,12 +4356,14 @@ pub fn serve_one_with_config(
 ) -> Result<(), TempodError> {
     config.validate_listener(&listener)?;
     let host_guard = TempodHostGuard::from_listener(&listener, &config.allowed_hosts)?;
+    let web_bot_auth_verifiers = config.web_bot_auth_verifiers.clone();
     serve_one_trusted(
         listener,
         pool,
         config.auth,
         host_guard,
         ConnectionLimiter::default(),
+        web_bot_auth_verifiers,
     )
 }
 
@@ -2966,6 +4373,7 @@ fn serve_one_trusted(
     auth: TempodAuth,
     host_guard: TempodHostGuard,
     limiter: ConnectionLimiter,
+    web_bot_auth_verifiers: Vec<WebBotAuthVerifier>,
 ) -> Result<(), TempodError> {
     let _ = process_start();
     let runtime = transport_runtime()?;
@@ -2983,6 +4391,7 @@ fn serve_one_trusted(
             auth,
             host_guard,
             limiter: limiter.clone(),
+            web_bot_auth_verifiers,
         });
         serve_tcp_connection(stream, router, permit).await;
         // A BiDi upgrade hands the socket to a spawned WebSocket task and the
@@ -3071,12 +4480,14 @@ struct TempodAppState {
     auth: TempodAuth,
     host_guard: TempodHostGuard,
     limiter: ConnectionLimiter,
+    web_bot_auth_verifiers: Vec<WebBotAuthVerifier>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TempodHostGuard {
     allowed_hosts: BTreeSet<String>,
     allow_any_valid_host: bool,
+    is_loopback_listener: bool,
 }
 
 impl TempodHostGuard {
@@ -3087,7 +4498,8 @@ impl TempodHostGuard {
         let mut allowed_hosts = configured_hosts.clone();
         let addr = listener.local_addr()?;
         allowed_hosts.insert(canonical_ip_host(addr.ip()));
-        if addr.ip().is_loopback() {
+        let is_loopback_listener = addr.ip().is_loopback();
+        if is_loopback_listener {
             allowed_hosts.insert("localhost".to_string());
             allowed_hosts.insert("127.0.0.1".to_string());
             allowed_hosts.insert("[::1]".to_string());
@@ -3095,6 +4507,7 @@ impl TempodHostGuard {
         Ok(Self {
             allowed_hosts,
             allow_any_valid_host: addr.ip().is_unspecified(),
+            is_loopback_listener,
         })
     }
 
@@ -3107,7 +4520,12 @@ impl TempodHostGuard {
                 "[::1]".to_string(),
             ]),
             allow_any_valid_host: false,
+            is_loopback_listener: true,
         }
+    }
+
+    fn is_loopback_listener(&self) -> bool {
+        self.is_loopback_listener
     }
 
     fn allows(&self, host: Option<&str>) -> bool {
@@ -3132,6 +4550,10 @@ fn tempod_router(state: TempodAppState) -> Router {
         .route("/health", get(health))
         .route("/ready", get(ready))
         .route(TEMPOD_OPENAPI_PATH, get(openapi))
+        .route(
+            WEB_BOT_AUTH_KEY_DIRECTORY_PATH,
+            get(web_bot_auth_key_directory),
+        )
         .route(tempo_mcp::A2A_AGENT_CARD_PATH, get(agent_card))
         .route(tempo_mcp::A2A_AGENT_JSON_PATH, get(agent_card))
         .route("/mcp", get(mcp_get).post(mcp_post))
@@ -3172,7 +4594,10 @@ async fn guard_control_plane(
 ) -> Response {
     let method = request.method().as_str();
     let path = request.uri().path();
-    if route_requires_host_check(method, path)
+    let is_loopback_listener = state.host_guard.is_loopback_listener();
+    let auth_protected_metadata =
+        state.auth.is_required() && is_protected_metadata_route(method, path);
+    if (route_requires_host_check(method, path, is_loopback_listener) || auth_protected_metadata)
         && !state
             .host_guard
             .allows(header_str(request.headers(), header::HOST))
@@ -3180,7 +4605,7 @@ async fn guard_control_plane(
         return tempod_error_response(&TempodError::Forbidden("host not allowed".into()))
             .into_response();
     }
-    if route_requires_auth(method, path)
+    if route_requires_auth(method, path, is_loopback_listener)
         && let Err(err) = state
             .auth
             .authorize(header_str(request.headers(), header::AUTHORIZATION))
@@ -3464,6 +4889,14 @@ async fn agent_card(headers: HeaderMap) -> HttpResponse {
     )))
 }
 
+async fn web_bot_auth_key_directory(State(state): State<TempodAppState>) -> HttpResponse {
+    HttpResponse::new(
+        200,
+        WEB_BOT_AUTH_KEY_DIRECTORY_CONTENT_TYPE,
+        web_bot_auth_key_directory_json(&state.web_bot_auth_verifiers).into_bytes(),
+    )
+}
+
 async fn mcp_get() -> HttpResponse {
     HttpResponse::from_mcp(tempo_mcp::handle_get())
 }
@@ -3718,7 +5151,7 @@ fn create_session_shared(
     let root_driver = {
         let pool = lock_pool(pool)?;
         pool.ensure_accepting_session()?;
-        enforce_tempod_navigation_url(&pool.url_policy, &url)?;
+        enforce_tempod_navigation_url(&pool.browser_hardening_policy, &url)?;
         pool.driver.clone()
     };
 
@@ -3901,12 +5334,19 @@ fn route_session_act_batch(
 
     let (mut driver, request_fingerprint, idempotency_key, policy) = {
         let mut pool = lock_pool(pool)?;
-        let policy = enforce_session_batch_policy(
-            &pool.url_policy,
+        let policy = match enforce_session_batch_policy(
+            &pool.browser_hardening_policy,
             pool.privacy_mode,
             &body,
             observation.as_ref(),
-        )?;
+        ) {
+            Ok(policy) => policy,
+            Err(TempodError::BrowserHardeningBlocked(block)) => {
+                let _ = pool.record_browser_hardening_block(&id, (*block).clone());
+                return Err(TempodError::BrowserHardeningBlocked(block));
+            }
+            Err(error) => return Err(error),
+        };
         let request_fingerprint = session_act_batch_idempotency_fingerprint(&body);
         if let Some(key) = body.idempotency_key.as_deref()
             && let Some(response) =
@@ -3938,7 +5378,6 @@ fn route_session_act_batch(
             body: json!({ "error": error.to_string() }),
         },
     };
-
     if let Some(key) = idempotency_key {
         let mut pool = lock_pool(pool)?;
         pool.remember_session_act_batch_response(
@@ -3949,7 +5388,75 @@ fn route_session_act_batch(
             response.body.clone(),
         )?;
     }
+    spawn_post_action_identity_observation(pool.clone(), id.clone(), driver);
     Ok(HttpResponse::json(response.status, response.body))
+}
+
+fn spawn_post_action_identity_observation(
+    pool: Arc<Mutex<SessionPool>>,
+    id: TempodSessionId,
+    mut driver: AttachedEngineDriver,
+) {
+    let Some(_slot) = try_acquire_post_action_identity_slot() else {
+        log_tempod_warn("post-action identity observation skipped: worker limit reached")
+            .field("session_id", id.0)
+            .field("limit", MAX_POST_ACTION_IDENTITY_OBSERVERS)
+            .emit();
+        return;
+    };
+    thread::spawn(move || {
+        let _slot = _slot;
+        let post_action_observation = futures::executor::block_on(driver.observe())
+            .map_err(|error| {
+                log_tempod_warn(
+                    "policy taint requires post-action observation, but observe failed",
+                )
+                .field("session_id", id.0.clone())
+                .field("error", error.to_string())
+                .emit();
+            })
+            .ok();
+        if let Some(observation) = post_action_observation {
+            let takeover = detect_human_takeover(&observation);
+            match lock_pool(&pool) {
+                Ok(mut pool) => pool.record_identity_strategy_outcome(&id, &observation, takeover),
+                Err(error) => {
+                    log_tempod_warn("failed to record post-action identity strategy")
+                        .field("session_id", id.0.clone())
+                        .field("error", error.to_string())
+                        .emit();
+                }
+            }
+        }
+    });
+}
+
+struct PostActionIdentitySlot;
+
+impl Drop for PostActionIdentitySlot {
+    fn drop(&mut self) {
+        POST_ACTION_IDENTITY_OBSERVERS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+static POST_ACTION_IDENTITY_OBSERVERS: AtomicUsize = AtomicUsize::new(0);
+
+fn try_acquire_post_action_identity_slot() -> Option<PostActionIdentitySlot> {
+    let mut current = POST_ACTION_IDENTITY_OBSERVERS.load(Ordering::Relaxed);
+    loop {
+        if current >= MAX_POST_ACTION_IDENTITY_OBSERVERS {
+            return None;
+        }
+        match POST_ACTION_IDENTITY_OBSERVERS.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::Acquire,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return Some(PostActionIdentitySlot),
+            Err(observed) => current = observed,
+        }
+    }
 }
 
 fn parse_session_act_batch_request(body: &[u8]) -> Result<SessionActBatchRequest, TempodError> {
@@ -3973,7 +5480,7 @@ fn reject_explicit_null_field(value: &JsonValue, field: &'static str) -> Result<
 }
 
 fn enforce_session_batch_policy(
-    policy: &UrlPolicy,
+    policy: &BrowserHardeningPolicy,
     privacy_mode: PrivacyMode,
     body: &SessionActBatchRequest,
     observation: Option<&CompiledObservation>,
@@ -4131,36 +5638,123 @@ fn action_kind(action: &Action) -> &'static str {
     }
 }
 
-fn tempod_navigation_url_policy_denial(policy: &UrlPolicy, url: &str) -> Option<String> {
+fn tempod_navigation_url_policy_denial(
+    policy: &BrowserHardeningPolicy,
+    url: &str,
+) -> Option<TempodBrowserHardeningBlock> {
     policy
-        .enforce(url)
+        .check_url(url)
         .err()
-        .map(|error| format!("navigation URL denied by tempod URL policy: {error}"))
+        .map(|blocked| tempod_browser_hardening_block(url, blocked, None, None))
 }
 
-fn tempod_resolved_navigation_url_policy_denial(policy: &UrlPolicy, url: &str) -> Option<String> {
-    if let Some(message) = tempod_navigation_url_policy_denial(policy, url) {
-        return Some(message);
+fn tempod_resolved_navigation_url_policy_denial(
+    policy: &BrowserHardeningPolicy,
+    url: &str,
+) -> Option<TempodBrowserHardeningBlock> {
+    if let Some(block) = tempod_navigation_url_policy_denial(policy, url) {
+        return Some(block);
     }
-    if policy == &UrlPolicy::allow_all() {
+    let url_policy = policy.url_policy();
+    if url_policy == &UrlPolicy::allow_all() {
         return None;
     }
     let sockets = match resolve_navigation_url_sockets(url) {
         Ok(sockets) => sockets,
         Err(reason) => {
-            return Some(format!(
-                "navigation URL denied by tempod URL policy: {reason}"
+            return Some(tempod_url_policy_hardening_block(
+                url,
+                "url_policy_resolution_failed",
+                None,
+                reason,
+                None,
+                None,
             ));
         }
     };
     for socket in sockets {
-        if let Err(error) = policy.enforce_resolved_socket(url, socket) {
-            return Some(format!(
-                "navigation URL denied by tempod URL policy: {error}"
+        if let Err(error) = url_policy.enforce_resolved_socket(url, socket) {
+            return Some(tempod_url_policy_hardening_block(
+                url,
+                &format!(
+                    "url_policy_{}",
+                    block_code_label(error.reason.code).replace('-', "_")
+                ),
+                Some(error.reason.code),
+                error.reason.detail,
+                None,
+                None,
             ));
         }
     }
     None
+}
+
+fn tempod_browser_hardening_block(
+    url: &str,
+    blocked: BrowserHardeningBlocked,
+    action: Option<&str>,
+    action_index: Option<usize>,
+) -> TempodBrowserHardeningBlock {
+    let (code, url_policy_code) = browser_hardening_code_labels(blocked.code);
+    TempodBrowserHardeningBlock {
+        url: url.into(),
+        code,
+        url_policy_code,
+        origin: blocked.origin,
+        reason: blocked.reason,
+        action: action.map(str::to_string),
+        action_index,
+    }
+}
+
+fn tempod_url_policy_hardening_block(
+    url: &str,
+    code: &str,
+    url_policy_code: Option<BlockCode>,
+    reason: impl Into<String>,
+    action: Option<&str>,
+    action_index: Option<usize>,
+) -> TempodBrowserHardeningBlock {
+    TempodBrowserHardeningBlock {
+        url: url.into(),
+        code: code.into(),
+        url_policy_code: url_policy_code.map(block_code_label).map(str::to_string),
+        origin: None,
+        reason: reason.into(),
+        action: action.map(str::to_string),
+        action_index,
+    }
+}
+
+fn browser_hardening_code_labels(code: BrowserHardeningBlockCode) -> (String, Option<String>) {
+    match code {
+        BrowserHardeningBlockCode::UrlPolicy(block_code) => (
+            format!(
+                "url_policy_{}",
+                block_code_label(block_code).replace('-', "_")
+            ),
+            Some(block_code_label(block_code).into()),
+        ),
+        BrowserHardeningBlockCode::InsecureTopLevelNavigation => {
+            ("insecure_top_level_navigation".into(), None)
+        }
+        BrowserHardeningBlockCode::ThreatListedDomain => ("threat_listed_domain".into(), None),
+        BrowserHardeningBlockCode::RiskyDownload => ("risky_download".into(), None),
+    }
+}
+
+fn block_code_label(code: BlockCode) -> &'static str {
+    match code {
+        BlockCode::InvalidUrl => "invalid-url",
+        BlockCode::UnsupportedScheme => "unsupported-scheme",
+        BlockCode::EmptyHost => "empty-host",
+        BlockCode::MalformedIpv6 => "malformed-ipv6",
+        BlockCode::Localhost => "localhost",
+        BlockCode::BlockedIp => "blocked-ip",
+        BlockCode::PolicyDenied => "policy-denied",
+        BlockCode::CrawlLimit => "crawl-limit",
+    }
 }
 
 fn resolve_navigation_url_sockets(url: &str) -> Result<Vec<SocketAddr>, String> {
@@ -4181,31 +5775,34 @@ fn resolve_navigation_url_sockets(url: &str) -> Result<Vec<SocketAddr>, String> 
     Ok(sockets)
 }
 
-fn enforce_tempod_navigation_url(policy: &UrlPolicy, url: &str) -> Result<(), TempodError> {
-    if let Some(message) = tempod_navigation_url_policy_denial(policy, url) {
-        return Err(TempodError::Forbidden(message));
+fn enforce_tempod_navigation_url(
+    policy: &BrowserHardeningPolicy,
+    url: &str,
+) -> Result<(), TempodError> {
+    if let Some(block) = tempod_navigation_url_policy_denial(policy, url) {
+        return Err(TempodError::BrowserHardeningBlocked(Box::new(block)));
     }
     Ok(())
 }
 
 fn enforce_batch_navigation_url_policy(
-    policy: &UrlPolicy,
+    policy: &BrowserHardeningPolicy,
     batch: &ActionBatch,
 ) -> Result<(), TempodError> {
     for (index, action) in batch.actions.iter().enumerate() {
         if let Action::Goto { url } = action
-            && let Some(message) = tempod_navigation_url_policy_denial(policy, url)
+            && let Some(mut block) = tempod_navigation_url_policy_denial(policy, url)
         {
-            return Err(TempodError::Forbidden(format!(
-                "action {index} goto {message}"
-            )));
+            block.action = Some("goto".into());
+            block.action_index = Some(index);
+            return Err(TempodError::BrowserHardeningBlocked(Box::new(block)));
         }
     }
     Ok(())
 }
 
 fn enforce_tempod_navigation_url_transport(
-    policy: &UrlPolicy,
+    policy: &BrowserHardeningPolicy,
     url: &str,
 ) -> Result<(), TransportError> {
     if tempod_resolved_navigation_url_policy_denial(policy, url).is_some() {
@@ -4215,7 +5812,7 @@ fn enforce_tempod_navigation_url_transport(
 }
 
 fn enforce_action_navigation_url_policy(
-    policy: &UrlPolicy,
+    policy: &BrowserHardeningPolicy,
     action: &Action,
 ) -> Result<(), TransportError> {
     if let Action::Goto { url } = action {
@@ -4225,7 +5822,7 @@ fn enforce_action_navigation_url_policy(
 }
 
 fn enforce_batch_navigation_url_policy_transport(
-    policy: &UrlPolicy,
+    policy: &BrowserHardeningPolicy,
     batch: &ActionBatch,
 ) -> Result<(), TransportError> {
     for action in &batch.actions {
@@ -4378,6 +5975,12 @@ pub fn tempod_openapi(base_url: &str) -> JsonValue {
                     "responses": {"200": {"description": "OpenAPI 3.1 document"}}
                 }
             },
+            WEB_BOT_AUTH_KEY_DIRECTORY_PATH: {
+                "get": {
+                    "operationId": "webBotAuthKeyDirectory",
+                    "responses": {"200": {"description": "Web Bot Auth HTTP message signatures JWK directory"}}
+                }
+            },
             "/sessions": {
                 "get": {
                     "operationId": "listSessions",
@@ -4393,6 +5996,10 @@ pub fn tempod_openapi(base_url: &str) -> JsonValue {
                     },
                     "responses": {
                         "201": {"description": "Created session"},
+                        "403": {
+                            "description": "Browser hardening blocked navigation",
+                            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/BrowserHardeningError"}}}
+                        },
                         "429": {"description": "Session admission limit reached"}
                     }
                 }
@@ -4416,7 +6023,13 @@ pub fn tempod_openapi(base_url: &str) -> JsonValue {
                     },
                     "responses": {
                         "200": {"description": "Action batch outcome"},
-                        "403": {"description": "Policy denied"},
+                        "403": {
+                            "description": "Policy denied or browser hardening blocked navigation",
+                            "content": {"application/json": {"schema": {"oneOf": [
+                                {"$ref": "#/components/schemas/PolicyDeniedError"},
+                                {"$ref": "#/components/schemas/BrowserHardeningError"}
+                            ]}}}
+                        },
                         "409": {"description": "Idempotency conflict"}
                     }
                 }
@@ -4499,6 +6112,64 @@ pub fn tempod_openapi(base_url: &str) -> JsonValue {
                             "maxLength": MAX_IDEMPOTENCY_KEY_BYTES
                         }
                     }
+                },
+                "PolicyDeniedError": {
+                    "type": "object",
+                    "additionalProperties": true,
+                    "required": ["error"],
+                    "properties": {
+                        "error": {"type": "string"}
+                    }
+                },
+                "BrowserHardeningError": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["error", "browser_hardening"],
+                    "properties": {
+                        "error": {"type": "string"},
+                        "browser_hardening": {"$ref": "#/components/schemas/TempodBrowserHardeningBlock"}
+                    }
+                },
+                "TempodBrowserHardeningBlock": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["url", "code", "origin", "reason", "action", "action_index"],
+                    "properties": {
+                        "url": {"type": "string", "format": "uri"},
+                        "code": {
+                            "type": "string",
+                            "enum": [
+                                "url_policy_invalid_url",
+                                "url_policy_unsupported_scheme",
+                                "url_policy_empty_host",
+                                "url_policy_malformed_ipv6",
+                                "url_policy_localhost",
+                                "url_policy_blocked_ip",
+                                "url_policy_crawl_limit",
+                                "url_policy_resolution_failed",
+                                "insecure_top_level_navigation",
+                                "threat_listed_domain",
+                                "risky_download"
+                            ]
+                        },
+                        "url_policy_code": {
+                            "type": ["string", "null"],
+                            "enum": [
+                                "invalid-url",
+                                "unsupported-scheme",
+                                "empty-host",
+                                "malformed-ipv6",
+                                "localhost",
+                                "blocked-ip",
+                                "crawl-limit",
+                                null
+                            ]
+                        },
+                        "origin": {"type": ["string", "null"]},
+                        "reason": {"type": "string"},
+                        "action": {"type": ["string", "null"]},
+                        "action_index": {"type": ["integer", "null"], "minimum": 0}
+                    }
                 }
             }
         }
@@ -4537,6 +6208,7 @@ fn control_route_requires_origin_check(method: &str, path: &str) -> bool {
         ("GET", "/health")
             | ("GET", tempo_mcp::A2A_AGENT_CARD_PATH)
             | ("GET", tempo_mcp::A2A_AGENT_JSON_PATH)
+            | ("GET", WEB_BOT_AUTH_KEY_DIRECTORY_PATH)
             | ("GET", TEMPOD_OPENAPI_PATH)
             | ("GET", "/mcp")
             | ("POST", "/mcp")
@@ -4545,15 +6217,44 @@ fn control_route_requires_origin_check(method: &str, path: &str) -> bool {
     )
 }
 
-fn route_requires_auth(method: &str, path: &str) -> bool {
+fn is_metadata_route(method: &str, path: &str) -> bool {
+    matches!(
+        (method, path),
+        ("GET", "/health")
+            | ("GET", tempo_mcp::A2A_AGENT_CARD_PATH)
+            | ("GET", tempo_mcp::A2A_AGENT_JSON_PATH)
+            | ("GET", WEB_BOT_AUTH_KEY_DIRECTORY_PATH)
+            | ("GET", TEMPOD_OPENAPI_PATH)
+    )
+}
+
+fn is_protected_metadata_route(method: &str, path: &str) -> bool {
+    matches!(
+        (method, path),
+        ("GET", tempo_mcp::A2A_AGENT_CARD_PATH)
+            | ("GET", tempo_mcp::A2A_AGENT_JSON_PATH)
+            | ("GET", TEMPOD_OPENAPI_PATH)
+    )
+}
+
+fn is_public_key_directory_route(method: &str, path: &str) -> bool {
+    matches!((method, path), ("GET", WEB_BOT_AUTH_KEY_DIRECTORY_PATH))
+}
+
+fn route_requires_auth(method: &str, path: &str, is_loopback_listener: bool) -> bool {
     matches!(
         (method, path),
         ("GET", "/mcp") | ("POST", "/mcp") | ("GET", "/bidi") | ("POST", "/bidi")
     ) || control_route_requires_origin_check(method, path)
+        || is_protected_metadata_route(method, path)
+        || (!is_loopback_listener
+            && is_metadata_route(method, path)
+            && !is_public_key_directory_route(method, path))
 }
 
-fn route_requires_host_check(method: &str, path: &str) -> bool {
-    route_requires_auth(method, path)
+fn route_requires_host_check(method: &str, path: &str, is_loopback_listener: bool) -> bool {
+    route_requires_auth(method, path, is_loopback_listener)
+        && !(is_loopback_listener && is_protected_metadata_route(method, path))
 }
 
 fn bind_addr_is_loopback(addr: &str) -> Result<bool, TempodError> {
@@ -5055,6 +6756,7 @@ fn network_navigation_events(
     url: &str,
 ) -> Vec<BidiMessage> {
     let request_id = format!("tempo-request-{id}");
+    let identity_mode = network_navigation_identity_mode(pool, url);
     let mut events = Vec::new();
     if pool
         .bidi
@@ -5065,7 +6767,7 @@ fn network_navigation_events(
             "GET",
             url,
             format!("tempo-bidi-profile-{}", context.0),
-            tempo_net::IdentityMode::AgentDeclared,
+            identity_mode,
         );
         if let Ok(event) =
             network_before_request_sent(BidiNetworkRequest::from_tempo_request(&request))
@@ -5087,6 +6789,12 @@ fn network_navigation_events(
         }
     }
     events
+}
+
+fn network_navigation_identity_mode(pool: &SessionPool, url: &str) -> tempo_net::IdentityMode {
+    pool.identity_strategy_table()
+        .mode_for_url(url)
+        .unwrap_or(tempo_net::IdentityMode::AgentDeclared)
 }
 
 #[derive(Debug, Clone)]
@@ -5360,6 +7068,8 @@ pub enum TempodError {
     Conflict(String),
     #[error("forbidden: {0}")]
     Forbidden(String),
+    #[error("browser hardening blocked navigation: {0}")]
+    BrowserHardeningBlocked(Box<TempodBrowserHardeningBlock>),
     #[error("{0}")]
     PolicyDenied(Box<PolicyDeniedError>),
     #[error("connection limit reached: {0}")]
@@ -5389,6 +7099,7 @@ impl TempodError {
             Self::Unauthorized(_) => 401,
             Self::Conflict(_) => 409,
             Self::Forbidden(_) => 403,
+            Self::BrowserHardeningBlocked(_) => 403,
             Self::PolicyDenied(_) => 403,
             Self::SessionLimit { .. } => 429,
             Self::SessionNotFound(_) | Self::EngineNotFound(_) => 404,
@@ -5399,6 +7110,10 @@ impl TempodError {
 
     fn body(&self) -> JsonValue {
         match self {
+            Self::BrowserHardeningBlocked(block) => json!({
+                "error": self.to_string(),
+                "browser_hardening": block,
+            }),
             Self::PolicyDenied(error) => policy_denied_error_json(error),
             _ => json!({
                 "error": self.to_string(),
@@ -5495,6 +7210,7 @@ mod tests {
             auth: auth.clone(),
             host_guard: TempodHostGuard::loopback(),
             limiter: ConnectionLimiter::default(),
+            web_bot_auth_verifiers: Vec::new(),
         });
         let mut builder = axum::http::Request::builder()
             .method(request.method.as_str())
@@ -6760,7 +8476,7 @@ mod tests {
         for _ in 0..count {
             let listener = listener.try_clone()?;
             let pool = Arc::clone(pool);
-            handles.push(thread::spawn(move || serve_one(listener, pool)));
+            handles.push(thread::spawn(move || serve_one_unsafe(listener, pool)));
         }
         Ok(handles)
     }
@@ -7354,7 +9070,7 @@ mod tests {
         // bounded IPC wait; never joined).
         let wedged_listener = listener.try_clone()?;
         let wedged_pool = Arc::clone(&pool);
-        thread::spawn(move || serve_one(wedged_listener, wedged_pool));
+        thread::spawn(move || serve_one_unsafe(wedged_listener, wedged_pool));
         thread::spawn(move || {
             let _ = http_post(
                 addr,
@@ -7457,6 +9173,96 @@ mod tests {
     }
 
     #[test]
+    fn browser_hardening_blocks_are_structured_errors() -> TestResult {
+        let mut pool = SessionPool::default().with_browser_hardening_policy(
+            BrowserHardeningPolicy::strict().with_url_policy(UrlPolicy::allow_all()),
+        );
+        let error = pool
+            .create("http://example.com/login")
+            .expect_err("strict hardening should block cleartext navigation");
+        assert_eq!(error.status(), 403);
+
+        let response = tempod_error_response(&error);
+        let value: Value = serde_json::from_slice(&response.body)?;
+        assert_eq!(
+            value["browser_hardening"]["code"],
+            "insecure_top_level_navigation"
+        );
+        assert_eq!(
+            value["browser_hardening"]["url"],
+            "http://example.com/login"
+        );
+        assert_eq!(value["browser_hardening"]["origin"], "http://example.com");
+        assert_eq!(value["browser_hardening"]["action"], Value::Null);
+        Ok(())
+    }
+
+    #[test]
+    fn session_pool_records_browser_hardening_blocks_on_the_event_stream() -> TestResult {
+        let mut pool = SessionPool::default();
+        let session = pool.create("https://hardening.test")?;
+        let block = TempodBrowserHardeningBlock {
+            url: "https://hardening.test/installer.dmg".into(),
+            code: "risky_download".into(),
+            url_policy_code: None,
+            origin: Some("https://hardening.test".into()),
+            reason: "browser hardening blocked an executable-like download path".into(),
+            action: Some("goto".into()),
+            action_index: Some(0),
+        };
+        let event = pool.record_browser_hardening_block(&session.id, block.clone())?;
+
+        assert_eq!(
+            event.event,
+            TempodSessionEventKind::BrowserHardeningBlocked {
+                block: block.clone()
+            }
+        );
+        let json = serde_json::to_value(&event.event)?;
+        assert_eq!(json["kind"], "browser_hardening_blocked");
+        assert_eq!(json["block"]["code"], "risky_download");
+        assert_eq!(json["block"]["action"], "goto");
+
+        assert!(matches!(
+            pool.record_browser_hardening_block(&TempodSessionId("missing".into()), block),
+            Err(TempodError::SessionNotFound(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn session_batch_policy_tags_browser_hardening_blocked_goto_action() -> TestResult {
+        let body = SessionActBatchRequest {
+            batch: ActionBatch {
+                actions: vec![Action::Goto {
+                    url: "https://example.com/download/installer.dmg".into(),
+                }],
+                quiescence: tempo_schema::QuiescencePolicy::Composite,
+            },
+            input_tainted: None,
+            confirmed: false,
+            idempotency_key: None,
+        };
+        let error = enforce_session_batch_policy(
+            &BrowserHardeningPolicy::standard().with_url_policy(UrlPolicy::allow_all()),
+            PrivacyMode::Audit,
+            &body,
+            None,
+        )
+        .expect_err("risky downloads should be blocked before dispatch");
+
+        match error {
+            TempodError::BrowserHardeningBlocked(block) => {
+                assert_eq!(block.code, "risky_download");
+                assert_eq!(block.action.as_deref(), Some("goto"));
+                assert_eq!(block.action_index, Some(0));
+            }
+            other => return Err(format!("unexpected error: {other}").into()),
+        }
+        Ok(())
+    }
+
+    #[test]
     fn stealth_mode_does_not_retain_lifecycle_or_step_events() -> TestResult {
         let mut pool = SessionPool::default().with_privacy_mode(PrivacyMode::Stealth);
         let session = pool.create("https://stealth.test")?;
@@ -7533,6 +9339,630 @@ mod tests {
                 .otlp_exporter()
                 .is_none()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn session_pool_from_env_loads_threat_domain_feed() -> TestResult {
+        let root = unique_dir("env-threat-feed")?;
+        std::fs::create_dir_all(&root)?;
+        let path = root.join("threat-domains.txt");
+        std::fs::write(
+            &path,
+            "# local fixture feed\nmalware.test\n*.phishing.test\n",
+        )?;
+
+        let pool = SessionPool::from_env_values(
+            None,
+            None,
+            None,
+            Some(path.as_os_str().to_os_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(pool.browser_hardening_policy.threat_domain_count(), 2);
+        assert!(matches!(
+            pool.browser_hardening_policy
+                .check_url("https://login.phishing.test/"),
+            Err(BrowserHardeningBlocked {
+                code: BrowserHardeningBlockCode::ThreatListedDomain,
+                ..
+            })
+        ));
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn session_pool_from_env_persists_threat_domain_feed_audit() -> TestResult {
+        let root = unique_dir("env-threat-audit")?;
+        std::fs::create_dir_all(&root)?;
+        let feed_path = root.join("threat-domains.txt");
+        let audit_path = root.join("threat-audit.jsonl");
+        std::fs::write(
+            &feed_path,
+            "# local fixture feed\nmalware.test\n*.phishing.test\n",
+        )?;
+
+        let pool = SessionPool::from_env_values(
+            None,
+            None,
+            None,
+            Some(feed_path.as_os_str().to_os_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(audit_path.as_os_str().to_os_string()),
+        );
+
+        assert_eq!(pool.browser_hardening_policy.threat_domain_count(), 2);
+        let bytes = std::fs::read(&audit_path)?;
+        let value: Value = serde_json::from_slice(bytes.strip_suffix(b"\n").unwrap_or(&bytes))?;
+        assert_eq!(value["source"], "env_file");
+        assert_eq!(value["env"], TEMPO_THREAT_DOMAIN_FILE_ENV);
+        assert_eq!(value["provider_id"], "tempo-threat-domain-file");
+        assert_eq!(value["rule_count"], 2);
+        assert_eq!(value["exact_rules"], 1);
+        assert_eq!(value["suffix_rules"], 1);
+        let serialized = String::from_utf8(bytes)?;
+        assert!(!serialized.contains("malware.test"));
+        assert!(!serialized.contains("phishing.test"));
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn threat_domain_feed_url_rejects_cleartext() {
+        let error = fetch_threat_domain_feed_url("http://example.test/threats.txt")
+            .expect_err("cleartext feed URLs must be rejected before network");
+
+        assert!(error.contains("must use https"));
+    }
+
+    #[test]
+    fn threat_domain_feed_url_rejects_private_targets() {
+        let error = fetch_threat_domain_feed_url("https://127.0.0.1/threats.txt")
+            .expect_err("private feed URLs must be rejected before network");
+
+        assert!(error.contains("URL blocked"));
+    }
+
+    #[test]
+    fn threat_domain_feed_invalid_digest_pin_fails_closed_by_default() {
+        let pool = SessionPool::from_env_values(
+            None,
+            None,
+            None,
+            None,
+            Some(std::ffi::OsString::from("https://example.test/feed.txt")),
+            None,
+            Some(std::ffi::OsString::from("not-a-sha256")),
+            None,
+            None,
+            None,
+        );
+
+        assert!(matches!(
+            pool.browser_hardening_policy
+                .check_url("https://example.com/"),
+            Err(BrowserHardeningBlocked {
+                code: BrowserHardeningBlockCode::UrlPolicy(BlockCode::PolicyDenied),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn threat_domain_feed_invalid_digest_pin_can_fail_open_explicitly() {
+        let pool = SessionPool::from_env_values(
+            None,
+            None,
+            None,
+            None,
+            Some(std::ffi::OsString::from("https://example.test/feed.txt")),
+            None,
+            Some(std::ffi::OsString::from("not-a-sha256")),
+            None,
+            Some(std::ffi::OsString::from("fail-open")),
+            None,
+        );
+
+        assert!(pool
+            .browser_hardening_policy
+            .check_url("https://example.com/")
+            .is_ok());
+    }
+
+    #[test]
+    fn threat_domain_feed_sha256_accepts_matching_digest() -> TestResult {
+        let contents = "malware.test\n".to_string();
+        let digest = sha256_hex(contents.as_bytes());
+
+        let verified = verify_threat_domain_feed_sha256(contents.clone(), Some(&digest))
+            .map_err(std::io::Error::other)?;
+
+        assert_eq!(verified, contents);
+        Ok(())
+    }
+
+    #[test]
+    fn threat_domain_feed_sha256_rejects_mismatch() {
+        let error = verify_threat_domain_feed_sha256(
+            "malware.test\n".to_string(),
+            Some("0000000000000000000000000000000000000000000000000000000000000000"),
+        )
+        .expect_err("mismatched feed digest must be rejected");
+
+        assert!(error.contains("digest mismatch"));
+    }
+
+    #[test]
+    fn signed_threat_domain_metadata_accepts_trusted_signature() -> TestResult {
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let feed = "malware.test\n";
+        let signing_key = SigningKey::from_bytes(&[7_u8; 32]);
+        let key_id = "root-2026".to_string();
+        let mut metadata = ThreatDomainSignedMetadata {
+            version: "2026-07-05T00:00:00Z".into(),
+            issued_at_ms: 1_788_480_000_000,
+            expires_at_ms: 1_791_072_000_000,
+            feed_sha256: sha256_hex(feed.as_bytes()),
+            key_id: key_id.clone(),
+            signature: String::new(),
+            next_key_id: None,
+            next_public_key: None,
+        };
+        let payload =
+            threat_domain_metadata_signing_payload(&metadata).map_err(std::io::Error::other)?;
+        metadata.signature = BASE64_STANDARD.encode(signing_key.sign(&payload).to_bytes());
+        let metadata_json = serde_json::to_string(&metadata)?;
+        let mut trusted = BTreeMap::new();
+        trusted.insert(
+            key_id.clone(),
+            BASE64_STANDARD.encode(signing_key.verifying_key().to_bytes()),
+        );
+
+        let verified =
+            verify_signed_threat_domain_metadata(&metadata_json, feed, &trusted, 1_788_480_001_000)
+                .map_err(std::io::Error::other)?;
+
+        assert_eq!(verified.key_id, key_id);
+        assert_eq!(verified.feed_sha256, sha256_hex(feed.as_bytes()));
+        Ok(())
+    }
+
+    #[test]
+    fn signed_threat_domain_metadata_rejects_expired_envelope() -> TestResult {
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let feed = "malware.test\n";
+        let signing_key = SigningKey::from_bytes(&[9_u8; 32]);
+        let key_id = "root-2026".to_string();
+        let mut metadata = ThreatDomainSignedMetadata {
+            version: "2026-07-05T00:00:00Z".into(),
+            issued_at_ms: 1_788_480_000_000,
+            expires_at_ms: 1_788_480_001_000,
+            feed_sha256: sha256_hex(feed.as_bytes()),
+            key_id: key_id.clone(),
+            signature: String::new(),
+            next_key_id: None,
+            next_public_key: None,
+        };
+        let payload =
+            threat_domain_metadata_signing_payload(&metadata).map_err(std::io::Error::other)?;
+        metadata.signature = BASE64_STANDARD.encode(signing_key.sign(&payload).to_bytes());
+        let metadata_json = serde_json::to_string(&metadata)?;
+        let mut trusted = BTreeMap::new();
+        trusted.insert(
+            key_id,
+            BASE64_STANDARD.encode(signing_key.verifying_key().to_bytes()),
+        );
+
+        let error =
+            verify_signed_threat_domain_metadata(&metadata_json, feed, &trusted, 1_788_480_002_000)
+                .expect_err("expired signed metadata must be rejected");
+
+        assert!(error.contains("expired"));
+        Ok(())
+    }
+
+    #[test]
+    fn signed_threat_domain_key_rotation_adds_current_key_signed_next_key() -> TestResult {
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let feed = "malware.test\n";
+        let signing_key = SigningKey::from_bytes(&[10_u8; 32]);
+        let next_signing_key = SigningKey::from_bytes(&[13_u8; 32]);
+        let key_id = "root-2026".to_string();
+        let next_key_id = "root-2027".to_string();
+        let next_public_key = BASE64_STANDARD.encode(next_signing_key.verifying_key().to_bytes());
+        let mut metadata = ThreatDomainSignedMetadata {
+            version: "2026-07-05T00:00:00Z".into(),
+            issued_at_ms: 1_788_480_000_000,
+            expires_at_ms: 1_791_072_000_000,
+            feed_sha256: sha256_hex(feed.as_bytes()),
+            key_id: key_id.clone(),
+            signature: String::new(),
+            next_key_id: Some(next_key_id.clone()),
+            next_public_key: Some(next_public_key.clone()),
+        };
+        let payload =
+            threat_domain_metadata_signing_payload(&metadata).map_err(std::io::Error::other)?;
+        metadata.signature = BASE64_STANDARD.encode(signing_key.sign(&payload).to_bytes());
+        let metadata_json = serde_json::to_string(&metadata)?;
+        let mut trusted = BTreeMap::new();
+        trusted.insert(
+            key_id,
+            BASE64_STANDARD.encode(signing_key.verifying_key().to_bytes()),
+        );
+        let verified =
+            verify_signed_threat_domain_metadata(&metadata_json, feed, &trusted, 1_788_480_001_000)
+                .map_err(std::io::Error::other)?;
+
+        let rotated = apply_verified_threat_domain_key_rotation(&trusted, &verified)
+            .map_err(std::io::Error::other)?;
+
+        assert_eq!(rotated.get(&next_key_id), Some(&next_public_key));
+        Ok(())
+    }
+
+    #[test]
+    fn signed_threat_domain_key_rotation_rejects_duplicate_key_id() {
+        let key_id = "root-2026".to_string();
+        let verified = VerifiedThreatDomainMetadata {
+            version: "2026-07-05T00:00:00Z".into(),
+            key_id: key_id.clone(),
+            feed_sha256: "0".repeat(64),
+            next_key_id: Some(key_id.clone()),
+            next_public_key: Some(BASE64_STANDARD.encode([1_u8; 32])),
+        };
+        let mut trusted = BTreeMap::new();
+        trusted.insert(key_id, BASE64_STANDARD.encode([2_u8; 32]));
+
+        let error = apply_verified_threat_domain_key_rotation(&trusted, &verified)
+            .expect_err("duplicate rotation key ids must be rejected");
+
+        assert!(error.contains("already exists"));
+    }
+
+    #[test]
+    fn signed_threat_domain_policy_snapshot_applies_after_full_verification() -> TestResult {
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let feed = "malware.test\n";
+        let signing_key = SigningKey::from_bytes(&[14_u8; 32]);
+        let key_id = "root-2026".to_string();
+        let mut metadata = ThreatDomainSignedMetadata {
+            version: "2026-07-05T00:00:00Z".into(),
+            issued_at_ms: 1_788_480_000_000,
+            expires_at_ms: 1_791_072_000_000,
+            feed_sha256: sha256_hex(feed.as_bytes()),
+            key_id: key_id.clone(),
+            signature: String::new(),
+            next_key_id: None,
+            next_public_key: None,
+        };
+        let payload =
+            threat_domain_metadata_signing_payload(&metadata).map_err(std::io::Error::other)?;
+        metadata.signature = BASE64_STANDARD.encode(signing_key.sign(&payload).to_bytes());
+        let metadata_json = serde_json::to_string(&metadata)?;
+        let mut trusted = BTreeMap::new();
+        trusted.insert(
+            key_id,
+            BASE64_STANDARD.encode(signing_key.verifying_key().to_bytes()),
+        );
+        let mut pool = SessionPool::default().with_browser_hardening_policy(
+            BrowserHardeningPolicy::standard().with_url_policy(UrlPolicy::allow_all()),
+        );
+
+        let audit = pool
+            .apply_verified_signed_threat_domain_policy_snapshot(
+                &mut trusted,
+                &metadata_json,
+                feed,
+                1_788_480_001_000,
+            )
+            .map_err(std::io::Error::other)?;
+
+        assert_eq!(audit.rule_count, 1);
+        assert!(matches!(
+            pool.browser_hardening_policy
+                .check_url("https://malware.test/payload"),
+            Err(BrowserHardeningBlocked {
+                code: BrowserHardeningBlockCode::ThreatListedDomain,
+                ..
+            })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn signed_threat_domain_production_fixture_applies_exact_and_suffix_rules() -> TestResult {
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let feed = "malware.test\n*.phishing.test\n";
+        let signing_key = SigningKey::from_bytes(&[17_u8; 32]);
+        let key_id = "root-2026".to_string();
+        let mut metadata = ThreatDomainSignedMetadata {
+            version: "2026-07-05T00:00:00Z".into(),
+            issued_at_ms: 1_788_480_000_000,
+            expires_at_ms: 1_791_072_000_000,
+            feed_sha256: sha256_hex(feed.as_bytes()),
+            key_id: key_id.clone(),
+            signature: String::new(),
+            next_key_id: None,
+            next_public_key: None,
+        };
+        let payload =
+            threat_domain_metadata_signing_payload(&metadata).map_err(std::io::Error::other)?;
+        metadata.signature = BASE64_STANDARD.encode(signing_key.sign(&payload).to_bytes());
+        let metadata_json = serde_json::to_string(&metadata)?;
+        let mut trusted = BTreeMap::new();
+        trusted.insert(
+            key_id,
+            BASE64_STANDARD.encode(signing_key.verifying_key().to_bytes()),
+        );
+        let mut pool = SessionPool::default().with_browser_hardening_policy(
+            BrowserHardeningPolicy::standard().with_url_policy(UrlPolicy::allow_all()),
+        );
+
+        let audit = pool
+            .apply_verified_signed_threat_domain_policy_snapshot(
+                &mut trusted,
+                &metadata_json,
+                feed,
+                1_788_480_001_000,
+            )
+            .map_err(std::io::Error::other)?;
+
+        assert_eq!(audit.rule_count, 2);
+        assert_eq!(audit.exact_rules, 1);
+        assert_eq!(audit.suffix_rules, 1);
+        assert!(matches!(
+            pool.browser_hardening_policy
+                .check_url("https://malware.test/payload"),
+            Err(BrowserHardeningBlocked {
+                code: BrowserHardeningBlockCode::ThreatListedDomain,
+                ..
+            })
+        ));
+        assert!(matches!(
+            pool.browser_hardening_policy
+                .check_url("https://login.phishing.test/"),
+            Err(BrowserHardeningBlocked {
+                code: BrowserHardeningBlockCode::ThreatListedDomain,
+                ..
+            })
+        ));
+        assert!(pool
+            .browser_hardening_policy
+            .check_url("https://example.com/")
+            .is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn signed_threat_domain_policy_snapshot_failure_preserves_existing_policy() -> TestResult {
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let feed = "malware.test\n";
+        let signing_key = SigningKey::from_bytes(&[15_u8; 32]);
+        let key_id = "root-2026".to_string();
+        let mut metadata = ThreatDomainSignedMetadata {
+            version: "2026-07-05T00:00:00Z".into(),
+            issued_at_ms: 1_788_480_000_000,
+            expires_at_ms: 1_791_072_000_000,
+            feed_sha256: sha256_hex(feed.as_bytes()),
+            key_id: key_id.clone(),
+            signature: String::new(),
+            next_key_id: None,
+            next_public_key: None,
+        };
+        let payload =
+            threat_domain_metadata_signing_payload(&metadata).map_err(std::io::Error::other)?;
+        metadata.signature = BASE64_STANDARD.encode(signing_key.sign(&payload).to_bytes());
+        let metadata_json = serde_json::to_string(&metadata)?;
+        let mut trusted = BTreeMap::new();
+        trusted.insert(
+            key_id,
+            BASE64_STANDARD.encode(signing_key.verifying_key().to_bytes()),
+        );
+        let mut pool = SessionPool::default().with_browser_hardening_policy(
+            BrowserHardeningPolicy::standard().with_url_policy(UrlPolicy::allow_all()),
+        );
+
+        let error = pool
+            .apply_verified_signed_threat_domain_policy_snapshot(
+                &mut trusted,
+                &metadata_json,
+                "different.test\n",
+                1_788_480_001_000,
+            )
+            .expect_err("tampered feed must not swap policy");
+
+        assert!(error.contains("digest"));
+        assert!(pool
+            .browser_hardening_policy
+            .check_url("https://malware.test/payload")
+            .is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn signed_threat_domain_refresh_rejects_cleartext_metadata_without_policy_swap() {
+        let mut pool = SessionPool::default().with_browser_hardening_policy(
+            BrowserHardeningPolicy::standard().with_url_policy(UrlPolicy::allow_all()),
+        );
+        let mut trusted = BTreeMap::new();
+
+        let error = pool
+            .refresh_signed_threat_domain_policy_once(
+                &mut trusted,
+                "http://example.test/metadata.json",
+                "https://example.test/feed.txt",
+                None,
+                None,
+                1_788_480_001_000,
+            )
+            .expect_err("cleartext signed metadata URL must be rejected before network");
+
+        assert!(error.contains("must use https"));
+        assert!(pool
+            .browser_hardening_policy
+            .check_url("https://example.com/")
+            .is_ok());
+    }
+
+    #[test]
+    fn signed_threat_domain_public_key_env_parses_trust_roots() -> TestResult {
+        use ed25519_dalek::SigningKey;
+
+        let signing_key = SigningKey::from_bytes(&[16_u8; 32]);
+        let encoded = BASE64_STANDARD.encode(signing_key.verifying_key().to_bytes());
+        let keys = parse_signed_threat_domain_public_keys_env(Some(std::ffi::OsString::from(
+            format!("root-2026={encoded}"),
+        )))
+        .map_err(std::io::Error::other)?;
+
+        assert_eq!(keys.get("root-2026"), Some(&encoded));
+        Ok(())
+    }
+
+    #[test]
+    fn signed_threat_domain_refresh_interval_enforces_minimum() {
+        assert_eq!(
+            parse_signed_threat_domain_refresh_interval_env(Some(std::ffi::OsString::from("59"))),
+            TEMPO_THREAT_DOMAIN_DEFAULT_REFRESH_INTERVAL
+        );
+        assert_eq!(
+            parse_signed_threat_domain_refresh_interval_env(Some(std::ffi::OsString::from("60"))),
+            Duration::from_secs(60)
+        );
+    }
+
+    #[test]
+    fn signed_threat_domain_cache_round_trips_verified_snapshot() -> TestResult {
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let root = unique_dir("signed-threat-cache")?;
+        std::fs::create_dir_all(&root)?;
+        let metadata_path = root.join("feed.metadata.json");
+        let feed_path = root.join("feed.txt");
+        let feed = "malware.test\n";
+        let signing_key = SigningKey::from_bytes(&[11_u8; 32]);
+        let key_id = "root-2026".to_string();
+        let mut metadata = ThreatDomainSignedMetadata {
+            version: "2026-07-05T00:00:00Z".into(),
+            issued_at_ms: 1_788_480_000_000,
+            expires_at_ms: 1_791_072_000_000,
+            feed_sha256: sha256_hex(feed.as_bytes()),
+            key_id: key_id.clone(),
+            signature: String::new(),
+            next_key_id: None,
+            next_public_key: None,
+        };
+        let payload =
+            threat_domain_metadata_signing_payload(&metadata).map_err(std::io::Error::other)?;
+        metadata.signature = BASE64_STANDARD.encode(signing_key.sign(&payload).to_bytes());
+        let metadata_json = serde_json::to_string(&metadata)?;
+        write_signed_threat_domain_cache(&metadata_path, &feed_path, &metadata_json, feed)
+            .map_err(std::io::Error::other)?;
+        let mut trusted = BTreeMap::new();
+        trusted.insert(
+            key_id.clone(),
+            BASE64_STANDARD.encode(signing_key.verifying_key().to_bytes()),
+        );
+
+        let (cached_feed, verified) = read_signed_threat_domain_cache(
+            &metadata_path,
+            &feed_path,
+            &trusted,
+            1_788_480_001_000,
+        )
+        .map_err(std::io::Error::other)?;
+
+        assert_eq!(cached_feed, feed);
+        assert_eq!(verified.key_id, key_id);
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn signed_threat_domain_cache_rejects_tampered_feed() -> TestResult {
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let root = unique_dir("signed-threat-cache-tamper")?;
+        std::fs::create_dir_all(&root)?;
+        let metadata_path = root.join("feed.metadata.json");
+        let feed_path = root.join("feed.txt");
+        let feed = "malware.test\n";
+        let signing_key = SigningKey::from_bytes(&[12_u8; 32]);
+        let key_id = "root-2026".to_string();
+        let mut metadata = ThreatDomainSignedMetadata {
+            version: "2026-07-05T00:00:00Z".into(),
+            issued_at_ms: 1_788_480_000_000,
+            expires_at_ms: 1_791_072_000_000,
+            feed_sha256: sha256_hex(feed.as_bytes()),
+            key_id: key_id.clone(),
+            signature: String::new(),
+            next_key_id: None,
+            next_public_key: None,
+        };
+        let payload =
+            threat_domain_metadata_signing_payload(&metadata).map_err(std::io::Error::other)?;
+        metadata.signature = BASE64_STANDARD.encode(signing_key.sign(&payload).to_bytes());
+        let metadata_json = serde_json::to_string(&metadata)?;
+        write_signed_threat_domain_cache(
+            &metadata_path,
+            &feed_path,
+            &metadata_json,
+            "different.test\n",
+        )
+        .map_err(std::io::Error::other)?;
+        let mut trusted = BTreeMap::new();
+        trusted.insert(
+            key_id,
+            BASE64_STANDARD.encode(signing_key.verifying_key().to_bytes()),
+        );
+
+        let error = read_signed_threat_domain_cache(
+            &metadata_path,
+            &feed_path,
+            &trusted,
+            1_788_480_001_000,
+        )
+        .expect_err("tampered cached feed must be rejected");
+
+        assert!(error.contains("digest"));
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn threat_domain_cache_round_trips_owner_only_snapshot() -> TestResult {
+        let root = unique_dir("threat-cache")?;
+        std::fs::create_dir_all(&root)?;
+        let path = root.join("feed.cache");
+        let contents = "malware.test\n";
+        let digest = sha256_hex(contents.as_bytes());
+
+        write_threat_domain_cache(&path, contents).map_err(std::io::Error::other)?;
+        let cached =
+            read_threat_domain_cache(&path, Some(&digest), std::time::Duration::from_secs(60))
+                .map_err(std::io::Error::other)?;
+
+        assert_eq!(cached, contents);
+        remove_dir_if_exists(&root)?;
         Ok(())
     }
 
@@ -7662,7 +10092,7 @@ mod tests {
         let addr = listener.local_addr()?;
         let pool = Arc::new(Mutex::new(SessionPool::default()));
         let server_pool = Arc::clone(&pool);
-        let handle = thread::spawn(move || serve_one(listener, server_pool));
+        let handle = thread::spawn(move || serve_one_unsafe(listener, server_pool));
 
         let response = send_http(
             addr,
@@ -7676,7 +10106,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let addr = listener.local_addr()?;
         let server_pool = Arc::clone(&pool);
-        let handle = thread::spawn(move || serve_one(listener, server_pool));
+        let handle = thread::spawn(move || serve_one_unsafe(listener, server_pool));
 
         let response = send_http(addr, "GET /sessions HTTP/1.1\r\n\r\n")?;
         join_server(handle)?;
@@ -7923,7 +10353,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let addr = listener.local_addr()?;
         let pool = Arc::new(Mutex::new(SessionPool::default()));
-        let handle = thread::spawn(move || serve_one(listener, pool));
+        let handle = thread::spawn(move || serve_one_unsafe(listener, pool));
 
         let response = send_http(
             addr,
@@ -7971,6 +10401,88 @@ mod tests {
         );
         let card: Value = serde_json::from_slice(&response.body)?;
         assert_eq!(card["url"], "http://localhost:8787/mcp");
+        Ok(())
+    }
+
+    #[test]
+    fn tempod_serves_web_bot_auth_key_directory() -> TestResult {
+        let mut pool = SessionPool::default();
+        let response = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "GET".into(),
+                path: WEB_BOT_AUTH_KEY_DIRECTORY_PATH.into(),
+                headers: BTreeMap::new(),
+                host: Some("localhost:8787".into()),
+                origin: None,
+                body: Vec::new(),
+            },
+        )?;
+
+        assert_eq!(response.status, 200);
+        assert_eq!(
+            response.content_type,
+            WEB_BOT_AUTH_KEY_DIRECTORY_CONTENT_TYPE
+        );
+        let directory: Value = serde_json::from_slice(&response.body)?;
+        assert_eq!(
+            directory["keys"]
+                .as_array()
+                .ok_or("key directory must expose keys array")?
+                .len(),
+            0
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn tempod_key_directory_serves_configured_web_bot_auth_verifier() -> TestResult {
+        use tempo_net::WebBotAuthSigningKey;
+        use tower::ServiceExt as _;
+
+        let runtime = transport_runtime()?;
+        let key = WebBotAuthSigningKey::from_seed("tempo-agent", &[7_u8; 32])?;
+        let router = tempod_router(TempodAppState {
+            pool: Arc::new(Mutex::new(SessionPool::default())),
+            auth: TempodAuth::disabled(),
+            host_guard: TempodHostGuard::loopback(),
+            limiter: ConnectionLimiter::default(),
+            web_bot_auth_verifiers: vec![key.verifier()],
+        });
+        let response = runtime.block_on(async move {
+            router
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("GET")
+                        .uri(WEB_BOT_AUTH_KEY_DIRECTORY_PATH)
+                        .header("host", "127.0.0.1:8787")
+                        .body(axum::body::Body::empty())
+                        .map_err(|error| TempodError::Driver(error.to_string()))?,
+                )
+                .await
+                .map_err(|error| TempodError::Driver(error.to_string()))
+        })?;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let content_type = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .ok_or("missing content-type")?;
+        assert_eq!(content_type, WEB_BOT_AUTH_KEY_DIRECTORY_CONTENT_TYPE);
+        let body = runtime
+            .block_on(
+                async move { axum::body::to_bytes(response.into_body(), MAX_HTTP_BYTES).await },
+            )
+            .map_err(|error| TempodError::Driver(error.to_string()))?;
+        let directory: Value = serde_json::from_slice(&body)?;
+        let keys = directory["keys"]
+            .as_array()
+            .ok_or("key directory must expose keys array")?;
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0]["kid"], "tempo-agent");
+        assert_eq!(keys[0]["kty"], "OKP");
+        assert_eq!(keys[0]["crv"], "Ed25519");
         Ok(())
     }
 
@@ -8048,6 +10560,20 @@ mod tests {
             "Session admission limit reached"
         );
         assert_eq!(
+            openapi["paths"]["/sessions"]["post"]["responses"]["403"]["content"]
+                ["application/json"]["schema"]["$ref"],
+            "#/components/schemas/BrowserHardeningError"
+        );
+        assert_eq!(
+            openapi["components"]["schemas"]["BrowserHardeningError"]["required"],
+            json!(["error", "browser_hardening"])
+        );
+        assert_eq!(
+            openapi["components"]["schemas"]["TempodBrowserHardeningBlock"]["properties"]["code"]
+                ["enum"][8],
+            "insecure_top_level_navigation"
+        );
+        assert_eq!(
             openapi["components"]["schemas"]["ReadinessResponse"]["properties"]["reasons"]["items"]
                 ["enum"],
             json!(["draining", "engine_detached", "session_limit_reached"])
@@ -8082,7 +10608,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let addr = listener.local_addr()?;
         let pool = Arc::new(Mutex::new(SessionPool::default()));
-        let handle = thread::spawn(move || serve_one(listener, pool));
+        let handle = thread::spawn(move || serve_one_unsafe(listener, pool));
         let mut stream = TcpStream::connect(addr)?;
         stream.set_read_timeout(Some(Duration::from_secs(5)))?;
 
@@ -8133,7 +10659,7 @@ mod tests {
         let pool = Arc::new(Mutex::new(pool));
         let handle = thread::spawn({
             let pool = Arc::clone(&pool);
-            move || serve_one(listener, pool)
+            move || serve_one_unsafe(listener, pool)
         });
         let mut stream = TcpStream::connect(addr)?;
         stream.set_read_timeout(Some(Duration::from_secs(5)))?;
@@ -8244,6 +10770,29 @@ mod tests {
 
         drop(pool);
         join_driver_handler(server)?;
+        Ok(())
+    }
+
+    #[test]
+    fn bidi_navigation_identity_follows_recorded_strategy() -> TestResult {
+        let mut pool = SessionPool::default();
+        let url = "https://challenged.example/path";
+
+        assert_eq!(
+            network_navigation_identity_mode(&pool, url),
+            tempo_net::IdentityMode::AgentDeclared
+        );
+        pool.identity_strategy_table
+            .record_request(url, true)
+            .map_err(|error| error.to_string())?;
+        assert_eq!(
+            network_navigation_identity_mode(&pool, url),
+            tempo_net::IdentityMode::UserDriven
+        );
+        assert_eq!(
+            network_navigation_identity_mode(&pool, "not a url"),
+            tempo_net::IdentityMode::AgentDeclared
+        );
         Ok(())
     }
 
@@ -10073,7 +12622,7 @@ mod tests {
         let addr = listener.local_addr()?;
         let pool = Arc::new(Mutex::new(SessionPool::default()));
         let server_pool = Arc::clone(&pool);
-        let handle = thread::spawn(move || serve_one(listener, server_pool));
+        let handle = thread::spawn(move || serve_one_unsafe(listener, server_pool));
 
         let body = r#"{"url":"https://chunked.test"}"#;
         let request = format!(
@@ -10097,7 +12646,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let addr = listener.local_addr()?;
         let pool = Arc::new(Mutex::new(SessionPool::default()));
-        let handle = thread::spawn(move || serve_one(listener, pool));
+        let handle = thread::spawn(move || serve_one_unsafe(listener, pool));
 
         let oversized = "x".repeat(MAX_HTTP_BYTES + 1);
         let response = send_http(
@@ -10429,7 +12978,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let addr = listener.local_addr()?;
         let pool = Arc::new(Mutex::new(SessionPool::default()));
-        let handle = thread::spawn(move || serve_one(listener, pool));
+        let handle = thread::spawn(move || serve_one_unsafe(listener, pool));
 
         let response = send_http(
             addr,
@@ -10818,6 +13367,120 @@ mod tests {
     }
 
     #[test]
+    fn non_loopback_metadata_routes_require_auth_when_auth_is_enabled() -> TestResult {
+        let auth = TempodAuth::bearer("runtime-token")?;
+        let metadata_endpoints = [
+            "/health",
+            tempo_mcp::A2A_AGENT_CARD_PATH,
+            TEMPOD_OPENAPI_PATH,
+        ];
+
+        let run_once =
+            |path: &str, token: Option<&str>| -> Result<String, Box<dyn std::error::Error>> {
+                let listener = TcpListener::bind("0.0.0.0:0")?;
+                let connect_addr =
+                    std::net::SocketAddr::from(([127, 0, 0, 1], listener.local_addr()?.port()));
+                let pool = Arc::new(Mutex::new(SessionPool::default()));
+                let config = TempodServerConfig::new()
+                    .allow_remote_binds()
+                    .with_auth(auth.clone());
+                let handle = thread::spawn(move || serve_one_with_config(listener, pool, config));
+
+                let request = if let Some(token) = token {
+                    format!(
+                        "GET {path} HTTP/1.1\r\n\
+                     host: 127.0.0.1\r\n\
+                     authorization: Bearer {token}\r\n\r\n"
+                    )
+                } else {
+                    format!("GET {path} HTTP/1.1\r\nhost: 127.0.0.1\r\n\r\n")
+                };
+                let response = send_http(connect_addr, &request)?;
+                join_server(handle).map_err(|error| error as Box<dyn std::error::Error>)?;
+                Ok(response)
+            };
+
+        for path in metadata_endpoints {
+            let missing = run_once(path, None)?;
+            assert!(
+                missing.starts_with("HTTP/1.1 401"),
+                "missing token for {path}: {missing}"
+            );
+
+            let ok = run_once(path, Some("runtime-token"))?;
+            assert!(
+                ok.starts_with("HTTP/1.1 200"),
+                "authorized request for {path}: {ok}"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn non_loopback_web_bot_auth_key_directory_is_public_when_auth_is_enabled() -> TestResult {
+        let auth = TempodAuth::bearer("runtime-token")?;
+        let listener = TcpListener::bind("0.0.0.0:0")?;
+        let connect_addr =
+            std::net::SocketAddr::from(([127, 0, 0, 1], listener.local_addr()?.port()));
+        let pool = Arc::new(Mutex::new(SessionPool::default()));
+        let config = TempodServerConfig::new()
+            .allow_remote_binds()
+            .with_auth(auth);
+        let handle = thread::spawn(move || serve_one_with_config(listener, pool, config));
+
+        let request =
+            format!("GET {WEB_BOT_AUTH_KEY_DIRECTORY_PATH} HTTP/1.1\r\nhost: 127.0.0.1\r\n\r\n");
+        let response = send_http(connect_addr, &request)?;
+        join_server(handle)?;
+
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "key directory should be public: {response}"
+        );
+        assert!(response.contains("content-type: application/jwk-set+json"));
+        assert!(response.ends_with("{\"keys\":[]}"));
+        Ok(())
+    }
+
+    #[test]
+    fn loopback_operational_metadata_routes_require_auth_when_auth_is_enabled() -> TestResult {
+        let auth = TempodAuth::bearer("runtime-token")?;
+        let metadata_endpoints = [
+            tempo_mcp::A2A_AGENT_CARD_PATH,
+            tempo_mcp::A2A_AGENT_JSON_PATH,
+            TEMPOD_OPENAPI_PATH,
+        ];
+
+        for path in metadata_endpoints {
+            let listener = TcpListener::bind("127.0.0.1:0")?;
+            let connect_addr = listener.local_addr()?;
+            let pool = Arc::new(Mutex::new(SessionPool::default()));
+            let config = TempodServerConfig::new().with_auth(auth.clone());
+            let handle = thread::spawn(move || serve_one_with_config(listener, pool, config));
+
+            let response = send_http(
+                connect_addr,
+                &format!("GET {path} HTTP/1.1\r\nhost: 127.0.0.1\r\n\r\n"),
+            )?;
+            join_server(handle)?;
+            assert!(
+                response.starts_with("HTTP/1.1 401"),
+                "missing token for {path}: {response}"
+            );
+        }
+
+        let mut pool = SessionPool::default();
+        let health = handle_http_request_with_auth(
+            &mut pool,
+            control_request("GET", "/health", None, b""),
+            &auth,
+        );
+        assert_eq!(health.status, 200);
+        Ok(())
+    }
+
+    #[test]
     fn non_loopback_bind_requires_remote_flag_and_auth_token() -> TestResult {
         assert!(TempodServerConfig::new()
             .validate_bind_addr("127.0.0.1:8787")
@@ -10869,7 +13532,7 @@ mod tests {
 
         let listener = TcpListener::bind("0.0.0.0:0")?;
         assert!(matches!(
-            serve_one(listener, Arc::clone(&pool)),
+            serve_one_unsafe(listener, Arc::clone(&pool)),
             Err(TempodError::BadRequest(_))
         ));
 
@@ -11042,7 +13705,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let addr = listener.local_addr()?;
         let pool = Arc::new(Mutex::new(SessionPool::default()));
-        let handle = thread::spawn(move || serve_one(listener, pool));
+        let handle = thread::spawn(move || serve_one_unsafe(listener, pool));
 
         let response = send_http(
             addr,
@@ -11066,7 +13729,7 @@ mod tests {
         let pool = Arc::new(Mutex::new(SessionPool::default()));
         let server_pool = Arc::clone(&pool);
         // serve_forever must keep accepting after a faulty connection.
-        let handle = thread::spawn(move || serve_forever(listener, server_pool));
+        let handle = thread::spawn(move || serve_forever_unsafe(listener, server_pool));
 
         // First client connects and disconnects immediately without sending a
         // request (client-side reset), which previously bubbled an Io error out
