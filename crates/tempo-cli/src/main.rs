@@ -61,7 +61,7 @@ Commands:
   run-cdp-task --start-url URL --actions PATH --journal PATH [--output PATH]
             [--run-id ID] [--session-id ID] [--chrome PATH]
             [--allow-private-network]
-            [--confirmation-mode deny|auto-clean|auto-all]
+            [--confirmation-mode deny|auto-clean]
 ";
 
 const USAGE_HINT: &str = "Run with --help for usage.";
@@ -688,7 +688,6 @@ fn parse_confirmation_mode(value: String) -> Result<ConfirmationMode, CliError> 
     match value.as_str() {
         "deny" => Ok(ConfirmationMode::DenyHumanRequired),
         "auto-clean" => Ok(ConfirmationMode::AutoConfirmClean),
-        "auto-all" => Ok(ConfirmationMode::AutoConfirmAll),
         _ => Err(CliError::InvalidValue {
             flag: "--confirmation-mode",
             value,
@@ -2069,6 +2068,30 @@ mod tests {
                 flag: "--confirmation-mode",
                 value,
             }) => assert_eq!(value, "always"),
+            other => return Err(format!("unexpected command parse result: {other:?}").into()),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn run_cdp_task_command_rejects_auto_all_confirmation_mode() -> TestResult {
+        let result = Command::parse([
+            "run-cdp-task",
+            "--start-url",
+            "https://example.com",
+            "--actions",
+            "actions.json",
+            "--journal",
+            "session.jsonl",
+            "--confirmation-mode",
+            "auto-all",
+        ]);
+
+        match result {
+            Err(CliError::InvalidValue {
+                flag: "--confirmation-mode",
+                value,
+            }) => assert_eq!(value, "auto-all"),
             other => return Err(format!("unexpected command parse result: {other:?}").into()),
         }
         Ok(())
