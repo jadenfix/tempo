@@ -103,6 +103,10 @@ pub struct ObservationDiff {
     /// compiler considered.
     #[serde(default, skip_serializing_if = "u32_is_zero")]
     pub omitted: u32,
+    /// Current observation set-of-marks labels. Stable mark labels are stateful,
+    /// so consumers cannot derive these from diff elements alone.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub marks: Vec<(NodeId, u32)>,
     pub added: Vec<InteractiveElement>,
     pub removed: Vec<NodeId>,
     pub changed: Vec<InteractiveElement>,
@@ -967,6 +971,18 @@ pub fn observation_diff_json_schema() -> Value {
             "since_seq": { "type": "integer", "minimum": 0 },
             "seq": { "type": "integer", "minimum": 0 },
             "omitted": { "type": "integer", "minimum": 0, "maximum": u32::MAX },
+            "marks": {
+                "type": "array",
+                "items": {
+                    "type": "array",
+                    "prefixItems": [
+                        { "$ref": "#/$defs/NodeId" },
+                        { "type": "integer", "minimum": 1, "maximum": u32::MAX }
+                    ],
+                    "minItems": 2,
+                    "maxItems": 2
+                }
+            },
             "added": {
                 "type": "array",
                 "items": { "$ref": "#/$defs/InteractiveElement" }
@@ -1855,6 +1871,7 @@ mod tests {
             .filter_map(Value::as_str)
             .collect();
         assert!(!diff_required.contains(&"omitted"));
+        assert!(!diff_required.contains(&"marks"));
 
         let grounding = grounding_json_schema();
         let grounding_required: Vec<&str> = grounding["required"]
@@ -2229,6 +2246,7 @@ mod tests {
                 since_seq: 2,
                 seq: 3,
                 omitted: 0,
+                marks: Vec::new(),
                 added: vec![],
                 removed: vec![],
                 changed: vec![],

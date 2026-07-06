@@ -3095,6 +3095,7 @@ fn diff_from_base(
             since_seq,
             seq: current.seq,
             omitted: current.omitted,
+            marks: current.marks.clone(),
             added: current.elements.clone(),
             removed: Vec::new(),
             changed: Vec::new(),

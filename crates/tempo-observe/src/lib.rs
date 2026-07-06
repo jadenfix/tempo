@@ -808,6 +808,7 @@ pub fn diff_observations(
         since_seq: previous.seq,
         seq: current.seq,
         omitted: current.omitted,
+        marks: current.marks.clone(),
         added,
         removed,
         changed,
@@ -873,8 +874,7 @@ pub fn observation_corpus_report(
         if let Some(previous) = &previous_observation {
             diff_snapshots += 1;
             let diff = diff_observations(previous, &snapshot.observation);
-            if diff_reconstructs_current(previous, &snapshot.observation, &diff, options.max_marks)
-            {
+            if diff_reconstructs_current(previous, &snapshot.observation, &diff) {
                 diff_reconstructable_snapshots += 1;
             }
         }
@@ -925,7 +925,6 @@ fn diff_reconstructs_current(
     previous: &CompiledObservation,
     current: &CompiledObservation,
     diff: &ObservationDiff,
-    max_marks: usize,
 ) -> bool {
     if diff.since_seq != previous.seq || diff.seq != current.seq {
         return false;
@@ -984,9 +983,17 @@ fn diff_reconstructs_current(
         }
         elements.push(added.clone());
     }
+    sort_elements_for_observation(&mut elements);
 
-    let reconstructed = make_observation(&previous.url, diff.seq, elements, max_marks);
-    reconstructed_observation_matches_current(reconstructed, current, max_marks)
+    let reconstructed = CompiledObservation {
+        schema_version: previous.schema_version.clone(),
+        url: previous.url.clone(),
+        seq: diff.seq,
+        elements,
+        omitted: diff.omitted,
+        marks: diff.marks.clone(),
+    };
+    serialized_observations_equal(&reconstructed, current)
 }
 
 fn corpus_identity_key(raw: &RawElement) -> String {
@@ -1148,49 +1155,6 @@ fn ratio(numerator: usize, denominator: usize) -> f64 {
     }
 }
 
-fn reconstructed_observation_matches_current(
-    mut reconstructed: CompiledObservation,
-    current: &CompiledObservation,
-    max_marks: usize,
-) -> bool {
-    // `ObservationDiff` carries element deltas, omitted count, and seq, but it
-    // intentionally does not carry set-of-marks labels. Marks can now be stable
-    // across rank insertions, so their numeric labels are stateful metadata on
-    // the current observation rather than data reconstructable from the diff.
-    if !marks_reference_marked_prefix(current, max_marks) {
-        return false;
-    }
-    reconstructed.marks = current.marks.clone();
-    serialized_observations_equal(&reconstructed, current)
-}
-
-fn marks_reference_marked_prefix(observation: &CompiledObservation, max_marks: usize) -> bool {
-    let marked_prefix: HashSet<&str> = observation
-        .elements
-        .iter()
-        .take(max_marks)
-        .map(|element| element.node_id.0.as_str())
-        .collect();
-    if observation.marks.len() > marked_prefix.len() {
-        return false;
-    }
-
-    let mut node_ids = HashSet::with_capacity(observation.marks.len());
-    let mut labels = HashSet::with_capacity(observation.marks.len());
-    for (node_id, label) in &observation.marks {
-        if *label == 0 {
-            return false;
-        }
-        if !marked_prefix.contains(node_id.0.as_str()) {
-            return false;
-        }
-        if !node_ids.insert(node_id.0.as_str()) || !labels.insert(*label) {
-            return false;
-        }
-    }
-    true
-}
-
 fn serialized_observations_equal(left: &CompiledObservation, right: &CompiledObservation) -> bool {
     let Ok(left) = serde_json::to_vec(left) else {
         return false;
@@ -1204,6 +1168,15 @@ fn serialized_observations_equal(left: &CompiledObservation, right: &CompiledObs
 /// Stable crate summary used by smoke tests and binaries.
 pub fn describe() -> &'static str {
     "observation compiler: stable-ID mapper, interactive-element ranker, diff engine, set-of-marks compositor, token budgeter"
+}
+
+fn sort_elements_for_observation(elements: &mut [InteractiveElement]) {
+    elements.sort_by(|left, right| {
+        right
+            .rank
+            .total_cmp(&left.rank)
+            .then_with(|| left.node_id.0.cmp(&right.node_id.0))
+    });
 }
 
 /// Turn an already-built interactive-element list into a finished
@@ -1221,12 +1194,7 @@ pub fn finalize_observation(
     mut elements: Vec<InteractiveElement>,
     options: CompileOptions,
 ) -> CompiledObservation {
-    elements.sort_by(|left, right| {
-        right
-            .rank
-            .total_cmp(&left.rank)
-            .then_with(|| left.node_id.0.cmp(&right.node_id.0))
-    });
+    sort_elements_for_observation(&mut elements);
     apply_budget(url, seq, elements, options)
 }
 
@@ -1237,12 +1205,7 @@ pub fn finalize_observation_with_stable_marks(
     options: CompileOptions,
     mapper: &mut StableIdMapper,
 ) -> CompiledObservation {
-    elements.sort_by(|left, right| {
-        right
-            .rank
-            .total_cmp(&left.rank)
-            .then_with(|| left.node_id.0.cmp(&right.node_id.0))
-    });
+    sort_elements_for_observation(&mut elements);
     let full_marks = mapper.mark_labels_for(&elements, options.max_marks);
     apply_budget_with_marks(url, seq, elements, options, full_marks)
 }
@@ -1390,6 +1353,7 @@ fn assemble_observation(
     }
 }
 
+#[cfg(test)]
 fn make_observation(
     url: &str,
     seq: u64,
@@ -2338,17 +2302,13 @@ mod tests {
             since_seq: previous.seq,
             seq: current.seq,
             omitted: 0,
+            marks: current.marks.clone(),
             added: Vec::new(),
             removed: Vec::new(),
             changed: Vec::new(),
         };
 
-        assert!(!diff_reconstructs_current(
-            &previous,
-            &current,
-            &lossy_diff,
-            2
-        ));
+        assert!(!diff_reconstructs_current(&previous, &current, &lossy_diff));
     }
 
     #[test]
@@ -2405,12 +2365,89 @@ mod tests {
         assert_ne!(ordinal.marks, current.marks);
 
         let diff = diff_observations(&previous, &current);
-        assert!(diff_reconstructs_current(
-            &previous,
-            &current,
-            &diff,
-            DEFAULT_MAX_MARKS
+        assert!(diff_reconstructs_current(&previous, &current, &diff));
+    }
+
+    #[test]
+    fn diff_reconstruction_uses_stable_mark_labels() {
+        let mut compiler = ObservationCompiler::new();
+        let previous = compiler.compile(ObservationInput::new(
+            "https://shop.example/cart",
+            vec![
+                RawElement::new("button", "Pay now")
+                    .stable_hint("pay")
+                    .bounds([0.0, 0.0, 80.0, 24.0]),
+                RawElement::new("textbox", "Search")
+                    .stable_hint("search")
+                    .bounds([0.0, 32.0, 160.0, 24.0]),
+            ],
         ));
+        let current = compiler.compile(ObservationInput::new(
+            "https://shop.example/cart",
+            vec![
+                RawElement::new("button", "Pay now")
+                    .stable_hint("pay")
+                    .bounds([0.0, 0.0, 80.0, 24.0]),
+                RawElement::new("button", "Apply coupon")
+                    .stable_hint("coupon")
+                    .bounds([0.0, 28.0, 120.0, 24.0]),
+                RawElement::new("textbox", "Search")
+                    .stable_hint("search")
+                    .bounds([0.0, 64.0, 160.0, 24.0]),
+            ],
+        ));
+
+        let stateless_marks = mark_labels(&current.elements, DEFAULT_MAX_MARKS);
+        assert_ne!(current.marks, stateless_marks);
+
+        let diff = diff_observations(&previous, &current);
+        assert_eq!(diff.marks, current.marks);
+        assert!(diff_reconstructs_current(&previous, &current, &diff));
+    }
+
+    #[test]
+    fn diff_carries_hidden_mark_mapper_state_for_new_top_mark() {
+        let mut compiler = ObservationCompiler::with_options(CompileOptions {
+            max_marks: 1,
+            ..CompileOptions::default()
+        });
+        let first = compiler.compile(ObservationInput::new(
+            "https://shop.example/cart",
+            vec![RawElement::new("textbox", "A")
+                .stable_hint("a")
+                .bounds([0.0, 0.0, 40.0, 24.0])],
+        ));
+        assert_eq!(first.marks[0].1, 1);
+
+        let second = compiler.compile(ObservationInput::new(
+            "https://shop.example/cart",
+            vec![
+                RawElement::new("textbox", "B")
+                    .stable_hint("b")
+                    .bounds([0.0, 0.0, 40.0, 24.0]),
+                RawElement::new("link", "A")
+                    .stable_hint("a")
+                    .bounds([0.0, 32.0, 40.0, 24.0]),
+            ],
+        ));
+        assert_eq!(second.marks[0].1, 2);
+
+        let third = compiler.compile(ObservationInput::new(
+            "https://shop.example/cart",
+            vec![
+                RawElement::new("textbox", "C")
+                    .stable_hint("c")
+                    .bounds([0.0, 0.0, 40.0, 24.0]),
+                RawElement::new("link", "B")
+                    .stable_hint("b")
+                    .bounds([0.0, 32.0, 40.0, 24.0]),
+            ],
+        ));
+        assert_eq!(third.marks[0].1, 3);
+
+        let diff = diff_observations(&second, &third);
+        assert_eq!(diff.marks, third.marks);
+        assert!(diff_reconstructs_current(&second, &third, &diff));
     }
 
     #[test]

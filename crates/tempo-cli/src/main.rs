@@ -3060,6 +3060,7 @@ mod tests {
                 since_seq: 0,
                 seq: 1,
                 omitted: 0,
+                marks: Vec::new(),
                 added: Vec::new(),
                 removed: Vec::new(),
                 changed: Vec::new(),
