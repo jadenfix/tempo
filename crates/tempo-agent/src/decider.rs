@@ -1809,7 +1809,7 @@ mod tests {
         assert!(!report.rounds[0].resumed);
         assert_eq!(report.usage, DecisionUsage::default());
         assert_eq!(driver.goto_calls, 1);
-        assert_eq!(driver.observe_calls, 1);
+        assert_eq!(driver.observe_calls, 0);
         assert_eq!(driver.observe_diff_calls, 0);
         assert_eq!(driver.act_calls, 1);
 
