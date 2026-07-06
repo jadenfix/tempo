@@ -65,6 +65,11 @@ needs a concrete traced failure, not a preference for more code.
   results. Send narrow local deltas for fields the UI actually owns.
 - A local convenience cache is not authoritative once the daemon, engine, or
   worker can mutate the same domain object.
+- Cache and fast-path hooks that return snapshots, diffs, or observations must
+  document the identity they bind to, such as sequence, base sequence, URL,
+  frame, policy epoch, or capability token. Callers must reject cache misses or
+  identity mismatches and re-derive state, with tests for stale and
+  wrong-identity implementations.
 - Client disconnect does not cancel already-started blocking work. Engine-driving
   `spawn_blocking` routes need cancellation before dispatch or their own
   live-work quota; an HTTP connection cap alone is not enough.
