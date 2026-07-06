@@ -1018,6 +1018,12 @@ struct RunCdpTaskStep {
     confirmation_gate: String,
     confirmed: bool,
     denied: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    action_latency_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    post_action_observe_latency_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    act_to_observed_latency_ms: Option<u64>,
     outcome: RunCdpTaskStepOutcome,
 }
 
@@ -1053,6 +1059,11 @@ impl From<&tempo_agent::AgentStepReport> for RunCdpTaskStep {
             confirmation_gate: format!("{:?}", step.policy.confirmation_gate),
             confirmed: step.policy.confirmed,
             denied: step.policy.denied,
+            action_latency_ms: step.timing.map(|timing| timing.action_latency_ms),
+            post_action_observe_latency_ms: step
+                .timing
+                .and_then(|timing| timing.post_action_observe_latency_ms),
+            act_to_observed_latency_ms: step.timing.map(|timing| timing.act_to_observed_latency_ms),
             outcome: step_outcome(&step.triple.outcome),
         }
     }
@@ -2142,6 +2153,33 @@ mod tests {
         assert_eq!(status.origin.as_deref(), Some("https://structured.example"));
         assert_eq!(status.action_index, None);
         assert_eq!(status.reason, None);
+    }
+
+    #[test]
+    fn run_cdp_task_step_serializes_live_timing() -> TestResult {
+        let step = RunCdpTaskStep {
+            index: 0,
+            idempotency_key: "abc123".into(),
+            side_effect: "Write".into(),
+            input_tainted: false,
+            confirmation_gate: "None".into(),
+            confirmed: true,
+            denied: false,
+            action_latency_ms: Some(12),
+            post_action_observe_latency_ms: Some(5),
+            act_to_observed_latency_ms: Some(17),
+            outcome: RunCdpTaskStepOutcome {
+                state: "applied",
+                reason: None,
+            },
+        };
+
+        let value: Value = serde_json::to_value(step)?;
+
+        assert_eq!(value["action_latency_ms"], 12);
+        assert_eq!(value["post_action_observe_latency_ms"], 5);
+        assert_eq!(value["act_to_observed_latency_ms"], 17);
+        Ok(())
     }
 
     #[test]
