@@ -1241,7 +1241,7 @@ impl AgentRunner {
     ///   * without cache, navigating actions (`Goto`/`Click`/`Type`/`Select`/
     ///     `Skill`) still full-observe because a diff carries no URL;
     ///   * without cache, a diff that adds an element, was not computed against
-    ///     our exact base, or that a marked page cannot reproduce is declined by
+    ///     our exact base, or carries ambiguous/malformed marks is declined by
     ///     [`reconstruct_observation`] and full-observed instead.
     async fn reobserve_after_action<D>(
         &self,
@@ -1380,11 +1380,11 @@ fn prompt_context_after_action(
 ///
 /// With `added` empty, the reconstructed vector is exactly the survivors of
 /// `base.elements` (content-updated in place) in their original order — what a
-/// full observe of the same page yields. `seq` comes from the diff; `url`,
-/// `marks`, and `schema_version` are carried from `base`, unchanged because the
-/// caller only takes this path for same-document actions (URL/origin #254) whose
-/// pages produce empty marks (guarded). The takeover detector (#343) and taint
-/// recomputation read this preserved element set / URL.
+/// full observe of the same page yields. `seq`, `omitted`, and `marks` come from
+/// the diff; `url` and `schema_version` are carried from `base`, unchanged
+/// because the caller only takes this path for same-document actions
+/// (URL/origin #254). The takeover detector (#343) and taint recomputation read
+/// this preserved element set / URL.
 ///
 /// Fallback conditions (return `None`):
 ///   * `diff.since_seq != base.seq` — the diff was not computed against our base
@@ -1393,9 +1393,9 @@ fn prompt_context_after_action(
 ///   * `!diff.added.is_empty()` — an addition's position is not recoverable from
 ///     the diff, so a full observe is required to place it;
 ///   * the delta is structurally inconsistent with `base` (a `changed`/`removed`
-///     node absent from `base`) — a sign the diff was taken against a different
-///     base;
-///   * `base` carries a set-of-marks overlay, which the diff cannot reproduce.
+///     node absent from `base`, or a mark for a node absent from the
+///     reconstructed observation) — a sign the diff was taken against a
+///     different base.
 fn reconstruct_observation(
     base: &CompiledObservation,
     diff: &ObservationDiff,
@@ -1408,12 +1408,6 @@ fn reconstruct_observation(
     if !diff.added.is_empty() {
         return None;
     }
-    // A diff carries no set-of-marks overlay; only reconstruct when there is
-    // none to preserve.
-    if !base.marks.is_empty() {
-        return None;
-    }
-
     let base_ids: HashSet<&str> = base
         .elements
         .iter()
@@ -1453,13 +1447,28 @@ fn reconstruct_observation(
         }
     }
 
+    let reconstructed_ids: HashSet<&str> = elements
+        .iter()
+        .map(|element| element.node_id.0.as_str())
+        .collect();
+    if !base.marks.is_empty() && diff.marks.is_empty() && !reconstructed_ids.is_empty() {
+        return None;
+    }
+    if !diff
+        .marks
+        .iter()
+        .all(|(node_id, label)| *label != 0 && reconstructed_ids.contains(node_id.0.as_str()))
+    {
+        return None;
+    }
+
     Some(CompiledObservation {
         schema_version: base.schema_version.clone(),
         url: base.url.clone(),
         seq: diff.seq,
         elements,
         omitted: diff.omitted,
-        marks: base.marks.clone(),
+        marks: diff.marks.clone(),
     })
 }
 
@@ -2190,6 +2199,7 @@ mod tests {
                 since_seq,
                 seq: self.seq,
                 omitted: 0,
+                marks: Vec::new(),
                 added: Vec::new(),
                 removed: Vec::new(),
                 changed: vec![button("submit")],
@@ -2994,6 +3004,7 @@ mod tests {
             since_seq: base.seq,
             seq: 8,
             omitted: 0,
+            marks: Vec::new(),
             added: Vec::new(),
             removed: Vec::new(),
             changed: vec![changed],
@@ -3327,6 +3338,7 @@ mod tests {
                 since_seq,
                 seq: self.seq,
                 omitted: current.omitted,
+                marks: Vec::new(),
                 added,
                 removed,
                 changed,
@@ -3370,6 +3382,7 @@ mod tests {
                     since_seq,
                     seq: self.seq,
                     omitted: 0,
+                    marks: Vec::new(),
                     added: self.elements.clone(),
                     removed: Vec::new(),
                     changed: Vec::new(),
@@ -3793,13 +3806,14 @@ mod tests {
             seq: 4,
             elements: vec![el("a", 0.9), el("b", 0.5), el("c", 0.3)],
             omitted: 0,
-            marks: vec![],
+            marks: vec![(NodeId("a".into()), 1), (NodeId("b".into()), 2)],
         };
         // Change "a" in place, remove "b" — no additions, so order is preserved.
         let diff = ObservationDiff {
             since_seq: 4,
             seq: 5,
             omitted: 2,
+            marks: vec![(NodeId("a".into()), 1), (NodeId("c".into()), 3)],
             added: vec![],
             removed: vec![NodeId("b".into())],
             changed: vec![el("a", 0.2)],
@@ -3818,6 +3832,7 @@ mod tests {
         assert_eq!(ids, vec!["a", "c"]);
         assert_eq!(rebuilt.elements[0].rank, 0.2, "changed content not applied");
         assert_eq!(rebuilt.omitted, 2);
+        assert_eq!(rebuilt.marks, diff.marks);
     }
 
     #[test]
@@ -3834,6 +3849,7 @@ mod tests {
             since_seq: 4,
             seq: 5,
             omitted: 0,
+            marks: Vec::new(),
             added: vec![],
             removed: vec![],
             changed: vec![],
@@ -3883,12 +3899,43 @@ mod tests {
             }
         )
         .is_none());
-        // A set-of-marks overlay the diff cannot reproduce.
+        // Set-of-marks labels come from the diff. A marked base can still use
+        // prompt-diff context after the observe layer vends current labels.
         let marked = CompiledObservation {
             marks: vec![(NodeId("a".into()), 1)],
             ..base.clone()
         };
-        assert!(reconstruct_observation(&marked, &ok).is_none());
+        assert!(
+            reconstruct_observation(&marked, &ok).is_none(),
+            "missing diff marks are ambiguous for a marked base, so full observe"
+        );
+        let Some(rebuilt) = reconstruct_observation(
+            &marked,
+            &ObservationDiff {
+                marks: vec![(NodeId("a".into()), 7)],
+                ..ok.clone()
+            },
+        ) else {
+            panic!("marked diff should reconstruct from diff marks");
+        };
+        assert_eq!(rebuilt.marks, vec![(NodeId("a".into()), 7)]);
+        // Marks must still point at reconstructed elements with non-zero labels.
+        assert!(reconstruct_observation(
+            &base,
+            &ObservationDiff {
+                marks: vec![(NodeId("z".into()), 1)],
+                ..ok.clone()
+            }
+        )
+        .is_none());
+        assert!(reconstruct_observation(
+            &base,
+            &ObservationDiff {
+                marks: vec![(NodeId("a".into()), 0)],
+                ..ok.clone()
+            }
+        )
+        .is_none());
     }
 
     #[test]
@@ -3905,6 +3952,7 @@ mod tests {
             since_seq: 4,
             seq: 5,
             omitted: 0,
+            marks: Vec::new(),
             added: vec![],
             removed: vec![],
             changed: vec![el("a", 0.2)],

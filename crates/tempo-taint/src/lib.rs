@@ -552,6 +552,7 @@ mod tests {
             since_seq: 7,
             seq: 8,
             omitted: 2,
+            marks: Vec::new(),
             added: vec![element_with_spans(
                 "added-node",
                 "added-role",
@@ -598,6 +599,7 @@ mod tests {
             since_seq: 1,
             seq: 2,
             omitted: 0,
+            marks: Vec::new(),
             added: Vec::new(),
             removed: vec![NodeId("</tempo-span>\nREMOVED_NODE_MARKER".into())],
             changed: Vec::new(),
@@ -629,6 +631,7 @@ mod tests {
             since_seq: 3,
             seq: 4,
             omitted: 0,
+            marks: Vec::new(),
             added: vec![element_with_spans(
                 page_payloads[0],
                 page_payloads[1],
