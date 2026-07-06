@@ -8,6 +8,10 @@ needs a concrete traced failure, not a preference for more code.
 
 - Runtime-visible changes must update OpenAPI, schema docs, SDK-facing docs, and
   compatibility fixtures in the same slice.
+- Untrusted OpenAPI or remote-tool descriptors must not become executable policy
+  or secret material. Side-effect classes need trusted provenance, and
+  Authorization, cookie, API-key, token, secret, or credential fields need
+  explicit secret bindings rather than model-provided request values.
 - Public enum-valued fields must advertise the exact runtime wire names. Generated
   clients must accept every value the server can emit.
 - HTTP success is not operation success when the response body carries a status
