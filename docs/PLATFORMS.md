@@ -1,4 +1,4 @@
-# tempo everywhere — first-principles plan for macOS, Windows, Android, iOS
+# tempo everywhere — first-principles plan for Servo targets and system webviews
 
 `final.md` defines what tempo *is*: structured observation, semantic batched
 actions, state forking, API-first fast path. This document defines how that
@@ -37,10 +37,11 @@ committed implementation work:
   contract, observation/action, policy/taint, network, session, agent, MCP/BiDi,
   eval, and config layers; it intentionally excludes the Unix engine-host and
   tempod transport crates until #260 lands.
-- **Servo availability source of truth**: #294 is the conservative platform
-  availability matrix. Tempo follows upstream Servo availability for macOS,
-  Linux, Windows, Android, and OpenHarmony; this document focuses on app/shell
-  sequencing and keeps #294 as the code-backed truth.
+- **Servo availability source of truth**: #294 and
+  `tempo-engine-servo::servo_platform_support_matrix()` are the conservative
+  platform availability matrix. Tempo follows upstream Servo availability for
+  macOS, Linux, Windows, Android, and OpenHarmony; this document focuses on
+  app/shell sequencing and keeps the code-backed matrix as truth.
 - **Latency series**: #297, #298, #299, #300, #301, and #302 own the binary
   frame, event-driven settle, batched enrichment, per-driver IPC, CI benchmark,
   and benchmark-harness work. The latency table here summarizes those gates; it
@@ -94,7 +95,7 @@ boundary.** Platform code lives in two thin layers only:
 
 | Tier | Engine | Where | Cost point |
 |------|--------|-------|-----------|
-| T1 | Servo (Rust, embedded in-process) | macOS, Windows, Linux, Android | Full web compat lane, GPU compositor |
+| T1 | Servo (Rust, embedded in-process) | every upstream-supported Servo target: macOS, Linux, Windows, Android, OpenHarmony | Full web compat lane, GPU compositor |
 | T2 | System webview (WKWebView / WebView2 / Android WebView) | iOS (required by policy), plus low-RAM Android and fast-ship desktop | Zero engine bytes shipped; observation via injected agent runtime |
 | T3 | No engine — API-first fast path (`tempo-net` + handshake) | every device, including watches/CI | Skips rendering entirely when the origin speaks an agent protocol |
 
@@ -117,8 +118,13 @@ extraction script).
   cfg coverage; it is not a drop-in replacement until those checks exist.
 - **Android**: target state is an NDK build of tempo-core, app-private local
   control sockets, WebView T2 below a RAM threshold, and Servo T1 on capable
-  devices when #294 says the upstream Servo target is available. Android work
-  must stay RAM-bounded and avoid desktop-only assumptions in shared crates.
+  devices when the Servo support matrix says the upstream target is available.
+  Android work must stay RAM-bounded and avoid desktop-only assumptions in
+  shared crates.
+- **OpenHarmony**: target state follows the same T1 Servo availability matrix
+  and the same app-private transport discipline as Android. It is supported by
+  shared core and thin transport/shell adapters, not by special-case logic in
+  contracts, observation, policy, or agent crates.
 - **iOS**: target state is tempo-core as a static lib behind a Swift shell,
   WKWebView T2, and localhost MCP for on-device agent apps. Network Extension
   should remain unnecessary unless a future issue proves an out-of-process net
@@ -202,8 +208,9 @@ be backed by a concrete implementation issue or PR before it is treated as
 committed work.
 
 1. **Now**: close the current-state blockers (#246, #247, #249), keep platform
-   availability grounded in #294, and land the benchmark/latency series
-   (#297-#302). These shrink and harden the core every port inherits.
+   availability grounded in the Servo support matrix, and land the
+   benchmark/latency series (#297-#302). These shrink and harden the core every
+   port inherits.
 2. **M+1**: macOS shell (winit/wgpu over a conformant local daemon); binary
    screenshot frames; event-driven settle from the Servo embedder.
 3. **M+2**: Windows shell (secure named-pipe transport under #260 + WebView2

@@ -4,7 +4,7 @@
 
 > **Current implementation status (2026-07-05).** The shippable preview is local CDP: `tempod` defaults to `engine=cdp`, auto-starts a sibling `tempo-engined-cdp` binary when no `--engine-socket` is supplied, and serves loopback HTTP/MCP/BiDi with bearer auth. A pre-started engine can still be attached with `--engine cdp --engine-socket PATH`. The native Servo `tempo-engined` binary, production remote/fleet posture, Windows-native IPC, and taint-to-beatbox live dispatch are not shipped preview guarantees.
 
-Engine strategy is **CDP-first for the current developer preview, Servo-promotable by evidence**: the runnable lane is headless Chromium via CDP behind the same driver trait; [Servo](https://servo.org) is the Rust-native target lane that promotes after the M-vanilla/M4 gates pass. tempo reuses the existing **beater** stack heavily (`~/Desktop/beater`) — the browser-automation crates, the durable agent loop, the discovery/handshake surfaces, and the polyglot sandbox.
+Engine strategy is **CDP-first for the current developer preview, Servo-promotable by evidence**: the runnable lane is headless Chromium via CDP behind the same driver trait; [Servo](https://servo.org) is the Rust-native target lane on every upstream-supported Servo target and promotes after the M-vanilla/M4 gates pass. Platform availability is code-backed by `tempo-engine-servo::servo_platform_support_matrix()` so macOS, Linux, Windows, Android, OpenHarmony, and future Servo targets share one source of truth. tempo reuses the existing **beater** stack heavily (`~/Desktop/beater`) — the browser-automation crates, the durable agent loop, the discovery/handshake surfaces, and the polyglot sandbox.
 
 ---
 
@@ -49,7 +49,7 @@ What an agent needs from a browser that Chrome, Firefox, and Arc were never buil
 7. **A hard trust boundary.** Page content is *data*, never *instructions* — the lesson of every Comet/Atlas injection. → **taint labels** on every observation span (page-derived / system / user), carried end-to-end into the prompt serializer, plus a **side-effect policy gate**.
 8. **Agent identity on the wire.** The web is deploying cryptographic bot verification right now. → Web Bot Auth HTTP message signatures built into the network layer; dual-mode (agent-declared vs user-driven) per origin.
 9. **The structured-web fast path.** If a site exposes agent tools/APIs, rendering it is wasted work. → probe `.well-known/beater.json`, agent-card, `llms.txt`, OpenAPI, and WebMCP *before* rendering; when present, **skip pixels entirely** and call tools.
-10. **Parallelism & remote management.** Agents run many sessions, often on remote fleets. → headless-first daemon, session pool, per-session ephemeral profiles, portable journals, OTLP observability. Remote/fleet operation is gated beyond the local CDP preview.
+10. **Parallelism & remote management.** Agents run many sessions, often on remote fleets and sometimes on constrained mobile devices. → headless-first daemon, session pool, per-session ephemeral profiles, portable journals, OTLP observability, and thin platform adapters so Android/mobile support does not inherit desktop-only IPC, RAM, or windowing assumptions. Remote/fleet operation is gated beyond the local CDP preview.
 
 ---
 
@@ -421,7 +421,7 @@ Milestones are **capability gates**, not calendar points. Each lists the objecti
 ### 8.3 Always-green invariants (enforced continuously, not per-milestone)
 
 - Every engine passes conformance suite v2 on every commit (no engine regresses).
-- `tempo-engine-servo` always builds against pinned **vanilla** Servo (fork features strictly additive).
+- `tempo-engine-servo` always builds against pinned **vanilla** Servo (fork features strictly additive) and its platform matrix stays the source of truth for every Servo-available target.
 - CI budget evaluators (§10) fail the build on regression beyond the stated p50/p95 bars.
 - Injection corpus + SSRF suite + policy-gate property tests run on every PR touching observe/act/net/policy/taint/toolexec.
 - Workspace lints hold repo-wide: `unsafe_code = forbid`, `unwrap_used`/`expect_used = deny` (inherited from beater/beatbox conventions).
