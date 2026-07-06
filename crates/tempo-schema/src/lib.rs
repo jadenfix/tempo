@@ -977,7 +977,7 @@ pub fn observation_diff_json_schema() -> Value {
                     "type": "array",
                     "prefixItems": [
                         { "$ref": "#/$defs/NodeId" },
-                        { "type": "integer", "minimum": 1, "maximum": u32::MAX }
+                        { "type": "integer", "minimum": 0, "maximum": u32::MAX }
                     ],
                     "minItems": 2,
                     "maxItems": 2
@@ -1983,7 +1983,12 @@ mod tests {
         // The schema must reject mark labels serde would reject (`u32` overflow).
         let observation = compiled_observation_json_schema();
         let label = &observation["properties"]["marks"]["items"]["prefixItems"][1];
+        assert_eq!(label["minimum"], 0);
         assert_eq!(label["maximum"], u32::MAX);
+        let diff = observation_diff_json_schema();
+        let diff_label = &diff["properties"]["marks"]["items"]["prefixItems"][1];
+        assert_eq!(diff_label["minimum"], 0);
+        assert_eq!(diff_label["maximum"], u32::MAX);
 
         let overflow = format!(
             r#"{{"schema_version":"{SCHEMA_VERSION}","url":"u","seq":1,"elements":[],"marks":[["n",{}]]}}"#,

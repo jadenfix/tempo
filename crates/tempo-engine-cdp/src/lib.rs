@@ -2716,9 +2716,11 @@ fn compile_observation(
 
 fn raw_element_from_selector_element(element: &InteractiveElement) -> RawElement {
     let mut raw = RawElement::new(element.role.clone(), "")
-        .source_id(element.node_id.0.clone())
         .name_spans(element.name.clone())
         .value_spans(element.value.clone());
+    if let Some(source_id) = source_id_for_selector_element(element) {
+        raw = raw.source_id(source_id);
+    }
     if let Some(stable_hint) = stable_hint_for_selector_element(element) {
         raw = raw.stable_hint(stable_hint);
     }
@@ -2726,6 +2728,14 @@ fn raw_element_from_selector_element(element: &InteractiveElement) -> RawElement
         raw = raw.bounds(bounds);
     }
     raw
+}
+
+fn source_id_for_selector_element(element: &InteractiveElement) -> Option<String> {
+    let selector = element.node_id.0.as_str();
+    if selector.contains(":nth-of-type(") {
+        return None;
+    }
+    Some(selector.to_string())
 }
 
 fn stable_hint_for_selector_element(element: &InteractiveElement) -> Option<String> {
@@ -3801,6 +3811,87 @@ mod tests {
         assert_eq!(
             selectors.get(&save_node).map(String::as_str),
             Some("[id=\"renamed-save\"]")
+        );
+    }
+
+    #[test]
+    fn id_selector_text_mutation_keeps_node_id_and_selector() {
+        let mut mapper = StableIdMapper::new();
+        let (first, first_selectors) = compile_observation(
+            &mut mapper,
+            "https://example.test/".into(),
+            r#"<main><button id="save">Save</button></main>"#.into(),
+            1,
+        );
+        let save_node = first.elements[0].node_id.clone();
+        assert_eq!(
+            first_selectors.get(&save_node).map(String::as_str),
+            Some("[id=\"save\"]")
+        );
+
+        let (second, selectors) = compile_observation(
+            &mut mapper,
+            "https://example.test/".into(),
+            r#"<main><button id="save">Saved</button></main>"#.into(),
+            2,
+        );
+
+        assert_eq!(second.elements[0].node_id, save_node);
+        assert_eq!(
+            selectors.get(&save_node).map(String::as_str),
+            Some("[id=\"save\"]")
+        );
+    }
+
+    #[test]
+    fn duplicate_id_selectors_keep_node_ids_when_reordered() {
+        let mut mapper = StableIdMapper::new();
+        let (first, first_selectors) = compile_observation(
+            &mut mapper,
+            "https://example.test/".into(),
+            r#"<main><button id="delete-a">Delete</button><button id="delete-b">Delete</button></main>"#
+                .into(),
+            1,
+        );
+        let delete_a = first
+            .elements
+            .iter()
+            .find(|element| {
+                first_selectors.get(&element.node_id).map(String::as_str)
+                    == Some("[id=\"delete-a\"]")
+            })
+            .map(|element| element.node_id.clone());
+        let Some(delete_a) = delete_a else {
+            panic!("delete-a should be present");
+        };
+        let delete_b = first
+            .elements
+            .iter()
+            .find(|element| {
+                first_selectors.get(&element.node_id).map(String::as_str)
+                    == Some("[id=\"delete-b\"]")
+            })
+            .map(|element| element.node_id.clone());
+        let Some(delete_b) = delete_b else {
+            panic!("delete-b should be present");
+        };
+        assert_ne!(delete_a, delete_b);
+
+        let (_second, selectors) = compile_observation(
+            &mut mapper,
+            "https://example.test/".into(),
+            r#"<main><button id="delete-b">Delete</button><button id="delete-a">Delete</button></main>"#
+                .into(),
+            2,
+        );
+
+        assert_eq!(
+            selectors.get(&delete_a).map(String::as_str),
+            Some("[id=\"delete-a\"]")
+        );
+        assert_eq!(
+            selectors.get(&delete_b).map(String::as_str),
+            Some("[id=\"delete-b\"]")
         );
     }
 

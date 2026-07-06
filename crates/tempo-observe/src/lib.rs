@@ -532,23 +532,27 @@ impl StableIdMapper {
             let _ = write!(fingerprint, "{base_fingerprint}#{occurrence}");
         }
 
+        if let Some(source_key) = &source_key
+            && let Some(entry) = self.by_source.get_mut(source_key)
+        {
+            entry.last_seen = seq;
+            let node_id = entry.node_id.clone();
+            self.by_fingerprint.insert(
+                fingerprint,
+                MappedId {
+                    node_id: node_id.clone(),
+                    last_seen: seq,
+                },
+            );
+            return node_id;
+        }
+
         if raw.stable_hint.is_some() {
             return self.node_id_for_stable_hint(
                 source_key,
                 base_fingerprint.as_str(),
                 fingerprint,
             );
-        }
-
-        if let Some(source_key) = &source_key
-            && let Some(entry) = self.by_source.get_mut(source_key)
-        {
-            entry.last_seen = seq;
-            let node_id = entry.node_id.clone();
-            if let Some(entry) = self.by_fingerprint.get_mut(&fingerprint) {
-                entry.last_seen = seq;
-            }
-            return node_id;
         }
 
         if let Some(entry) = self.by_fingerprint.get_mut(&fingerprint) {
@@ -567,13 +571,9 @@ impl StableIdMapper {
         }
 
         // Allocation-key rule over the digests already computed above: a
-        // stable hint (or a missing source id) allocates from the
-        // fingerprint, otherwise from the source identity.
-        let allocation_key = if raw.stable_hint.is_some() {
-            base_fingerprint.as_str()
-        } else {
-            source_key.as_deref().unwrap_or(base_fingerprint.as_str())
-        };
+        // missing source id allocates from the fingerprint, otherwise from the
+        // source identity.
+        let allocation_key = source_key.as_deref().unwrap_or(base_fingerprint.as_str());
         let node_id = self.allocate(allocation_key);
         if let Some(source_key) = source_key {
             self.by_source.insert(
@@ -1944,6 +1944,56 @@ mod tests {
         assert!(first.iter().all(|node_id| node_id.0.starts_with("node:")));
         assert_eq!(second[0], first[0]);
         assert_eq!(second[1], first[1]);
+    }
+
+    #[test]
+    fn stable_mapper_prefers_source_identity_over_changed_hint() {
+        let mut mapper = StableIdMapper::new();
+        let first = mapper.map_snapshot(
+            1,
+            &[RawElement::new("button", "Save")
+                .source_id("css:[id=save]")
+                .stable_hint("fallback:button:Save:")],
+        );
+        let second = mapper.map_snapshot(
+            2,
+            &[RawElement::new("button", "Saved")
+                .source_id("css:[id=save]")
+                .stable_hint("fallback:button:Saved:")],
+        );
+
+        assert_eq!(second[0], first[0]);
+    }
+
+    #[test]
+    fn stable_mapper_rebinds_fingerprint_occurrences_to_source_hits() {
+        let mut mapper = StableIdMapper::new();
+        let first = mapper.map_snapshot(
+            1,
+            &[
+                RawElement::new("button", "Delete")
+                    .source_id("css:[id=delete-a]")
+                    .stable_hint("fallback:button:Delete:"),
+                RawElement::new("button", "Delete")
+                    .source_id("css:[id=delete-b]")
+                    .stable_hint("fallback:button:Delete:"),
+            ],
+        );
+        let second = mapper.map_snapshot(
+            2,
+            &[
+                RawElement::new("button", "Delete")
+                    .source_id("css:[id=delete-b]")
+                    .stable_hint("fallback:button:Delete:"),
+                RawElement::new("button", "Delete")
+                    .source_id("css:[id=delete-a]")
+                    .stable_hint("fallback:button:Delete:"),
+            ],
+        );
+
+        assert_ne!(first[0], first[1]);
+        assert_eq!(second[0], first[1]);
+        assert_eq!(second[1], first[0]);
     }
 
     #[test]
