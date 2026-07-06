@@ -8351,10 +8351,13 @@ mod tests {
         let session = pool.finish_create("https://runs.test".into(), None);
         let run_id = insert_test_run(&mut pool, &session.id, AgentRunState::Completed, false);
 
-        let error = pool.resume_run(&run_id);
+        let error = match pool.resume_run(&run_id) {
+            Ok(_) => return Err("completed run must not resume".into()),
+            Err(error) => error,
+        };
+
         assert!(
-            matches!(error, Err(TempodError::Conflict(message)) if message.contains("run_not_resumable")),
-            "completed run must not resume"
+            matches!(error, TempodError::Conflict(message) if message.contains("run_not_resumable"))
         );
         assert_eq!(pool.run(&run_id)?.state, AgentRunState::Completed);
         assert_eq!(
@@ -8381,13 +8384,13 @@ mod tests {
             }),
         )?;
 
-        let error = pool.resume_run(&run_id);
+        let error = match pool.resume_run(&run_id) {
+            Ok(_) => return Err("human-owned waiting run must require handoff first".into()),
+            Err(error) => error,
+        };
+
         assert!(
-            matches!(
-                error,
-                Err(TempodError::Conflict(message)) if message.contains("human currently owns")
-            ),
-            "human-owned waiting run must require handoff first"
+            matches!(error, TempodError::Conflict(message) if message.contains("human currently owns"))
         );
         assert_eq!(pool.run(&run_id)?.state, AgentRunState::WaitingForHuman);
         assert_eq!(
@@ -8426,13 +8429,13 @@ mod tests {
         let session = pool.finish_create("https://runs.test".into(), None);
         let run_id = insert_test_run(&mut pool, &session.id, AgentRunState::Failed, false);
 
-        let error = pool.cancel_run(&run_id);
+        let error = match pool.cancel_run(&run_id) {
+            Ok(_) => return Err("terminal run must not be cancellable".into()),
+            Err(error) => error,
+        };
+
         assert!(
-            matches!(
-                error,
-                Err(TempodError::Conflict(message)) if message.contains("run_not_cancellable")
-            ),
-            "terminal run must not be cancellable"
+            matches!(error, TempodError::Conflict(message) if message.contains("run_not_cancellable"))
         );
         assert_eq!(pool.run(&run_id)?.state, AgentRunState::Failed);
         Ok(())
