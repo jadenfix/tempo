@@ -60,6 +60,12 @@ jobs:
           --input fixtures/evals/ci-budget-pass.jsonl
           --min-success-rate 1
           --max-fallback-rate 0
+      - name: e2e latency budget fixture gate
+        run: >
+          cargo run -p tempo-cli -- e2e-budget
+          --input fixtures/evals/ci-budget-pass.jsonl
+          --max-observe-p50-ms 150
+          --max-act-to-settled-p50-ms 800
       - name: observe fixture gate
         run: >
           cargo run -p tempo-cli -- observe-gate
