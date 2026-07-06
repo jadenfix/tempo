@@ -5719,7 +5719,6 @@ fn route_session_act_batch(
         (driver, idempotency_key, policy, server_confirmed)
     };
 
-    cancel.check_tempod()?;
     let response = match driver.act_batch_with_cancel(&body.batch, cancel) {
         Ok(outcome) => CachedSessionActBatchResponse {
             status: 200,
@@ -5731,10 +5730,19 @@ fn route_session_act_batch(
             }
             return Err(TempodError::RequestCancelled);
         }
-        Err(CancellableDriverError::Transport(error)) => CachedSessionActBatchResponse {
-            status: 500,
-            body: json!({ "error": error.to_string() }),
-        },
+        Err(CancellableDriverError::Transport(error)) => {
+            if idempotency_key.is_some() {
+                CachedSessionActBatchResponse {
+                    status: 409,
+                    body: session_act_batch_unknown_outcome_response(&policy),
+                }
+            } else {
+                CachedSessionActBatchResponse {
+                    status: 500,
+                    body: json!({ "error": error.to_string() }),
+                }
+            }
+        }
     };
 
     if let Some(key) = idempotency_key {
@@ -16073,6 +16081,162 @@ mod tests {
             elapsed < Duration::from_secs(1),
             "cancelled gate waiter should not wait for full timeout: {elapsed:?}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn issue414_cancel_after_idempotency_lease_clears_provisional_response() -> TestResult {
+        let (client_stream, mut server_stream) = UnixStream::pair()?;
+        server_stream.set_nonblocking(true)?;
+        let mut pool = SessionPool::default();
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream))?;
+        let session_driver = pool
+            .driver
+            .clone()
+            .ok_or("attached engine driver should be present")?;
+        let session = pool.finish_create("https://cancel-window.test".into(), Some(session_driver));
+        let held_gate = pool
+            .session_drivers
+            .get(&session.id)
+            .ok_or("session driver should be attached")?
+            .gate
+            .acquire(Duration::from_secs(1))
+            .ok_or("initial gate acquisition must succeed")?;
+
+        let body = parse_session_act_batch_request(
+            br#"{
+                "batch": {
+                    "actions": [{"kind": "scroll", "x": 0.0, "y": 4.0}],
+                    "quiescence": "composite"
+                },
+                "input_tainted": false,
+                "idempotency_key": "cancel-window"
+            }"#,
+        )?;
+        let request_fingerprint = session_act_batch_idempotency_fingerprint(&body);
+        let session_id = session.id.clone();
+        let shared = Arc::new(Mutex::new(pool));
+        let cancel = RequestCancel::default();
+        let worker_pool = Arc::clone(&shared);
+        let worker_cancel = cancel.clone();
+        let worker_session_id = session_id.clone();
+        let worker = thread::spawn(move || {
+            route_session_act_batch(&worker_pool, worker_session_id, body, &worker_cancel)
+        });
+
+        let started = Instant::now();
+        loop {
+            if lock_pool(&shared)?.session_idempotency_record_count(&session_id) == 1 {
+                break;
+            }
+            if started.elapsed() > Duration::from_secs(1) {
+                return Err("act_batch did not reserve provisional idempotency response".into());
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        cancel.cancel();
+        match worker.join().map_err(|_| "route worker panicked")? {
+            Err(TempodError::RequestCancelled) => {}
+            Err(error) => return Err(format!("expected cancellation, got {error}").into()),
+            Ok(response) => {
+                return Err(format!("expected cancellation, got HTTP {}", response.status).into());
+            }
+        }
+        drop(held_gate);
+
+        {
+            let pool = lock_pool(&shared)?;
+            assert_eq!(pool.session_idempotency_record_count(&session_id), 0);
+            assert!(
+                pool.cached_session_act_batch_response(
+                    &session_id,
+                    "cancel-window",
+                    &request_fingerprint,
+                )?
+                .is_none(),
+                "pre-dispatch cancellation must not leave an unknown-outcome replay"
+            );
+        }
+        assert_no_driver_ipc(&mut server_stream)?;
+        discard_unserved_attached_engine(&mut *lock_pool(&shared)?);
+        Ok(())
+    }
+
+    #[test]
+    fn issue414_post_dispatch_transport_error_preserves_unknown_outcome_replay() -> TestResult {
+        let (client_stream, server_stream) = UnixStream::pair()?;
+        let (dispatched_tx, dispatched_rx) = std::sync::mpsc::channel();
+        let handler = thread::spawn(move || {
+            let mut connection = EngineIpcConnection::from_stream(server_stream);
+            let request = connection.read_driver_request()?;
+            let _ = dispatched_tx.send(request.command);
+            Ok::<(), EngineHostError>(())
+        });
+
+        let mut pool = SessionPool::default();
+        pool.attach_engine_driver(Engine::Cdp, EngineIpcClient::from_stream(client_stream))?;
+        let session_driver = pool
+            .driver
+            .clone()
+            .ok_or("attached engine driver should be present")?;
+        let session = pool.finish_create("https://post-dispatch.test".into(), Some(session_driver));
+        let body_bytes = br#"{
+            "batch": {
+                "actions": [{"kind": "scroll", "x": 0.0, "y": 4.0}],
+                "quiescence": "composite"
+            },
+            "input_tainted": false,
+            "idempotency_key": "post-dispatch"
+        }"#;
+        let body = parse_session_act_batch_request(body_bytes)?;
+        let request_fingerprint = session_act_batch_idempotency_fingerprint(&body);
+        let session_id = session.id.clone();
+        let shared = Arc::new(Mutex::new(pool));
+        let cancel = RequestCancel::default();
+        let worker_pool = Arc::clone(&shared);
+        let worker_cancel = cancel.clone();
+        let worker_session_id = session_id.clone();
+        let worker = thread::spawn(move || {
+            route_session_act_batch(&worker_pool, worker_session_id, body, &worker_cancel)
+        });
+
+        let command = dispatched_rx.recv_timeout(Duration::from_secs(1))?;
+        assert!(matches!(command, HostDriverCommand::ActBatch { .. }));
+        cancel.cancel();
+        join_driver_handler(handler)?;
+
+        let first = worker.join().map_err(|_| "route worker panicked")??;
+        assert_eq!(first.status, 409);
+        let first_body: Value = serde_json::from_slice(&first.body)?;
+        assert_eq!(first_body["status"], "unknown_outcome");
+
+        {
+            let pool = lock_pool(&shared)?;
+            assert_eq!(pool.session_idempotency_record_count(&session_id), 1);
+            let cached = pool
+                .cached_session_act_batch_response(
+                    &session_id,
+                    "post-dispatch",
+                    &request_fingerprint,
+                )?
+                .ok_or("post-dispatch transport error should keep an idempotency entry")?;
+            assert_eq!(cached.status, 409);
+            assert_eq!(cached.body["status"], "unknown_outcome");
+        }
+
+        let replay_body = parse_session_act_batch_request(body_bytes)?;
+        let replay = route_session_act_batch(
+            &shared,
+            session_id.clone(),
+            replay_body,
+            &RequestCancel::default(),
+        )?;
+        assert_eq!(replay.status, 409);
+        let replay_body: Value = serde_json::from_slice(&replay.body)?;
+        assert_eq!(replay_body["status"], "unknown_outcome");
+
+        discard_unserved_attached_engine(&mut *lock_pool(&shared)?);
         Ok(())
     }
 
