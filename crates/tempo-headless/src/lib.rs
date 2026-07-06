@@ -23,6 +23,8 @@ use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::service::TowerToHyperService;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as JsonValue};
+#[cfg(test)]
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::fs::{File, OpenOptions};
@@ -151,6 +153,32 @@ const TEMPOD_AUTH_TOKEN_FILE_NAME: &str = "tempod.token";
 /// cannot be recovered by an offline dictionary search of the exported value.
 const REDACTED_MARKER: &str = "[redacted]";
 
+#[cfg(test)]
+thread_local! {
+    static TEST_RUNTIME_AUTH_TOKEN_PATH: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+struct TestRuntimeAuthTokenPathGuard {
+    previous: Option<PathBuf>,
+}
+
+#[cfg(test)]
+impl Drop for TestRuntimeAuthTokenPathGuard {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        TEST_RUNTIME_AUTH_TOKEN_PATH.with(|path| {
+            *path.borrow_mut() = previous;
+        });
+    }
+}
+
+#[cfg(test)]
+fn scoped_test_runtime_auth_token_path(path: PathBuf) -> TestRuntimeAuthTokenPathGuard {
+    let previous = TEST_RUNTIME_AUTH_TOKEN_PATH.with(|slot| slot.borrow_mut().replace(path));
+    TestRuntimeAuthTokenPathGuard { previous }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TempodRuntimeAuthToken {
     pub token: String,
@@ -199,6 +227,10 @@ impl TempodAuth {
 }
 
 pub fn tempod_runtime_auth_token_path() -> PathBuf {
+    #[cfg(test)]
+    if let Some(path) = TEST_RUNTIME_AUTH_TOKEN_PATH.with(|slot| slot.borrow().clone()) {
+        return path;
+    }
     if let Some(path) =
         std::env::var_os(TEMPO_TEMPOD_AUTH_TOKEN_FILE_ENV).filter(|path| !path.is_empty())
     {
@@ -11234,6 +11266,37 @@ mod tests {
     }
 
     #[test]
+    fn serve_one_default_config_requires_runtime_bearer_token() -> TestResult {
+        let root = unique_dir("serve-one-runtime-auth")?;
+        remove_dir_if_exists(&root)?;
+        let token_path = root.join("tempod.token");
+        let body = r#"{"url":"https://one.test"}"#;
+
+        let missing = serve_one_post_session_with_runtime_auth_path(&token_path, None, body)?;
+        assert!(
+            missing.starts_with("HTTP/1.1 401 Unauthorized"),
+            "default serve_one must reject missing bearer token, got: {missing}"
+        );
+
+        let token = std::fs::read_to_string(&token_path)?.trim().to_string();
+        assert!(
+            token.len() >= 40,
+            "serve_one should create a high-entropy runtime token"
+        );
+
+        let allowed =
+            serve_one_post_session_with_runtime_auth_path(&token_path, Some(&token), body)?;
+        assert!(
+            allowed.starts_with("HTTP/1.1 201 Created"),
+            "runtime bearer token should authorize the public serve_one path, got: {allowed}"
+        );
+        assert!(allowed.contains("\"id\":\"session-0\""));
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[test]
     fn control_routes_reject_cross_origin_requests() -> TestResult {
         // #83 follow-up: session/control-plane routes must share the loopback
         // Origin guard so a DNS-rebinding page cannot create/drive sessions.
@@ -12172,6 +12235,33 @@ mod tests {
         stream.write_all(request.as_bytes())?;
         stream.shutdown(std::net::Shutdown::Write)?;
         read_http_response(&mut stream)
+    }
+
+    fn serve_one_post_session_with_runtime_auth_path(
+        token_path: &Path,
+        bearer: Option<&str>,
+        body: &str,
+    ) -> Result<String, Box<dyn Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let pool = Arc::new(Mutex::new(SessionPool::default()));
+        let token_path = token_path.to_path_buf();
+        let handle = thread::spawn(move || {
+            let _runtime_auth_path = scoped_test_runtime_auth_token_path(token_path);
+            serve_one(listener, pool)
+        });
+        let authorization = bearer
+            .map(|token| format!("authorization: Bearer {token}\r\n"))
+            .unwrap_or_default();
+        let response = send_http(
+            addr,
+            &format!(
+                "POST /sessions HTTP/1.1\r\n{authorization}content-length: {}\r\n\r\n{body}",
+                body.len()
+            ),
+        )?;
+        join_server(handle)?;
+        Ok(response)
     }
 
     fn request_with_default_host(addr: std::net::SocketAddr, request: &str) -> String {
