@@ -174,6 +174,24 @@ impl RawElement {
             return opaque_identity_key("hint", &[hint.as_str()]);
         }
 
+        self.semantic_fingerprint_key()
+    }
+
+    fn fingerprint_keys(&self) -> Vec<String> {
+        let primary = self.fingerprint_key();
+        if self.stable_hint.is_none() {
+            return vec![primary];
+        }
+
+        let fallback = self.semantic_fingerprint_key();
+        if fallback == primary {
+            vec![primary]
+        } else {
+            vec![primary, fallback]
+        }
+    }
+
+    fn semantic_fingerprint_key(&self) -> String {
         let mut role = String::with_capacity(self.role.len());
         let mut name = String::with_capacity(spans_text_len(&self.name));
         let mut value = String::with_capacity(spans_text_len(&self.value));
@@ -508,116 +526,73 @@ impl StableIdMapper {
         // whichever key it chose — which dominated compile cost on large
         // snapshots.
         let source_key = raw.source_key();
-        let base_fingerprint = raw.fingerprint_key();
+        let base_fingerprints = raw.fingerprint_keys();
 
         // Disambiguate elements that share a fingerprint within this snapshot: the
         // Nth occurrence gets its own lookup key so two genuinely distinct
         // elements never resolve to the same NodeId (issue #105).
-        // get_mut-then-insert instead of entry(clone): the common case (first
-        // occurrence within a snapshot) pays one clone, repeats pay none.
-        let occurrence = match self.occurrences.get_mut(&base_fingerprint) {
-            Some(counter) => {
-                let current = *counter;
-                *counter += 1;
-                current
-            }
-            None => {
-                self.occurrences.insert(base_fingerprint.clone(), 1);
-                0
-            }
-        };
-        let mut fingerprint = String::with_capacity(base_fingerprint.len() + 4);
-        {
-            use std::fmt::Write as _;
-            let _ = write!(fingerprint, "{base_fingerprint}#{occurrence}");
-        }
+        let fingerprints: Vec<String> = base_fingerprints
+            .iter()
+            .map(|base_fingerprint| self.snapshot_fingerprint_key(base_fingerprint))
+            .collect();
 
         if let Some(source_key) = &source_key
             && let Some(entry) = self.by_source.get_mut(source_key)
         {
             entry.last_seen = seq;
             let node_id = entry.node_id.clone();
-            self.by_fingerprint.insert(
-                fingerprint,
-                MappedId {
-                    node_id: node_id.clone(),
-                    last_seen: seq,
-                },
-            );
+            self.insert_fingerprint_mappings(&fingerprints, &node_id, seq);
             return node_id;
         }
 
-        if raw.stable_hint.is_some() {
-            return self.node_id_for_stable_hint(
-                source_key,
-                base_fingerprint.as_str(),
-                fingerprint,
-            );
-        }
-
-        if let Some(entry) = self.by_fingerprint.get_mut(&fingerprint) {
-            entry.last_seen = seq;
-            let node_id = entry.node_id.clone();
-            if let Some(source_key) = source_key {
-                self.by_source.insert(
-                    source_key,
-                    MappedId {
-                        node_id: node_id.clone(),
-                        last_seen: seq,
-                    },
-                );
-            }
+        if let Some(node_id) = self.node_id_for_fingerprint_hit(&fingerprints, seq) {
+            self.insert_source_mapping(source_key, &node_id, seq);
+            self.insert_fingerprint_mappings(&fingerprints, &node_id, seq);
             return node_id;
         }
 
         // Allocation-key rule over the digests already computed above: a
         // missing source id allocates from the fingerprint, otherwise from the
         // source identity.
-        let allocation_key = source_key.as_deref().unwrap_or(base_fingerprint.as_str());
+        let allocation_key = source_key
+            .as_deref()
+            .unwrap_or(base_fingerprints[0].as_str());
         let node_id = self.allocate(allocation_key);
-        if let Some(source_key) = source_key {
-            self.by_source.insert(
-                source_key,
-                MappedId {
-                    node_id: node_id.clone(),
-                    last_seen: seq,
-                },
-            );
-        }
-        self.by_fingerprint.insert(
-            fingerprint,
-            MappedId {
-                node_id: node_id.clone(),
-                last_seen: seq,
-            },
-        );
+        self.insert_source_mapping(source_key, &node_id, seq);
+        self.insert_fingerprint_mappings(&fingerprints, &node_id, seq);
         node_id
     }
 
-    fn node_id_for_stable_hint(
-        &mut self,
-        source_key: Option<String>,
-        base_fingerprint: &str,
-        fingerprint: String,
-    ) -> NodeId {
-        let seq = self.seq;
-
-        if let Some(entry) = self.by_fingerprint.get_mut(&fingerprint) {
-            entry.last_seen = seq;
-            let node_id = entry.node_id.clone();
-            if let Some(source_key) = source_key {
-                self.by_source.insert(
-                    source_key,
-                    MappedId {
-                        node_id: node_id.clone(),
-                        last_seen: seq,
-                    },
-                );
+    fn snapshot_fingerprint_key(&mut self, base_fingerprint: &str) -> String {
+        // get_mut-then-insert instead of entry(clone): the common case (first
+        // occurrence within a snapshot) pays one clone, repeats pay none.
+        let occurrence = match self.occurrences.get_mut(base_fingerprint) {
+            Some(counter) => {
+                let current = *counter;
+                *counter += 1;
+                current
             }
-            return node_id;
-        }
+            None => {
+                self.occurrences.insert(base_fingerprint.to_owned(), 1);
+                0
+            }
+        };
+        let mut fingerprint = String::with_capacity(base_fingerprint.len() + 4);
+        let _ = write!(fingerprint, "{base_fingerprint}#{occurrence}");
+        fingerprint
+    }
 
-        let node_id = self.allocate(base_fingerprint);
+    fn node_id_for_fingerprint_hit(&mut self, fingerprints: &[String], seq: u64) -> Option<NodeId> {
+        for fingerprint in fingerprints {
+            if let Some(entry) = self.by_fingerprint.get_mut(fingerprint) {
+                entry.last_seen = seq;
+                return Some(entry.node_id.clone());
+            }
+        }
+        None
+    }
+
+    fn insert_source_mapping(&mut self, source_key: Option<String>, node_id: &NodeId, seq: u64) {
         if let Some(source_key) = source_key {
             self.by_source.insert(
                 source_key,
@@ -627,14 +602,18 @@ impl StableIdMapper {
                 },
             );
         }
-        self.by_fingerprint.insert(
-            fingerprint,
-            MappedId {
-                node_id: node_id.clone(),
-                last_seen: seq,
-            },
-        );
-        node_id
+    }
+
+    fn insert_fingerprint_mappings(&mut self, fingerprints: &[String], node_id: &NodeId, seq: u64) {
+        for fingerprint in fingerprints {
+            self.by_fingerprint.insert(
+                fingerprint.clone(),
+                MappedId {
+                    node_id: node_id.clone(),
+                    last_seen: seq,
+                },
+            );
+        }
     }
 
     pub fn mark_labels_for(
@@ -1952,6 +1931,25 @@ mod tests {
     }
 
     #[test]
+    fn stable_ids_survive_source_and_hint_churn_via_content_fingerprint() {
+        let mut mapper = StableIdMapper::new();
+        let first = mapper.map_snapshot(
+            1,
+            &[RawElement::new("button", "Continue")
+                .source_id("ax:old")
+                .stable_hint("button#old")],
+        );
+        let second = mapper.map_snapshot(
+            2,
+            &[RawElement::new("button", "Continue")
+                .source_id("ax:new")
+                .stable_hint("button#new")],
+        );
+
+        assert_eq!(second[0], first[0]);
+    }
+
+    #[test]
     fn stable_mapper_prefers_source_identity_over_changed_hint() {
         let mut mapper = StableIdMapper::new();
         let first = mapper.map_snapshot(
@@ -2002,6 +2000,38 @@ mod tests {
     }
 
     #[test]
+    fn stable_mapper_keeps_duplicate_content_fallbacks_distinct() {
+        let mut mapper = StableIdMapper::new();
+        let first = mapper.map_snapshot(
+            1,
+            &[
+                RawElement::new("button", "Delete")
+                    .source_id("ax:delete-a")
+                    .stable_hint("button#delete-a"),
+                RawElement::new("button", "Delete")
+                    .source_id("ax:delete-b")
+                    .stable_hint("button#delete-b"),
+            ],
+        );
+        let second = mapper.map_snapshot(
+            2,
+            &[
+                RawElement::new("button", "Delete")
+                    .source_id("ax:delete-a-rerendered")
+                    .stable_hint("button#delete-a-rerendered"),
+                RawElement::new("button", "Delete")
+                    .source_id("ax:delete-b-rerendered")
+                    .stable_hint("button#delete-b-rerendered"),
+            ],
+        );
+
+        assert_ne!(first[0], first[1]);
+        assert_eq!(second[0], first[0]);
+        assert_eq!(second[1], first[1]);
+        assert_ne!(second[0], second[1]);
+    }
+
+    #[test]
     fn stable_mapper_retains_opaque_identity_keys() {
         let mut mapper = StableIdMapper::new();
         let element = RawElement::new("textbox", "Account secret")
@@ -2026,6 +2056,39 @@ mod tests {
             "css:input",
         ] {
             assert!(!retained.contains(secret), "leaked {secret}: {retained}");
+        }
+    }
+
+    #[test]
+    fn stable_mapper_content_fallbacks_remain_opaque() {
+        let mut mapper = StableIdMapper::new();
+        let first = RawElement::new("button", "Transfer 4111-secret")
+            .source_id("ax:old-secret")
+            .stable_hint("button#old-secret")
+            .value("sensitive-value");
+        let second = RawElement::new("button", "Transfer 4111-secret")
+            .source_id("ax:new-secret")
+            .stable_hint("button#new-secret")
+            .value("sensitive-value");
+
+        mapper.map_snapshot(1, std::slice::from_ref(&first));
+        mapper.map_snapshot(2, std::slice::from_ref(&second));
+        let retained = format!(
+            "{:?}\n{:?}",
+            mapper.by_source.keys().collect::<Vec<_>>(),
+            mapper.by_fingerprint.keys().collect::<Vec<_>>()
+        );
+
+        assert!(retained.contains("sha256"));
+        for secret in [
+            "Transfer 4111-secret",
+            "ax:old-secret",
+            "ax:new-secret",
+            "button#old-secret",
+            "button#new-secret",
+            "sensitive-value",
+        ] {
+            assert!(!retained.contains(secret), "{secret} leaked in {retained}");
         }
     }
 
