@@ -928,10 +928,8 @@ impl AttachedEngineDriver {
     ) -> Result<StepOutcome, CancellableDriverError> {
         match self
             .request_cancellable(command, Some(cancel))
-            .map_err(|error| match error {
-                DriverClientError::Cancelled => CancellableDriverError::CancelledBeforeDispatch,
-                other => CancellableDriverError::Transport(driver_client_transport_error(other)),
-            })? {
+            .map_err(cancellable_driver_error)?
+        {
             DriverResponse::Step { outcome } => Ok(outcome.into()),
             DriverResponse::Error { error } => Err(CancellableDriverError::Transport(
                 driver_wire_transport_error(error),
@@ -1151,7 +1149,18 @@ enum DriverClientError {
 
 enum CancellableDriverError {
     CancelledBeforeDispatch,
+    FailedBeforeDispatch(TransportError),
     Transport(TransportError),
+}
+
+fn cancellable_driver_error(error: DriverClientError) -> CancellableDriverError {
+    match error {
+        DriverClientError::Cancelled => CancellableDriverError::CancelledBeforeDispatch,
+        DriverClientError::Busy => CancellableDriverError::FailedBeforeDispatch(
+            driver_client_transport_error(DriverClientError::Busy),
+        ),
+        other => CancellableDriverError::Transport(driver_client_transport_error(other)),
+    }
 }
 
 /// In-memory session pool for a tempod process.
@@ -5729,6 +5738,15 @@ fn route_session_act_batch(
                 lock_pool(pool)?.clear_session_act_batch_response(&id, key, &request_fingerprint);
             }
             return Err(TempodError::RequestCancelled);
+        }
+        Err(CancellableDriverError::FailedBeforeDispatch(error)) => {
+            if let Some(key) = idempotency_key.as_deref() {
+                lock_pool(pool)?.clear_session_act_batch_response(&id, key, &request_fingerprint);
+            }
+            return Ok(HttpResponse::json(
+                500,
+                json!({ "error": error.to_string() }),
+            ));
         }
         Err(CancellableDriverError::Transport(error)) => {
             if idempotency_key.is_some() {
@@ -16081,6 +16099,98 @@ mod tests {
             elapsed < Duration::from_secs(1),
             "cancelled gate waiter should not wait for full timeout: {elapsed:?}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn issue414_busy_gate_error_is_classified_before_dispatch() -> TestResult {
+        match cancellable_driver_error(DriverClientError::Busy) {
+            CancellableDriverError::FailedBeforeDispatch(error) => {
+                assert!(error.to_string().contains("busy"));
+                Ok(())
+            }
+            CancellableDriverError::CancelledBeforeDispatch => {
+                Err("busy gate error must not be classified as cancellation".into())
+            }
+            CancellableDriverError::Transport(error) => Err(format!(
+                "busy gate error must not be classified as post-dispatch transport: {error}"
+            )
+            .into()),
+        }
+    }
+
+    #[test]
+    fn issue414_successful_idempotent_act_batch_replays_cached_terminal_response() -> TestResult {
+        let mut pool = SessionPool::default();
+        let handle = attach_driver_handler(&mut pool, |request| match request.command {
+            HostDriverCommand::ActBatch { batch } => {
+                assert_eq!(
+                    batch,
+                    ActionBatch {
+                        actions: vec![Action::Scroll { x: 0.0, y: 4.0 }],
+                        quiescence: QuiescencePolicy::Composite,
+                    }
+                );
+                DriverResponse::Step {
+                    outcome: StepOutcome::Applied {
+                        diff: ObservationDiff {
+                            since_seq: 1,
+                            seq: 2,
+                            omitted: 0,
+                            added: Vec::new(),
+                            removed: Vec::new(),
+                            changed: Vec::new(),
+                        },
+                    }
+                    .into(),
+                }
+            }
+            _ => DriverResponse::Closed,
+        })?;
+        let session_driver = pool
+            .driver
+            .clone()
+            .ok_or("attached engine driver should be present")?;
+        let session =
+            pool.finish_create("https://success-replay.test".into(), Some(session_driver));
+        let body = br#"{
+            "batch": {
+                "actions": [{"kind": "scroll", "x": 0.0, "y": 4.0}],
+                "quiescence": "composite"
+            },
+            "input_tainted": false,
+            "idempotency_key": "success-replay"
+        }"#;
+
+        let first = route_http_request(
+            &mut pool,
+            control_request(
+                "POST",
+                &format!("/sessions/{}/act_batch", session.id.0),
+                None,
+                body,
+            ),
+        )?;
+        join_driver_handler(handle)?;
+        assert_eq!(first.status, 200);
+        let first_body: Value = serde_json::from_slice(&first.body)?;
+        assert_eq!(first_body["status"], "applied");
+
+        let replay = route_http_request(
+            &mut pool,
+            control_request(
+                "POST",
+                &format!("/sessions/{}/act_batch", session.id.0),
+                None,
+                body,
+            ),
+        )?;
+        assert_eq!(replay.status, 200);
+        let replay_body: Value = serde_json::from_slice(&replay.body)?;
+        assert_eq!(replay_body, first_body);
+        assert_eq!(pool.session_idempotency_record_count(&session.id), 1);
+
+        discard_unserved_attached_engine(&mut pool);
         Ok(())
     }
 
