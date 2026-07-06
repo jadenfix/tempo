@@ -385,7 +385,25 @@ impl CdpTempoDriver {
         &self,
         cursor: u64,
     ) -> Result<(), TransportError> {
-        wait_for_no_blocked_request_since(&self.request_policy_tracker, cursor).await
+        let idle_fast_return = self.request_policy_tracker.has_seen_since(cursor)
+            || self.request_policy_ordering_barrier().await;
+        wait_for_no_blocked_request_with_grace(
+            &self.request_policy_tracker,
+            cursor,
+            REQUEST_POLICY_EVENT_GRACE,
+            idle_fast_return,
+        )
+        .await
+    }
+
+    async fn request_policy_ordering_barrier(&self) -> bool {
+        // A successful CDP response is ordered after request-paused events that
+        // were already emitted on the same connection. If this fails, callers
+        // fall back to the timed grace instead of assuming the stream is idle.
+        match self.page() {
+            Ok(page) => page.evaluate("1").await.is_ok(),
+            Err(_error) => false,
+        }
     }
 
     async fn map_cdp_result_since<T>(
@@ -1705,6 +1723,10 @@ impl RequestPolicyTracker {
         self.lock().pending.range(cursor..).next().is_some()
     }
 
+    fn has_seen_since(&self, cursor: u64) -> bool {
+        self.lock().next_seq > cursor
+    }
+
     fn record_resume_failure(&self) {
         let mut guard = self.lock();
         guard.resume_failures = guard.resume_failures.saturating_add(1);
@@ -1741,11 +1763,12 @@ impl RequestPolicyTracker {
     }
 }
 
+#[cfg(test)]
 async fn wait_for_no_blocked_request_since(
     tracker: &RequestPolicyTracker,
     cursor: u64,
 ) -> Result<(), TransportError> {
-    wait_for_no_blocked_request_with_grace(tracker, cursor, REQUEST_POLICY_EVENT_GRACE).await
+    wait_for_no_blocked_request_with_grace(tracker, cursor, REQUEST_POLICY_EVENT_GRACE, true).await
 }
 
 /// Settle variant with no minimum event grace: drains pending requests since
@@ -1759,19 +1782,27 @@ async fn wait_for_no_blocked_request_settled(
     tracker: &RequestPolicyTracker,
     cursor: u64,
 ) -> Result<(), TransportError> {
-    wait_for_no_blocked_request_with_grace(tracker, cursor, Duration::ZERO).await
+    wait_for_no_blocked_request_with_grace(tracker, cursor, Duration::ZERO, true).await
 }
 
 async fn wait_for_no_blocked_request_with_grace(
     tracker: &RequestPolicyTracker,
     cursor: u64,
     grace: Duration,
+    idle_fast_return: bool,
 ) -> Result<(), TransportError> {
     let event_deadline = Instant::now() + grace;
     let deadline = Instant::now() + BLOCKED_REQUEST_SETTLE_TIMEOUT;
     loop {
         if tracker.has_blocked_since(cursor) {
             return Err(TransportError::UrlBlocked);
+        }
+        // If the interception stream has not observed any request for this
+        // cursor and the caller has already served an ordering barrier, there
+        // is no request event to debounce. Once a request is seen, keep the
+        // grace/settle behavior so blocked verdicts still surface.
+        if idle_fast_return && !tracker.has_seen_since(cursor) {
+            return Ok(());
         }
         if !tracker.has_pending_since(cursor) {
             if Instant::now() >= event_deadline {
@@ -4433,9 +4464,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn request_policy_tracker_clean_path_returns_without_settle_delay() {
+    async fn request_policy_tracker_idle_path_returns_before_event_grace() {
         let tracker = RequestPolicyTracker::new();
         let cursor = tracker.cursor();
+        let started = Instant::now();
 
         match tokio::time::timeout(
             Duration::from_millis(75),
@@ -4449,6 +4481,31 @@ mod tests {
                 panic!("clean policy tracker waited for the full settle deadline");
             }
         }
+        assert!(
+            started.elapsed() < REQUEST_POLICY_EVENT_GRACE,
+            "an idle cursor with no observed request must not pay the event grace"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_policy_tracker_observed_clean_request_keeps_event_grace() {
+        let tracker = RequestPolicyTracker::new();
+        let cursor = tracker.cursor();
+        let seq = tracker.start_request();
+        tracker.finish_request(seq, None);
+
+        let early = tokio::time::timeout(
+            Duration::from_millis(5),
+            wait_for_no_blocked_request_since(&tracker, cursor),
+        )
+        .await;
+
+        assert!(
+            early.is_err(),
+            "a cursor that observed request activity must still serve the debounce grace"
+        );
+        let result = wait_for_no_blocked_request_since(&tracker, cursor).await;
+        assert!(result.is_ok());
     }
 
     #[tokio::test]
@@ -4463,7 +4520,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn request_policy_tracker_catches_event_registered_during_grace() {
+    async fn request_policy_tracker_catches_observed_request_blocked_during_grace() {
+        let tracker = Arc::new(RequestPolicyTracker::new());
+        let cursor = tracker.cursor();
+        let seq = tracker.start_request();
+        let delayed_tracker = tracker.clone();
+        let finisher = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            delayed_tracker.finish_request(seq, Some("http://127.0.0.1/private".into()));
+        });
+
+        let result = wait_for_no_blocked_request_since(&tracker, cursor).await;
+
+        assert!(matches!(result, Err(TransportError::UrlBlocked)));
+        match finisher.await {
+            Ok(()) => {}
+            Err(error) => panic!("late request finisher task failed: {error}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn request_policy_tracker_required_grace_catches_event_registered_during_grace() {
         let tracker = Arc::new(RequestPolicyTracker::new());
         let cursor = tracker.cursor();
         let delayed_tracker = tracker.clone();
@@ -4474,7 +4551,13 @@ mod tests {
             delayed_tracker.finish_request(seq, Some("http://127.0.0.1/private".into()));
         });
 
-        let result = wait_for_no_blocked_request_since(&tracker, cursor).await;
+        let result = wait_for_no_blocked_request_with_grace(
+            &tracker,
+            cursor,
+            REQUEST_POLICY_EVENT_GRACE,
+            false,
+        )
+        .await;
 
         assert!(matches!(result, Err(TransportError::UrlBlocked)));
         match finisher.await {
