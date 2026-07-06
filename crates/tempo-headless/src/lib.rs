@@ -2987,12 +2987,13 @@ pub fn serve_forever_with_config(
 }
 
 #[cfg(test)]
-fn serve_forever_with_limits(
+fn serve_forever_without_auth_for_tests_with_limits(
     listener: TcpListener,
     pool: Arc<Mutex<SessionPool>>,
     limiter: ConnectionLimiter,
 ) -> Result<(), TempodError> {
-    serve_forever_without_auth_for_tests_with_limits(listener, pool, limiter)
+    let host_guard = TempodHostGuard::from_listener(&listener, &BTreeSet::new())?;
+    serve_forever_trusted(listener, pool, TempodAuth::disabled(), host_guard, limiter)
 }
 
 #[cfg(test)]
@@ -3001,16 +3002,6 @@ fn serve_forever_without_auth_for_tests(
     pool: Arc<Mutex<SessionPool>>,
 ) -> Result<(), TempodError> {
     serve_forever_without_auth_for_tests_with_limits(listener, pool, ConnectionLimiter::default())
-}
-
-#[cfg(test)]
-fn serve_forever_without_auth_for_tests_with_limits(
-    listener: TcpListener,
-    pool: Arc<Mutex<SessionPool>>,
-    limiter: ConnectionLimiter,
-) -> Result<(), TempodError> {
-    let host_guard = TempodHostGuard::from_listener(&listener, &BTreeSet::new())?;
-    serve_forever_trusted(listener, pool, TempodAuth::disabled(), host_guard, limiter)
 }
 
 fn serve_forever_trusted(
@@ -11702,8 +11693,9 @@ mod tests {
         let pool = Arc::new(Mutex::new(SessionPool::default()));
         let limiter = ConnectionLimiter::new(1, 1);
         let server_limiter = limiter.clone();
-        let handle =
-            thread::spawn(move || serve_forever_with_limits(listener, pool, server_limiter));
+        let handle = thread::spawn(move || {
+            serve_forever_without_auth_for_tests_with_limits(listener, pool, server_limiter)
+        });
 
         let held = TcpStream::connect(addr)?;
         wait_for_connection_counts(&limiter, (1, 0))?;
@@ -11725,8 +11717,9 @@ mod tests {
         let pool = Arc::new(Mutex::new(SessionPool::default()));
         let limiter = ConnectionLimiter::new(1, 1);
         let server_limiter = limiter.clone();
-        let handle =
-            thread::spawn(move || serve_forever_with_limits(listener, pool, server_limiter));
+        let handle = thread::spawn(move || {
+            serve_forever_without_auth_for_tests_with_limits(listener, pool, server_limiter)
+        });
 
         let mut held = open_bidi_websocket(addr)?;
         wait_for_connection_counts(&limiter, (0, 1))?;
@@ -11755,8 +11748,9 @@ mod tests {
         let pool = Arc::new(Mutex::new(SessionPool::default()));
         let limiter = ConnectionLimiter::new(1, 1);
         let server_limiter = limiter.clone();
-        let handle =
-            thread::spawn(move || serve_forever_with_limits(listener, pool, server_limiter));
+        let handle = thread::spawn(move || {
+            serve_forever_without_auth_for_tests_with_limits(listener, pool, server_limiter)
+        });
 
         let mut first = open_bidi_websocket(addr)?;
         wait_for_connection_counts(&limiter, (0, 1))?;
