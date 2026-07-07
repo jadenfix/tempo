@@ -72,7 +72,7 @@ use tempo_policy::ConfirmationGate;
 use tempo_schema::{
     Action, ActionBatch, AdoptionLease, AgentRun, AgentRunId, AgentRunState, BrowserEngineTier,
     CompiledObservation, ConfirmationGrant, ConfirmationRequest, ControlOwner, HumanTakeover,
-    ManagerEvent, ManagerSessionState, NodeId, ObservationDiff, QuiescencePolicy,
+    ManagerEvent, ManagerSessionState, NodeId, ObservationDiff, PaymentContext, QuiescencePolicy,
     SessionAttachment, ShellSurfaceId, SideEffect, StorageContinuityMode,
 };
 use thiserror::Error;
@@ -1856,6 +1856,7 @@ impl SessionPool {
             action_index: denied_action_index,
             action_kind: denied_action_kind.to_string(),
             reason: reason.to_string(),
+            payment_context: report.payment_context.clone(),
             created_ms: now,
             expires_ms: now.saturating_add(CONFIRMATION_TTL_MS),
         };
@@ -5423,8 +5424,18 @@ async fn session_mcp_post(
     body: Bytes,
 ) -> Response {
     let origin = header_str(&headers, header::ORIGIN).map(str::to_owned);
+    let aether_payment = match aether_payment_context_from_headers(&headers) {
+        Ok(context) => context,
+        Err(error) => return tempod_error_response(&error).into_response(),
+    };
     run_blocking(move || {
-        route_session_mcp(&state.pool, &TempodSessionId(id), origin.as_deref(), &body)
+        route_session_mcp(
+            &state.pool,
+            &TempodSessionId(id),
+            origin.as_deref(),
+            aether_payment,
+            &body,
+        )
     })
     .await
 }
@@ -5553,13 +5564,15 @@ async fn run_resume(
 
 async fn session_act_batch(
     State(state): State<TempodAppState>,
+    headers: HeaderMap,
     UrlPath(id): UrlPath<String>,
     body: Bytes,
 ) -> Response {
     run_limited_blocking(
         state.limiter.clone(),
         move |cancel| -> Result<HttpResponse, TempodError> {
-            let body = parse_session_act_batch_request(&body)?;
+            let mut body = parse_session_act_batch_request(&body)?;
+            merge_aether_payment_headers(&headers, &mut body)?;
             route_session_act_batch(&state.pool, TempodSessionId(id), body, &cancel)
         },
     )
@@ -5953,9 +5966,10 @@ fn session_batch_policy_observation(
 fn route_session_act_batch(
     pool: &Arc<Mutex<SessionPool>>,
     id: TempodSessionId,
-    body: SessionActBatchRequest,
+    mut body: SessionActBatchRequest,
     cancel: &RequestCancel,
 ) -> Result<HttpResponse, TempodError> {
+    normalize_session_payment_context(&mut body)?;
     let request_fingerprint = session_act_batch_idempotency_fingerprint(&body);
     cancel.check_tempod()?;
     {
@@ -6089,9 +6103,99 @@ fn parse_session_act_batch_request(body: &[u8]) -> Result<SessionActBatchRequest
     })?;
     reject_explicit_null_field(&value, "input_tainted")?;
     reject_explicit_null_field(&value, "idempotency_key")?;
+    reject_explicit_null_field(&value, "payment_context")?;
     serde_json::from_value(value).map_err(|error| {
         TempodError::BadRequest(format!("invalid act_batch request JSON: {error}"))
     })
+}
+
+const AETHER_PAYMENT_HEADER: &str = "x-payment";
+const AETHER_PAYMENT_HASH_HEADER: &str = "x-aether-payment-hash";
+const MAX_AETHER_PAYMENT_HEADER_BYTES: usize = 8192;
+
+fn merge_aether_payment_headers(
+    headers: &HeaderMap,
+    body: &mut SessionActBatchRequest,
+) -> Result<(), TempodError> {
+    let Some(header_context) = aether_payment_context_from_headers(headers)? else {
+        return Ok(());
+    };
+    if body.payment_context.is_some() {
+        return Err(TempodError::BadRequest(
+            "payment_context must not be combined with x-payment headers".into(),
+        ));
+    }
+    body.payment_context = Some(header_context);
+    Ok(())
+}
+
+fn aether_payment_context_from_headers(
+    headers: &HeaderMap,
+) -> Result<Option<PaymentContext>, TempodError> {
+    let payment_count = headers.get_all(AETHER_PAYMENT_HEADER).iter().count();
+    let hash_count = headers.get_all(AETHER_PAYMENT_HASH_HEADER).iter().count();
+    if payment_count > 1 || hash_count > 1 {
+        return Err(TempodError::BadRequest(
+            "duplicate Aether payment headers are not allowed".into(),
+        ));
+    }
+    match (payment_count, hash_count) {
+        (0, 0) => Ok(None),
+        (1, 1) => {
+            let payment = header_value_str(headers, AETHER_PAYMENT_HEADER)?;
+            if payment.len() > MAX_AETHER_PAYMENT_HEADER_BYTES {
+                return Err(TempodError::BadRequest(format!(
+                    "{AETHER_PAYMENT_HEADER} exceeds {MAX_AETHER_PAYMENT_HEADER_BYTES} bytes"
+                )));
+            }
+            let payment_hash = header_value_str(headers, AETHER_PAYMENT_HASH_HEADER)?;
+            validate_aether_payment_hash(payment_hash)?;
+            Ok(Some(PaymentContext {
+                rail: "aether".to_string(),
+                payment_hash: payment_hash.to_ascii_lowercase(),
+            }))
+        }
+        _ => Err(TempodError::BadRequest(format!(
+            "{AETHER_PAYMENT_HEADER} and {AETHER_PAYMENT_HASH_HEADER} must be supplied together"
+        ))),
+    }
+}
+
+fn header_value_str<'a>(headers: &'a HeaderMap, name: &str) -> Result<&'a str, TempodError> {
+    headers
+        .get(name)
+        .ok_or_else(|| TempodError::BadRequest(format!("{name} is missing")))?
+        .to_str()
+        .map_err(|_| TempodError::BadRequest(format!("{name} must be valid ASCII")))
+}
+
+fn normalize_session_payment_context(body: &mut SessionActBatchRequest) -> Result<(), TempodError> {
+    if let Some(context) = body.payment_context.as_mut() {
+        validate_payment_context(context)?;
+        context.payment_hash = context.payment_hash.to_ascii_lowercase();
+    }
+    Ok(())
+}
+
+fn validate_payment_context(context: &PaymentContext) -> Result<(), TempodError> {
+    if context.rail != "aether" {
+        return Err(TempodError::BadRequest(
+            "payment_context.rail must be \"aether\"".into(),
+        ));
+    }
+    validate_aether_payment_hash(&context.payment_hash)
+}
+
+fn validate_aether_payment_hash(value: &str) -> Result<(), TempodError> {
+    let hex = value
+        .strip_prefix("0x")
+        .ok_or_else(|| TempodError::BadRequest("Aether payment hash must start with 0x".into()))?;
+    if hex.len() != 64 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(TempodError::BadRequest(
+            "Aether payment hash must be a 0x-prefixed 32-byte hex digest".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn reject_explicit_null_field(value: &JsonValue, field: &'static str) -> Result<(), TempodError> {
@@ -6143,6 +6247,7 @@ fn enforce_session_batch_policy(
         idempotency_required: false,
         idempotency_key_provided: body.idempotency_key.is_some(),
         idempotency_cache_retained: privacy_mode.retains_idempotency_cache(),
+        payment_context: body.payment_context.clone(),
     };
     let mut first_confirmation_index = None;
     let mut first_idempotency_index = None;
@@ -6371,6 +6476,7 @@ fn session_act_batch_idempotency_fingerprint(body: &SessionActBatchRequest) -> J
     json!({
         "batch": &body.batch,
         "input_tainted": body.input_tainted,
+        "payment_context": body.payment_context,
     })
 }
 
@@ -6388,6 +6494,7 @@ struct SessionBatchPolicyReport {
     idempotency_required: bool,
     idempotency_key_provided: bool,
     idempotency_cache_retained: bool,
+    payment_context: Option<PaymentContext>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -6450,7 +6557,7 @@ fn policy_denied_error_json(error: &PolicyDeniedError) -> JsonValue {
 }
 
 fn session_batch_policy_json(policy: &SessionBatchPolicyReport) -> JsonValue {
-    json!({
+    let mut value = json!({
         "input_tainted_declared": policy.input_tainted_declared,
         "input_tainted_effective": policy.input_tainted_effective,
         "forced_tainted_actions": policy.forced_tainted_actions,
@@ -6463,7 +6570,11 @@ fn session_batch_policy_json(policy: &SessionBatchPolicyReport) -> JsonValue {
         "idempotency_required": policy.idempotency_required,
         "idempotency_key_provided": policy.idempotency_key_provided,
         "idempotency_cache_retained": policy.idempotency_cache_retained,
-    })
+    });
+    if let Some(context) = policy.payment_context.as_ref() {
+        value["payment_context"] = json!(context);
+    }
+    value
 }
 
 fn confirmation_gate_name(gate: ConfirmationGate) -> &'static str {
@@ -6676,7 +6787,11 @@ pub fn tempod_openapi(base_url: &str) -> JsonValue {
                 "post": {
                     "operationId": "actBatchSession",
                     "security": [{"TempodBearer": []}],
-                    "parameters": [{"$ref": "#/components/parameters/SessionId"}],
+                    "parameters": [
+                        {"$ref": "#/components/parameters/SessionId"},
+                        {"$ref": "#/components/parameters/AetherPayment"},
+                        {"$ref": "#/components/parameters/AetherPaymentHash"}
+                    ],
                     "requestBody": {
                         "required": true,
                         "content": {"application/json": {"schema": {"$ref": "#/components/schemas/SessionActBatchRequest"}}}
@@ -6692,7 +6807,11 @@ pub fn tempod_openapi(base_url: &str) -> JsonValue {
                 "post": {
                     "operationId": "mcpPostSession",
                     "security": [{"TempodBearer": []}],
-                    "parameters": [{"$ref": "#/components/parameters/SessionId"}],
+                    "parameters": [
+                        {"$ref": "#/components/parameters/SessionId"},
+                        {"$ref": "#/components/parameters/AetherPayment"},
+                        {"$ref": "#/components/parameters/AetherPaymentHash"}
+                    ],
                     "responses": {"200": {"description": "MCP JSON-RPC response bound to this session driver"}}
                 }
             },
@@ -6978,6 +7097,20 @@ pub fn tempod_openapi(base_url: &str) -> JsonValue {
                     "in": "path",
                     "required": true,
                     "schema": {"type": "string"}
+                },
+                "AetherPayment": {
+                    "name": "x-payment",
+                    "in": "header",
+                    "required": false,
+                    "schema": {"type": "string"},
+                    "description": "Raw Aether payment evidence accepted only with x-aether-payment-hash. The raw value is never echoed; clients that can send JSON should prefer payment_context."
+                },
+                "AetherPaymentHash": {
+                    "name": "x-aether-payment-hash",
+                    "in": "header",
+                    "required": false,
+                    "schema": {"type": "string"},
+                    "description": "Hash binding for x-payment. Required when x-payment is present and normalized into the hash-only PaymentContext used by policy, confirmation, and idempotency."
                 }
             },
             "schemas": {
@@ -7153,7 +7286,20 @@ pub fn tempod_openapi(base_url: &str) -> JsonValue {
                             "minLength": 1,
                             "maxLength": MAX_IDEMPOTENCY_KEY_BYTES
                         },
-                        "confirmation_grant": {"$ref": "#/components/schemas/ConfirmationGrant"}
+                        "confirmation_grant": {"$ref": "#/components/schemas/ConfirmationGrant"},
+                        "payment_context": {"$ref": "#/components/schemas/PaymentContext"}
+                    }
+                },
+                "PaymentContext": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["rail", "payment_hash"],
+                    "properties": {
+                        "rail": {"type": "string", "const": "aether"},
+                        "payment_hash": {
+                            "type": "string",
+                            "pattern": "^0x[0-9a-fA-F]{64}$"
+                        }
                     }
                 },
                 "ShellSurfaceId": {
@@ -7267,6 +7413,7 @@ pub fn tempod_openapi(base_url: &str) -> JsonValue {
                         "action_index": {"type": "integer", "minimum": 0},
                         "action_kind": {"type": "string"},
                         "reason": {"type": "string"},
+                        "payment_context": {"$ref": "#/components/schemas/PaymentContext"},
                         "created_ms": {"type": "integer", "minimum": 0},
                         "expires_ms": {"type": "integer", "minimum": 0}
                     }
@@ -8352,12 +8499,15 @@ fn route_session_mcp(
     pool: &Arc<Mutex<SessionPool>>,
     id: &TempodSessionId,
     origin: Option<&str>,
+    aether_payment: Option<PaymentContext>,
     body: &[u8],
 ) -> HttpResponse {
     if let Err(error) = lock_pool(pool).and_then(|pool| pool.ensure_session_record(id)) {
         return tempod_error_response(&error);
     }
-    if let Some(response) = route_session_mcp_shared_session_tool(pool, id, origin, body) {
+    if let Some(response) =
+        route_session_mcp_shared_session_tool(pool, id, origin, aether_payment.clone(), body)
+    {
         return response;
     }
     let driver = match lock_pool(pool).and_then(|mut pool| {
@@ -8377,6 +8527,7 @@ fn route_session_mcp_shared_session_tool(
     pool: &Arc<Mutex<SessionPool>>,
     id: &TempodSessionId,
     origin: Option<&str>,
+    aether_payment: Option<PaymentContext>,
     body: &[u8],
 ) -> Option<HttpResponse> {
     if !tempo_mcp::origin_allowed(origin) {
@@ -8452,12 +8603,23 @@ fn route_session_mcp_shared_session_tool(
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| json!({}));
-    let batch_request = match session_mcp_act_batch_request(name, arguments) {
+    let mut batch_request = match session_mcp_act_batch_request(name, arguments) {
         Ok(request) => request,
         Err(message) => {
             return Some(session_mcp_json_rpc_error(200, rpc_id, -32602, message));
         }
     };
+    if let Some(context) = aether_payment {
+        if batch_request.payment_context.is_some() {
+            return Some(session_mcp_json_rpc_error(
+                200,
+                rpc_id,
+                -32602,
+                "payment_context must not be combined with x-payment headers",
+            ));
+        }
+        batch_request.payment_context = Some(context);
+    }
     let response =
         match route_session_act_batch(pool, id.clone(), batch_request, &RequestCancel::default()) {
             Ok(response) => response,
@@ -8481,6 +8643,7 @@ fn session_mcp_act_batch_request(
     name: &str,
     arguments: JsonValue,
 ) -> Result<SessionActBatchRequest, String> {
+    reject_explicit_null_field(&arguments, "payment_context").map_err(|error| error.to_string())?;
     match name {
         "act" => serde_json::from_value::<SessionMcpActArgs>(arguments)
             .map_err(|error| error.to_string())
@@ -8603,8 +8766,25 @@ fn session_mcp_action_input_schema(mut input_schema: JsonValue) -> JsonValue {
             "confirmation_grant".into(),
             session_mcp_confirmation_grant_schema(),
         );
+        properties.insert(
+            "payment_context".into(),
+            session_mcp_payment_context_schema(),
+        );
     }
     input_schema
+}
+
+fn session_mcp_payment_context_schema() -> JsonValue {
+    json!({
+        "type": "object",
+        "description": "Hash-only payment evidence for a session action. Raw x-payment payloads are accepted only at the HTTP header boundary and are never echoed.",
+        "required": ["rail", "payment_hash"],
+        "additionalProperties": false,
+        "properties": {
+            "rail": {"type": "string", "const": "aether"},
+            "payment_hash": {"type": "string", "pattern": "^0x[0-9a-fA-F]{64}$"}
+        }
+    })
 }
 
 fn session_mcp_confirmation_grant_schema() -> JsonValue {
@@ -9230,6 +9410,8 @@ struct SessionActBatchRequest {
     idempotency_key: Option<String>,
     #[serde(default)]
     confirmation_grant: Option<ConfirmationGrant>,
+    #[serde(default)]
+    payment_context: Option<PaymentContext>,
 }
 
 #[derive(Deserialize)]
@@ -9245,6 +9427,8 @@ struct SessionMcpActArgs {
     idempotency_key: Option<String>,
     #[serde(default)]
     confirmation_grant: Option<ConfirmationGrant>,
+    #[serde(default)]
+    payment_context: Option<PaymentContext>,
 }
 
 impl SessionMcpActArgs {
@@ -9261,6 +9445,7 @@ impl SessionMcpActArgs {
             confirmed: self.confirmed,
             idempotency_key: self.idempotency_key,
             confirmation_grant: self.confirmation_grant,
+            payment_context: self.payment_context,
         })
     }
 }
@@ -9278,6 +9463,8 @@ struct SessionMcpActBatchArgs {
     idempotency_key: Option<String>,
     #[serde(default)]
     confirmation_grant: Option<ConfirmationGrant>,
+    #[serde(default)]
+    payment_context: Option<PaymentContext>,
 }
 
 impl SessionMcpActBatchArgs {
@@ -9291,6 +9478,7 @@ impl SessionMcpActBatchArgs {
             confirmed: self.confirmed,
             idempotency_key: self.idempotency_key,
             confirmation_grant: self.confirmation_grant,
+            payment_context: self.payment_context,
         })
     }
 }
@@ -10740,6 +10928,103 @@ mod tests {
     }
 
     #[test]
+    fn aether_payment_headers_are_pairwise_bounded_and_hash_only() -> TestResult {
+        let valid_hash = "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        let mut headers = HeaderMap::new();
+        headers.insert(AETHER_PAYMENT_HEADER, HeaderValue::from_static("opaque"));
+        headers.insert(
+            AETHER_PAYMENT_HASH_HEADER,
+            HeaderValue::from_static(valid_hash),
+        );
+        let context = aether_payment_context_from_headers(&headers)?
+            .ok_or("headers should produce payment context")?;
+        assert_eq!(context.rail, "aether");
+        assert_eq!(context.payment_hash, valid_hash);
+
+        let mut missing_hash = HeaderMap::new();
+        missing_hash.insert(AETHER_PAYMENT_HEADER, HeaderValue::from_static("opaque"));
+        let Err(error) = aether_payment_context_from_headers(&missing_hash) else {
+            return Err("unpaired x-payment must fail".into());
+        };
+        assert_eq!(error.status(), 400);
+
+        let mut malformed_hash = HeaderMap::new();
+        malformed_hash.insert(AETHER_PAYMENT_HEADER, HeaderValue::from_static("opaque"));
+        malformed_hash.insert(
+            AETHER_PAYMENT_HASH_HEADER,
+            HeaderValue::from_static("0xshort"),
+        );
+        let Err(error) = aether_payment_context_from_headers(&malformed_hash) else {
+            return Err("malformed hash must fail".into());
+        };
+        assert_eq!(error.status(), 400);
+
+        let mut duplicate = HeaderMap::new();
+        duplicate.append(AETHER_PAYMENT_HEADER, HeaderValue::from_static("one"));
+        duplicate.append(AETHER_PAYMENT_HEADER, HeaderValue::from_static("two"));
+        duplicate.insert(
+            AETHER_PAYMENT_HASH_HEADER,
+            HeaderValue::from_static(valid_hash),
+        );
+        let Err(error) = aether_payment_context_from_headers(&duplicate) else {
+            return Err("duplicate payment headers must fail".into());
+        };
+        assert_eq!(error.status(), 400);
+        Ok(())
+    }
+
+    #[test]
+    fn session_act_batch_aether_headers_emit_hash_only_payment_context() -> TestResult {
+        let mut pool = SessionPool::default();
+        let session = pool.finish_create("https://header-payment.test".into(), None);
+        let raw_payment = "opaque-aether-payment-payload-must-not-echo";
+        let payment_hash = "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+        let body = serde_json::to_vec(&json!({
+            "batch": {
+                "actions": [{"kind": "click", "node": "purchase"}],
+                "quiescence": "composite"
+            },
+            "input_tainted": false,
+            "confirmed": true,
+            "idempotency_key": "header-payment-1"
+        }))?;
+        let mut headers = BTreeMap::new();
+        headers.insert(AETHER_PAYMENT_HEADER.to_string(), raw_payment.to_string());
+        headers.insert(
+            AETHER_PAYMENT_HASH_HEADER.to_string(),
+            payment_hash.to_string(),
+        );
+
+        let denied = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: format!("/sessions/{}/act_batch", session.id.0),
+                headers,
+                host: None,
+                origin: None,
+                body,
+            },
+        )?;
+        assert_eq!(denied.status, 403);
+        let body_text = String::from_utf8(denied.body.clone())?;
+        assert!(
+            body_text.contains(payment_hash),
+            "hash-only payment context should be returned"
+        );
+        assert!(
+            !body_text.contains(raw_payment),
+            "raw x-payment payload must never be echoed"
+        );
+        let denied: Value = serde_json::from_slice(&denied.body)?;
+        assert_eq!(
+            denied["confirmation_request"]["payment_context"]["payment_hash"],
+            payment_hash
+        );
+        Ok(())
+    }
+
+    #[test]
     fn session_act_batch_requires_server_minted_confirmation_grant() -> TestResult {
         let mut pool = SessionPool::default();
         let handle = attach_driver_handler(&mut pool, |request| match request.command {
@@ -10772,11 +11057,18 @@ mod tests {
             "actions": [{"kind": "click", "node": "purchase"}],
             "quiescence": "composite"
         });
+        let payment_context = json!({
+            "rail": "aether",
+            "payment_hash": "0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        });
+        let normalized_payment_hash =
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let first_body = serde_json::to_vec(&json!({
             "batch": batch,
             "input_tainted": false,
             "confirmed": true,
-            "idempotency_key": "purchase-1"
+            "idempotency_key": "purchase-1",
+            "payment_context": payment_context
         }))?;
 
         let denied = route_http_request(
@@ -10797,6 +11089,14 @@ mod tests {
         assert_eq!(
             denied["confirmation_request"]["session_id"],
             session.id.0.as_str()
+        );
+        assert_eq!(
+            denied["policy"]["payment_context"]["payment_hash"],
+            normalized_payment_hash
+        );
+        assert_eq!(
+            denied["confirmation_request"]["payment_context"]["payment_hash"],
+            normalized_payment_hash
         );
         let confirmation_id = denied["confirmation_request"]["confirmation_id"]
             .as_str()
@@ -10897,11 +11197,43 @@ mod tests {
             .ok_or("mismatch should include an error string")?
             .contains("does not match this session request"));
 
+        let mismatched_payment_body = serde_json::to_vec(&json!({
+            "batch": batch,
+            "input_tainted": false,
+            "idempotency_key": "purchase-payment-mismatch",
+            "confirmation_grant": grant.clone(),
+            "payment_context": {
+                "rail": "aether",
+                "payment_hash": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            }
+        }))?;
+        let mismatched_payment = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: format!("/sessions/{}/act_batch", session.id.0),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: mismatched_payment_body,
+            },
+        )?;
+        assert_eq!(mismatched_payment.status, 403);
+        let mismatched_payment: Value = serde_json::from_slice(&mismatched_payment.body)?;
+        assert!(mismatched_payment["error"]
+            .as_str()
+            .ok_or("payment mismatch should include an error string")?
+            .contains("does not match this session request"));
+
         let granted_body = serde_json::to_vec(&json!({
             "batch": batch,
             "input_tainted": false,
             "idempotency_key": "purchase-1",
-            "confirmation_grant": grant.clone()
+            "confirmation_grant": grant.clone(),
+            "payment_context": {
+                "rail": "aether",
+                "payment_hash": normalized_payment_hash
+            }
         }))?;
         let executed = route_http_request(
             &mut pool,
@@ -10919,6 +11251,10 @@ mod tests {
         let executed: Value = serde_json::from_slice(&executed.body)?;
         assert_eq!(executed["status"], "applied");
         assert_eq!(executed["policy"]["confirmed_effective"], true);
+        assert_eq!(
+            executed["policy"]["payment_context"]["payment_hash"],
+            normalized_payment_hash
+        );
 
         let manager = pool.manager_state(&session.id)?;
         assert!(manager.pending_confirmations.is_empty());
@@ -10927,7 +11263,11 @@ mod tests {
             "batch": batch,
             "input_tainted": false,
             "idempotency_key": "purchase-replay",
-            "confirmation_grant": grant
+            "confirmation_grant": grant,
+            "payment_context": {
+                "rail": "aether",
+                "payment_hash": normalized_payment_hash
+            }
         }))?;
         let replay = route_http_request(
             &mut pool,
@@ -11013,6 +11353,12 @@ mod tests {
         );
         assert!(
             act_batch_schema["inputSchema"]["properties"]
+                .get("payment_context")
+                .is_some(),
+            "session MCP act_batch schema must advertise payment context"
+        );
+        assert!(
+            act_batch_schema["inputSchema"]["properties"]
                 .get("driver_id")
                 .is_none(),
             "session MCP must not advertise root/fork driver ids"
@@ -11022,6 +11368,10 @@ mod tests {
             "actions": [{"kind": "click", "node": "purchase"}],
             "quiescence": "composite"
         });
+        let payment_context = json!({
+            "rail": "aether",
+            "payment_hash": "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        });
         let mut denied_request = mcp_tool_request(
             31,
             "act_batch",
@@ -11029,7 +11379,8 @@ mod tests {
                 "batch": batch,
                 "input_tainted": false,
                 "confirmed": true,
-                "idempotency_key": "mcp-purchase-1"
+                "idempotency_key": "mcp-purchase-1",
+                "payment_context": payment_context
             }),
         )?;
         denied_request.path = format!("/sessions/{}/mcp", session.id.0);
@@ -11043,6 +11394,10 @@ mod tests {
         assert_eq!(
             denied_structured["confirmation_request"]["session_id"],
             session.id.0.as_str()
+        );
+        assert_eq!(
+            denied_structured["confirmation_request"]["payment_context"]["payment_hash"],
+            "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
         );
         let confirmation_id = denied_structured["confirmation_request"]["confirmation_id"]
             .as_str()
@@ -11082,7 +11437,11 @@ mod tests {
                 "batch": batch,
                 "input_tainted": false,
                 "idempotency_key": "mcp-purchase-1",
-                "confirmation_grant": grant.clone()
+                "confirmation_grant": grant.clone(),
+                "payment_context": {
+                    "rail": "aether",
+                    "payment_hash": "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                }
             }),
         )?;
         granted_request.path = format!("/sessions/{}/mcp", session.id.0);
@@ -11107,7 +11466,11 @@ mod tests {
                 "batch": batch,
                 "input_tainted": false,
                 "idempotency_key": "mcp-purchase-replay",
-                "confirmation_grant": grant
+                "confirmation_grant": grant,
+                "payment_context": {
+                    "rail": "aether",
+                    "payment_hash": "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                }
             }),
         )?;
         replay_request.path = format!("/sessions/{}/mcp", session.id.0);
@@ -13961,6 +14324,31 @@ mod tests {
             "#/components/schemas/ConfirmationGrant"
         );
         assert_eq!(
+            openapi["components"]["schemas"]["SessionActBatchRequest"]["properties"]
+                ["payment_context"]["$ref"],
+            "#/components/schemas/PaymentContext"
+        );
+        assert_eq!(
+            openapi["components"]["schemas"]["PaymentContext"]["properties"]["rail"]["const"],
+            "aether"
+        );
+        assert_eq!(
+            openapi["components"]["parameters"]["AetherPayment"]["name"],
+            AETHER_PAYMENT_HEADER
+        );
+        assert_eq!(
+            openapi["components"]["parameters"]["AetherPaymentHash"]["name"],
+            AETHER_PAYMENT_HASH_HEADER
+        );
+        assert_eq!(
+            openapi["paths"]["/sessions/{session_id}/act_batch"]["post"]["parameters"][1]["$ref"],
+            "#/components/parameters/AetherPayment"
+        );
+        assert_eq!(
+            openapi["paths"]["/sessions/{session_id}/act_batch"]["post"]["parameters"][2]["$ref"],
+            "#/components/parameters/AetherPaymentHash"
+        );
+        assert_eq!(
             openapi["paths"]["/sessions/{session_id}/manager"]["get"]["operationId"],
             "managerSession"
         );
@@ -14001,6 +14389,14 @@ mod tests {
         assert_eq!(
             openapi["paths"]["/sessions/{session_id}/mcp"]["post"]["operationId"],
             "mcpPostSession"
+        );
+        assert_eq!(
+            openapi["paths"]["/sessions/{session_id}/mcp"]["post"]["parameters"][1]["$ref"],
+            "#/components/parameters/AetherPayment"
+        );
+        assert_eq!(
+            openapi["paths"]["/sessions/{session_id}/mcp"]["post"]["parameters"][2]["$ref"],
+            "#/components/parameters/AetherPaymentHash"
         );
         assert_eq!(
             openapi["paths"]["/sessions/{session_id}/bidi"]["post"]["operationId"],
@@ -14049,6 +14445,11 @@ mod tests {
             openapi["components"]["schemas"]["ConfirmationRequest"]["properties"]["side_effect"]
                 ["enum"],
             json!(["read", "draft", "write", "send", "purchase", "delete"])
+        );
+        assert_eq!(
+            openapi["components"]["schemas"]["ConfirmationRequest"]["properties"]
+                ["payment_context"]["$ref"],
+            "#/components/schemas/PaymentContext"
         );
         assert_eq!(openapi["paths"]["/runs"]["get"]["operationId"], "listRuns");
         assert_eq!(
@@ -18026,6 +18427,34 @@ mod tests {
         assert_eq!(replay_body, first_body);
         assert_eq!(pool.session_idempotency_record_count(&session.id), 1);
 
+        let different_payment_body = br#"{
+            "batch": {
+                "actions": [{"kind": "scroll", "x": 0.0, "y": 4.0}],
+                "quiescence": "composite"
+            },
+            "input_tainted": false,
+            "idempotency_key": "success-replay",
+            "payment_context": {
+                "rail": "aether",
+                "payment_hash": "0xdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+            }
+        }"#;
+        let different_payment = route_http_request(
+            &mut pool,
+            control_request(
+                "POST",
+                &format!("/sessions/{}/act_batch", session.id.0),
+                None,
+                different_payment_body,
+            ),
+        )?;
+        assert_eq!(different_payment.status, 409);
+        let different_payment_body: Value = serde_json::from_slice(&different_payment.body)?;
+        assert!(different_payment_body["error"]
+            .as_str()
+            .ok_or("idempotency mismatch should include an error")?
+            .contains("idempotency_key"));
+
         discard_unserved_attached_engine(&mut pool);
         Ok(())
     }
@@ -19114,6 +19543,7 @@ mod tests {
             idempotency_required: false,
             idempotency_key_provided: false,
             idempotency_cache_retained: true,
+            payment_context: None,
         };
 
         let error = deny_session_batch_policy(false, false, false, None, None, &body, report);

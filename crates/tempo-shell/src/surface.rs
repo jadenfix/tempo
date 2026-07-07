@@ -611,6 +611,7 @@ mod tests {
             action_index: 0,
             action_kind: "click".to_string(),
             reason: "send message".to_string(),
+            payment_context: None,
             created_ms: 10,
             expires_ms: 20,
         };
