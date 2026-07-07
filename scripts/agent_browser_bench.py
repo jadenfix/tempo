@@ -4,31 +4,24 @@
 from __future__ import annotations
 
 import argparse
-import base64
-import hashlib
-import http.client
 import http.server
 import json
 import os
-import random
 import resource
 import shutil
-import socket
 import socketserver
-import struct
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 from pathlib import Path
-from urllib.parse import urlparse
 
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE_DIR = ROOT / "fixtures" / "evals" / "live_agent"
 FIXTURE_HTML = FIXTURE_DIR / "checkout.html"
 FIXTURE_ACTIONS = FIXTURE_DIR / "checkout-actions.json"
+RUNNER_DIR = ROOT / "scripts" / "agent_bench_runners"
 SUITE = "live-agent-browser-bench"
 CASE_ID = "checkout-submit"
 
@@ -67,233 +60,84 @@ class StaticServer:
         return f"http://{host}:{port}"
 
 
-class WebSocket:
-    def __init__(self, url: str) -> None:
-        parsed = urlparse(url)
-        if parsed.scheme != "ws":
-            raise RuntimeError(f"unsupported websocket URL: {url}")
-        self.sock = socket.create_connection((parsed.hostname, parsed.port), timeout=10)
-        key = base64.b64encode(os.urandom(16)).decode("ascii")
-        path = parsed.path
-        if parsed.query:
-            path = f"{path}?{parsed.query}"
-        request = (
-            f"GET {path} HTTP/1.1\r\n"
-            f"Host: {parsed.hostname}:{parsed.port}\r\n"
-            "Upgrade: websocket\r\n"
-            "Connection: Upgrade\r\n"
-            f"Sec-WebSocket-Key: {key}\r\n"
-            "Sec-WebSocket-Version: 13\r\n"
-            "\r\n"
-        )
-        self.sock.sendall(request.encode("ascii"))
-        response = self._read_http_response()
-        if b" 101 " not in response.split(b"\r\n", 1)[0]:
-            raise RuntimeError(f"websocket upgrade failed: {response[:200]!r}")
+class RssSampler:
+    def __init__(self, root_pid: int) -> None:
+        self.root_pid = root_pid
+        self.max_rss_bytes = 0
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
 
-    def _read_http_response(self) -> bytes:
-        data = bytearray()
-        while b"\r\n\r\n" not in data:
-            chunk = self.sock.recv(4096)
-            if not chunk:
-                break
-            data.extend(chunk)
-        return bytes(data)
+    def __enter__(self) -> "RssSampler":
+        self._thread.start()
+        return self
 
-    def send_json(self, value: dict) -> None:
-        payload = json.dumps(value, separators=(",", ":")).encode("utf-8")
-        header = bytearray([0x81])
-        length = len(payload)
-        if length < 126:
-            header.append(0x80 | length)
-        elif length <= 0xFFFF:
-            header.append(0x80 | 126)
-            header.extend(struct.pack("!H", length))
-        else:
-            header.append(0x80 | 127)
-            header.extend(struct.pack("!Q", length))
-        mask = os.urandom(4)
-        header.extend(mask)
-        masked = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
-        self.sock.sendall(bytes(header) + masked)
+    def __exit__(self, *_exc: object) -> None:
+        self._stop.set()
+        self._thread.join(timeout=2)
+        self.sample()
 
-    def recv_json(self) -> dict:
-        payload = self._recv_frame()
-        return json.loads(payload.decode("utf-8"))
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            self.sample()
+            self._stop.wait(0.05)
 
-    def _recv_exact(self, length: int) -> bytes:
-        data = bytearray()
-        while len(data) < length:
-            chunk = self.sock.recv(length - len(data))
-            if not chunk:
-                raise RuntimeError("websocket closed")
-            data.extend(chunk)
-        return bytes(data)
-
-    def _recv_frame(self) -> bytes:
-        first, second = self._recv_exact(2)
-        opcode = first & 0x0F
-        masked = second & 0x80
-        length = second & 0x7F
-        if length == 126:
-            length = struct.unpack("!H", self._recv_exact(2))[0]
-        elif length == 127:
-            length = struct.unpack("!Q", self._recv_exact(8))[0]
-        mask = self._recv_exact(4) if masked else b""
-        payload = self._recv_exact(length)
-        if masked:
-            payload = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
-        if opcode == 0x8:
-            raise RuntimeError("websocket close frame received")
-        if opcode == 0x9:
-            self._send_pong(payload)
-            return self._recv_frame()
-        if opcode != 0x1:
-            return self._recv_frame()
-        return payload
-
-    def _send_pong(self, payload: bytes) -> None:
-        header = bytearray([0x8A, 0x80 | len(payload)])
-        mask = os.urandom(4)
-        header.extend(mask)
-        masked = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
-        self.sock.sendall(bytes(header) + masked)
-
-    def close(self) -> None:
-        self.sock.close()
+    def sample(self) -> None:
+        pids = descendants(self.root_pid)
+        if self.root_pid != os.getpid():
+            pids.add(self.root_pid)
+        rss = rss_bytes(pids)
+        if rss > self.max_rss_bytes:
+            self.max_rss_bytes = rss
 
 
-class ChromeCdp:
-    def __init__(self, chrome: str) -> None:
-        self.profile = tempfile.mkdtemp(prefix="tempo-agent-bench-chrome-")
-        self.port = free_port()
-        args = [
-            chrome,
-            "--headless=new",
-            "--disable-gpu",
-            "--disable-dev-shm-usage",
-            "--remote-debugging-address=127.0.0.1",
-            f"--remote-debugging-port={self.port}",
-            f"--user-data-dir={self.profile}",
-            "about:blank",
-        ]
-        if os.environ.get("TEMPO_CDP_NO_SANDBOX") == "1":
-            args.insert(1, "--no-sandbox")
-        self.proc = subprocess.Popen(
-            args,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        ws_url = self._wait_for_browser_ws()
-        self.ws = WebSocket(ws_url)
-        self.next_id = 0
-        self.session_id = self._new_page_session()
-
-    def _wait_for_browser_ws(self) -> str:
-        deadline = time.monotonic() + 15
-        last_error = ""
-        while time.monotonic() < deadline:
-            if self.proc.poll() is not None:
-                stderr = ""
-                if self.proc.stderr is not None:
-                    stderr = self.proc.stderr.read()
-                raise RuntimeError(f"chrome exited before CDP was ready: {stderr}")
-            try:
-                conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=1)
-                conn.request("GET", "/json/version")
-                response = conn.getresponse()
-                body = response.read()
-                conn.close()
-                if response.status == 200:
-                    return json.loads(body.decode("utf-8"))["webSocketDebuggerUrl"]
-            except Exception as error:  # noqa: BLE001
-                last_error = str(error)
-            time.sleep(0.05)
-        raise RuntimeError(f"timed out waiting for Chrome CDP: {last_error}")
-
-    def _new_page_session(self) -> str:
-        created = self.command("Target.createTarget", {"url": "about:blank"})
-        attached = self.command(
-            "Target.attachToTarget",
-            {"targetId": created["targetId"], "flatten": True},
-        )
-        session_id = attached["sessionId"]
-        self.command("Page.enable", session_id=session_id)
-        self.command("Runtime.enable", session_id=session_id)
-        self.command("Accessibility.enable", session_id=session_id)
-        return session_id
-
-    def command(
-        self,
-        method: str,
-        params: dict | None = None,
-        session_id: str | None = None,
-    ) -> dict:
-        self.next_id += 1
-        message = {"id": self.next_id, "method": method}
-        if params is not None:
-            message["params"] = params
-        if session_id is not None:
-            message["sessionId"] = session_id
-        self.ws.send_json(message)
-        while True:
-            received = self.ws.recv_json()
-            if received.get("id") == self.next_id:
-                if "error" in received:
-                    raise RuntimeError(f"CDP {method} failed: {received['error']}")
-                return received.get("result", {})
-
-    def wait_event(self, method: str, timeout: float = 10.0) -> None:
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            received = self.ws.recv_json()
-            if received.get("method") == method and received.get("sessionId") == self.session_id:
-                return
-        raise RuntimeError(f"timed out waiting for {method}")
-
-    def navigate(self, url: str) -> None:
-        self.command("Page.navigate", {"url": url}, session_id=self.session_id)
-        self.wait_event("Page.loadEventFired")
-
-    def evaluate(self, expression: str) -> object:
-        result = self.command(
-            "Runtime.evaluate",
-            {"expression": expression, "returnByValue": True, "awaitPromise": True},
-            session_id=self.session_id,
-        )
-        remote = result.get("result", {})
-        if "exceptionDetails" in result:
-            raise RuntimeError(f"runtime exception: {result['exceptionDetails']}")
-        return remote.get("value")
-
-    def ax_text(self) -> str:
-        tree = self.command("Accessibility.getFullAXTree", session_id=self.session_id)
-        lines: list[str] = []
-        for node in tree.get("nodes", []):
-            role = node.get("role", {}).get("value")
-            name = node.get("name", {}).get("value", "")
-            if role and name:
-                lines.append(f'- {role} "{name}"')
-        return "\n".join(lines)
-
-    def close(self) -> None:
+def descendants(root_pid: int) -> set[int]:
+    found: set[int] = set()
+    pending = [root_pid]
+    while pending:
+        parent = pending.pop()
         try:
-            self.ws.close()
-        finally:
-            self.proc.terminate()
+            completed = subprocess.run(
+                ["pgrep", "-P", str(parent)],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        except FileNotFoundError:
+            return found
+        if completed.returncode not in (0, 1):
+            continue
+        for line in completed.stdout.splitlines():
             try:
-                self.proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self.proc.kill()
-                self.proc.wait(timeout=5)
-            shutil.rmtree(self.profile, ignore_errors=True)
+                child = int(line.strip())
+            except ValueError:
+                continue
+            if child not in found:
+                found.add(child)
+                pending.append(child)
+    return found
 
 
-def free_port() -> int:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
+def rss_bytes(pids: set[int]) -> int:
+    if not pids:
+        return 0
+    try:
+        completed = subprocess.run(
+            ["ps", "-o", "rss=", "-p", ",".join(str(pid) for pid in sorted(pids))],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    except FileNotFoundError:
+        return 0
+    total_kib = 0
+    for line in completed.stdout.splitlines():
+        try:
+            total_kib += int(line.strip())
+        except ValueError:
+            continue
+    return total_kib * 1024
 
 
 def estimated_tokens(byte_count: int) -> int:
@@ -359,6 +203,21 @@ def run_checked(cmd: list[str], env: dict[str, str]) -> None:
     subprocess.run(cmd, cwd=ROOT, env=env, check=True)
 
 
+def chrome_version(chrome: str) -> str:
+    try:
+        completed = subprocess.run(
+            [chrome, "--version"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+            timeout=10,
+        )
+    except Exception as error:  # noqa: BLE001
+        return f"unknown: {type(error).__name__}"
+    return completed.stdout.strip() or f"unknown: exit_{completed.returncode}"
+
+
 def run_tempo(url: str, chrome: str, output_dir: Path) -> dict:
     journal = output_dir / "tempo-journal.sqlite"
     run_report = output_dir / "tempo-run.json"
@@ -390,12 +249,14 @@ def run_tempo(url: str, chrome: str, output_dir: Path) -> dict:
         "auto-clean",
     ]
     failure_mode = None
-    try:
-        run_checked(cmd, env)
-    except subprocess.CalledProcessError as error:
-        failure_mode = f"exit_{error.returncode}"
+    proc = subprocess.Popen(cmd, cwd=ROOT, env=env)
+    with RssSampler(proc.pid) as sampler:
+        returncode = proc.wait()
+    if returncode != 0:
+        failure_mode = f"exit_{returncode}"
     wall = now_ms() - started
     usage = usage_delta(before, usage_children())
+    usage["max_rss_bytes"] = sampler.max_rss_bytes
     report = {}
     if run_report.exists():
         report = json.loads(run_report.read_text())
@@ -419,10 +280,8 @@ def run_tempo(url: str, chrome: str, output_dir: Path) -> dict:
     return metric
 
 
-def perform_checkout(cdp: ChromeCdp, url: str) -> bool:
-    cdp.navigate(url)
-    cdp.evaluate(
-        """
+def checkout_expression() -> str:
+    return """
         (() => {
           const email = document.querySelector('#email');
           email.value = 'agent@example.com';
@@ -432,8 +291,6 @@ def perform_checkout(cdp: ChromeCdp, url: str) -> bool:
           return document.querySelector('#status').dataset.done === 'true';
         })()
         """
-    )
-    return bool(cdp.evaluate("document.querySelector('#status').dataset.done === 'true'"))
 
 
 def browser_use_snapshot_expression() -> str:
@@ -479,28 +336,62 @@ def browser_use_snapshot_expression() -> str:
 
 
 def run_cdp_baseline(chrome: str, url: str, runner: str, snapshot: str | None) -> dict:
+    from playwright.sync_api import sync_playwright
+
     before_self = usage_self()
     before_children = usage_children()
     started = now_ms()
     failure_mode = None
     model_input = ""
     success = False
-    cdp = None
-    try:
-        cdp = ChromeCdp(chrome)
-        cdp.navigate(url)
-        if snapshot == "ax":
-            model_input = cdp.ax_text()
-        elif snapshot == "browser_use_dom":
-            model_input = str(cdp.evaluate(browser_use_snapshot_expression()))
-        success = perform_checkout(cdp, url)
-    except Exception as error:  # noqa: BLE001
-        failure_mode = type(error).__name__
-    finally:
-        if cdp is not None:
-            cdp.close()
+    with RssSampler(os.getpid()) as sampler:
+        try:
+            args = ["--disable-gpu", "--disable-dev-shm-usage"]
+            if os.environ.get("TEMPO_CDP_NO_SANDBOX") == "1":
+                args.append("--no-sandbox")
+            with sync_playwright() as playwright:
+                browser = playwright.chromium.launch(
+                    executable_path=chrome,
+                    headless=True,
+                    args=args,
+                )
+                try:
+                    page = browser.new_page()
+                    page.goto(url, wait_until="load", timeout=15000)
+                    cdp = page.context.new_cdp_session(page)
+                    cdp.send("Runtime.enable")
+                    cdp.send("Accessibility.enable")
+                    if snapshot == "ax":
+                        tree = cdp.send("Accessibility.getFullAXTree")
+                        lines: list[str] = []
+                        for node in tree.get("nodes", []):
+                            role = node.get("role", {}).get("value")
+                            name = node.get("name", {}).get("value", "")
+                            if role and name:
+                                lines.append(f'- {role} "{name}"')
+                        model_input = "\n".join(lines)
+                    elif snapshot == "browser_use_dom":
+                        model_input = str(page.evaluate(browser_use_snapshot_expression()))
+                    result = cdp.send(
+                        "Runtime.evaluate",
+                        {
+                            "expression": checkout_expression(),
+                            "returnByValue": True,
+                            "awaitPromise": True,
+                        },
+                    )
+                    if "exceptionDetails" in result:
+                        raise RuntimeError(f"runtime exception: {result['exceptionDetails']}")
+                    success = bool(
+                        page.evaluate("document.querySelector('#status').dataset.done === 'true'")
+                    )
+                finally:
+                    browser.close()
+        except Exception as error:  # noqa: BLE001
+            failure_mode = type(error).__name__
     wall = now_ms() - started
     usage = combined_usage_delta(before_self, before_children, usage_self(), usage_children())
+    usage["max_rss_bytes"] = sampler.max_rss_bytes
     byte_count = len(model_input.encode("utf-8"))
     metric = {
         "runner": runner,
@@ -514,8 +405,94 @@ def run_cdp_baseline(chrome: str, url: str, runner: str, snapshot: str | None) -
         "model_input_bytes": byte_count,
         "model_input_tokens": estimated_tokens(byte_count),
         "observations": 1 if snapshot else 0,
+        "adapter": "playwright-cdp-session",
     }
     metric.update(usage)
+    return metric
+
+
+def run_external_baseline(
+    chrome: str,
+    url: str,
+    runner: str,
+    script_name: str,
+    output_dir: Path,
+) -> dict:
+    report_path = output_dir / f"{runner}.json"
+    stdout_path = output_dir / f"{runner}.stdout.log"
+    stderr_path = output_dir / f"{runner}.stderr.log"
+    script_path = RUNNER_DIR / script_name
+    env = os.environ.copy()
+    env.setdefault("TEMPO_CDP_NO_SANDBOX", "1")
+    before = usage_children()
+    started = now_ms()
+    failure_mode = None
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            str(script_path),
+            "--url",
+            url,
+            "--chrome",
+            chrome,
+            "--output",
+            str(report_path),
+        ],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    with RssSampler(proc.pid) as sampler:
+        stdout, stderr = proc.communicate()
+    completed_returncode = proc.returncode
+    stdout_path.write_text(stdout)
+    stderr_path.write_text(stderr)
+    if completed_returncode != 0:
+        failure_mode = f"exit_{completed_returncode}"
+    wall = now_ms() - started
+    usage = usage_delta(before, usage_children())
+    report: dict = {}
+    if report_path.exists():
+        report = json.loads(report_path.read_text())
+        if report.get("failure_mode") and failure_mode is None:
+            failure_mode = str(report["failure_mode"])
+    else:
+        failure_mode = failure_mode or "missing_report"
+    success = completed_returncode == 0 and bool(report.get("success"))
+    metric = {
+        "runner": runner,
+        "suite": SUITE,
+        "case_id": CASE_ID,
+        "success": success,
+        "wall_clock_ms": wall,
+        "child_wall_clock_ms": int(report.get("wall_clock_ms", 0)),
+        "step_count": int(report.get("step_count", 0)),
+        "retry_count": int(report.get("retry_count", 0)),
+        "failure_mode": failure_mode,
+        "model_input_bytes": int(report.get("model_input_bytes", 0)),
+        "model_input_tokens": int(report.get("model_input_tokens", 0)),
+        "observations": int(report.get("observations", 0)),
+        "adapter": str(report.get("adapter", script_name)),
+        "external_process": True,
+        "runner_report": str(report_path),
+        "runner_stdout": str(stdout_path),
+        "runner_stderr": str(stderr_path),
+    }
+    if "total_model_input_bytes" in report:
+        metric["total_model_input_bytes"] = int(report["total_model_input_bytes"])
+    if "total_model_input_tokens" in report:
+        metric["total_model_input_tokens"] = int(report["total_model_input_tokens"])
+    if "max_observation_bytes" in report:
+        metric["max_observation_bytes"] = int(report["max_observation_bytes"])
+    if "max_observation_tokens" in report:
+        metric["max_observation_tokens"] = int(report["max_observation_tokens"])
+    for key in ("model_input_path", "action_trace_path"):
+        if key in report:
+            metric[key] = str(report[key])
+    metric.update(usage)
+    metric["max_rss_bytes"] = sampler.max_rss_bytes
     return metric
 
 
@@ -533,6 +510,9 @@ def write_jsonl(path: Path, values: list[dict]) -> None:
 
 def clean_output_dir(output_dir: Path) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
+    for child in output_dir.glob("iteration-*"):
+        if child.is_dir():
+            shutil.rmtree(child)
     for name in [
         "agent-browser-bench.json",
         "agent-browser-bench.jsonl",
@@ -547,6 +527,17 @@ def clean_output_dir(output_dir: Path) -> None:
         "tempo-journal.sqlite-wal",
         "tempo-journal.sqlite.lock",
         "tempo-run.json",
+        "chrome-version.txt",
+        "real-playwright.json",
+        "real-playwright.stdout.log",
+        "real-playwright.stderr.log",
+        "real-playwright.model-input.txt",
+        "real-playwright.trace.json",
+        "external-browser-use-dom-loop.json",
+        "external-browser-use-dom-loop.stdout.log",
+        "external-browser-use-dom-loop.stderr.log",
+        "external-browser-use-dom-loop.model-input.txt",
+        "external-browser-use-dom-loop.trace.json",
     ]:
         path = output_dir / name
         if path.exists():
@@ -588,6 +579,22 @@ def summarize_metrics(metrics: list[dict]) -> dict:
             "step_count": summarize_int_field(runner_metrics, "step_count"),
             "retry_count_total": sum(int(metric.get("retry_count", 0)) for metric in runner_metrics),
         }
+        if any("total_model_input_bytes" in metric for metric in runner_metrics):
+            summary[runner]["total_model_input_bytes"] = summarize_int_field(
+                runner_metrics, "total_model_input_bytes"
+            )
+        if any("total_model_input_tokens" in metric for metric in runner_metrics):
+            summary[runner]["total_model_input_tokens"] = summarize_int_field(
+                runner_metrics, "total_model_input_tokens"
+            )
+        if any("max_observation_bytes" in metric for metric in runner_metrics):
+            summary[runner]["max_observation_bytes"] = summarize_int_field(
+                runner_metrics, "max_observation_bytes"
+            )
+        if any("max_observation_tokens" in metric for metric in runner_metrics):
+            summary[runner]["max_observation_tokens"] = summarize_int_field(
+                runner_metrics, "max_observation_tokens"
+            )
     return summary
 
 
@@ -757,6 +764,7 @@ def main() -> int:
     iterations = args.iterations if args.iterations is not None else (5 if args.full else 1)
     if iterations < 1:
         raise RuntimeError("--iterations must be >= 1")
+    resolved_chrome_version = chrome_version(args.chrome)
 
     with StaticServer(FIXTURE_DIR) as server:
         url = f"{server.base_url}/checkout.html"
@@ -769,12 +777,32 @@ def main() -> int:
                 run_cdp_baseline(args.chrome, url, "raw-chrome-cdp", None),
                 run_cdp_baseline(args.chrome, url, "synthetic-playwright-ax", "ax"),
                 run_cdp_baseline(args.chrome, url, "synthetic-browser-use-dom", "browser_use_dom"),
+                run_external_baseline(
+                    args.chrome,
+                    url,
+                    "real-playwright",
+                    "playwright_checkout.py",
+                    iteration_dir,
+                ),
+                run_external_baseline(
+                    args.chrome,
+                    url,
+                    "external-browser-use-dom-loop",
+                    "browser_use_dom_loop.py",
+                    iteration_dir,
+                ),
             ]
             for metric in iteration_metrics:
                 metric["iteration"] = iteration
             write_json(
                 iteration_dir / "agent-browser-bench.json",
-                {"url": url, "iteration": iteration, "metrics": iteration_metrics},
+                {
+                    "url": url,
+                    "iteration": iteration,
+                    "chrome": args.chrome,
+                    "chrome_version": resolved_chrome_version,
+                    "metrics": iteration_metrics,
+                },
             )
             write_jsonl(iteration_dir / "agent-browser-bench.jsonl", iteration_metrics)
             derive_artifacts(iteration_dir, iteration_metrics, url)
@@ -782,10 +810,21 @@ def main() -> int:
         summary = summarize_metrics(metrics)
         write_json(
             output_dir / "agent-browser-bench.json",
-            {"url": url, "iterations": iterations, "metrics": metrics, "summary": summary},
+            {
+                "url": url,
+                "iterations": iterations,
+                "chrome": args.chrome,
+                "chrome_version": resolved_chrome_version,
+                "metrics": metrics,
+                "summary": summary,
+            },
         )
         write_jsonl(output_dir / "agent-browser-bench.jsonl", metrics)
         write_json(output_dir / "agent-browser-bench-summary.json", summary)
+        write_json(
+            output_dir / "chrome-version.txt",
+            {"chrome": args.chrome, "version": resolved_chrome_version},
+        )
 
     violations = validate_summary(summary, args)
     if violations:

@@ -11,11 +11,20 @@ The harness drives the same checkout task through:
   Chrome's live Accessibility domain.
 - A synthetic browser-use-style DOM serializer path, captured from the live page
   DOM.
+- A real external Playwright subprocess (`real-playwright`) using the Python
+  Playwright API against the same Chrome executable.
+- A browser-use-style external DOM loop
+  (`external-browser-use-dom-loop`) that observes indexed interactive DOM lines
+  and acts from those observations. This is a deterministic browser-use-format
+  control loop, not the full browser-use LLM agent package.
 
-The generated benchmark artifact records success, wall time, CPU time, max RSS,
-step count, retry count, failure mode, and model-facing bytes/tokens for each
-runner. `--full` repeats the case five times by default and writes
+The generated benchmark artifact records success, wall time, CPU time, sampled
+process-tree max RSS, step count, retry count, failure mode, and model-facing
+bytes/tokens for each runner. Multi-observation loops report total model-facing
+input in `model_input_*` and largest single-observation size in
+`max_observation_*`. `--full` repeats the case five times by default and writes
 `agent-browser-bench-summary.json` with per-runner success rate, failure-mode
 counts, retry totals, and p50/p95/max stats. It also emits Tempo
 `session-eval`, `replay`, `scorecard`, and `amdahl` artifacts from the real
-journal so benchmark runs stay tied to durable agent evidence.
+journal, external runner model-input/action traces, and `chrome-version.txt` so
+benchmark runs stay tied to durable agent evidence.

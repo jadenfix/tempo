@@ -47,7 +47,7 @@ docker build \
   "$ROOT"
 
 COMMON_ENV=(
-  -e PATH=/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+  -e PATH=/opt/tempo-agent-bench/bin:/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
   -e CARGO_TARGET_DIR=/target
   -e TEMPO_CDP_CHROME_CACHE=/target/chrome-for-testing
   -e TEMPO_CDP_NO_SANDBOX=1
@@ -87,6 +87,7 @@ docker run --rm \
   -w /work \
   "$IMAGE" \
   bash -c "set -euo pipefail
+    trap 'chmod -R a+rX /work/target/linux-agent-gate/agent-browser-bench 2>/dev/null || true' EXIT
     rustc --version
     cargo --version
     cargo fmt --all --check
@@ -102,10 +103,18 @@ docker run --rm \
     bash scripts/check-no-solver.sh
     CHROME_PATH=\"\${TEMPO_CDP_CHROME:-}\"
     if [[ -z \"\$CHROME_PATH\" ]]; then
-      CHROME_PATH=\"\$(scripts/setup-cdp-chrome.sh)\"
+      if ! CHROME_PATH=\"\$(scripts/setup-cdp-chrome.sh 2>/tmp/tempo-cft-setup.err)\"; then
+        echo \"warning: Chrome for Testing setup failed for ${PLATFORM}; falling back to distro chromium preflight\" >&2
+        cat /tmp/tempo-cft-setup.err >&2 || true
+        CHROME_PATH=\"\$(command -v chromium || true)\"
+        if [[ -z \"\$CHROME_PATH\" ]]; then
+          echo \"warning: no fallback chromium binary found in container\" >&2
+        fi
+      fi
     fi
-    rm -f /tmp/tempo-chromium-preflight.out /tmp/tempo-chromium-preflight.err
-    \"\$CHROME_PATH\" \
+    if [[ -n \"\$CHROME_PATH\" ]]; then
+      rm -f /tmp/tempo-chromium-preflight.out /tmp/tempo-chromium-preflight.err
+      \"\$CHROME_PATH\" \
       --headless=new \
       --disable-gpu \
       --no-sandbox \
@@ -114,9 +123,10 @@ docker run --rm \
       about:blank \
       >/tmp/tempo-chromium-preflight.out \
       2>/tmp/tempo-chromium-preflight.err &
-    chromium_pid=\$!
-    sleep 3
-    if kill -0 \"\$chromium_pid\" >/dev/null 2>&1; then
+      chromium_pid=\$!
+      sleep 3
+    fi
+    if [[ -n \"\$CHROME_PATH\" ]] && kill -0 \"\$chromium_pid\" >/dev/null 2>&1; then
       kill \"\$chromium_pid\" >/dev/null 2>&1 || true
       wait \"\$chromium_pid\" >/dev/null 2>&1 || true
       TEMPO_CDP_CHROME=\"\$CHROME_PATH\" scripts/test-live-cdp.sh ${INNER_MODE}
@@ -132,9 +142,18 @@ docker run --rm \
       test -s \"\$BENCH_OUT/replay.json\"
       test -s \"\$BENCH_OUT/scorecard.json\"
       test -s \"\$BENCH_OUT/amdahl.json\"
+      test -s \"\$BENCH_OUT/chrome-version.txt\"
+      test -s \"\$BENCH_OUT/real-playwright.json\"
+      test -s \"\$BENCH_OUT/real-playwright.model-input.txt\"
+      test -s \"\$BENCH_OUT/real-playwright.trace.json\"
+      test -s \"\$BENCH_OUT/external-browser-use-dom-loop.json\"
+      test -s \"\$BENCH_OUT/external-browser-use-dom-loop.model-input.txt\"
+      test -s \"\$BENCH_OUT/external-browser-use-dom-loop.trace.json\"
       chmod -R a+rX \"\$BENCH_OUT\"
     else
-      wait \"\$chromium_pid\" >/dev/null 2>&1 || true
+      if [[ -n \"\${chromium_pid:-}\" ]]; then
+        wait \"\$chromium_pid\" >/dev/null 2>&1 || true
+      fi
       echo \"warning: skipping Docker live-CDP smoke because container Chrome did not launch on ${PLATFORM}\" >&2
       echo \"warning: run scripts/test-live-cdp.sh --smoke on the host, or rerun this gate on a Linux host with a working Chrome runtime\" >&2
       cat /tmp/tempo-chromium-preflight.err >&2 || true

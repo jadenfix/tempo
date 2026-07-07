@@ -6,6 +6,7 @@ RUN apt-get update \
         chromium \
         curl \
         python3 \
+        python3-venv \
         unzip \
         pkg-config \
         libasound2 \
@@ -32,5 +33,11 @@ RUN apt-get update \
         libxrandr2 \
         fonts-liberation \
     && rm -rf /var/lib/apt/lists/*
+
+COPY scripts/requirements-agent-bench.txt /tmp/requirements-agent-bench.txt
+RUN python3 -m venv /opt/tempo-agent-bench \
+    && /opt/tempo-agent-bench/bin/python -m pip install -r /tmp/requirements-agent-bench.txt
+
+ENV PATH="/opt/tempo-agent-bench/bin:${PATH}"
 
 WORKDIR /work
