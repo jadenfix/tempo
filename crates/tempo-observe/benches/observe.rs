@@ -33,6 +33,26 @@ fn synthetic_page(url: &str, elements: usize, generation: u64) -> tempo_observe:
     tempo_observe::ObservationInput::new(url, raw)
 }
 
+fn relayout_task_page(generation: u64) -> tempo_observe::ObservationInput {
+    let roles = ["button", "textbox", "link", "checkbox", "combobox"];
+    let raw = (0..80)
+        .map(|index| {
+            let role = roles[index % roles.len()];
+            let shift = generation as f32 * 0.5;
+            RawElement::new(role, format!("Task element {index}"))
+                .source_id(format!("rerender-{generation}-{index}"))
+                .stable_hint(format!("{role}#task-element-{index}"))
+                .bounds([
+                    (index % 8) as f32 * 96.0 + shift,
+                    (index / 8) as f32 * 36.0 + shift,
+                    84.0,
+                    28.0,
+                ])
+        })
+        .collect();
+    tempo_observe::ObservationInput::new("https://task.example/workflow", raw)
+}
+
 fn bench_compile(c: &mut Criterion) {
     let mut group = c.benchmark_group("observe/compile");
     for &elements in &[50_usize, 200, 1000] {
@@ -137,6 +157,27 @@ fn bench_corpus_report(c: &mut Criterion) {
     });
 }
 
+fn bench_diff_loop_report(c: &mut Criterion) {
+    let corpus: Vec<_> = (0..10).map(relayout_task_page).collect();
+    c.bench_function("observe/diff-loop-report-10x80-relayout", |b| {
+        b.iter(|| {
+            let report = observation_corpus_report(
+                black_box(&corpus),
+                CompileOptions {
+                    max_bytes: 0,
+                    max_tokens: 0,
+                    max_marks: 16,
+                },
+            );
+            black_box((
+                report.full_resnapshot_tokens,
+                report.diff_loop_tokens,
+                report.diff_loop_byte_savings_rate,
+            ))
+        });
+    });
+}
+
 fn bench_serialized_len(c: &mut Criterion) {
     let mut compiler = ObservationCompiler::new();
     let observation = compiler.compile(synthetic_page("https://bench.example", 200, 0));
@@ -167,6 +208,7 @@ criterion_group!(
     bench_diff,
     bench_budget_truncation,
     bench_corpus_report,
+    bench_diff_loop_report,
     bench_serialized_len,
     bench_set_of_marks
 );
