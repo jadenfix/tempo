@@ -20,14 +20,11 @@ use chromiumoxide::cdp::browser_protocol::fetch::{
 };
 use chromiumoxide::cdp::browser_protocol::network::ErrorReason;
 use chromiumoxide::cdp::browser_protocol::page::{
-    CaptureScreenshotFormat, CreateIsolatedWorldParams, Viewport,
+    CaptureScreenshotFormat, CreateIsolatedWorldParams, NavigateParams, Viewport,
 };
-use chromiumoxide::cdp::browser_protocol::target::{
-    CreateBrowserContextParams, CreateTargetParams,
-};
+use chromiumoxide::cdp::browser_protocol::target::CreateTargetParams;
 use chromiumoxide::cdp::js_protocol::runtime::{EvaluateParams, ExecutionContextId};
 use chromiumoxide::error::CdpError;
-use chromiumoxide::handler::HandlerConfig;
 use chromiumoxide::page::{Page, ScreenshotParams};
 use futures::{future::join_all, StreamExt};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -36,14 +33,18 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tempo_driver::{
-    BrowsingContextCreateOptions, DriverTrait, Engine, StepOutcome, TransportError, Unsupported,
-    MAX_SCREENSHOT_BYTES, MAX_SCREENSHOT_HEIGHT, MAX_SCREENSHOT_WIDTH,
+    BrowsingContextCreateOptions, DriverTrait, Engine, ScreenshotCapture, ScreenshotFormat,
+    ScreenshotOptions, StepOutcome, TransportError, Unsupported, MAX_SCREENSHOT_BYTES,
+    MAX_SCREENSHOT_HEIGHT, MAX_SCREENSHOT_WIDTH,
 };
 use tempo_net::{BrowserHardeningPolicy, UrlPolicy};
-use tempo_observe::{finalize_observation, CompileOptions, RawElement, StableIdMapper};
+use tempo_observe::{
+    finalize_observation_with_mark_mapper, CompileOptions, RawElement, StableIdMapper,
+    StableMarkMapper,
+};
 use tempo_schema::{
     Action, ActionBatch, CompiledObservation, InteractiveElement, NodeId, ObservationDiff,
-    Provenance, QuiescencePolicy, TaintSpan,
+    ObservationResource, Provenance, QuiescencePolicy, TaintSpan,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener as TokioTcpListener, TcpStream};
@@ -63,6 +64,8 @@ use tokio::task::JoinHandle;
 /// so every element that actually survives into the marked observation is still
 /// enriched, while the long tail stays present but without an AX overlay.
 const MAX_AX_ENRICHED_ELEMENTS: usize = 16;
+const MAX_OBSERVATION_RESOURCES: usize = 32;
+const MAX_OBSERVATION_RESOURCE_URL_BYTES: usize = 512;
 /// How many recent compiled observations to retain for diff bases. Diffs are only
 /// ever requested against recent seqs (`previous_seq`, `batch_base_seq`, a
 /// client-supplied `since_seq`), and `diff_from_base(None, ...)` already degrades a
@@ -197,10 +200,12 @@ pub struct CdpTempoDriver {
     policy_proxy: Option<PolicyProxy>,
     browser_context_id: Option<BrowserContextId>,
     profile_dir: Option<tempfile::TempDir>,
+    launch_config: CdpConfig,
     owns_browser: bool,
     seq: u64,
     history: BTreeMap<u64, Arc<CompiledObservation>>,
     stable_id_mapper: StableIdMapper,
+    stable_mark_mapper: StableMarkMapper,
     selectors_by_node: BTreeMap<NodeId, String>,
     url_policy: Arc<Mutex<UrlPolicy>>,
     browser_hardening_policy: Arc<Mutex<BrowserHardeningPolicy>>,
@@ -236,6 +241,7 @@ impl CdpTempoDriver {
             request_policy_tracker.clone(),
         )
         .await?;
+        let launch_config = config.clone();
         let mut config = config;
         config.args.extend([
             format!("--proxy-server=http://{}", policy_proxy.addr),
@@ -283,10 +289,12 @@ impl CdpTempoDriver {
             policy_proxy: Some(policy_proxy),
             browser_context_id: None,
             profile_dir: Some(profile_dir),
+            launch_config,
             owns_browser: true,
             seq: 0,
             history: BTreeMap::new(),
             stable_id_mapper: StableIdMapper::new(),
+            stable_mark_mapper: StableMarkMapper::new(),
             selectors_by_node: BTreeMap::new(),
             url_policy,
             browser_hardening_policy,
@@ -481,22 +489,27 @@ impl CdpTempoDriver {
         &mut self,
         url: String,
         dom_html: String,
+        http_status: Option<u16>,
     ) -> Result<Arc<CompiledObservation>, TransportError> {
         self.seq += 1;
         let (mut compiled, selectors_by_node) =
             compile_observation(&mut self.stable_id_mapper, url, dom_html, self.seq);
         self.selectors_by_node = selectors_by_node;
         self.enrich_observation_from_ax_tree(&mut compiled).await?;
+        let resources = compiled.resources;
         // Finish the live observation the same way the fixture compiler does:
         // rank-sort, apply the byte/token budget, and populate set-of-marks labels.
         // Run after enrichment so the budget accounts for enriched AX names/values.
         // Without this the CDP lane shipped the full, unranked, unbudgeted
         // document-order element dump with no marks (#477).
-        let compiled = finalize_observation(
+        let compiled = finalize_observation_with_mark_mapper(
             compiled.url,
             compiled.seq,
             compiled.elements,
             CompileOptions::default(),
+            http_status,
+            resources,
+            &mut self.stable_mark_mapper,
         );
         Ok(retain_observation_history(&mut self.history, compiled))
     }
@@ -506,8 +519,9 @@ impl CdpTempoDriver {
         cursor: u64,
         url: String,
         dom_html: String,
+        http_status: Option<u16>,
     ) -> Result<Arc<CompiledObservation>, TransportError> {
-        let compiled = self.record_snapshot(url, dom_html).await?;
+        let compiled = self.record_snapshot(url, dom_html, http_status).await?;
         // Every `_since` caller has already served the full 25ms event grace
         // for this same cursor immediately after its action command returned
         // (click/type/select/scroll/wait/goto/fixed-millis), so this side only
@@ -532,7 +546,8 @@ impl CdpTempoDriver {
         cursor: u64,
     ) -> Result<Arc<CompiledObservation>, TransportError> {
         let (url, dom_html) = self.snapshot_since(cursor).await?;
-        self.record_snapshot_since(cursor, url, dom_html).await
+        self.record_snapshot_since(cursor, url, dom_html, None)
+            .await
     }
 
     async fn goto_recorded(
@@ -545,14 +560,40 @@ impl CdpTempoDriver {
         if self.should_recreate_child_page_for_navigation() {
             self.recreate_child_page_for_navigation().await?;
         }
-        match tokio::time::timeout(CDP_NAVIGATION_AWAIT_TIMEOUT, self.page()?.goto(url)).await {
-            Ok(Ok(_page)) => {}
-            Ok(Err(CdpError::Timeout)) | Err(_) => {
-                self.recover_timed_out_navigation_since(cursor, url).await?;
+        let page = self.page()?.clone();
+        let mut navigation_status = None;
+        if self.browser_context_id.is_some() {
+            match tokio::time::timeout(
+                CDP_NAVIGATION_AWAIT_TIMEOUT,
+                navigate_without_http_status(&page, url),
+            )
+            .await
+            {
+                Ok(Ok(())) | Ok(Err(CdpError::Timeout)) | Err(_) => {
+                    self.recover_timed_out_navigation_since(cursor, url).await?;
+                }
+                Ok(Err(error)) => {
+                    self.enforce_no_blocked_request_soon_since(cursor).await?;
+                    return Err(map_cdp_error(error));
+                }
             }
-            Ok(Err(error)) => {
-                self.enforce_no_blocked_request_soon_since(cursor).await?;
-                return Err(map_cdp_error(error));
+        } else {
+            match tokio::time::timeout(
+                CDP_NAVIGATION_AWAIT_TIMEOUT,
+                navigate_with_http_status(&page, url),
+            )
+            .await
+            {
+                Ok(Ok(status)) => {
+                    navigation_status = status;
+                }
+                Ok(Err(CdpError::Timeout)) | Err(_) => {
+                    self.recover_timed_out_navigation_since(cursor, url).await?;
+                }
+                Ok(Err(error)) => {
+                    self.enforce_no_blocked_request_soon_since(cursor).await?;
+                    return Err(map_cdp_error(error));
+                }
             }
         }
         self.enforce_no_blocked_request_soon_since(cursor).await?;
@@ -566,12 +607,16 @@ impl CdpTempoDriver {
         // the sampler still recreates on demand if this fails.
         let _ = self.probe_context_id(true, cursor).await;
         let (final_url, dom_html) = self.snapshot_since(cursor).await?;
-        self.record_snapshot_since(cursor, final_url, dom_html)
+        self.record_snapshot_since(cursor, final_url, dom_html, navigation_status)
             .await
     }
 
     fn should_recreate_child_page_for_navigation(&self) -> bool {
-        self.browser_context_id.is_some()
+        // A child browsing context is already isolated by its Chrome
+        // BrowserContext. Recreating the target on every navigation makes
+        // ordinary tab navigations depend on target attach/detach races and can
+        // wedge the CDP handler before a later observe/act_batch returns.
+        false
     }
 
     async fn recreate_child_page_for_navigation(&mut self) -> Result<(), TransportError> {
@@ -823,6 +868,24 @@ impl CdpTempoDriver {
             Ok(StepOutcome::StepError {
                 reason: format!("node not found: {target}"),
             })
+        }
+    }
+
+    async fn settle_after_batch_action(
+        &mut self,
+        quiescence: QuiescencePolicy,
+    ) -> Result<Arc<CompiledObservation>, TransportError> {
+        match quiescence {
+            QuiescencePolicy::FixedMillis(millis) => {
+                let cursor = self.request_policy_cursor();
+                tokio::time::sleep(Duration::from_millis(millis)).await;
+                self.enforce_no_blocked_request_soon_since(cursor).await?;
+                self.record_current_observation_since(cursor).await
+            }
+            QuiescencePolicy::Composite => {
+                self.wait_for_composite_quiescence().await?;
+                self.record_current_observation().await
+            }
         }
     }
 
@@ -1228,39 +1291,30 @@ impl DriverTrait for CdpTempoDriver {
 
     async fn act_batch(&mut self, batch: &ActionBatch) -> Result<StepOutcome, TransportError> {
         let batch_base_seq = self.seq;
+        let mut last_settled = None;
         for action in &batch.actions {
             let outcome = self.run_one(action).await?;
             if matches!(outcome, StepOutcome::StepError { .. }) {
                 return Ok(outcome);
             }
+            if matches!(action, Action::Goto { .. }) {
+                last_settled = self.history.get(&self.seq).cloned();
+            } else {
+                last_settled = Some(self.settle_after_batch_action(batch.quiescence).await?);
+            }
         }
 
-        match batch.quiescence {
-            QuiescencePolicy::FixedMillis(millis) => {
-                let cursor = self.request_policy_cursor();
-                tokio::time::sleep(Duration::from_millis(millis)).await;
-                self.enforce_no_blocked_request_soon_since(cursor).await?;
-                let compiled = self.record_current_observation_since(cursor).await?;
-                Ok(StepOutcome::Applied {
-                    diff: diff_from_base(
-                        history_base(&self.history, batch_base_seq),
-                        compiled.as_ref(),
-                        batch_base_seq,
-                    ),
-                })
-            }
-            QuiescencePolicy::Composite => {
-                self.wait_for_composite_quiescence().await?;
-                let compiled = self.record_current_observation().await?;
-                Ok(StepOutcome::Applied {
-                    diff: diff_from_base(
-                        history_base(&self.history, batch_base_seq),
-                        compiled.as_ref(),
-                        batch_base_seq,
-                    ),
-                })
-            }
-        }
+        let compiled = match last_settled {
+            Some(compiled) => compiled,
+            None => self.record_current_observation().await?,
+        };
+        Ok(StepOutcome::Applied {
+            diff: diff_from_base(
+                history_base(&self.history, batch_base_seq),
+                compiled.as_ref(),
+                batch_base_seq,
+            ),
+        })
     }
 
     async fn fork(&mut self) -> Result<Box<dyn DriverTrait>, Unsupported> {
@@ -1271,97 +1325,22 @@ impl DriverTrait for CdpTempoDriver {
         &mut self,
         _options: BrowsingContextCreateOptions,
     ) -> Result<Box<dyn DriverTrait>, Unsupported> {
-        let browser_context_id = self
-            .browser
-            .create_browser_context(
-                CreateBrowserContextParams::builder()
-                    .dispose_on_detach(true)
-                    .build(),
-            )
+        let mut child = Self::launch_with(self.launch_config.clone())
             .await
             .map_err(|_error| Unsupported("fresh CDP browsing context"))?;
-        let browser_ws = self.browser.websocket_address().clone();
-        let handler_config = HandlerConfig {
-            context_ids: vec![browser_context_id.clone()],
-            request_timeout: CDP_REQUEST_TIMEOUT,
-            ..HandlerConfig::default()
-        };
-        let (browser, mut handler) =
-            match Browser::connect_with_config(browser_ws, handler_config).await {
-                Ok(pair) => pair,
-                Err(_error) => {
-                    let _ = self
-                        .browser
-                        .dispose_browser_context(browser_context_id.clone())
-                        .await;
-                    return Err(Unsupported("fresh CDP browsing context"));
-                }
-            };
-        let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
-        let page_params = match CreateTargetParams::builder()
-            .url("about:blank")
-            .browser_context_id(browser_context_id.clone())
-            .build()
-        {
-            Ok(params) => params,
-            Err(_error) => {
-                let _ = browser
-                    .dispose_browser_context(browser_context_id.clone())
-                    .await;
-                handler_task.abort();
-                return Err(Unsupported("fresh CDP browsing context"));
-            }
-        };
-        let page = match browser.new_page(page_params).await {
-            Ok(page) => page,
-            Err(_error) => {
-                let _ = browser
-                    .dispose_browser_context(browser_context_id.clone())
-                    .await;
-                handler_task.abort();
-                return Err(Unsupported("fresh CDP browsing context"));
-            }
-        };
-        let blocked_request_url = Arc::new(Mutex::new(None));
-        let request_policy_tracker = Arc::new(RequestPolicyTracker::new());
-        let request_policy_task = match install_request_policy(
-            &page,
-            self.browser_hardening_policy.clone(),
-            blocked_request_url.clone(),
-            request_policy_tracker.clone(),
-        )
-        .await
-        {
-            Ok(task) => task,
-            Err(_error) => {
-                let _ = page.close().await;
-                let _ = browser
-                    .dispose_browser_context(browser_context_id.clone())
-                    .await;
-                handler_task.abort();
-                return Err(Unsupported("fresh CDP browsing context"));
-            }
-        };
-
-        Ok(Box::new(Self {
-            browser,
-            page: Some(page),
-            handler_task,
-            request_policy_task: Some(request_policy_task),
-            policy_proxy: None,
-            browser_context_id: Some(browser_context_id),
-            profile_dir: None,
-            owns_browser: false,
-            seq: 0,
-            history: BTreeMap::new(),
-            stable_id_mapper: StableIdMapper::new(),
-            selectors_by_node: BTreeMap::new(),
-            url_policy: self.url_policy.clone(),
-            browser_hardening_policy: self.browser_hardening_policy.clone(),
-            blocked_request_url,
-            request_policy_tracker,
-            probe_context: Mutex::new(None),
-        }))
+        let url_policy = self
+            .url_policy
+            .lock()
+            .map_err(|_error| Unsupported("fresh CDP browsing context"))?
+            .clone();
+        let hardening_policy = self
+            .browser_hardening_policy
+            .lock()
+            .map_err(|_error| Unsupported("fresh CDP browsing context"))?
+            .clone();
+        child.set_url_policy(url_policy);
+        child.set_browser_hardening_policy(hardening_policy);
+        Ok(Box::new(child))
     }
 
     async fn extract(&mut self, node: &NodeId) -> Result<serde_json::Value, TransportError> {
@@ -1408,18 +1387,33 @@ impl DriverTrait for CdpTempoDriver {
     }
 
     async fn screenshot(&mut self) -> Result<Vec<u8>, TransportError> {
-        let params = ScreenshotParams::builder()
-            .format(CaptureScreenshotFormat::Png)
-            .clip(screenshot_viewport_clip()?)
-            .capture_beyond_viewport(false)
-            .build();
+        Ok(self
+            .screenshot_with_options(ScreenshotOptions::png_lossless())
+            .await?
+            .bytes)
+    }
+
+    async fn screenshot_with_options(
+        &mut self,
+        options: ScreenshotOptions,
+    ) -> Result<ScreenshotCapture, TransportError> {
+        let params = screenshot_params(options)?;
         self.enforce_current_url_policy().await?;
+        let started = Instant::now();
         let bytes = self
             .page()?
             .screenshot(params)
             .await
             .map_err(map_cdp_error)?;
-        validate_screenshot_bytes(bytes)
+        let capture_ms = elapsed_ms(started);
+        let bytes = validate_screenshot_bytes(bytes)?;
+        let delivered_bytes = bytes.len();
+        Ok(ScreenshotCapture {
+            mime_type: options.format.mime_type().into(),
+            delivered_bytes,
+            capture_ms,
+            bytes,
+        })
     }
 
     async fn close(&mut self) -> Result<(), TransportError> {
@@ -2081,15 +2075,57 @@ fn enforce_url_policy_with_resolved_socket(
         .map_err(|_error| TransportError::UrlBlocked)
 }
 
-fn screenshot_viewport_clip() -> Result<Viewport, TransportError> {
+fn screenshot_viewport_clip_with_scale(scale: f64) -> Result<Viewport, TransportError> {
     Viewport::builder()
         .x(0.0)
         .y(0.0)
         .width(f64::from(MAX_SCREENSHOT_WIDTH))
         .height(f64::from(MAX_SCREENSHOT_HEIGHT))
-        .scale(1.0)
+        .scale(scale)
         .build()
         .map_err(TransportError::Other)
+}
+
+fn screenshot_params(options: ScreenshotOptions) -> Result<ScreenshotParams, TransportError> {
+    let mut builder = ScreenshotParams::builder()
+        .format(cdp_screenshot_format(options.format))
+        .clip(screenshot_viewport_clip_with_scale(screenshot_scale(
+            options.max_dimension,
+        ))?)
+        .capture_beyond_viewport(false);
+    if let Some(quality) = options.quality {
+        if quality > 100 {
+            return Err(TransportError::Other(format!(
+                "screenshot quality must be 0..=100, got {quality}"
+            )));
+        }
+        if matches!(
+            options.format,
+            ScreenshotFormat::Jpeg | ScreenshotFormat::Webp
+        ) {
+            builder = builder.quality(i64::from(quality));
+        }
+    }
+    Ok(builder.build())
+}
+
+fn cdp_screenshot_format(format: ScreenshotFormat) -> CaptureScreenshotFormat {
+    match format {
+        ScreenshotFormat::Png => CaptureScreenshotFormat::Png,
+        ScreenshotFormat::Jpeg => CaptureScreenshotFormat::Jpeg,
+        ScreenshotFormat::Webp => CaptureScreenshotFormat::Webp,
+    }
+}
+
+fn screenshot_scale(max_dimension: Option<u32>) -> f64 {
+    let Some(max_dimension) = max_dimension else {
+        return 1.0;
+    };
+    if max_dimension == 0 {
+        return 1.0;
+    }
+    let longest_side = MAX_SCREENSHOT_WIDTH.max(MAX_SCREENSHOT_HEIGHT);
+    (f64::from(max_dimension) / f64::from(longest_side)).clamp(0.01, 1.0)
 }
 
 fn validate_screenshot_bytes(bytes: Vec<u8>) -> Result<Vec<u8>, TransportError> {
@@ -2101,6 +2137,43 @@ fn validate_screenshot_bytes(bytes: Vec<u8>) -> Result<Vec<u8>, TransportError> 
         });
     }
     Ok(bytes)
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+async fn navigate_with_http_status(page: &Page, url: &str) -> Result<Option<u16>, CdpError> {
+    let request = page
+        .http_future(NavigateParams {
+            url: url.to_string(),
+            transition_type: None,
+            frame_id: None,
+            referrer: None,
+            referrer_policy: None,
+        })?
+        .await?;
+    Ok(request.and_then(|request| request.response.as_ref().and_then(cdp_status_to_u16)))
+}
+
+async fn navigate_without_http_status(page: &Page, url: &str) -> Result<(), CdpError> {
+    page.goto(NavigateParams {
+        url: url.to_string(),
+        transition_type: None,
+        frame_id: None,
+        referrer: None,
+        referrer_policy: None,
+    })
+    .await?;
+    Ok(())
+}
+
+fn cdp_status_to_u16(
+    response: &chromiumoxide::cdp::browser_protocol::network::Response,
+) -> Option<u16> {
+    u16::try_from(response.status)
+        .ok()
+        .filter(|status| (100..=599).contains(status))
 }
 
 fn map_cdp_error(error: CdpError) -> TransportError {
@@ -2395,16 +2468,24 @@ fn compile_observation(
     seq: u64,
 ) -> (CompiledObservation, BTreeMap<NodeId, String>) {
     let mut elements = extract_interactive_elements(&dom_html);
+    let mut resources = extract_observation_resources(&dom_html, &url);
     let raw_elements: Vec<_> = elements
         .iter()
         .map(raw_element_from_selector_element)
         .collect();
     let node_ids = mapper.map_snapshot(seq, &raw_elements);
     let mut selectors_by_node = BTreeMap::new();
+    let mut node_by_selector = BTreeMap::new();
     for (element, node_id) in elements.iter_mut().zip(node_ids) {
         let selector = element.node_id.0.clone();
         element.node_id = node_id.clone();
+        node_by_selector.insert(selector.clone(), node_id.clone());
         selectors_by_node.insert(node_id, selector);
+    }
+    for resource in &mut resources {
+        if let Some(node) = &resource.node {
+            resource.node = node_by_selector.get(&node.0).cloned();
+        }
     }
 
     (
@@ -2415,6 +2496,8 @@ fn compile_observation(
             elements,
             omitted: 0,
             marks: Vec::new(),
+            http_status: None,
+            resources,
         },
         selectors_by_node,
     )
@@ -2423,12 +2506,30 @@ fn compile_observation(
 fn raw_element_from_selector_element(element: &InteractiveElement) -> RawElement {
     let mut raw = RawElement::new(element.role.clone(), "")
         .source_id(element.node_id.0.clone())
+        .stable_hint(cdp_stable_hint(element))
         .name_spans(element.name.clone())
         .value_spans(element.value.clone());
     if let Some(bounds) = element.bounds {
         raw = raw.bounds(bounds);
     }
     raw
+}
+
+fn cdp_stable_hint(element: &InteractiveElement) -> String {
+    let mut hint = String::new();
+    hint.push_str("content:");
+    hint.push_str(&element.role);
+    hint.push('|');
+    push_spans_text(&mut hint, &element.name);
+    hint.push('|');
+    push_spans_text(&mut hint, &element.value);
+    hint
+}
+
+fn push_spans_text(output: &mut String, spans: &[TaintSpan]) {
+    for span in spans {
+        output.push_str(&span.text);
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2582,7 +2683,7 @@ fn top_ranked_indices(elements: &[InteractiveElement], limit: usize) -> Vec<usiz
 
 fn visual_extraction_taint(value: &str) -> Vec<TaintSpan> {
     vec![TaintSpan {
-        provenance: Provenance::Page,
+        provenance: Provenance::VisualExtraction,
         text: value.to_string(),
     }]
 }
@@ -2609,6 +2710,8 @@ fn diff_from_base(
             added: current.elements.clone(),
             removed: Vec::new(),
             changed: Vec::new(),
+            http_status: current.http_status,
+            resources: current.resources.clone(),
         };
     };
 
@@ -2650,6 +2753,8 @@ fn diff_from_base(
         added,
         removed,
         changed,
+        http_status: current.http_status,
+        resources: current.resources.clone(),
     }
 }
 
@@ -2819,6 +2924,144 @@ fn extract_interactive_elements(html: &str) -> Vec<InteractiveElement> {
     }
 
     elements
+}
+
+fn extract_observation_resources(html: &str, page_url: &str) -> Vec<ObservationResource> {
+    struct Frame {
+        tag: String,
+        child_counts: BTreeMap<String, usize>,
+        selector_path: String,
+    }
+
+    let mut resources = Vec::new();
+    let mut search_from = 0;
+    let mut stack: Vec<Frame> = vec![Frame {
+        tag: String::new(),
+        child_counts: BTreeMap::new(),
+        selector_path: String::new(),
+    }];
+
+    while let Some(start_offset) = html[search_from..].find('<') {
+        if resources.len() >= MAX_OBSERVATION_RESOURCES {
+            break;
+        }
+        let start = search_from + start_offset;
+        let Some(end_offset) = html[start..].find('>') else {
+            break;
+        };
+        let end = start + end_offset;
+        let raw_tag = html[start + 1..end].trim();
+        search_from = end + 1;
+
+        if raw_tag.is_empty() || raw_tag.starts_with('!') || raw_tag.starts_with('?') {
+            continue;
+        }
+
+        if let Some(name) = raw_tag.strip_prefix('/') {
+            let name = name.trim().to_ascii_lowercase();
+            if let Some(position) = stack.iter().rposition(|frame| frame.tag == name)
+                && position > 0
+            {
+                stack.truncate(position);
+            }
+            continue;
+        }
+
+        let self_closing = raw_tag.ends_with('/');
+        let raw_tag = raw_tag.trim_end_matches('/').trim();
+        let Some((tag, attrs_raw)) = split_tag(raw_tag) else {
+            continue;
+        };
+        let tag = tag.to_ascii_lowercase();
+        let attrs = parse_attrs(attrs_raw);
+
+        let (nth_of_type, parent_selector_path) = {
+            let Some(parent) = stack.last_mut() else {
+                break;
+            };
+            let count = parent.child_counts.entry(tag.clone()).or_insert(0);
+            *count += 1;
+            (*count, parent.selector_path.clone())
+        };
+        let selector_segment = format!("{tag}:nth-of-type({nth_of_type})");
+        let fallback_selector = child_structural_selector(&parent_selector_path, &selector_segment);
+
+        if !(self_closing || is_void_element(&tag)) {
+            stack.push(Frame {
+                tag: tag.clone(),
+                child_counts: BTreeMap::new(),
+                selector_path: fallback_selector.clone(),
+            });
+        }
+
+        if !matches!(tag.as_str(), "iframe" | "frame" | "embed" | "script") {
+            continue;
+        }
+        let Some(src) = attrs.get("src").filter(|src| !src.trim().is_empty()) else {
+            continue;
+        };
+        let Some((url, origin)) = sanitized_resource_url(page_url, src) else {
+            continue;
+        };
+        let node = if tag == "script" {
+            None
+        } else {
+            Some(NodeId(
+                selector_for(&tag, &attrs).unwrap_or(fallback_selector),
+            ))
+        };
+        resources.push(ObservationResource {
+            node,
+            role: tag,
+            url,
+            origin,
+            status: None,
+        });
+    }
+
+    resources
+}
+
+fn sanitized_resource_url(page_url: &str, src: &str) -> Option<(String, String)> {
+    let mut parsed = match url::Url::parse(src) {
+        Ok(parsed) => parsed,
+        Err(_) => url::Url::parse(page_url).ok()?.join(src).ok()?,
+    };
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        return None;
+    }
+    parsed.set_fragment(None);
+    parsed.set_query(None);
+    let _ = parsed.set_username("");
+    let _ = parsed.set_password(None);
+    let origin = resource_origin(&parsed)?;
+    let mut url = parsed.to_string();
+    truncate_to_char_boundary(&mut url, MAX_OBSERVATION_RESOURCE_URL_BYTES);
+    Some((url, origin))
+}
+
+fn resource_origin(parsed: &url::Url) -> Option<String> {
+    let host = parsed.host_str()?;
+    let mut origin = String::new();
+    origin.push_str(parsed.scheme());
+    origin.push_str("://");
+    origin.push_str(host);
+    if let Some(port) = parsed.port() {
+        origin.push(':');
+        origin.push_str(&port.to_string());
+    }
+    Some(origin)
+}
+
+fn truncate_to_char_boundary(value: &mut String, max_bytes: usize) {
+    if value.len() <= max_bytes {
+        return;
+    }
+    let mut boundary = max_bytes;
+    while boundary > 0 && !value.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    value.truncate(boundary);
 }
 
 fn is_void_element(tag: &str) -> bool {
@@ -3199,6 +3442,67 @@ mod tests {
     }
 
     #[test]
+    fn selector_elements_carry_stable_hints_for_observe_identity() {
+        let selector_backed = InteractiveElement {
+            node_id: NodeId("#pay".to_string()),
+            role: "button".to_string(),
+            name: vec![TaintSpan {
+                provenance: Provenance::Page,
+                text: "Pay".to_string(),
+            }],
+            value: Vec::new(),
+            bounds: None,
+            rank: 1.0,
+        };
+        let raw = raw_element_from_selector_element(&selector_backed);
+        assert_eq!(raw.source_id.as_deref(), Some("#pay"));
+        assert_eq!(raw.stable_hint.as_deref(), Some("content:button|Pay|"));
+
+        let structural = InteractiveElement {
+            node_id: NodeId("main:nth-of-type(1) > button:nth-of-type(2)".to_string()),
+            role: "button".to_string(),
+            name: vec![TaintSpan {
+                provenance: Provenance::Page,
+                text: "Continue".to_string(),
+            }],
+            value: Vec::new(),
+            bounds: None,
+            rank: 1.0,
+        };
+        let raw = raw_element_from_selector_element(&structural);
+        assert_eq!(
+            raw.source_id.as_deref(),
+            Some("main:nth-of-type(1) > button:nth-of-type(2)")
+        );
+        assert_eq!(raw.stable_hint.as_deref(), Some("content:button|Continue|"));
+    }
+
+    #[test]
+    fn extracts_resource_origins_for_scripts_and_embeds() {
+        let resources = extract_observation_resources(
+            r#"
+              <main>
+                <script src="/static/app.js?token=secret#fragment"></script>
+                <iframe title="challenge" src="https://www.google.com/recaptcha/api2/anchor?k=abc"></iframe>
+                <embed src="data:text/plain,ignored">
+                <script src="https://cdn.example.test/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"></script>
+              </main>
+            "#,
+            "https://shop.example/checkout",
+        );
+
+        assert_eq!(resources.len(), 3);
+        assert_eq!(resources[0].role, "script");
+        assert_eq!(resources[0].url, "https://shop.example/static/app.js");
+        assert_eq!(resources[0].origin, "https://shop.example");
+        assert!(resources[0].node.is_none());
+        assert_eq!(resources[1].role, "iframe");
+        assert_eq!(resources[1].origin, "https://www.google.com");
+        assert!(resources[1].node.is_some());
+        assert!(resources[2].url.len() <= MAX_OBSERVATION_RESOURCE_URL_BYTES);
+    }
+
+    #[test]
     fn find_close_tag_matches_case_insensitively_in_one_pass() {
         // Case-insensitive, returns the byte offset of the '<' of "</tag".
         assert_eq!(find_close_tag(b"hi</A>", b"a"), Some(2));
@@ -3242,8 +3546,12 @@ mod tests {
             compile_observation(&mut mapper, "https://example.test/".into(), html.into(), 1);
         // Raw extractor emits document order and no marks.
         assert!(raw.marks.is_empty());
-        let finished =
-            finalize_observation(raw.url, raw.seq, raw.elements, CompileOptions::default());
+        let finished = tempo_observe::finalize_observation(
+            raw.url,
+            raw.seq,
+            raw.elements,
+            CompileOptions::default(),
+        );
         // Rank-sorted: ranks are non-increasing.
         assert!(finished
             .elements
@@ -3260,7 +3568,7 @@ mod tests {
         let (raw_big, _) = compile_observation(&mut mapper, "https://example.test/".into(), big, 2);
         let raw_count = raw_big.elements.len();
         assert!(raw_count > 200, "fixture should extract all 400 buttons");
-        let finished_big = finalize_observation(
+        let finished_big = tempo_observe::finalize_observation(
             raw_big.url,
             raw_big.seq,
             raw_big.elements,
@@ -3291,6 +3599,8 @@ mod tests {
                 elements: Vec::new(),
                 marks: Vec::new(),
                 omitted: 0,
+                http_status: None,
+                resources: Vec::new(),
             }
         }
         let mut history: BTreeMap<u64, Arc<CompiledObservation>> = BTreeMap::new();
@@ -3325,6 +3635,8 @@ mod tests {
                 elements: Vec::new(),
                 marks: Vec::new(),
                 omitted: 0,
+                http_status: None,
+                resources: Vec::new(),
             },
         );
 
@@ -3444,6 +3756,8 @@ mod tests {
             ),
             omitted: 0,
             marks: Vec::new(),
+            http_status: None,
+            resources: Vec::new(),
         };
         let after = CompiledObservation {
             schema_version: tempo_schema::SCHEMA_VERSION.into(),
@@ -3454,6 +3768,8 @@ mod tests {
             ),
             omitted: 0,
             marks: Vec::new(),
+            http_status: None,
+            resources: Vec::new(),
         };
 
         let diff = diff_from_base(Some(&before), &after, before.seq);
@@ -3694,7 +4010,7 @@ mod tests {
 
     #[test]
     fn screenshot_clip_uses_max_dimensions() -> Result<(), Box<dyn std::error::Error>> {
-        let clip = screenshot_viewport_clip()?;
+        let clip = screenshot_viewport_clip_with_scale(1.0)?;
 
         assert_eq!(clip.x, 0.0);
         assert_eq!(clip.y, 0.0);
@@ -3702,6 +4018,41 @@ mod tests {
         assert_eq!(clip.height, f64::from(MAX_SCREENSHOT_HEIGHT));
         assert_eq!(clip.scale, 1.0);
         Ok(())
+    }
+
+    #[test]
+    fn screenshot_params_support_jpeg_quality_and_downscale(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let params = screenshot_params(ScreenshotOptions {
+            format: ScreenshotFormat::Jpeg,
+            max_dimension: Some(1024),
+            quality: Some(70),
+        })?;
+        let clip = params.cdp_params.clip.ok_or("missing clip")?;
+
+        assert_eq!(
+            params.cdp_params.format,
+            Some(CaptureScreenshotFormat::Jpeg)
+        );
+        assert_eq!(params.cdp_params.quality, Some(70));
+        assert_eq!(clip.width, f64::from(MAX_SCREENSHOT_WIDTH));
+        assert_eq!(clip.height, f64::from(MAX_SCREENSHOT_HEIGHT));
+        assert_eq!(clip.scale, 0.25);
+        Ok(())
+    }
+
+    #[test]
+    fn screenshot_params_reject_invalid_quality() {
+        let error = match screenshot_params(ScreenshotOptions {
+            format: ScreenshotFormat::Jpeg,
+            max_dimension: Some(1024),
+            quality: Some(101),
+        }) {
+            Ok(_) => panic!("invalid quality should fail"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("quality must be 0..=100"));
     }
 
     #[test]
@@ -3762,9 +4113,9 @@ mod tests {
 
         assert_eq!(element.role, "textbox");
         assert_eq!(element.name[0].text, "Email Address");
-        assert_eq!(element.name[0].provenance, Provenance::Page);
+        assert_eq!(element.name[0].provenance, Provenance::VisualExtraction);
         assert_eq!(element.value[0].text, "me@example.com");
-        assert_eq!(element.value[0].provenance, Provenance::Page);
+        assert_eq!(element.value[0].provenance, Provenance::VisualExtraction);
         Ok(())
     }
 
@@ -4990,6 +5341,8 @@ mod tests {
     #[tokio::test]
     async fn live_cdp_child_browsing_context_isolates_storage(
     ) -> Result<(), Box<dyn std::error::Error>> {
+        const CHILD_CONTEXT_OP_TIMEOUT: Duration = Duration::from_secs(30);
+
         let Some(chrome) = std::env::var_os("TEMPO_CDP_CHROME") else {
             eprintln!("skipping live CDP context isolation test; TEMPO_CDP_CHROME is unset");
             return Ok(());
@@ -5031,18 +5384,18 @@ mod tests {
 
         assert_eq!(child_value, serde_json::json!("__missing__"));
         assert_eq!(child_cookie, serde_json::json!(""));
-        let child_observe = tokio::time::timeout(Duration::from_secs(10), child.observe())
+        let child_observe = tokio::time::timeout(CHILD_CONTEXT_OP_TIMEOUT, child.observe())
             .await
             .map_err(|_| std::io::Error::other("child observe timed out"))??;
         assert_eq!(child_observe.url, url);
         let child_next_url = format!("{url}again");
         let child_second_goto =
-            tokio::time::timeout(Duration::from_secs(10), child.goto(&child_next_url))
+            tokio::time::timeout(CHILD_CONTEXT_OP_TIMEOUT, child.goto(&child_next_url))
                 .await
                 .map_err(|_| std::io::Error::other("child second goto timed out"))??;
         assert_eq!(child_second_goto.url, child_next_url);
         let child_batch = tokio::time::timeout(
-            Duration::from_secs(10),
+            CHILD_CONTEXT_OP_TIMEOUT,
             child.act_batch(&ActionBatch {
                 actions: vec![Action::Goto {
                     url: format!("{url}batch"),
