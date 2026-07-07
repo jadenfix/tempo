@@ -132,6 +132,7 @@ docker run --rm \
       test -s \"\$BENCH_OUT/replay.json\"
       test -s \"\$BENCH_OUT/scorecard.json\"
       test -s \"\$BENCH_OUT/amdahl.json\"
+      chmod -R a+rX \"\$BENCH_OUT\"
     else
       wait \"\$chromium_pid\" >/dev/null 2>&1 || true
       echo \"warning: skipping Docker live-CDP smoke because container Chrome did not launch on ${PLATFORM}\" >&2
