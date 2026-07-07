@@ -1151,7 +1151,7 @@ fn replay_steps_from_entries(entries: &[JournalEntry]) -> Result<Vec<ReplayStep>
                     outcome: ReplayStepOutcome::Pending,
                 });
             }
-            JournalEvent::StepApplied { action, diff } => {
+            JournalEvent::StepApplied { action, diff, .. } => {
                 pending = None;
                 steps.push(ReplayStep {
                     index: completed_steps,
@@ -3134,6 +3134,7 @@ mod tests {
                 removed: Vec::new(),
                 changed: Vec::new(),
             },
+            read_result: None,
         })?;
         journal.append(JournalEvent::SessionClosed)?;
         Ok(())

@@ -397,9 +397,9 @@ impl WebViewDriver {
             Err(error) => return Err(error.into_transport_error()),
         };
         let current = self.record_snapshot(snapshot)?;
-        Ok(StepOutcome::Applied {
-            diff: self.diff_from_base(previous_seq, current.as_ref()),
-        })
+        Ok(StepOutcome::applied(
+            self.diff_from_base(previous_seq, current.as_ref()),
+        ))
     }
 
     fn capped_page_value(
@@ -455,9 +455,9 @@ impl DriverTrait for WebViewDriver {
         match action {
             Action::Goto { url } => {
                 let observation = self.goto(url).await?;
-                Ok(StepOutcome::Applied {
-                    diff: self.diff_from_base(previous_seq, &observation),
-                })
+                Ok(StepOutcome::applied(
+                    self.diff_from_base(previous_seq, &observation),
+                ))
             }
             Action::Click { node } => {
                 self.run_node_action(node, |host, locator| host.click(locator))
@@ -471,16 +471,16 @@ impl DriverTrait for WebViewDriver {
             Action::Scroll { x, y } => {
                 let snapshot = self.host.scroll(*x, *y).map_err(map_host_error)?;
                 let current = self.record_snapshot(snapshot)?;
-                Ok(StepOutcome::Applied {
-                    diff: self.diff_from_base(previous_seq, current.as_ref()),
-                })
+                Ok(StepOutcome::applied(
+                    self.diff_from_base(previous_seq, current.as_ref()),
+                ))
             }
             Action::Wait { millis } => {
                 let snapshot = self.host.wait(*millis).map_err(map_host_error)?;
                 let current = self.record_snapshot(snapshot)?;
-                Ok(StepOutcome::Applied {
-                    diff: self.diff_from_base(previous_seq, current.as_ref()),
-                })
+                Ok(StepOutcome::applied(
+                    self.diff_from_base(previous_seq, current.as_ref()),
+                ))
             }
             Action::Extract { node } => self.run_node_action(node, |host, locator| {
                 host.extract(locator)?;
@@ -502,9 +502,9 @@ impl DriverTrait for WebViewDriver {
         }
         let snapshot = self.host.settle(batch.quiescence).map_err(map_host_error)?;
         let current = self.record_snapshot(snapshot)?;
-        Ok(StepOutcome::Applied {
-            diff: self.diff_from_base(batch_base_seq, current.as_ref()),
-        })
+        Ok(StepOutcome::applied(
+            self.diff_from_base(batch_base_seq, current.as_ref()),
+        ))
     }
 
     async fn fork(&mut self) -> Result<Box<dyn DriverTrait>, Unsupported> {

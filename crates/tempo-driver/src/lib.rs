@@ -100,10 +100,34 @@ pub enum TransportError {
 
 /// Outcome of an action: either it grounded and produced a diff, or it was a step error
 /// (e.g. NodeId not present) — which is a normal, recoverable signal, not a transport fault.
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum StepOutcome {
-    Applied { diff: ObservationDiff },
-    StepError { reason: String },
+    Applied {
+        diff: ObservationDiff,
+        /// Optional page-derived structured payload produced by read actions
+        /// such as `extract`. This is separate from the observation diff so an
+        /// empty-diff read can still be journaled and fed back to the model.
+        read_result: Option<TaintedValue>,
+    },
+    StepError {
+        reason: String,
+    },
+}
+
+impl StepOutcome {
+    pub fn applied(diff: ObservationDiff) -> Self {
+        Self::Applied {
+            diff,
+            read_result: None,
+        }
+    }
+
+    pub fn applied_with_read_result(diff: ObservationDiff, read_result: TaintedValue) -> Self {
+        Self::Applied {
+            diff,
+            read_result: Some(read_result),
+        }
+    }
 }
 
 /// Capability a driver may not support (e.g. CDP lane cannot natively `fork`).
@@ -307,18 +331,16 @@ impl DriverTrait for TestDriver {
         if let Action::Goto { url } = action {
             let since_seq = self.seq;
             let observation = self.goto(url).await?;
-            return Ok(StepOutcome::Applied {
-                diff: ObservationDiff {
-                    since_seq,
-                    seq: observation.seq,
-                    url: Some(observation.url.clone()),
-                    omitted: 0,
-                    marks: observation.marks.clone(),
-                    added: vec![],
-                    removed: vec![],
-                    changed: vec![],
-                },
-            });
+            return Ok(StepOutcome::applied(ObservationDiff {
+                since_seq,
+                seq: observation.seq,
+                url: Some(observation.url.clone()),
+                omitted: 0,
+                marks: observation.marks.clone(),
+                added: vec![],
+                removed: vec![],
+                changed: vec![],
+            }));
         }
 
         // Grounding contract: an action against a missing node is a StepError, not a fault.
@@ -335,33 +357,36 @@ impl DriverTrait for TestDriver {
             });
         }
         self.seq += 1;
-        Ok(StepOutcome::Applied {
-            diff: ObservationDiff {
-                since_seq: self.seq - 1,
-                seq: self.seq,
-                url: None,
-                omitted: 0,
-                marks: Vec::new(),
-                added: vec![],
-                removed: vec![],
-                changed: vec![],
-            },
-        })
+        let diff = ObservationDiff {
+            since_seq: self.seq - 1,
+            seq: self.seq,
+            url: None,
+            omitted: 0,
+            marks: Vec::new(),
+            added: vec![],
+            removed: vec![],
+            changed: vec![],
+        };
+        if let Action::Extract { node } = action {
+            return Ok(StepOutcome::applied_with_read_result(
+                diff,
+                TaintedValue::page(serde_json::json!({ "node": node.0 })),
+            ));
+        }
+        Ok(StepOutcome::applied(diff))
     }
 
     async fn act_batch(&mut self, batch: &ActionBatch) -> Result<StepOutcome, TransportError> {
-        let mut last = StepOutcome::Applied {
-            diff: ObservationDiff {
-                since_seq: self.seq,
-                seq: self.seq,
-                url: None,
-                omitted: 0,
-                marks: Vec::new(),
-                added: vec![],
-                removed: vec![],
-                changed: vec![],
-            },
-        };
+        let mut last = StepOutcome::applied(ObservationDiff {
+            since_seq: self.seq,
+            seq: self.seq,
+            url: None,
+            omitted: 0,
+            marks: Vec::new(),
+            added: vec![],
+            removed: vec![],
+            changed: vec![],
+        });
         for a in &batch.actions {
             last = self.act(a).await?;
             if matches!(last, StepOutcome::StepError { .. }) {

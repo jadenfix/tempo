@@ -2534,8 +2534,12 @@ fn confirmed_tool_schema() -> Value {
 
 fn step_outcome_json(outcome: StepOutcome) -> Value {
     match outcome {
-        StepOutcome::Applied { diff } => {
-            json!({"status": "applied", "diff": diff})
+        StepOutcome::Applied { diff, read_result } => {
+            let mut value = json!({"status": "applied", "diff": diff});
+            if let Some(read_result) = read_result {
+                value["read_result"] = json!(read_result);
+            }
+            value
         }
         StepOutcome::StepError { reason } => {
             json!({"status": "step_error", "reason": reason})
@@ -4531,18 +4535,16 @@ mod tests {
                 });
             }
             self.observation.seq += 1;
-            Ok(StepOutcome::Applied {
-                diff: ObservationDiff {
-                    since_seq: self.observation.seq - 1,
-                    seq: self.observation.seq,
-                    url: None,
-                    omitted: 0,
-                    marks: Vec::new(),
-                    added: Vec::new(),
-                    removed: Vec::new(),
-                    changed: self.observation.elements.clone(),
-                },
-            })
+            Ok(StepOutcome::applied(ObservationDiff {
+                since_seq: self.observation.seq - 1,
+                seq: self.observation.seq,
+                url: None,
+                omitted: 0,
+                marks: Vec::new(),
+                added: Vec::new(),
+                removed: Vec::new(),
+                changed: self.observation.elements.clone(),
+            }))
         }
 
         async fn act_batch(

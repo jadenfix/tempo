@@ -569,7 +569,7 @@ fn replay_steps(entries: &[JournalEntry]) -> Vec<ReplayStep> {
     let mut steps = Vec::new();
     for entry in entries {
         match &entry.event {
-            JournalEvent::StepApplied { action, diff } => steps.push(ReplayStep::Applied {
+            JournalEvent::StepApplied { action, diff, .. } => steps.push(ReplayStep::Applied {
                 seq: entry.seq,
                 action: action.clone(),
                 diff: diff.clone(),
@@ -776,6 +776,7 @@ mod tests {
         journal.append(JournalEvent::StepApplied {
             action: action.clone(),
             diff: diff.clone(),
+            read_result: None,
         })?;
 
         let branch = branch(
@@ -938,6 +939,7 @@ mod tests {
                     JournalEvent::StepApplied {
                         action: prefix_action.clone(),
                         diff: empty_diff(1, 2),
+                        read_result: None,
                     },
                 ),
             ],
@@ -1247,6 +1249,7 @@ mod tests {
                     JournalEvent::StepApplied {
                         action: Action::Scroll { x: 0.0, y: 1.0 },
                         diff: empty_diff(1, 2),
+                        read_result: None,
                     },
                 ),
             ],
@@ -1439,6 +1442,7 @@ mod tests {
                 JournalEvent::StepApplied {
                     action: Action::Scroll { x: 0.0, y: 1.0 },
                     diff: empty_diff(1, 2),
+                    read_result: None,
                 },
             ),
         ];

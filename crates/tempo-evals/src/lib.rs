@@ -2648,6 +2648,7 @@ mod tests {
                 removed: vec![],
                 changed: vec![],
             },
+            read_result: None,
         })?;
 
         let record = eval_record_from_session_journal(
@@ -2716,6 +2717,7 @@ mod tests {
                 removed: vec![],
                 changed: vec![],
             },
+            read_result: None,
         })?;
         drop(journal);
 
