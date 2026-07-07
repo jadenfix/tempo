@@ -53,6 +53,10 @@ COMMON_ENV=(
   -e TEMPO_CDP_NO_SANDBOX=1
 )
 
+if [[ -n "${TEMPO_LINUX_AGENT_REQUIRE_LIVE_CDP:-}" ]]; then
+  COMMON_ENV+=(-e "TEMPO_LINUX_AGENT_REQUIRE_LIVE_CDP=${TEMPO_LINUX_AGENT_REQUIRE_LIVE_CDP}")
+fi
+
 COMMON_MOUNTS=(
   -v "$ROOT:/work"
   -v tempo-cargo-registry:/usr/local/cargo/registry
@@ -96,8 +100,12 @@ docker run --rm \
     cargo run -p tempo-cli -- taint-gate --input fixtures/security/taint-redteam-pass.json
     bash scripts/check-servo-public-api.sh
     bash scripts/check-no-solver.sh
+    CHROME_PATH=\"\${TEMPO_CDP_CHROME:-}\"
+    if [[ -z \"\$CHROME_PATH\" ]]; then
+      CHROME_PATH=\"\$(scripts/setup-cdp-chrome.sh)\"
+    fi
     rm -f /tmp/tempo-chromium-preflight.out /tmp/tempo-chromium-preflight.err
-    /usr/bin/chromium \
+    \"\$CHROME_PATH\" \
       --headless=new \
       --disable-gpu \
       --no-sandbox \
@@ -111,9 +119,9 @@ docker run --rm \
     if kill -0 \"\$chromium_pid\" >/dev/null 2>&1; then
       kill \"\$chromium_pid\" >/dev/null 2>&1 || true
       wait \"\$chromium_pid\" >/dev/null 2>&1 || true
-      TEMPO_CDP_CHROME=/usr/bin/chromium scripts/test-live-cdp.sh ${INNER_MODE}
+      TEMPO_CDP_CHROME=\"\$CHROME_PATH\" scripts/test-live-cdp.sh ${INNER_MODE}
       BENCH_OUT=/work/target/linux-agent-gate/agent-browser-bench
-      TEMPO_CDP_CHROME=/usr/bin/chromium scripts/agent-browser-bench.sh \
+      TEMPO_CDP_CHROME=\"\$CHROME_PATH\" scripts/agent-browser-bench.sh \
         --smoke \
         --min-success-rate 1 \
         --output-dir \"\$BENCH_OUT\"
@@ -126,8 +134,8 @@ docker run --rm \
       test -s \"\$BENCH_OUT/amdahl.json\"
     else
       wait \"\$chromium_pid\" >/dev/null 2>&1 || true
-      echo \"warning: skipping Docker live-CDP smoke because container Chromium did not launch on ${PLATFORM}\" >&2
-      echo \"warning: run scripts/test-live-cdp.sh --smoke on the host, or rerun this gate on a Linux host with a working Chromium/Chrome runtime\" >&2
+      echo \"warning: skipping Docker live-CDP smoke because container Chrome did not launch on ${PLATFORM}\" >&2
+      echo \"warning: run scripts/test-live-cdp.sh --smoke on the host, or rerun this gate on a Linux host with a working Chrome runtime\" >&2
       cat /tmp/tempo-chromium-preflight.err >&2 || true
       if [[ \"\${TEMPO_LINUX_AGENT_REQUIRE_LIVE_CDP:-}\" == \"1\" ]]; then
         exit 1
