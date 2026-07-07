@@ -10474,6 +10474,12 @@ mod tests {
             .clone()
             .ok_or("attached engine driver should be present")?;
         let session = pool.finish_create("https://runs.test/verify".into(), Some(session_driver));
+        let pre_run_seq = pool
+            .events(&session.id, None)?
+            .events
+            .last()
+            .map(|event| event.seq)
+            .ok_or("created session must have an initial event")?;
 
         let response = route_http_request(
             &mut pool,
@@ -10506,7 +10512,7 @@ mod tests {
             &mut pool,
             HttpRequest {
                 method: "GET".into(),
-                path: format!("/sessions/{}/events", session.id.0),
+                path: format!("/sessions/{}/events?after_seq={pre_run_seq}", session.id.0),
                 headers: BTreeMap::new(),
                 host: None,
                 origin: None,
@@ -10515,6 +10521,54 @@ mod tests {
         )?;
         assert_eq!(events_response.status, 200);
         let events: TempodSessionEvents = serde_json::from_slice(&events_response.body)?;
+        assert!(events
+            .events
+            .iter()
+            .all(|event| event.session_id == session.id && event.seq > pre_run_seq));
+        let mut client_event_kinds = Vec::new();
+        for record in &events.events {
+            let kind = match &record.event {
+                TempodSessionEventKind::Manager {
+                    event: ManagerEvent::OwnerChanged { .. },
+                } => "manager_owner_changed",
+                TempodSessionEventKind::Manager {
+                    event: ManagerEvent::RunStateChanged { run },
+                } if run.state == AgentRunState::Running => "manager_run_running",
+                TempodSessionEventKind::ModelDecision { .. } => "model_decision",
+                TempodSessionEventKind::StepTriple { .. } => "step_triple",
+                TempodSessionEventKind::HumanTakeoverRequired { .. } => "human_takeover_required",
+                TempodSessionEventKind::Manager {
+                    event: ManagerEvent::RunStateChanged { run },
+                } if run.state == AgentRunState::WaitingForHuman => "manager_run_waiting",
+                other => return Err(format!("unexpected client event {other:?}").into()),
+            };
+            client_event_kinds.push(kind);
+        }
+        assert_eq!(
+            client_event_kinds,
+            vec![
+                "manager_owner_changed",
+                "manager_run_running",
+                "model_decision",
+                "step_triple",
+                "human_takeover_required",
+                "manager_run_waiting",
+            ]
+        );
+        let run_events_response = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "GET".into(),
+                path: format!("/runs/{}/events?after_seq={pre_run_seq}", run.run_id.0),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: Vec::new(),
+            },
+        )?;
+        assert_eq!(run_events_response.status, 200);
+        let run_events: TempodSessionEvents = serde_json::from_slice(&run_events_response.body)?;
+        assert_eq!(run_events, events);
         let producer_events: Vec<_> = events
             .events
             .iter()
