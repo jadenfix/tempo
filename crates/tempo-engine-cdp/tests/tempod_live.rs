@@ -4,7 +4,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use tempo_driver::Engine;
@@ -163,6 +163,25 @@ fn tempod_http_mcp_and_bidi_drive_live_cdp_browser() -> TestResult {
         json!({"id": 11, "method": "session.status", "params": {}}),
     )?;
     assert_eq!(status["id"], 11);
+    let seeded = mcp_tool(
+        addr,
+        7,
+        "act",
+        json!({
+            "action": { "kind": "goto", "url": fixture.url("/seed-storage") },
+            "input_tainted": false
+        }),
+    )?;
+    assert_eq!(seeded["status"], "applied");
+    let seeded_path = fixture.wait_for_request("/storage-seeded?", Duration::from_secs(10))?;
+    assert!(
+        seeded_path.contains("local=present"),
+        "root context did not establish localStorage: {seeded_path}"
+    );
+    assert!(
+        seeded_path.contains("cookie=present"),
+        "root context did not establish cookie: {seeded_path}"
+    );
     let created = bidi(
         addr,
         json!({"id": 12, "method": "browsingContext.create", "params": {"type": "tab"}}),
@@ -170,6 +189,28 @@ fn tempod_http_mcp_and_bidi_drive_live_cdp_browser() -> TestResult {
     let context = created["result"]["context"]
         .as_str()
         .ok_or("BiDi create response missing context")?;
+    let storage_report = bidi(
+        addr,
+        json!({
+            "id": 17,
+            "method": "browsingContext.navigate",
+            "params": {
+                "context": context,
+                "url": fixture.url("/storage-report"),
+                "inputTainted": false
+            }
+        }),
+    )?;
+    assert_eq!(storage_report["id"], 17);
+    let report_path = fixture.wait_for_request("/storage-result?", Duration::from_secs(10))?;
+    assert!(
+        report_path.contains("local=missing"),
+        "child context inherited parent localStorage: {report_path}"
+    );
+    assert!(
+        report_path.contains("cookie=absent"),
+        "child context inherited parent cookie: {report_path}"
+    );
     let navigated = bidi(
         addr,
         json!({
@@ -293,31 +334,57 @@ fn run_cdp_engine(
 
 struct FixtureServer {
     addr: SocketAddr,
+    requests: Arc<Mutex<Vec<String>>>,
 }
 
 impl FixtureServer {
     fn start() -> Result<Self, std::io::Error> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let addr = listener.local_addr()?;
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let server_requests = Arc::clone(&requests);
         thread::spawn(move || {
             for stream in listener.incoming().take(128) {
                 let Ok(stream) = stream else {
                     continue;
                 };
+                let connection_requests = Arc::clone(&server_requests);
                 thread::spawn(move || {
-                    let _ignored = serve_fixture_connection(stream);
+                    let _ignored = serve_fixture_connection(stream, connection_requests);
                 });
             }
         });
-        Ok(Self { addr })
+        Ok(Self { addr, requests })
     }
 
     fn url(&self, path: &str) -> String {
         format!("http://{}{}", self.addr, path)
     }
+
+    fn wait_for_request(&self, prefix: &str, timeout: Duration) -> TestResult<String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            {
+                let requests = self
+                    .requests
+                    .lock()
+                    .map_err(|_| "fixture request log mutex poisoned")?;
+                if let Some(path) = requests.iter().find(|path| path.starts_with(prefix)) {
+                    return Ok(path.clone());
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(format!("timed out waiting for fixture request {prefix:?}").into());
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
 }
 
-fn serve_fixture_connection(mut stream: TcpStream) -> Result<(), std::io::Error> {
+fn serve_fixture_connection(
+    mut stream: TcpStream,
+    requests: Arc<Mutex<Vec<String>>>,
+) -> Result<(), std::io::Error> {
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     let mut request = [0_u8; 1024];
     let bytes = stream.read(&mut request).unwrap_or(0);
@@ -327,6 +394,9 @@ fn serve_fixture_connection(mut stream: TcpStream) -> Result<(), std::io::Error>
         .next()
         .and_then(|line| line.split_whitespace().nth(1))
         .unwrap_or("/");
+    if let Ok(mut requests) = requests.lock() {
+        requests.push(path.to_owned());
+    }
     let body = fixture_page(path);
     let response = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -338,6 +408,38 @@ fn serve_fixture_connection(mut stream: TcpStream) -> Result<(), std::io::Error>
 }
 
 fn fixture_page(path: &str) -> String {
+    if path == "/seed-storage" {
+        return r#"<!doctype html>
+<html>
+  <head>
+    <title>Tempo Fixture Seed Storage</title>
+    <script>
+      localStorage.setItem('tempoIsolation', 'root');
+      document.cookie = 'tempoIsolation=root; SameSite=Lax';
+      const local = localStorage.getItem('tempoIsolation') === 'root' ? 'present' : 'missing';
+      const cookie = document.cookie.includes('tempoIsolation=root') ? 'present' : 'absent';
+      location.replace(`/storage-seeded?local=${local}&cookie=${cookie}`);
+    </script>
+  </head>
+  <body>seeded</body>
+</html>"#
+            .to_owned();
+    }
+    if path == "/storage-report" {
+        return r#"<!doctype html>
+<html>
+  <head>
+    <title>Tempo Fixture Storage Report</title>
+    <script>
+      const local = localStorage.getItem('tempoIsolation') === null ? 'missing' : 'present';
+      const cookie = document.cookie.includes('tempoIsolation=root') ? 'present' : 'absent';
+      location.replace(`/storage-result?local=${local}&cookie=${cookie}`);
+    </script>
+  </head>
+  <body>reporting</body>
+</html>"#
+            .to_owned();
+    }
     format!(
         r#"<!doctype html>
 <html>
