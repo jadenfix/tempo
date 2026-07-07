@@ -50,18 +50,41 @@ fn main() {
         tempo_telemetry::logger().set_min_level(level);
     }
     let navigation_url_policy = options.navigation_url_policy();
+    let mut engine_args = options.engine_args.clone();
+    if options.allow_private_network
+        && options.engine == Engine::Cdp
+        && !engine_args
+            .iter()
+            .any(|arg| arg == "--allow-private-network")
+    {
+        engine_args.push("--allow-private-network".into());
+    }
     tempo_telemetry::logger()
         .event(tempo_telemetry::Level::Info, "tempod", "starting")
         .field("addr", options.addr.clone())
         .field("engine", format!("{:?}", options.engine))
-        .field("attached_engine", options.engine_socket.is_some())
+        .field(
+            "attached_engine",
+            options.engine_socket.is_some() || options.engine_program.is_some(),
+        )
         .field("metrics_enabled", effective_metrics_enabled)
         .field("privacy_mode", format!("{privacy_mode:?}"))
         .field("allow_private_network", options.allow_private_network)
         .emit();
 
-    let result = match options.engine_socket {
-        Some(socket_path) => {
+    let result = match (options.engine_program, options.engine_socket) {
+        (Some(engine_program), socket_path) => {
+            tempo_headless::run_tempod_with_spawned_engine_config_and_navigation_url_policy(
+                &options.addr,
+                config,
+                options.engine,
+                engine_program,
+                engine_args,
+                socket_path,
+                navigation_url_policy,
+            )
+        }
+        (None, Some(socket_path)) => {
             tempo_headless::run_tempod_with_attached_driver_config_and_navigation_url_policy(
                 &options.addr,
                 config,
@@ -70,7 +93,7 @@ fn main() {
                 navigation_url_policy,
             )
         }
-        None => tempo_headless::run_tempod_with_config_and_navigation_url_policy(
+        (None, None) => tempo_headless::run_tempod_with_config_and_navigation_url_policy(
             &options.addr,
             config,
             navigation_url_policy,
@@ -87,6 +110,8 @@ struct TempodOptions {
     addr: String,
     engine: Engine,
     engine_socket: Option<PathBuf>,
+    engine_program: Option<PathBuf>,
+    engine_args: Vec<String>,
     allow_remote: bool,
     allow_private_network: bool,
     auth_token: Option<String>,
@@ -114,6 +139,10 @@ impl TempodOptions {
                         .next()
                         .ok_or_else(|| "--engine-socket requires a path".to_string())?;
                     overrides.engine_socket = Some(value.clone());
+                }
+                "--engine-program" | "--engine-arg" => {
+                    args.next()
+                        .ok_or_else(|| format!("{arg} requires a value"))?;
                 }
                 "--allow-remote" | "--allow-private-network" => {}
                 "--auth-token" => {
@@ -155,6 +184,8 @@ impl TempodOptions {
         let mut engine = engine_from_config(defaults.engine);
         let mut engine_was_set = false;
         let mut engine_socket = defaults.engine_socket.clone().map(PathBuf::from);
+        let mut engine_program = None;
+        let mut engine_args = Vec::new();
         let mut allow_remote = false;
         let mut allow_private_network = false;
         let mut auth_token = env_auth_token.filter(|token| !token.is_empty());
@@ -174,6 +205,18 @@ impl TempodOptions {
                         .next()
                         .ok_or_else(|| "--engine-socket requires a path".to_string())?;
                     engine_socket = Some(PathBuf::from(value));
+                }
+                "--engine-program" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| "--engine-program requires a path".to_string())?;
+                    engine_program = Some(PathBuf::from(value));
+                }
+                "--engine-arg" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| "--engine-arg requires a value".to_string())?;
+                    engine_args.push(value);
                 }
                 "--allow-remote" => {
                     allow_remote = true;
@@ -199,13 +242,13 @@ impl TempodOptions {
             }
         }
 
-        if engine_socket.is_none() && engine_was_set {
+        if engine_socket.is_none() && engine_program.is_none() && engine_was_set {
             return Err(format!(
-                "--engine only applies with --engine-socket; otherwise tempod starts without an attached engine\n{}",
+                "--engine only applies with --engine-socket or --engine-program; otherwise tempod starts without an attached engine\n{}",
                 usage()
             ));
         }
-        if engine_socket.is_none() && engine != Engine::Cdp {
+        if engine_socket.is_none() && engine_program.is_none() && engine != Engine::Cdp {
             return Err(format!(
                 "configured engine {} requires --engine-socket or {}\n{}",
                 defaults.engine.as_str(),
@@ -218,6 +261,8 @@ impl TempodOptions {
             addr: addr.unwrap_or_else(|| defaults.bind_addr.clone()),
             engine,
             engine_socket,
+            engine_program,
+            engine_args,
             allow_remote,
             allow_private_network,
             auth_token,
@@ -281,7 +326,7 @@ fn parse_engine(value: &str) -> Result<Engine, String> {
 fn usage() -> String {
     format!(
         "usage: tempod [ADDR] [--engine cdp|servo] [--engine-socket PATH] [--allow-remote] [--auth-token TOKEN]\n\
-         [--allow-private-network]\n\
+         [--allow-private-network] [--engine-program PATH] [--engine-arg ARG]\n\
          \n\
          layered config: defaults < JSON file named by {config_env} < TEMPO_* env < flags\n\
          tempod requires bearer auth even on loopback; without --auth-token or {env}, it creates/uses an owner-only runtime token file ({file_env})\n\
@@ -333,6 +378,8 @@ mod tests {
             addr: "127.0.0.1:8787".into(),
             engine: Engine::Cdp,
             engine_socket: None,
+            engine_program: None,
+            engine_args: Vec::new(),
             allow_remote: true,
             allow_private_network: false,
             auth_token: None,
@@ -349,6 +396,8 @@ mod tests {
             addr: "127.0.0.1:8787".into(),
             engine: Engine::Cdp,
             engine_socket: None,
+            engine_program: None,
+            engine_args: Vec::new(),
             allow_remote: true,
             allow_private_network: false,
             auth_token: Some("cli-token".into()),
@@ -473,5 +522,29 @@ mod tests {
             options.engine_socket,
             Some(PathBuf::from("/tmp/tempo-engine.sock"))
         );
+    }
+
+    #[test]
+    fn explicit_engine_with_program_is_accepted() -> Result<(), String> {
+        let options = TempodOptions::parse_with_env(
+            [
+                "--engine".to_string(),
+                "cdp".to_string(),
+                "--engine-program".to_string(),
+                "/opt/tempo/tempo-engined-cdp".to_string(),
+                "--engine-arg".to_string(),
+                "--trace".to_string(),
+            ],
+            None,
+            &TempodConfig::default(),
+        )?;
+
+        assert_eq!(options.engine, Engine::Cdp);
+        assert_eq!(
+            options.engine_program,
+            Some(PathBuf::from("/opt/tempo/tempo-engined-cdp"))
+        );
+        assert_eq!(options.engine_args, vec!["--trace"]);
+        Ok(())
     }
 }

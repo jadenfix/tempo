@@ -28,9 +28,11 @@ use serde_json::{json, Value as JsonValue};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::fs::{File, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, ToSocketAddrs};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::TrySendError;
@@ -58,7 +60,7 @@ use tempo_driver::{
 };
 use tempo_engine_host::{
     DriverCommand as HostDriverCommand, DriverResponse, DriverWireError, EngineHost,
-    EngineHostConfig, EngineHostError, EngineIpcClient, SharedEngineIpcClient,
+    EngineHostConfig, EngineHostError, EngineIpcClient, RestartPolicy, SharedEngineIpcClient,
 };
 use tempo_net::{
     web_bot_auth_key_directory_json, BlockCode, BrowserHardeningBlockCode, BrowserHardeningBlocked,
@@ -3924,14 +3926,66 @@ pub fn run_tempod_with_attached_driver_config_and_navigation_url_policy_and_iden
     serve_forever_with_config(listener, pool, config)
 }
 
+pub fn run_tempod_with_spawned_engine_config_and_navigation_url_policy(
+    addr: &str,
+    config: TempodServerConfig,
+    engine: Engine,
+    engine_program: impl Into<PathBuf>,
+    engine_args: impl IntoIterator<Item = String>,
+    socket_path: Option<PathBuf>,
+    url_policy: UrlPolicy,
+) -> Result<(), TempodError> {
+    let config = config.with_bind_addr_host(addr);
+    config.validate_bind_addr(addr)?;
+    let listener = TcpListener::bind(addr)?;
+    let socket_path = match socket_path {
+        Some(socket_path) => socket_path,
+        None => create_private_engine_control_socket_path()?,
+    };
+    let mut host_config = EngineHostConfig::new(engine_program)
+        .restart(RestartPolicy::Never)
+        .control_socket(socket_path.clone());
+    for arg in engine_args {
+        host_config = host_config.arg(arg);
+    }
+    let (_engine_host, engine_server) = EngineHost::spawn_with_ipc(host_config)?;
+    let engine_connection = engine_server.accept_timeout(Duration::from_secs(30))?;
+    let mut pool = SessionPool::from_env().with_navigation_url_policy(url_policy);
+    pool.attach_engine_driver(
+        engine,
+        attach_engine_client_from_stream(engine_connection.into_inner())?,
+    )?;
+    let pool = Arc::new(Mutex::new(pool));
+    spawn_signed_threat_domain_refresh_supervisor_from_env(Arc::clone(&pool));
+    serve_forever_with_config(listener, pool, config)
+}
+
+fn attach_engine_client_from_stream(
+    stream: std::os::unix::net::UnixStream,
+) -> Result<EngineIpcClient, TempodError> {
+    stream.set_write_timeout(Some(ENGINE_IPC_TIMEOUT))?;
+    Ok(EngineIpcClient::from_stream(stream))
+}
+
+fn create_private_engine_control_socket_path() -> Result<PathBuf, TempodError> {
+    let root = std::env::temp_dir().join(format!(
+        "tempo-engine-{}-{}",
+        std::process::id(),
+        current_time_ms()
+    ));
+    fs::create_dir(&root)?;
+    #[cfg(unix)]
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
+    Ok(root.join("engine.sock"))
+}
+
 /// Connect to the engine host UDS with a bounded write timeout. Read bounding
 /// is per-request: the multiplexed client (`SharedEngineIpcClient`) awaits each
 /// response with its own `ENGINE_IPC_TIMEOUT` and clears the socket read
 /// timeout so its idle reader thread never mis-times a frame (issue #230).
 fn connect_engine_ipc(socket_path: impl AsRef<Path>) -> Result<EngineIpcClient, TempodError> {
     let stream = std::os::unix::net::UnixStream::connect(socket_path)?;
-    stream.set_write_timeout(Some(ENGINE_IPC_TIMEOUT))?;
-    Ok(EngineIpcClient::from_stream(stream))
+    attach_engine_client_from_stream(stream)
 }
 
 /// Reconnect behaviour for the engine-liveness monitor (#398).

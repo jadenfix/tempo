@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tempo_driver::{
     BrowsingContextCreateOptions, DriverTrait, StepOutcome, TransportError, Unsupported,
 };
@@ -544,6 +544,60 @@ impl EngineIpcServer {
         Ok(EngineIpcConnection { stream })
     }
 
+    pub fn accept_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<EngineIpcConnection, EngineHostError> {
+        self.listener.set_nonblocking(true)?;
+        let deadline = Instant::now() + timeout;
+        let result = loop {
+            match self.listener.accept() {
+                Ok((mut stream, _)) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        break Err(EngineHostError::IpcTimeout { timeout });
+                    }
+                    let accepted = stream
+                        .set_nonblocking(false)
+                        .map_err(EngineHostError::Io)
+                        .and_then(|()| {
+                            stream
+                                .set_read_timeout(Some(remaining))
+                                .map_err(EngineHostError::Io)
+                        })
+                        .and_then(|()| {
+                            authorize_peer(&stream)?;
+                            verify_control_token(&mut stream, &self.auth_token)?;
+                            stream.set_read_timeout(None).map_err(EngineHostError::Io)?;
+                            Ok(EngineIpcConnection { stream })
+                        });
+                    break match accepted {
+                        Err(EngineHostError::Io(error))
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                            ) =>
+                        {
+                            Err(EngineHostError::IpcTimeout { timeout })
+                        }
+                        result => result,
+                    };
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        break Err(EngineHostError::IpcTimeout { timeout });
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                Err(error) => break Err(EngineHostError::Io(error)),
+            }
+        };
+        match self.listener.set_nonblocking(false) {
+            Ok(()) => result,
+            Err(error) => Err(EngineHostError::Io(error)),
+        }
+    }
+
     pub fn local_path(&self) -> &Path {
         &self.path
     }
@@ -607,6 +661,12 @@ impl EngineIpcClient {
             },
             &mut self.write_scratch,
         )
+    }
+
+    pub fn into_connection(self) -> EngineIpcConnection {
+        EngineIpcConnection {
+            stream: self.stream,
+        }
     }
 
     pub fn request(&mut self, command: DriverCommand) -> Result<DriverResponse, EngineHostError> {
@@ -911,6 +971,13 @@ impl EngineIpcConnection {
         Ok(Self {
             stream: UnixStream::connect(path)?,
         })
+    }
+
+    pub fn connect_authenticated(
+        path: impl AsRef<Path>,
+        token: &str,
+    ) -> Result<Self, EngineHostError> {
+        Ok(EngineIpcClient::connect_with_token(path, token)?.into_connection())
     }
 
     pub fn from_stream(stream: UnixStream) -> Self {
@@ -2241,6 +2308,30 @@ mod tests {
             server.accept(),
             Err(EngineHostError::ControlAuthFailed)
         ));
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn ipc_accept_timeout_bounds_missing_control_token() -> TestResult {
+        let root = unique_dir("uds-auth-timeout")?;
+        remove_dir_if_exists(&root)?;
+        create_private_dir(&root)?;
+        let socket_path = root.join("engine.sock");
+        let server = EngineIpcServer::bind(&socket_path)?;
+        let _stream = UnixStream::connect(&socket_path)?;
+        let start = Instant::now();
+
+        assert!(matches!(
+            server.accept_timeout(Duration::from_millis(100)),
+            Err(EngineHostError::IpcTimeout { .. })
+        ));
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "auth timeout should be bounded, elapsed {:?}",
+            start.elapsed()
+        );
 
         remove_dir_if_exists(&root)?;
         Ok(())

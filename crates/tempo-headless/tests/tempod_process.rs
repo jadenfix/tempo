@@ -2,9 +2,11 @@ use reqwest::blocking::{Client, Response};
 use reqwest::StatusCode;
 use serde_json::{json, Value};
 use std::error::Error;
-use std::io::Read;
-use std::net::TcpListener;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::thread;
 use std::time::{Duration, Instant};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -100,6 +102,164 @@ fn tempod_binary_serves_authenticated_control_plane_and_drains() -> TestResult {
     Ok(())
 }
 
+#[test]
+fn tempod_binary_live_cdp_spawns_engine_and_drives_agent_protocols() -> TestResult {
+    let Some(chrome) = std::env::var_os("TEMPO_CDP_CHROME") else {
+        eprintln!("skipping live tempod process/CDP smoke; TEMPO_CDP_CHROME is unset");
+        return Ok(());
+    };
+    let Some(engine_program) = tempo_engined_cdp_path() else {
+        eprintln!(
+            "skipping live tempod process/CDP smoke; build tempo-engined-cdp first or set CARGO_BIN_EXE_tempo-engined-cdp"
+        );
+        return Ok(());
+    };
+
+    let fixture = FixtureServer::start()?;
+    let addr = reserve_loopback_addr()?;
+    let mut tempod =
+        TempodProcess::spawn_with_cdp_engine(&addr, AUTH_TOKEN, &engine_program, &chrome)?;
+    let client = Client::builder().timeout(Duration::from_secs(10)).build()?;
+    let base_url = format!("http://{addr}");
+
+    wait_for_health(&client, &base_url, &mut tempod)?;
+
+    let ready = get_json(&client, &base_url, "/ready", Some(AUTH_TOKEN))?;
+    assert_eq!(ready.status, StatusCode::OK);
+    assert_eq!(ready.body["ready"], true);
+    assert_eq!(ready.body["engine_attached"], true);
+
+    let create_body = json!({ "url": fixture.url("/") }).to_string();
+    let session = post_json(
+        &client,
+        &base_url,
+        "/sessions",
+        Some(AUTH_TOKEN),
+        &create_body,
+    )?;
+    assert_eq!(
+        session.status,
+        StatusCode::CREATED,
+        "session response: {}",
+        session.body
+    );
+    let session_id = session.body["id"]
+        .as_str()
+        .ok_or("session create response missing id")?;
+
+    let observation = get_json(
+        &client,
+        &base_url,
+        &format!("/sessions/{session_id}/observe"),
+        Some(AUTH_TOKEN),
+    )?;
+    assert_eq!(observation.status, StatusCode::OK);
+    assert_eq!(observation.body["url"], fixture.url("/"));
+    assert_json_contains(&observation.body, "Agent Name")?;
+    assert_json_contains(&observation.body, "Save")?;
+
+    let mcp_goto_body = json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "tools/call",
+        "params": {
+            "name": "act",
+            "arguments": {
+                "action": { "kind": "goto", "url": fixture.url("/mcp") },
+                "input_tainted": false
+            }
+        }
+    })
+    .to_string();
+    let mcp_goto = post_json(&client, &base_url, "/mcp", Some(AUTH_TOKEN), &mcp_goto_body)?;
+    assert_eq!(mcp_goto.status, StatusCode::OK);
+    assert_eq!(
+        mcp_goto.body["result"]["structuredContent"]["status"],
+        "applied"
+    );
+
+    let mcp_observe = post_json(
+        &client,
+        &base_url,
+        "/mcp",
+        Some(AUTH_TOKEN),
+        r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"observe","arguments":{}}}"#,
+    )?;
+    assert_eq!(mcp_observe.status, StatusCode::OK);
+    assert_eq!(mcp_observe.body["jsonrpc"], "2.0");
+    assert_eq!(
+        mcp_observe.body["result"]["structuredContent"]["url"],
+        fixture.url("/mcp")
+    );
+    assert_json_contains(&mcp_observe.body, "Agent Name")?;
+
+    let bidi_create = post_json(
+        &client,
+        &base_url,
+        "/bidi",
+        Some(AUTH_TOKEN),
+        r#"{"id":5,"method":"browsingContext.create","params":{"type":"tab"}}"#,
+    )?;
+    assert_eq!(bidi_create.status, StatusCode::OK);
+    assert_eq!(bidi_create.body["type"], "success");
+    let bidi_context = bidi_create.body["result"]["context"]
+        .as_str()
+        .ok_or("BiDi create response missing context")?;
+    let bidi_navigate_body = json!({
+        "id": 6,
+        "method": "browsingContext.navigate",
+        "params": {
+            "context": bidi_context,
+            "url": fixture.url("/bidi"),
+            "inputTainted": false
+        }
+    })
+    .to_string();
+    let bidi_navigate = post_json(
+        &client,
+        &base_url,
+        "/bidi",
+        Some(AUTH_TOKEN),
+        &bidi_navigate_body,
+    )?;
+    assert_eq!(bidi_navigate.status, StatusCode::OK);
+    assert_eq!(bidi_navigate.body["type"], "success");
+    assert_eq!(bidi_navigate.body["result"]["url"], fixture.url("/bidi"));
+
+    let bidi_status = post_json(
+        &client,
+        &base_url,
+        "/bidi",
+        Some(AUTH_TOKEN),
+        r#"{"id":7,"method":"session.status","params":{}}"#,
+    )?;
+    assert_eq!(bidi_status.status, StatusCode::OK);
+    assert_eq!(bidi_status.body["type"], "success");
+    assert_eq!(bidi_status.body["result"]["ready"], true);
+
+    let bidi_close_body = json!({
+        "id": 8,
+        "method": "browsingContext.close",
+        "params": { "context": bidi_context }
+    })
+    .to_string();
+    let bidi_close = post_json(
+        &client,
+        &base_url,
+        "/bidi",
+        Some(AUTH_TOKEN),
+        &bidi_close_body,
+    )?;
+    assert_eq!(bidi_close.status, StatusCode::OK);
+    assert_eq!(bidi_close.body["type"], "success");
+
+    let drain = post_json(&client, &base_url, "/drain", Some(AUTH_TOKEN), "{}")?;
+    assert_eq!(drain.status, StatusCode::OK);
+    assert_eq!(drain.body["draining"], true);
+
+    Ok(())
+}
+
 struct TempodProcess {
     child: Child,
 }
@@ -111,6 +271,34 @@ impl TempodProcess {
             .arg(addr)
             .arg("--auth-token")
             .arg(token)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        Ok(Self { child })
+    }
+
+    fn spawn_with_cdp_engine(
+        addr: &str,
+        token: &str,
+        engine_program: &Path,
+        chrome: &std::ffi::OsStr,
+    ) -> TestResult<Self> {
+        let child = Command::new(env!("CARGO_BIN_EXE_tempod"))
+            .arg(addr)
+            .arg("--auth-token")
+            .arg(token)
+            .arg("--allow-private-network")
+            .arg("--engine")
+            .arg("cdp")
+            .arg("--engine-program")
+            .arg(engine_program)
+            .env_remove("TEMPO_CONFIG")
+            .env_remove("TEMPO_ENGINE_SOCKET")
+            .env_remove("TEMPO_TEMPOD_AUTH_TOKEN")
+            .env_remove("TEMPO_TEMPOD_AUTH_TOKEN_FILE")
+            .env("TEMPO_CDP_CHROME", chrome)
+            .env("TEMPO_CDP_NO_SANDBOX", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -145,6 +333,64 @@ struct JsonResponse {
     body: Value,
 }
 
+struct FixtureServer {
+    addr: String,
+}
+
+impl FixtureServer {
+    fn start() -> TestResult<Self> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?.to_string();
+        thread::spawn(move || {
+            for stream in listener.incoming().take(64) {
+                let Ok(stream) = stream else {
+                    continue;
+                };
+                thread::spawn(move || {
+                    let _ignored = serve_fixture_connection(stream);
+                });
+            }
+        });
+        Ok(Self { addr })
+    }
+
+    fn url(&self, path: &str) -> String {
+        format!("http://{}{}", self.addr, path)
+    }
+}
+
+fn serve_fixture_connection(mut stream: TcpStream) -> Result<(), std::io::Error> {
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    let mut request = [0_u8; 1024];
+    let bytes = stream.read(&mut request).unwrap_or(0);
+    let request = String::from_utf8_lossy(&request[..bytes]);
+    let path = request
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .unwrap_or("/");
+    let body = format!(
+        r#"<!doctype html>
+<html>
+  <head><title>Tempo Process {path}</title></head>
+  <body>
+    <main>
+      <label for="agent-name">Agent Name</label>
+      <input id="agent-name" aria-label="Agent Name" value="">
+      <button id="save" onclick="this.dataset.saved = 'true'">Save</button>
+    </main>
+  </body>
+</html>"#
+    );
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    stream.write_all(response.as_bytes())?;
+    stream.flush()
+}
+
 fn reserve_loopback_addr() -> TestResult<String> {
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let addr = listener.local_addr()?;
@@ -153,7 +399,7 @@ fn reserve_loopback_addr() -> TestResult<String> {
 }
 
 fn wait_for_health(client: &Client, base_url: &str, tempod: &mut TempodProcess) -> TestResult {
-    let deadline = Instant::now() + Duration::from_secs(8);
+    let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
         tempod.assert_running()?;
         match client.get(format!("{base_url}/health")).send() {
@@ -185,12 +431,12 @@ fn post_json(
     base_url: &str,
     path: &str,
     token: Option<&str>,
-    body: &'static str,
+    body: &str,
 ) -> TestResult<JsonResponse> {
     let mut request = client
         .post(format!("{base_url}{path}"))
         .header("content-type", "application/json")
-        .body(body);
+        .body(body.to_owned());
     if let Some(token) = token {
         request = request.bearer_auth(token);
     }
@@ -203,4 +449,28 @@ fn response_json(response: Response) -> TestResult<JsonResponse> {
     let body = serde_json::from_str(&text)
         .map_err(|error| format!("response body should be JSON ({status}): {error}: {text}"))?;
     Ok(JsonResponse { status, body })
+}
+
+fn tempo_engined_cdp_path() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("CARGO_BIN_EXE_tempo-engined-cdp").map(PathBuf::from)
+        && path.is_file()
+    {
+        return Some(path);
+    }
+
+    let mut path = std::env::current_exe().ok()?;
+    path.pop();
+    if path.file_name().is_some_and(|name| name == "deps") {
+        path.pop();
+    }
+    path.push(format!("tempo-engined-cdp{}", std::env::consts::EXE_SUFFIX));
+    path.is_file().then_some(path)
+}
+
+fn assert_json_contains(value: &Value, needle: &str) -> TestResult {
+    if value.to_string().contains(needle) {
+        Ok(())
+    } else {
+        Err(format!("JSON response did not contain {needle:?}: {value}").into())
+    }
 }

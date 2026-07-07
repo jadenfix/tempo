@@ -129,7 +129,9 @@ docker run --rm \
     if [[ -n \"\$CHROME_PATH\" ]] && kill -0 \"\$chromium_pid\" >/dev/null 2>&1; then
       kill \"\$chromium_pid\" >/dev/null 2>&1 || true
       wait \"\$chromium_pid\" >/dev/null 2>&1 || true
+      cargo build -p tempo-engine-cdp --bin tempo-engined-cdp
       TEMPO_CDP_CHROME=\"\$CHROME_PATH\" scripts/test-live-cdp.sh ${INNER_MODE}
+      TEMPO_CDP_CHROME=\"\$CHROME_PATH\" cargo test -p tempo-headless --test tempod_process live_cdp -- --nocapture --test-threads=1
       BENCH_OUT=/work/target/linux-agent-gate/agent-browser-bench
       TEMPO_CDP_CHROME=\"\$CHROME_PATH\" scripts/agent-browser-bench.sh \
         --smoke \
