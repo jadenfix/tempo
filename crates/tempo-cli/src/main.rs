@@ -1724,6 +1724,7 @@ fn observation_gate_violations(report: &ObservationCorpusReport) -> usize {
         report.budget_gate_passed(),
         report.stable_id_gate_passed(),
         report.diff_gate_passed(),
+        report.diff_loop_savings_passed(),
     ]
     .into_iter()
     .filter(|passed| !passed)
@@ -2349,6 +2350,14 @@ mod tests {
         assert_eq!(value["stable_id_survival_rate"].as_f64(), Some(1.0));
         assert_eq!(value["diff_snapshots"], 2);
         assert_eq!(value["diff_reconstructable_snapshots"], 2);
+        assert!(value["full_resnapshot_bytes"].as_u64().unwrap_or(0) > 0);
+        assert!(value["diff_loop_bytes"].as_u64().unwrap_or(0) > 0);
+        assert!(
+            value["diff_loop_byte_savings_rate"]
+                .as_f64()
+                .unwrap_or_default()
+                > 0.0
+        );
         remove_dir(&dir)?;
         Ok(())
     }
@@ -2381,7 +2390,7 @@ mod tests {
         assert!(stdout.is_empty());
         assert!(matches!(
             result,
-            Err(CliError::GateFailed { violations: 3 })
+            Err(CliError::GateFailed { violations: 4 })
         ));
         let value: Value = serde_json::from_reader(File::open(&output)?)?;
         assert_eq!(value["snapshots"], 1);
@@ -2406,9 +2415,14 @@ mod tests {
             stable_id_survival_rate: 0.0,
             diff_snapshots: 1,
             diff_reconstructable_snapshots: 0,
+            full_resnapshot_bytes: 10,
+            full_resnapshot_tokens: 3,
+            diff_loop_bytes: 12,
+            diff_loop_tokens: 3,
+            diff_loop_byte_savings_rate: 0.0,
         };
 
-        assert_eq!(observation_gate_violations(&report), 4);
+        assert_eq!(observation_gate_violations(&report), 5);
     }
 
     #[test]

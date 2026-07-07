@@ -259,6 +259,17 @@ pub struct ObservationCorpusReport {
     pub stable_id_survival_rate: f64,
     pub diff_snapshots: usize,
     pub diff_reconstructable_snapshots: usize,
+    /// Cumulative bytes if every task step sends the full observation.
+    pub full_resnapshot_bytes: usize,
+    /// Cumulative token estimate if every task step sends the full observation.
+    pub full_resnapshot_tokens: usize,
+    /// Cumulative bytes for a model-boundary diff loop: first snapshot is full,
+    /// then adjacent steps send their `ObservationDiff` envelope.
+    pub diff_loop_bytes: usize,
+    /// Cumulative token estimate for [`Self::diff_loop_bytes`].
+    pub diff_loop_tokens: usize,
+    /// Fraction of full-resnapshot bytes saved by the diff loop.
+    pub diff_loop_byte_savings_rate: f64,
 }
 
 impl ObservationCorpusReport {
@@ -288,11 +299,17 @@ impl ObservationCorpusReport {
             && self.diff_snapshots == self.diff_reconstructable_snapshots
     }
 
+    pub fn diff_loop_savings_passed(&self) -> bool {
+        self.diff_snapshots >= MIN_DIFF_SNAPSHOTS
+            && self.diff_loop_bytes < self.full_resnapshot_bytes
+    }
+
     pub fn final_md_gate_passed(&self) -> bool {
         self.snapshot_evidence_passed()
             && self.budget_gate_passed()
             && self.stable_id_gate_passed()
             && self.diff_gate_passed()
+            && self.diff_loop_savings_passed()
     }
 }
 
@@ -831,6 +848,10 @@ pub fn observation_corpus_report(
     let mut stable_id_survivors = 0usize;
     let mut diff_snapshots = 0usize;
     let mut diff_reconstructable_snapshots = 0usize;
+    let mut full_resnapshot_bytes = 0usize;
+    let mut full_resnapshot_tokens = 0usize;
+    let mut diff_loop_bytes = 0usize;
+    let mut diff_loop_tokens = 0usize;
 
     for input in inputs.iter().cloned() {
         let snapshot = compiler.compile_with_identities(input);
@@ -838,8 +859,11 @@ pub fn observation_corpus_report(
         // of the serialized byte length, so a second full serialization for
         // `estimated_tokens` would double the dominant cost of this loop.
         let byte_len = serialized_len(&snapshot.observation);
+        let token_len = tokens_for_serialized_len(byte_len);
+        full_resnapshot_bytes = full_resnapshot_bytes.saturating_add(byte_len);
+        full_resnapshot_tokens = full_resnapshot_tokens.saturating_add(token_len);
         bytes.push(byte_len);
-        tokens.push(tokens_for_serialized_len(byte_len));
+        tokens.push(token_len);
         let current_identities = unique_identity_map(snapshot.identities);
 
         for (key, node_id) in &current_identities {
@@ -854,9 +878,16 @@ pub fn observation_corpus_report(
         if let Some(previous) = &previous_observation {
             diff_snapshots += 1;
             let diff = diff_observations(previous, &snapshot.observation);
+            let diff_byte_len = serialized_value_len(&diff);
+            diff_loop_bytes = diff_loop_bytes.saturating_add(diff_byte_len);
+            diff_loop_tokens =
+                diff_loop_tokens.saturating_add(tokens_for_serialized_len(diff_byte_len));
             if diff_reconstructs_current(previous, &snapshot.observation, &diff) {
                 diff_reconstructable_snapshots += 1;
             }
+        } else {
+            diff_loop_bytes = diff_loop_bytes.saturating_add(byte_len);
+            diff_loop_tokens = diff_loop_tokens.saturating_add(token_len);
         }
 
         previous_identities = current_identities;
@@ -878,6 +909,11 @@ pub fn observation_corpus_report(
         stable_id_survival_rate: ratio(stable_id_survivors, stable_id_opportunities),
         diff_snapshots,
         diff_reconstructable_snapshots,
+        full_resnapshot_bytes,
+        full_resnapshot_tokens,
+        diff_loop_bytes,
+        diff_loop_tokens,
+        diff_loop_byte_savings_rate: savings_rate(full_resnapshot_bytes, diff_loop_bytes),
     }
 }
 
@@ -1104,7 +1140,11 @@ pub fn composite_set_of_marks_rgba_in_place(
 
 /// Serialized JSON byte length for a compiled observation.
 pub fn serialized_len(observation: &CompiledObservation) -> usize {
-    match serde_json::to_vec(observation) {
+    serialized_value_len(observation)
+}
+
+fn serialized_value_len<T: Serialize + ?Sized>(value: &T) -> usize {
+    match serde_json::to_vec(value) {
         Ok(bytes) => bytes.len(),
         Err(_) => usize::MAX,
     }
@@ -1136,6 +1176,14 @@ fn ratio(numerator: usize, denominator: usize) -> f64 {
         0.0
     } else {
         numerator as f64 / denominator as f64
+    }
+}
+
+fn savings_rate(before: usize, after: usize) -> f64 {
+    if before == 0 || after >= before {
+        0.0
+    } else {
+        (before - after) as f64 / before as f64
     }
 }
 
@@ -1852,6 +1900,27 @@ mod tests {
         )
     }
 
+    fn relayout_task_fixture(generation: u64) -> ObservationInput {
+        let roles = ["button", "textbox", "link", "checkbox", "combobox"];
+        let elements = (0..80)
+            .map(|index| {
+                let role = roles[index % roles.len()];
+                let shift = generation as f32 * 0.5;
+                RawElement::new(role, format!("Task element {index}"))
+                    .source_id(format!("rerender-{generation}-{index}"))
+                    .stable_hint(format!("{role}#task-element-{index}"))
+                    .bounds([
+                        (index % 8) as f32 * 96.0 + shift,
+                        (index / 8) as f32 * 36.0 + shift,
+                        84.0,
+                        28.0,
+                    ])
+            })
+            .collect();
+
+        ObservationInput::new("https://task.example/workflow", elements)
+    }
+
     #[test]
     fn compiles_schema_observation_with_page_taint() {
         let mut compiler = ObservationCompiler::new();
@@ -2380,7 +2449,72 @@ mod tests {
         assert_eq!(report.stable_id_survival_rate, 1.0);
         assert_eq!(report.diff_snapshots, 2);
         assert_eq!(report.diff_reconstructable_snapshots, 2);
+        assert!(
+            report.diff_loop_bytes < report.full_resnapshot_bytes,
+            "diff loop should send less wire data than full snapshots: {report:?}"
+        );
+        assert!(
+            report.diff_loop_tokens < report.full_resnapshot_tokens,
+            "diff loop should spend fewer estimated tokens than full snapshots: {report:?}"
+        );
+        assert!(report.diff_loop_byte_savings_rate > 0.0);
         assert!(report.final_md_gate_passed());
+    }
+
+    #[test]
+    fn corpus_report_quantifies_diff_loop_savings_over_ten_step_relayout_task() {
+        let fixtures: Vec<_> = (0..10).map(relayout_task_fixture).collect();
+
+        let report = observation_corpus_report(
+            &fixtures,
+            CompileOptions {
+                max_bytes: 0,
+                max_tokens: 0,
+                max_marks: DEFAULT_MAX_MARKS,
+            },
+        );
+        let mut compiler = ObservationCompiler::with_options(CompileOptions {
+            max_bytes: 0,
+            max_tokens: 0,
+            max_marks: DEFAULT_MAX_MARKS,
+        });
+        let mut previous = None;
+        let mut expected_full_tokens = 0usize;
+        let mut expected_diff_tokens = 0usize;
+        for fixture in fixtures.iter().cloned() {
+            let current = compiler.compile(fixture);
+            let full_bytes = serialized_len(&current);
+            expected_full_tokens =
+                expected_full_tokens.saturating_add(tokens_for_serialized_len(full_bytes));
+            if let Some(previous) = &previous {
+                let diff = diff_observations(previous, &current);
+                expected_diff_tokens = expected_diff_tokens
+                    .saturating_add(tokens_for_serialized_len(serialized_value_len(&diff)));
+            } else {
+                expected_diff_tokens =
+                    expected_diff_tokens.saturating_add(tokens_for_serialized_len(full_bytes));
+            }
+            previous = Some(current);
+        }
+
+        assert_eq!(report.snapshots, 10);
+        assert_eq!(report.diff_snapshots, 9);
+        assert_eq!(report.diff_reconstructable_snapshots, 0);
+        assert_eq!(report.full_resnapshot_tokens, expected_full_tokens);
+        assert_eq!(report.diff_loop_tokens, expected_diff_tokens);
+        assert!(
+            report.stable_id_gate_passed(),
+            "stable ids must survive rerenders before diff evidence is meaningful: {report:?}"
+        );
+        assert!(
+            report.diff_loop_byte_savings_rate >= 0.70,
+            "layout-only task should avoid repeated full observation JSON: {report:?}"
+        );
+        assert!(
+            report.diff_loop_tokens * 4 <= report.full_resnapshot_tokens,
+            "diff-loop token estimate should be at least 4x smaller than resnapshotting: {report:?}"
+        );
+        assert!(report.diff_loop_savings_passed());
     }
 
     #[test]
@@ -2389,6 +2523,7 @@ mod tests {
         assert!(!empty.snapshot_evidence_passed());
         assert!(!empty.stable_id_gate_passed());
         assert!(!empty.diff_gate_passed());
+        assert!(!empty.diff_loop_savings_passed());
         assert!(!empty.final_md_gate_passed());
 
         let single = observation_corpus_report(&[checkout_fixture()], CompileOptions::default());
@@ -2399,6 +2534,7 @@ mod tests {
         assert!(!single.stable_id_gate_passed());
         assert_eq!(single.diff_snapshots, 0);
         assert!(!single.diff_gate_passed());
+        assert!(!single.diff_loop_savings_passed());
         assert!(!single.final_md_gate_passed());
 
         let no_repeated_identity = observation_corpus_report(
