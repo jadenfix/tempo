@@ -1330,6 +1330,18 @@ impl CdpTempoDriver {
 
     async fn wait_for_composite_quiescence(&self) -> Result<(), TransportError> {
         let deadline = Instant::now() + Duration::from_secs(2);
+        let cursor = self.request_policy_cursor();
+        if self
+            .wait_for_event_driven_quiescence_since(
+                cursor,
+                QUIESCENCE_EVENT_QUIET_WINDOW_MS,
+                deadline.saturating_duration_since(Instant::now()),
+            )
+            .await?
+        {
+            return Ok(());
+        }
+
         let mut tracker = CompositeQuiescenceTracker::new(3);
 
         // Ramp the sampling interval instead of a fixed 50ms: a page that is
@@ -1359,6 +1371,80 @@ impl CdpTempoDriver {
             poll_index += 1;
             tokio::time::sleep(Duration::from_millis(interval)).await;
         }
+    }
+
+    async fn wait_for_event_driven_quiescence_since(
+        &self,
+        cursor: u64,
+        quiet_window_ms: u64,
+        timeout: Duration,
+    ) -> Result<bool, TransportError> {
+        if timeout.is_zero() {
+            return Err(TransportError::NavTimeout);
+        }
+
+        for recreate in [false, true] {
+            let Some(context_id) = self.probe_context_id(recreate, cursor).await? else {
+                self.enforce_no_blocked_request_since(cursor)?;
+                return Ok(false);
+            };
+            let params = match EvaluateParams::builder()
+                .expression(stability_quiet_window_script(quiet_window_ms))
+                .context_id(context_id)
+                .return_by_value(true)
+                .await_promise(true)
+                .build()
+            {
+                Ok(params) => params,
+                Err(_) => {
+                    self.enforce_no_blocked_request_since(cursor)?;
+                    return Ok(false);
+                }
+            };
+            let evaluated = match tokio::time::timeout(timeout, self.page()?.execute(params)).await
+            {
+                Ok(Ok(response)) => response.result,
+                Ok(Err(_)) if !recreate => {
+                    self.enforce_no_blocked_request_soon_since(cursor).await?;
+                    continue;
+                }
+                Ok(Err(_)) => {
+                    self.enforce_no_blocked_request_soon_since(cursor).await?;
+                    return Ok(false);
+                }
+                Err(_) => return Err(TransportError::NavTimeout),
+            };
+            if evaluated.exception_details.is_some() {
+                self.enforce_no_blocked_request_since(cursor)?;
+                return Ok(false);
+            }
+            let Some(probe) = evaluated
+                .result
+                .value
+                .as_ref()
+                .and_then(serde_json::Value::as_str)
+            else {
+                if !recreate {
+                    continue;
+                }
+                self.enforce_no_blocked_request_since(cursor)?;
+                return Ok(false);
+            };
+            let Some(probe) = parse_stability_probe(probe) else {
+                self.enforce_no_blocked_request_since(cursor)?;
+                return Ok(false);
+            };
+            match &probe.url {
+                Some(url) => self.enforce_current_url_policy_value(url)?,
+                None => {
+                    self.enforce_current_url_policy().await?;
+                }
+            }
+            self.enforce_no_blocked_request_since(cursor)?;
+            return Ok(probe.sample.ready);
+        }
+        self.enforce_no_blocked_request_since(cursor)?;
+        Ok(false)
     }
 
     /// One O(1) stability sample: a single `Runtime.evaluate` in a CDP
@@ -1541,9 +1627,14 @@ fn parse_stability_probe(probe: &str) -> Option<ParsedStabilityProbe> {
     })
 }
 
-/// Poll ramp for composite quiescence sampling, capped at the legacy 50ms.
-/// Quiet pages produce three stable samples spanning ~75ms (vs 100ms before)
-/// with O(1) sampling cost.
+/// Quiet-window used by the event-driven MutationObserver settle path. This
+/// preserves the 75ms quiet evidence floor from the existing poll ramp while
+/// collapsing the common already-quiet case to one CDP round-trip.
+const QUIESCENCE_EVENT_QUIET_WINDOW_MS: u64 = 75;
+
+/// Fallback poll ramp for composite quiescence sampling, capped at the legacy
+/// 50ms. Quiet pages produce three stable samples spanning ~75ms with O(1)
+/// sampling cost when the event-driven isolated-world path is unavailable.
 const QUIESCENCE_POLL_INTERVALS_MS: [u64; 2] = [25, 50];
 const QUIESCENCE_POLL_INTERVAL_CAP_MS: u64 = 50;
 
@@ -1571,6 +1662,51 @@ const STABILITY_PROBE_SCRIPT: &str = r#"(() => {
   const gen = w.__tempoMutObs ? w.__tempoMutGen : -1;
   return `${document.readyState}|${gen}|${location.href}`;
 })()"#;
+
+fn stability_quiet_window_script(quiet_window_ms: u64) -> String {
+    format!(
+        r#"(() => new Promise((resolve) => {{
+  const quietMs = {quiet_window_ms};
+  const target = document.documentElement || document;
+  if (typeof MutationObserver === 'undefined' || !target) {{
+    resolve(`${{document.readyState}}|-1|${{location.href}}`);
+    return;
+  }}
+  let gen = 0;
+  let timer = null;
+  let observer = null;
+  const cleanup = () => {{
+    if (timer !== null) clearTimeout(timer);
+    document.removeEventListener('readystatechange', arm);
+    if (observer && typeof observer.disconnect === 'function') {{
+      try {{ observer.disconnect(); }} catch (e) {{}}
+    }}
+  }};
+  const finish = () => {{
+    cleanup();
+    resolve(`${{document.readyState}}|${{gen}}|${{location.href}}`);
+  }};
+  function arm() {{
+    if (timer !== null) clearTimeout(timer);
+    if (document.readyState !== 'loading') {{
+      timer = setTimeout(finish, quietMs);
+    }}
+  }}
+  try {{
+    observer = new MutationObserver(() => {{
+      gen += 1;
+      arm();
+    }});
+    observer.observe(target, {{ subtree: true, childList: true, attributes: true, characterData: true }});
+  }} catch (e) {{
+    resolve(`${{document.readyState}}|-1|${{location.href}}`);
+    return;
+  }}
+  document.addEventListener('readystatechange', arm);
+  arm();
+}}))()"#
+    )
+}
 
 fn is_policy_proxy_arg(arg: &str) -> bool {
     let name = arg
@@ -4600,6 +4736,17 @@ mod tests {
         assert!(STABILITY_PROBE_SCRIPT.contains("location.href"));
     }
 
+    #[test]
+    fn stability_quiet_window_script_uses_mutation_observer_promise() {
+        let script = stability_quiet_window_script(QUIESCENCE_EVENT_QUIET_WINDOW_MS);
+
+        assert!(script.contains("new Promise"));
+        assert!(script.contains("new MutationObserver"));
+        assert!(script.contains("setTimeout(finish, quietMs)"));
+        assert!(script.contains("readystatechange"));
+        assert!(script.contains("location.href"));
+    }
+
     #[tokio::test]
     async fn settled_wait_returns_immediately_when_nothing_pending(
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -4672,6 +4819,7 @@ mod tests {
         // late-starting JS keeps close to the legacy 100ms observation window.
         let evidence_span: u64 = QUIESCENCE_POLL_INTERVALS_MS.iter().sum();
         assert!(evidence_span >= 75);
+        assert_eq!(QUIESCENCE_EVENT_QUIET_WINDOW_MS, evidence_span);
     }
 
     #[test]
