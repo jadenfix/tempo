@@ -41,6 +41,8 @@ const RESPONSE_TOO_LARGE_ERROR_CODE: i64 = -32003;
 /// and was not returned within [`DRIVER_LEASE_TIMEOUT`].
 const DRIVER_BUSY_ERROR_CODE: i64 = -32004;
 const TOOL_TEXT_SUMMARY_MAX_CHARS: usize = 240;
+const DEFAULT_LOCAL_QUERY_RESULTS: usize = 20;
+const MAX_LOCAL_QUERY_RESULTS: usize = 50;
 const HANDSHAKE_PROBE_LIMIT_ERROR_CODE: &str = "handshake_probe_limit";
 /// Upper bound on concurrently live forked drivers per session. Forks each hold a
 /// live browser context/target for real engines, so refuse to accumulate beyond
@@ -655,6 +657,25 @@ where
             .collect()
     }
 
+    async fn call_local_query(
+        &self,
+        driver_id: Option<&str>,
+        script: String,
+    ) -> Result<ToolCall, JsonRpcError> {
+        let mut lease = self.lease_driver(driver_id)?;
+        let Some(driver) = lease.driver_mut() else {
+            return Err(JsonRpcError::invalid_request("driver lease was empty"));
+        };
+        match driver.evaluate_script(&script, true).await {
+            Ok(value) => Ok(ToolCall::success_json_bounded(
+                "local_query_json",
+                value,
+                MAX_EXTRACT_JSON_BYTES,
+            )),
+            Err(error) => Ok(ToolCall::error(error.to_string())),
+        }
+    }
+
     async fn call_tool(&self, name: &str, arguments: Value) -> Result<ToolCall, JsonRpcError> {
         match name {
             "observe" => {
@@ -678,6 +699,39 @@ where
                     Ok(diff) => Ok(ToolCall::success(json!(diff))),
                     Err(error) => Ok(ToolCall::error(error.to_string())),
                 }
+            }
+            "find_text" => {
+                let args: FindTextArgs = parse_args(arguments)?;
+                let limit = local_query_limit(args.max_results)?;
+                let script = find_text_script(&args.text, args.case_sensitive, limit)?;
+                self.call_local_query(args.driver_id.as_deref(), script)
+                    .await
+            }
+            "element_present" => {
+                let args: ElementPresentArgs = parse_args(arguments)?;
+                let script = match (args.selector.as_deref(), args.text.as_deref()) {
+                    (Some(selector), None) => element_present_selector_script(selector)?,
+                    (None, Some(text)) => element_present_text_script(text, args.case_sensitive)?,
+                    (Some(_), Some(_)) => {
+                        return Err(JsonRpcError::invalid_params(
+                            "element_present accepts exactly one of selector or text",
+                        ));
+                    }
+                    (None, None) => {
+                        return Err(JsonRpcError::invalid_params(
+                            "element_present requires selector or text",
+                        ));
+                    }
+                };
+                self.call_local_query(args.driver_id.as_deref(), script)
+                    .await
+            }
+            "query_selector" => {
+                let args: QuerySelectorArgs = parse_args(arguments)?;
+                let limit = local_query_limit(args.max_results)?;
+                let script = query_selector_script(&args.selector, limit)?;
+                self.call_local_query(args.driver_id.as_deref(), script)
+                    .await
             }
             "act" => {
                 let args: ActArgs = parse_args(arguments)?;
@@ -1103,6 +1157,96 @@ pub fn tools() -> Vec<ToolDescriptor> {
             ),
         },
         ToolDescriptor {
+            name: "find_text",
+            description: "Search visible page text locally without an LLM round trip.",
+            input_schema: object_schema(
+                vec![
+                    (
+                        "text",
+                        json!({
+                            "type": "string",
+                            "description": "Text to search for in visible page content."
+                        }),
+                    ),
+                    (
+                        "case_sensitive",
+                        json!({
+                            "type": "boolean",
+                            "description": "Whether matching should preserve case. Defaults to false."
+                        }),
+                    ),
+                    (
+                        "max_results",
+                        json!({
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 50,
+                            "description": "Maximum matched elements to return. Defaults to 20."
+                        }),
+                    ),
+                    ("driver_id", json!({"type": "string"})),
+                ],
+                &["text"],
+            ),
+        },
+        ToolDescriptor {
+            name: "element_present",
+            description: "Check whether a selector or visible text is present locally without an LLM round trip.",
+            input_schema: object_schema(
+                vec![
+                    (
+                        "selector",
+                        json!({
+                            "type": "string",
+                            "description": "CSS selector to check. Provide exactly one of selector or text."
+                        }),
+                    ),
+                    (
+                        "text",
+                        json!({
+                            "type": "string",
+                            "description": "Visible text to check. Provide exactly one of selector or text."
+                        }),
+                    ),
+                    (
+                        "case_sensitive",
+                        json!({
+                            "type": "boolean",
+                            "description": "Whether text matching should preserve case. Defaults to false."
+                        }),
+                    ),
+                    ("driver_id", json!({"type": "string"})),
+                ],
+                &[],
+            ),
+        },
+        ToolDescriptor {
+            name: "query_selector",
+            description: "Run a bounded local CSS selector query and return compact element summaries.",
+            input_schema: object_schema(
+                vec![
+                    (
+                        "selector",
+                        json!({
+                            "type": "string",
+                            "description": "CSS selector to query in the current page."
+                        }),
+                    ),
+                    (
+                        "max_results",
+                        json!({
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 50,
+                            "description": "Maximum matched elements to return. Defaults to 20."
+                        }),
+                    ),
+                    ("driver_id", json!({"type": "string"})),
+                ],
+                &["selector"],
+            ),
+        },
+        ToolDescriptor {
             name: "screenshot",
             description: "Capture a PNG screenshot as MCP image content.",
             input_schema: object_schema(
@@ -1144,7 +1288,7 @@ fn tool_descriptors() -> &'static [ToolDescriptor] {
 }
 
 pub fn describe() -> &'static str {
-    "tempo MCP server core: initialize/ping/tools/list/tools/call for observe, observe_diff, act, act_batch, fork, close_fork, extract, screenshot, and handshake"
+    "tempo MCP server core: initialize/ping/tools/list/tools/call for observe, observe_diff, act, act_batch, fork, close_fork, extract, find_text, element_present, query_selector, screenshot, and handshake"
 }
 
 #[derive(Debug, Error)]
@@ -1375,6 +1519,41 @@ struct ExtractArgs {
     node: NodeId,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FindTextArgs {
+    #[serde(default)]
+    driver_id: Option<String>,
+    text: String,
+    #[serde(default)]
+    case_sensitive: bool,
+    #[serde(default)]
+    max_results: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ElementPresentArgs {
+    #[serde(default)]
+    driver_id: Option<String>,
+    #[serde(default)]
+    selector: Option<String>,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    case_sensitive: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QuerySelectorArgs {
+    #[serde(default)]
+    driver_id: Option<String>,
+    selector: String,
+    #[serde(default)]
+    max_results: Option<usize>,
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ScreenshotArgs {
@@ -1474,6 +1653,185 @@ fn required_caller_claims(
         ));
     }
     Ok(CallerPolicyClaims::new(input_tainted, confirmed))
+}
+
+fn local_query_limit(max_results: Option<usize>) -> Result<usize, JsonRpcError> {
+    let limit = max_results.unwrap_or(DEFAULT_LOCAL_QUERY_RESULTS);
+    if !(1..=MAX_LOCAL_QUERY_RESULTS).contains(&limit) {
+        return Err(JsonRpcError::invalid_params(format!(
+            "max_results must be between 1 and {MAX_LOCAL_QUERY_RESULTS}"
+        )));
+    }
+    Ok(limit)
+}
+
+fn non_empty_query(value: &str, field: &'static str) -> Result<(), JsonRpcError> {
+    if value.trim().is_empty() {
+        return Err(JsonRpcError::invalid_params(format!(
+            "{field} must not be empty"
+        )));
+    }
+    Ok(())
+}
+
+fn js_literal(value: &str) -> Result<String, JsonRpcError> {
+    serde_json::to_string(value)
+        .map_err(|error| JsonRpcError::invalid_params(format!("invalid script argument: {error}")))
+}
+
+fn find_text_script(
+    text: &str,
+    case_sensitive: bool,
+    limit: usize,
+) -> Result<String, JsonRpcError> {
+    non_empty_query(text, "text")?;
+    let text = js_literal(text)?;
+    Ok(format!(
+        r#"(() => {{
+  const __tempo_mcp_find_text = true;
+  const needle = {text};
+  const caseSensitive = {case_sensitive};
+  const limit = {limit};
+  const compact = (value, max) => String(value ?? '').replace(/\s+/g, ' ').trim().slice(0, max);
+  const normalize = (value) => caseSensitive ? value : value.toLocaleLowerCase();
+  const escapeIdent = (value) => globalThis.CSS && CSS.escape ? CSS.escape(value) : value.replace(/["\\]/g, '\\$&');
+  const visible = (element) => Boolean(element.offsetWidth || element.offsetHeight || element.getClientRects().length);
+  const describe = (element, text) => ({{
+    tag: element.tagName ? element.tagName.toLowerCase() : '',
+    id: element.id || null,
+    role: element.getAttribute('role') || null,
+    name: compact(element.getAttribute('aria-label') || element.getAttribute('title') || text, 160),
+    text: compact(text, 240),
+    selector_hint: element.id ? `#${{escapeIdent(element.id)}}` : null,
+    visible: visible(element),
+  }});
+  const target = normalize(needle);
+  const matches = [];
+  let count = 0;
+  for (const element of Array.from(document.body ? document.body.querySelectorAll('body *') : [])) {{
+    if (!visible(element)) continue;
+    const elementText = compact(element.innerText || element.textContent || '', 4096);
+    if (!elementText || !normalize(elementText).includes(target)) continue;
+    count += 1;
+    if (matches.length < limit) matches.push(describe(element, elementText));
+  }}
+  return {{
+    kind: 'find_text',
+    query: needle,
+    case_sensitive: caseSensitive,
+    found: count > 0,
+    count,
+    returned: matches.length,
+    truncated: count > matches.length,
+    matches,
+  }};
+}})()"#
+    ))
+}
+
+fn element_present_text_script(text: &str, case_sensitive: bool) -> Result<String, JsonRpcError> {
+    non_empty_query(text, "text")?;
+    let text = js_literal(text)?;
+    Ok(format!(
+        r#"(() => {{
+  const __tempo_mcp_element_present = true;
+  const needle = {text};
+  const caseSensitive = {case_sensitive};
+  const normalize = (value) => caseSensitive ? value : value.toLocaleLowerCase();
+  const pageText = String(document.body ? document.body.innerText || document.body.textContent || '' : '');
+  const present = normalize(pageText).includes(normalize(needle));
+  return {{
+    kind: 'element_present',
+    mode: 'text',
+    query: needle,
+    case_sensitive: caseSensitive,
+    present,
+    valid: true,
+  }};
+}})()"#
+    ))
+}
+
+fn element_present_selector_script(selector: &str) -> Result<String, JsonRpcError> {
+    non_empty_query(selector, "selector")?;
+    let selector = js_literal(selector)?;
+    Ok(format!(
+        r#"(() => {{
+  const __tempo_mcp_element_present = true;
+  const selector = {selector};
+  try {{
+    const element = document.querySelector(selector);
+    return {{
+      kind: 'element_present',
+      mode: 'selector',
+      query: selector,
+      present: Boolean(element),
+      valid: true,
+    }};
+  }} catch (error) {{
+    return {{
+      kind: 'element_present',
+      mode: 'selector',
+      query: selector,
+      present: false,
+      valid: false,
+      error: String(error && error.message ? error.message : error),
+    }};
+  }}
+}})()"#
+    ))
+}
+
+fn query_selector_script(selector: &str, limit: usize) -> Result<String, JsonRpcError> {
+    non_empty_query(selector, "selector")?;
+    let selector = js_literal(selector)?;
+    Ok(format!(
+        r#"(() => {{
+  const __tempo_mcp_query_selector = true;
+  const selector = {selector};
+  const limit = {limit};
+  const compact = (value, max) => String(value ?? '').replace(/\s+/g, ' ').trim().slice(0, max);
+  const escapeIdent = (value) => globalThis.CSS && CSS.escape ? CSS.escape(value) : value.replace(/["\\]/g, '\\$&');
+  const visible = (element) => Boolean(element.offsetWidth || element.offsetHeight || element.getClientRects().length);
+  const describe = (element) => {{
+    const text = compact(element.innerText || element.textContent || '', 240);
+    return {{
+      tag: element.tagName ? element.tagName.toLowerCase() : '',
+      id: element.id || null,
+      role: element.getAttribute('role') || null,
+      name: compact(element.getAttribute('aria-label') || element.getAttribute('title') || text, 160),
+      text,
+      selector_hint: element.id ? `#${{escapeIdent(element.id)}}` : null,
+      visible: visible(element),
+    }};
+  }};
+  try {{
+    const elements = Array.from(document.querySelectorAll(selector));
+    return {{
+      kind: 'query_selector',
+      selector,
+      found: elements.length > 0,
+      valid: true,
+      count: elements.length,
+      returned: Math.min(elements.length, limit),
+      truncated: elements.length > limit,
+      matches: elements.slice(0, limit).map(describe),
+    }};
+  }} catch (error) {{
+    return {{
+      kind: 'query_selector',
+      selector,
+      found: false,
+      valid: false,
+      count: 0,
+      returned: 0,
+      truncated: false,
+      matches: [],
+      error: String(error && error.message ? error.message : error),
+    }};
+  }}
+}})()"#
+    ))
 }
 
 /// Observe failure while gathering trust-boundary taint evidence: fail the
@@ -1941,6 +2299,22 @@ fn tool_content_summary(value: &Value) -> String {
         );
     }
 
+    if object.get("provenance").and_then(Value::as_str) == Some("page")
+        && let Some(value) = object.get("value").and_then(Value::as_object)
+        && let Some(kind) = value.get("kind").and_then(Value::as_str)
+        && matches!(kind, "find_text" | "element_present" | "query_selector")
+    {
+        if let Some(present) = value
+            .get("present")
+            .or_else(|| value.get("found"))
+            .and_then(Value::as_bool)
+        {
+            let count = display_json_scalar(value.get("count"));
+            return format!("local_query kind={kind}, present={present}, count={count}");
+        }
+        return format!("local_query kind={kind}");
+    }
+
     if let Some(status) = object.get("status").and_then(Value::as_str) {
         if let Some(diff) = object.get("diff") {
             return format!(
@@ -2400,6 +2774,9 @@ mod tests {
                 "fork",
                 "close_fork",
                 "extract",
+                "find_text",
+                "element_present",
+                "query_selector",
                 "screenshot",
                 "handshake"
             ]
@@ -2452,6 +2829,9 @@ mod tests {
             "fork",
             "close_fork",
             "extract",
+            "find_text",
+            "element_present",
+            "query_selector",
             "screenshot",
             "handshake",
         ] {
@@ -2516,6 +2896,31 @@ mod tests {
             "extract node must explain where the id comes from"
         );
 
+        let find_text = tool_input_schema("find_text")?;
+        assert_eq!(find_text["required"], json!(["text"]));
+        assert_eq!(find_text["properties"]["text"]["type"], "string");
+        assert_eq!(
+            find_text["properties"]["max_results"]["maximum"],
+            MAX_LOCAL_QUERY_RESULTS
+        );
+
+        let element_present = tool_input_schema("element_present")?;
+        assert_eq!(element_present["required"], json!([]));
+        let element_present_properties = element_present["properties"]
+            .as_object()
+            .ok_or("element_present properties must be an object")?;
+        assert!(element_present_properties.contains_key("selector"));
+        assert!(element_present_properties.contains_key("text"));
+        assert!(element_present_properties.contains_key("case_sensitive"));
+
+        let query_selector = tool_input_schema("query_selector")?;
+        assert_eq!(query_selector["required"], json!(["selector"]));
+        assert_eq!(query_selector["properties"]["selector"]["type"], "string");
+        assert_eq!(
+            query_selector["properties"]["max_results"]["maximum"],
+            MAX_LOCAL_QUERY_RESULTS
+        );
+
         let handshake = tool_input_schema("handshake")?;
         let responses = &handshake["properties"]["responses"];
         assert_eq!(responses["type"], "array");
@@ -2549,6 +2954,9 @@ mod tests {
         );
         assert!(skills.iter().any(|skill| skill["id"] == "observe"));
         assert!(skills.iter().any(|skill| skill["id"] == "observe_diff"));
+        assert!(skills.iter().any(|skill| skill["id"] == "find_text"));
+        assert!(skills.iter().any(|skill| skill["id"] == "element_present"));
+        assert!(skills.iter().any(|skill| skill["id"] == "query_selector"));
         assert!(skills.iter().any(|skill| skill["id"] == "handshake"));
         Ok(())
     }
@@ -2614,6 +3022,38 @@ mod tests {
         assert_eq!(extract["provenance"], "page");
         assert_eq!(extract["value"]["node"], "button.primary");
 
+        let find_text = call_tool(
+            &mut server,
+            "find_text",
+            json!({"text": "Continue", "max_results": 3}),
+        )
+        .await?;
+        assert_eq!(find_text["provenance"], "page");
+        assert_eq!(find_text["value"]["kind"], "find_text");
+        assert_eq!(find_text["value"]["found"], true);
+        assert_eq!(find_text["value"]["returned"], 1);
+
+        let element_present = call_tool(
+            &mut server,
+            "element_present",
+            json!({"selector": "button.primary"}),
+        )
+        .await?;
+        assert_eq!(element_present["provenance"], "page");
+        assert_eq!(element_present["value"]["kind"], "element_present");
+        assert_eq!(element_present["value"]["present"], true);
+
+        let query_selector = call_tool(
+            &mut server,
+            "query_selector",
+            json!({"selector": "button.primary", "max_results": 2}),
+        )
+        .await?;
+        assert_eq!(query_selector["provenance"], "page");
+        assert_eq!(query_selector["value"]["kind"], "query_selector");
+        assert_eq!(query_selector["value"]["found"], true);
+        assert_eq!(query_selector["value"]["returned"], 1);
+
         let screenshot = call_tool_envelope(&mut server, "screenshot", json!({})).await?;
         let screenshot_meta = &screenshot["result"]["structuredContent"];
         assert_eq!(screenshot_meta["mime_type"], "image/png");
@@ -2622,6 +3062,36 @@ mod tests {
         assert!(screenshot_meta.get("encoding").is_none());
         let bytes = decode_image_content(&screenshot)?;
         assert_eq!(bytes, TEST_SCREENSHOT_PNG);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_helper_tools_validate_inputs_before_driver_work() -> Result<(), String> {
+        let mut server = TempoMcpServer::new(MemoryDriver::new());
+
+        let ambiguous = call_tool_envelope(
+            &mut server,
+            "element_present",
+            json!({"selector": "button", "text": "Continue"}),
+        )
+        .await?;
+        assert_eq!(ambiguous["error"]["code"], -32602);
+        assert!(ambiguous["error"]["message"]
+            .as_str()
+            .ok_or("ambiguous response should have an error message")?
+            .contains("exactly one"));
+
+        let too_many = call_tool_envelope(
+            &mut server,
+            "find_text",
+            json!({"text": "Continue", "max_results": MAX_LOCAL_QUERY_RESULTS + 1}),
+        )
+        .await?;
+        assert_eq!(too_many["error"]["code"], -32602);
+        assert!(too_many["error"]["message"]
+            .as_str()
+            .ok_or("max_results response should have an error message")?
+            .contains("max_results"));
         Ok(())
     }
 
@@ -4115,6 +4585,55 @@ mod tests {
                     } else {
                         Vec::<&str>::new()
                     },
+                })));
+            }
+            if expression.contains("__tempo_mcp_find_text") {
+                return Ok(tempo_driver::TaintedValue::page(json!({
+                    "kind": "find_text",
+                    "query": "Continue",
+                    "case_sensitive": false,
+                    "found": true,
+                    "count": 1,
+                    "returned": 1,
+                    "truncated": false,
+                    "matches": [{
+                        "tag": "button",
+                        "id": null,
+                        "role": "button",
+                        "name": "Continue",
+                        "text": "Continue",
+                        "selector_hint": null,
+                        "visible": true,
+                    }],
+                })));
+            }
+            if expression.contains("__tempo_mcp_element_present") {
+                return Ok(tempo_driver::TaintedValue::page(json!({
+                    "kind": "element_present",
+                    "mode": if expression.contains("querySelector") { "selector" } else { "text" },
+                    "query": "Continue",
+                    "present": true,
+                    "valid": true,
+                })));
+            }
+            if expression.contains("__tempo_mcp_query_selector") {
+                return Ok(tempo_driver::TaintedValue::page(json!({
+                    "kind": "query_selector",
+                    "selector": "button.primary",
+                    "found": true,
+                    "valid": true,
+                    "count": 1,
+                    "returned": 1,
+                    "truncated": false,
+                    "matches": [{
+                        "tag": "button",
+                        "id": null,
+                        "role": "button",
+                        "name": "Continue",
+                        "text": "Continue",
+                        "selector_hint": null,
+                        "visible": true,
+                    }],
                 })));
             }
             Ok(tempo_driver::TaintedValue::page(json!({
