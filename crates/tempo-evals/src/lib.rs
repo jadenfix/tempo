@@ -167,8 +167,10 @@ pub enum E2eLatencyViolation {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct E2eBudgetReport {
     pub total_cases: usize,
+    pub completed_cases: usize,
     pub total_steps: u64,
     pub total_round_trips: u64,
+    pub llm_round_trips_per_completed_task: Option<f64>,
     pub wall_clock_ms_total: u64,
     pub wall_clock_ms_p50: u64,
     pub observe_latency_ms_p50: u64,
@@ -193,6 +195,14 @@ impl E2eBudgetReport {
 
         let total_steps: u64 = records.iter().map(|record| record.step_count).sum();
         let total_round_trips: u64 = records.iter().map(|record| record.round_trips).sum();
+        let completed_cases = records.iter().filter(|record| record.success).count();
+        let completed_round_trips: u64 = records
+            .iter()
+            .filter(|record| record.success)
+            .map(|record| record.round_trips)
+            .sum();
+        let llm_round_trips_per_completed_task =
+            (completed_cases > 0).then(|| completed_round_trips as f64 / completed_cases as f64);
         let wall_clock_ms_total: u64 = records.iter().map(|record| record.wall_clock_ms).sum();
         let wall_clock_ms_p50 =
             percentile_u64(records.iter().map(|record| record.wall_clock_ms), 0.50);
@@ -218,8 +228,10 @@ impl E2eBudgetReport {
 
         Ok(Self {
             total_cases: records.len(),
+            completed_cases,
             total_steps,
             total_round_trips,
+            llm_round_trips_per_completed_task,
             wall_clock_ms_total,
             wall_clock_ms_p50,
             observe_latency_ms_p50,
@@ -2310,8 +2322,10 @@ mod tests {
 
         assert!(report.passes());
         assert_eq!(report.total_cases, 1);
+        assert_eq!(report.completed_cases, 1);
         assert_eq!(report.total_steps, 2);
         assert_eq!(report.total_round_trips, 2);
+        assert_eq!(report.llm_round_trips_per_completed_task, Some(2.0));
         assert_eq!(report.input_tokens, 600);
         assert_eq!(report.output_tokens, 120);
         assert_eq!(report.cache_read_input_tokens, 200);
@@ -2321,6 +2335,27 @@ mod tests {
         assert_eq!(report.subsystems[0].subsystem, "decode");
         assert_eq!(report.subsystems[0].total_ms, 500);
         assert!((report.subsystems[0].share - 0.5).abs() < f64::EPSILON);
+        Ok(())
+    }
+
+    #[test]
+    fn e2e_budget_report_has_no_completed_round_trip_metric_without_successes() -> TestResult {
+        let mut failed = record(
+            "failed",
+            "https://e2e.test",
+            Lane::Cdp,
+            false,
+            false,
+            1_000,
+            10,
+        );
+        failed.round_trips = 3;
+
+        let report = E2eBudgetReport::from_records(&[failed], &E2eLatencyBudget::default())?;
+
+        assert_eq!(report.completed_cases, 0);
+        assert_eq!(report.total_round_trips, 3);
+        assert_eq!(report.llm_round_trips_per_completed_task, None);
         Ok(())
     }
 
