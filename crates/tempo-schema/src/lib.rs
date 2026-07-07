@@ -283,8 +283,21 @@ pub struct ConfirmationRequest {
     pub action_index: usize,
     pub action_kind: String,
     pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payment_context: Option<PaymentContext>,
     pub created_ms: u64,
     pub expires_ms: u64,
+}
+
+/// Hash-only payment evidence attached to a high-risk action boundary.
+///
+/// Raw payment payloads stay at the transport edge. This metadata is safe to
+/// journal, show in confirmation UI, and bind into idempotency fingerprints.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PaymentContext {
+    pub rail: String,
+    pub payment_hash: String,
 }
 
 /// Server-minted proof that a native shell confirmed one pending request.
@@ -897,6 +910,7 @@ pub fn schema_bundle_json_schema() -> Value {
         "ConfirmationRequest".into(),
         confirmation_request_json_schema(),
     );
+    defs.insert("PaymentContext".into(), payment_context_json_schema());
     defs.insert("ConfirmationGrant".into(), confirmation_grant_json_schema());
     defs.insert(
         "NativePromptRequest".into(),
@@ -1359,8 +1373,30 @@ fn confirmation_request_json_schema() -> Value {
             "action_index": { "type": "integer", "minimum": 0 },
             "action_kind": { "type": "string" },
             "reason": { "type": "string" },
+            "payment_context": {
+                "anyOf": [
+                    { "$ref": "#/$defs/PaymentContext" },
+                    { "type": "null" }
+                ]
+            },
             "created_ms": { "type": "integer", "minimum": 0 },
             "expires_ms": { "type": "integer", "minimum": 0 }
+        }
+    })
+}
+
+fn payment_context_json_schema() -> Value {
+    json!({
+        "title": "PaymentContext",
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["rail", "payment_hash"],
+        "properties": {
+            "rail": { "type": "string", "const": "aether" },
+            "payment_hash": {
+                "type": "string",
+                "pattern": "^0x[0-9a-fA-F]{64}$"
+            }
         }
     })
 }
@@ -1832,6 +1868,7 @@ mod tests {
             "SessionAttachment",
             "AdoptionLease",
             "ConfirmationRequest",
+            "PaymentContext",
             "ConfirmationGrant",
             "NativePromptRequest",
             "AgentRun",
@@ -1859,6 +1896,30 @@ mod tests {
             defs["ManagerEvent"]["oneOf"][0]["properties"]["owner"]["$ref"],
             "#/$defs/ControlOwner"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn payment_context_schema_matches_runtime_contract() -> Result<(), serde_json::Error> {
+        let schema = payment_context_json_schema();
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(schema["properties"]["rail"]["const"], "aether");
+        assert_eq!(
+            schema["properties"]["payment_hash"]["pattern"],
+            "^0x[0-9a-fA-F]{64}$"
+        );
+
+        let exact = serde_json::from_value::<PaymentContext>(json!({
+            "rail": "aether",
+            "payment_hash": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }))?;
+        assert_eq!(exact.rail, "aether");
+        assert!(serde_json::from_value::<PaymentContext>(json!({
+            "rail": "aether",
+            "payment_hash": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "raw_payment": "must-not-be-silently-dropped"
+        }))
+        .is_err());
         Ok(())
     }
 
