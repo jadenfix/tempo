@@ -12,7 +12,10 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::ops::Deref;
-use tempo_schema::{Action, ActionBatch, CompiledObservation, NodeId, ObservationDiff, Provenance};
+use tempo_schema::{
+    Action, ActionBatch, CompiledObservation, ElementPresentMode, NodeId, ObservationDiff,
+    Provenance, DEFAULT_READ_ACTION_RESULTS, MAX_READ_ACTION_RESULTS,
+};
 #[cfg(any(test, feature = "test-driver"))]
 use tempo_urlpolicy::UrlPolicy;
 use thiserror::Error;
@@ -31,6 +34,199 @@ pub const MAX_PROTOCOL_RESPONSE_BYTES: usize = 6 * 1024 * 1024;
 
 pub fn output_cap_message(artifact: &str, bytes: usize, max_bytes: usize) -> String {
     format!("{artifact} exceeded output cap: {bytes} bytes > {max_bytes} bytes")
+}
+
+pub fn read_action_script(action: &Action) -> Result<Option<String>, String> {
+    match action {
+        Action::FindText {
+            text,
+            case_sensitive,
+            max_results,
+        } => find_text_script(text, *case_sensitive, read_action_limit(*max_results)?).map(Some),
+        Action::ElementPresent {
+            mode,
+            query,
+            case_sensitive,
+        } => match mode {
+            ElementPresentMode::Selector => element_present_selector_script(query).map(Some),
+            ElementPresentMode::Text => {
+                element_present_text_script(query, *case_sensitive).map(Some)
+            }
+        },
+        Action::QuerySelector {
+            selector,
+            max_results,
+        } => query_selector_script(selector, read_action_limit(*max_results)?).map(Some),
+        _ => Ok(None),
+    }
+}
+
+fn read_action_limit(max_results: Option<usize>) -> Result<usize, String> {
+    let limit = max_results.unwrap_or(DEFAULT_READ_ACTION_RESULTS);
+    if !(1..=MAX_READ_ACTION_RESULTS).contains(&limit) {
+        return Err(format!(
+            "max_results must be between 1 and {MAX_READ_ACTION_RESULTS}"
+        ));
+    }
+    Ok(limit)
+}
+
+fn non_empty_query(value: &str, field: &'static str) -> Result<(), String> {
+    if value.trim().is_empty() {
+        return Err(format!("{field} must not be empty"));
+    }
+    Ok(())
+}
+
+fn js_literal(value: &str) -> Result<String, String> {
+    serde_json::to_string(value).map_err(|error| format!("invalid script argument: {error}"))
+}
+
+fn find_text_script(text: &str, case_sensitive: bool, limit: usize) -> Result<String, String> {
+    non_empty_query(text, "text")?;
+    let text = js_literal(text)?;
+    Ok(format!(
+        r#"(() => {{
+  const needle = {text};
+  const caseSensitive = {case_sensitive};
+  const limit = {limit};
+  const compact = (value, max) => String(value ?? '').replace(/\s+/g, ' ').trim().slice(0, max);
+  const normalize = (value) => caseSensitive ? value : value.toLocaleLowerCase();
+  const escapeIdent = (value) => globalThis.CSS && CSS.escape ? CSS.escape(value) : value.replace(/["\\]/g, '\\$&');
+  const visible = (element) => Boolean(element.offsetWidth || element.offsetHeight || element.getClientRects().length);
+  const describe = (element, text) => ({{
+    tag: element.tagName ? element.tagName.toLowerCase() : '',
+    id: element.id || null,
+    role: element.getAttribute('role') || null,
+    name: compact(element.getAttribute('aria-label') || element.getAttribute('title') || text, 160),
+    text: compact(text, 240),
+    selector_hint: element.id ? `#${{escapeIdent(element.id)}}` : null,
+    visible: visible(element),
+  }});
+  const target = normalize(needle);
+  const matches = [];
+  let count = 0;
+  for (const element of Array.from(document.body ? document.body.querySelectorAll('body *') : [])) {{
+    if (!visible(element)) continue;
+    const elementText = compact(element.innerText || element.textContent || '', 4096);
+    if (!elementText || !normalize(elementText).includes(target)) continue;
+    count += 1;
+    if (matches.length < limit) matches.push(describe(element, elementText));
+  }}
+  return {{
+    kind: 'find_text',
+    query: needle,
+    case_sensitive: caseSensitive,
+    found: count > 0,
+    count,
+    returned: matches.length,
+    truncated: count > matches.length,
+    matches,
+  }};
+}})()"#
+    ))
+}
+
+fn element_present_text_script(text: &str, case_sensitive: bool) -> Result<String, String> {
+    non_empty_query(text, "text")?;
+    let text = js_literal(text)?;
+    Ok(format!(
+        r#"(() => {{
+  const needle = {text};
+  const caseSensitive = {case_sensitive};
+  const normalize = (value) => caseSensitive ? value : value.toLocaleLowerCase();
+  const pageText = String(document.body ? document.body.innerText || document.body.textContent || '' : '');
+  const present = normalize(pageText).includes(normalize(needle));
+  return {{
+    kind: 'element_present',
+    mode: 'text',
+    query: needle,
+    case_sensitive: caseSensitive,
+    present,
+    valid: true,
+  }};
+}})()"#
+    ))
+}
+
+fn element_present_selector_script(selector: &str) -> Result<String, String> {
+    non_empty_query(selector, "selector")?;
+    let selector = js_literal(selector)?;
+    Ok(format!(
+        r#"(() => {{
+  const selector = {selector};
+  try {{
+    const element = document.querySelector(selector);
+    return {{
+      kind: 'element_present',
+      mode: 'selector',
+      query: selector,
+      present: Boolean(element),
+      valid: true,
+    }};
+  }} catch (error) {{
+    return {{
+      kind: 'element_present',
+      mode: 'selector',
+      query: selector,
+      present: false,
+      valid: false,
+      error: String(error && error.message ? error.message : error),
+    }};
+  }}
+}})()"#
+    ))
+}
+
+fn query_selector_script(selector: &str, limit: usize) -> Result<String, String> {
+    non_empty_query(selector, "selector")?;
+    let selector = js_literal(selector)?;
+    Ok(format!(
+        r#"(() => {{
+  const selector = {selector};
+  const limit = {limit};
+  const compact = (value, max) => String(value ?? '').replace(/\s+/g, ' ').trim().slice(0, max);
+  const escapeIdent = (value) => globalThis.CSS && CSS.escape ? CSS.escape(value) : value.replace(/["\\]/g, '\\$&');
+  const visible = (element) => Boolean(element.offsetWidth || element.offsetHeight || element.getClientRects().length);
+  const describe = (element) => {{
+    const text = compact(element.innerText || element.textContent || '', 240);
+    return {{
+      tag: element.tagName ? element.tagName.toLowerCase() : '',
+      id: element.id || null,
+      role: element.getAttribute('role') || null,
+      name: compact(element.getAttribute('aria-label') || element.getAttribute('title') || text, 160),
+      text,
+      selector_hint: element.id ? `#${{escapeIdent(element.id)}}` : null,
+      visible: visible(element),
+    }};
+  }};
+  try {{
+    const elements = Array.from(document.querySelectorAll(selector));
+    return {{
+      kind: 'query_selector',
+      selector,
+      found: elements.length > 0,
+      valid: true,
+      count: elements.length,
+      returned: Math.min(elements.length, limit),
+      truncated: elements.length > limit,
+      matches: elements.slice(0, limit).map(describe),
+    }};
+  }} catch (error) {{
+    return {{
+      kind: 'query_selector',
+      selector,
+      found: false,
+      valid: false,
+      count: 0,
+      returned: 0,
+      truncated: false,
+      matches: [],
+      error: String(error && error.message ? error.message : error),
+    }};
+  }}
+}})()"#
+    ))
 }
 
 /// Page-data payload returned by driver primitives that read DOM/script content.
@@ -281,6 +477,135 @@ impl TestDriver {
     fn has_node(&self, node: &NodeId) -> bool {
         self.elements.iter().any(|e| &e.node_id == node)
     }
+
+    fn element_text(element: &tempo_schema::InteractiveElement) -> String {
+        element
+            .name
+            .iter()
+            .chain(element.value.iter())
+            .map(|span| span.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn text_contains(haystack: &str, needle: &str, case_sensitive: bool) -> bool {
+        if case_sensitive {
+            haystack.contains(needle)
+        } else {
+            haystack
+                .to_lowercase()
+                .contains(needle.to_lowercase().as_str())
+        }
+    }
+
+    fn read_action_result(&self, action: &Action) -> Result<Option<TaintedValue>, String> {
+        let Some(_) = read_action_script(action)? else {
+            return Ok(None);
+        };
+        let value = match action {
+            Action::FindText {
+                text,
+                case_sensitive,
+                max_results,
+            } => {
+                let limit = read_action_limit(*max_results)?;
+                let matches = self
+                    .elements
+                    .iter()
+                    .filter_map(|element| {
+                        let text_content = Self::element_text(element);
+                        Self::text_contains(&text_content, text, *case_sensitive).then(|| {
+                            serde_json::json!({
+                                "tag": element.role,
+                                "id": element.node_id.0,
+                                "role": element.role,
+                                "name": text_content.chars().take(160).collect::<String>(),
+                                "text": text_content.chars().take(240).collect::<String>(),
+                                "selector_hint": element.node_id.0,
+                                "visible": true,
+                            })
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let count = matches.len();
+                serde_json::json!({
+                    "kind": "find_text",
+                    "query": text,
+                    "case_sensitive": case_sensitive,
+                    "found": count > 0,
+                    "count": count,
+                    "returned": count.min(limit),
+                    "truncated": count > limit,
+                    "matches": matches.into_iter().take(limit).collect::<Vec<_>>(),
+                })
+            }
+            Action::ElementPresent {
+                mode,
+                query,
+                case_sensitive,
+            } => match mode {
+                ElementPresentMode::Selector => serde_json::json!({
+                    "kind": "element_present",
+                    "mode": "selector",
+                    "query": query,
+                    "present": self.has_node(&NodeId(query.clone())),
+                    "valid": true,
+                }),
+                ElementPresentMode::Text => {
+                    let page_text = self
+                        .elements
+                        .iter()
+                        .map(Self::element_text)
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    serde_json::json!({
+                        "kind": "element_present",
+                        "mode": "text",
+                        "query": query,
+                        "case_sensitive": case_sensitive,
+                        "present": Self::text_contains(&page_text, query, *case_sensitive),
+                        "valid": true,
+                    })
+                }
+            },
+            Action::QuerySelector {
+                selector,
+                max_results,
+            } => {
+                let limit = read_action_limit(*max_results)?;
+                let matches = self
+                    .elements
+                    .iter()
+                    .filter(|element| element.node_id.0 == *selector)
+                    .map(|element| {
+                        let text_content = Self::element_text(element);
+                        serde_json::json!({
+                            "tag": element.role,
+                            "id": element.node_id.0,
+                            "role": element.role,
+                            "name": text_content.chars().take(160).collect::<String>(),
+                            "text": text_content.chars().take(240).collect::<String>(),
+                            "selector_hint": element.node_id.0,
+                            "visible": true,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let count = matches.len();
+                serde_json::json!({
+                    "kind": "query_selector",
+                    "selector": selector,
+                    "found": count > 0,
+                    "valid": true,
+                    "count": count,
+                    "returned": count.min(limit),
+                    "truncated": count > limit,
+                    "matches": matches.into_iter().take(limit).collect::<Vec<_>>(),
+                })
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(TaintedValue::page(value)))
+    }
 }
 
 #[cfg(any(test, feature = "test-driver"))]
@@ -356,6 +681,9 @@ impl DriverTrait for TestDriver {
                 reason: "node not found".into(),
             });
         }
+        if let Err(reason) = read_action_script(action) {
+            return Ok(StepOutcome::StepError { reason });
+        }
         self.seq += 1;
         let diff = ObservationDiff {
             since_seq: self.seq - 1,
@@ -373,6 +701,12 @@ impl DriverTrait for TestDriver {
                 TaintedValue::page(serde_json::json!({ "node": node.0 })),
             ));
         }
+        if let Some(read_result) = self
+            .read_action_result(action)
+            .map_err(TransportError::Other)?
+        {
+            return Ok(StepOutcome::applied_with_read_result(diff, read_result));
+        }
         Ok(StepOutcome::applied(diff))
     }
 
@@ -389,7 +723,7 @@ impl DriverTrait for TestDriver {
         });
         for a in &batch.actions {
             last = self.act(a).await?;
-            if matches!(last, StepOutcome::StepError { .. }) {
+            if matches!(last, StepOutcome::StepError { .. }) || a.terminates_sequence() {
                 break;
             }
         }
@@ -772,6 +1106,66 @@ mod tests {
         assert_eq!(root_observation.seq, 1);
         assert_eq!(root_observation.elements.len(), 1);
         futures::executor::block_on(created.close()).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_driver_helper_action_returns_page_read_result() -> Result<(), String> {
+        let mut driver = TestDriver::new().with_elements(vec![button("submit")]);
+        let outcome = futures::executor::block_on(driver.act(&Action::FindText {
+            text: "submit".into(),
+            case_sensitive: false,
+            max_results: Some(1),
+        }))
+        .map_err(|error| error.to_string())?;
+
+        let StepOutcome::Applied {
+            read_result: Some(read_result),
+            ..
+        } = outcome
+        else {
+            return Err(format!(
+                "helper action did not return read_result: {outcome:?}"
+            ));
+        };
+        assert!(read_result.is_page_derived());
+        assert_eq!(read_result.value["kind"], "find_text");
+        assert_eq!(read_result.value["found"], true);
+        assert_eq!(read_result.value["returned"], 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_driver_batch_stops_after_helper_read_result() -> Result<(), String> {
+        let mut driver = TestDriver::new().with_elements(vec![button("submit")]);
+        let outcome = futures::executor::block_on(driver.act_batch(&ActionBatch {
+            actions: vec![
+                Action::FindText {
+                    text: "submit".into(),
+                    case_sensitive: false,
+                    max_results: Some(1),
+                },
+                Action::Goto {
+                    url: "https://later.test".into(),
+                },
+            ],
+            quiescence: tempo_schema::QuiescencePolicy::FixedMillis(0),
+        }))
+        .map_err(|error| error.to_string())?;
+
+        let observation =
+            futures::executor::block_on(driver.observe()).map_err(|e| e.to_string())?;
+        assert_eq!(observation.url, "about:blank");
+        let StepOutcome::Applied {
+            read_result: Some(read_result),
+            ..
+        } = outcome
+        else {
+            return Err(format!(
+                "batch did not preserve helper read_result: {outcome:?}"
+            ));
+        };
+        assert_eq!(read_result.value["kind"], "find_text");
         Ok(())
     }
 

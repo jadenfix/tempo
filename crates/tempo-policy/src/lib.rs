@@ -491,6 +491,29 @@ mod tests {
                 SideEffect::Read,
             ),
             (
+                Action::FindText {
+                    text: "continue".into(),
+                    case_sensitive: false,
+                    max_results: None,
+                },
+                SideEffect::Read,
+            ),
+            (
+                Action::ElementPresent {
+                    mode: tempo_schema::ElementPresentMode::Selector,
+                    query: "#main".into(),
+                    case_sensitive: false,
+                },
+                SideEffect::Read,
+            ),
+            (
+                Action::QuerySelector {
+                    selector: "main".into(),
+                    max_results: None,
+                },
+                SideEffect::Read,
+            ),
+            (
                 Action::Skill {
                     name: "checkout".into(),
                     input: serde_json::Value::Null,

@@ -1575,7 +1575,7 @@ impl AgentRunner {
 /// `Type` and `Select` are treated as navigating: a `<select onchange>`
 /// jump-menu or an input handler can assign `location`, swapping the document
 /// cross-origin, and a content diff cannot reveal that. Only genuinely
-/// same-document actions (`Scroll`/`Wait`/`Extract`) take the diff path.
+/// same-document actions (`Scroll`/`Wait`/read helpers) take the diff path.
 /// `Skill` is rejected by the decided loop before it executes, so it never
 /// reaches the post-action re-observe; it is listed defensively.
 fn action_may_navigate(action: &Action) -> bool {
@@ -1585,7 +1585,12 @@ fn action_may_navigate(action: &Action) -> bool {
         | Action::Type { .. }
         | Action::Select { .. }
         | Action::Skill { .. } => true,
-        Action::Scroll { .. } | Action::Wait { .. } | Action::Extract { .. } => false,
+        Action::Scroll { .. }
+        | Action::Wait { .. }
+        | Action::Extract { .. }
+        | Action::FindText { .. }
+        | Action::ElementPresent { .. }
+        | Action::QuerySelector { .. } => false,
     }
 }
 
@@ -1692,6 +1697,9 @@ fn action_kind(action: &Action) -> &'static str {
         Action::Scroll { .. } => "scroll",
         Action::Wait { .. } => "wait",
         Action::Extract { .. } => "extract",
+        Action::FindText { .. } => "find_text",
+        Action::ElementPresent { .. } => "element_present",
+        Action::QuerySelector { .. } => "query_selector",
         Action::Skill { .. } => "skill",
     }
 }
@@ -2478,6 +2486,18 @@ mod tests {
             click("stale-after-navigation"),
         ]);
         assert_eq!(truncated, vec![Action::Wait { millis: 1 }, goto]);
+
+        let read = Action::FindText {
+            text: "continue".into(),
+            case_sensitive: false,
+            max_results: None,
+        };
+        let truncated = sanitize_decided_actions(vec![
+            Action::Wait { millis: 1 },
+            read.clone(),
+            click("stale-after-read"),
+        ]);
+        assert_eq!(truncated, vec![Action::Wait { millis: 1 }, read]);
     }
 
     #[tokio::test]
@@ -5167,6 +5187,20 @@ mod tests {
         assert!(!action_may_navigate(&Action::Wait { millis: 1 }));
         assert!(!action_may_navigate(&Action::Extract {
             node: NodeId("x".into())
+        }));
+        assert!(!action_may_navigate(&Action::FindText {
+            text: "continue".into(),
+            case_sensitive: false,
+            max_results: None,
+        }));
+        assert!(!action_may_navigate(&Action::ElementPresent {
+            mode: tempo_schema::ElementPresentMode::Text,
+            query: "receipt".into(),
+            case_sensitive: false,
+        }));
+        assert!(!action_may_navigate(&Action::QuerySelector {
+            selector: "main".into(),
+            max_results: None,
         }));
     }
 }

@@ -486,6 +486,11 @@ impl DriverTrait for WebViewDriver {
                 host.extract(locator)?;
                 host.observe()
             }),
+            Action::FindText { .. }
+            | Action::ElementPresent { .. }
+            | Action::QuerySelector { .. } => Ok(StepOutcome::StepError {
+                reason: "read helper actions are not implemented by WebView yet".into(),
+            }),
             Action::Skill { name, .. } => Ok(StepOutcome::StepError {
                 reason: format!("skill action {name:?} is handled by tempo-skills, not WebView"),
             }),

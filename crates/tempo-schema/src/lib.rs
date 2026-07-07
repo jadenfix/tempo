@@ -13,6 +13,12 @@ use std::fmt;
 /// Frozen schema version. Bumped only by a deliberate contract change (final.md §8.2 M0).
 pub const SCHEMA_VERSION: &str = "2.0.0";
 
+/// Default number of structured matches returned by read-only helper actions.
+pub const DEFAULT_READ_ACTION_RESULTS: usize = 10;
+
+/// Hard cap for structured matches returned by read-only helper actions.
+pub const MAX_READ_ACTION_RESULTS: usize = 50;
+
 /// Stable identifier for a page element that survives relayout / re-render.
 ///
 /// Grounding contract: an action planned against a `NodeId` in observation N must still
@@ -423,11 +429,36 @@ pub enum Action {
     Extract {
         node: NodeId,
     },
+    FindText {
+        text: String,
+        #[serde(default)]
+        case_sensitive: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_results: Option<usize>,
+    },
+    ElementPresent {
+        mode: ElementPresentMode,
+        query: String,
+        #[serde(default)]
+        case_sensitive: bool,
+    },
+    QuerySelector {
+        selector: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_results: Option<usize>,
+    },
     /// Invoke a named macro/skill from the skill store (final.md tempo-skills).
     Skill {
         name: String,
         input: serde_json::Value,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ElementPresentMode {
+    Selector,
+    Text,
 }
 
 impl Action {
@@ -437,7 +468,10 @@ impl Action {
             Action::Goto { .. }
             | Action::Scroll { .. }
             | Action::Wait { .. }
-            | Action::Extract { .. } => SideEffect::Read,
+            | Action::Extract { .. }
+            | Action::FindText { .. }
+            | Action::ElementPresent { .. }
+            | Action::QuerySelector { .. } => SideEffect::Read,
             Action::Click { .. } | Action::Type { .. } | Action::Select { .. } => SideEffect::Write,
             // Skills declare their own class; default to the safe-but-gated Write.
             Action::Skill { .. } => SideEffect::Write,
@@ -451,8 +485,14 @@ impl Action {
     /// then must discard any later queued actions and re-plan from the next
     /// observation.
     pub fn terminates_sequence(&self) -> bool {
-        matches!(self, Action::Goto { .. } | Action::Extract { .. })
-            || self.side_effect() >= SideEffect::Send
+        matches!(
+            self,
+            Action::Goto { .. }
+                | Action::Extract { .. }
+                | Action::FindText { .. }
+                | Action::ElementPresent { .. }
+                | Action::QuerySelector { .. }
+        ) || self.side_effect() >= SideEffect::Send
     }
 }
 
@@ -501,6 +541,7 @@ pub struct StepTriple {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BeaterCompatError {
     UnsupportedSkillAction { name: String },
+    UnsupportedReadAction { kind: &'static str },
     UnsupportedScrollCoordinates { x: String, y: String },
     UnsupportedDiff { since_seq: u64, seq: u64 },
     InvalidDecision { reason: String },
@@ -513,6 +554,12 @@ impl fmt::Display for BeaterCompatError {
                 write!(
                     f,
                     "tempo skill action cannot convert to beater BrowserAction: {name}"
+                )
+            }
+            Self::UnsupportedReadAction { kind } => {
+                write!(
+                    f,
+                    "tempo read helper action cannot convert to beater BrowserAction: {kind}"
                 )
             }
             Self::UnsupportedScrollCoordinates { x, y } => {
@@ -597,6 +644,15 @@ impl TryFrom<Action> for beater_browser::BrowserAction {
             }),
             Action::Wait { millis } => Ok(Self::Wait { millis }),
             Action::Extract { node } => Ok(Self::Extract { selector: node.0 }),
+            Action::FindText { .. } => {
+                Err(BeaterCompatError::UnsupportedReadAction { kind: "find_text" })
+            }
+            Action::ElementPresent { .. } => Err(BeaterCompatError::UnsupportedReadAction {
+                kind: "element_present",
+            }),
+            Action::QuerySelector { .. } => Err(BeaterCompatError::UnsupportedReadAction {
+                kind: "query_selector",
+            }),
             Action::Skill { name, .. } => Err(BeaterCompatError::UnsupportedSkillAction { name }),
         }
     }
@@ -1058,6 +1114,43 @@ pub fn action_json_schema() -> Value {
             action_variant_schema("extract", json!({
                 "node": { "$ref": "#/$defs/NodeId" }
             })),
+            action_variant_schema_with_required(
+                "find_text",
+                json!({
+                    "text": { "type": "string" },
+                    "case_sensitive": { "type": "boolean", "default": false },
+                    "max_results": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": MAX_READ_ACTION_RESULTS
+                    }
+                }),
+                &["text"]
+            ),
+            action_variant_schema_with_required(
+                "element_present",
+                json!({
+                    "mode": {
+                        "type": "string",
+                        "enum": ["selector", "text"]
+                    },
+                    "query": { "type": "string" },
+                    "case_sensitive": { "type": "boolean", "default": false }
+                }),
+                &["mode", "query"]
+            ),
+            action_variant_schema_with_required(
+                "query_selector",
+                json!({
+                    "selector": { "type": "string" },
+                    "max_results": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": MAX_READ_ACTION_RESULTS
+                    }
+                }),
+                &["selector"]
+            ),
             action_variant_schema("skill", json!({
                 "name": { "type": "string" },
                 "input": true
@@ -1622,6 +1715,19 @@ fn quiescence_policy_json_schema() -> Value {
 }
 
 fn action_variant_schema(kind: &'static str, properties: Value) -> Value {
+    let required = match &properties {
+        Value::Object(map) => map.keys().cloned().collect::<Vec<_>>(),
+        _ => Vec::new(),
+    };
+    let required = required.iter().map(String::as_str).collect::<Vec<_>>();
+    action_variant_schema_with_required(kind, properties, &required)
+}
+
+fn action_variant_schema_with_required(
+    kind: &'static str,
+    properties: Value,
+    required_properties: &[&str],
+) -> Value {
     let mut required = vec![Value::String("kind".into())];
     let mut merged = serde_json::Map::new();
     merged.insert(
@@ -1634,10 +1740,14 @@ fn action_variant_schema(kind: &'static str, properties: Value) -> Value {
 
     if let Value::Object(map) = properties {
         for (key, value) in map {
-            required.push(Value::String(key.clone()));
             merged.insert(key, value);
         }
     }
+    required.extend(
+        required_properties
+            .iter()
+            .map(|field| Value::String((*field).into())),
+    );
 
     json!({
         "type": "object",
@@ -1692,6 +1802,61 @@ mod tests {
             input: serde_json::json!({}),
         }
         .terminates_sequence());
+        assert!(Action::FindText {
+            text: "continue".into(),
+            case_sensitive: false,
+            max_results: None,
+        }
+        .terminates_sequence());
+        assert!(Action::ElementPresent {
+            mode: ElementPresentMode::Selector,
+            query: "#main".into(),
+            case_sensitive: false,
+        }
+        .terminates_sequence());
+        assert!(Action::QuerySelector {
+            selector: "main".into(),
+            max_results: None,
+        }
+        .terminates_sequence());
+    }
+
+    #[test]
+    fn helper_action_defaults_round_trip() -> Result<(), serde_json::Error> {
+        assert_eq!(
+            serde_json::from_value::<Action>(json!({
+                "kind": "find_text",
+                "text": "continue"
+            }))?,
+            Action::FindText {
+                text: "continue".into(),
+                case_sensitive: false,
+                max_results: None,
+            }
+        );
+        assert_eq!(
+            serde_json::from_value::<Action>(json!({
+                "kind": "element_present",
+                "mode": "text",
+                "query": "receipt"
+            }))?,
+            Action::ElementPresent {
+                mode: ElementPresentMode::Text,
+                query: "receipt".into(),
+                case_sensitive: false,
+            }
+        );
+        assert_eq!(
+            serde_json::from_value::<Action>(json!({
+                "kind": "query_selector",
+                "selector": "main"
+            }))?,
+            Action::QuerySelector {
+                selector: "main".into(),
+                max_results: None,
+            }
+        );
+        Ok(())
     }
 
     #[test]
@@ -2123,6 +2288,20 @@ mod tests {
             Action::Extract {
                 node: NodeId("n1".into()),
             },
+            Action::FindText {
+                text: "continue".into(),
+                case_sensitive: false,
+                max_results: None,
+            },
+            Action::ElementPresent {
+                mode: ElementPresentMode::Text,
+                query: "receipt".into(),
+                case_sensitive: false,
+            },
+            Action::QuerySelector {
+                selector: "main".into(),
+                max_results: None,
+            },
             Action::Skill {
                 name: "checkout".into(),
                 input: serde_json::Value::Null,
@@ -2152,12 +2331,19 @@ mod tests {
             let required = schema_variant["required"]
                 .as_array()
                 .ok_or_else(|| format!("required fields missing for {kind}"))?;
+            let properties = schema_variant["properties"]
+                .as_object()
+                .ok_or_else(|| format!("properties missing for {kind}"))?;
             for field in fields.keys() {
                 assert!(
-                    required
-                        .iter()
-                        .any(|required| required.as_str() == Some(field.as_str())),
-                    "{kind} missing required field {field}"
+                    properties.contains_key(field),
+                    "{kind} serialized undeclared field {field}"
+                );
+            }
+            for field in required.iter().filter_map(|field| field.as_str()) {
+                assert!(
+                    fields.contains_key(field),
+                    "{kind} required field {field} missing from serde output"
                 );
             }
         }
