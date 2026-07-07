@@ -1342,14 +1342,12 @@ impl CdpTempoDriver {
             return Ok(());
         }
 
-        let mut tracker = CompositeQuiescenceTracker::new(3);
+        let mut tracker =
+            CompositeQuiescenceTracker::new(QUIESCENCE_FALLBACK_REQUIRED_STABLE_SAMPLES);
 
-        // Ramp the sampling interval instead of a fixed 50ms: a page that is
-        // already quiet settles after ~75ms of evidence instead of ~100ms,
-        // while a busy page converges to the same 50ms cadence. The ramp is
-        // deliberately conservative — the quiet-evidence window stays within
-        // 25% of the legacy 100ms so late-starting JS (hydration, analytics)
-        // has nearly the same chance to be observed before settle.
+        // Adaptive fallback for runtimes where the event-driven isolated-world
+        // promise cannot run: start quickly, then converge to the legacy 50ms
+        // cadence while preserving the 75ms quiet-evidence floor.
         let mut poll_index = 0_usize;
         loop {
             // URL policy is enforced inside each stability sample (from the
@@ -1632,11 +1630,13 @@ fn parse_stability_probe(probe: &str) -> Option<ParsedStabilityProbe> {
 /// collapsing the common already-quiet case to one CDP round-trip.
 const QUIESCENCE_EVENT_QUIET_WINDOW_MS: u64 = 75;
 
-/// Fallback poll ramp for composite quiescence sampling, capped at the legacy
-/// 50ms. Quiet pages produce three stable samples spanning ~75ms with O(1)
-/// sampling cost when the event-driven isolated-world path is unavailable.
-const QUIESCENCE_POLL_INTERVALS_MS: [u64; 2] = [25, 50];
+/// Fallback poll ramp for composite quiescence sampling when the event-driven
+/// isolated-world path is unavailable. It starts below one frame, roughly backs
+/// off to the legacy 50ms cap, and still requires 75ms of quiet evidence before
+/// settling.
+const QUIESCENCE_POLL_INTERVALS_MS: [u64; 3] = [8, 17, 50];
 const QUIESCENCE_POLL_INTERVAL_CAP_MS: u64 = 50;
+const QUIESCENCE_FALLBACK_REQUIRED_STABLE_SAMPLES: u8 = 4;
 
 /// In-page probe: installs a document-wide MutationObserver, rebinds it if the
 /// document root is replaced, and reports `readyState|generation`
@@ -4811,14 +4811,21 @@ mod tests {
     }
 
     #[test]
-    fn quiescence_poll_ramp_is_bounded_by_legacy_cap() {
+    fn quiescence_fallback_poll_ramp_is_adaptive_and_bounded() {
+        assert!(
+            QUIESCENCE_POLL_INTERVALS_MS[0] < 10,
+            "fallback should start with a sub-10ms probe"
+        );
         for interval in QUIESCENCE_POLL_INTERVALS_MS {
             assert!(interval <= QUIESCENCE_POLL_INTERVAL_CAP_MS);
         }
-        // Three stable samples must span at least 75ms of quiet evidence so
-        // late-starting JS keeps close to the legacy 100ms observation window.
+        assert_eq!(
+            usize::from(QUIESCENCE_FALLBACK_REQUIRED_STABLE_SAMPLES),
+            QUIESCENCE_POLL_INTERVALS_MS.len() + 1
+        );
+        // Four stable samples span the same 75ms quiet evidence floor while
+        // letting the fallback probe start sooner than the old 25ms ramp.
         let evidence_span: u64 = QUIESCENCE_POLL_INTERVALS_MS.iter().sum();
-        assert!(evidence_span >= 75);
         assert_eq!(QUIESCENCE_EVENT_QUIET_WINDOW_MS, evidence_span);
     }
 
