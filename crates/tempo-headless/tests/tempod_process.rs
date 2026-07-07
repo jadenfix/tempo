@@ -2,12 +2,15 @@ use reqwest::blocking::{Client, Response};
 use reqwest::StatusCode;
 use serde_json::{json, Value};
 use std::error::Error;
+use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -260,6 +263,67 @@ fn tempod_binary_live_cdp_spawns_engine_and_drives_agent_protocols() -> TestResu
     Ok(())
 }
 
+#[test]
+#[cfg(unix)]
+fn tempod_binary_live_cdp_recovers_after_spawned_engine_death() -> TestResult {
+    let Some(chrome) = std::env::var_os("TEMPO_CDP_CHROME") else {
+        eprintln!("skipping live tempod process/CDP recovery smoke; TEMPO_CDP_CHROME is unset");
+        return Ok(());
+    };
+    let Some(engine_program) = tempo_engined_cdp_path() else {
+        eprintln!(
+            "skipping live tempod process/CDP recovery smoke; build tempo-engined-cdp first or set CARGO_BIN_EXE_tempo-engined-cdp"
+        );
+        return Ok(());
+    };
+
+    let fixture = FixtureServer::start()?;
+    let root = unique_temp_dir("tempod-cdp-recovery")?;
+    let pid_file = root.join("engine.pid");
+    let wrapper = cdp_engine_pid_wrapper(&root, &engine_program, &pid_file)?;
+    let addr = reserve_loopback_addr()?;
+    let mut tempod = TempodProcess::spawn_with_cdp_engine(&addr, AUTH_TOKEN, &wrapper, &chrome)?;
+    let client = Client::builder().timeout(Duration::from_secs(10)).build()?;
+    let base_url = format!("http://{addr}");
+
+    wait_for_health(&client, &base_url, &mut tempod)?;
+    wait_for_ready(&client, &base_url, &mut tempod)?;
+
+    let first_pid = wait_for_engine_pid(&pid_file, None, &mut tempod)?;
+    create_and_observe_session(
+        &client,
+        &base_url,
+        &fixture.url("/before-restart"),
+        "Agent Name",
+    )?;
+
+    let status = Command::new("kill")
+        .arg("-TERM")
+        .arg(first_pid.to_string())
+        .status()?;
+    assert!(
+        status.success(),
+        "failed to terminate engine pid {first_pid}"
+    );
+
+    let restarted_pid = wait_for_engine_pid(&pid_file, Some(first_pid), &mut tempod)?;
+    assert_ne!(first_pid, restarted_pid);
+    wait_for_ready(&client, &base_url, &mut tempod)?;
+    create_and_observe_session(
+        &client,
+        &base_url,
+        &fixture.url("/after-restart"),
+        "Agent Name",
+    )?;
+
+    let drain = post_json(&client, &base_url, "/drain", Some(AUTH_TOKEN), "{}")?;
+    assert_eq!(drain.status, StatusCode::OK);
+    assert_eq!(drain.body["draining"], true);
+
+    fs::remove_dir_all(root)?;
+    Ok(())
+}
+
 struct TempodProcess {
     child: Child,
 }
@@ -391,6 +455,40 @@ fn serve_fixture_connection(mut stream: TcpStream) -> Result<(), std::io::Error>
     stream.flush()
 }
 
+fn create_and_observe_session(
+    client: &Client,
+    base_url: &str,
+    url: &str,
+    expected_text: &str,
+) -> TestResult {
+    let create_body = json!({ "url": url }).to_string();
+    let session = post_json(
+        client,
+        base_url,
+        "/sessions",
+        Some(AUTH_TOKEN),
+        &create_body,
+    )?;
+    assert_eq!(
+        session.status,
+        StatusCode::CREATED,
+        "session response: {}",
+        session.body
+    );
+    let session_id = session.body["id"]
+        .as_str()
+        .ok_or("session create response missing id")?;
+    let observation = get_json(
+        client,
+        base_url,
+        &format!("/sessions/{session_id}/observe"),
+        Some(AUTH_TOKEN),
+    )?;
+    assert_eq!(observation.status, StatusCode::OK);
+    assert_eq!(observation.body["url"], url);
+    assert_json_contains(&observation.body, expected_text)
+}
+
 fn reserve_loopback_addr() -> TestResult<String> {
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let addr = listener.local_addr()?;
@@ -411,6 +509,27 @@ fn wait_for_health(client: &Client, base_url: &str, tempod: &mut TempodProcess) 
     }
     tempod.assert_running()?;
     Err("timed out waiting for tempod /health".into())
+}
+
+fn wait_for_ready(client: &Client, base_url: &str, tempod: &mut TempodProcess) -> TestResult {
+    let deadline = Instant::now() + Duration::from_secs(45);
+    while Instant::now() < deadline {
+        tempod.assert_running()?;
+        match get_json(client, base_url, "/ready", Some(AUTH_TOKEN)) {
+            Ok(response)
+                if response.status == StatusCode::OK
+                    && response.body["ready"] == true
+                    && response.body["engine_attached"] == true =>
+            {
+                return Ok(())
+            }
+            Ok(_response) => {}
+            Err(_error) => {}
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    tempod.assert_running()?;
+    Err("timed out waiting for tempod /ready".into())
 }
 
 fn get_json(
@@ -473,4 +592,66 @@ fn assert_json_contains(value: &Value, needle: &str) -> TestResult {
     } else {
         Err(format!("JSON response did not contain {needle:?}: {value}").into())
     }
+}
+
+#[cfg(unix)]
+fn cdp_engine_pid_wrapper(
+    root: &Path,
+    engine_program: &Path,
+    pid_file: &Path,
+) -> TestResult<PathBuf> {
+    let script = root.join("tempo-engined-cdp-wrapper.sh");
+    let body = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$$\" > {}\nexec {} \"$@\"\n",
+        shell_quote(pid_file),
+        shell_quote(engine_program)
+    );
+    fs::write(&script, body)?;
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o700))?;
+    Ok(script)
+}
+
+#[cfg(unix)]
+fn wait_for_engine_pid(
+    pid_file: &Path,
+    previous: Option<u32>,
+    tempod: &mut TempodProcess,
+) -> TestResult<u32> {
+    let deadline = Instant::now() + Duration::from_secs(45);
+    while Instant::now() < deadline {
+        tempod.assert_running()?;
+        if let Ok(text) = fs::read_to_string(pid_file)
+            && let Ok(pid) = text.trim().parse::<u32>()
+            && Some(pid) != previous
+        {
+            return Ok(pid);
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    tempod.assert_running()?;
+    Err(format!(
+        "timed out waiting for engine pid file {}",
+        pid_file.display()
+    )
+    .into())
+}
+
+#[cfg(unix)]
+fn unique_temp_dir(prefix: &str) -> TestResult<PathBuf> {
+    let root = std::env::temp_dir().join(format!(
+        "{prefix}-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0)
+    ));
+    fs::create_dir(&root)?;
+    Ok(root)
+}
+
+#[cfg(unix)]
+fn shell_quote(path: &Path) -> String {
+    let value = path.to_string_lossy();
+    format!("'{}'", value.replace('\'', "'\\''"))
 }

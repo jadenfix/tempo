@@ -3943,12 +3943,14 @@ pub fn run_tempod_with_spawned_engine_config_and_navigation_url_policy(
         None => create_private_engine_control_socket_path()?,
     };
     let mut host_config = EngineHostConfig::new(engine_program)
-        .restart(RestartPolicy::Never)
+        .restart(RestartPolicy::Always {
+            max_restarts: u32::MAX,
+        })
         .control_socket(socket_path.clone());
     for arg in engine_args {
         host_config = host_config.arg(arg);
     }
-    let (_engine_host, engine_server) = EngineHost::spawn_with_ipc(host_config)?;
+    let (engine_host, engine_server) = EngineHost::spawn_with_ipc(host_config)?;
     let engine_connection = engine_server.accept_timeout(Duration::from_secs(30))?;
     let mut pool = SessionPool::from_env().with_navigation_url_policy(url_policy);
     pool.attach_engine_driver(
@@ -3957,6 +3959,13 @@ pub fn run_tempod_with_spawned_engine_config_and_navigation_url_policy(
     )?;
     let pool = Arc::new(Mutex::new(pool));
     spawn_signed_threat_domain_refresh_supervisor_from_env(Arc::clone(&pool));
+    spawn_spawned_engine_liveness_monitor(
+        Arc::clone(&pool),
+        engine,
+        engine_host,
+        engine_server,
+        EngineReconnectPolicy::default(),
+    );
     serve_forever_with_config(listener, pool, config)
 }
 
@@ -3965,6 +3974,99 @@ fn attach_engine_client_from_stream(
 ) -> Result<EngineIpcClient, TempodError> {
     stream.set_write_timeout(Some(ENGINE_IPC_TIMEOUT))?;
     Ok(EngineIpcClient::from_stream(stream))
+}
+
+fn spawn_spawned_engine_liveness_monitor(
+    pool: Arc<Mutex<SessionPool>>,
+    engine: Engine,
+    engine_host: EngineHost,
+    engine_server: tempo_engine_host::EngineIpcServer,
+    policy: EngineReconnectPolicy,
+) {
+    thread::spawn(move || {
+        run_spawned_engine_liveness_monitor(&pool, engine, engine_host, engine_server, policy)
+    });
+}
+
+fn run_spawned_engine_liveness_monitor(
+    pool: &Arc<Mutex<SessionPool>>,
+    engine: Engine,
+    mut engine_host: EngineHost,
+    engine_server: tempo_engine_host::EngineIpcServer,
+    policy: EngineReconnectPolicy,
+) {
+    let mut controller = ReconnectController::new(policy.clone(), Instant::now());
+    loop {
+        thread::sleep(policy.poll_interval);
+        if Arc::strong_count(pool) <= 1 {
+            return;
+        }
+        let dead = match pool.lock() {
+            Ok(guard) => guard.engine_driver_dead(),
+            Err(_) => return,
+        };
+        match controller.on_sample(dead, Instant::now()) {
+            ReconnectAction::Idle => {}
+            ReconnectAction::GiveUp => {
+                log_tempod_warn(
+                    "spawned engine reconnect budget exhausted; leaving engine detached",
+                )
+                .field("issue", "#398")
+                .field("attempts", controller.attempts.to_string())
+                .emit();
+                if let Ok(mut guard) = pool.lock() {
+                    guard.detach_engine_driver();
+                }
+                if let Err(error) = engine_host.kill() {
+                    log_tempod_error(
+                        "failed to kill spawned engine after reconnect give-up",
+                        error,
+                    );
+                }
+                return;
+            }
+            ReconnectAction::Reconnect { backoff } => {
+                let delay = jittered_backoff(backoff, policy.max_backoff, current_time_ns());
+                thread::sleep(delay);
+                match reconnect_spawned_engine(pool, engine, &mut engine_host, &engine_server) {
+                    Ok(()) => {
+                        controller.record_reconnect(Instant::now());
+                        tempo_telemetry::logger()
+                            .event(
+                                tempo_telemetry::Level::Info,
+                                "tempod",
+                                "restarted spawned engine after disconnect",
+                            )
+                            .field("issue", "#398")
+                            .field("attempts", controller.attempts.to_string())
+                            .field("pid", engine_host.pid().to_string())
+                            .emit();
+                    }
+                    Err(error) => {
+                        controller.record_failure();
+                        log_tempod_error("spawned engine reconnect attempt failed", error);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn reconnect_spawned_engine(
+    pool: &Arc<Mutex<SessionPool>>,
+    engine: Engine,
+    engine_host: &mut EngineHost,
+    engine_server: &tempo_engine_host::EngineIpcServer,
+) -> Result<(), TempodError> {
+    if engine_host.try_wait()?.is_none() {
+        engine_host.kill()?;
+    }
+    engine_host.restart_if_exited()?;
+    let connection = engine_server.accept_timeout(Duration::from_secs(30))?;
+    lock_pool(pool)?.attach_engine_driver(
+        engine,
+        attach_engine_client_from_stream(connection.into_inner())?,
+    )
 }
 
 fn create_private_engine_control_socket_path() -> Result<PathBuf, TempodError> {
