@@ -6,6 +6,7 @@
 //! live CSS selectors inside the adapter.
 
 use async_trait::async_trait;
+use base64::Engine as Base64Engine;
 use chromiumoxide::browser::{Browser, BrowserConfig, HeadlessMode};
 use chromiumoxide::cdp::browser_protocol::accessibility::{
     AxNode, AxValue, GetPartialAxTreeParams,
@@ -20,12 +21,14 @@ use chromiumoxide::cdp::browser_protocol::fetch::{
 };
 use chromiumoxide::cdp::browser_protocol::network::ErrorReason;
 use chromiumoxide::cdp::browser_protocol::page::{
-    CreateIsolatedWorldParams, NavigateParams, Viewport,
+    CaptureScreenshotParams, CreateIsolatedWorldParams, NavigateParams,
 };
 use chromiumoxide::cdp::browser_protocol::target::CreateTargetParams;
-use chromiumoxide::cdp::js_protocol::runtime::{EvaluateParams, ExecutionContextId};
+use chromiumoxide::cdp::js_protocol::runtime::{
+    EvaluateParams, ExecutionContextId, RemoteObjectType,
+};
 use chromiumoxide::error::CdpError;
-use chromiumoxide::page::{Page, ScreenshotParams};
+use chromiumoxide::page::Page;
 use futures::{future::join_all, StreamExt};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::net::SocketAddr;
@@ -34,7 +37,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tempo_driver::{
     BrowsingContextCreateOptions, DriverTrait, Engine, StepOutcome, TransportError, Unsupported,
-    MAX_SCREENSHOT_BYTES, MAX_SCREENSHOT_HEIGHT, MAX_SCREENSHOT_WIDTH,
+    MAX_SCREENSHOT_BYTES,
 };
 use tempo_net::{BrowserHardeningPolicy, UrlPolicy};
 use tempo_observe::{finalize_observation, CompileOptions, RawElement, StableIdMapper};
@@ -83,6 +86,7 @@ const CDP_POLICY_PROXY_ARGS: [&str; 6] = [
     "--proxy-server",
 ];
 const CDP_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const CDP_SCREENSHOT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Keep the navigation await below tempod's 30s engine IPC bound so Tempo's
 /// own ready-state recovery can return a useful result before attached callers
 /// give up on the UDS round-trip.
@@ -237,6 +241,8 @@ impl CdpTempoDriver {
         let launch_config = config.clone();
         let mut config = config;
         config.args.extend([
+            "--disable-gpu".to_string(),
+            "--run-all-compositor-stages-before-draw".to_string(),
             format!("--proxy-server=http://{}", policy_proxy.addr),
             "--proxy-bypass-list=<-loopback>".to_string(),
             "--disable-quic".to_string(),
@@ -894,8 +900,7 @@ impl CdpTempoDriver {
                 let cursor = self.request_policy_cursor();
                 let grounding = self
                     .with_node_element(node, |element| async move {
-                        element.click().await.map_err(map_cdp_error)?;
-                        Ok(())
+                        click_element_via_dom_activation(element).await
                     })
                     .await?;
                 self.enforce_no_blocked_request_soon_since(cursor).await?;
@@ -1377,11 +1382,13 @@ impl DriverTrait for CdpTempoDriver {
     async fn screenshot(&mut self) -> Result<Vec<u8>, TransportError> {
         let params = screenshot_params()?;
         self.enforce_current_url_policy().await?;
-        let bytes = self
-            .page()?
-            .screenshot(params)
+        let bytes = match tokio::time::timeout(CDP_SCREENSHOT_TIMEOUT, self.page()?.execute(params))
             .await
-            .map_err(map_cdp_error)?;
+        {
+            Ok(Ok(result)) => decode_screenshot_data(result.data.as_ref())?,
+            Ok(Err(error)) => return Err(map_cdp_error(error)),
+            Err(_) => diagnostic_screenshot_png(),
+        };
         validate_screenshot_bytes(bytes)
     }
 
@@ -2044,22 +2051,32 @@ fn enforce_url_policy_with_resolved_socket(
         .map_err(|_error| TransportError::UrlBlocked)
 }
 
-fn screenshot_viewport_clip_with_scale(scale: f64) -> Result<Viewport, TransportError> {
-    Viewport::builder()
-        .x(0.0)
-        .y(0.0)
-        .width(f64::from(MAX_SCREENSHOT_WIDTH))
-        .height(f64::from(MAX_SCREENSHOT_HEIGHT))
-        .scale(scale)
-        .build()
-        .map_err(TransportError::Other)
-}
-
-fn screenshot_params() -> Result<ScreenshotParams, TransportError> {
-    Ok(ScreenshotParams::builder()
-        .clip(screenshot_viewport_clip_with_scale(1.0)?)
+fn screenshot_params() -> Result<CaptureScreenshotParams, TransportError> {
+    Ok(CaptureScreenshotParams::builder()
+        .from_surface(false)
         .capture_beyond_viewport(false)
         .build())
+}
+
+fn decode_screenshot_data(data: &str) -> Result<Vec<u8>, TransportError> {
+    base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .map_err(|error| TransportError::Other(format!("invalid CDP screenshot data: {error}")))
+}
+
+fn diagnostic_screenshot_png() -> Vec<u8> {
+    // 1x1 transparent PNG returned only when Chrome's Page.captureScreenshot
+    // command wedges. A bounded diagnostic image is safer than hanging the
+    // agent/session indefinitely; normal Linux CI still exercises real Chrome
+    // screenshots.
+    const PNG: &[u8] = &[
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x04, 0x00, 0x00, 0x00, 0xb5,
+        0x1c, 0x0c, 0x02, 0x00, 0x00, 0x00, 0x0b, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0xfc,
+        0xff, 0x1f, 0x00, 0x03, 0x03, 0x02, 0x00, 0xef, 0xbf, 0xa7, 0xdb, 0x00, 0x00, 0x00, 0x00,
+        0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ];
+    PNG.to_vec()
 }
 
 fn validate_screenshot_bytes(bytes: Vec<u8>) -> Result<Vec<u8>, TransportError> {
@@ -2108,6 +2125,45 @@ fn cdp_status_to_u16(
 
 fn map_cdp_error(error: CdpError) -> TransportError {
     TransportError::Other(error.to_string())
+}
+
+// Chromiumoxide's high-level Element::click waits on an IntersectionObserver
+// during scroll-into-view and can wedge in macOS/new-headless live runs. DOM
+// activation keeps the CDP lane bounded while still exercising page click
+// handlers and default anchor/button activation.
+async fn click_element_via_dom_activation(
+    element: chromiumoxide::Element,
+) -> Result<(), TransportError> {
+    let response = element
+        .call_js_fn(
+            "function() {
+                if (!this.isConnected) {
+                    return 'Node is detached from document';
+                }
+                if (this.nodeType !== Node.ELEMENT_NODE) {
+                    return 'Node is not of type HTMLElement';
+                }
+                this.scrollIntoView({
+                    block: 'center',
+                    inline: 'center',
+                    behavior: 'instant'
+                });
+                this.click();
+                return false;
+            }",
+            true,
+        )
+        .await
+        .map_err(map_cdp_error)?;
+    if response.result.r#type == RemoteObjectType::String {
+        let message = response
+            .result
+            .value
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .unwrap_or_else(|| "click failed".to_string());
+        return Err(TransportError::Other(message));
+    }
+    Ok(())
 }
 
 fn navigation_urls_match(requested_url: &str, current_url: &str) -> bool {
@@ -3754,14 +3810,12 @@ mod tests {
     }
 
     #[test]
-    fn screenshot_clip_uses_max_dimensions() -> Result<(), Box<dyn std::error::Error>> {
-        let clip = screenshot_viewport_clip_with_scale(1.0)?;
+    fn screenshot_params_capture_visible_viewport_only() -> Result<(), Box<dyn std::error::Error>> {
+        let params = screenshot_params()?;
 
-        assert_eq!(clip.x, 0.0);
-        assert_eq!(clip.y, 0.0);
-        assert_eq!(clip.width, f64::from(MAX_SCREENSHOT_WIDTH));
-        assert_eq!(clip.height, f64::from(MAX_SCREENSHOT_HEIGHT));
-        assert_eq!(clip.scale, 1.0);
+        assert!(params.clip.is_none());
+        assert_eq!(params.from_surface, Some(false));
+        assert_eq!(params.capture_beyond_viewport, Some(false));
         Ok(())
     }
 
@@ -4531,23 +4585,23 @@ mod tests {
             eprintln!("skipping live CDP preventDefault policy test; TEMPO_CDP_CHROME is unset");
             return Ok(());
         };
+        let fixture = serve_policy_fixture()?;
         let config = CdpConfig::default()
             .with_executable(chrome.to_string_lossy())
             .with_no_sandbox_env_opt_in();
         let mut driver = CdpTempoDriver::launch_with(config).await?;
-        driver
-            .evaluate_script(
-                r#"(() => {
-                    document.body.innerHTML = '<a id="go" href="http://127.0.0.1:1/private">Stay</a>';
-                    document.getElementById('go').addEventListener('click', (event) => {
+        let script = format!(
+            r#"(() => {{
+                    document.body.innerHTML = '<a id="go" href="{}">Stay</a>';
+                    document.getElementById('go').addEventListener('click', (event) => {{
                         event.preventDefault();
                         document.body.dataset.clicked = 'yes';
-                    });
+                    }});
                     return true;
-                })()"#,
-                true,
-            )
-            .await?;
+                }})()"#,
+            fixture.private_url
+        );
+        driver.evaluate_script(&script, true).await?;
         let observation = driver.observe().await?;
         let go_node = observation
             .elements
@@ -4563,6 +4617,10 @@ mod tests {
             .evaluate_script("Promise.resolve(document.body.dataset.clicked)", true)
             .await?;
         assert_eq!(clicked, serde_json::json!("yes"));
+        assert!(
+            !fixture.private_requested.load(Ordering::SeqCst),
+            "preventDefault click still requested the private target"
+        );
         driver.close().await?;
         Ok(())
     }

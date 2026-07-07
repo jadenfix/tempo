@@ -8533,6 +8533,7 @@ name = "tempo-engine-cdp"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64",
  "chromiumoxide",
  "futures",
  "serde_json",
