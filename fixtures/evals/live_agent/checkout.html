@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Tempo live agent checkout fixture</title>
+    <style>
+      body {
+        font-family: system-ui, sans-serif;
+        margin: 2rem;
+        max-width: 48rem;
+      }
+      label, button {
+        display: block;
+        margin-top: 1rem;
+      }
+      .checkbox {
+        border: 1px solid #555;
+        display: inline-block;
+        padding: 0.35rem 0.6rem;
+      }
+      #status {
+        margin-top: 1.5rem;
+        font-weight: 700;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Checkout</h1>
+      <p>Complete the order using the agent-controlled form.</p>
+      <label>
+        Email
+        <input id="email" name="email" type="email" autocomplete="off">
+      </label>
+      <button id="remember" type="button" role="checkbox" aria-checked="false">
+        Remember me
+      </button>
+      <button id="pay" type="button">Pay now</button>
+      <p id="status" role="status">Waiting</p>
+    </main>
+    <script>
+      const remember = document.querySelector("#remember");
+      const status = document.querySelector("#status");
+      remember.addEventListener("click", () => {
+        const next = remember.getAttribute("aria-checked") !== "true";
+        remember.setAttribute("aria-checked", String(next));
+      });
+      document.querySelector("#pay").addEventListener("click", () => {
+        const email = document.querySelector("#email").value.trim();
+        if (email && remember.getAttribute("aria-checked") === "true") {
+          status.textContent = "Order submitted";
+          status.dataset.done = "true";
+        } else {
+          status.textContent = "Missing details";
+          status.dataset.done = "false";
+        }
+      });
+    </script>
+  </body>
+</html>

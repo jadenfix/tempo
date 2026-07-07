@@ -1,0 +1,15 @@
+[
+  {
+    "kind": "type",
+    "node": "#email",
+    "text": "agent@example.com"
+  },
+  {
+    "kind": "click",
+    "node": "#remember"
+  },
+  {
+    "kind": "click",
+    "node": "#pay"
+  }
+]

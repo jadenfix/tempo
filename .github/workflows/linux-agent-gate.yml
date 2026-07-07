@@ -1,0 +1,27 @@
+name: linux-agent-gate
+
+on:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "53 10 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  docker-smoke-amd64:
+    name: Docker Linux agent smoke (amd64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      TEMPO_LINUX_AGENT_PLATFORM: linux/amd64
+      TEMPO_LINUX_AGENT_REQUIRE_LIVE_CDP: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show Docker runtime
+        run: |
+          docker version
+          docker info
+      - name: Run Linux agent gate
+        run: scripts/linux-agent-gate.sh --smoke

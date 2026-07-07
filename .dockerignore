@@ -1,0 +1,7 @@
+.git
+.local
+target
+**/*.rs.bk
+.DS_Store
+*.db
+*.sqlite
