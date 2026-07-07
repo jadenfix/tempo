@@ -7,12 +7,15 @@ The harness drives the same checkout task through:
 
 - Tempo CDP via `tempo-cli run-cdp-task`.
 - Raw Chrome CDP selector actions.
-- A Playwright-MCP-style accessibility snapshot path, captured from Chrome's
-  live Accessibility domain.
-- A browser-use-style DOM serializer path, captured from the live page DOM.
+- A synthetic Playwright-MCP-style accessibility snapshot path, captured from
+  Chrome's live Accessibility domain.
+- A synthetic browser-use-style DOM serializer path, captured from the live page
+  DOM.
 
 The generated benchmark artifact records success, wall time, CPU time, max RSS,
 step count, retry count, failure mode, and model-facing bytes/tokens for each
-runner. It also emits Tempo `session-eval`, `replay`, `scorecard`, and `amdahl`
-artifacts from the real journal so benchmark runs stay tied to durable agent
-evidence.
+runner. `--full` repeats the case five times by default and writes
+`agent-browser-bench-summary.json` with per-runner success rate, failure-mode
+counts, retry totals, and p50/p95/max stats. It also emits Tempo
+`session-eval`, `replay`, `scorecard`, and `amdahl` artifacts from the real
+journal so benchmark runs stay tied to durable agent evidence.

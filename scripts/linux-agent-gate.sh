@@ -112,7 +112,18 @@ docker run --rm \
       kill \"\$chromium_pid\" >/dev/null 2>&1 || true
       wait \"\$chromium_pid\" >/dev/null 2>&1 || true
       TEMPO_CDP_CHROME=/usr/bin/chromium scripts/test-live-cdp.sh ${INNER_MODE}
-      TEMPO_CDP_CHROME=/usr/bin/chromium scripts/agent-browser-bench.sh --smoke --output-dir /tmp/tempo-agent-browser-bench
+      BENCH_OUT=/work/target/linux-agent-gate/agent-browser-bench
+      TEMPO_CDP_CHROME=/usr/bin/chromium scripts/agent-browser-bench.sh \
+        --smoke \
+        --min-success-rate 1 \
+        --output-dir \"\$BENCH_OUT\"
+      test -s \"\$BENCH_OUT/agent-browser-bench.json\"
+      test -s \"\$BENCH_OUT/agent-browser-bench.jsonl\"
+      test -s \"\$BENCH_OUT/agent-browser-bench-summary.json\"
+      test -s \"\$BENCH_OUT/tempo-journal.sqlite\"
+      test -s \"\$BENCH_OUT/replay.json\"
+      test -s \"\$BENCH_OUT/scorecard.json\"
+      test -s \"\$BENCH_OUT/amdahl.json\"
     else
       wait \"\$chromium_pid\" >/dev/null 2>&1 || true
       echo \"warning: skipping Docker live-CDP smoke because container Chromium did not launch on ${PLATFORM}\" >&2

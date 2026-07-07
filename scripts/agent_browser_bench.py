@@ -536,6 +536,7 @@ def clean_output_dir(output_dir: Path) -> None:
     for name in [
         "agent-browser-bench.json",
         "agent-browser-bench.jsonl",
+        "agent-browser-bench-summary.json",
         "amdahl.json",
         "eval-records.jsonl",
         "replay.json",
@@ -550,6 +551,80 @@ def clean_output_dir(output_dir: Path) -> None:
         path = output_dir / name
         if path.exists():
             path.unlink()
+
+
+def percentile(values: list[int], pct: float) -> int:
+    if not values:
+        return 0
+    values = sorted(values)
+    if len(values) == 1:
+        return values[0]
+    index = round((len(values) - 1) * pct)
+    return values[max(0, min(index, len(values) - 1))]
+
+
+def summarize_metrics(metrics: list[dict]) -> dict:
+    runners = sorted({str(metric["runner"]) for metric in metrics})
+    summary = {}
+    for runner in runners:
+        runner_metrics = [metric for metric in metrics if metric["runner"] == runner]
+        successes = [metric for metric in runner_metrics if metric["success"]]
+        failure_modes: dict[str, int] = {}
+        for metric in runner_metrics:
+            mode = metric.get("failure_mode")
+            if mode:
+                failure_modes[str(mode)] = failure_modes.get(str(mode), 0) + 1
+        summary[runner] = {
+            "runs": len(runner_metrics),
+            "successes": len(successes),
+            "success_rate": len(successes) / len(runner_metrics) if runner_metrics else 0.0,
+            "failure_modes": failure_modes,
+            "wall_clock_ms": summarize_int_field(runner_metrics, "wall_clock_ms"),
+            "cpu_user_ms": summarize_int_field(runner_metrics, "cpu_user_ms"),
+            "cpu_system_ms": summarize_int_field(runner_metrics, "cpu_system_ms"),
+            "max_rss_bytes": summarize_int_field(runner_metrics, "max_rss_bytes"),
+            "model_input_bytes": summarize_int_field(runner_metrics, "model_input_bytes"),
+            "model_input_tokens": summarize_int_field(runner_metrics, "model_input_tokens"),
+            "step_count": summarize_int_field(runner_metrics, "step_count"),
+            "retry_count_total": sum(int(metric.get("retry_count", 0)) for metric in runner_metrics),
+        }
+    return summary
+
+
+def validate_summary(summary: dict, args: argparse.Namespace) -> list[str]:
+    violations = []
+    for runner, runner_summary in summary.items():
+        success_rate = float(runner_summary["success_rate"])
+        if args.min_success_rate is not None and success_rate < args.min_success_rate:
+            violations.append(
+                f"{runner}: success_rate {success_rate:.3f} < {args.min_success_rate:.3f}"
+            )
+        wall_p95 = int(runner_summary["wall_clock_ms"]["p95"])
+        if args.max_p95_wall_ms is not None and wall_p95 > args.max_p95_wall_ms:
+            violations.append(f"{runner}: wall_clock_ms.p95 {wall_p95} > {args.max_p95_wall_ms}")
+        tokens_p95 = int(runner_summary["model_input_tokens"]["p95"])
+        if (
+            args.max_p95_model_input_tokens is not None
+            and tokens_p95 > args.max_p95_model_input_tokens
+        ):
+            violations.append(
+                f"{runner}: model_input_tokens.p95 {tokens_p95} > "
+                f"{args.max_p95_model_input_tokens}"
+            )
+        rss_p95 = int(runner_summary["max_rss_bytes"]["p95"])
+        if args.max_p95_rss_bytes is not None and rss_p95 > args.max_p95_rss_bytes:
+            violations.append(f"{runner}: max_rss_bytes.p95 {rss_p95} > {args.max_p95_rss_bytes}")
+    return violations
+
+
+def summarize_int_field(metrics: list[dict], field: str) -> dict:
+    values = [int(metric.get(field, 0)) for metric in metrics]
+    return {
+        "min": min(values) if values else 0,
+        "p50": percentile(values, 0.50),
+        "p95": percentile(values, 0.95),
+        "max": max(values) if values else 0,
+    }
 
 
 def derive_artifacts(output_dir: Path, metrics: list[dict], url: str) -> None:
@@ -625,27 +700,51 @@ def derive_artifacts(output_dir: Path, metrics: list[dict], url: str) -> None:
         ],
         env,
     )
-    run_checked(
-        [
-            "cargo",
-            "run",
-            "-p",
-            "tempo-cli",
-            "--",
-            "amdahl",
-            "--input",
-            str(records),
-            "--output",
-            str(output_dir / "amdahl.json"),
-        ],
-        env,
-    )
+    write_json(output_dir / "amdahl.json", amdahl_summary(metrics))
+
+
+def amdahl_summary(metrics: list[dict]) -> dict:
+    baseline = next((metric for metric in metrics if metric["runner"] == "raw-chrome-cdp"), None)
+    baseline_wall_ms = int(baseline["wall_clock_ms"]) if baseline else 0
+    rows = []
+    for metric in metrics:
+        wall_ms = int(metric.get("wall_clock_ms", 0))
+        rows.append(
+            {
+                "runner": metric["runner"],
+                "wall_clock_ms": wall_ms,
+                "baseline_wall_clock_ms": baseline_wall_ms,
+                "relative_wall_clock": (
+                    wall_ms / baseline_wall_ms if baseline_wall_ms > 0 else None
+                ),
+                "agent_overhead_ms": wall_ms - baseline_wall_ms if baseline_wall_ms > 0 else None,
+                "model_input_tokens": int(metric.get("model_input_tokens", 0)),
+                "success": bool(metric.get("success")),
+            }
+        )
+    return {
+        "suite": SUITE,
+        "case_id": CASE_ID,
+        "baseline_runner": "raw-chrome-cdp",
+        "baseline_wall_clock_ms": baseline_wall_ms,
+        "rows": rows,
+    }
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--full", action="store_true")
+    parser.add_argument(
+        "--iterations",
+        type=int,
+        default=None,
+        help="number of benchmark iterations; defaults to 1 for smoke and 5 for --full",
+    )
+    parser.add_argument("--min-success-rate", type=float, default=None)
+    parser.add_argument("--max-p95-wall-ms", type=int, default=None)
+    parser.add_argument("--max-p95-model-input-tokens", type=int, default=None)
+    parser.add_argument("--max-p95-rss-bytes", type=int, default=None)
     parser.add_argument("--chrome", required=True)
     parser.add_argument("--output-dir", required=True)
     args = parser.parse_args()
@@ -655,19 +754,43 @@ def main() -> int:
 
     output_dir = Path(args.output_dir)
     clean_output_dir(output_dir)
+    iterations = args.iterations if args.iterations is not None else (5 if args.full else 1)
+    if iterations < 1:
+        raise RuntimeError("--iterations must be >= 1")
 
     with StaticServer(FIXTURE_DIR) as server:
         url = f"{server.base_url}/checkout.html"
-        metrics = [
-            run_tempo(url, args.chrome, output_dir),
-            run_cdp_baseline(args.chrome, url, "raw-chrome-cdp", None),
-            run_cdp_baseline(args.chrome, url, "playwright-style-ax", "ax"),
-            run_cdp_baseline(args.chrome, url, "browser-use-style-dom", "browser_use_dom"),
-        ]
-        write_json(output_dir / "agent-browser-bench.json", {"url": url, "metrics": metrics})
+        metrics = []
+        for iteration in range(1, iterations + 1):
+            iteration_dir = output_dir if iterations == 1 else output_dir / f"iteration-{iteration:03d}"
+            clean_output_dir(iteration_dir)
+            iteration_metrics = [
+                run_tempo(url, args.chrome, iteration_dir),
+                run_cdp_baseline(args.chrome, url, "raw-chrome-cdp", None),
+                run_cdp_baseline(args.chrome, url, "synthetic-playwright-ax", "ax"),
+                run_cdp_baseline(args.chrome, url, "synthetic-browser-use-dom", "browser_use_dom"),
+            ]
+            for metric in iteration_metrics:
+                metric["iteration"] = iteration
+            write_json(
+                iteration_dir / "agent-browser-bench.json",
+                {"url": url, "iteration": iteration, "metrics": iteration_metrics},
+            )
+            write_jsonl(iteration_dir / "agent-browser-bench.jsonl", iteration_metrics)
+            derive_artifacts(iteration_dir, iteration_metrics, url)
+            metrics.extend(iteration_metrics)
+        summary = summarize_metrics(metrics)
+        write_json(
+            output_dir / "agent-browser-bench.json",
+            {"url": url, "iterations": iterations, "metrics": metrics, "summary": summary},
+        )
         write_jsonl(output_dir / "agent-browser-bench.jsonl", metrics)
-        derive_artifacts(output_dir, metrics, url)
+        write_json(output_dir / "agent-browser-bench-summary.json", summary)
 
+    violations = validate_summary(summary, args)
+    if violations:
+        print(json.dumps({"violations": violations}, indent=2), file=sys.stderr)
+        return 1
     failures = [metric for metric in metrics if not metric["success"]]
     if failures:
         print(json.dumps({"failed": failures}, indent=2), file=sys.stderr)

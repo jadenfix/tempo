@@ -6,6 +6,8 @@ cd "$ROOT"
 
 MODE="--full"
 OUTPUT_DIR="${TEMPO_AGENT_BENCH_OUTPUT_DIR:-target/agent-browser-bench}"
+ITERATIONS=()
+GATES=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -17,13 +19,21 @@ while [[ $# -gt 0 ]]; do
       OUTPUT_DIR="$2"
       shift 2
       ;;
+    --iterations)
+      ITERATIONS=(--iterations "$2")
+      shift 2
+      ;;
+    --min-success-rate | --max-p95-wall-ms | --max-p95-model-input-tokens | --max-p95-rss-bytes)
+      GATES+=("$1" "$2")
+      shift 2
+      ;;
     -h | --help)
-      echo "usage: scripts/agent-browser-bench.sh [--smoke|--full] [--output-dir PATH]" >&2
+      echo "usage: scripts/agent-browser-bench.sh [--smoke|--full] [--iterations N] [--min-success-rate N] [--max-p95-wall-ms N] [--max-p95-model-input-tokens N] [--max-p95-rss-bytes N] [--output-dir PATH]" >&2
       exit 0
       ;;
     *)
       echo "unknown argument: $1" >&2
-      echo "usage: scripts/agent-browser-bench.sh [--smoke|--full] [--output-dir PATH]" >&2
+      echo "usage: scripts/agent-browser-bench.sh [--smoke|--full] [--iterations N] [--min-success-rate N] [--max-p95-wall-ms N] [--max-p95-model-input-tokens N] [--max-p95-rss-bytes N] [--output-dir PATH]" >&2
       exit 2
       ;;
   esac
@@ -44,5 +54,7 @@ export TEMPO_DURABLE_RETENTION="${TEMPO_DURABLE_RETENTION:-plaintext-unsafe}"
 
 python3 scripts/agent_browser_bench.py \
   "$MODE" \
+  "${ITERATIONS[@]}" \
+  "${GATES[@]}" \
   --chrome "$TEMPO_CDP_CHROME" \
   --output-dir "$OUTPUT_DIR"

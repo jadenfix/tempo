@@ -25,3 +25,10 @@ jobs:
           docker info
       - name: Run Linux agent gate
         run: scripts/linux-agent-gate.sh --smoke
+      - name: Upload agent browser benchmark artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-agent-browser-bench
+          path: target/linux-agent-gate/agent-browser-bench
+          if-no-files-found: warn
