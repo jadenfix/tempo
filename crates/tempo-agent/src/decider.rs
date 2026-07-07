@@ -1652,14 +1652,10 @@ fn decided_transport_error(
     }
 }
 
-fn action_terminates_sequence(action: &Action) -> bool {
-    matches!(action, Action::Goto { .. }) || action.side_effect() >= SideEffect::Send
-}
-
 fn sanitize_decided_actions(actions: Vec<Action>) -> Vec<Action> {
     let mut sanitized = Vec::new();
     for action in actions.into_iter().take(MAX_DECIDED_BATCH_ACTIONS) {
-        let terminates = action_terminates_sequence(&action);
+        let terminates = action.terminates_sequence();
         sanitized.push(action);
         if terminates {
             break;

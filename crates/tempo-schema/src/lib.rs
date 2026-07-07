@@ -430,6 +430,16 @@ impl Action {
             Action::Skill { .. } => SideEffect::Write,
         }
     }
+
+    /// Whether executing this action should stop a queued multi-action sequence.
+    ///
+    /// Navigation changes the page identity, and Send-or-stronger side effects
+    /// cross a user-visible boundary. Callers may execute the terminal action,
+    /// then must discard any later queued actions and re-plan from the next
+    /// observation.
+    pub fn terminates_sequence(&self) -> bool {
+        matches!(self, Action::Goto { .. }) || self.side_effect() >= SideEffect::Send
+    }
 }
 
 /// Step status preserved when converting beater `StepTriple`s into tempo's schema layer.
@@ -1623,6 +1633,28 @@ mod tests {
     fn side_effect_ordering_holds() {
         assert!(SideEffect::Read < SideEffect::Send);
         assert!(SideEffect::Send < SideEffect::Delete);
+    }
+
+    #[test]
+    fn action_terminates_sequence_for_navigation_and_send_or_stronger_effects() {
+        assert!(Action::Goto {
+            url: "https://example.test".into(),
+        }
+        .terminates_sequence());
+        assert!(!Action::Click {
+            node: NodeId("save".into()),
+        }
+        .terminates_sequence());
+        assert!(!Action::Type {
+            node: NodeId("email".into()),
+            text: "hello".into(),
+        }
+        .terminates_sequence());
+        assert!(!Action::Skill {
+            name: "draft-note".into(),
+            input: serde_json::json!({}),
+        }
+        .terminates_sequence());
     }
 
     #[test]

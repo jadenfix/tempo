@@ -1087,8 +1087,38 @@ impl CdpTempoDriver {
         &mut self,
         node: &NodeId,
     ) -> Result<Option<String>, TransportError> {
-        let _ = self.record_current_observation().await?;
-        Ok(self.selectors_by_node.get(node).cloned())
+        let previous = self.history.values().rev().find_map(|observation| {
+            observation
+                .elements
+                .iter()
+                .find(|element| &element.node_id == node)
+                .cloned()
+        });
+        let observation = self.record_current_observation().await?;
+        if let Some(selector) = self.selectors_by_node.get(node).cloned() {
+            return Ok(Some(selector));
+        }
+
+        let Some(previous) = previous else {
+            return Ok(None);
+        };
+        let mut matched_nodes = observation
+            .elements
+            .iter()
+            .filter(|element| same_action_identity(&previous, element))
+            .map(|element| element.node_id.clone())
+            .collect::<Vec<_>>();
+        matched_nodes.sort();
+        matched_nodes.dedup();
+        let [matched_node] = matched_nodes.as_slice() else {
+            return Ok(None);
+        };
+        let selector = self.selectors_by_node.get(matched_node).cloned();
+        if let Some(selector) = selector.as_ref() {
+            self.selectors_by_node
+                .insert(node.clone(), selector.clone());
+        }
+        Ok(selector)
     }
 
     async fn resolve_node_action_element(
@@ -1277,6 +1307,24 @@ impl CdpTempoDriver {
             Action::Skill { name, .. } => Ok(StepOutcome::StepError {
                 reason: format!("skill action {name:?} is handled by tempo-skills, not CDP"),
             }),
+        }
+    }
+
+    async fn settle_batch_action(
+        &mut self,
+        quiescence: QuiescencePolicy,
+    ) -> Result<Arc<CompiledObservation>, TransportError> {
+        match quiescence {
+            QuiescencePolicy::FixedMillis(millis) => {
+                let cursor = self.request_policy_cursor();
+                tokio::time::sleep(Duration::from_millis(millis)).await;
+                self.enforce_no_blocked_request_soon_since(cursor).await?;
+                self.record_current_observation_since(cursor).await
+            }
+            QuiescencePolicy::Composite => {
+                self.wait_for_composite_quiescence().await?;
+                self.record_current_observation().await
+            }
         }
     }
 
@@ -1577,39 +1625,39 @@ impl DriverTrait for CdpTempoDriver {
 
     async fn act_batch(&mut self, batch: &ActionBatch) -> Result<StepOutcome, TransportError> {
         let batch_base_seq = self.seq;
+        if batch.actions.is_empty() {
+            let compiled = self.settle_batch_action(batch.quiescence).await?;
+            return Ok(StepOutcome::Applied {
+                diff: diff_from_base(
+                    history_base(&self.history, batch_base_seq),
+                    compiled.as_ref(),
+                    batch_base_seq,
+                ),
+            });
+        }
+
+        let mut settled = None;
         for action in &batch.actions {
             let outcome = self.run_one(action).await?;
             if matches!(outcome, StepOutcome::StepError { .. }) {
                 return Ok(outcome);
             }
+
+            settled = Some(self.settle_batch_action(batch.quiescence).await?);
+            if action.terminates_sequence() {
+                break;
+            }
         }
 
-        match batch.quiescence {
-            QuiescencePolicy::FixedMillis(millis) => {
-                let cursor = self.request_policy_cursor();
-                tokio::time::sleep(Duration::from_millis(millis)).await;
-                self.enforce_no_blocked_request_soon_since(cursor).await?;
-                let compiled = self.record_current_observation_since(cursor).await?;
-                Ok(StepOutcome::Applied {
-                    diff: diff_from_base(
-                        history_base(&self.history, batch_base_seq),
-                        compiled.as_ref(),
-                        batch_base_seq,
-                    ),
-                })
-            }
-            QuiescencePolicy::Composite => {
-                self.wait_for_composite_quiescence().await?;
-                let compiled = self.record_current_observation().await?;
-                Ok(StepOutcome::Applied {
-                    diff: diff_from_base(
-                        history_base(&self.history, batch_base_seq),
-                        compiled.as_ref(),
-                        batch_base_seq,
-                    ),
-                })
-            }
-        }
+        let compiled =
+            settled.ok_or_else(|| TransportError::Other("batch produced no observation".into()))?;
+        Ok(StepOutcome::Applied {
+            diff: diff_from_base(
+                history_base(&self.history, batch_base_seq),
+                compiled.as_ref(),
+                batch_base_seq,
+            ),
+        })
     }
 
     async fn fork(&mut self) -> Result<Box<dyn DriverTrait>, Unsupported> {
@@ -2638,6 +2686,23 @@ fn selector_or_legacy_fallback(
             Some(node.0.clone())
         }
     })
+}
+
+fn same_action_identity(left: &InteractiveElement, right: &InteractiveElement) -> bool {
+    left.role == right.role
+        && taint_text(&left.name) == taint_text(&right.name)
+        && taint_text(&left.value) == taint_text(&right.value)
+}
+
+fn taint_text(spans: &[TaintSpan]) -> String {
+    let mut text = String::new();
+    for span in spans {
+        if !text.is_empty() {
+            text.push('\x1f');
+        }
+        text.push_str(&span.text);
+    }
+    text
 }
 
 fn extraction_found(value: &serde_json::Value) -> bool {
@@ -6243,6 +6308,85 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn live_cdp_act_batch_regrounds_between_subactions(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(chrome) = live_cdp_chrome_executable() else {
+            eprintln!("skipping live CDP act_batch regrounding test; TEMPO_CDP_CHROME is unset");
+            return Ok(());
+        };
+        let url = serve_act_batch_regrounding_fixture()?;
+        let config = CdpConfig::default()
+            .with_executable(chrome)
+            .with_no_sandbox_env_opt_in();
+        let mut driver = CdpTempoDriver::launch_with(config)
+            .await?
+            .allow_private_network_access();
+
+        let observation = driver.goto(&url).await?;
+        let reveal_node = observation
+            .elements
+            .iter()
+            .find(|element| {
+                element.role == "button"
+                    && element.name.first().map(|span| span.text.as_str()) == Some("Reveal Later")
+            })
+            .map(|element| element.node_id.clone())
+            .ok_or_else(|| std::io::Error::other("missing reveal button"))?;
+        let target_node = observation
+            .elements
+            .iter()
+            .find(|element| {
+                element.role == "button"
+                    && element.name.first().map(|span| span.text.as_str()) == Some("Target")
+            })
+            .map(|element| element.node_id.clone())
+            .ok_or_else(|| std::io::Error::other("missing target button"))?;
+
+        let outcome = driver
+            .act_batch(&ActionBatch {
+                actions: vec![
+                    Action::Click { node: reveal_node },
+                    Action::Click { node: target_node },
+                ],
+                quiescence: QuiescencePolicy::FixedMillis(80),
+            })
+            .await?;
+        if !matches!(outcome, StepOutcome::Applied { .. }) {
+            let html = driver
+                .evaluate_script("Promise.resolve(document.body.innerHTML)", true)
+                .await?;
+            let observed = driver.observe().await?;
+            let names: Vec<_> = observed
+                .elements
+                .iter()
+                .map(|element| {
+                    let name = element
+                        .name
+                        .iter()
+                        .map(|span| span.text.as_str())
+                        .collect::<String>();
+                    format!("{}:{}:{}", element.node_id.0, element.role, name)
+                })
+                .collect();
+            panic!("unexpected act_batch outcome: {outcome:?}; html={html:?}; names={names:?}");
+        }
+
+        assert_eq!(
+            driver
+                .evaluate_script(
+                    "Promise.resolve(document.body.dataset.target ?? 'unset')",
+                    true
+                )
+                .await?,
+            serde_json::json!("new"),
+            "act_batch must settle and refresh NodeId grounding before the next sub-action"
+        );
+
+        driver.close().await?;
+        Ok(())
+    }
+
     fn serve_fixture() -> Result<String, std::io::Error> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let addr = listener.local_addr()?;
@@ -6256,6 +6400,47 @@ mod tests {
                     </button>
                     <label for="email">Email Address</label>
                     <input id="email" value="me@example.com">
+                  </body>
+                </html>"#;
+            for stream in listener.incoming().take(16) {
+                let Ok(mut stream) = stream else {
+                    continue;
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+
+        Ok(format!("http://{addr}/"))
+    }
+
+    fn serve_act_batch_regrounding_fixture() -> Result<String, std::io::Error> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+
+        std::thread::spawn(move || {
+            let body = r#"<!doctype html>
+                <html>
+                  <body>
+                    <button id="reveal">
+                      <span>Reveal Later</span>
+                    </button>
+                    <button id="target" onclick="document.body.dataset.target='old'">
+                      <span>Target</span>
+                    </button>
+                    <script>
+                      document.getElementById('reveal').addEventListener('click', () => {
+                        setTimeout(() => {
+                          document.getElementById('target').outerHTML =
+                            `<button id="target-new" onclick="document.body.dataset.target='new'"><span>Target</span></button>`;
+                        }, 30);
+                      });
+                    </script>
                   </body>
                 </html>"#;
             for stream in listener.incoming().take(16) {
