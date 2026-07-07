@@ -1123,6 +1123,7 @@ impl SessionPool {
     /// behavior when configured protection cannot load, and
     /// `TEMPO_THREAT_DOMAIN_AUDIT_JSONL` persists count-only feed-load audit
     /// records.
+    #[allow(clippy::too_many_arguments)]
     fn from_env_values(
         jsonl: Option<std::ffi::OsString>,
         endpoint: Option<std::ffi::OsString>,
@@ -1351,6 +1352,7 @@ impl SessionPool {
         Ok(snapshot.audit)
     }
 
+    #[cfg(test)]
     fn refresh_signed_threat_domain_policy_once(
         &mut self,
         trusted_public_keys: &mut BTreeMap<String, String>,
@@ -1447,14 +1449,14 @@ impl SessionPool {
         human_takeover: Option<HumanTakeover>,
     ) {
         let human_driven = human_takeover.is_some();
-        if let Some(takeover) = human_takeover {
-            if let Err(error) = self.record_human_takeover(id, takeover) {
-                log_tempod_warn("failed to record human takeover")
-                    .field("session_id", id.0.clone())
-                    .field("url", observation.url.clone())
-                    .field("error", error.to_string())
-                    .emit();
-            }
+        if let Some(takeover) = human_takeover
+            && let Err(error) = self.record_human_takeover(id, takeover)
+        {
+            log_tempod_warn("failed to record human takeover")
+                .field("session_id", id.0.clone())
+                .field("url", observation.url.clone())
+                .field("error", error.to_string())
+                .emit();
         }
         if let Err(error) = self
             .identity_strategy_table
@@ -2671,6 +2673,7 @@ fn write_signed_threat_domain_cache(
     write_threat_domain_cache(feed_path, feed_contents)
 }
 
+#[cfg(test)]
 fn read_signed_threat_domain_cache(
     metadata_path: &Path,
     feed_path: &Path,
@@ -2728,6 +2731,7 @@ struct VerifiedThreatDomainPolicySnapshot {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg(test)]
 struct SignedThreatDomainRefreshResult {
     audit: ThreatDomainProviderAudit,
     metadata: VerifiedThreatDomainMetadata,
@@ -3214,6 +3218,7 @@ fn read_threat_domain_cache(
     verify_threat_domain_feed_sha256(contents, expected_sha256)
 }
 
+#[cfg(test)]
 fn read_owner_only_text_file(path: &Path) -> Result<String, String> {
     validate_owner_only_cache_file(path)?;
     std::fs::read_to_string(path).map_err(|error| format!("failed to read cache: {error}"))
@@ -7148,6 +7153,13 @@ mod tests {
 
     type TestResult = Result<(), Box<dyn Error>>;
 
+    fn expect_test_err<T, E>(result: Result<T, E>, message: &str) -> E {
+        match result {
+            Ok(_) => panic!("{message}"),
+            Err(error) => error,
+        }
+    }
+
     // RFC 6455 opcodes used by the raw-socket WebSocket test client.
     const WS_OPCODE_TEXT: u8 = 0x1;
     const WS_OPCODE_CLOSE: u8 = 0x8;
@@ -9177,9 +9189,10 @@ mod tests {
         let mut pool = SessionPool::default().with_browser_hardening_policy(
             BrowserHardeningPolicy::strict().with_url_policy(UrlPolicy::allow_all()),
         );
-        let error = pool
-            .create("http://example.com/login")
-            .expect_err("strict hardening should block cleartext navigation");
+        let error = expect_test_err(
+            pool.create("http://example.com/login"),
+            "strict hardening should block cleartext navigation",
+        );
         assert_eq!(error.status(), 403);
 
         let response = tempod_error_response(&error);
@@ -9243,13 +9256,15 @@ mod tests {
             confirmed: false,
             idempotency_key: None,
         };
-        let error = enforce_session_batch_policy(
-            &BrowserHardeningPolicy::standard().with_url_policy(UrlPolicy::allow_all()),
-            PrivacyMode::Audit,
-            &body,
-            None,
-        )
-        .expect_err("risky downloads should be blocked before dispatch");
+        let error = expect_test_err(
+            enforce_session_batch_policy(
+                &BrowserHardeningPolicy::standard().with_url_policy(UrlPolicy::allow_all()),
+                PrivacyMode::Audit,
+                &body,
+                None,
+            ),
+            "risky downloads should be blocked before dispatch",
+        );
 
         match error {
             TempodError::BrowserHardeningBlocked(block) => {
@@ -9422,16 +9437,20 @@ mod tests {
 
     #[test]
     fn threat_domain_feed_url_rejects_cleartext() {
-        let error = fetch_threat_domain_feed_url("http://example.test/threats.txt")
-            .expect_err("cleartext feed URLs must be rejected before network");
+        let error = expect_test_err(
+            fetch_threat_domain_feed_url("http://example.test/threats.txt"),
+            "cleartext feed URLs must be rejected before network",
+        );
 
         assert!(error.contains("must use https"));
     }
 
     #[test]
     fn threat_domain_feed_url_rejects_private_targets() {
-        let error = fetch_threat_domain_feed_url("https://127.0.0.1/threats.txt")
-            .expect_err("private feed URLs must be rejected before network");
+        let error = expect_test_err(
+            fetch_threat_domain_feed_url("https://127.0.0.1/threats.txt"),
+            "private feed URLs must be rejected before network",
+        );
 
         assert!(error.contains("URL blocked"));
     }
@@ -9496,11 +9515,13 @@ mod tests {
 
     #[test]
     fn threat_domain_feed_sha256_rejects_mismatch() {
-        let error = verify_threat_domain_feed_sha256(
-            "malware.test\n".to_string(),
-            Some("0000000000000000000000000000000000000000000000000000000000000000"),
-        )
-        .expect_err("mismatched feed digest must be rejected");
+        let error = expect_test_err(
+            verify_threat_domain_feed_sha256(
+                "malware.test\n".to_string(),
+                Some("0000000000000000000000000000000000000000000000000000000000000000"),
+            ),
+            "mismatched feed digest must be rejected",
+        );
 
         assert!(error.contains("digest mismatch"));
     }
@@ -9568,9 +9589,10 @@ mod tests {
             BASE64_STANDARD.encode(signing_key.verifying_key().to_bytes()),
         );
 
-        let error =
-            verify_signed_threat_domain_metadata(&metadata_json, feed, &trusted, 1_788_480_002_000)
-                .expect_err("expired signed metadata must be rejected");
+        let error = expect_test_err(
+            verify_signed_threat_domain_metadata(&metadata_json, feed, &trusted, 1_788_480_002_000),
+            "expired signed metadata must be rejected",
+        );
 
         assert!(error.contains("expired"));
         Ok(())
@@ -9629,8 +9651,10 @@ mod tests {
         let mut trusted = BTreeMap::new();
         trusted.insert(key_id, BASE64_STANDARD.encode([2_u8; 32]));
 
-        let error = apply_verified_threat_domain_key_rotation(&trusted, &verified)
-            .expect_err("duplicate rotation key ids must be rejected");
+        let error = expect_test_err(
+            apply_verified_threat_domain_key_rotation(&trusted, &verified),
+            "duplicate rotation key ids must be rejected",
+        );
 
         assert!(error.contains("already exists"));
     }
@@ -9781,14 +9805,15 @@ mod tests {
             BrowserHardeningPolicy::standard().with_url_policy(UrlPolicy::allow_all()),
         );
 
-        let error = pool
-            .apply_verified_signed_threat_domain_policy_snapshot(
+        let error = expect_test_err(
+            pool.apply_verified_signed_threat_domain_policy_snapshot(
                 &mut trusted,
                 &metadata_json,
                 "different.test\n",
                 1_788_480_001_000,
-            )
-            .expect_err("tampered feed must not swap policy");
+            ),
+            "tampered feed must not swap policy",
+        );
 
         assert!(error.contains("digest"));
         assert!(pool
@@ -9805,16 +9830,17 @@ mod tests {
         );
         let mut trusted = BTreeMap::new();
 
-        let error = pool
-            .refresh_signed_threat_domain_policy_once(
+        let error = expect_test_err(
+            pool.refresh_signed_threat_domain_policy_once(
                 &mut trusted,
                 "http://example.test/metadata.json",
                 "https://example.test/feed.txt",
                 None,
                 None,
                 1_788_480_001_000,
-            )
-            .expect_err("cleartext signed metadata URL must be rejected before network");
+            ),
+            "cleartext signed metadata URL must be rejected before network",
+        );
 
         assert!(error.contains("must use https"));
         assert!(pool
@@ -9935,13 +9961,15 @@ mod tests {
             BASE64_STANDARD.encode(signing_key.verifying_key().to_bytes()),
         );
 
-        let error = read_signed_threat_domain_cache(
-            &metadata_path,
-            &feed_path,
-            &trusted,
-            1_788_480_001_000,
-        )
-        .expect_err("tampered cached feed must be rejected");
+        let error = expect_test_err(
+            read_signed_threat_domain_cache(
+                &metadata_path,
+                &feed_path,
+                &trusted,
+                1_788_480_001_000,
+            ),
+            "tampered cached feed must be rejected",
+        );
 
         assert!(error.contains("digest"));
         remove_dir_if_exists(&root)?;

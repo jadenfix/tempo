@@ -34,7 +34,7 @@ fn tempod_http_mcp_and_bidi_drive_live_cdp_browser() -> TestResult {
         if let Err(error) =
             tempo_headless::run_tempod_with_attached_driver_config_and_navigation_url_policy(
                 &tempod_addr,
-                tempo_headless::TempodServerConfig::new().with_bidi_enabled(true),
+                tempo_headless::TempodServerConfig::new(),
                 Engine::Cdp,
                 tempod_socket,
                 UrlPolicy::allow_all(),
@@ -102,6 +102,8 @@ fn tempod_http_mcp_and_bidi_drive_live_cdp_browser() -> TestResult {
         "observe_diff",
         "act",
         "act_batch",
+        "fork",
+        "close_fork",
         "extract",
         "screenshot",
         "handshake",
@@ -111,9 +113,6 @@ fn tempod_http_mcp_and_bidi_drive_live_cdp_browser() -> TestResult {
             "tools/list did not include {expected}: {tool_names:?}"
         );
     }
-    assert!(!tool_names.contains(&"fork"), "{tool_names:?}");
-    assert!(!tool_names.contains(&"close_fork"), "{tool_names:?}");
-
     let root_goto = mcp_tool(
         addr,
         2,

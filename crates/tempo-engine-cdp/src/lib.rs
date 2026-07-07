@@ -20,7 +20,7 @@ use chromiumoxide::cdp::browser_protocol::fetch::{
 };
 use chromiumoxide::cdp::browser_protocol::network::ErrorReason;
 use chromiumoxide::cdp::browser_protocol::page::{
-    CaptureScreenshotFormat, CreateIsolatedWorldParams, NavigateParams, Viewport,
+    CreateIsolatedWorldParams, NavigateParams, Viewport,
 };
 use chromiumoxide::cdp::browser_protocol::target::CreateTargetParams;
 use chromiumoxide::cdp::js_protocol::runtime::{EvaluateParams, ExecutionContextId};
@@ -33,18 +33,14 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tempo_driver::{
-    BrowsingContextCreateOptions, DriverTrait, Engine, ScreenshotCapture, ScreenshotFormat,
-    ScreenshotOptions, StepOutcome, TransportError, Unsupported, MAX_SCREENSHOT_BYTES,
-    MAX_SCREENSHOT_HEIGHT, MAX_SCREENSHOT_WIDTH,
+    BrowsingContextCreateOptions, DriverTrait, Engine, StepOutcome, TransportError, Unsupported,
+    MAX_SCREENSHOT_BYTES, MAX_SCREENSHOT_HEIGHT, MAX_SCREENSHOT_WIDTH,
 };
 use tempo_net::{BrowserHardeningPolicy, UrlPolicy};
-use tempo_observe::{
-    finalize_observation_with_mark_mapper, CompileOptions, RawElement, StableIdMapper,
-    StableMarkMapper,
-};
+use tempo_observe::{finalize_observation, CompileOptions, RawElement, StableIdMapper};
 use tempo_schema::{
     Action, ActionBatch, CompiledObservation, InteractiveElement, NodeId, ObservationDiff,
-    ObservationResource, Provenance, QuiescencePolicy, TaintSpan,
+    Provenance, QuiescencePolicy, TaintSpan,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener as TokioTcpListener, TcpStream};
@@ -64,8 +60,6 @@ use tokio::task::JoinHandle;
 /// so every element that actually survives into the marked observation is still
 /// enriched, while the long tail stays present but without an AX overlay.
 const MAX_AX_ENRICHED_ELEMENTS: usize = 16;
-const MAX_OBSERVATION_RESOURCES: usize = 32;
-const MAX_OBSERVATION_RESOURCE_URL_BYTES: usize = 512;
 /// How many recent compiled observations to retain for diff bases. Diffs are only
 /// ever requested against recent seqs (`previous_seq`, `batch_base_seq`, a
 /// client-supplied `since_seq`), and `diff_from_base(None, ...)` already degrades a
@@ -205,7 +199,6 @@ pub struct CdpTempoDriver {
     seq: u64,
     history: BTreeMap<u64, Arc<CompiledObservation>>,
     stable_id_mapper: StableIdMapper,
-    stable_mark_mapper: StableMarkMapper,
     selectors_by_node: BTreeMap<NodeId, String>,
     url_policy: Arc<Mutex<UrlPolicy>>,
     browser_hardening_policy: Arc<Mutex<BrowserHardeningPolicy>>,
@@ -294,7 +287,6 @@ impl CdpTempoDriver {
             seq: 0,
             history: BTreeMap::new(),
             stable_id_mapper: StableIdMapper::new(),
-            stable_mark_mapper: StableMarkMapper::new(),
             selectors_by_node: BTreeMap::new(),
             url_policy,
             browser_hardening_policy,
@@ -489,27 +481,23 @@ impl CdpTempoDriver {
         &mut self,
         url: String,
         dom_html: String,
-        http_status: Option<u16>,
+        _http_status: Option<u16>,
     ) -> Result<Arc<CompiledObservation>, TransportError> {
         self.seq += 1;
         let (mut compiled, selectors_by_node) =
             compile_observation(&mut self.stable_id_mapper, url, dom_html, self.seq);
         self.selectors_by_node = selectors_by_node;
         self.enrich_observation_from_ax_tree(&mut compiled).await?;
-        let resources = compiled.resources;
         // Finish the live observation the same way the fixture compiler does:
         // rank-sort, apply the byte/token budget, and populate set-of-marks labels.
         // Run after enrichment so the budget accounts for enriched AX names/values.
         // Without this the CDP lane shipped the full, unranked, unbudgeted
         // document-order element dump with no marks (#477).
-        let compiled = finalize_observation_with_mark_mapper(
+        let compiled = finalize_observation(
             compiled.url,
             compiled.seq,
             compiled.elements,
             CompileOptions::default(),
-            http_status,
-            resources,
-            &mut self.stable_mark_mapper,
         );
         Ok(retain_observation_history(&mut self.history, compiled))
     }
@@ -1387,33 +1375,14 @@ impl DriverTrait for CdpTempoDriver {
     }
 
     async fn screenshot(&mut self) -> Result<Vec<u8>, TransportError> {
-        Ok(self
-            .screenshot_with_options(ScreenshotOptions::png_lossless())
-            .await?
-            .bytes)
-    }
-
-    async fn screenshot_with_options(
-        &mut self,
-        options: ScreenshotOptions,
-    ) -> Result<ScreenshotCapture, TransportError> {
-        let params = screenshot_params(options)?;
+        let params = screenshot_params()?;
         self.enforce_current_url_policy().await?;
-        let started = Instant::now();
         let bytes = self
             .page()?
             .screenshot(params)
             .await
             .map_err(map_cdp_error)?;
-        let capture_ms = elapsed_ms(started);
-        let bytes = validate_screenshot_bytes(bytes)?;
-        let delivered_bytes = bytes.len();
-        Ok(ScreenshotCapture {
-            mime_type: options.format.mime_type().into(),
-            delivered_bytes,
-            capture_ms,
-            bytes,
-        })
+        validate_screenshot_bytes(bytes)
     }
 
     async fn close(&mut self) -> Result<(), TransportError> {
@@ -2086,46 +2055,11 @@ fn screenshot_viewport_clip_with_scale(scale: f64) -> Result<Viewport, Transport
         .map_err(TransportError::Other)
 }
 
-fn screenshot_params(options: ScreenshotOptions) -> Result<ScreenshotParams, TransportError> {
-    let mut builder = ScreenshotParams::builder()
-        .format(cdp_screenshot_format(options.format))
-        .clip(screenshot_viewport_clip_with_scale(screenshot_scale(
-            options.max_dimension,
-        ))?)
-        .capture_beyond_viewport(false);
-    if let Some(quality) = options.quality {
-        if quality > 100 {
-            return Err(TransportError::Other(format!(
-                "screenshot quality must be 0..=100, got {quality}"
-            )));
-        }
-        if matches!(
-            options.format,
-            ScreenshotFormat::Jpeg | ScreenshotFormat::Webp
-        ) {
-            builder = builder.quality(i64::from(quality));
-        }
-    }
-    Ok(builder.build())
-}
-
-fn cdp_screenshot_format(format: ScreenshotFormat) -> CaptureScreenshotFormat {
-    match format {
-        ScreenshotFormat::Png => CaptureScreenshotFormat::Png,
-        ScreenshotFormat::Jpeg => CaptureScreenshotFormat::Jpeg,
-        ScreenshotFormat::Webp => CaptureScreenshotFormat::Webp,
-    }
-}
-
-fn screenshot_scale(max_dimension: Option<u32>) -> f64 {
-    let Some(max_dimension) = max_dimension else {
-        return 1.0;
-    };
-    if max_dimension == 0 {
-        return 1.0;
-    }
-    let longest_side = MAX_SCREENSHOT_WIDTH.max(MAX_SCREENSHOT_HEIGHT);
-    (f64::from(max_dimension) / f64::from(longest_side)).clamp(0.01, 1.0)
+fn screenshot_params() -> Result<ScreenshotParams, TransportError> {
+    Ok(ScreenshotParams::builder()
+        .clip(screenshot_viewport_clip_with_scale(1.0)?)
+        .capture_beyond_viewport(false)
+        .build())
 }
 
 fn validate_screenshot_bytes(bytes: Vec<u8>) -> Result<Vec<u8>, TransportError> {
@@ -2137,10 +2071,6 @@ fn validate_screenshot_bytes(bytes: Vec<u8>) -> Result<Vec<u8>, TransportError> 
         });
     }
     Ok(bytes)
-}
-
-fn elapsed_ms(started: Instant) -> u64 {
-    started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
 }
 
 async fn navigate_with_http_status(page: &Page, url: &str) -> Result<Option<u16>, CdpError> {
@@ -2468,24 +2398,16 @@ fn compile_observation(
     seq: u64,
 ) -> (CompiledObservation, BTreeMap<NodeId, String>) {
     let mut elements = extract_interactive_elements(&dom_html);
-    let mut resources = extract_observation_resources(&dom_html, &url);
     let raw_elements: Vec<_> = elements
         .iter()
         .map(raw_element_from_selector_element)
         .collect();
     let node_ids = mapper.map_snapshot(seq, &raw_elements);
     let mut selectors_by_node = BTreeMap::new();
-    let mut node_by_selector = BTreeMap::new();
     for (element, node_id) in elements.iter_mut().zip(node_ids) {
         let selector = element.node_id.0.clone();
         element.node_id = node_id.clone();
-        node_by_selector.insert(selector.clone(), node_id.clone());
         selectors_by_node.insert(node_id, selector);
-    }
-    for resource in &mut resources {
-        if let Some(node) = &resource.node {
-            resource.node = node_by_selector.get(&node.0).cloned();
-        }
     }
 
     (
@@ -2496,8 +2418,6 @@ fn compile_observation(
             elements,
             omitted: 0,
             marks: Vec::new(),
-            http_status: None,
-            resources,
         },
         selectors_by_node,
     )
@@ -2683,7 +2603,7 @@ fn top_ranked_indices(elements: &[InteractiveElement], limit: usize) -> Vec<usiz
 
 fn visual_extraction_taint(value: &str) -> Vec<TaintSpan> {
     vec![TaintSpan {
-        provenance: Provenance::VisualExtraction,
+        provenance: Provenance::Page,
         text: value.to_string(),
     }]
 }
@@ -2710,8 +2630,6 @@ fn diff_from_base(
             added: current.elements.clone(),
             removed: Vec::new(),
             changed: Vec::new(),
-            http_status: current.http_status,
-            resources: current.resources.clone(),
         };
     };
 
@@ -2753,8 +2671,6 @@ fn diff_from_base(
         added,
         removed,
         changed,
-        http_status: current.http_status,
-        resources: current.resources.clone(),
     }
 }
 
@@ -2924,144 +2840,6 @@ fn extract_interactive_elements(html: &str) -> Vec<InteractiveElement> {
     }
 
     elements
-}
-
-fn extract_observation_resources(html: &str, page_url: &str) -> Vec<ObservationResource> {
-    struct Frame {
-        tag: String,
-        child_counts: BTreeMap<String, usize>,
-        selector_path: String,
-    }
-
-    let mut resources = Vec::new();
-    let mut search_from = 0;
-    let mut stack: Vec<Frame> = vec![Frame {
-        tag: String::new(),
-        child_counts: BTreeMap::new(),
-        selector_path: String::new(),
-    }];
-
-    while let Some(start_offset) = html[search_from..].find('<') {
-        if resources.len() >= MAX_OBSERVATION_RESOURCES {
-            break;
-        }
-        let start = search_from + start_offset;
-        let Some(end_offset) = html[start..].find('>') else {
-            break;
-        };
-        let end = start + end_offset;
-        let raw_tag = html[start + 1..end].trim();
-        search_from = end + 1;
-
-        if raw_tag.is_empty() || raw_tag.starts_with('!') || raw_tag.starts_with('?') {
-            continue;
-        }
-
-        if let Some(name) = raw_tag.strip_prefix('/') {
-            let name = name.trim().to_ascii_lowercase();
-            if let Some(position) = stack.iter().rposition(|frame| frame.tag == name)
-                && position > 0
-            {
-                stack.truncate(position);
-            }
-            continue;
-        }
-
-        let self_closing = raw_tag.ends_with('/');
-        let raw_tag = raw_tag.trim_end_matches('/').trim();
-        let Some((tag, attrs_raw)) = split_tag(raw_tag) else {
-            continue;
-        };
-        let tag = tag.to_ascii_lowercase();
-        let attrs = parse_attrs(attrs_raw);
-
-        let (nth_of_type, parent_selector_path) = {
-            let Some(parent) = stack.last_mut() else {
-                break;
-            };
-            let count = parent.child_counts.entry(tag.clone()).or_insert(0);
-            *count += 1;
-            (*count, parent.selector_path.clone())
-        };
-        let selector_segment = format!("{tag}:nth-of-type({nth_of_type})");
-        let fallback_selector = child_structural_selector(&parent_selector_path, &selector_segment);
-
-        if !(self_closing || is_void_element(&tag)) {
-            stack.push(Frame {
-                tag: tag.clone(),
-                child_counts: BTreeMap::new(),
-                selector_path: fallback_selector.clone(),
-            });
-        }
-
-        if !matches!(tag.as_str(), "iframe" | "frame" | "embed" | "script") {
-            continue;
-        }
-        let Some(src) = attrs.get("src").filter(|src| !src.trim().is_empty()) else {
-            continue;
-        };
-        let Some((url, origin)) = sanitized_resource_url(page_url, src) else {
-            continue;
-        };
-        let node = if tag == "script" {
-            None
-        } else {
-            Some(NodeId(
-                selector_for(&tag, &attrs).unwrap_or(fallback_selector),
-            ))
-        };
-        resources.push(ObservationResource {
-            node,
-            role: tag,
-            url,
-            origin,
-            status: None,
-        });
-    }
-
-    resources
-}
-
-fn sanitized_resource_url(page_url: &str, src: &str) -> Option<(String, String)> {
-    let mut parsed = match url::Url::parse(src) {
-        Ok(parsed) => parsed,
-        Err(_) => url::Url::parse(page_url).ok()?.join(src).ok()?,
-    };
-    if parsed.scheme() != "http" && parsed.scheme() != "https" {
-        return None;
-    }
-    parsed.set_fragment(None);
-    parsed.set_query(None);
-    let _ = parsed.set_username("");
-    let _ = parsed.set_password(None);
-    let origin = resource_origin(&parsed)?;
-    let mut url = parsed.to_string();
-    truncate_to_char_boundary(&mut url, MAX_OBSERVATION_RESOURCE_URL_BYTES);
-    Some((url, origin))
-}
-
-fn resource_origin(parsed: &url::Url) -> Option<String> {
-    let host = parsed.host_str()?;
-    let mut origin = String::new();
-    origin.push_str(parsed.scheme());
-    origin.push_str("://");
-    origin.push_str(host);
-    if let Some(port) = parsed.port() {
-        origin.push(':');
-        origin.push_str(&port.to_string());
-    }
-    Some(origin)
-}
-
-fn truncate_to_char_boundary(value: &mut String, max_bytes: usize) {
-    if value.len() <= max_bytes {
-        return;
-    }
-    let mut boundary = max_bytes;
-    while boundary > 0 && !value.is_char_boundary(boundary) {
-        boundary -= 1;
-    }
-    value.truncate(boundary);
 }
 
 fn is_void_element(tag: &str) -> bool {
@@ -3478,31 +3256,6 @@ mod tests {
     }
 
     #[test]
-    fn extracts_resource_origins_for_scripts_and_embeds() {
-        let resources = extract_observation_resources(
-            r#"
-              <main>
-                <script src="/static/app.js?token=secret#fragment"></script>
-                <iframe title="challenge" src="https://www.google.com/recaptcha/api2/anchor?k=abc"></iframe>
-                <embed src="data:text/plain,ignored">
-                <script src="https://cdn.example.test/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"></script>
-              </main>
-            "#,
-            "https://shop.example/checkout",
-        );
-
-        assert_eq!(resources.len(), 3);
-        assert_eq!(resources[0].role, "script");
-        assert_eq!(resources[0].url, "https://shop.example/static/app.js");
-        assert_eq!(resources[0].origin, "https://shop.example");
-        assert!(resources[0].node.is_none());
-        assert_eq!(resources[1].role, "iframe");
-        assert_eq!(resources[1].origin, "https://www.google.com");
-        assert!(resources[1].node.is_some());
-        assert!(resources[2].url.len() <= MAX_OBSERVATION_RESOURCE_URL_BYTES);
-    }
-
-    #[test]
     fn find_close_tag_matches_case_insensitively_in_one_pass() {
         // Case-insensitive, returns the byte offset of the '<' of "</tag".
         assert_eq!(find_close_tag(b"hi</A>", b"a"), Some(2));
@@ -3599,8 +3352,6 @@ mod tests {
                 elements: Vec::new(),
                 marks: Vec::new(),
                 omitted: 0,
-                http_status: None,
-                resources: Vec::new(),
             }
         }
         let mut history: BTreeMap<u64, Arc<CompiledObservation>> = BTreeMap::new();
@@ -3635,8 +3386,6 @@ mod tests {
                 elements: Vec::new(),
                 marks: Vec::new(),
                 omitted: 0,
-                http_status: None,
-                resources: Vec::new(),
             },
         );
 
@@ -3756,8 +3505,6 @@ mod tests {
             ),
             omitted: 0,
             marks: Vec::new(),
-            http_status: None,
-            resources: Vec::new(),
         };
         let after = CompiledObservation {
             schema_version: tempo_schema::SCHEMA_VERSION.into(),
@@ -3768,8 +3515,6 @@ mod tests {
             ),
             omitted: 0,
             marks: Vec::new(),
-            http_status: None,
-            resources: Vec::new(),
         };
 
         let diff = diff_from_base(Some(&before), &after, before.seq);
@@ -4021,41 +3766,6 @@ mod tests {
     }
 
     #[test]
-    fn screenshot_params_support_jpeg_quality_and_downscale(
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let params = screenshot_params(ScreenshotOptions {
-            format: ScreenshotFormat::Jpeg,
-            max_dimension: Some(1024),
-            quality: Some(70),
-        })?;
-        let clip = params.cdp_params.clip.ok_or("missing clip")?;
-
-        assert_eq!(
-            params.cdp_params.format,
-            Some(CaptureScreenshotFormat::Jpeg)
-        );
-        assert_eq!(params.cdp_params.quality, Some(70));
-        assert_eq!(clip.width, f64::from(MAX_SCREENSHOT_WIDTH));
-        assert_eq!(clip.height, f64::from(MAX_SCREENSHOT_HEIGHT));
-        assert_eq!(clip.scale, 0.25);
-        Ok(())
-    }
-
-    #[test]
-    fn screenshot_params_reject_invalid_quality() {
-        let error = match screenshot_params(ScreenshotOptions {
-            format: ScreenshotFormat::Jpeg,
-            max_dimension: Some(1024),
-            quality: Some(101),
-        }) {
-            Ok(_) => panic!("invalid quality should fail"),
-            Err(error) => error,
-        };
-
-        assert!(error.to_string().contains("quality must be 0..=100"));
-    }
-
-    #[test]
     fn screenshot_bytes_are_capped() -> Result<(), Box<dyn std::error::Error>> {
         let error = validate_screenshot_bytes(vec![0_u8; MAX_SCREENSHOT_BYTES + 1])
             .err()
@@ -4113,9 +3823,9 @@ mod tests {
 
         assert_eq!(element.role, "textbox");
         assert_eq!(element.name[0].text, "Email Address");
-        assert_eq!(element.name[0].provenance, Provenance::VisualExtraction);
+        assert_eq!(element.name[0].provenance, Provenance::Page);
         assert_eq!(element.value[0].text, "me@example.com");
-        assert_eq!(element.value[0].provenance, Provenance::VisualExtraction);
+        assert_eq!(element.value[0].provenance, Provenance::Page);
         Ok(())
     }
 

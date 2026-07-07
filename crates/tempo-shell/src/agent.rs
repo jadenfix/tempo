@@ -111,6 +111,11 @@ impl JournalEntry {
                 format!("{} — {}", takeover.kind.label(), takeover.url),
                 false,
             ),
+            TempodSessionEventKind::BrowserHardeningBlocked { block } => (
+                "browser_hardening_blocked",
+                format!("{}: {}", block.reason, block.url),
+                false,
+            ),
         };
         Self {
             seq: event.seq,
