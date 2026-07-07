@@ -2392,6 +2392,15 @@ fn tool_descriptor_json() -> Vec<Value> {
         .collect()
 }
 
+pub fn mcp_tool_catalog() -> Value {
+    json!({
+        "schema_version": 1,
+        "protocolVersion": MCP_PROTOCOL_VERSION,
+        "transport": "streamable-http-json-rpc",
+        "tools": tool_descriptor_json(),
+    })
+}
+
 fn tool_descriptor_value(tool: &ToolDescriptor) -> Value {
     json!({
         "name": tool.name,
@@ -2666,6 +2675,31 @@ mod tests {
             .find(|tool| tool["name"] == name)
             .map(|tool| tool["inputSchema"].clone())
             .ok_or_else(|| format!("missing tool schema for {name}"))
+    }
+
+    #[test]
+    fn mcp_tool_catalog_matches_fixture() -> Result<(), String> {
+        let actual = mcp_tool_catalog();
+        let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/mcp-tools.catalog.json");
+
+        if std::env::var_os("TEMPO_BLESS_MCP_CATALOG").is_some() {
+            let parent = fixture_path
+                .parent()
+                .ok_or_else(|| "catalog fixture path has no parent".to_string())?;
+            std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+            let pretty =
+                serde_json::to_string_pretty(&actual).map_err(|error| error.to_string())?;
+            std::fs::write(&fixture_path, format!("{pretty}\n"))
+                .map_err(|error| error.to_string())?;
+            return Ok(());
+        }
+
+        let expected: Value =
+            serde_json::from_str(include_str!("../fixtures/mcp-tools.catalog.json"))
+                .map_err(|error| error.to_string())?;
+        assert_eq!(actual, expected, "MCP tool catalog fixture is stale");
+        Ok(())
     }
 
     /// Poison a mutex by locking it on a thread that then panics; the guard's
