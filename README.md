@@ -2,7 +2,12 @@
 
 An **AI-agent-native browser**, built from first principles in Rust.
 
-Today's agentic browsers drive the web the way a human would — *screenshot → reason → one click → repeat*. That loop is slow, expensive, and prompt-injectable. tempo replaces it with **structured observation** (ranked, stably-identified, diff-able elements at ~2–5KB instead of a 40–500K-token DOM dump), **batched semantic actions** with a real page-settled signal, **state forking** for speculative parallel exploration, and an **API-first fast path** that skips rendering entirely when a site already speaks an agent protocol.
+Today's agentic browsers drive the web the way a human would — *screenshot → reason → one click → repeat*. That loop is slow, expensive, and prompt-injectable. tempo replaces it with **structured observation** (ranked, stably-identified, diff-able elements at ~2–5KB instead of a 40–500K-token DOM dump), **batched semantic actions** with a real page-settled signal, a planned **state-forking** lane for speculative parallel exploration, and an **API-first fast path** that skips rendering entirely when a site already speaks an agent protocol.
+
+Honesty note on token claims: the big win is scoped to raw screenshot, raw CDP,
+and full DOM/HTML loops. Tempo is not yet smaller than compact Playwright-MCP or
+browser-use-style model-facing formats on the checked-in differential fixtures;
+ADR 0008 tracks that as a separate lean-projection and diff-to-model goal.
 
 Engine strategy is **Rust-first**: [Servo](https://servo.org) is the primary rendering engine; a headless-Chromium lane (CDP) is a per-origin fallback behind the same driver trait. tempo reuses the sibling **beater** stack (`../beater-agents`, `../beater.js`, `../beater.js-connect`, `../beatbox`).
 
@@ -37,7 +42,7 @@ observation, action, network, runtime, protocol, shell, eval, and compatibility 
   and gated test-driver support.
 - `tempo-engine-cdp`, `tempo-engine-servo`, `tempo-engine-host`, and `tempo-headless`
   provide the current engine boundaries, CDP lane, host supervision, UDS transport,
-  tempod control plane, MCP, and BiDi routing.
+  tempod control plane, MCP, and default-off BiDi routing.
 - `tempo-observe`, `tempo-taint`, `tempo-act`, `tempo-policy`, `tempo-net`,
   `tempo-session`, `tempo-agent`, `tempo-skills`, `tempo-speculate`, `tempo-toolexec`,
   `tempo-shell`, `tempo-evals`, `tempo-compat`, and `tempo-cli` carry the supporting
@@ -47,16 +52,99 @@ observation, action, network, runtime, protocol, shell, eval, and compatibility 
 cargo test --workspace   # contracts, conformance, runtime, protocol, and shell tests
 ```
 
+Local live-CDP smoke tests need a Chrome/Chromium binary. To download Chrome for
+Testing into `.local/` and run the browser-backed smoke gates:
+
+```
+scripts/test-live-cdp.sh
+```
+
+To run the broader live-CDP suite, including known-longer child browsing-context
+coverage:
+
+```
+scripts/test-live-cdp.sh --full
+```
+
+For the Linux-first agent gate, run the same agent/browser checks in a pinned
+Rust + Chrome-for-Testing container:
+
+```
+scripts/linux-agent-gate.sh
+```
+
+The gate defaults to Docker's native Linux architecture (`linux/arm64` on Apple
+Silicon Docker Desktop, `linux/amd64` on x86 Linux), uses Docker volumes for
+Cargo and build artifacts, uses container Chromium for live-CDP checks, and
+exercises the CLI/fixture/live-CDP path agents depend on. Set
+`TEMPO_LINUX_AGENT_PLATFORM=linux/amd64` when you specifically need an x86 run.
+Use `scripts/linux-agent-gate.sh --shell` to debug inside the same container, or
+`scripts/linux-agent-gate.sh --full` to include the broader live-CDP suite.
+On Apple Silicon Docker Desktop, distro Chromium may fail before CDP startup in
+the Linux VM; the smoke gate then reports the browser preflight failure and skips
+only the Docker live-CDP subgate. Set `TEMPO_LINUX_AGENT_REQUIRE_LIVE_CDP=1` to
+make that preflight mandatory, and use `scripts/test-live-cdp.sh --smoke` on the
+host for the macOS Chrome-for-Testing browser smoke.
+
+Real agent/browser benchmark artifacts are generated with:
+
+```
+scripts/agent-browser-bench.sh --smoke --output-dir target/agent-browser-bench
+```
+
+That harness serves `fixtures/evals/live_agent/checkout.html`, drives the same
+task through Tempo CDP, raw Chrome CDP, a Playwright-MCP-style live AX snapshot,
+and a browser-use-style live DOM serializer. The latter two are explicitly
+synthetic Chrome/CDP style lanes (`synthetic-playwright-ax` and
+`synthetic-browser-use-dom`), not external Playwright or browser-use agent
+processes. The harness writes:
+
+- `agent-browser-bench.json[l]` with success, wall time, CPU time, max RSS,
+  step count, retry count, failure mode, and model-facing bytes/tokens.
+- `agent-browser-bench-summary.json` with per-runner run count, success rate,
+  failure-mode counts, retry totals, and p50/p95/max stats for latency, CPU,
+  RSS, step count, and model-facing bytes/tokens. `--smoke` runs one iteration;
+  `--full` runs five by default, and `--iterations N` overrides either mode.
+- `tempo-journal.sqlite`, `replay.json`, and `tempo-run.json` so the run is
+  grounded in durable agent evidence.
+- `eval-records.jsonl`, `scorecard.json`, and `amdahl.json`; `amdahl.json` is
+  generated by the harness as a raw-Chrome-relative wall-clock comparison.
+
+The Docker Linux gate runs this benchmark after live-CDP succeeds. The
+`.github/workflows/linux-agent-gate.yml` workflow forces
+`TEMPO_LINUX_AGENT_PLATFORM=linux/amd64` and
+`TEMPO_LINUX_AGENT_REQUIRE_LIVE_CDP=1`, so the authoritative container live-CDP
+and benchmark proof is real Linux amd64 CI. Apple Silicon local Docker remains a
+build/test/fixture gate plus an explicit Chromium-preflight diagnostic; host
+Chrome-for-Testing covers local live browser execution on macOS.
+
 ## Operations & governance
 
+- Current shipped security posture is narrower than the long-term design in
+  `final.md`: tempod is loopback-first unless remote binds are explicitly
+  enabled with bearer auth; Web Bot Auth signing is opt-in in selected
+  `tempo-net` dispatch paths, not universal for all API/MCP calls; stealth mode
+  suppresses tempod/session history, telemetry exporters, and durable journals
+  it controls, but it does not erase OS, browser-engine, proxy, DNS, or remote
+  service logs; and beatbox-backed taint-to-sandbox dispatch is deferred until
+  ADR 0001 is wired through a runtime caller. ADR 0005 freezes public
+  fork/speculation tooling until an engine supports real fork semantics. ADR
+  0006 keeps WebDriver BiDi compiled but disabled by default behind
+  `TEMPO_BIDI=on` / `protocols.bidi_enabled=true`. ADR 0009 scopes confirmed
+  daemon writes to REST session `act_batch` plus operator `confirmation_grant`;
+  MCP and BiDi remain read/draft-only for confirmation-gated writes. ADR 0004
+  records the currently shipped taint-channel, opaque-handle, lethal-trifecta,
+  and linear-batch CFI primitives plus the runtime wiring still deferred.
 - `tempo-telemetry` / `tempo-config` (paired observability PR) are the
   observability and configuration backbones; tempod serves Prometheus
   exposition at `GET /metrics`.
 - `tempod` requires bearer auth on loopback and remote binds. Set
   `TEMPO_TEMPOD_AUTH_TOKEN` or `--auth-token` explicitly, or let the daemon
   create an owner-only runtime token file; shell clients read the same file by
-  default. Loopback, Host, and Origin checks defend binding/CSRF edges, but they
-  are not authentication on shared machines.
+  default. Confirming policy-gated REST writes requires a separate operator
+  token (`TEMPO_TEMPOD_OPERATOR_TOKEN`, `--operator-token`, or the owner-only
+  operator runtime token file). Loopback, Host, and Origin checks defend
+  binding/CSRF edges, but they are not authentication on shared machines.
 - Supply-chain policy lives in [`deny.toml`](./deny.toml) (checked in CI);
   tagged `v*` releases build stripped, thin-LTO `tempod` + `tempo-cli`
   binaries for macOS and Linux.
