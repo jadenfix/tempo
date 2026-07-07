@@ -1,0 +1,658 @@
+{
+  "protocolVersion": "2025-11-25",
+  "schema_version": 1,
+  "tools": [
+    {
+      "description": "Return the current compiled observation.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "driver_id": {
+            "type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "observe"
+    },
+    {
+      "description": "Return the observation diff since a known sequence number.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "driver_id": {
+            "type": "string"
+          },
+          "since_seq": {
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "since_seq"
+        ],
+        "type": "object"
+      },
+      "name": "observe_diff"
+    },
+    {
+      "description": "Execute one tempo semantic action. input_tainted/confirmed are advisory: taint is recomputed server-side and can only be escalated by the caller.",
+      "inputSchema": {
+        "$defs": {
+          "NodeId": {
+            "description": "Stable node id emitted by observe/observe_diff.",
+            "title": "NodeId",
+            "type": "string"
+          }
+        },
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "description": "One tempo semantic action. Select exactly one variant by its kind field.",
+            "oneOf": [
+              {
+                "additionalProperties": true,
+                "properties": {
+                  "kind": {
+                    "const": "goto",
+                    "type": "string"
+                  },
+                  "url": {
+                    "format": "uri-reference",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "url"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": true,
+                "properties": {
+                  "kind": {
+                    "const": "click",
+                    "type": "string"
+                  },
+                  "node": {
+                    "$ref": "#/$defs/NodeId"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "node"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": true,
+                "properties": {
+                  "kind": {
+                    "const": "type",
+                    "type": "string"
+                  },
+                  "node": {
+                    "$ref": "#/$defs/NodeId"
+                  },
+                  "text": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "node",
+                  "text"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": true,
+                "properties": {
+                  "kind": {
+                    "const": "select",
+                    "type": "string"
+                  },
+                  "node": {
+                    "$ref": "#/$defs/NodeId"
+                  },
+                  "value": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "node",
+                  "value"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": true,
+                "properties": {
+                  "kind": {
+                    "const": "scroll",
+                    "type": "string"
+                  },
+                  "x": {
+                    "type": "number"
+                  },
+                  "y": {
+                    "type": "number"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "x",
+                  "y"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": true,
+                "properties": {
+                  "kind": {
+                    "const": "wait",
+                    "type": "string"
+                  },
+                  "millis": {
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "millis"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": true,
+                "properties": {
+                  "kind": {
+                    "const": "extract",
+                    "type": "string"
+                  },
+                  "node": {
+                    "$ref": "#/$defs/NodeId"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "node"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": true,
+                "properties": {
+                  "input": true,
+                  "kind": {
+                    "const": "skill",
+                    "type": "string"
+                  },
+                  "name": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "input",
+                  "name"
+                ],
+                "type": "object"
+              }
+            ],
+            "title": "Action"
+          },
+          "confirmed": {
+            "description": "Set true only after an explicit human confirmation for a policy-gated action.",
+            "type": "boolean"
+          },
+          "driver_id": {
+            "description": "Optional fork driver id returned by fork; omit to target the root driver.",
+            "type": "string"
+          },
+          "input_tainted": {
+            "description": "Set true when any action argument comes from page-derived, user-provided, or otherwise untrusted content. Use false only for caller-authored constants; the server recomputes live observation taint and may escalate this claim.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "action",
+          "input_tainted"
+        ],
+        "type": "object"
+      },
+      "name": "act"
+    },
+    {
+      "description": "Execute a batch of tempo semantic actions. input_tainted/confirmed are advisory: taint is recomputed server-side and can only be escalated by the caller.",
+      "inputSchema": {
+        "$defs": {
+          "NodeId": {
+            "description": "Stable node id emitted by observe/observe_diff.",
+            "title": "NodeId",
+            "type": "string"
+          }
+        },
+        "additionalProperties": false,
+        "properties": {
+          "batch": {
+            "additionalProperties": true,
+            "properties": {
+              "actions": {
+                "items": {
+                  "description": "One tempo semantic action. Select exactly one variant by its kind field.",
+                  "oneOf": [
+                    {
+                      "additionalProperties": true,
+                      "properties": {
+                        "kind": {
+                          "const": "goto",
+                          "type": "string"
+                        },
+                        "url": {
+                          "format": "uri-reference",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "kind",
+                        "url"
+                      ],
+                      "type": "object"
+                    },
+                    {
+                      "additionalProperties": true,
+                      "properties": {
+                        "kind": {
+                          "const": "click",
+                          "type": "string"
+                        },
+                        "node": {
+                          "$ref": "#/$defs/NodeId"
+                        }
+                      },
+                      "required": [
+                        "kind",
+                        "node"
+                      ],
+                      "type": "object"
+                    },
+                    {
+                      "additionalProperties": true,
+                      "properties": {
+                        "kind": {
+                          "const": "type",
+                          "type": "string"
+                        },
+                        "node": {
+                          "$ref": "#/$defs/NodeId"
+                        },
+                        "text": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "kind",
+                        "node",
+                        "text"
+                      ],
+                      "type": "object"
+                    },
+                    {
+                      "additionalProperties": true,
+                      "properties": {
+                        "kind": {
+                          "const": "select",
+                          "type": "string"
+                        },
+                        "node": {
+                          "$ref": "#/$defs/NodeId"
+                        },
+                        "value": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "kind",
+                        "node",
+                        "value"
+                      ],
+                      "type": "object"
+                    },
+                    {
+                      "additionalProperties": true,
+                      "properties": {
+                        "kind": {
+                          "const": "scroll",
+                          "type": "string"
+                        },
+                        "x": {
+                          "type": "number"
+                        },
+                        "y": {
+                          "type": "number"
+                        }
+                      },
+                      "required": [
+                        "kind",
+                        "x",
+                        "y"
+                      ],
+                      "type": "object"
+                    },
+                    {
+                      "additionalProperties": true,
+                      "properties": {
+                        "kind": {
+                          "const": "wait",
+                          "type": "string"
+                        },
+                        "millis": {
+                          "minimum": 0,
+                          "type": "integer"
+                        }
+                      },
+                      "required": [
+                        "kind",
+                        "millis"
+                      ],
+                      "type": "object"
+                    },
+                    {
+                      "additionalProperties": true,
+                      "properties": {
+                        "kind": {
+                          "const": "extract",
+                          "type": "string"
+                        },
+                        "node": {
+                          "$ref": "#/$defs/NodeId"
+                        }
+                      },
+                      "required": [
+                        "kind",
+                        "node"
+                      ],
+                      "type": "object"
+                    },
+                    {
+                      "additionalProperties": true,
+                      "properties": {
+                        "input": true,
+                        "kind": {
+                          "const": "skill",
+                          "type": "string"
+                        },
+                        "name": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "kind",
+                        "input",
+                        "name"
+                      ],
+                      "type": "object"
+                    }
+                  ],
+                  "title": "Action"
+                },
+                "type": "array"
+              },
+              "quiescence": {
+                "description": "How tempo decides the page has settled after the batch.",
+                "oneOf": [
+                  {
+                    "const": "composite",
+                    "description": "Wait for network idle, layout stability, and JS/microtask quiescence.",
+                    "type": "string"
+                  },
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "fixed_millis": {
+                        "description": "Fallback fixed wait in milliseconds.",
+                        "minimum": 0,
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "fixed_millis"
+                    ],
+                    "type": "object"
+                  }
+                ],
+                "title": "QuiescencePolicy"
+              }
+            },
+            "required": [
+              "actions",
+              "quiescence"
+            ],
+            "title": "ActionBatch",
+            "type": "object"
+          },
+          "confirmed": {
+            "description": "Set true only after an explicit human confirmation for a policy-gated action.",
+            "type": "boolean"
+          },
+          "driver_id": {
+            "description": "Optional fork driver id returned by fork; omit to target the root driver.",
+            "type": "string"
+          },
+          "input_tainted": {
+            "description": "Set true when any action argument comes from page-derived, user-provided, or otherwise untrusted content. Use false only for caller-authored constants; the server recomputes live observation taint and may escalate this claim.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "batch",
+          "input_tainted"
+        ],
+        "type": "object"
+      },
+      "name": "act_batch"
+    },
+    {
+      "description": "Fork the current page state when the active driver supports it.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "driver_id": {
+            "type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "fork"
+    },
+    {
+      "description": "Close a forked driver and release its engine resources.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "driver_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "driver_id"
+        ],
+        "type": "object"
+      },
+      "name": "close_fork"
+    },
+    {
+      "description": "Extract structured data rooted at a stable node id from observe/observe_diff.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "driver_id": {
+            "type": "string"
+          },
+          "node": {
+            "description": "Stable node id from observe/observe_diff, for example \"button.primary\".",
+            "type": "string"
+          }
+        },
+        "required": [
+          "node"
+        ],
+        "type": "object"
+      },
+      "name": "extract"
+    },
+    {
+      "description": "Search visible page text locally without an LLM round trip.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "case_sensitive": {
+            "description": "Whether matching should preserve case. Defaults to false.",
+            "type": "boolean"
+          },
+          "driver_id": {
+            "type": "string"
+          },
+          "max_results": {
+            "description": "Maximum matched elements to return. Defaults to 20.",
+            "maximum": 50,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "text": {
+            "description": "Text to search for in visible page content.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "type": "object"
+      },
+      "name": "find_text"
+    },
+    {
+      "description": "Check whether a selector or visible text is present locally without an LLM round trip.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "case_sensitive": {
+            "description": "Whether text matching should preserve case. Defaults to false.",
+            "type": "boolean"
+          },
+          "driver_id": {
+            "type": "string"
+          },
+          "selector": {
+            "description": "CSS selector to check. Provide exactly one of selector or text.",
+            "type": "string"
+          },
+          "text": {
+            "description": "Visible text to check. Provide exactly one of selector or text.",
+            "type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "element_present"
+    },
+    {
+      "description": "Run a bounded local CSS selector query and return compact element summaries.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "driver_id": {
+            "type": "string"
+          },
+          "max_results": {
+            "description": "Maximum matched elements to return. Defaults to 20.",
+            "maximum": 50,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "selector": {
+            "description": "CSS selector to query in the current page.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "selector"
+        ],
+        "type": "object"
+      },
+      "name": "query_selector"
+    },
+    {
+      "description": "Capture a PNG screenshot as MCP image content.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "driver_id": {
+            "type": "string"
+          },
+          "set_of_marks": {
+            "type": "boolean"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "screenshot"
+    },
+    {
+      "description": "Evaluate structured-web probe evidence and lane decision.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "driver_id": {
+            "type": "string"
+          },
+          "live_http": {
+            "type": "boolean"
+          },
+          "origin": {
+            "type": "string"
+          },
+          "responses": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "body": {
+                  "type": "string"
+                },
+                "content_type": {
+                  "type": "string"
+                },
+                "path": {
+                  "type": "string"
+                },
+                "status": {
+                  "maximum": 599,
+                  "minimum": 100,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "path",
+                "status"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "handshake"
+    }
+  ],
+  "transport": "streamable-http-json-rpc"
+}

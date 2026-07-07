@@ -107,6 +107,10 @@ observation, action, network, runtime, protocol, shell, eval, and compatibility 
 - `tempo-engine-cdp`, `tempo-engine-servo`, `tempo-engine-host`, and `tempo-headless`
   provide the current engine boundaries, CDP lane, host supervision, UDS transport,
   tempod control plane, MCP, and BiDi routing.
+- `tempo-mcp` owns the Streamable HTTP JSON-RPC tool surface; its committed
+  catalog fixture lives at
+  `crates/tempo-mcp/fixtures/mcp-tools.catalog.json` and is drift-checked
+  against the runtime descriptors.
 - `tempo-observe`, `tempo-taint`, `tempo-act`, `tempo-policy`, `tempo-net`,
   `tempo-session`, `tempo-agent`, `tempo-skills`, `tempo-speculate`, `tempo-toolexec`,
   `tempo-shell`, `tempo-evals`, `tempo-compat`, and `tempo-cli` carry the supporting
