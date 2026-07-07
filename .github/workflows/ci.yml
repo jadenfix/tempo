@@ -134,15 +134,11 @@ jobs:
         run: |
           set -euo pipefail
           test -n "$TEMPO_CDP_CHROME"
-          "$TEMPO_CDP_CHROME" --version
-          export TMPDIR="$(mktemp -d)"
-          trap 'rm -rf "$TMPDIR"' EXIT
-          cargo test -p tempo-engine-cdp live_cdp -- --nocapture --test-threads=1 2>&1 | tee live-cdp.log
-          cargo test -p tempo-engine-cdp --test uds_driver -- --nocapture --test-threads=1 2>&1 | tee -a live-cdp.log
-          cargo test -p tempo-agent live_cdp -- --nocapture --test-threads=1 2>&1 | tee -a live-cdp.log
+          scripts/test-live-cdp.sh --full 2>&1 | tee live-cdp.log
           grep -F "test tests::live_cdp_driver_passes_conformance_v2 ... ok" live-cdp.log
           grep -F "test tests::live_cdp_driver_navigates_observes_acts_and_screenshots ... ok" live-cdp.log
           grep -F "test cdp_driver_serves_commands_over_engine_host_uds ... ok" live-cdp.log
+          grep -F "test tempod_http_mcp_and_bidi_drive_live_cdp_browser ... ok" live-cdp.log
           grep -F "test tests::live_cdp_runner_completes_scripted_task_and_journals_it ... ok" live-cdp.log
           if grep -Eiq 'skipping live CDP|TEMPO_CDP_CHROME is unset|TEMPO_CDP_CHROME is not set' live-cdp.log; then
             echo "live CDP tests skipped despite CI Chrome setup"

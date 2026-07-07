@@ -20,14 +20,11 @@ use chromiumoxide::cdp::browser_protocol::fetch::{
 };
 use chromiumoxide::cdp::browser_protocol::network::ErrorReason;
 use chromiumoxide::cdp::browser_protocol::page::{
-    CaptureScreenshotFormat, CreateIsolatedWorldParams, Viewport,
+    CreateIsolatedWorldParams, NavigateParams, Viewport,
 };
-use chromiumoxide::cdp::browser_protocol::target::{
-    CreateBrowserContextParams, CreateTargetParams,
-};
+use chromiumoxide::cdp::browser_protocol::target::CreateTargetParams;
 use chromiumoxide::cdp::js_protocol::runtime::{EvaluateParams, ExecutionContextId};
 use chromiumoxide::error::CdpError;
-use chromiumoxide::handler::HandlerConfig;
 use chromiumoxide::page::{Page, ScreenshotParams};
 use futures::{future::join_all, StreamExt};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -197,6 +194,7 @@ pub struct CdpTempoDriver {
     policy_proxy: Option<PolicyProxy>,
     browser_context_id: Option<BrowserContextId>,
     profile_dir: Option<tempfile::TempDir>,
+    launch_config: CdpConfig,
     owns_browser: bool,
     seq: u64,
     history: BTreeMap<u64, Arc<CompiledObservation>>,
@@ -236,6 +234,7 @@ impl CdpTempoDriver {
             request_policy_tracker.clone(),
         )
         .await?;
+        let launch_config = config.clone();
         let mut config = config;
         config.args.extend([
             format!("--proxy-server=http://{}", policy_proxy.addr),
@@ -283,6 +282,7 @@ impl CdpTempoDriver {
             policy_proxy: Some(policy_proxy),
             browser_context_id: None,
             profile_dir: Some(profile_dir),
+            launch_config,
             owns_browser: true,
             seq: 0,
             history: BTreeMap::new(),
@@ -481,6 +481,7 @@ impl CdpTempoDriver {
         &mut self,
         url: String,
         dom_html: String,
+        _http_status: Option<u16>,
     ) -> Result<Arc<CompiledObservation>, TransportError> {
         self.seq += 1;
         let (mut compiled, selectors_by_node) =
@@ -506,8 +507,9 @@ impl CdpTempoDriver {
         cursor: u64,
         url: String,
         dom_html: String,
+        http_status: Option<u16>,
     ) -> Result<Arc<CompiledObservation>, TransportError> {
-        let compiled = self.record_snapshot(url, dom_html).await?;
+        let compiled = self.record_snapshot(url, dom_html, http_status).await?;
         // Every `_since` caller has already served the full 25ms event grace
         // for this same cursor immediately after its action command returned
         // (click/type/select/scroll/wait/goto/fixed-millis), so this side only
@@ -532,7 +534,8 @@ impl CdpTempoDriver {
         cursor: u64,
     ) -> Result<Arc<CompiledObservation>, TransportError> {
         let (url, dom_html) = self.snapshot_since(cursor).await?;
-        self.record_snapshot_since(cursor, url, dom_html).await
+        self.record_snapshot_since(cursor, url, dom_html, None)
+            .await
     }
 
     async fn goto_recorded(
@@ -545,14 +548,40 @@ impl CdpTempoDriver {
         if self.should_recreate_child_page_for_navigation() {
             self.recreate_child_page_for_navigation().await?;
         }
-        match tokio::time::timeout(CDP_NAVIGATION_AWAIT_TIMEOUT, self.page()?.goto(url)).await {
-            Ok(Ok(_page)) => {}
-            Ok(Err(CdpError::Timeout)) | Err(_) => {
-                self.recover_timed_out_navigation_since(cursor, url).await?;
+        let page = self.page()?.clone();
+        let mut navigation_status = None;
+        if self.browser_context_id.is_some() {
+            match tokio::time::timeout(
+                CDP_NAVIGATION_AWAIT_TIMEOUT,
+                navigate_without_http_status(&page, url),
+            )
+            .await
+            {
+                Ok(Ok(())) | Ok(Err(CdpError::Timeout)) | Err(_) => {
+                    self.recover_timed_out_navigation_since(cursor, url).await?;
+                }
+                Ok(Err(error)) => {
+                    self.enforce_no_blocked_request_soon_since(cursor).await?;
+                    return Err(map_cdp_error(error));
+                }
             }
-            Ok(Err(error)) => {
-                self.enforce_no_blocked_request_soon_since(cursor).await?;
-                return Err(map_cdp_error(error));
+        } else {
+            match tokio::time::timeout(
+                CDP_NAVIGATION_AWAIT_TIMEOUT,
+                navigate_with_http_status(&page, url),
+            )
+            .await
+            {
+                Ok(Ok(status)) => {
+                    navigation_status = status;
+                }
+                Ok(Err(CdpError::Timeout)) | Err(_) => {
+                    self.recover_timed_out_navigation_since(cursor, url).await?;
+                }
+                Ok(Err(error)) => {
+                    self.enforce_no_blocked_request_soon_since(cursor).await?;
+                    return Err(map_cdp_error(error));
+                }
             }
         }
         self.enforce_no_blocked_request_soon_since(cursor).await?;
@@ -566,12 +595,16 @@ impl CdpTempoDriver {
         // the sampler still recreates on demand if this fails.
         let _ = self.probe_context_id(true, cursor).await;
         let (final_url, dom_html) = self.snapshot_since(cursor).await?;
-        self.record_snapshot_since(cursor, final_url, dom_html)
+        self.record_snapshot_since(cursor, final_url, dom_html, navigation_status)
             .await
     }
 
     fn should_recreate_child_page_for_navigation(&self) -> bool {
-        self.browser_context_id.is_some()
+        // A child browsing context is already isolated by its Chrome
+        // BrowserContext. Recreating the target on every navigation makes
+        // ordinary tab navigations depend on target attach/detach races and can
+        // wedge the CDP handler before a later observe/act_batch returns.
+        false
     }
 
     async fn recreate_child_page_for_navigation(&mut self) -> Result<(), TransportError> {
@@ -823,6 +856,24 @@ impl CdpTempoDriver {
             Ok(StepOutcome::StepError {
                 reason: format!("node not found: {target}"),
             })
+        }
+    }
+
+    async fn settle_after_batch_action(
+        &mut self,
+        quiescence: QuiescencePolicy,
+    ) -> Result<Arc<CompiledObservation>, TransportError> {
+        match quiescence {
+            QuiescencePolicy::FixedMillis(millis) => {
+                let cursor = self.request_policy_cursor();
+                tokio::time::sleep(Duration::from_millis(millis)).await;
+                self.enforce_no_blocked_request_soon_since(cursor).await?;
+                self.record_current_observation_since(cursor).await
+            }
+            QuiescencePolicy::Composite => {
+                self.wait_for_composite_quiescence().await?;
+                self.record_current_observation().await
+            }
         }
     }
 
@@ -1228,39 +1279,30 @@ impl DriverTrait for CdpTempoDriver {
 
     async fn act_batch(&mut self, batch: &ActionBatch) -> Result<StepOutcome, TransportError> {
         let batch_base_seq = self.seq;
+        let mut last_settled = None;
         for action in &batch.actions {
             let outcome = self.run_one(action).await?;
             if matches!(outcome, StepOutcome::StepError { .. }) {
                 return Ok(outcome);
             }
+            if matches!(action, Action::Goto { .. }) {
+                last_settled = self.history.get(&self.seq).cloned();
+            } else {
+                last_settled = Some(self.settle_after_batch_action(batch.quiescence).await?);
+            }
         }
 
-        match batch.quiescence {
-            QuiescencePolicy::FixedMillis(millis) => {
-                let cursor = self.request_policy_cursor();
-                tokio::time::sleep(Duration::from_millis(millis)).await;
-                self.enforce_no_blocked_request_soon_since(cursor).await?;
-                let compiled = self.record_current_observation_since(cursor).await?;
-                Ok(StepOutcome::Applied {
-                    diff: diff_from_base(
-                        history_base(&self.history, batch_base_seq),
-                        compiled.as_ref(),
-                        batch_base_seq,
-                    ),
-                })
-            }
-            QuiescencePolicy::Composite => {
-                self.wait_for_composite_quiescence().await?;
-                let compiled = self.record_current_observation().await?;
-                Ok(StepOutcome::Applied {
-                    diff: diff_from_base(
-                        history_base(&self.history, batch_base_seq),
-                        compiled.as_ref(),
-                        batch_base_seq,
-                    ),
-                })
-            }
-        }
+        let compiled = match last_settled {
+            Some(compiled) => compiled,
+            None => self.record_current_observation().await?,
+        };
+        Ok(StepOutcome::Applied {
+            diff: diff_from_base(
+                history_base(&self.history, batch_base_seq),
+                compiled.as_ref(),
+                batch_base_seq,
+            ),
+        })
     }
 
     async fn fork(&mut self) -> Result<Box<dyn DriverTrait>, Unsupported> {
@@ -1271,97 +1313,22 @@ impl DriverTrait for CdpTempoDriver {
         &mut self,
         _options: BrowsingContextCreateOptions,
     ) -> Result<Box<dyn DriverTrait>, Unsupported> {
-        let browser_context_id = self
-            .browser
-            .create_browser_context(
-                CreateBrowserContextParams::builder()
-                    .dispose_on_detach(true)
-                    .build(),
-            )
+        let mut child = Self::launch_with(self.launch_config.clone())
             .await
             .map_err(|_error| Unsupported("fresh CDP browsing context"))?;
-        let browser_ws = self.browser.websocket_address().clone();
-        let handler_config = HandlerConfig {
-            context_ids: vec![browser_context_id.clone()],
-            request_timeout: CDP_REQUEST_TIMEOUT,
-            ..HandlerConfig::default()
-        };
-        let (browser, mut handler) =
-            match Browser::connect_with_config(browser_ws, handler_config).await {
-                Ok(pair) => pair,
-                Err(_error) => {
-                    let _ = self
-                        .browser
-                        .dispose_browser_context(browser_context_id.clone())
-                        .await;
-                    return Err(Unsupported("fresh CDP browsing context"));
-                }
-            };
-        let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
-        let page_params = match CreateTargetParams::builder()
-            .url("about:blank")
-            .browser_context_id(browser_context_id.clone())
-            .build()
-        {
-            Ok(params) => params,
-            Err(_error) => {
-                let _ = browser
-                    .dispose_browser_context(browser_context_id.clone())
-                    .await;
-                handler_task.abort();
-                return Err(Unsupported("fresh CDP browsing context"));
-            }
-        };
-        let page = match browser.new_page(page_params).await {
-            Ok(page) => page,
-            Err(_error) => {
-                let _ = browser
-                    .dispose_browser_context(browser_context_id.clone())
-                    .await;
-                handler_task.abort();
-                return Err(Unsupported("fresh CDP browsing context"));
-            }
-        };
-        let blocked_request_url = Arc::new(Mutex::new(None));
-        let request_policy_tracker = Arc::new(RequestPolicyTracker::new());
-        let request_policy_task = match install_request_policy(
-            &page,
-            self.browser_hardening_policy.clone(),
-            blocked_request_url.clone(),
-            request_policy_tracker.clone(),
-        )
-        .await
-        {
-            Ok(task) => task,
-            Err(_error) => {
-                let _ = page.close().await;
-                let _ = browser
-                    .dispose_browser_context(browser_context_id.clone())
-                    .await;
-                handler_task.abort();
-                return Err(Unsupported("fresh CDP browsing context"));
-            }
-        };
-
-        Ok(Box::new(Self {
-            browser,
-            page: Some(page),
-            handler_task,
-            request_policy_task: Some(request_policy_task),
-            policy_proxy: None,
-            browser_context_id: Some(browser_context_id),
-            profile_dir: None,
-            owns_browser: false,
-            seq: 0,
-            history: BTreeMap::new(),
-            stable_id_mapper: StableIdMapper::new(),
-            selectors_by_node: BTreeMap::new(),
-            url_policy: self.url_policy.clone(),
-            browser_hardening_policy: self.browser_hardening_policy.clone(),
-            blocked_request_url,
-            request_policy_tracker,
-            probe_context: Mutex::new(None),
-        }))
+        let url_policy = self
+            .url_policy
+            .lock()
+            .map_err(|_error| Unsupported("fresh CDP browsing context"))?
+            .clone();
+        let hardening_policy = self
+            .browser_hardening_policy
+            .lock()
+            .map_err(|_error| Unsupported("fresh CDP browsing context"))?
+            .clone();
+        child.set_url_policy(url_policy);
+        child.set_browser_hardening_policy(hardening_policy);
+        Ok(Box::new(child))
     }
 
     async fn extract(&mut self, node: &NodeId) -> Result<serde_json::Value, TransportError> {
@@ -1408,11 +1375,7 @@ impl DriverTrait for CdpTempoDriver {
     }
 
     async fn screenshot(&mut self) -> Result<Vec<u8>, TransportError> {
-        let params = ScreenshotParams::builder()
-            .format(CaptureScreenshotFormat::Png)
-            .clip(screenshot_viewport_clip()?)
-            .capture_beyond_viewport(false)
-            .build();
+        let params = screenshot_params()?;
         self.enforce_current_url_policy().await?;
         let bytes = self
             .page()?
@@ -2081,15 +2044,22 @@ fn enforce_url_policy_with_resolved_socket(
         .map_err(|_error| TransportError::UrlBlocked)
 }
 
-fn screenshot_viewport_clip() -> Result<Viewport, TransportError> {
+fn screenshot_viewport_clip_with_scale(scale: f64) -> Result<Viewport, TransportError> {
     Viewport::builder()
         .x(0.0)
         .y(0.0)
         .width(f64::from(MAX_SCREENSHOT_WIDTH))
         .height(f64::from(MAX_SCREENSHOT_HEIGHT))
-        .scale(1.0)
+        .scale(scale)
         .build()
         .map_err(TransportError::Other)
+}
+
+fn screenshot_params() -> Result<ScreenshotParams, TransportError> {
+    Ok(ScreenshotParams::builder()
+        .clip(screenshot_viewport_clip_with_scale(1.0)?)
+        .capture_beyond_viewport(false)
+        .build())
 }
 
 fn validate_screenshot_bytes(bytes: Vec<u8>) -> Result<Vec<u8>, TransportError> {
@@ -2101,6 +2071,39 @@ fn validate_screenshot_bytes(bytes: Vec<u8>) -> Result<Vec<u8>, TransportError> 
         });
     }
     Ok(bytes)
+}
+
+async fn navigate_with_http_status(page: &Page, url: &str) -> Result<Option<u16>, CdpError> {
+    let request = page
+        .http_future(NavigateParams {
+            url: url.to_string(),
+            transition_type: None,
+            frame_id: None,
+            referrer: None,
+            referrer_policy: None,
+        })?
+        .await?;
+    Ok(request.and_then(|request| request.response.as_ref().and_then(cdp_status_to_u16)))
+}
+
+async fn navigate_without_http_status(page: &Page, url: &str) -> Result<(), CdpError> {
+    page.goto(NavigateParams {
+        url: url.to_string(),
+        transition_type: None,
+        frame_id: None,
+        referrer: None,
+        referrer_policy: None,
+    })
+    .await?;
+    Ok(())
+}
+
+fn cdp_status_to_u16(
+    response: &chromiumoxide::cdp::browser_protocol::network::Response,
+) -> Option<u16> {
+    u16::try_from(response.status)
+        .ok()
+        .filter(|status| (100..=599).contains(status))
 }
 
 fn map_cdp_error(error: CdpError) -> TransportError {
@@ -2423,12 +2426,30 @@ fn compile_observation(
 fn raw_element_from_selector_element(element: &InteractiveElement) -> RawElement {
     let mut raw = RawElement::new(element.role.clone(), "")
         .source_id(element.node_id.0.clone())
+        .stable_hint(cdp_stable_hint(element))
         .name_spans(element.name.clone())
         .value_spans(element.value.clone());
     if let Some(bounds) = element.bounds {
         raw = raw.bounds(bounds);
     }
     raw
+}
+
+fn cdp_stable_hint(element: &InteractiveElement) -> String {
+    let mut hint = String::new();
+    hint.push_str("content:");
+    hint.push_str(&element.role);
+    hint.push('|');
+    push_spans_text(&mut hint, &element.name);
+    hint.push('|');
+    push_spans_text(&mut hint, &element.value);
+    hint
+}
+
+fn push_spans_text(output: &mut String, spans: &[TaintSpan]) {
+    for span in spans {
+        output.push_str(&span.text);
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3199,6 +3220,42 @@ mod tests {
     }
 
     #[test]
+    fn selector_elements_carry_stable_hints_for_observe_identity() {
+        let selector_backed = InteractiveElement {
+            node_id: NodeId("#pay".to_string()),
+            role: "button".to_string(),
+            name: vec![TaintSpan {
+                provenance: Provenance::Page,
+                text: "Pay".to_string(),
+            }],
+            value: Vec::new(),
+            bounds: None,
+            rank: 1.0,
+        };
+        let raw = raw_element_from_selector_element(&selector_backed);
+        assert_eq!(raw.source_id.as_deref(), Some("#pay"));
+        assert_eq!(raw.stable_hint.as_deref(), Some("content:button|Pay|"));
+
+        let structural = InteractiveElement {
+            node_id: NodeId("main:nth-of-type(1) > button:nth-of-type(2)".to_string()),
+            role: "button".to_string(),
+            name: vec![TaintSpan {
+                provenance: Provenance::Page,
+                text: "Continue".to_string(),
+            }],
+            value: Vec::new(),
+            bounds: None,
+            rank: 1.0,
+        };
+        let raw = raw_element_from_selector_element(&structural);
+        assert_eq!(
+            raw.source_id.as_deref(),
+            Some("main:nth-of-type(1) > button:nth-of-type(2)")
+        );
+        assert_eq!(raw.stable_hint.as_deref(), Some("content:button|Continue|"));
+    }
+
+    #[test]
     fn find_close_tag_matches_case_insensitively_in_one_pass() {
         // Case-insensitive, returns the byte offset of the '<' of "</tag".
         assert_eq!(find_close_tag(b"hi</A>", b"a"), Some(2));
@@ -3242,8 +3299,12 @@ mod tests {
             compile_observation(&mut mapper, "https://example.test/".into(), html.into(), 1);
         // Raw extractor emits document order and no marks.
         assert!(raw.marks.is_empty());
-        let finished =
-            finalize_observation(raw.url, raw.seq, raw.elements, CompileOptions::default());
+        let finished = tempo_observe::finalize_observation(
+            raw.url,
+            raw.seq,
+            raw.elements,
+            CompileOptions::default(),
+        );
         // Rank-sorted: ranks are non-increasing.
         assert!(finished
             .elements
@@ -3260,7 +3321,7 @@ mod tests {
         let (raw_big, _) = compile_observation(&mut mapper, "https://example.test/".into(), big, 2);
         let raw_count = raw_big.elements.len();
         assert!(raw_count > 200, "fixture should extract all 400 buttons");
-        let finished_big = finalize_observation(
+        let finished_big = tempo_observe::finalize_observation(
             raw_big.url,
             raw_big.seq,
             raw_big.elements,
@@ -3694,7 +3755,7 @@ mod tests {
 
     #[test]
     fn screenshot_clip_uses_max_dimensions() -> Result<(), Box<dyn std::error::Error>> {
-        let clip = screenshot_viewport_clip()?;
+        let clip = screenshot_viewport_clip_with_scale(1.0)?;
 
         assert_eq!(clip.x, 0.0);
         assert_eq!(clip.y, 0.0);
@@ -4990,6 +5051,8 @@ mod tests {
     #[tokio::test]
     async fn live_cdp_child_browsing_context_isolates_storage(
     ) -> Result<(), Box<dyn std::error::Error>> {
+        const CHILD_CONTEXT_OP_TIMEOUT: Duration = Duration::from_secs(30);
+
         let Some(chrome) = std::env::var_os("TEMPO_CDP_CHROME") else {
             eprintln!("skipping live CDP context isolation test; TEMPO_CDP_CHROME is unset");
             return Ok(());
@@ -5031,18 +5094,18 @@ mod tests {
 
         assert_eq!(child_value, serde_json::json!("__missing__"));
         assert_eq!(child_cookie, serde_json::json!(""));
-        let child_observe = tokio::time::timeout(Duration::from_secs(10), child.observe())
+        let child_observe = tokio::time::timeout(CHILD_CONTEXT_OP_TIMEOUT, child.observe())
             .await
             .map_err(|_| std::io::Error::other("child observe timed out"))??;
         assert_eq!(child_observe.url, url);
         let child_next_url = format!("{url}again");
         let child_second_goto =
-            tokio::time::timeout(Duration::from_secs(10), child.goto(&child_next_url))
+            tokio::time::timeout(CHILD_CONTEXT_OP_TIMEOUT, child.goto(&child_next_url))
                 .await
                 .map_err(|_| std::io::Error::other("child second goto timed out"))??;
         assert_eq!(child_second_goto.url, child_next_url);
         let child_batch = tokio::time::timeout(
-            Duration::from_secs(10),
+            CHILD_CONTEXT_OP_TIMEOUT,
             child.act_batch(&ActionBatch {
                 actions: vec![Action::Goto {
                     url: format!("{url}batch"),

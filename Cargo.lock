@@ -8539,6 +8539,7 @@ dependencies = [
  "tempfile",
  "tempo-driver",
  "tempo-engine-host",
+ "tempo-headless",
  "tempo-net",
  "tempo-observe",
  "tempo-schema",

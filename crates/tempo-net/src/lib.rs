@@ -5186,8 +5186,11 @@ mod tests {
         let error = StaticThreatDomainProvider::from_feed_lines(
             "fixture-feed",
             "good.test\nhttps://bad.test/path\n",
-        )
-        .expect_err("URL-shaped entries must be rejected");
+        );
+        let error = match error {
+            Ok(_) => panic!("URL-shaped entries must be rejected"),
+            Err(error) => error,
+        };
 
         assert_eq!(error.line, 2);
         assert_eq!(error.entry, "https://bad.test/path");
