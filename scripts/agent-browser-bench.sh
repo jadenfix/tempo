@@ -52,9 +52,15 @@ fi
 export TEMPO_CDP_NO_SANDBOX="${TEMPO_CDP_NO_SANDBOX:-1}"
 export TEMPO_DURABLE_RETENTION="${TEMPO_DURABLE_RETENTION:-plaintext-unsafe}"
 
+PY_ARGS=("$MODE")
+if [[ ${#ITERATIONS[@]} -gt 0 ]]; then
+  PY_ARGS+=("${ITERATIONS[@]}")
+fi
+if [[ ${#GATES[@]} -gt 0 ]]; then
+  PY_ARGS+=("${GATES[@]}")
+fi
+
 python3 scripts/agent_browser_bench.py \
-  "$MODE" \
-  "${ITERATIONS[@]}" \
-  "${GATES[@]}" \
+  "${PY_ARGS[@]}" \
   --chrome "$TEMPO_CDP_CHROME" \
   --output-dir "$OUTPUT_DIR"

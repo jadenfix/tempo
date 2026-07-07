@@ -9,6 +9,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: linux-agent-gate-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   docker-smoke-amd64:
     name: Docker Linux agent smoke (amd64)

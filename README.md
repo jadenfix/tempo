@@ -92,19 +92,27 @@ Real agent/browser benchmark artifacts are generated with:
 scripts/agent-browser-bench.sh --smoke --output-dir target/agent-browser-bench
 ```
 
-That harness serves `fixtures/evals/live_agent/checkout.html`, drives the same
-task through Tempo CDP, raw Chrome CDP, a Playwright-MCP-style live AX snapshot,
-and a browser-use-style live DOM serializer. The latter two are explicitly
-synthetic Chrome/CDP style lanes (`synthetic-playwright-ax` and
-`synthetic-browser-use-dom`), not external Playwright or browser-use agent
-processes. The harness writes:
+That harness serves `fixtures/evals/live_agent/checkout.html` and drives the
+same task through Tempo CDP, raw Chrome CDP, synthetic CDP snapshots for
+continuity, and two external subprocess baselines: `real-playwright` via
+Playwright's Python API and `external-browser-use-dom-loop`, a browser-use-style
+indexed DOM observation/action loop. The latter is deliberately labeled as a
+DOM-loop baseline rather than a full browser-use LLM agent, which would require
+model credentials and a separate prompt contract. The harness writes:
 
-- `agent-browser-bench.json[l]` with success, wall time, CPU time, max RSS,
-  step count, retry count, failure mode, and model-facing bytes/tokens.
+- `agent-browser-bench.json[l]` with success, wall time, CPU time, sampled
+  process-tree max RSS, step count, retry count, failure mode, and model-facing
+  bytes/tokens. Multi-observation loops report total model-facing input in
+  `model_input_*` and their largest single observation in `max_observation_*`.
 - `agent-browser-bench-summary.json` with per-runner run count, success rate,
   failure-mode counts, retry totals, and p50/p95/max stats for latency, CPU,
   RSS, step count, and model-facing bytes/tokens. `--smoke` runs one iteration;
   `--full` runs five by default, and `--iterations N` overrides either mode.
+- `real-playwright.json` and `external-browser-use-dom-loop.json`, plus each
+  runner's stdout/stderr logs, model-input text, and action trace, so CI proves
+  the external subprocess lanes ran and leaves auditable model-facing evidence.
+- `chrome-version.txt` and matching fields in the benchmark JSON so floating
+  Chrome-for-Testing resolution is captured with each artifact set.
 - `tempo-journal.sqlite`, `replay.json`, and `tempo-run.json` so the run is
   grounded in durable agent evidence.
 - `eval-records.jsonl`, `scorecard.json`, and `amdahl.json`; `amdahl.json` is
