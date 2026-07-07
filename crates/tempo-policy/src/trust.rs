@@ -112,6 +112,9 @@ pub fn action_caller_texts(action: &Action) -> Vec<&str> {
         Action::Goto { url } => vec![url.as_str()],
         Action::Type { text, .. } => vec![text.as_str()],
         Action::Select { value, .. } => vec![value.as_str()],
+        Action::FindText { text, .. } => vec![text.as_str()],
+        Action::ElementPresent { query, .. } => vec![query.as_str()],
+        Action::QuerySelector { selector, .. } => vec![selector.as_str()],
         Action::Skill { input, .. } => {
             let mut texts = Vec::new();
             collect_string_leaves(input, &mut texts);
@@ -301,6 +304,29 @@ mod tests {
                 value: "opt".into()
             }),
             vec!["opt"]
+        );
+        assert_eq!(
+            action_caller_texts(&Action::FindText {
+                text: "continue".into(),
+                case_sensitive: false,
+                max_results: None,
+            }),
+            vec!["continue"]
+        );
+        assert_eq!(
+            action_caller_texts(&Action::ElementPresent {
+                mode: tempo_schema::ElementPresentMode::Text,
+                query: "receipt".into(),
+                case_sensitive: false,
+            }),
+            vec!["receipt"]
+        );
+        assert_eq!(
+            action_caller_texts(&Action::QuerySelector {
+                selector: "main article".into(),
+                max_results: None,
+            }),
+            vec!["main article"]
         );
         assert!(action_caller_texts(&Action::Click {
             node: NodeId("n".into())

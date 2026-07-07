@@ -3343,6 +3343,34 @@ fn redact_action(action: &Action) -> serde_json::Value {
         Action::Scroll { x, y } => json!({ "kind": "scroll", "x": x, "y": y }),
         Action::Wait { millis } => json!({ "kind": "wait", "millis": millis }),
         Action::Extract { node: _ } => json!({ "kind": "extract", "node": REDACTED_MARKER }),
+        Action::FindText {
+            text: _,
+            case_sensitive,
+            max_results,
+        } => json!({
+            "kind": "find_text",
+            "text": REDACTED_MARKER,
+            "case_sensitive": case_sensitive,
+            "max_results": max_results,
+        }),
+        Action::ElementPresent {
+            mode,
+            query: _,
+            case_sensitive,
+        } => json!({
+            "kind": "element_present",
+            "mode": mode,
+            "query": REDACTED_MARKER,
+            "case_sensitive": case_sensitive,
+        }),
+        Action::QuerySelector {
+            selector: _,
+            max_results,
+        } => json!({
+            "kind": "query_selector",
+            "selector": REDACTED_MARKER,
+            "max_results": max_results,
+        }),
         // Skill input is arbitrary JSON that may contain secrets — keep the name
         // (a skill identifier, not page-derived), mark the input.
         Action::Skill { name, input: _ } => json!({
@@ -6392,6 +6420,9 @@ fn action_kind(action: &Action) -> &'static str {
         Action::Scroll { .. } => "scroll",
         Action::Wait { .. } => "wait",
         Action::Extract { .. } => "extract",
+        Action::FindText { .. } => "find_text",
+        Action::ElementPresent { .. } => "element_present",
+        Action::QuerySelector { .. } => "query_selector",
         Action::Skill { .. } => "skill",
     }
 }
@@ -14489,8 +14520,23 @@ mod tests {
             openapi["components"]["schemas"]["Action"]["oneOf"]
                 .as_array()
                 .map(Vec::len),
-            Some(8)
+            Some(11)
         );
+        let Some(action_variants) = openapi["components"]["schemas"]["Action"]["oneOf"].as_array()
+        else {
+            panic!("Action schema oneOf missing");
+        };
+        let action_kinds = action_variants
+            .iter()
+            .filter_map(|variant| {
+                variant["properties"]["kind"]["const"]
+                    .as_str()
+                    .map(str::to_owned)
+            })
+            .collect::<Vec<_>>();
+        assert!(action_kinds.iter().any(|kind| kind == "find_text"));
+        assert!(action_kinds.iter().any(|kind| kind == "element_present"));
+        assert!(action_kinds.iter().any(|kind| kind == "query_selector"));
         assert_eq!(
             openapi["components"]["schemas"]["Action"]["oneOf"][1]["properties"]["node"]["$ref"],
             "#/components/schemas/NodeId"

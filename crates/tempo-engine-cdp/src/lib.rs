@@ -41,8 +41,9 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tempo_driver::{
-    BrowsingContextCreateOptions, DriverTrait, Engine, StepOutcome, TaintedValue, TransportError,
-    Unsupported, MAX_SCREENSHOT_BYTES, MAX_SCREENSHOT_HEIGHT, MAX_SCREENSHOT_WIDTH,
+    read_action_script, BrowsingContextCreateOptions, DriverTrait, Engine, StepOutcome,
+    TaintedValue, TransportError, Unsupported, MAX_EXTRACT_JSON_BYTES, MAX_SCREENSHOT_BYTES,
+    MAX_SCREENSHOT_HEIGHT, MAX_SCREENSHOT_WIDTH,
 };
 use tempo_net::UrlPolicy;
 use tempo_observe::{
@@ -209,6 +210,19 @@ impl Default for CdpConfig {
             args: Vec::new(),
         }
     }
+}
+
+fn enforce_read_action_result_cap(value: TaintedValue) -> Result<TaintedValue, TransportError> {
+    let bytes = serde_json::to_vec(&value)
+        .map_err(|error| TransportError::Other(format!("serialize read action result: {error}")))?;
+    if bytes.len() > MAX_EXTRACT_JSON_BYTES {
+        return Err(TransportError::OutputTooLarge {
+            artifact: "read_action_json",
+            bytes: bytes.len(),
+            max_bytes: MAX_EXTRACT_JSON_BYTES,
+        });
+    }
+    Ok(value)
 }
 
 /// CDP-backed tempo driver. Construct it with [`CdpTempoDriver::launch`].
@@ -1292,6 +1306,30 @@ impl CdpTempoDriver {
                     });
                 }
                 let read_result = self.extract(node).await?;
+                let compiled = self.record_current_observation().await?;
+                Ok(StepOutcome::applied_with_read_result(
+                    diff_from_base(
+                        history_base(&self.history, previous_seq),
+                        compiled.as_ref(),
+                        previous_seq,
+                    ),
+                    read_result,
+                ))
+            }
+            Action::FindText { .. }
+            | Action::ElementPresent { .. }
+            | Action::QuerySelector { .. } => {
+                let script = match read_action_script(action) {
+                    Ok(Some(script)) => script,
+                    Ok(None) => {
+                        return Ok(StepOutcome::StepError {
+                            reason: "not a read helper action".into(),
+                        });
+                    }
+                    Err(reason) => return Ok(StepOutcome::StepError { reason }),
+                };
+                let read_result =
+                    enforce_read_action_result_cap(self.evaluate_script(&script, true).await?)?;
                 let compiled = self.record_current_observation().await?;
                 Ok(StepOutcome::applied_with_read_result(
                     diff_from_base(

@@ -472,6 +472,9 @@ pub enum ServoEmbedderCommand {
     ExtractNode {
         node: NodeId,
     },
+    UnsupportedReadHelper {
+        action_kind: String,
+    },
     InvokeSkill {
         name: String,
         input: serde_json::Value,
@@ -492,6 +495,15 @@ impl ServoEmbedderCommand {
             Action::Scroll { x, y } => Self::Scroll { x, y },
             Action::Wait { millis } => Self::Wait { millis },
             Action::Extract { node } => Self::ExtractNode { node },
+            Action::FindText { .. } => Self::UnsupportedReadHelper {
+                action_kind: "find_text".into(),
+            },
+            Action::ElementPresent { .. } => Self::UnsupportedReadHelper {
+                action_kind: "element_present".into(),
+            },
+            Action::QuerySelector { .. } => Self::UnsupportedReadHelper {
+                action_kind: "query_selector".into(),
+            },
             Action::Skill { name, input } => Self::InvokeSkill { name, input },
         }
     }

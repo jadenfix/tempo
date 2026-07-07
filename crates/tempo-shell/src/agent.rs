@@ -166,6 +166,9 @@ fn action_kind(action: &Action) -> &'static str {
         Action::Scroll { .. } => "scroll",
         Action::Wait { .. } => "wait",
         Action::Extract { .. } => "extract",
+        Action::FindText { .. } => "find_text",
+        Action::ElementPresent { .. } => "element_present",
+        Action::QuerySelector { .. } => "query_selector",
         Action::Skill { .. } => "skill",
     }
 }
