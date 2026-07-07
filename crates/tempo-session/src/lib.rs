@@ -17,7 +17,7 @@ use std::io::{BufRead as _, BufReader, Read as _, Seek as _, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tempo_driver::{StepOutcome, TransportError};
+use tempo_driver::{StepOutcome, TaintedValue, TransportError};
 use tempo_schema::{Action, CompiledObservation, HumanTakeover, ObservationDiff};
 use thiserror::Error;
 
@@ -138,6 +138,8 @@ pub enum JournalEvent {
     StepApplied {
         action: Action,
         diff: ObservationDiff,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        read_result: Option<TaintedValue>,
     },
     StepError {
         action: Action,
@@ -171,7 +173,11 @@ impl JournalEvent {
     /// Convert a driver step result into the journal shape that survives process restarts.
     pub fn from_step_outcome(action: Action, outcome: StepOutcome) -> Self {
         match outcome {
-            StepOutcome::Applied { diff } => Self::StepApplied { action, diff },
+            StepOutcome::Applied { diff, read_result } => Self::StepApplied {
+                action,
+                diff,
+                read_result,
+            },
             StepOutcome::StepError { reason } => Self::StepError {
                 action,
                 reason,
@@ -1892,6 +1898,7 @@ mod tests {
                     removed: vec![],
                     changed: vec![],
                 },
+                read_result: None,
             },
             JournalEvent::SessionClosed,
         ];
@@ -2066,6 +2073,63 @@ mod tests {
                 policy_denied: false,
             }
         );
+    }
+
+    #[test]
+    fn step_outcome_conversion_preserves_read_result() {
+        let action = Action::Extract {
+            node: NodeId("button.primary".into()),
+        };
+        let diff = ObservationDiff {
+            since_seq: 1,
+            seq: 2,
+            url: None,
+            omitted: 0,
+            marks: Vec::new(),
+            added: Vec::new(),
+            removed: Vec::new(),
+            changed: Vec::new(),
+        };
+        let read_result = tempo_driver::TaintedValue::page(serde_json::json!({
+            "kind": "extract",
+            "text": "fixture"
+        }));
+        let event = JournalEvent::from_step_outcome(
+            action.clone(),
+            StepOutcome::applied_with_read_result(diff.clone(), read_result.clone()),
+        );
+
+        assert_eq!(
+            event,
+            JournalEvent::StepApplied {
+                action,
+                diff,
+                read_result: Some(read_result),
+            }
+        );
+    }
+
+    #[test]
+    fn legacy_step_applied_without_read_result_defaults_to_none() -> TestResult {
+        let json = serde_json::json!({
+            "kind": "step_applied",
+            "action": {"kind": "scroll", "x": 0.0, "y": 1.0},
+            "diff": {
+                "since_seq": 1,
+                "seq": 2,
+                "added": [],
+                "removed": [],
+                "changed": []
+            }
+        });
+        let event: JournalEvent = serde_json::from_value(json)?;
+        match event {
+            JournalEvent::StepApplied { read_result, .. } => {
+                assert_eq!(read_result, None);
+                Ok(())
+            }
+            other => Err(format!("expected StepApplied, got {other:?}").into()),
+        }
     }
 
     #[test]
@@ -3998,6 +4062,7 @@ mod tests {
                     removed: vec![],
                     changed: vec![],
                 },
+                read_result: None,
             },
             JournalEvent::CassetteRecorded {
                 key: CassetteKey("checkout-response".into()),

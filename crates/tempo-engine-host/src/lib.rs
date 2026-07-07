@@ -458,14 +458,20 @@ struct DriverRequestPayload {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WireStepOutcome {
-    Applied { diff: ObservationDiff },
-    StepError { reason: String },
+    Applied {
+        diff: ObservationDiff,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        read_result: Option<TaintedValue>,
+    },
+    StepError {
+        reason: String,
+    },
 }
 
 impl From<StepOutcome> for WireStepOutcome {
     fn from(outcome: StepOutcome) -> Self {
         match outcome {
-            StepOutcome::Applied { diff } => Self::Applied { diff },
+            StepOutcome::Applied { diff, read_result } => Self::Applied { diff, read_result },
             StepOutcome::StepError { reason } => Self::StepError { reason },
         }
     }
@@ -474,7 +480,7 @@ impl From<StepOutcome> for WireStepOutcome {
 impl From<WireStepOutcome> for StepOutcome {
     fn from(outcome: WireStepOutcome) -> Self {
         match outcome {
-            WireStepOutcome::Applied { diff } => Self::Applied { diff },
+            WireStepOutcome::Applied { diff, read_result } => Self::Applied { diff, read_result },
             WireStepOutcome::StepError { reason } => Self::StepError { reason },
         }
     }

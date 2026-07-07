@@ -1183,13 +1183,11 @@ impl CdpTempoDriver {
     ) -> Result<StepOutcome, TransportError> {
         let compiled = self.record_current_observation_since(cursor).await?;
         if grounded {
-            Ok(StepOutcome::Applied {
-                diff: diff_from_base(
-                    history_base(&self.history, previous_seq),
-                    compiled.as_ref(),
-                    previous_seq,
-                ),
-            })
+            Ok(StepOutcome::applied(diff_from_base(
+                history_base(&self.history, previous_seq),
+                compiled.as_ref(),
+                previous_seq,
+            )))
         } else {
             Ok(StepOutcome::StepError {
                 reason: format!("node not found: {target}"),
@@ -1202,13 +1200,11 @@ impl CdpTempoDriver {
         match action {
             Action::Goto { url } => {
                 let compiled = self.goto_recorded(url).await?;
-                Ok(StepOutcome::Applied {
-                    diff: diff_from_base(
-                        history_base(&self.history, previous_seq),
-                        compiled.as_ref(),
-                        previous_seq,
-                    ),
-                })
+                Ok(StepOutcome::applied(diff_from_base(
+                    history_base(&self.history, previous_seq),
+                    compiled.as_ref(),
+                    previous_seq,
+                )))
             }
             Action::Click { node } => {
                 let cursor = self.request_policy_cursor();
@@ -1271,38 +1267,40 @@ impl CdpTempoDriver {
                     .map_err(map_cdp_error)?;
                 self.enforce_no_blocked_request_soon_since(cursor).await?;
                 let compiled = self.record_current_observation_since(cursor).await?;
-                Ok(StepOutcome::Applied {
-                    diff: diff_from_base(
-                        history_base(&self.history, previous_seq),
-                        compiled.as_ref(),
-                        previous_seq,
-                    ),
-                })
+                Ok(StepOutcome::applied(diff_from_base(
+                    history_base(&self.history, previous_seq),
+                    compiled.as_ref(),
+                    previous_seq,
+                )))
             }
             Action::Wait { millis } => {
                 let cursor = self.request_policy_cursor();
                 tokio::time::sleep(Duration::from_millis(*millis)).await;
                 self.enforce_no_blocked_request_soon_since(cursor).await?;
                 let compiled = self.record_current_observation_since(cursor).await?;
-                Ok(StepOutcome::Applied {
-                    diff: diff_from_base(
+                Ok(StepOutcome::applied(diff_from_base(
+                    history_base(&self.history, previous_seq),
+                    compiled.as_ref(),
+                    previous_seq,
+                )))
+            }
+            Action::Extract { node } => {
+                let grounding = self.resolve_node_action_element(node).await?;
+                if grounding.element.is_none() {
+                    return Ok(StepOutcome::StepError {
+                        reason: format!("node not found: {}", grounding.target),
+                    });
+                }
+                let read_result = self.extract(node).await?;
+                let compiled = self.record_current_observation().await?;
+                Ok(StepOutcome::applied_with_read_result(
+                    diff_from_base(
                         history_base(&self.history, previous_seq),
                         compiled.as_ref(),
                         previous_seq,
                     ),
-                })
-            }
-            Action::Extract { node } => {
-                let cursor = self.request_policy_cursor();
-                let grounding = self.resolve_node_action_element(node).await?;
-                self.enforce_no_blocked_request_soon_since(cursor).await?;
-                self.node_outcome_since(
-                    previous_seq,
-                    &grounding.target,
-                    grounding.element.is_some(),
-                    cursor,
-                )
-                .await
+                    read_result,
+                ))
             }
             Action::Skill { name, .. } => Ok(StepOutcome::StepError {
                 reason: format!("skill action {name:?} is handled by tempo-skills, not CDP"),
@@ -1763,13 +1761,11 @@ impl DriverTrait for CdpTempoDriver {
         let batch_base_seq = self.seq;
         if batch.actions.is_empty() {
             let compiled = self.settle_batch_action(batch.quiescence).await?;
-            return Ok(StepOutcome::Applied {
-                diff: diff_from_base(
-                    history_base(&self.history, batch_base_seq),
-                    compiled.as_ref(),
-                    batch_base_seq,
-                ),
-            });
+            return Ok(StepOutcome::applied(diff_from_base(
+                history_base(&self.history, batch_base_seq),
+                compiled.as_ref(),
+                batch_base_seq,
+            )));
         }
 
         let mut settled = None;
@@ -1787,13 +1783,11 @@ impl DriverTrait for CdpTempoDriver {
 
         let compiled =
             settled.ok_or_else(|| TransportError::Other("batch produced no observation".into()))?;
-        Ok(StepOutcome::Applied {
-            diff: diff_from_base(
-                history_base(&self.history, batch_base_seq),
-                compiled.as_ref(),
-                batch_base_seq,
-            ),
-        })
+        Ok(StepOutcome::applied(diff_from_base(
+            history_base(&self.history, batch_base_seq),
+            compiled.as_ref(),
+            batch_base_seq,
+        )))
     }
 
     async fn fork(&mut self) -> Result<Box<dyn DriverTrait>, Unsupported> {

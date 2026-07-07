@@ -11,7 +11,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use tempo_act::{execute_action_from_seq, execute_batch_from_seq, ExecutionStatus};
-use tempo_driver::{DriverTrait, Engine, StepOutcome, TransportError};
+use tempo_driver::{DriverTrait, Engine, StepOutcome, TaintedValue, TransportError};
 use tempo_handshake::{probe_http_origin, LaneDecision, ProbeHit};
 pub use tempo_handshake::{HttpProbeConfig, Lane as StructuredLane, StructuredSignal};
 use tempo_net::resolve_url_target;
@@ -1183,9 +1183,7 @@ impl AgentRunner {
             // but the side effects are already captured by the forced post-batch
             // diff and the post-action observation below.
             let outcome = match execution.status {
-                ExecutionStatus::Applied => StepOutcome::Applied {
-                    diff: execution.diff,
-                },
+                ExecutionStatus::Applied => StepOutcome::applied(execution.diff),
                 ExecutionStatus::PartiallyApplied { reason }
                 | ExecutionStatus::StepError { reason } => StepOutcome::StepError { reason },
             };
@@ -1416,9 +1414,7 @@ impl AgentRunner {
                             reason: call.error_reason(),
                         }
                     } else {
-                        StepOutcome::Applied {
-                            diff: empty_structured_diff(index as u64),
-                        }
+                        StepOutcome::applied(empty_structured_diff(index as u64))
                     }
                 }
                 other => {
@@ -1854,7 +1850,9 @@ impl StepTriple {
         event: JournalEvent,
     ) -> Result<Self, AgentError> {
         let outcome = match event {
-            JournalEvent::StepApplied { diff, .. } => StepTripleOutcome::Applied { diff },
+            JournalEvent::StepApplied {
+                diff, read_result, ..
+            } => StepTripleOutcome::Applied { diff, read_result },
             JournalEvent::StepError { reason, .. } => StepTripleOutcome::StepError { reason },
             _ => return Err(AgentError::JournalEventIsNotStep { seq }),
         };
@@ -1871,8 +1869,14 @@ impl StepTriple {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum StepTripleOutcome {
-    Applied { diff: ObservationDiff },
-    StepError { reason: String },
+    Applied {
+        diff: ObservationDiff,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        read_result: Option<TaintedValue>,
+    },
+    StepError {
+        reason: String,
+    },
 }
 
 /// Rebuild StepTriples from a real session journal and the original plan.
@@ -2659,7 +2663,7 @@ mod tests {
             TokenBudget::new(20),
         )?;
 
-        let triple = agent.record_next_outcome(StepOutcome::Applied { diff: diff(0, 1) })?;
+        let triple = agent.record_next_outcome(StepOutcome::applied(diff(0, 1)))?;
         let entries = read_journal_entries(&journal_path)?;
         let triples = step_triples_from_journal_plaintext_unsafe(&journal_path, &plan)?;
 
@@ -2699,6 +2703,7 @@ mod tests {
         journal.append(JournalEvent::StepApplied {
             action: first.clone(),
             diff: diff(0, 1),
+            read_result: None,
         })?;
         journal.append(JournalEvent::ActionPlanned {
             action: second.clone(),
@@ -2755,6 +2760,7 @@ mod tests {
         journal.append(JournalEvent::StepApplied {
             action: completed.clone(),
             diff: diff(0, 1),
+            read_result: None,
         })?;
         journal.append(JournalEvent::ActionPlanned { action: pending })?;
         drop(journal);
@@ -2789,6 +2795,7 @@ mod tests {
         journal.append(JournalEvent::StepApplied {
             action: first,
             diff: diff(0, 1),
+            read_result: None,
         })?;
         journal.append(JournalEvent::ActionPlanned {
             action: second.clone(),
@@ -2841,6 +2848,7 @@ mod tests {
         journal.append(JournalEvent::StepApplied {
             action: first,
             diff: diff(0, 1),
+            read_result: None,
         })?;
         drop(journal);
 
@@ -2919,6 +2927,7 @@ mod tests {
         journal.append(JournalEvent::StepApplied {
             action,
             diff: diff(0, 1),
+            read_result: None,
         })?;
         drop(journal);
 
@@ -2960,6 +2969,7 @@ mod tests {
         journal.append(JournalEvent::StepApplied {
             action: first,
             diff: diff(0, 1),
+            read_result: None,
         })?;
         journal.append(JournalEvent::ActionPlanned { action: second })?;
         drop(journal);
@@ -2998,6 +3008,7 @@ mod tests {
         journal.append(JournalEvent::StepApplied {
             action: Action::Scroll { x: 0.0, y: 99.0 },
             diff: diff(0, 1),
+            read_result: None,
         })?;
         drop(journal);
 
@@ -3033,7 +3044,7 @@ mod tests {
             TokenBudget::new(10),
         )?;
 
-        agent.record_next_outcome(StepOutcome::Applied { diff: diff(0, 1) })?;
+        agent.record_next_outcome(StepOutcome::applied(diff(0, 1)))?;
 
         assert_eq!(agent.completed_keys(), BTreeSet::from([expected]));
 

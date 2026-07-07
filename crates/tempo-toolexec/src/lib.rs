@@ -326,18 +326,16 @@ impl ToolStepStatus {
 
     pub fn to_step_outcome(&self, since_seq: u64, seq: u64) -> StepOutcome {
         match self {
-            Self::Applied => StepOutcome::Applied {
-                diff: ObservationDiff {
-                    since_seq,
-                    seq,
-                    url: None,
-                    omitted: 0,
-                    marks: Vec::new(),
-                    added: Vec::new(),
-                    removed: Vec::new(),
-                    changed: Vec::new(),
-                },
-            },
+            Self::Applied => StepOutcome::applied(ObservationDiff {
+                since_seq,
+                seq,
+                url: None,
+                omitted: 0,
+                marks: Vec::new(),
+                added: Vec::new(),
+                removed: Vec::new(),
+                changed: Vec::new(),
+            }),
             Self::StepError { reason } => StepOutcome::StepError {
                 reason: reason.clone(),
             },
@@ -899,7 +897,7 @@ mod tests {
         assert!(execution.audit.has_egress());
         assert_eq!(execution.audit.inputs_digest, "sha256:test");
         match execution.to_step_outcome(12, 13) {
-            StepOutcome::Applied { diff } => {
+            StepOutcome::Applied { diff, .. } => {
                 assert_eq!(diff.since_seq, 12);
                 assert_eq!(diff.seq, 13);
                 assert!(diff.added.is_empty());

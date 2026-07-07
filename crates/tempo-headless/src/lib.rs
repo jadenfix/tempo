@@ -3357,14 +3357,20 @@ fn redact_action(action: &Action) -> serde_json::Value {
 /// diff (which contains taint-labeled page text) is reduced to element counts.
 fn redact_step_outcome(outcome: &StepTripleOutcome) -> serde_json::Value {
     match outcome {
-        StepTripleOutcome::Applied { diff } => json!({
-            "kind": "applied",
-            "since_seq": diff.since_seq,
-            "seq": diff.seq,
-            "added": diff.added.len(),
-            "removed": diff.removed.len(),
-            "changed": diff.changed.len(),
-        }),
+        StepTripleOutcome::Applied { diff, read_result } => {
+            let mut value = json!({
+                "kind": "applied",
+                "since_seq": diff.since_seq,
+                "seq": diff.seq,
+                "added": diff.added.len(),
+                "removed": diff.removed.len(),
+                "changed": diff.changed.len(),
+            });
+            if let Some(read_result) = read_result {
+                value["read_result"] = redact_read_result(read_result);
+            }
+            value
+        }
         // `reason` is free-form and can embed arbitrary remote/secret content
         // (e.g. a failed navigation echoing a URL with `?token=...`, or a remote
         // error body), so replace it with the constant marker — consistent with
@@ -3374,6 +3380,27 @@ fn redact_step_outcome(outcome: &StepTripleOutcome) -> serde_json::Value {
             "reason": REDACTED_MARKER,
         }),
     }
+}
+
+fn redact_read_result(read_result: &TaintedValue) -> serde_json::Value {
+    let value = &read_result.value;
+    let kind = value
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("structured_read");
+    let shape = match value {
+        serde_json::Value::Array(items) => format!("array:{}", items.len()),
+        serde_json::Value::Object(map) => format!("object:{}", map.len()),
+        serde_json::Value::Null => "null".to_string(),
+        serde_json::Value::Bool(_) => "bool".to_string(),
+        serde_json::Value::Number(_) => "number".to_string(),
+        serde_json::Value::String(_) => "string".to_string(),
+    };
+    json!({
+        "provenance": read_result.provenance,
+        "kind": kind,
+        "shape": shape,
+    })
 }
 
 /// Redact a `Goto` URL for telemetry: emit only the origin plus non-sensitive
@@ -6524,11 +6551,17 @@ impl std::error::Error for PolicyDeniedError {}
 fn step_outcome_response(outcome: StepOutcome, policy: SessionBatchPolicyReport) -> JsonValue {
     let policy = session_batch_policy_json(&policy);
     match outcome {
-        StepOutcome::Applied { diff } => json!({
-            "status": "applied",
-            "diff": diff,
-            "policy": policy,
-        }),
+        StepOutcome::Applied { diff, read_result } => {
+            let mut value = json!({
+                "status": "applied",
+                "diff": diff,
+                "policy": policy,
+            });
+            if let Some(read_result) = read_result {
+                value["read_result"] = json!(read_result);
+            }
+            value
+        }
         StepOutcome::StepError { reason } => json!({
             "status": "step_error",
             "reason": reason,
@@ -7162,7 +7195,15 @@ pub fn tempod_openapi(base_url: &str) -> JsonValue {
                             "required": ["kind", "diff"],
                             "properties": {
                                 "kind": {"const": "applied"},
-                                "diff": {"$ref": "#/components/schemas/ObservationDiff"}
+                                "diff": {"$ref": "#/components/schemas/ObservationDiff"},
+                                "read_result": {
+                                    "type": "object",
+                                    "additionalProperties": true,
+                                    "properties": {
+                                        "value": true,
+                                        "provenance": {"type": "string"}
+                                    }
+                                }
                             }
                         },
                         {
@@ -9189,7 +9230,11 @@ fn replay_decided_journal_events(
                     },
                 )?;
             }
-            tempo_session::JournalEvent::StepApplied { action, diff } => {
+            tempo_session::JournalEvent::StepApplied {
+                action,
+                diff,
+                read_result,
+            } => {
                 let key = IdempotencyKey::for_action(step_index, action)
                     .map_err(|error| TempodError::Driver(error.to_string()))?;
                 pool.record_step(
@@ -9198,7 +9243,10 @@ fn replay_decided_journal_events(
                         key,
                         seq: entry.seq,
                         action: action.clone(),
-                        outcome: StepTripleOutcome::Applied { diff: diff.clone() },
+                        outcome: StepTripleOutcome::Applied {
+                            diff: diff.clone(),
+                            read_result: read_result.clone(),
+                        },
                     },
                 )?;
                 step_index += 1;
@@ -10348,6 +10396,7 @@ mod tests {
                             removed: Vec::new(),
                             changed: Vec::new(),
                         },
+                        read_result: None,
                     }
                     .into(),
                 }
@@ -10456,6 +10505,7 @@ mod tests {
                             removed: Vec::new(),
                             changed: Vec::new(),
                         },
+                        read_result: None,
                     }
                     .into(),
                 }
@@ -10591,7 +10641,7 @@ mod tests {
             TempodSessionEventKind::StepTriple { triple } => {
                 assert_eq!(triple.action, Action::Scroll { x: 0.0, y: 4.0 });
                 match &triple.outcome {
-                    StepTripleOutcome::Applied { diff } => {
+                    StepTripleOutcome::Applied { diff, .. } => {
                         assert_eq!(diff.since_seq, 1);
                         assert_eq!(diff.seq, 2);
                     }
@@ -10819,6 +10869,7 @@ mod tests {
                             removed: Vec::new(),
                             changed: Vec::new(),
                         },
+                        read_result: None,
                     }
                     .into(),
                 }
@@ -10898,6 +10949,7 @@ mod tests {
                             removed: Vec::new(),
                             changed: Vec::new(),
                         },
+                        read_result: None,
                     }
                     .into(),
                 }
@@ -11096,6 +11148,7 @@ mod tests {
                             removed: Vec::new(),
                             changed: Vec::new(),
                         },
+                        read_result: None,
                     }
                     .into(),
                 }
@@ -11361,6 +11414,7 @@ mod tests {
                             removed: Vec::new(),
                             changed: Vec::new(),
                         },
+                        read_result: None,
                     }
                     .into(),
                 }
@@ -11666,6 +11720,7 @@ mod tests {
                         removed: Vec::new(),
                         changed: Vec::new(),
                     },
+                    read_result: None,
                 }
                 .into(),
             },
@@ -15463,6 +15518,7 @@ mod tests {
                         removed: Vec::new(),
                         changed: Vec::new(),
                     },
+                    read_result: None,
                 }
                 .into(),
             }
@@ -15711,6 +15767,7 @@ mod tests {
                         removed: Vec::new(),
                         changed: Vec::new(),
                     },
+                    read_result: None,
                 }
                 .into(),
             }
@@ -16434,6 +16491,7 @@ mod tests {
                     removed: vec![],
                     changed: vec![],
                 },
+                read_result: None,
             },
         };
 
@@ -16523,6 +16581,7 @@ mod tests {
                     removed: vec![],
                     changed: vec![],
                 },
+                read_result: None,
             },
         };
         OtlpJsonExporter::new(&typed_path).export_step(&typed)?;
@@ -16614,6 +16673,7 @@ mod tests {
                     removed: vec![],
                     changed: vec![],
                 },
+                read_result: None,
             },
         };
         OtlpJsonExporter::new(&port_path).export_step(&port_goto)?;
@@ -18432,6 +18492,7 @@ mod tests {
                             removed: Vec::new(),
                             changed: Vec::new(),
                         },
+                        read_result: None,
                     }
                     .into(),
                 }
@@ -19523,6 +19584,7 @@ mod tests {
                     removed: vec![],
                     changed: vec![],
                 },
+                read_result: None,
             },
         }
     }

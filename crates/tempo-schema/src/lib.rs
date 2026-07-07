@@ -451,7 +451,8 @@ impl Action {
     /// then must discard any later queued actions and re-plan from the next
     /// observation.
     pub fn terminates_sequence(&self) -> bool {
-        matches!(self, Action::Goto { .. }) || self.side_effect() >= SideEffect::Send
+        matches!(self, Action::Goto { .. } | Action::Extract { .. })
+            || self.side_effect() >= SideEffect::Send
     }
 }
 

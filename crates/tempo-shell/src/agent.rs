@@ -139,7 +139,12 @@ impl JournalEntry {
 /// step error carries no new observation, so it is treated as untainted.
 fn step_is_tainted(triple: &SessionStepTriple) -> bool {
     match &triple.outcome {
-        SessionStepOutcome::Applied { diff } => tempo_taint::contains_untrusted(diff_spans(diff)),
+        SessionStepOutcome::Applied { diff, read_result } => {
+            tempo_taint::contains_untrusted(diff_spans(diff))
+                || read_result
+                    .as_ref()
+                    .is_some_and(tempo_driver::TaintedValue::is_page_derived)
+        }
         SessionStepOutcome::StepError { .. } => false,
     }
 }
@@ -324,7 +329,7 @@ impl JournalLog {
         for event in fresh {
             match &event.event {
                 TempodSessionEventKind::StepTriple { triple } => {
-                    if let SessionStepOutcome::Applied { diff } = &triple.outcome {
+                    if let SessionStepOutcome::Applied { diff, .. } = &triple.outcome {
                         self.accumulate_taint(diff);
                     }
                 }
@@ -425,7 +430,10 @@ mod tests {
             action: Action::Goto {
                 url: "https://step.test".to_string(),
             },
-            outcome: SessionStepOutcome::Applied { diff },
+            outcome: SessionStepOutcome::Applied {
+                diff,
+                read_result: None,
+            },
         };
         TempodSessionEvent {
             session_id: TempodSessionId("session-0".to_string()),

@@ -9,7 +9,7 @@ pub mod detect;
 
 pub use detect::detect_human_takeover;
 
-use tempo_driver::{DriverTrait, Engine, StepOutcome, TransportError};
+use tempo_driver::{DriverTrait, Engine, StepOutcome, TaintedValue, TransportError};
 use tempo_schema::{Action, ActionBatch, ObservationDiff, SideEffect};
 
 /// Result category for one executed action or batch.
@@ -42,6 +42,7 @@ pub struct ActionExecution {
     pub since_seq: u64,
     pub seq: u64,
     pub diff: ObservationDiff,
+    pub read_result: Option<TaintedValue>,
 }
 
 impl ActionExecution {
@@ -289,7 +290,7 @@ where
     // previous action, not the batch base — re-grounds below. Verification
     // callers (Grounding::IndependentRediff) always re-ground.
     let outcome = match outcome {
-        StepOutcome::Applied { diff }
+        StepOutcome::Applied { diff, read_result }
             if grounding == Grounding::TrustMatchingDiff && diff.since_seq == since_seq =>
         {
             return Ok(ActionExecution {
@@ -300,6 +301,7 @@ where
                 since_seq,
                 seq: diff.seq,
                 diff,
+                read_result,
             });
         }
         other => other,
@@ -310,12 +312,12 @@ where
     // StepError with a non-empty diff means earlier actions already grounded:
     // that is a partial apply, not a no-op.
     let diff = driver.observe_diff(since_seq).await?;
-    let status = match outcome {
-        StepOutcome::Applied { .. } => ExecutionStatus::Applied,
+    let (status, read_result) = match outcome {
+        StepOutcome::Applied { read_result, .. } => (ExecutionStatus::Applied, read_result),
         StepOutcome::StepError { reason } if diff_grounded(&diff) => {
-            ExecutionStatus::PartiallyApplied { reason }
+            (ExecutionStatus::PartiallyApplied { reason }, None)
         }
-        StepOutcome::StepError { reason } => ExecutionStatus::StepError { reason },
+        StepOutcome::StepError { reason } => (ExecutionStatus::StepError { reason }, None),
     };
     Ok(ActionExecution {
         engine,
@@ -325,6 +327,7 @@ where
         since_seq,
         seq: diff.seq,
         diff,
+        read_result,
     })
 }
 
@@ -794,6 +797,25 @@ mod tests {
     }
 
     #[test]
+    fn verified_read_result_survives_independent_rediff() -> Result<(), String> {
+        let mut driver = ContractDriver::new();
+        let action = Action::Extract {
+            node: NodeId("button".into()),
+        };
+        let execution = block_on(execute_action_verified_from_seq(&mut driver, &action, 10))
+            .map_err(|error| error.to_string())?;
+        assert!(execution.applied());
+        assert_eq!(driver.observe_diff_calls, vec![10]);
+        let read_result = execution
+            .read_result
+            .ok_or("extract should preserve read_result")?;
+        assert!(read_result.is_page_derived());
+        assert_eq!(read_result.value["kind"], "extract");
+        assert_eq!(read_result.value["value"], "fixture");
+        Ok(())
+    }
+
+    #[test]
     fn applied_batch_with_mismatched_base_regrounds_with_forced_rediff() -> Result<(), String> {
         let mut driver = ContractDriver::new();
         // Two actions through the per-action mock batch: the last embedded
@@ -1014,18 +1036,26 @@ mod tests {
                 });
             }
             self.seq += 1;
-            Ok(StepOutcome::Applied {
-                diff: ObservationDiff {
-                    since_seq: self.seq - 1,
-                    seq: self.seq,
-                    url: None,
-                    omitted: 0,
-                    marks: Vec::new(),
-                    added: Vec::new(),
-                    removed: Vec::new(),
-                    changed: vec![button_element(self.seq)],
-                },
-            })
+            let diff = ObservationDiff {
+                since_seq: self.seq - 1,
+                seq: self.seq,
+                url: None,
+                omitted: 0,
+                marks: Vec::new(),
+                added: Vec::new(),
+                removed: Vec::new(),
+                changed: vec![button_element(self.seq)],
+            };
+            if matches!(action, Action::Extract { .. }) {
+                return Ok(StepOutcome::applied_with_read_result(
+                    diff,
+                    tempo_driver::TaintedValue::page(serde_json::json!({
+                        "kind": "extract",
+                        "value": "fixture"
+                    })),
+                ));
+            }
+            Ok(StepOutcome::applied(diff))
         }
 
         async fn act_batch(&mut self, batch: &ActionBatch) -> Result<StepOutcome, TransportError> {
@@ -1033,18 +1063,16 @@ mod tests {
             // break on the first StepError. `act` advances `seq` for grounded
             // actions and leaves it untouched for a StepError, so an earlier
             // grounded action stays observable in the forced post-batch diff.
-            let mut last = StepOutcome::Applied {
-                diff: ObservationDiff {
-                    since_seq: self.seq,
-                    seq: self.seq,
-                    url: None,
-                    omitted: 0,
-                    marks: Vec::new(),
-                    added: Vec::new(),
-                    removed: Vec::new(),
-                    changed: Vec::new(),
-                },
-            };
+            let mut last = StepOutcome::applied(ObservationDiff {
+                since_seq: self.seq,
+                seq: self.seq,
+                url: None,
+                omitted: 0,
+                marks: Vec::new(),
+                added: Vec::new(),
+                removed: Vec::new(),
+                changed: Vec::new(),
+            });
             for action in &batch.actions {
                 last = self.act(action).await?;
                 if matches!(last, StepOutcome::StepError { .. }) {
