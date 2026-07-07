@@ -828,6 +828,27 @@ pub struct DecidedRunReport {
     pub usage: DecisionUsage,
 }
 
+impl DecidedRunReport {
+    /// Number of journaled model-decision boundaries for the task lifetime.
+    ///
+    /// Resumed rounds are included because they represent LLM round-trips that
+    /// already happened for this task and were replayed from the durable
+    /// journal.
+    pub fn llm_round_trips(&self) -> usize {
+        self.rounds.len()
+    }
+
+    /// Number of model decisions inferred during this attempt.
+    pub fn live_llm_round_trips(&self) -> usize {
+        self.rounds.iter().filter(|round| !round.resumed).count()
+    }
+
+    /// Per-task metric used by evals: only completed tasks contribute a value.
+    pub fn llm_round_trips_per_completed_task(&self) -> Option<usize> {
+        matches!(self.status, DecidedRunStatus::Completed).then_some(self.llm_round_trips())
+    }
+}
+
 struct DecidedRunState {
     journal: SessionJournal,
     budget: TokenBudget,
@@ -2175,6 +2196,9 @@ mod tests {
         assert_eq!(report.status, DecidedRunStatus::Completed);
         assert_eq!(report.actions_completed, 1);
         assert_eq!(report.rounds.len(), 2);
+        assert_eq!(report.llm_round_trips(), 2);
+        assert_eq!(report.live_llm_round_trips(), 2);
+        assert_eq!(report.llm_round_trips_per_completed_task(), Some(2));
         assert!(!report.rounds[0].resumed);
         assert_eq!(report.usage, DecisionUsage::default());
         assert_eq!(driver.goto_calls, 1);

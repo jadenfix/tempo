@@ -71,6 +71,9 @@ fn run_decided_task_binary_drives_live_cdp_with_scripted_decider() -> TestResult
     let report: Value = serde_json::from_reader(File::open(&output)?)?;
     assert_eq!(report["status"]["state"], "completed");
     assert_eq!(report["actions_completed"], 2);
+    assert_eq!(report["llm_round_trips"], 2);
+    assert_eq!(report["live_llm_round_trips"], 2);
+    assert_eq!(report["llm_round_trips_per_completed_task"], 2);
     assert_eq!(report["rounds"].as_array().map(Vec::len), Some(2));
     assert_eq!(report["usage"]["total_tokens"], 0);
 
@@ -141,8 +144,10 @@ fn run_decided_task_binary_drives_live_cdp_with_scripted_decider() -> TestResult
     assert!(status.success(), "e2e-budget exited with {status}");
     let budget: Value = serde_json::from_reader(File::open(&e2e_budget)?)?;
     assert_eq!(budget["total_cases"], 1);
+    assert_eq!(budget["completed_cases"], 1);
     assert_eq!(budget["total_steps"], 2);
     assert_eq!(budget["total_round_trips"], 2);
+    assert_eq!(budget["llm_round_trips_per_completed_task"], 2.0);
     assert!(budget["violations"]
         .as_array()
         .is_some_and(|violations| violations.is_empty()));

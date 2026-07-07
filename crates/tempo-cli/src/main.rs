@@ -1295,6 +1295,10 @@ struct RunDecidedTaskReport {
     journal: String,
     status: RunDecidedTaskStatus,
     actions_completed: usize,
+    llm_round_trips: usize,
+    live_llm_round_trips: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    llm_round_trips_per_completed_task: Option<usize>,
     rounds: Vec<RunDecidedTaskRound>,
     usage: RunDecidedTaskUsage,
 }
@@ -1356,6 +1360,9 @@ impl RunDecidedTaskReport {
             journal: report.journal_path.display().to_string(),
             status: decided_status(&report.status),
             actions_completed: report.actions_completed,
+            llm_round_trips: report.llm_round_trips(),
+            live_llm_round_trips: report.live_llm_round_trips(),
+            llm_round_trips_per_completed_task: report.llm_round_trips_per_completed_task(),
             rounds: report
                 .rounds
                 .iter()
@@ -2820,6 +2827,9 @@ mod tests {
         assert_eq!(report.engine, "test");
         assert_eq!(report.status.state, "completed");
         assert_eq!(report.actions_completed, 1);
+        assert_eq!(report.llm_round_trips, 2);
+        assert_eq!(report.live_llm_round_trips, 2);
+        assert_eq!(report.llm_round_trips_per_completed_task, Some(2));
         assert_eq!(report.rounds.len(), 2);
         assert_eq!(report.rounds[0].actions, 1);
         assert_eq!(report.rounds[1].actions, 0);

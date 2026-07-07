@@ -54,10 +54,11 @@ Priority = measured cost × feasibility, from final.md §12. Every item lands wi
 real `run-decided-task`, converts its durable session journal through
 `tempo-cli session-eval`, then feeds that JSONL record to `tempo-cli e2e-budget`.
 That proves real browser observations/actions produce eval-compatible
-`step_count`, `round_trips`, token totals, observe/action latency samples, and
-wall time. Provider `prefill_ms` and `decode_ms` remain explicit pending
-instrumentation: current `DecisionUsage` records token counts and cache reads,
-but not provider latency splits.
+`step_count`, `round_trips`, `llm_round_trips_per_completed_task`, token
+totals, observe/action latency samples, and wall time. Provider `prefill_ms`
+and `decode_ms` remain explicit pending instrumentation: current
+`DecisionUsage` records token counts and cache reads, but not provider latency
+splits.
 
 ## 4. Memory doctrine (the "most efficient" half of the claim)
 
