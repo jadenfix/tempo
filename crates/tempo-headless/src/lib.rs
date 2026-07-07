@@ -6787,7 +6787,11 @@ pub fn tempod_openapi(base_url: &str) -> JsonValue {
                 "post": {
                     "operationId": "actBatchSession",
                     "security": [{"TempodBearer": []}],
-                    "parameters": [{"$ref": "#/components/parameters/SessionId"}],
+                    "parameters": [
+                        {"$ref": "#/components/parameters/SessionId"},
+                        {"$ref": "#/components/parameters/AetherPayment"},
+                        {"$ref": "#/components/parameters/AetherPaymentHash"}
+                    ],
                     "requestBody": {
                         "required": true,
                         "content": {"application/json": {"schema": {"$ref": "#/components/schemas/SessionActBatchRequest"}}}
@@ -6803,7 +6807,11 @@ pub fn tempod_openapi(base_url: &str) -> JsonValue {
                 "post": {
                     "operationId": "mcpPostSession",
                     "security": [{"TempodBearer": []}],
-                    "parameters": [{"$ref": "#/components/parameters/SessionId"}],
+                    "parameters": [
+                        {"$ref": "#/components/parameters/SessionId"},
+                        {"$ref": "#/components/parameters/AetherPayment"},
+                        {"$ref": "#/components/parameters/AetherPaymentHash"}
+                    ],
                     "responses": {"200": {"description": "MCP JSON-RPC response bound to this session driver"}}
                 }
             },
@@ -7089,6 +7097,20 @@ pub fn tempod_openapi(base_url: &str) -> JsonValue {
                     "in": "path",
                     "required": true,
                     "schema": {"type": "string"}
+                },
+                "AetherPayment": {
+                    "name": "x-payment",
+                    "in": "header",
+                    "required": false,
+                    "schema": {"type": "string"},
+                    "description": "Raw Aether payment evidence accepted only with x-aether-payment-hash. The raw value is never echoed; clients that can send JSON should prefer payment_context."
+                },
+                "AetherPaymentHash": {
+                    "name": "x-aether-payment-hash",
+                    "in": "header",
+                    "required": false,
+                    "schema": {"type": "string"},
+                    "description": "Hash binding for x-payment. Required when x-payment is present and normalized into the hash-only PaymentContext used by policy, confirmation, and idempotency."
                 }
             },
             "schemas": {
@@ -14311,6 +14333,22 @@ mod tests {
             "aether"
         );
         assert_eq!(
+            openapi["components"]["parameters"]["AetherPayment"]["name"],
+            AETHER_PAYMENT_HEADER
+        );
+        assert_eq!(
+            openapi["components"]["parameters"]["AetherPaymentHash"]["name"],
+            AETHER_PAYMENT_HASH_HEADER
+        );
+        assert_eq!(
+            openapi["paths"]["/sessions/{session_id}/act_batch"]["post"]["parameters"][1]["$ref"],
+            "#/components/parameters/AetherPayment"
+        );
+        assert_eq!(
+            openapi["paths"]["/sessions/{session_id}/act_batch"]["post"]["parameters"][2]["$ref"],
+            "#/components/parameters/AetherPaymentHash"
+        );
+        assert_eq!(
             openapi["paths"]["/sessions/{session_id}/manager"]["get"]["operationId"],
             "managerSession"
         );
@@ -14351,6 +14389,14 @@ mod tests {
         assert_eq!(
             openapi["paths"]["/sessions/{session_id}/mcp"]["post"]["operationId"],
             "mcpPostSession"
+        );
+        assert_eq!(
+            openapi["paths"]["/sessions/{session_id}/mcp"]["post"]["parameters"][1]["$ref"],
+            "#/components/parameters/AetherPayment"
+        );
+        assert_eq!(
+            openapi["paths"]["/sessions/{session_id}/mcp"]["post"]["parameters"][2]["$ref"],
+            "#/components/parameters/AetherPaymentHash"
         );
         assert_eq!(
             openapi["paths"]["/sessions/{session_id}/bidi"]["post"]["operationId"],
