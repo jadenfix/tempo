@@ -44,6 +44,8 @@ jobs:
         run: bash scripts/check-servo-public-api.sh
       - name: no CAPTCHA solving service (#244)
         run: bash scripts/check-no-solver.sh
+      - name: linux agent gate mode wiring
+        run: bash scripts/check-linux-agent-gate-mode.sh
       - name: cargo test (contracts + conformance)
         run: cargo test --workspace
       - name: cargo test (toolexec live beatbox)
