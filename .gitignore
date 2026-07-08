@@ -1,4 +1,6 @@
 /target
+/.tempo-linux-agent-cache
+/.tempo-linux-agent-docker-cache
 **/*.rs.bk
 .DS_Store
 *.db

@@ -176,6 +176,11 @@ Docker Linux gate also honors `TEMPO_LINUX_AGENT_CACHE_DIR`: when set, the
 container uses host-backed `cargo-registry`, `cargo-git`, and `target`
 directories so Actions can persist the expensive Linux build products across
 runs; without it, local runs keep using Docker named volumes.
+The same gate honors `TEMPO_LINUX_AGENT_DOCKER_CACHE_BACKEND=gha` in CI for
+BuildKit's GitHub Actions layer cache, so the Rust/Chromium/Python benchmark
+image layers stay remote instead of being restored into the runner workspace.
+Local runs can set `TEMPO_LINUX_AGENT_DOCKER_CACHE_BACKEND=local` with
+`TEMPO_LINUX_AGENT_DOCKER_CACHE_DIR` for a filesystem-backed buildx cache.
 
 The same Linux gate runs the live beatbox-backed `tempo-toolexec` tests. At the
 pinned beatbox milestone the executable sandbox lane is W0 Wasm, so live tests

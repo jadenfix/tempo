@@ -33,13 +33,16 @@ jobs:
       TEMPO_LINUX_AGENT_PLATFORM: linux/amd64
       TEMPO_LINUX_AGENT_REQUIRE_LIVE_CDP: "1"
       TEMPO_LINUX_AGENT_CACHE_DIR: .tempo-linux-agent-cache
+      TEMPO_LINUX_AGENT_DOCKER_CACHE_BACKEND: gha
+      TEMPO_LINUX_AGENT_DOCKER_CACHE_SCOPE: docker-smoke-amd64-linux-agent
     steps:
       - uses: actions/checkout@v4
       - name: Cache Docker Linux agent build artifacts
         uses: actions/cache@v4
         with:
-          path: .tempo-linux-agent-cache
-          key: ${{ runner.os }}-${{ github.job }}-linux-agent-${{ hashFiles('Cargo.lock', 'docker/linux-agent.Dockerfile', 'scripts/linux-agent-gate.sh', 'scripts/agent-browser-bench.sh', 'scripts/agent_browser_bench.py') }}
+          path: |
+            .tempo-linux-agent-cache
+          key: ${{ runner.os }}-${{ github.job }}-linux-agent-${{ hashFiles('Cargo.lock', 'docker/linux-agent.Dockerfile', 'scripts/linux-agent-gate.sh', 'scripts/agent-browser-bench.sh', 'scripts/agent_browser_bench.py', 'scripts/agent_bench_runners/*.py', 'scripts/requirements-agent-bench.txt', 'scripts/validate-agent-bench-artifacts.py') }}
           restore-keys: |
             ${{ runner.os }}-${{ github.job }}-linux-agent-
             ${{ runner.os }}-linux-agent-
@@ -68,13 +71,16 @@ jobs:
       TEMPO_LINUX_AGENT_PLATFORM: linux/amd64
       TEMPO_LINUX_AGENT_REQUIRE_LIVE_CDP: "1"
       TEMPO_LINUX_AGENT_CACHE_DIR: .tempo-linux-agent-cache
+      TEMPO_LINUX_AGENT_DOCKER_CACHE_BACKEND: gha
+      TEMPO_LINUX_AGENT_DOCKER_CACHE_SCOPE: docker-full-amd64-linux-agent
     steps:
       - uses: actions/checkout@v4
       - name: Cache Docker Linux agent build artifacts
         uses: actions/cache@v4
         with:
-          path: .tempo-linux-agent-cache
-          key: ${{ runner.os }}-${{ github.job }}-linux-agent-${{ hashFiles('Cargo.lock', 'docker/linux-agent.Dockerfile', 'scripts/linux-agent-gate.sh', 'scripts/agent-browser-bench.sh', 'scripts/agent_browser_bench.py') }}
+          path: |
+            .tempo-linux-agent-cache
+          key: ${{ runner.os }}-${{ github.job }}-linux-agent-${{ hashFiles('Cargo.lock', 'docker/linux-agent.Dockerfile', 'scripts/linux-agent-gate.sh', 'scripts/agent-browser-bench.sh', 'scripts/agent_browser_bench.py', 'scripts/agent_bench_runners/*.py', 'scripts/requirements-agent-bench.txt', 'scripts/validate-agent-bench-artifacts.py') }}
           restore-keys: |
             ${{ runner.os }}-${{ github.job }}-linux-agent-
             ${{ runner.os }}-linux-agent-
