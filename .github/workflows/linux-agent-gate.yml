@@ -3,6 +3,14 @@ name: linux-agent-gate
 on:
   pull_request:
   workflow_dispatch:
+    inputs:
+      mode:
+        description: "Linux agent gate mode"
+        type: choice
+        options:
+          - smoke
+          - full
+        default: smoke
   schedule:
     - cron: "53 10 * * *"
 
@@ -16,6 +24,9 @@ concurrency:
 jobs:
   docker-smoke-amd64:
     name: Docker Linux agent smoke (amd64)
+    if: >-
+      github.event_name == 'pull_request' ||
+      (github.event_name == 'workflow_dispatch' && inputs.mode == 'smoke')
     runs-on: ubuntu-latest
     timeout-minutes: 90
     env:
@@ -34,5 +45,31 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: linux-agent-browser-bench
+          path: target/linux-agent-gate/agent-browser-bench
+          if-no-files-found: warn
+
+  docker-full-amd64:
+    name: Docker Linux agent full (amd64)
+    if: >-
+      github.event_name == 'schedule' ||
+      (github.event_name == 'workflow_dispatch' && inputs.mode == 'full')
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env:
+      TEMPO_LINUX_AGENT_PLATFORM: linux/amd64
+      TEMPO_LINUX_AGENT_REQUIRE_LIVE_CDP: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show Docker runtime
+        run: |
+          docker version
+          docker info
+      - name: Run Linux agent gate
+        run: scripts/linux-agent-gate.sh --full
+      - name: Upload agent browser benchmark artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-agent-browser-bench-full
           path: target/linux-agent-gate/agent-browser-bench
           if-no-files-found: warn

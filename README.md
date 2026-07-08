@@ -130,7 +130,10 @@ model credentials and a separate prompt contract. The harness writes:
 
 The Docker Linux gate runs this benchmark after live-CDP succeeds: smoke mode
 runs one iteration, while `--full` runs the benchmark harness's five-iteration
-default. The
+default. Pull requests run the real `linux/amd64` Docker smoke gate; scheduled
+workflow runs and manual `linux-agent-gate` dispatches with `mode=full` run
+`scripts/linux-agent-gate.sh --full` and upload the full benchmark artifacts.
+The
 `scripts/validate-agent-bench-artifacts.py` validator then requires the six
 expected runners, successful metrics, per-runner summary stats, model-input and
 resource counters, comparative gap report, Chrome version capture, and the
