@@ -76,8 +76,12 @@ fi
 
 if [[ "$MODE" == "--full" ]]; then
   INNER_MODE="--full"
+  BENCH_MODE="--full"
+  BENCH_EXPECTED_ITERATIONS="5"
 else
   INNER_MODE="--smoke"
+  BENCH_MODE="--smoke"
+  BENCH_EXPECTED_ITERATIONS="1"
 fi
 
 docker run --rm \
@@ -134,12 +138,12 @@ docker run --rm \
       TEMPO_CDP_CHROME=\"\$CHROME_PATH\" cargo test -p tempo-headless --test tempod_process live_cdp -- --nocapture --test-threads=1
       BENCH_OUT=/work/target/linux-agent-gate/agent-browser-bench
       TEMPO_CDP_CHROME=\"\$CHROME_PATH\" scripts/agent-browser-bench.sh \
-        --smoke \
+        ${BENCH_MODE} \
         --min-success-rate 1 \
         --output-dir \"\$BENCH_OUT\"
       scripts/validate-agent-bench-artifacts.py \
         --output-dir \"\$BENCH_OUT\" \
-        --expected-iterations 1 \
+        --expected-iterations ${BENCH_EXPECTED_ITERATIONS} \
         --require-derived-artifacts
       chmod -R a+rX \"\$BENCH_OUT\"
     else
