@@ -73,13 +73,16 @@ class StaticServer:
 class RssSampler:
     def __init__(self, root_pid: int) -> None:
         self.root_pid = root_pid
+        self.started = time.monotonic()
         self.max_rss_bytes = 0
         self.rss_at_peak_by_command_bytes: dict[str, int] = {}
         self.peak_rss_by_command_bytes: dict[str, int] = {}
         self.rss_at_peak_by_process_type_bytes: dict[str, int] = {}
         self.peak_rss_by_process_type_bytes: dict[str, int] = {}
+        self.rss_peak_elapsed_ms = 0
         self.process_count_at_peak = 0
         self.process_count_at_peak_by_type: dict[str, int] = {}
+        self.processes_at_peak: list[dict[str, object]] = []
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
 
@@ -101,13 +104,15 @@ class RssSampler:
         pids = descendants(self.root_pid)
         if self.root_pid != os.getpid():
             pids.add(self.root_pid)
-        rss, by_command, by_process_type, process_count_by_type = rss_snapshot(pids)
+        rss, by_command, by_process_type, process_count_by_type, processes = rss_snapshot(pids)
         if rss > self.max_rss_bytes:
             self.max_rss_bytes = rss
             self.rss_at_peak_by_command_bytes = by_command
             self.rss_at_peak_by_process_type_bytes = by_process_type
+            self.rss_peak_elapsed_ms = int((time.monotonic() - self.started) * 1000)
             self.process_count_at_peak = sum(process_count_by_type.values())
             self.process_count_at_peak_by_type = process_count_by_type
+            self.processes_at_peak = processes
         for command, command_rss in by_command.items():
             if command_rss > self.peak_rss_by_command_bytes.get(command, 0):
                 self.peak_rss_by_command_bytes[command] = command_rss
@@ -129,10 +134,12 @@ class RssSampler:
             "peak_rss_by_process_type_bytes": dict(
                 sorted(self.peak_rss_by_process_type_bytes.items())
             ),
+            "rss_peak_elapsed_ms": self.rss_peak_elapsed_ms,
             "process_count_at_peak": self.process_count_at_peak,
             "process_count_at_peak_by_type": dict(
                 sorted(self.process_count_at_peak_by_type.items())
             ),
+            "processes_at_peak": self.processes_at_peak,
         }
 
 
@@ -170,16 +177,16 @@ def rss_bytes(pids: set[int]) -> int:
 
 def rss_snapshot(
     pids: set[int],
-) -> tuple[int, dict[str, int], dict[str, int], dict[str, int]]:
+) -> tuple[int, dict[str, int], dict[str, int], dict[str, int], list[dict[str, object]]]:
     if not pids:
-        return 0, {}, {}, {}
+        return 0, {}, {}, {}, []
     args_by_pid = process_args_by_pid(pids)
     try:
         completed = subprocess.run(
             [
                 "ps",
                 "-o",
-                "pid=,rss=,comm=",
+                "pid=,ppid=,rss=,comm=",
                 "-p",
                 ",".join(str(pid) for pid in sorted(pids)),
             ],
@@ -189,23 +196,28 @@ def rss_snapshot(
             check=False,
         )
     except FileNotFoundError:
-        return 0, {}, {}, {}
+        return 0, {}, {}, {}, []
     total_kib = 0
     by_command: dict[str, int] = {}
     by_process_type: dict[str, int] = {}
     process_count_by_type: dict[str, int] = {}
+    processes: list[dict[str, object]] = []
     for line in completed.stdout.splitlines():
-        fields = line.strip().split(None, 2)
-        if len(fields) < 2:
+        fields = line.strip().split(None, 3)
+        if len(fields) < 3:
             continue
         try:
             pid = int(fields[0])
-            rss_kib = int(fields[1])
+            ppid = int(fields[1])
+            rss_kib = int(fields[2])
         except ValueError:
             continue
-        command = fields[2].strip() if len(fields) > 2 else "<unknown>"
+        if rss_kib <= 0:
+            continue
+        command = fields[3].strip() if len(fields) > 3 else "<unknown>"
         command = Path(command).name or command or "<unknown>"
-        process_type = classify_process_type(command, args_by_pid.get(pid, ""))
+        args = args_by_pid.get(pid, "")
+        process_type = classify_process_type(command, args)
         rss_bytes_for_process = rss_kib * 1024
         total_kib += rss_kib
         by_command[command] = by_command.get(command, 0) + rss_bytes_for_process
@@ -213,11 +225,22 @@ def rss_snapshot(
             by_process_type.get(process_type, 0) + rss_bytes_for_process
         )
         process_count_by_type[process_type] = process_count_by_type.get(process_type, 0) + 1
+        processes.append(
+            {
+                "pid": pid,
+                "ppid": ppid,
+                "command": command,
+                "process_type": process_type,
+                "rss_bytes": rss_bytes_for_process,
+                "args": truncate_process_args(args),
+            }
+        )
     return (
         total_kib * 1024,
         dict(sorted(by_command.items())),
         dict(sorted(by_process_type.items())),
         dict(sorted(process_count_by_type.items())),
+        sorted(processes, key=lambda process: (str(process["process_type"]), int(process["pid"]))),
     )
 
 
@@ -266,6 +289,13 @@ def classify_process_type(command: str, args: str) -> str:
                 return f"chrome-{process_type}" if process_type else "chrome-child"
         return "chrome-browser"
     return command or "<unknown>"
+
+
+def truncate_process_args(args: str) -> str:
+    max_len = 4096
+    if len(args) <= max_len:
+        return args
+    return args[: max_len - 3] + "..."
 
 
 def estimated_tokens(byte_count: int) -> int:
