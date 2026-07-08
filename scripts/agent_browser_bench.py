@@ -213,6 +213,13 @@ def run_checked(cmd: list[str], env: dict[str, str]) -> None:
     subprocess.run(cmd, cwd=ROOT, env=env, check=True)
 
 
+def tempo_cli_command(*args: str) -> list[str]:
+    tempo_cli = os.environ.get("TEMPO_CLI")
+    if tempo_cli:
+        return [tempo_cli, *args]
+    return ["cargo", "run", "-p", "tempo-cli", "--", *args]
+
+
 def chrome_version(chrome: str) -> str:
     try:
         completed = subprocess.run(
@@ -237,12 +244,7 @@ def run_tempo(url: str, chrome: str, output_dir: Path) -> dict:
     env.setdefault("TEMPO_DURABLE_RETENTION", "plaintext-unsafe")
     before = usage_children()
     started = now_ms()
-    cmd = [
-        "cargo",
-        "run",
-        "-p",
-        "tempo-cli",
-        "--",
+    cmd = tempo_cli_command(
         "run-cdp-task",
         "--start-url",
         url,
@@ -257,7 +259,7 @@ def run_tempo(url: str, chrome: str, output_dir: Path) -> dict:
         "--allow-private-network",
         "--confirmation-mode",
         "auto-clean",
-    ]
+    )
     failure_mode = None
     proc = subprocess.Popen(cmd, cwd=ROOT, env=env)
     with RssSampler(proc.pid) as sampler:
@@ -287,6 +289,8 @@ def run_tempo(url: str, chrome: str, output_dir: Path) -> dict:
         "observations": int(report.get("observations", 0)),
         "journal": str(journal),
         "run_report": str(run_report),
+        "tempo_cli": cmd[0],
+        "tempo_cli_prebuilt": cmd[0] != "cargo",
     }
     metric.update(usage)
     return metric
@@ -859,12 +863,7 @@ def derive_artifacts(output_dir: Path, metrics: list[dict], url: str) -> None:
     baseline_wall = int(chrome["wall_clock_ms"]) if chrome else 0
     eval_record = output_dir / "tempo-eval-record.json"
     run_checked(
-        [
-            "cargo",
-            "run",
-            "-p",
-            "tempo-cli",
-            "--",
+        tempo_cli_command(
             "session-eval",
             "--journal",
             str(journal),
@@ -884,41 +883,31 @@ def derive_artifacts(output_dir: Path, metrics: list[dict], url: str) -> None:
             str(baseline_wall),
             "--output",
             str(eval_record),
-        ],
+        ),
         env,
     )
     record = json.loads(eval_record.read_text())
     records = output_dir / "eval-records.jsonl"
     records.write_text(json.dumps(record, sort_keys=True) + "\n")
     run_checked(
-        [
-            "cargo",
-            "run",
-            "-p",
-            "tempo-cli",
-            "--",
+        tempo_cli_command(
             "replay",
             "--journal",
             str(journal),
             "--output",
             str(output_dir / "replay.json"),
-        ],
+        ),
         env,
     )
     run_checked(
-        [
-            "cargo",
-            "run",
-            "-p",
-            "tempo-cli",
-            "--",
+        tempo_cli_command(
             "scorecard",
             "--input",
             str(records),
             "--output",
             str(output_dir / "scorecard.json"),
             "--allow-missing-speculation",
-        ],
+        ),
         env,
     )
     write_json(output_dir / "amdahl.json", amdahl_summary(metrics))
