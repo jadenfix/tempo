@@ -142,6 +142,10 @@ not a hosted model credential or prompt contract. The harness writes:
   it has no model-facing observation stream. Row-level total model-input token
   p95 is included only where the runner reports a comparable model-facing stream
   cost.
+- `agent-browser-bench-status.md` with the same rankings rendered as a stable
+  Markdown status table, so CI artifacts show which categories Tempo already
+  wins or ties and which gaps still block "better than Chrome in every tracked
+  category."
 - `real-playwright.json`, `external-browser-use-dom-loop.json`, and
   `real-browser-use.json`, plus each runner's stdout/stderr logs, model-input
   text, and action trace, so CI proves the external subprocess lanes ran and

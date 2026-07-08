@@ -16,6 +16,8 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
+from agent_bench_status import STATUS_ARTIFACT, render_status_markdown
+
 
 EXPECTED_RUNNERS = {
     "tempo-cdp-agent",
@@ -98,6 +100,7 @@ ROOT_ARTIFACTS = {
     "agent-browser-bench.jsonl",
     "agent-browser-bench-gaps.json",
     "agent-browser-bench-summary.json",
+    STATUS_ARTIFACT,
     "chrome-version.txt",
 }
 
@@ -739,6 +742,11 @@ def validate_bench_json(output_dir: Path) -> tuple[int, list[dict[str, Any]]]:
         raise ValidationError("chrome-version.txt chrome does not match report")
     if chrome_version.get("version") != report["chrome_version"]:
         raise ValidationError("chrome-version.txt version does not match report")
+
+    expected_status = render_status_markdown(report, summary, gap_report, chrome_version)
+    require_file(output_dir / STATUS_ARTIFACT)
+    if (output_dir / STATUS_ARTIFACT).read_text() != expected_status:
+        raise ValidationError(f"{STATUS_ARTIFACT} does not match report summary")
 
     return iterations, metrics
 

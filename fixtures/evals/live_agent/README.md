@@ -48,7 +48,8 @@ success, latency, RSS, retries, failures, model-facing tokens, largest durable
 observation tokens, and agent step count. CPU is reported row-level until every
 runner uses the same resource-accounting scope. Row-level total model-input
 token p95 is included where a runner reports a comparable model-facing stream
-cost. It
+cost. `agent-browser-bench-status.md` renders the same ranking and gap data as a
+stable Markdown report for quick artifact review. It
 also emits Tempo `session-eval`, `replay`, `scorecard`, and `amdahl` artifacts
 from the real journal, external runner model-input/action traces, and
 `chrome-version.txt` so benchmark runs stay tied to durable agent evidence.

@@ -17,6 +17,8 @@ import threading
 import time
 from pathlib import Path
 
+from agent_bench_status import STATUS_ARTIFACT, render_status_markdown
+
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE_DIR = ROOT / "fixtures" / "evals" / "live_agent"
@@ -740,6 +742,7 @@ def clean_output_dir(output_dir: Path) -> None:
         "agent-browser-bench.jsonl",
         "agent-browser-bench-gaps.json",
         "agent-browser-bench-summary.json",
+        STATUS_ARTIFACT,
         "amdahl.json",
         "eval-records.jsonl",
         "replay.json",
@@ -1266,23 +1269,31 @@ def main() -> int:
             derive_artifacts(iteration_dir, iteration_metrics, url)
             metrics.extend(iteration_metrics)
         summary = summarize_metrics(metrics)
-        write_json(
-            output_dir / "agent-browser-bench.json",
-            {
-                "url": url,
-                "iterations": iterations,
-                "chrome": args.chrome,
-                "chrome_version": resolved_chrome_version,
-                "metrics": metrics,
-                "summary": summary,
-            },
-        )
+        root_report = {
+            "url": url,
+            "iterations": iterations,
+            "chrome": args.chrome,
+            "chrome_version": resolved_chrome_version,
+            "metrics": metrics,
+            "summary": summary,
+        }
+        write_json(output_dir / "agent-browser-bench.json", root_report)
         write_jsonl(output_dir / "agent-browser-bench.jsonl", metrics)
         write_json(output_dir / "agent-browser-bench-summary.json", summary)
-        write_json(output_dir / "agent-browser-bench-gaps.json", benchmark_gap_report(metrics, summary))
+        gap_report = benchmark_gap_report(metrics, summary)
+        write_json(output_dir / "agent-browser-bench-gaps.json", gap_report)
+        chrome_version_artifact = {"chrome": args.chrome, "version": resolved_chrome_version}
         write_json(
             output_dir / "chrome-version.txt",
-            {"chrome": args.chrome, "version": resolved_chrome_version},
+            chrome_version_artifact,
+        )
+        (output_dir / STATUS_ARTIFACT).write_text(
+            render_status_markdown(
+                root_report,
+                summary,
+                gap_report,
+                chrome_version_artifact,
+            )
         )
 
     violations = validate_summary(summary, args)
