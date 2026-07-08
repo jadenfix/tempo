@@ -243,6 +243,7 @@ impl CdpTempoDriver {
         config.args.extend([
             "--disable-gpu".to_string(),
             "--run-all-compositor-stages-before-draw".to_string(),
+            "--use-mock-keychain".to_string(),
             format!("--proxy-server=http://{}", policy_proxy.addr),
             "--proxy-bypass-list=<-loopback>".to_string(),
             "--disable-quic".to_string(),

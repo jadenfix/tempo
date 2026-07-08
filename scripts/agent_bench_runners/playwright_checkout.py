@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import tempfile
 import time
 from pathlib import Path
 
@@ -25,7 +26,7 @@ def write_text(path: Path, text: str) -> None:
 
 
 def launch_args() -> list[str]:
-    args = ["--disable-gpu", "--disable-dev-shm-usage"]
+    args = ["--disable-gpu", "--disable-dev-shm-usage", "--use-mock-keychain"]
     if os.environ.get("TEMPO_CDP_NO_SANDBOX") == "1":
         args.append("--no-sandbox")
     return args
@@ -57,33 +58,35 @@ def run(url: str, chrome: str, output: Path) -> dict:
     final_status = ""
     try:
         with sync_playwright() as playwright:
-            browser = playwright.chromium.launch(
-                executable_path=chrome,
-                headless=True,
-                args=launch_args(),
-            )
-            try:
-                page = browser.new_page()
-                page.goto(url, wait_until="load", timeout=15000)
-                model_input = capture_aria_snapshot(page)
-                observations = 1
-                page.get_by_label("Email").fill("agent@example.com", timeout=5000)
-                step_count += 1
-                actions.append({"kind": "fill", "target": "label=Email"})
-                page.get_by_role("checkbox", name="Remember me").click(timeout=5000)
-                step_count += 1
-                actions.append({"kind": "click", "target": "role=checkbox name=Remember me"})
-                page.get_by_role("button", name="Pay now").click(timeout=5000)
-                step_count += 1
-                actions.append({"kind": "click", "target": "role=button name=Pay now"})
-                page.wait_for_function(
-                    "document.querySelector('#status')?.dataset.done === 'true'",
-                    timeout=5000,
+            with tempfile.TemporaryDirectory(prefix="tempo-real-playwright-profile-") as profile_dir:
+                context = playwright.chromium.launch_persistent_context(
+                    user_data_dir=profile_dir,
+                    executable_path=chrome,
+                    headless=True,
+                    args=launch_args(),
                 )
-                final_status = page.locator("#status").inner_text(timeout=5000)
-                success = page.locator("#status").get_attribute("data-done") == "true"
-            finally:
-                browser.close()
+                try:
+                    page = context.new_page()
+                    page.goto(url, wait_until="load", timeout=15000)
+                    model_input = capture_aria_snapshot(page)
+                    observations = 1
+                    page.get_by_label("Email").fill("agent@example.com", timeout=5000)
+                    step_count += 1
+                    actions.append({"kind": "fill", "target": "label=Email"})
+                    page.get_by_role("checkbox", name="Remember me").click(timeout=5000)
+                    step_count += 1
+                    actions.append({"kind": "click", "target": "role=checkbox name=Remember me"})
+                    page.get_by_role("button", name="Pay now").click(timeout=5000)
+                    step_count += 1
+                    actions.append({"kind": "click", "target": "role=button name=Pay now"})
+                    page.wait_for_function(
+                        "document.querySelector('#status')?.dataset.done === 'true'",
+                        timeout=5000,
+                    )
+                    final_status = page.locator("#status").inner_text(timeout=5000)
+                    success = page.locator("#status").get_attribute("data-done") == "true"
+                finally:
+                    context.close()
     except Exception as error:  # noqa: BLE001
         failure_mode = type(error).__name__
     wall_ms = int((time.monotonic() - started) * 1000)

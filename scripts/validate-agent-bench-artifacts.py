@@ -24,6 +24,15 @@ EXPECTED_RUNNERS = {
     "real-playwright",
     "external-browser-use-dom-loop",
 }
+TEMPO_RUNNER = "tempo-cdp-agent"
+RAW_CHROME_RUNNER = "raw-chrome-cdp"
+AGENT_STYLE_RUNNERS = {
+    "tempo-cdp-agent",
+    "synthetic-playwright-ax",
+    "synthetic-browser-use-dom",
+    "real-playwright",
+    "external-browser-use-dom-loop",
+}
 
 REQUIRED_METRIC_FIELDS = {
     "runner",
@@ -71,6 +80,7 @@ SUMMARY_STAT_FIELDS = {"min", "p50", "p95", "max"}
 ROOT_ARTIFACTS = {
     "agent-browser-bench.json",
     "agent-browser-bench.jsonl",
+    "agent-browser-bench-gaps.json",
     "agent-browser-bench-summary.json",
     "chrome-version.txt",
 }
@@ -233,6 +243,206 @@ def expected_summary(metrics: list[dict[str, Any]]) -> dict[str, Any]:
     return summary
 
 
+def expected_gap_report(metrics: list[dict[str, Any]], summary: dict[str, Any]) -> dict[str, Any]:
+    runners = sorted(summary)
+    rows = [
+        comparison_row(
+            runner,
+            summary[runner],
+            [metric for metric in metrics if metric["runner"] == runner],
+        )
+        for runner in runners
+    ]
+    row_by_runner = {row["runner"]: row for row in rows}
+    category_specs = [
+        ("success_rate", "higher_is_better", runners),
+        ("wall_clock_ms_p95", "lower_is_better", runners),
+        ("max_rss_bytes_p95", "lower_is_better", runners),
+        ("retry_count_total", "lower_is_better", runners),
+        ("failure_count", "lower_is_better", runners),
+        (
+            "max_observation_tokens_p95",
+            "lower_is_better",
+            sorted(runner for runner in runners if runner in AGENT_STYLE_RUNNERS),
+        ),
+        (
+            "step_count_p95",
+            "lower_is_better",
+            sorted(runner for runner in runners if runner in AGENT_STYLE_RUNNERS),
+        ),
+    ]
+    categories = []
+    gaps_to_close = []
+    for name, direction, category_runners in category_specs:
+        participants = [runner for runner in category_runners if runner in row_by_runner]
+        ranked = sorted(
+            (
+                {
+                    "runner": runner,
+                    "value": row_by_runner[runner][name],
+                }
+                for runner in participants
+            ),
+            key=lambda entry: category_sort_key(entry, direction),
+        )
+        if not ranked or TEMPO_RUNNER not in participants:
+            continue
+        tempo_value = row_by_runner[TEMPO_RUNNER][name]
+        tempo_rank = comparison_rank(tempo_value, ranked, direction)
+        best = {"runner": TEMPO_RUNNER, "value": tempo_value} if tempo_rank == 1 else ranked[0]
+        best_value = ranked[0]["value"]
+        best_runners = [
+            str(entry["runner"])
+            for entry in ranked
+            if comparison_delta(entry["value"], best_value, direction) == 0
+        ]
+        best_non_tempo = next(
+            (entry for entry in ranked if entry["runner"] != TEMPO_RUNNER),
+            None,
+        )
+        raw_chrome = (
+            {"runner": RAW_CHROME_RUNNER, "value": row_by_runner[RAW_CHROME_RUNNER][name]}
+            if RAW_CHROME_RUNNER in participants
+            else None
+        )
+        category = {
+            "name": name,
+            "direction": direction,
+            "runners": participants,
+            "tempo": {"runner": TEMPO_RUNNER, "value": tempo_value},
+            "best": best,
+            "best_runners": best_runners,
+            "best_non_tempo": best_non_tempo,
+            "raw_chrome": raw_chrome,
+            "tempo_rank": tempo_rank,
+            "tempo_is_best": tempo_rank == 1,
+            "tempo_delta_vs_best": comparison_delta(tempo_value, best_value, direction),
+            "tempo_delta_vs_best_non_tempo": (
+                comparison_delta(tempo_value, best_non_tempo["value"], direction)
+                if best_non_tempo
+                else None
+            ),
+            "tempo_delta_vs_raw_chrome": (
+                comparison_delta(tempo_value, raw_chrome["value"], direction)
+                if raw_chrome
+                else None
+            ),
+        }
+        categories.append(category)
+        if tempo_rank != 1:
+            gaps_to_close.append(
+                {
+                    "category": name,
+                    "direction": direction,
+                    "target_runner": ranked[0]["runner"],
+                    "target_runners": best_runners,
+                    "tempo_value": tempo_value,
+                    "target_value": best_value,
+                    "delta_to_match": comparison_delta(tempo_value, best_value, direction),
+                }
+            )
+    return {
+        "suite": "live-agent-browser-bench",
+        "case_id": "checkout-submit",
+        "tempo_runner": TEMPO_RUNNER,
+        "baseline_runner": RAW_CHROME_RUNNER,
+        "agent_style_runners": sorted(AGENT_STYLE_RUNNERS),
+        "comparison_notes": [
+            "raw-chrome-cdp is excluded from observation-token and agent-step categories because it has no model-facing observation stream.",
+            "max_observation_tokens_p95 compares the largest single observation per run; total_model_input_tokens_p95 is row-level only until every agent runner records true total stream cost.",
+            "cpu_time_ms_p95 is row-level only until every runner uses the same resource-accounting scope.",
+            "Positive deltas mean Tempo is behind that comparison target; negative deltas mean Tempo is ahead.",
+        ],
+        "rows": rows,
+        "categories": categories,
+        "gaps_to_close": gaps_to_close,
+    }
+
+
+def comparison_row(
+    runner: str,
+    runner_summary: dict[str, Any],
+    runner_metrics: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "runner": runner,
+        "runs": int(runner_summary["runs"]),
+        "success_rate": float(runner_summary["success_rate"]),
+        "failure_count": sum(int(count) for count in runner_summary["failure_modes"].values()),
+        "retry_count_total": int(runner_summary["retry_count_total"]),
+        "wall_clock_ms_p50": int(runner_summary["wall_clock_ms"]["p50"]),
+        "wall_clock_ms_p95": int(runner_summary["wall_clock_ms"]["p95"]),
+        "cpu_time_ms_p95": percentile(
+            [
+                int(metric.get("cpu_user_ms", 0)) + int(metric.get("cpu_system_ms", 0))
+                for metric in runner_metrics
+            ],
+            0.95,
+        ),
+        "max_rss_bytes_p95": int(runner_summary["max_rss_bytes"]["p95"]),
+        "model_input_tokens_p95": int(runner_summary["model_input_tokens"]["p95"]),
+        "max_observation_tokens_p95": percentile(
+            [
+                int(metric.get("max_observation_tokens", metric.get("model_input_tokens", 0)))
+                for metric in runner_metrics
+            ],
+            0.95,
+        ),
+        "total_model_input_tokens_p95": optional_percentile(
+            [
+                comparable_total_model_input_tokens(metric)
+                for metric in runner_metrics
+            ],
+            0.95,
+        ),
+        "step_count_p95": int(runner_summary["step_count"]["p95"]),
+    }
+
+
+def category_sort_key(entry: dict[str, Any], direction: str) -> tuple[float, str]:
+    value = float(entry["value"])
+    if direction == "higher_is_better":
+        return (-value, str(entry["runner"]))
+    return (value, str(entry["runner"]))
+
+
+def comparison_delta(
+    tempo_value: int | float,
+    target_value: int | float,
+    direction: str,
+) -> int | float:
+    if direction == "higher_is_better":
+        return target_value - tempo_value
+    return tempo_value - target_value
+
+
+def optional_percentile(values: list[int | None], pct: float) -> int | None:
+    concrete = [int(value) for value in values if value is not None]
+    if len(concrete) != len(values):
+        return None
+    return percentile(concrete, pct)
+
+
+def comparable_total_model_input_tokens(metric: dict[str, Any]) -> int | None:
+    if int(metric.get("observations", 0)) == 0:
+        return None
+    if "total_model_input_tokens" in metric:
+        return int(metric["total_model_input_tokens"])
+    if int(metric.get("observations", 0)) <= 1:
+        return int(metric.get("model_input_tokens", 0))
+    return None
+
+
+def comparison_rank(
+    tempo_value: int | float,
+    ranked: list[dict[str, Any]],
+    direction: str,
+) -> int:
+    if direction == "higher_is_better":
+        return 1 + sum(1 for entry in ranked if entry["value"] > tempo_value)
+    return 1 + sum(1 for entry in ranked if entry["value"] < tempo_value)
+
+
 def validate_summary(summary: dict[str, Any], iterations: int) -> None:
     runners = set(summary)
     if runners != EXPECTED_RUNNERS:
@@ -315,6 +525,10 @@ def validate_bench_json(output_dir: Path) -> tuple[int, list[dict[str, Any]]]:
     summary_file = load_json(output_dir / "agent-browser-bench-summary.json")
     if summary_file != summary:
         raise ValidationError("agent-browser-bench-summary.json does not match report summary")
+
+    gap_report = load_json(output_dir / "agent-browser-bench-gaps.json")
+    if gap_report != expected_gap_report(metrics, summary):
+        raise ValidationError("agent-browser-bench-gaps.json does not match report summary")
 
     jsonl_metrics = load_jsonl(output_dir / "agent-browser-bench.jsonl")
     if jsonl_metrics != metrics:
