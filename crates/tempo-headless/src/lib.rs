@@ -506,6 +506,7 @@ pub enum TempodSessionEventKind {
         url: String,
     },
     SessionAdopted,
+    SessionResumed,
     SessionKilled,
     SessionDrained,
     StepTriple {
@@ -1608,11 +1609,42 @@ impl SessionPool {
                 .sessions
                 .get_mut(id)
                 .ok_or_else(|| TempodError::SessionNotFound(id.clone()))?;
+            if session.state == TempodSessionState::Killed {
+                return Err(TempodError::Conflict(format!(
+                    "session {} is killed and cannot be adopted",
+                    id.0
+                )));
+            }
             session.state = TempodSessionState::Adopted;
             session.clone()
         };
         self.record_event(id, TempodSessionEventKind::SessionAdopted);
         Ok(session.clone())
+    }
+
+    /// Mark that a human has handed control back to the agent after an adopted
+    /// takeover window. This records an auditable control-plane event; it does
+    /// not bypass browser hardening or auto-clear a page challenge.
+    pub fn resume(&mut self, id: &TempodSessionId) -> Result<TempodSession, TempodError> {
+        if self.draining {
+            return Err(TempodError::Draining);
+        }
+        let session = {
+            let session = self
+                .sessions
+                .get_mut(id)
+                .ok_or_else(|| TempodError::SessionNotFound(id.clone()))?;
+            if session.state != TempodSessionState::Adopted {
+                return Err(TempodError::Conflict(format!(
+                    "session {} must be adopted before it can be resumed",
+                    id.0
+                )));
+            }
+            session.state = TempodSessionState::Running;
+            session.clone()
+        };
+        self.record_event(id, TempodSessionEventKind::SessionResumed);
+        Ok(session)
     }
 
     /// Kill a session, closing its engine context. Retained for direct
@@ -4722,6 +4754,7 @@ fn tempod_router(state: TempodAppState) -> Router {
         .route("/sessions", get(sessions_list).post(sessions_create))
         .route("/sessions/{id}", delete(session_kill))
         .route("/sessions/{id}/adopt", post(session_adopt))
+        .route("/sessions/{id}/resume", post(session_resume))
         .route("/sessions/{id}/observe", get(session_observe))
         .route("/sessions/{id}/act_batch", post(session_act_batch))
         .route("/sessions/{id}/events", get(session_events))
@@ -5133,6 +5166,19 @@ async fn session_adopt(
         Ok(HttpResponse::json(
             200,
             lock_pool(&state.pool)?.adopt(&TempodSessionId(id))?,
+        ))
+    })
+    .await
+}
+
+async fn session_resume(
+    State(state): State<TempodAppState>,
+    UrlPath(id): UrlPath<String>,
+) -> Response {
+    run_blocking(move || -> Result<HttpResponse, TempodError> {
+        Ok(HttpResponse::json(
+            200,
+            lock_pool(&state.pool)?.resume(&TempodSessionId(id))?,
         ))
     })
     .await
@@ -6173,6 +6219,17 @@ pub fn tempod_openapi(base_url: &str) -> JsonValue {
                     "responses": {"200": {"description": "Compiled observation"}}
                 }
             },
+            "/sessions/{session_id}/resume": {
+                "post": {
+                    "operationId": "resumeSession",
+                    "security": [{"TempodBearer": []}],
+                    "parameters": [{"$ref": "#/components/parameters/SessionId"}],
+                    "responses": {
+                        "200": {"description": "Session resumed and resume event recorded"},
+                        "409": {"description": "Session is terminal and cannot be resumed"}
+                    }
+                }
+            },
             "/sessions/{session_id}/act_batch": {
                 "post": {
                     "operationId": "actBatchSession",
@@ -6355,7 +6412,7 @@ fn after_seq(query: Option<&str>) -> Result<Option<u64>, TempodError> {
     Ok(None)
 }
 
-/// Whether a route must pass the loopback-Origin guard. Session/control-plane routes (create, drain, adopt, delete, list,
+/// Whether a route must pass the loopback-Origin guard. Session/control-plane routes (create, drain, adopt, resume, delete, list,
 /// session events, and any unrecognised — hence potentially state-changing —
 /// route) are guarded. Exempt are the public idempotent metadata routes
 /// (`/health`, the A2A agent card, `GET /mcp`) and the routes that already run
@@ -9272,32 +9329,36 @@ mod tests {
         let mut pool = SessionPool::default();
         let session = pool.create("https://events.test")?;
         pool.adopt(&session.id)?;
+        let resumed = pool.resume(&session.id)?;
+        assert_eq!(resumed.state, TempodSessionState::Running);
         let step = sample_step_triple(7);
         let step_event = pool.record_step(&session.id, step.clone())?;
         pool.kill(&session.id)?;
 
-        assert_eq!(step_event.seq, 2);
+        assert_eq!(step_event.seq, 3);
         assert_eq!(
             step_event.event,
             TempodSessionEventKind::StepTriple { triple: step }
         );
 
         let events = pool.events(&session.id, None)?;
-        assert_eq!(events.len(), 4);
+        assert_eq!(events.len(), 5);
         assert!(matches!(
             events[0].event,
             TempodSessionEventKind::SessionCreated { .. }
         ));
         assert_eq!(events[1].event, TempodSessionEventKind::SessionAdopted);
+        assert_eq!(events[2].event, TempodSessionEventKind::SessionResumed);
         assert!(matches!(
-            events[2].event,
+            events[3].event,
             TempodSessionEventKind::StepTriple { .. }
         ));
-        assert_eq!(events[3].event, TempodSessionEventKind::SessionKilled);
+        assert_eq!(events[4].event, TempodSessionEventKind::SessionKilled);
 
         let after_adopt = pool.events(&session.id, Some(1))?;
-        assert_eq!(after_adopt.len(), 2);
+        assert_eq!(after_adopt.len(), 3);
         assert_eq!(after_adopt[0].seq, 2);
+        assert_eq!(after_adopt[0].event, TempodSessionEventKind::SessionResumed);
         Ok(())
     }
 
@@ -10208,6 +10269,10 @@ mod tests {
             pool.adopt(&running.id),
             Err(TempodError::Draining)
         ));
+        assert!(matches!(
+            pool.resume(&running.id),
+            Err(TempodError::Draining)
+        ));
         assert_eq!(pool.list()[0].id, running.id);
         assert_eq!(pool.list()[0].state, TempodSessionState::Killed);
 
@@ -10267,6 +10332,105 @@ mod tests {
             "tempod is draining; new sessions are not accepted"
         );
         assert_eq!(pool.list()[0].state, TempodSessionState::Killed);
+        Ok(())
+    }
+
+    #[test]
+    fn http_resume_session_records_event_and_rejects_terminal_sessions() -> TestResult {
+        let mut pool = SessionPool::default();
+        let created = pool.create("https://resume.test")?;
+        pool.adopt(&created.id)?;
+
+        let response = route_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/sessions/session-0/resume".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: Vec::new(),
+            },
+        )?;
+        assert_eq!(response.status, 200);
+        let resumed: TempodSession = serde_json::from_slice(&response.body)?;
+        assert_eq!(resumed.state, TempodSessionState::Running);
+
+        let events = pool.events(&created.id, None)?;
+        assert_eq!(
+            events.last().map(|event| event.event.clone()),
+            Some(TempodSessionEventKind::SessionResumed)
+        );
+
+        pool.kill(&created.id)?;
+        let adopt_terminal = handle_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/sessions/session-0/adopt".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: Vec::new(),
+            },
+        );
+        assert_eq!(adopt_terminal.status, 409);
+        let terminal = handle_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/sessions/session-0/resume".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: Vec::new(),
+            },
+        );
+        assert_eq!(terminal.status, 409);
+        Ok(())
+    }
+
+    #[test]
+    fn http_resume_session_requires_adopted_state() -> TestResult {
+        let mut pool = SessionPool::default();
+        let created = pool.create("https://resume-state.test")?;
+
+        let running = handle_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/sessions/session-0/resume".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: Vec::new(),
+            },
+        );
+        assert_eq!(running.status, 409);
+        assert_eq!(pool.events(&created.id, None)?.len(), 1);
+
+        pool.adopt(&created.id)?;
+        pool.resume(&created.id)?;
+        let repeated = handle_http_request(
+            &mut pool,
+            HttpRequest {
+                method: "POST".into(),
+                path: "/sessions/session-0/resume".into(),
+                headers: BTreeMap::new(),
+                host: None,
+                origin: None,
+                body: Vec::new(),
+            },
+        );
+        assert_eq!(repeated.status, 409);
+        let events = pool.events(&created.id, None)?;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event == TempodSessionEventKind::SessionResumed)
+                .count(),
+            1
+        );
         Ok(())
     }
 
@@ -10729,6 +10893,10 @@ mod tests {
         assert_eq!(
             openapi["paths"]["/sessions"]["post"]["security"],
             json!([{"TempodBearer": []}])
+        );
+        assert_eq!(
+            openapi["paths"]["/sessions/{session_id}/resume"]["post"]["operationId"],
+            "resumeSession"
         );
         assert_eq!(
             openapi["paths"]["/mcp"]["post"]["security"],
@@ -13320,6 +13488,10 @@ mod tests {
         assert_eq!(metrics_route_class("POST", "/sessions"), "sessions");
         assert_eq!(
             metrics_route_class("POST", "/sessions/abc123/act_batch"),
+            "session"
+        );
+        assert_eq!(
+            metrics_route_class("POST", "/sessions/abc123/resume"),
             "session"
         );
         assert_eq!(metrics_route_class("DELETE", "/sessions/abc123"), "session");

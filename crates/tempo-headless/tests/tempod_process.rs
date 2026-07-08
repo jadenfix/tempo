@@ -53,6 +53,56 @@ fn tempod_binary_serves_authenticated_control_plane_and_drains() -> TestResult {
     assert_eq!(sessions.status, StatusCode::OK);
     assert_eq!(sessions.body, json!([]));
 
+    let created = post_json(
+        &client,
+        &base_url,
+        "/sessions",
+        Some(AUTH_TOKEN),
+        r#"{"url":"https://resume-process.test"}"#,
+    )?;
+    assert_eq!(
+        created.status,
+        StatusCode::CREATED,
+        "session response: {}",
+        created.body
+    );
+    let session_id = created.body["id"]
+        .as_str()
+        .ok_or("session create response missing id")?;
+    let adopted = post_json(
+        &client,
+        &base_url,
+        &format!("/sessions/{session_id}/adopt"),
+        Some(AUTH_TOKEN),
+        "{}",
+    )?;
+    assert_eq!(adopted.status, StatusCode::OK);
+    assert_eq!(adopted.body["state"], "adopted");
+    let resumed = post_json(
+        &client,
+        &base_url,
+        &format!("/sessions/{session_id}/resume"),
+        Some(AUTH_TOKEN),
+        "{}",
+    )?;
+    assert_eq!(resumed.status, StatusCode::OK);
+    assert_eq!(resumed.body["state"], "running");
+    let events = get_json(
+        &client,
+        &base_url,
+        &format!("/sessions/{session_id}/events"),
+        Some(AUTH_TOKEN),
+    )?;
+    assert_eq!(events.status, StatusCode::OK);
+    let event_kinds = events.body.as_array().ok_or("events must be an array")?;
+    assert!(
+        event_kinds
+            .iter()
+            .any(|event| event["event"]["kind"] == "session_resumed"),
+        "resume event missing from process event stream: {}",
+        events.body
+    );
+
     let unauthenticated_mcp = post_json(
         &client,
         &base_url,
@@ -96,7 +146,8 @@ fn tempod_binary_serves_authenticated_control_plane_and_drains() -> TestResult {
     let drain = post_json(&client, &base_url, "/drain", Some(AUTH_TOKEN), "{}")?;
     assert_eq!(drain.status, StatusCode::OK);
     assert_eq!(drain.body["draining"], true);
-    assert_eq!(drain.body["sessions"], json!([]));
+    assert_eq!(drain.body["sessions"][0]["id"], session_id);
+    assert_eq!(drain.body["sessions"][0]["state"], "killed");
 
     let ready_after_drain = get_json(&client, &base_url, "/ready", Some(AUTH_TOKEN))?;
     assert_eq!(ready_after_drain.status, StatusCode::SERVICE_UNAVAILABLE);

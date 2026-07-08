@@ -101,6 +101,7 @@ impl JournalEntry {
                 ("session_created", url.clone(), false)
             }
             TempodSessionEventKind::SessionAdopted => ("session_adopted", String::new(), false),
+            TempodSessionEventKind::SessionResumed => ("session_resumed", String::new(), false),
             TempodSessionEventKind::SessionKilled => ("session_killed", String::new(), false),
             TempodSessionEventKind::SessionDrained => ("session_drained", String::new(), false),
             TempodSessionEventKind::StepTriple { triple } => {
@@ -171,11 +172,10 @@ fn action_kind(action: &Action) -> &'static str {
 /// the human has actually cleared the challenge in the page — it never silently
 /// waves the agent past an unresolved CAPTCHA/auth-wall.
 ///
-/// **Resume transport is a documented seam:** there is no tempod resume endpoint
-/// and no `ShellClient::resume` today (checked against the whole `ShellClient`
-/// surface), so Resume cannot yet POST a "continue this run" to the backend.
-/// Wiring that call is a follow-up on the same deferred agent↔tempod bridge that
-/// gates step-event production; see the crate PR for #354.
+/// **Resume transport:** the shell can now POST an auditable resume signal to
+/// tempod. That signal does not solve the challenge or force an agent step; it
+/// records that the human handed control back, and the next observation can
+/// still raise a fresh takeover event if the challenge remains.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TakeoverBanner {
     /// The latched takeover the human must resolve, if any.
@@ -281,9 +281,9 @@ impl JournalLog {
         &self.takeover
     }
 
-    /// Human clicked Resume: clear the blocking takeover banner. See
-    /// [`TakeoverBanner::resume`] — this never auto-continues past an unresolved
-    /// challenge, and the run-resume wire call is a documented follow-up.
+    /// Human clicked Resume after the backend accepted the signal: clear the
+    /// blocking takeover banner. See [`TakeoverBanner::resume`] — this never
+    /// auto-continues past an unresolved challenge.
     pub fn resume_takeover(&mut self) {
         self.takeover.resume();
     }

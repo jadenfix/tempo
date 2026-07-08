@@ -52,6 +52,7 @@ pub trait SessionService {
     fn sessions(&self) -> Result<Vec<TempodSession>, ShellError>;
     fn open(&self, url: &str) -> Result<TempodSession, ShellError>;
     fn adopt(&self, session_id: &str) -> Result<TempodSession, ShellError>;
+    fn resume(&self, session_id: &str) -> Result<TempodSession, ShellError>;
     fn close(&self, session_id: &str) -> Result<TempodSession, ShellError>;
     /// Navigate a tab's driver to `url` (omnibox / back / forward).
     fn goto(&self, driver_id: Option<&str>, url: &str) -> Result<(), ShellError>;
@@ -85,6 +86,10 @@ impl SessionService for ShellClient {
 
     fn adopt(&self, session_id: &str) -> Result<TempodSession, ShellError> {
         ShellClient::adopt(self, session_id)
+    }
+
+    fn resume(&self, session_id: &str) -> Result<TempodSession, ShellError> {
+        ShellClient::resume(self, session_id)
     }
 
     fn close(&self, session_id: &str) -> Result<TempodSession, ShellError> {
@@ -143,10 +148,9 @@ pub enum UiAction {
     PollEvents,
     /// Toggle the set-of-marks overlay for the page-state screenshot.
     ToggleMarks,
-    /// Human clicked Resume on the blocking takeover banner (#354): clear the
-    /// local block. Never auto-continues past an unresolved challenge; the actual
-    /// run-resume wire call is a documented follow-up (no tempod resume endpoint /
-    /// `ShellClient::resume` yet).
+    /// Human clicked Resume on the blocking takeover banner (#354): signal
+    /// tempod, then clear the local block. Never auto-continues past an
+    /// unresolved challenge; a later observation can raise the banner again.
     ResumeTakeover,
 }
 
@@ -238,7 +242,7 @@ impl ShellUiModel {
             UiAction::RefreshScreenshot => self.refresh_screenshot(service),
             UiAction::PollEvents => self.poll_events(service),
             UiAction::ToggleMarks => self.toggle_marks(),
-            UiAction::ResumeTakeover => self.resume_takeover(),
+            UiAction::ResumeTakeover => self.resume_takeover(service),
         }
     }
 
@@ -416,19 +420,23 @@ impl ShellUiModel {
         }
     }
 
-    /// Resume from the blocking human-takeover banner (#354). Clears the local
-    /// block only; because takeover detection is pure over the observation, a
-    /// resumed run that re-observes an unresolved challenge re-journals the
-    /// takeover, which re-raises the banner on the next poll — it never
-    /// auto-continues past an unresolved CAPTCHA/auth-wall. The actual run-resume
-    /// wire call is a documented follow-up: there is no tempod resume endpoint or
-    /// `ShellClient::resume` today, so there is nothing to POST yet.
-    fn resume_takeover(&mut self) {
-        if self.journal.takeover().is_blocking() {
-            self.journal.resume_takeover();
-            self.status =
-                "Challenge dismissed locally — this build has no resume signal to the agent yet (follow-up)."
-                    .to_string();
+    /// Resume from the blocking human-takeover banner (#354). Signals tempod on
+    /// the session that produced the pending journal event before clearing the
+    /// local block; if the page still contains the same challenge, the next
+    /// event poll can raise the banner again.
+    fn resume_takeover(&mut self, service: &dyn SessionService) {
+        if !self.journal.takeover().is_blocking() {
+            return;
+        }
+        let Some(session_id) = self.journal.session_id.clone() else {
+            return;
+        };
+        match service.resume(&session_id) {
+            Ok(_) => {
+                self.journal.resume_takeover();
+                self.status = "Resume signalled to tempod.".to_string();
+            }
+            Err(err) => self.set_error("resume", &err),
         }
     }
 
@@ -624,6 +632,16 @@ mod tests {
                 session_id,
                 "https://adopted.test",
                 TempodSessionState::Adopted,
+            ))
+        }
+
+        fn resume(&self, session_id: &str) -> Result<TempodSession, ShellError> {
+            self.record(format!("resume:{session_id}"));
+            self.maybe_fail("resume")?;
+            Ok(session(
+                session_id,
+                "https://resumed.test",
+                TempodSessionState::Running,
             ))
         }
 
@@ -1107,15 +1125,65 @@ mod tests {
         assert_eq!(pending.url, "https://a.test/verify");
         assert_eq!(banner.reason_label(), Some("captcha"));
 
-        // The human clicks Resume: the local block clears, and the status is
-        // truthful that the agent is not yet signalled (no resume RPC exists).
+        // The human clicks Resume: the backend is signalled before the local
+        // block clears.
         model.dispatch(UiAction::ResumeTakeover, &service);
         assert!(
             !model.journal.takeover().is_blocking(),
             "Resume clears the local block"
         );
-        assert!(model.status.contains("dismissed locally"));
-        assert!(model.status.contains("no resume signal to the agent"));
+        assert_eq!(model.status, "Resume signalled to tempod.");
+        assert!(service.calls().contains(&"resume:session-0".to_string()));
+    }
+
+    #[test]
+    fn resume_takeover_keeps_banner_when_backend_resume_fails() {
+        let service = MockService {
+            canned_events: vec![takeover_event("session-0", 1)],
+            fail: Some("resume"),
+            ..MockService::default()
+        };
+        let mut model = ShellUiModel {
+            tabs: vec![Tab::new("session-0", None, "https://a.test")],
+            active_tab: Some(0),
+            ..ShellUiModel::default()
+        };
+
+        model.dispatch(UiAction::PollEvents, &service);
+        model.dispatch(UiAction::ResumeTakeover, &service);
+
+        assert!(model.journal.takeover().is_blocking());
+        assert!(model.status.contains("resume failed"));
+    }
+
+    #[test]
+    fn resume_takeover_targets_journal_session_after_tab_switch() {
+        let service = MockService {
+            canned_events: vec![takeover_event("session-a", 1)],
+            ..MockService::default()
+        };
+        let mut model = ShellUiModel {
+            tabs: vec![
+                Tab::new("session-a", None, "https://a.test"),
+                Tab::new("session-b", None, "https://b.test"),
+            ],
+            active_tab: Some(0),
+            ..ShellUiModel::default()
+        };
+
+        model.dispatch(UiAction::PollEvents, &service);
+        model.dispatch(UiAction::SelectTab(1), &service);
+        model.dispatch(UiAction::ResumeTakeover, &service);
+
+        assert!(
+            service.calls().contains(&"resume:session-a".to_string()),
+            "resume should target the session that raised the takeover"
+        );
+        assert!(
+            !service.calls().contains(&"resume:session-b".to_string()),
+            "resume must not target the newly active tab before it is polled"
+        );
+        assert!(!model.journal.takeover().is_blocking());
     }
 
     #[test]

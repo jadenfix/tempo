@@ -38,6 +38,7 @@ Commands:
   sessions
   open URL
   adopt SESSION_ID
+  resume SESSION_ID
   events SESSION_ID [AFTER_SEQ]
   close SESSION_ID
   agent-card
@@ -130,6 +131,9 @@ pub enum ShellCommand {
     Adopt {
         session_id: String,
     },
+    Resume {
+        session_id: String,
+    },
     Events {
         session_id: String,
         after_seq: Option<u64>,
@@ -159,6 +163,7 @@ impl ShellCommand {
             Self::Sessions => write_json(stdout, &client.sessions()?),
             Self::Open { url } => write_json(stdout, &client.open(url)?),
             Self::Adopt { session_id } => write_json(stdout, &client.adopt(session_id)?),
+            Self::Resume { session_id } => write_json(stdout, &client.resume(session_id)?),
             Self::Events {
                 session_id,
                 after_seq,
@@ -259,6 +264,11 @@ impl ShellClient {
 
     pub fn adopt(&self, session_id: &str) -> Result<TempodSession, ShellError> {
         let path = format!("/sessions/{}/adopt", safe_path_segment(session_id)?);
+        self.request_json("POST", &path, None::<serde_json::Value>)
+    }
+
+    pub fn resume(&self, session_id: &str) -> Result<TempodSession, ShellError> {
+        let path = format!("/sessions/{}/resume", safe_path_segment(session_id)?);
         self.request_json("POST", &path, None::<serde_json::Value>)
     }
 
@@ -460,6 +470,9 @@ fn parse_command(args: &[String]) -> Result<ShellCommand, ShellError> {
         "open" => one_arg(rest, "open URL", |url| ShellCommand::Open { url }),
         "adopt" => one_arg(rest, "adopt SESSION_ID", |session_id| ShellCommand::Adopt {
             session_id,
+        }),
+        "resume" => one_arg(rest, "resume SESSION_ID", |session_id| {
+            ShellCommand::Resume { session_id }
         }),
         "events" => parse_events_command(rest),
         "close" => one_arg(rest, "close SESSION_ID", |session_id| ShellCommand::Close {
@@ -886,6 +899,19 @@ mod tests {
     }
 
     #[test]
+    fn parses_resume_command() -> TestResult {
+        let options = ShellOptions::parse(["resume", "session-0"])?;
+
+        assert_eq!(
+            options.command,
+            ShellCommand::Resume {
+                session_id: "session-0".into(),
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
     fn parses_mcp_tool_command_with_json_arguments() -> TestResult {
         let options = ShellOptions::parse(["tool", "screenshot", r#"{"set_of_marks":true}"#])?;
 
@@ -1058,6 +1084,20 @@ mod tests {
         assert!(matches!(
             after_create[0].event,
             TempodSessionEventKind::SessionAdopted
+        ));
+
+        let resumed = with_tempod(&pool, |addr| {
+            ShellClient::new(addr.to_string()).resume(&opened.id.0)
+        })?;
+        assert_eq!(resumed.state, TempodSessionState::Running);
+        let after_adopt = with_tempod(&pool, |addr| {
+            ShellClient::new(addr.to_string()).events(&opened.id.0, Some(1))
+        })?;
+        assert_eq!(after_adopt.len(), 1);
+        assert_eq!(after_adopt[0].seq, 2);
+        assert!(matches!(
+            after_adopt[0].event,
+            TempodSessionEventKind::SessionResumed
         ));
         Ok(())
     }
@@ -1324,7 +1364,7 @@ mod tests {
     }
 
     #[test]
-    fn adopt_events_close_work_for_valid_session_id() -> TestResult {
+    fn adopt_resume_events_close_work_for_valid_session_id() -> TestResult {
         let pool = Arc::new(Mutex::new(SessionPool::default()));
         let opened = with_tempod(&pool, |addr| {
             ShellClient::new(addr.to_string()).open("https://valid.test")
@@ -1339,6 +1379,11 @@ mod tests {
             ShellClient::new(addr.to_string()).adopt(&session_id)
         })?;
         assert_eq!(adopted.state, TempodSessionState::Adopted);
+
+        let resumed = with_tempod(&pool, |addr| {
+            ShellClient::new(addr.to_string()).resume(&session_id)
+        })?;
+        assert_eq!(resumed.state, TempodSessionState::Running);
 
         let events = with_tempod(&pool, |addr| {
             ShellClient::new(addr.to_string()).events(&session_id, None)
