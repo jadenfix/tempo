@@ -50,6 +50,12 @@ REQUIRED_METRIC_FIELDS = {
     "cpu_user_ms",
     "cpu_system_ms",
     "max_rss_bytes",
+    "rss_at_peak_by_command_bytes",
+    "peak_rss_by_command_bytes",
+    "rss_at_peak_by_process_type_bytes",
+    "peak_rss_by_process_type_bytes",
+    "process_count_at_peak",
+    "process_count_at_peak_by_type",
     "iteration",
 }
 
@@ -64,6 +70,7 @@ INT_FIELDS = {
     "cpu_user_ms",
     "cpu_system_ms",
     "max_rss_bytes",
+    "process_count_at_peak",
     "iteration",
 }
 
@@ -154,6 +161,24 @@ def require_int(metric: dict[str, Any], field: str, *, positive: bool = False) -
         raise ValidationError(f"{metric.get('runner', '<unknown>')}.{field} must be > 0")
 
 
+def require_int_map(metric: dict[str, Any], field: str, *, positive: bool = False) -> None:
+    value = metric.get(field)
+    runner = metric.get("runner", "<unknown>")
+    if not isinstance(value, dict):
+        raise ValidationError(f"{runner}.{field} must be an object")
+    if positive and not value:
+        raise ValidationError(f"{runner}.{field} must not be empty")
+    for key, item in value.items():
+        if not isinstance(key, str) or not key:
+            raise ValidationError(f"{runner}.{field} keys must be non-empty strings")
+        if not isinstance(item, int) or isinstance(item, bool):
+            raise ValidationError(f"{runner}.{field}.{key} must be an integer")
+        if item < 0:
+            raise ValidationError(f"{runner}.{field}.{key} must be >= 0")
+        if positive and item <= 0:
+            raise ValidationError(f"{runner}.{field}.{key} must be > 0")
+
+
 def artifact_path(output_dir: Path, stored_path: str) -> Path:
     path = Path(stored_path)
     if path.exists():
@@ -182,6 +207,30 @@ def validate_metric(metric: dict[str, Any], iterations: int, output_dir: Path) -
 
     for field in INT_FIELDS:
         require_int(metric, field, positive=(field in {"wall_clock_ms", "step_count"}))
+    require_int_map(metric, "rss_at_peak_by_command_bytes", positive=True)
+    require_int_map(metric, "peak_rss_by_command_bytes", positive=True)
+    require_int_map(metric, "rss_at_peak_by_process_type_bytes", positive=True)
+    require_int_map(metric, "peak_rss_by_process_type_bytes", positive=True)
+    require_int_map(metric, "process_count_at_peak_by_type", positive=True)
+    rss_at_peak_total = sum(int(value) for value in metric["rss_at_peak_by_command_bytes"].values())
+    if rss_at_peak_total != int(metric["max_rss_bytes"]):
+        raise ValidationError(
+            f"{runner}.rss_at_peak_by_command_bytes sum must equal max_rss_bytes"
+        )
+    process_type_rss_at_peak_total = sum(
+        int(value) for value in metric["rss_at_peak_by_process_type_bytes"].values()
+    )
+    if process_type_rss_at_peak_total != int(metric["max_rss_bytes"]):
+        raise ValidationError(
+            f"{runner}.rss_at_peak_by_process_type_bytes sum must equal max_rss_bytes"
+        )
+    process_count_at_peak_total = sum(
+        int(value) for value in metric["process_count_at_peak_by_type"].values()
+    )
+    if process_count_at_peak_total != int(metric["process_count_at_peak"]):
+        raise ValidationError(
+            f"{runner}.process_count_at_peak_by_type sum must equal process_count_at_peak"
+        )
     if not 1 <= int(metric["iteration"]) <= iterations:
         raise ValidationError(f"{runner}.iteration is outside expected range: {metric['iteration']}")
 
