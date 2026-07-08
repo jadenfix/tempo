@@ -3,7 +3,7 @@
 > Status: design README. Proposes that `tempod`'s HTTP control plane + MCP surface
 > adopt the **unified Google-AIP contract language** used across the Tempera
 > stack, canonically defined in
-> [`tempera-dev/data-engine`'s `API_STYLE.md`](https://github.com/tempera-dev/data-engine/blob/main/API_STYLE.md).
+> [`tempera-dev/data-engine`'s `API_STYLE.md`](https://github.com/tempera-dev/data-engine/pull/1).
 > No code here; this is the target contract + migration mapping. Tempo stays
 > standalone and local-first — alignment is about contract *shape*, not adding a
 > dependency.
@@ -153,7 +153,7 @@ not part of the control-plane contract — it stays as-is.
 
 ## 7. Reference
 
-- Canonical language: [`tempera-dev/data-engine` → `API_STYLE.md`](https://github.com/tempera-dev/data-engine/blob/main/API_STYLE.md)
+- Canonical language: [`tempera-dev/data-engine` → `API_STYLE.md`](https://github.com/tempera-dev/data-engine/pull/1)
   (data-engine is the reference implementation; its `api/openapi.yaml` is the
   byte-for-byte oracle).
 - Transfer checklist: `API_STYLE.md` §16.
