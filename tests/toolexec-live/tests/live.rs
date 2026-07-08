@@ -1,14 +1,15 @@
 use beatbox_engine::BeatboxEngine;
 use beatbox_server::{router, ServerConfig};
 use std::error::Error;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tempo_schema::{Provenance, TaintSpan};
 use tempo_toolexec::{
-    tainted_sandbox_canary_report, Determinism, ExecuteRequest, ExecutionStatus, JobStatus, Lane,
-    Policy, ProvenancedInput, Source, TaintedTransform, ToolExecClient, ToolJobState,
-    ToolStepStatus,
+    tainted_sandbox_canary_report, BeatboxClientError, Determinism, ExecuteRequest,
+    ExecutionStatus, JobStatus, Lane, Mount, MountMode, Policy, ProvenancedInput, Source,
+    TaintedTransform, ToolExecClient, ToolExecError, ToolJobState, ToolStepStatus,
 };
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
@@ -63,6 +64,79 @@ async fn real_beatboxd_job_smoke_uses_http_client() -> TestResult {
     }
 
     Err("job did not finish within polling window".into())
+}
+
+#[tokio::test]
+async fn real_beatboxd_wasm_denies_workspace_policy() -> TestResult {
+    let beatboxd = RealBeatboxd::spawn().await?;
+    let mut request = live_smoke_request("tempo-toolexec-live-workspace-denied");
+    request.policy.fs.workspace = Some(PathBuf::from("/tmp/tempo-host-workspace"));
+
+    let executor = ToolExecClient::new(beatboxd.base_url());
+    let result = executor.execute_trusted_request(&request).await;
+    let Err(error) = result else {
+        return Err("workspace policy unexpectedly executed".into());
+    };
+    let message = beatbox_api_error_message(error, "policy_unenforceable")?;
+
+    assert!(message.contains("fs.workspace"), "{message}");
+    assert!(message.contains("W0 hermetic"), "{message}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn real_beatboxd_wasm_denies_host_mount_policy() -> TestResult {
+    let beatboxd = RealBeatboxd::spawn().await?;
+    let mut request = live_smoke_request("tempo-toolexec-live-mount-denied");
+    request.policy.fs.mounts.push(Mount {
+        host: PathBuf::from("/etc"),
+        guest: PathBuf::from("/host-etc"),
+        mode: MountMode::Ro,
+    });
+
+    let executor = ToolExecClient::new(beatboxd.base_url());
+    let result = executor.execute_trusted_request(&request).await;
+    let Err(error) = result else {
+        return Err("host mount policy unexpectedly executed".into());
+    };
+    let message = beatbox_api_error_message(error, "policy_unenforceable")?;
+
+    assert!(message.contains("fs.mounts"), "{message}");
+    assert!(message.contains("exposes no mounts"), "{message}");
+    assert!(message.contains("/host-etc"), "{message}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn real_beatboxd_process_lane_is_unavailable_until_sandbox_exists() -> TestResult {
+    let beatboxd = RealBeatboxd::spawn().await?;
+    let mut request = live_smoke_request("tempo-toolexec-live-exec-unavailable");
+    request.lane = Lane::Exec;
+    request.source = Source::Inline {
+        code: "echo should-not-run".into(),
+    };
+
+    let executor = ToolExecClient::new(beatboxd.base_url());
+    let execution = executor.execute_trusted_request(&request).await?;
+
+    assert_eq!(execution.result.status, ExecutionStatus::Denied);
+    assert_eq!(execution.audit.status, ExecutionStatus::Denied);
+    let error = execution
+        .result
+        .error
+        .as_ref()
+        .ok_or("process lane denial must include an error body")?;
+    assert_eq!(error.code, "lane_unavailable");
+    assert!(error.message.contains("Exec is not implemented"));
+    assert_eq!(
+        execution.step_status,
+        ToolStepStatus::StepError {
+            reason: error.message.clone()
+        }
+    );
+    assert!(execution.audit.effective_isolation.mechanisms.is_empty());
+    assert!(!execution.audit.has_egress());
+    Ok(())
 }
 
 #[tokio::test]
@@ -148,6 +222,16 @@ fn live_smoke_request(idempotency_key: &str) -> ExecuteRequest {
         stdin: String::new(),
         policy: Policy::default(),
         idempotency_key: Some(idempotency_key.into()),
+    }
+}
+
+fn beatbox_api_error_message(error: ToolExecError, expected_code: &str) -> TestResult<String> {
+    match error {
+        ToolExecError::Beatbox(BeatboxClientError::Api { code, message, .. }) => {
+            assert_eq!(code, expected_code);
+            Ok(message)
+        }
+        other => Err(format!("expected beatbox API error, got {other}").into()),
     }
 }
 
