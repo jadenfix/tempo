@@ -130,6 +130,13 @@ and benchmark proof is real Linux amd64 CI. Apple Silicon local Docker remains a
 build/test/fixture gate plus an explicit Chromium-preflight diagnostic; host
 Chrome-for-Testing covers local live browser execution on macOS.
 
+The same Linux gate runs the live beatbox-backed `tempo-toolexec` tests. At the
+pinned beatbox milestone the executable sandbox lane is W0 Wasm, so live tests
+prove real HTTP execution, async jobs, import-egress denial, and filesystem
+workspace/mount policy denial. Process-spawn denial is tracked as an explicit
+`Exec` lane-unavailable assertion until beatbox grows a process-capable sandbox
+lane.
+
 ## Operations & governance
 
 - Current shipped security posture is narrower than the long-term design in
