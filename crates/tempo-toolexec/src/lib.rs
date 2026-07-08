@@ -319,8 +319,13 @@ impl ToolAudit {
 pub struct TaintedSandboxCanaryReport {
     pub policy_net_denied: bool,
     pub secrets_empty: bool,
+    pub filesystem_mounts_empty: bool,
+    pub process_limited_to_single_pid: bool,
+    pub double_jail_requested: bool,
+    pub beatbox_status_denied: bool,
     pub beatbox_status: ExecutionStatus,
     pub beatbox_egress_empty: bool,
+    pub beatbox_isolation_downgrades: Vec<String>,
     pub canary_hit_count: usize,
     pub violations: Vec<TaintedSandboxViolation>,
 }
@@ -336,6 +341,10 @@ impl TaintedSandboxCanaryReport {
 pub enum TaintedSandboxViolation {
     NetworkPolicyAllowed,
     SecretsInScope,
+    FilesystemMountsInScope,
+    ProcessLimitTooPermissive { pids: u32 },
+    DoubleJailNotRequested,
+    BeatboxStatusUnexpected { status: ExecutionStatus },
     BeatboxReportedEgress,
     CanaryEndpointHit { hit_count: usize },
 }
@@ -348,6 +357,10 @@ pub fn tainted_sandbox_canary_report(
 ) -> TaintedSandboxCanaryReport {
     let policy_net_denied = matches!(request.policy.net, NetPolicy::Deny);
     let secrets_empty = request.policy.secrets.is_empty();
+    let filesystem_mounts_empty = request.policy.fs.mounts.is_empty();
+    let process_limited_to_single_pid = request.policy.limits.pids <= 1;
+    let double_jail_requested = request.policy.double_jail;
+    let beatbox_status_denied = execution.audit.status == ExecutionStatus::Denied;
     let beatbox_egress_empty = execution.audit.egress.is_empty();
     let mut violations = Vec::new();
 
@@ -356,6 +369,22 @@ pub fn tainted_sandbox_canary_report(
     }
     if !secrets_empty {
         violations.push(TaintedSandboxViolation::SecretsInScope);
+    }
+    if !filesystem_mounts_empty {
+        violations.push(TaintedSandboxViolation::FilesystemMountsInScope);
+    }
+    if !process_limited_to_single_pid {
+        violations.push(TaintedSandboxViolation::ProcessLimitTooPermissive {
+            pids: request.policy.limits.pids,
+        });
+    }
+    if !double_jail_requested {
+        violations.push(TaintedSandboxViolation::DoubleJailNotRequested);
+    }
+    if !beatbox_status_denied {
+        violations.push(TaintedSandboxViolation::BeatboxStatusUnexpected {
+            status: execution.audit.status.clone(),
+        });
     }
     if !beatbox_egress_empty {
         violations.push(TaintedSandboxViolation::BeatboxReportedEgress);
@@ -369,8 +398,13 @@ pub fn tainted_sandbox_canary_report(
     TaintedSandboxCanaryReport {
         policy_net_denied,
         secrets_empty,
+        filesystem_mounts_empty,
+        process_limited_to_single_pid,
+        double_jail_requested,
+        beatbox_status_denied,
         beatbox_status: execution.audit.status.clone(),
         beatbox_egress_empty,
+        beatbox_isolation_downgrades: execution.audit.effective_isolation.downgrades.clone(),
         canary_hit_count,
         violations,
     }
@@ -795,7 +829,16 @@ mod tests {
 
     #[test]
     fn tainted_canary_report_flags_policy_and_egress_violations() {
-        let mut request = live_smoke_request("tempo-toolexec-canary-violation");
+        let mut request = tainted_transform_request(
+            Lane::Wasm,
+            Source::WasmWat {
+                text: "(module)".into(),
+            },
+            serde_json::Value::Null,
+            None,
+            "tempo-toolexec-canary-violation",
+            Determinism::Off,
+        );
         request.policy.net = NetPolicy::Proxy {
             allow_domains: vec!["example.com".into()],
             allow_ports: vec![443],
@@ -817,9 +860,87 @@ mod tests {
             report.violations,
             vec![
                 TaintedSandboxViolation::NetworkPolicyAllowed,
+                TaintedSandboxViolation::BeatboxStatusUnexpected {
+                    status: ExecutionStatus::Ok,
+                },
                 TaintedSandboxViolation::BeatboxReportedEgress,
                 TaintedSandboxViolation::CanaryEndpointHit { hit_count: 1 },
             ]
+        );
+    }
+
+    #[test]
+    fn tainted_canary_report_flags_filesystem_process_and_jail_violations() {
+        let mut request = tainted_transform_request(
+            Lane::Wasm,
+            Source::WasmWat {
+                text: "(module)".into(),
+            },
+            serde_json::Value::Null,
+            None,
+            "tempo-toolexec-canary-boundary-violation",
+            Determinism::Off,
+        );
+        request.policy.fs.mounts.push(Mount {
+            host: PathBuf::from("/"),
+            guest: PathBuf::from("/host"),
+            mode: MountMode::Ro,
+        });
+        request.policy.limits.pids = 4;
+        request.policy.double_jail = false;
+        let execution = ToolExecution::from_result(execution_result(
+            ExecutionStatus::Denied,
+            Some(ErrorBody::new("policy_denied", "filesystem denied")),
+            Vec::new(),
+        ));
+
+        let report = tainted_sandbox_canary_report(&request, &execution, 0);
+
+        assert!(!report.passed());
+        assert!(report.policy_net_denied);
+        assert!(report.secrets_empty);
+        assert!(!report.filesystem_mounts_empty);
+        assert!(!report.process_limited_to_single_pid);
+        assert!(!report.double_jail_requested);
+        assert!(report.beatbox_status_denied);
+        assert_eq!(
+            report.violations,
+            vec![
+                TaintedSandboxViolation::FilesystemMountsInScope,
+                TaintedSandboxViolation::ProcessLimitTooPermissive { pids: 4 },
+                TaintedSandboxViolation::DoubleJailNotRequested,
+            ]
+        );
+    }
+
+    #[test]
+    fn tainted_canary_report_surfaces_beatbox_isolation_downgrades() {
+        let request = tainted_transform_request(
+            Lane::Wasm,
+            Source::WasmWat {
+                text: "(module)".into(),
+            },
+            serde_json::Value::Null,
+            None,
+            "tempo-toolexec-canary-downgrade-evidence",
+            Determinism::Off,
+        );
+        let mut result = execution_result(
+            ExecutionStatus::Denied,
+            Some(ErrorBody::new("policy_denied", "import denied")),
+            Vec::new(),
+        );
+        result.effective_isolation.downgrades =
+            vec!["double_jail_unavailable_in_initial_wasm_lane".into()];
+        let execution = ToolExecution::from_result(result);
+
+        let report = tainted_sandbox_canary_report(&request, &execution, 0);
+
+        assert!(report.passed(), "{:?}", report.violations);
+        assert!(report.beatbox_status_denied);
+        assert_eq!(
+            report.beatbox_isolation_downgrades,
+            vec!["double_jail_unavailable_in_initial_wasm_lane".to_string()]
         );
     }
 
