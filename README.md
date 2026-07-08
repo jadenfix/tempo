@@ -107,8 +107,11 @@ credentials and a separate prompt contract. The harness writes:
 
 - `agent-browser-bench.json[l]` with success, wall time, CPU time, sampled
   process-tree max RSS, step count, retry count, failure mode, and model-facing
-  bytes/tokens. Multi-observation loops report total model-facing input in
-  `model_input_*` and their largest single observation in `max_observation_*`.
+  bytes/tokens. Tempo reports `model_input_*` from its compact taint-preserving
+  prompt projection and keeps durable structured JSON cost in
+  `max_observation_*`; multi-observation loops report total model-facing input
+  in `model_input_*` and their largest single observation in
+  `max_observation_*`.
 - `agent-browser-bench-summary.json` with per-runner run count, success rate,
   failure-mode counts, retry totals, and p50/p95/max stats for latency, CPU,
   RSS, step count, and model-facing bytes/tokens. `--smoke` runs one iteration;
@@ -116,12 +119,12 @@ credentials and a separate prompt contract. The harness writes:
 - `agent-browser-bench-gaps.json` with deterministic category rankings and
   Tempo deltas against raw Chrome plus Playwright/browser-use-style agent
   baselines. It calls out gaps to close for success rate, latency, RSS,
-  retries, failures, largest observation tokens, and agent step count. CPU is
-  reported row-level until every runner uses the same resource-accounting
-  scope. Raw Chrome is deliberately excluded from observation-token and
-  agent-step categories because it has no model-facing observation stream.
-  Row-level total model-input token p95 is included only where the runner
-  reports a comparable total stream cost.
+  retries, failures, model-facing tokens, largest durable observation tokens,
+  and agent step count. CPU is reported row-level until every runner uses the
+  same resource-accounting scope. Raw Chrome is deliberately excluded from
+  observation-token and agent-step categories because it has no model-facing
+  observation stream. Row-level total model-input token p95 is included only
+  where the runner reports a comparable total stream cost.
 - `real-playwright.json` and `external-browser-use-dom-loop.json`, plus each
   runner's stdout/stderr logs, model-input text, and action trace, so CI proves
   the external subprocess lanes ran and leaves auditable model-facing evidence.
@@ -149,6 +152,12 @@ pass. The
 and benchmark proof is real Linux amd64 CI. Apple Silicon local Docker remains a
 build/test/fixture gate plus an explicit Chromium-preflight diagnostic; host
 Chrome-for-Testing covers local live browser execution on macOS.
+
+The GitHub workflows cache Cargo registry/git/target outputs per job. The
+Docker Linux gate also honors `TEMPO_LINUX_AGENT_CACHE_DIR`: when set, the
+container uses host-backed `cargo-registry`, `cargo-git`, and `target`
+directories so Actions can persist the expensive Linux build products across
+runs; without it, local runs keep using Docker named volumes.
 
 The same Linux gate runs the live beatbox-backed `tempo-toolexec` tests. At the
 pinned beatbox milestone the executable sandbox lane is W0 Wasm, so live tests
@@ -184,6 +193,11 @@ lane.
   token (`TEMPO_TEMPOD_OPERATOR_TOKEN`, `--operator-token`, or the owner-only
   operator runtime token file). Loopback, Host, and Origin checks defend
   binding/CSRF edges, but they are not authentication on shared machines.
+- Hosted identity/OAuth must stay delegated to the ecosystem control plane:
+  Tempo consumes ecosystem-issued credentials and enforces product permissions;
+  it does not own users, billing, orgs, API-key issuance, OAuth grants, JWKS, or
+  token revocation. See
+  [`docs/identity-and-oauth.md`](./docs/identity-and-oauth.md).
 - Supply-chain policy lives in [`deny.toml`](./deny.toml) (checked in CI);
   tagged `v*` releases build stripped, thin-LTO `tempod` + `tempo-cli`
   binaries for macOS and Linux.

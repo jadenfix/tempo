@@ -20,17 +20,19 @@ The harness drives the same checkout task through:
 
 The generated benchmark artifact records success, wall time, CPU time, sampled
 process-tree max RSS, step count, retry count, failure mode, and model-facing
-bytes/tokens for each runner. Multi-observation loops report total model-facing
-input in `model_input_*` and largest single-observation size in
-`max_observation_*`. `--full` repeats the case five times by default and writes
+bytes/tokens for each runner. Tempo reports `model_input_*` from its compact
+taint-preserving prompt projection and keeps durable structured JSON cost in
+`max_observation_*`; multi-observation loops report total model-facing input in
+`model_input_*` and largest single-observation size in `max_observation_*`.
+`--full` repeats the case five times by default and writes
 `agent-browser-bench-summary.json` with per-runner success rate, failure-mode
 counts, retry totals, and p50/p95/max stats. It also writes
 `agent-browser-bench-gaps.json`, a deterministic comparison report that ranks
 Tempo against raw Chrome, Playwright, and browser-use-style baselines for
-success, latency, RSS, retries, failures, largest observation tokens, and agent
-step count. CPU is reported row-level until every runner uses the same
-resource-accounting scope. Row-level total model-input token p95 is included
-where a runner reports a comparable total stream cost. It also emits Tempo
-`session-eval`, `replay`, `scorecard`, and `amdahl` artifacts from the real
-journal, external runner model-input/action traces, and `chrome-version.txt` so
-benchmark runs stay tied to durable agent evidence.
+success, latency, RSS, retries, failures, model-facing tokens, largest durable
+observation tokens, and agent step count. CPU is reported row-level until every
+runner uses the same resource-accounting scope. Row-level total model-input
+token p95 is included where a runner reports a comparable total stream cost. It
+also emits Tempo `session-eval`, `replay`, `scorecard`, and `amdahl` artifacts
+from the real journal, external runner model-input/action traces, and
+`chrome-version.txt` so benchmark runs stay tied to durable agent evidence.

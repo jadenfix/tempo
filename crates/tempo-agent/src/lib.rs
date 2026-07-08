@@ -23,6 +23,7 @@ use tempo_session::{
     SessionJournal,
 };
 use tempo_skills::{SkillError, SkillStore};
+use tempo_taint::serialize_compact_observation_for_model;
 use thiserror::Error;
 
 pub mod decider;
@@ -739,6 +740,13 @@ pub struct ObservationBudget {
     pub estimated_tokens: usize,
 }
 
+/// Measured compact model-facing projection size for evals and benchmark reports.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelInputBudget {
+    pub bytes: usize,
+    pub estimated_tokens: usize,
+}
+
 /// How a non-interactive runner treats policy confirmation gates.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ConfirmationMode {
@@ -1265,6 +1273,10 @@ impl AgentRunner {
             resolve_url_target(&endpoint, &self.structured_fast_path.config.url_policy)
                 .map_err(|error| error.to_string())?;
         let max_body_bytes = self.structured_fast_path.config.max_body_bytes;
+        // Hosted OAuth belongs to the central ecosystem issuer. This fast path
+        // must only use an explicit scoped grant from a future auth broker; it
+        // must not mint credentials, scrape page text, or replay ambient browser
+        // secrets into remote MCP calls.
         let client = reqwest::Client::builder()
             .timeout(self.structured_fast_path.config.timeout)
             .redirect(reqwest::redirect::Policy::none())
@@ -1382,9 +1394,16 @@ impl AgentRunner {
         observation: CompiledObservation,
     ) -> Result<ObservationBudget, AgentError> {
         let budget = self.observation_budget.validate(&observation)?;
+        let model_input = model_input_budget(&observation);
         report.observations += 1;
         report.max_observation_bytes = report.max_observation_bytes.max(budget.bytes);
         report.max_observation_tokens = report.max_observation_tokens.max(budget.estimated_tokens);
+        report.max_model_input_bytes = report.max_model_input_bytes.max(model_input.bytes);
+        report.max_model_input_tokens = report
+            .max_model_input_tokens
+            .max(model_input.estimated_tokens);
+        report.total_model_input_bytes += model_input.bytes;
+        report.total_model_input_tokens += model_input.estimated_tokens;
         agent.record_observation(observation)?;
         Ok(budget)
     }
@@ -1537,6 +1556,10 @@ pub struct AgentRunReport {
     pub observations: usize,
     pub max_observation_bytes: usize,
     pub max_observation_tokens: usize,
+    pub max_model_input_bytes: usize,
+    pub max_model_input_tokens: usize,
+    pub total_model_input_bytes: usize,
+    pub total_model_input_tokens: usize,
     pub steps: Vec<AgentStepReport>,
 }
 
@@ -1556,6 +1579,10 @@ impl AgentRunReport {
             observations: 0,
             max_observation_bytes: 0,
             max_observation_tokens: 0,
+            max_model_input_bytes: 0,
+            max_model_input_tokens: 0,
+            total_model_input_bytes: 0,
+            total_model_input_tokens: 0,
             steps: Vec::new(),
         }
     }
@@ -2245,6 +2272,14 @@ pub fn estimate_tokens(bytes: usize) -> usize {
     bytes.div_ceil(4)
 }
 
+fn model_input_budget(observation: &CompiledObservation) -> ModelInputBudget {
+    let bytes = serialize_compact_observation_for_model(observation).len();
+    ModelInputBudget {
+        bytes,
+        estimated_tokens: estimate_tokens(bytes),
+    }
+}
+
 /// Human-readable crate summary.
 pub fn describe() -> &'static str {
     "durable agent loop core with live driver execution, token budgets, idempotent resume, and StepTriple extraction"
@@ -2819,6 +2854,11 @@ mod tests {
         assert_eq!(report.status, AgentRunStatus::Completed);
         assert_eq!(report.actions_completed, 1);
         assert!(report.max_observation_bytes > 0);
+        assert!(report.max_model_input_bytes > 0);
+        assert!(report.max_model_input_tokens > 0);
+        assert!(report.max_model_input_bytes < report.max_observation_bytes);
+        assert!(report.total_model_input_bytes >= report.max_model_input_bytes);
+        assert!(report.total_model_input_tokens >= report.max_model_input_tokens);
         assert_eq!(report.steps[0].policy.idempotency_key.0.len(), 64);
         assert!(is_lower_hex(&report.steps[0].policy.idempotency_key.0));
 

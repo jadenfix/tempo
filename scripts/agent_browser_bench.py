@@ -282,10 +282,38 @@ def run_tempo(url: str, chrome: str, output_dir: Path) -> dict:
         "step_count": int(report.get("actions_completed", 0)),
         "retry_count": 0,
         "failure_mode": failure_mode,
-        "model_input_bytes": int(report.get("max_observation_bytes", 0)),
-        "model_input_tokens": int(report.get("max_observation_tokens", 0)),
+        "model_input_bytes": int(
+            report.get(
+                "total_model_input_bytes",
+                report.get("max_model_input_bytes", report.get("max_observation_bytes", 0)),
+            )
+        ),
+        "model_input_tokens": int(
+            report.get(
+                "total_model_input_tokens",
+                report.get("max_model_input_tokens", report.get("max_observation_tokens", 0)),
+            )
+        ),
         "max_observation_bytes": int(report.get("max_observation_bytes", 0)),
         "max_observation_tokens": int(report.get("max_observation_tokens", 0)),
+        "max_model_input_bytes": int(
+            report.get("max_model_input_bytes", report.get("max_observation_bytes", 0))
+        ),
+        "max_model_input_tokens": int(
+            report.get("max_model_input_tokens", report.get("max_observation_tokens", 0))
+        ),
+        "total_model_input_bytes": int(
+            report.get(
+                "total_model_input_bytes",
+                report.get("max_model_input_bytes", report.get("max_observation_bytes", 0)),
+            )
+        ),
+        "total_model_input_tokens": int(
+            report.get(
+                "total_model_input_tokens",
+                report.get("max_model_input_tokens", report.get("max_observation_tokens", 0)),
+            )
+        ),
         "observations": int(report.get("observations", 0)),
         "journal": str(journal),
         "run_report": str(run_report),
@@ -625,6 +653,14 @@ def summarize_metrics(metrics: list[dict]) -> dict:
             summary[runner]["max_observation_tokens"] = summarize_int_field(
                 runner_metrics, "max_observation_tokens"
             )
+        if any("max_model_input_bytes" in metric for metric in runner_metrics):
+            summary[runner]["max_model_input_bytes"] = summarize_int_field(
+                runner_metrics, "max_model_input_bytes"
+            )
+        if any("max_model_input_tokens" in metric for metric in runner_metrics):
+            summary[runner]["max_model_input_tokens"] = summarize_int_field(
+                runner_metrics, "max_model_input_tokens"
+            )
     return summary
 
 
@@ -681,6 +717,11 @@ def benchmark_gap_report(metrics: list[dict], summary: dict) -> dict:
         ("max_rss_bytes_p95", "lower_is_better", runners),
         ("retry_count_total", "lower_is_better", runners),
         ("failure_count", "lower_is_better", runners),
+        (
+            "model_input_tokens_p95",
+            "lower_is_better",
+            sorted(runner for runner in runners if runner in AGENT_STYLE_RUNNERS),
+        ),
         (
             "max_observation_tokens_p95",
             "lower_is_better",
@@ -770,7 +811,8 @@ def benchmark_gap_report(metrics: list[dict], summary: dict) -> dict:
         "agent_style_runners": sorted(AGENT_STYLE_RUNNERS),
         "comparison_notes": [
             "raw-chrome-cdp is excluded from observation-token and agent-step categories because it has no model-facing observation stream.",
-            "max_observation_tokens_p95 compares the largest single observation per run; total_model_input_tokens_p95 is row-level only until every agent runner records true total stream cost.",
+            "model_input_tokens_p95 ranks the compact model-facing input each runner presents to an agent; max_observation_tokens_p95 keeps Tempo's durable structured observation cost visible.",
+            "max_observation_tokens_p95 compares the largest single durable observation per run; total_model_input_tokens_p95 is row-level only until every agent runner records true total stream cost.",
             "cpu_time_ms_p95 is row-level only until every runner uses the same resource-accounting scope.",
             "Positive deltas mean Tempo is behind that comparison target; negative deltas mean Tempo is ahead.",
         ],

@@ -916,6 +916,10 @@ struct RunCdpTaskReport {
     observations: usize,
     max_observation_bytes: usize,
     max_observation_tokens: usize,
+    max_model_input_bytes: usize,
+    max_model_input_tokens: usize,
+    total_model_input_bytes: usize,
+    total_model_input_tokens: usize,
     steps: Vec<RunCdpTaskStep>,
 }
 
@@ -965,6 +969,10 @@ impl RunCdpTaskReport {
             observations: report.observations,
             max_observation_bytes: report.max_observation_bytes,
             max_observation_tokens: report.max_observation_tokens,
+            max_model_input_bytes: report.max_model_input_bytes,
+            max_model_input_tokens: report.max_model_input_tokens,
+            total_model_input_bytes: report.total_model_input_bytes,
+            total_model_input_tokens: report.total_model_input_tokens,
             steps: report.steps.iter().map(RunCdpTaskStep::from).collect(),
         }
     }
@@ -1604,14 +1612,14 @@ mod tests {
         );
 
         match result {
-            Err(CliError::GateFailed { violations }) => assert_eq!(violations, 2),
+            Err(CliError::GateFailed { violations }) => assert_eq!(violations, 3),
             other => return Err(unexpected_result(other)),
         }
         assert!(stdout.is_empty());
         let value: Value = serde_json::from_reader(File::open(&output)?)?;
         assert_eq!(value["total_cases"], 2);
         assert_eq!(value["passed_cases"], 1);
-        assert_eq!(value["violations"].as_array().map(Vec::len), Some(2));
+        assert_eq!(value["violations"].as_array().map(Vec::len), Some(3));
         assert_eq!(value["violations"][0]["id"], "trusted-mislabel");
         remove_dir(&dir)?;
         Ok(())
