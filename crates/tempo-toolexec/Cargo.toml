@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-beatbox-client = { git = "https://github.com/jadenfix/beatbox.git", rev = "b2e7b18e95563bc95aea58583e40f23a455df19f" }
+beatbox-client = { git = "https://github.com/jadenfix/beatbox.git", rev = "390013fc1e1f432b8fa1ffc494f88d05c14aa7fc" }
 serde_json.workspace = true
 thiserror.workspace = true
 tempo-driver = { path = "../tempo-driver" }

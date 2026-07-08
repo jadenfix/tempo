@@ -9,8 +9,8 @@ publish = false
 
 [dependencies]
 axum = "0.8"
-beatbox-engine = { git = "https://github.com/jadenfix/beatbox.git", rev = "b2e7b18e95563bc95aea58583e40f23a455df19f" }
-beatbox-server = { git = "https://github.com/jadenfix/beatbox.git", rev = "b2e7b18e95563bc95aea58583e40f23a455df19f" }
+beatbox-engine = { git = "https://github.com/jadenfix/beatbox.git", rev = "390013fc1e1f432b8fa1ffc494f88d05c14aa7fc" }
+beatbox-server = { git = "https://github.com/jadenfix/beatbox.git", rev = "390013fc1e1f432b8fa1ffc494f88d05c14aa7fc" }
 serde_json = "1"
 tempo-schema = { path = "../../crates/tempo-schema" }
 tempo-toolexec = { path = "../../crates/tempo-toolexec" }

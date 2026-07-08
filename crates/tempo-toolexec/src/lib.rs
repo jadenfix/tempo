@@ -8,9 +8,9 @@ use std::path::PathBuf;
 
 pub use beatbox_client::{
     Client as BeatboxClient, ClientError as BeatboxClientError, CreateJobResponse, Determinism,
-    EffectiveIsolation, EgressRecord, ErrorBody, ExecuteRequest, ExecutionResult, ExecutionStatus,
-    FsPolicy, JobRecord, JobStatus, Lane, Limits, Metrics, Mount, MountMode, NetPolicy, Policy,
-    Secret, Source,
+    EcosystemIntegrationContract, EcosystemLaneContract, EffectiveIsolation, EgressRecord,
+    ErrorBody, ExecuteRequest, ExecutionResult, ExecutionStatus, FsPolicy, JobRecord, JobStatus,
+    Lane, Limits, Metrics, Mount, MountMode, NetPolicy, Policy, Secret, Source,
 };
 use tempo_driver::StepOutcome;
 use tempo_schema::ObservationDiff;
@@ -21,7 +21,10 @@ use thiserror::Error;
 pub const TAINTED_WALL_MS: u64 = 2_000;
 
 /// Default CPU cap for transforms over tainted page content.
-pub const TAINTED_CPU_MS: u64 = 2_000;
+///
+/// Beatbox's W0 Wasm lane bounds compute with wall time and fuel, and rejects
+/// a tighter independent CPU ceiling because it cannot enforce one honestly.
+pub const TAINTED_CPU_MS: u64 = 5_000;
 
 /// Default memory cap for transforms over tainted page content.
 pub const TAINTED_MEMORY_BYTES: u64 = 64 * 1024 * 1024;
@@ -111,6 +114,17 @@ impl ToolExecClient {
 
     pub async fn cancel_job(&self, job_id: &str) -> Result<(), ToolExecError> {
         Ok(self.client.cancel_job(job_id).await?)
+    }
+
+    /// Fetch beatbox's raw capability document for diagnostics and CI evidence.
+    pub async fn capabilities(&self) -> Result<serde_json::Value, ToolExecError> {
+        Ok(self.client.capabilities().await?)
+    }
+
+    /// Fetch the typed integration contract Tempo uses to decide which native
+    /// tool lanes are runnable and which must stay fail-closed.
+    pub async fn integration(&self) -> Result<EcosystemIntegrationContract, ToolExecError> {
+        Ok(self.client.integration().await?)
     }
 }
 
@@ -355,7 +369,7 @@ pub fn tainted_sandbox_canary_report(
     execution: &ToolExecution,
     canary_hit_count: usize,
 ) -> TaintedSandboxCanaryReport {
-    let policy_net_denied = matches!(request.policy.net, NetPolicy::Deny);
+    let policy_net_denied = matches!(request.policy.net, NetPolicy::Deny {});
     let secrets_empty = request.policy.secrets.is_empty();
     let filesystem_mounts_empty = request.policy.fs.mounts.is_empty();
     let process_limited_to_single_pid = request.policy.limits.pids <= 1;
@@ -487,7 +501,7 @@ pub fn tainted_transform_policy(
             workspace: session_scratch,
             mounts: Vec::new(),
         },
-        net: NetPolicy::Deny,
+        net: NetPolicy::Deny {},
         env: Default::default(),
         secrets: Vec::new(),
         limits: Limits {
@@ -530,7 +544,7 @@ mod tests {
             },
         );
 
-        assert_eq!(policy.net, NetPolicy::Deny);
+        assert_eq!(policy.net, NetPolicy::Deny {});
         assert!(policy.secrets.is_empty());
         assert!(policy.fs.mounts.is_empty());
         assert_eq!(policy.fs.workspace, Some(PathBuf::from("/tmp/session")));
@@ -560,12 +574,12 @@ mod tests {
             serde_json::json!({ "text": "page" }),
             None,
             "step-42",
-            Determinism::Off,
+            Determinism::Off {},
         );
 
         assert_eq!(request.lane, Lane::PythonWasi);
         assert_eq!(request.idempotency_key, Some("step-42".into()));
-        assert_eq!(request.policy.net, NetPolicy::Deny);
+        assert_eq!(request.policy.net, NetPolicy::Deny {});
         assert!(request.policy.secrets.is_empty());
         assert!(request.policy.double_jail);
     }
@@ -594,7 +608,7 @@ mod tests {
         .try_into_request()
         .map_err(|err| err.to_string())?;
 
-        assert_eq!(request.policy.net, NetPolicy::Deny);
+        assert_eq!(request.policy.net, NetPolicy::Deny {});
         assert!(request.policy.secrets.is_empty());
         assert_eq!(
             request.policy.determinism,
@@ -622,7 +636,7 @@ mod tests {
             ),
             session_scratch: None,
             idempotency_key: "step-44".into(),
-            determinism: Determinism::Off,
+            determinism: Determinism::Off {},
         }
         .try_into_request();
 
@@ -795,7 +809,7 @@ mod tests {
                 ),
                 session_scratch: None,
                 idempotency_key: "step-45".into(),
-                determinism: Determinism::Off,
+                determinism: Determinism::Off {},
             })
             .await;
 
@@ -820,7 +834,7 @@ mod tests {
                 ),
                 session_scratch: None,
                 idempotency_key: "step-46".into(),
-                determinism: Determinism::Off,
+                determinism: Determinism::Off {},
             })
             .await;
 
@@ -837,7 +851,7 @@ mod tests {
             serde_json::Value::Null,
             None,
             "tempo-toolexec-canary-violation",
-            Determinism::Off,
+            Determinism::Off {},
         );
         request.policy.net = NetPolicy::Proxy {
             allow_domains: vec!["example.com".into()],
@@ -879,7 +893,7 @@ mod tests {
             serde_json::Value::Null,
             None,
             "tempo-toolexec-canary-boundary-violation",
-            Determinism::Off,
+            Determinism::Off {},
         );
         request.policy.fs.mounts.push(Mount {
             host: PathBuf::from("/"),
@@ -923,7 +937,7 @@ mod tests {
             serde_json::Value::Null,
             None,
             "tempo-toolexec-canary-downgrade-evidence",
-            Determinism::Off,
+            Determinism::Off {},
         );
         let mut result = execution_result(
             ExecutionStatus::Denied,
@@ -979,7 +993,7 @@ mod tests {
             error,
             metrics: Metrics {
                 wall_time_ms: 10,
-                cpu_time_ms: 8,
+                cpu_time_ms: Some(8),
                 fuel_used: Some(100),
                 peak_memory_bytes: Some(1024),
             },
