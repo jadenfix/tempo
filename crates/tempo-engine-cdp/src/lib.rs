@@ -240,16 +240,9 @@ impl CdpTempoDriver {
         .await?;
         let launch_config = config.clone();
         let mut config = config;
-        config.args.extend([
-            "--disable-gpu".to_string(),
-            "--run-all-compositor-stages-before-draw".to_string(),
-            "--use-mock-keychain".to_string(),
-            format!("--proxy-server=http://{}", policy_proxy.addr),
-            "--proxy-bypass-list=<-loopback>".to_string(),
-            "--disable-quic".to_string(),
-            "--dns-prefetch-disable".to_string(),
-            "--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1".to_string(),
-        ]);
+        config
+            .args
+            .extend(default_cdp_launch_args(policy_proxy.addr));
         let browser_config = config.browser_config(profile_dir.path())?;
         let (mut browser, mut handler) = Browser::launch(browser_config)
             .await
@@ -1244,6 +1237,28 @@ fn is_policy_proxy_arg(arg: &str) -> bool {
         .map(|(name, _value)| name)
         .unwrap_or(arg);
     CDP_POLICY_PROXY_ARGS.contains(&name)
+}
+
+fn default_cdp_launch_args(policy_proxy_addr: SocketAddr) -> Vec<String> {
+    vec![
+        "--disable-gpu".to_string(),
+        "--disable-dev-shm-usage".to_string(),
+        "--disable-background-networking".to_string(),
+        "--disable-component-update".to_string(),
+        "--disable-default-apps".to_string(),
+        "--disable-extensions".to_string(),
+        "--disable-sync".to_string(),
+        "--metrics-recording-only".to_string(),
+        "--no-default-browser-check".to_string(),
+        "--no-first-run".to_string(),
+        "--run-all-compositor-stages-before-draw".to_string(),
+        "--use-mock-keychain".to_string(),
+        format!("--proxy-server=http://{policy_proxy_addr}"),
+        "--proxy-bypass-list=<-loopback>".to_string(),
+        "--disable-quic".to_string(),
+        "--dns-prefetch-disable".to_string(),
+        "--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1".to_string(),
+    ]
 }
 
 impl Drop for CdpTempoDriver {
@@ -4288,6 +4303,35 @@ mod tests {
             .with_arg("--user-agent=tempo-test")
             .validate_policy_proxy_args()
             .is_ok());
+    }
+
+    #[test]
+    fn default_launch_args_keep_policy_proxy_and_headless_ci_parity() {
+        let args = default_cdp_launch_args(SocketAddr::from(([127, 0, 0, 1], 9001)));
+
+        for expected in [
+            "--disable-gpu",
+            "--disable-dev-shm-usage",
+            "--disable-background-networking",
+            "--disable-component-update",
+            "--disable-default-apps",
+            "--disable-extensions",
+            "--disable-sync",
+            "--metrics-recording-only",
+            "--no-default-browser-check",
+            "--no-first-run",
+            "--run-all-compositor-stages-before-draw",
+            "--use-mock-keychain",
+            "--disable-quic",
+            "--dns-prefetch-disable",
+            "--proxy-bypass-list=<-loopback>",
+            "--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1",
+        ] {
+            assert!(args.iter().any(|arg| arg == expected), "missing {expected}");
+        }
+        assert!(args
+            .iter()
+            .any(|arg| arg == "--proxy-server=http://127.0.0.1:9001"));
     }
 
     #[test]
