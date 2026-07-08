@@ -109,6 +109,15 @@ model credentials and a separate prompt contract. The harness writes:
   failure-mode counts, retry totals, and p50/p95/max stats for latency, CPU,
   RSS, step count, and model-facing bytes/tokens. `--smoke` runs one iteration;
   `--full` runs five by default, and `--iterations N` overrides either mode.
+- `agent-browser-bench-gaps.json` with deterministic category rankings and
+  Tempo deltas against raw Chrome plus Playwright/browser-use-style agent
+  baselines. It calls out gaps to close for success rate, latency, RSS,
+  retries, failures, largest observation tokens, and agent step count. CPU is
+  reported row-level until every runner uses the same resource-accounting
+  scope. Raw Chrome is deliberately excluded from observation-token and
+  agent-step categories because it has no model-facing observation stream.
+  Row-level total model-input token p95 is included only where the runner
+  reports a comparable total stream cost.
 - `real-playwright.json` and `external-browser-use-dom-loop.json`, plus each
   runner's stdout/stderr logs, model-input text, and action trace, so CI proves
   the external subprocess lanes ran and leaves auditable model-facing evidence.
@@ -124,8 +133,9 @@ runs one iteration, while `--full` runs the benchmark harness's five-iteration
 default. The
 `scripts/validate-agent-bench-artifacts.py` validator then requires the six
 expected runners, successful metrics, per-runner summary stats, model-input and
-resource counters, Chrome version capture, and the derived journal, replay,
-scorecard, and baseline artifacts before the gate can pass. The
+resource counters, comparative gap report, Chrome version capture, and the
+derived journal, replay, scorecard, and baseline artifacts before the gate can
+pass. The
 `.github/workflows/linux-agent-gate.yml` workflow forces
 `TEMPO_LINUX_AGENT_PLATFORM=linux/amd64` and
 `TEMPO_LINUX_AGENT_REQUIRE_LIVE_CDP=1`, so the authoritative container live-CDP
