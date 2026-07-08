@@ -195,6 +195,14 @@ def validate_metric(metric: dict[str, Any], iterations: int, output_dir: Path) -
                 f"{runner}.model_input_observations must be <= observations"
             )
 
+    if runner == "tempo-cdp-agent":
+        require_int(metric, "max_compact_observation_bytes", positive=True)
+        require_int(metric, "max_compact_observation_tokens", positive=True)
+        if int(metric["max_compact_observation_bytes"]) > int(metric["max_observation_bytes"]):
+            raise ValidationError(
+                "tempo-cdp-agent.max_compact_observation_bytes must be <= max_observation_bytes"
+            )
+
     if runner in {"real-playwright", "external-browser-use-dom-loop"}:
         if metric.get("external_process") is not True:
             raise ValidationError(f"{runner}.external_process must be true")
@@ -267,6 +275,8 @@ def expected_summary(metrics: list[dict[str, Any]]) -> dict[str, Any]:
             "total_model_input_tokens",
             "max_observation_bytes",
             "max_observation_tokens",
+            "max_compact_observation_bytes",
+            "max_compact_observation_tokens",
             "max_model_input_bytes",
             "max_model_input_tokens",
         ):
@@ -295,6 +305,11 @@ def expected_gap_report(metrics: list[dict[str, Any]], summary: dict[str, Any]) 
         ("failure_count", "lower_is_better", runners),
         (
             "model_input_tokens_p95",
+            "lower_is_better",
+            sorted(runner for runner in runners if runner in AGENT_STYLE_RUNNERS),
+        ),
+        (
+            "compact_observation_tokens_p95",
             "lower_is_better",
             sorted(runner for runner in runners if runner in AGENT_STYLE_RUNNERS),
         ),
@@ -387,7 +402,8 @@ def expected_gap_report(metrics: list[dict[str, Any]], summary: dict[str, Any]) 
         "agent_style_runners": sorted(AGENT_STYLE_RUNNERS),
         "comparison_notes": [
             "raw-chrome-cdp is excluded from observation-token and agent-step categories because it has no model-facing observation stream.",
-            "model_input_tokens_p95 ranks the compact model-facing input each runner presents to an agent; max_observation_tokens_p95 keeps Tempo's durable structured observation cost visible.",
+            "model_input_tokens_p95 ranks the full model-facing stream each runner presents to an agent; compact_observation_tokens_p95 ranks the largest compact observation projection per run.",
+            "max_observation_tokens_p95 keeps Tempo's full durable structured audit JSON cost visible and is intentionally separate from compact model-facing projections.",
             "max_observation_tokens_p95 compares the largest single durable observation per run; total_model_input_tokens_p95 is row-level only until every agent runner records true total stream cost.",
             "cpu_time_ms_p95 is row-level only until every runner uses the same resource-accounting scope.",
             "Positive deltas mean Tempo is behind that comparison target; negative deltas mean Tempo is ahead.",
@@ -420,6 +436,13 @@ def comparison_row(
         ),
         "max_rss_bytes_p95": int(runner_summary["max_rss_bytes"]["p95"]),
         "model_input_tokens_p95": int(runner_summary["model_input_tokens"]["p95"]),
+        "compact_observation_tokens_p95": percentile(
+            [
+                comparable_compact_observation_tokens(metric)
+                for metric in runner_metrics
+            ],
+            0.95,
+        ),
         "max_observation_tokens_p95": percentile(
             [
                 int(metric.get("max_observation_tokens", metric.get("model_input_tokens", 0)))
@@ -473,6 +496,12 @@ def comparable_total_model_input_tokens(metric: dict[str, Any]) -> int | None:
     if model_observations <= 1:
         return int(metric.get("model_input_tokens", 0))
     return None
+
+
+def comparable_compact_observation_tokens(metric: dict[str, Any]) -> int:
+    if "max_compact_observation_tokens" in metric:
+        return int(metric["max_compact_observation_tokens"])
+    return int(metric.get("max_observation_tokens", metric.get("model_input_tokens", 0)))
 
 
 def comparison_rank(

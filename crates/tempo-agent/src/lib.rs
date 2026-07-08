@@ -1418,15 +1418,22 @@ impl AgentRunner {
         report.observations += 1;
         report.max_observation_bytes = report.max_observation_bytes.max(budget.bytes);
         report.max_observation_tokens = report.max_observation_tokens.max(budget.estimated_tokens);
+        let compact_observation = compact_observation_budget(&observation);
+        report.max_compact_observation_bytes = report
+            .max_compact_observation_bytes
+            .max(compact_observation.bytes);
+        report.max_compact_observation_tokens = report
+            .max_compact_observation_tokens
+            .max(compact_observation.estimated_tokens);
         if observation_use == ObservationUse::ModelInput {
-            let model_input = model_input_budget(&observation);
             report.model_input_observations += 1;
-            report.max_model_input_bytes = report.max_model_input_bytes.max(model_input.bytes);
+            report.max_model_input_bytes =
+                report.max_model_input_bytes.max(compact_observation.bytes);
             report.max_model_input_tokens = report
                 .max_model_input_tokens
-                .max(model_input.estimated_tokens);
-            report.total_model_input_bytes += model_input.bytes;
-            report.total_model_input_tokens += model_input.estimated_tokens;
+                .max(compact_observation.estimated_tokens);
+            report.total_model_input_bytes += compact_observation.bytes;
+            report.total_model_input_tokens += compact_observation.estimated_tokens;
         }
         agent.record_observation(observation)?;
         Ok(budget)
@@ -1581,6 +1588,8 @@ pub struct AgentRunReport {
     pub model_input_observations: usize,
     pub max_observation_bytes: usize,
     pub max_observation_tokens: usize,
+    pub max_compact_observation_bytes: usize,
+    pub max_compact_observation_tokens: usize,
     pub max_model_input_bytes: usize,
     pub max_model_input_tokens: usize,
     pub total_model_input_bytes: usize,
@@ -1605,6 +1614,8 @@ impl AgentRunReport {
             model_input_observations: 0,
             max_observation_bytes: 0,
             max_observation_tokens: 0,
+            max_compact_observation_bytes: 0,
+            max_compact_observation_tokens: 0,
             max_model_input_bytes: 0,
             max_model_input_tokens: 0,
             total_model_input_bytes: 0,
@@ -2298,7 +2309,7 @@ pub fn estimate_tokens(bytes: usize) -> usize {
     bytes.div_ceil(4)
 }
 
-fn model_input_budget(observation: &CompiledObservation) -> ModelInputBudget {
+fn compact_observation_budget(observation: &CompiledObservation) -> ModelInputBudget {
     let bytes = serialize_compact_observation_for_model(observation).len();
     ModelInputBudget {
         bytes,
@@ -2882,6 +2893,9 @@ mod tests {
         assert_eq!(report.observations, 2);
         assert_eq!(report.model_input_observations, 1);
         assert!(report.max_observation_bytes > 0);
+        assert!(report.max_compact_observation_bytes > 0);
+        assert!(report.max_compact_observation_tokens > 0);
+        assert!(report.max_compact_observation_bytes <= report.max_observation_bytes);
         assert!(report.max_model_input_bytes > 0);
         assert!(report.max_model_input_tokens > 0);
         assert!(report.max_model_input_bytes < report.max_observation_bytes);
