@@ -54,8 +54,10 @@ REQUIRED_METRIC_FIELDS = {
     "peak_rss_by_command_bytes",
     "rss_at_peak_by_process_type_bytes",
     "peak_rss_by_process_type_bytes",
+    "rss_peak_elapsed_ms",
     "process_count_at_peak",
     "process_count_at_peak_by_type",
+    "processes_at_peak",
     "iteration",
 }
 
@@ -70,6 +72,7 @@ INT_FIELDS = {
     "cpu_user_ms",
     "cpu_system_ms",
     "max_rss_bytes",
+    "rss_peak_elapsed_ms",
     "process_count_at_peak",
     "iteration",
 }
@@ -179,6 +182,69 @@ def require_int_map(metric: dict[str, Any], field: str, *, positive: bool = Fals
             raise ValidationError(f"{runner}.{field}.{key} must be > 0")
 
 
+def validate_processes_at_peak(metric: dict[str, Any]) -> None:
+    runner = metric.get("runner", "<unknown>")
+    processes = metric.get("processes_at_peak")
+    if not isinstance(processes, list):
+        raise ValidationError(f"{runner}.processes_at_peak must be an array")
+    if len(processes) != int(metric["process_count_at_peak"]):
+        raise ValidationError(
+            f"{runner}.processes_at_peak length must equal process_count_at_peak"
+        )
+
+    rss_total = 0
+    by_command: dict[str, int] = {}
+    by_process_type: dict[str, int] = {}
+    count_by_process_type: dict[str, int] = {}
+    for index, process in enumerate(processes):
+        if not isinstance(process, dict):
+            raise ValidationError(f"{runner}.processes_at_peak[{index}] must be an object")
+        pid = process.get("pid")
+        ppid = process.get("ppid")
+        command = process.get("command")
+        process_type = process.get("process_type")
+        rss_bytes = process.get("rss_bytes")
+        args = process.get("args")
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+            raise ValidationError(f"{runner}.processes_at_peak[{index}].pid must be > 0")
+        if not isinstance(ppid, int) or isinstance(ppid, bool) or ppid < 0:
+            raise ValidationError(f"{runner}.processes_at_peak[{index}].ppid must be >= 0")
+        if not isinstance(command, str) or not command:
+            raise ValidationError(
+                f"{runner}.processes_at_peak[{index}].command must be a non-empty string"
+            )
+        if not isinstance(process_type, str) or not process_type:
+            raise ValidationError(
+                f"{runner}.processes_at_peak[{index}].process_type must be a non-empty string"
+            )
+        if not isinstance(rss_bytes, int) or isinstance(rss_bytes, bool) or rss_bytes <= 0:
+            raise ValidationError(
+                f"{runner}.processes_at_peak[{index}].rss_bytes must be > 0"
+            )
+        if not isinstance(args, str):
+            raise ValidationError(f"{runner}.processes_at_peak[{index}].args must be a string")
+
+        rss_total += rss_bytes
+        by_command[command] = by_command.get(command, 0) + rss_bytes
+        by_process_type[process_type] = by_process_type.get(process_type, 0) + rss_bytes
+        count_by_process_type[process_type] = count_by_process_type.get(process_type, 0) + 1
+
+    if rss_total != int(metric["max_rss_bytes"]):
+        raise ValidationError(f"{runner}.processes_at_peak rss sum must equal max_rss_bytes")
+    if dict(sorted(by_command.items())) != metric["rss_at_peak_by_command_bytes"]:
+        raise ValidationError(
+            f"{runner}.processes_at_peak command RSS must match rss_at_peak_by_command_bytes"
+        )
+    if dict(sorted(by_process_type.items())) != metric["rss_at_peak_by_process_type_bytes"]:
+        raise ValidationError(
+            f"{runner}.processes_at_peak type RSS must match rss_at_peak_by_process_type_bytes"
+        )
+    if dict(sorted(count_by_process_type.items())) != metric["process_count_at_peak_by_type"]:
+        raise ValidationError(
+            f"{runner}.processes_at_peak type counts must match process_count_at_peak_by_type"
+        )
+
+
 def artifact_path(output_dir: Path, stored_path: str) -> Path:
     path = Path(stored_path)
     if path.exists():
@@ -231,6 +297,7 @@ def validate_metric(metric: dict[str, Any], iterations: int, output_dir: Path) -
         raise ValidationError(
             f"{runner}.process_count_at_peak_by_type sum must equal process_count_at_peak"
         )
+    validate_processes_at_peak(metric)
     if not 1 <= int(metric["iteration"]) <= iterations:
         raise ValidationError(f"{runner}.iteration is outside expected range: {metric['iteration']}")
 
