@@ -747,6 +747,12 @@ pub struct ModelInputBudget {
     pub estimated_tokens: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ObservationUse {
+    ModelInput,
+    AuditOnly,
+}
+
 /// How a non-interactive runner treats policy confirmation gates.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ConfirmationMode {
@@ -901,14 +907,24 @@ impl AgentRunner {
                 .map_err(|source| journal_transport_error(&mut agent, "initial goto", source))?;
             current_origin = self.origin_for_url("initial observation", &observation.url)?;
             agent.record_session_started(task.start_url.clone())?;
-            self.record_observation(&mut agent, &mut report, observation)?;
+            self.record_observation(
+                &mut agent,
+                &mut report,
+                observation,
+                ObservationUse::ModelInput,
+            )?;
         } else {
             let observation = driver
                 .observe()
                 .await
                 .map_err(|source| journal_transport_error(&mut agent, "resume observe", source))?;
             current_origin = self.origin_for_url("resume observation", &observation.url)?;
-            self.record_observation(&mut agent, &mut report, observation)?;
+            self.record_observation(
+                &mut agent,
+                &mut report,
+                observation,
+                ObservationUse::ModelInput,
+            )?;
         }
 
         while let Some(planned) = agent.next_step().cloned() {
@@ -1020,8 +1036,12 @@ impl AgentRunner {
                 journal_transport_error(&mut agent, "post-action observe", source)
             })?;
             current_origin = self.origin_for_url("post-action observation", &observation.url)?;
-            let observation_budget =
-                self.record_observation(&mut agent, &mut report, observation)?;
+            let observation_budget = self.record_observation(
+                &mut agent,
+                &mut report,
+                observation,
+                ObservationUse::AuditOnly,
+            )?;
             let step_error = match &triple.outcome {
                 StepTripleOutcome::StepError { reason } => Some(reason.clone()),
                 StepTripleOutcome::Applied { .. } => None,
@@ -1392,18 +1412,22 @@ impl AgentRunner {
         agent: &mut AgentLoop,
         report: &mut AgentRunReport,
         observation: CompiledObservation,
+        observation_use: ObservationUse,
     ) -> Result<ObservationBudget, AgentError> {
         let budget = self.observation_budget.validate(&observation)?;
-        let model_input = model_input_budget(&observation);
         report.observations += 1;
         report.max_observation_bytes = report.max_observation_bytes.max(budget.bytes);
         report.max_observation_tokens = report.max_observation_tokens.max(budget.estimated_tokens);
-        report.max_model_input_bytes = report.max_model_input_bytes.max(model_input.bytes);
-        report.max_model_input_tokens = report
-            .max_model_input_tokens
-            .max(model_input.estimated_tokens);
-        report.total_model_input_bytes += model_input.bytes;
-        report.total_model_input_tokens += model_input.estimated_tokens;
+        if observation_use == ObservationUse::ModelInput {
+            let model_input = model_input_budget(&observation);
+            report.model_input_observations += 1;
+            report.max_model_input_bytes = report.max_model_input_bytes.max(model_input.bytes);
+            report.max_model_input_tokens = report
+                .max_model_input_tokens
+                .max(model_input.estimated_tokens);
+            report.total_model_input_bytes += model_input.bytes;
+            report.total_model_input_tokens += model_input.estimated_tokens;
+        }
         agent.record_observation(observation)?;
         Ok(budget)
     }
@@ -1554,6 +1578,7 @@ pub struct AgentRunReport {
     pub initial_journal_entries: usize,
     pub actions_completed: usize,
     pub observations: usize,
+    pub model_input_observations: usize,
     pub max_observation_bytes: usize,
     pub max_observation_tokens: usize,
     pub max_model_input_bytes: usize,
@@ -1577,6 +1602,7 @@ impl AgentRunReport {
             initial_journal_entries,
             actions_completed,
             observations: 0,
+            model_input_observations: 0,
             max_observation_bytes: 0,
             max_observation_tokens: 0,
             max_model_input_bytes: 0,
@@ -2853,12 +2879,17 @@ mod tests {
         assert_eq!(report.engine, Engine::Test);
         assert_eq!(report.status, AgentRunStatus::Completed);
         assert_eq!(report.actions_completed, 1);
+        assert_eq!(report.observations, 2);
+        assert_eq!(report.model_input_observations, 1);
         assert!(report.max_observation_bytes > 0);
         assert!(report.max_model_input_bytes > 0);
         assert!(report.max_model_input_tokens > 0);
         assert!(report.max_model_input_bytes < report.max_observation_bytes);
-        assert!(report.total_model_input_bytes >= report.max_model_input_bytes);
-        assert!(report.total_model_input_tokens >= report.max_model_input_tokens);
+        assert_eq!(report.total_model_input_bytes, report.max_model_input_bytes);
+        assert_eq!(
+            report.total_model_input_tokens,
+            report.max_model_input_tokens
+        );
         assert_eq!(report.steps[0].policy.idempotency_key.0.len(), 64);
         assert!(is_lower_hex(&report.steps[0].policy.idempotency_key.0));
 
