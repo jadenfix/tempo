@@ -108,8 +108,11 @@ credentials and a separate prompt contract. The harness writes:
 - `agent-browser-bench.json[l]` with success, wall time, CPU time, sampled
   process-tree max RSS, step count, retry count, failure mode, and model-facing
   bytes/tokens. Tempo reports `model_input_*` from its compact taint-preserving
-  prompt projection and keeps durable structured JSON cost in
-  `max_observation_*`. `observations` counts durable observations, while
+  prompt projection: set-of-marks handles such as `#1`, role, short
+  provenance prefixes, and accessible name/value text. The full URL and stable
+  `node_id` strings stay in the durable observation journal, not the prompt
+  projection. `max_observation_*` keeps that durable structured JSON cost
+  visible. `observations` counts durable observations, while
   `model_input_observations` counts the subset supplied to planning/deciding;
   post-action verification observations remain auditable and policy-relevant
   without inflating model prompt cost. Multi-observation model loops report
