@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sqlite3
 from pathlib import Path
 from typing import Any
 
@@ -746,6 +747,134 @@ def validate_iteration_dir(iteration_dir: Path, iteration: int) -> list[dict[str
     return metrics
 
 
+def sqlite_journal_entry_count(journal_path: Path) -> int:
+    try:
+        with sqlite3.connect(f"file:{journal_path}?mode=ro", uri=True) as conn:
+            row = conn.execute("select count(*) from journal_entries").fetchone()
+    except sqlite3.Error as error:
+        raise ValidationError(f"invalid tempo journal sqlite artifact {journal_path}: {error}") from error
+    if row is None:
+        raise ValidationError(f"tempo journal sqlite artifact has no journal_entries count: {journal_path}")
+    return int(row[0])
+
+
+def require_applied_steps(path: Path, steps: Any, expected_count: int) -> None:
+    if not isinstance(steps, list) or len(steps) != expected_count:
+        raise ValidationError(f"{path} steps must contain {expected_count} entries")
+    keys = set()
+    for index, step in enumerate(steps):
+        if not isinstance(step, dict):
+            raise ValidationError(f"{path} step {index} must be an object")
+        key = step.get("idempotency_key") or step.get("key")
+        if not isinstance(key, str) or not key:
+            raise ValidationError(f"{path} step {index} must include an idempotency key")
+        if key in keys:
+            raise ValidationError(f"{path} duplicate idempotency key: {key}")
+        keys.add(key)
+        outcome = step.get("outcome")
+        if not isinstance(outcome, dict):
+            raise ValidationError(f"{path} step {index} outcome must be an object")
+        state = outcome.get("state", outcome.get("kind"))
+        if state != "applied":
+            raise ValidationError(f"{path} step {index} must be applied, got {state!r}")
+
+
+def validate_tempo_derived_artifacts(
+    output_dir: Path,
+    metrics: list[dict[str, Any]],
+) -> None:
+    tempo = next((metric for metric in metrics if metric["runner"] == TEMPO_RUNNER), None)
+    raw_chrome = next((metric for metric in metrics if metric["runner"] == RAW_CHROME_RUNNER), None)
+    if tempo is None:
+        raise ValidationError(f"{output_dir} missing tempo-cdp-agent metric")
+    if raw_chrome is None:
+        raise ValidationError(f"{output_dir} missing raw-chrome-cdp metric")
+
+    run_report_path = output_dir / "tempo-run.json"
+    replay_path = output_dir / "replay.json"
+    eval_record_path = output_dir / "tempo-eval-record.json"
+    eval_records_path = output_dir / "eval-records.jsonl"
+    scorecard_path = output_dir / "scorecard.json"
+    journal_path = output_dir / "tempo-journal.sqlite"
+
+    run_report = load_json(run_report_path)
+    if run_report.get("engine") != "cdp":
+        raise ValidationError("tempo-run.json engine must be cdp")
+    if run_report.get("status", {}).get("state") != "completed":
+        raise ValidationError("tempo-run.json status.state must be completed")
+    if int(run_report.get("actions_completed", -1)) != int(tempo["step_count"]):
+        raise ValidationError("tempo-run.json actions_completed must match tempo step_count")
+    if int(run_report.get("observations", -1)) != int(tempo["observations"]):
+        raise ValidationError("tempo-run.json observations must match tempo metric")
+    if int(run_report.get("model_input_observations", -1)) != int(tempo["model_input_observations"]):
+        raise ValidationError("tempo-run.json model_input_observations must match tempo metric")
+    if int(run_report.get("total_model_input_tokens", -1)) != int(tempo["model_input_tokens"]):
+        raise ValidationError("tempo-run.json total_model_input_tokens must match tempo metric")
+    require_applied_steps(run_report_path, run_report.get("steps"), int(tempo["step_count"]))
+
+    journal_count = sqlite_journal_entry_count(journal_path)
+    replay = load_json(replay_path)
+    if replay.get("session_started") is not True or replay.get("session_closed") is not True:
+        raise ValidationError("replay.json must prove the session started and closed")
+    if int(replay.get("entries", -1)) != journal_count:
+        raise ValidationError("replay.json entries must match the sqlite journal entry count")
+    if int(replay.get("last_seq", -1)) != journal_count - 1:
+        raise ValidationError("replay.json last_seq must match the sqlite journal entry count")
+    if int(replay.get("applied_steps", -1)) != int(tempo["step_count"]):
+        raise ValidationError("replay.json applied_steps must match tempo step_count")
+    if int(replay.get("planned_actions", -1)) != int(tempo["step_count"]):
+        raise ValidationError("replay.json planned_actions must match tempo step_count")
+    if int(replay.get("observations", -1)) != int(tempo["observations"]):
+        raise ValidationError("replay.json observations must match tempo metric")
+    if int(replay.get("step_errors", -1)) != 0:
+        raise ValidationError("replay.json step_errors must be zero")
+    if int(replay.get("transport_errors", -1)) != 0:
+        raise ValidationError("replay.json transport_errors must be zero")
+    require_applied_steps(replay_path, replay.get("steps"), int(tempo["step_count"]))
+    require_applied_steps(replay_path, replay.get("step_triples"), int(tempo["step_count"]))
+
+    eval_record = load_json(eval_record_path)
+    if eval_record.get("suite") != "live-agent-browser-bench":
+        raise ValidationError("tempo-eval-record.json suite must be live-agent-browser-bench")
+    if eval_record.get("case_id") != "checkout-submit":
+        raise ValidationError("tempo-eval-record.json case_id must be checkout-submit")
+    if eval_record.get("lane") != "cdp":
+        raise ValidationError("tempo-eval-record.json lane must be cdp")
+    if eval_record.get("success") is not True:
+        raise ValidationError("tempo-eval-record.json success must be true")
+    if eval_record.get("fallback_used") is not False:
+        raise ValidationError("tempo-eval-record.json fallback_used must be false")
+    if int(eval_record.get("step_count", -1)) != int(tempo["step_count"]):
+        raise ValidationError("tempo-eval-record.json step_count must match tempo metric")
+    if int(eval_record.get("baseline_wall_clock_ms", -1)) != int(raw_chrome["wall_clock_ms"]):
+        raise ValidationError(
+            "tempo-eval-record.json baseline_wall_clock_ms must match raw Chrome wall_clock_ms"
+        )
+
+    eval_records = load_jsonl(eval_records_path)
+    if eval_records != [eval_record]:
+        raise ValidationError("eval-records.jsonl must contain exactly tempo-eval-record.json")
+
+    scorecard = load_json(scorecard_path)
+    if int(scorecard.get("total_cases", -1)) != 1:
+        raise ValidationError("scorecard.json total_cases must be 1")
+    if scorecard.get("success_rate") != 1.0:
+        raise ValidationError("scorecard.json success_rate must be 1.0")
+    if scorecard.get("fallback_rate") != 0.0:
+        raise ValidationError("scorecard.json fallback_rate must be 0.0")
+    if scorecard.get("violations") != []:
+        raise ValidationError("scorecard.json violations must be empty")
+    lanes = scorecard.get("lanes")
+    if not isinstance(lanes, list) or not any(
+        lane.get("lane") == "cdp"
+        and lane.get("success_rate") == 1.0
+        and int(lane.get("total_cases", -1)) == 1
+        for lane in lanes
+        if isinstance(lane, dict)
+    ):
+        raise ValidationError("scorecard.json must include one successful cdp lane")
+
+
 def validate_artifacts(
     output_dir: Path,
     iterations: int,
@@ -765,6 +894,7 @@ def validate_artifacts(
             if require_derived_artifacts:
                 for name in DERIVED_ARTIFACTS:
                     require_file(iteration_dir / name)
+                validate_tempo_derived_artifacts(iteration_dir, iteration_metrics[-len(EXPECTED_RUNNERS):])
         if iteration_metrics != root_metrics:
             raise ValidationError(
                 "root agent-browser-bench.json metrics do not match iteration artifacts"
@@ -774,6 +904,7 @@ def validate_artifacts(
     if require_derived_artifacts:
         for name in DERIVED_ARTIFACTS:
             require_file(output_dir / name)
+        validate_tempo_derived_artifacts(output_dir, root_metrics)
 
 
 def main() -> int:

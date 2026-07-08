@@ -3903,6 +3903,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn live_cdp_runner_resume_does_not_duplicate_completed_steps() -> TestResult {
+        let Some(chrome) = std::env::var("TEMPO_CDP_CHROME").ok() else {
+            eprintln!("skipping live CDP agent resume smoke; TEMPO_CDP_CHROME is not set");
+            return Ok(());
+        };
+
+        let url = serve_times(
+            r#"<!doctype html>
+            <html>
+              <body>
+                <input id="name" aria-label="Name">
+                <button id="finish" onclick="document.body.dataset.finished='yes'; document.getElementById('summary').textContent = document.getElementById('name').value;">Finish</button>
+                <div id="summary" tabindex="0" aria-label="Summary"></div>
+              </body>
+            </html>"#,
+            3,
+        )?;
+        let root = unique_dir("runner-live-cdp-resume")?;
+        remove_dir_if_exists(&root)?;
+        fs::create_dir_all(&root)?;
+        let journal_path = root.join("session.jsonl");
+        let ids = AgentRunIds::new("run-live-cdp-resume", "session-live-cdp-resume");
+
+        let mut first_driver = CdpTempoDriver::launch_with(
+            CdpConfig::default()
+                .with_executable(chrome.clone())
+                .with_no_sandbox_env_opt_in(),
+        )
+        .await?
+        .allow_private_network_access();
+        let observation = first_driver.goto(&url).await?;
+        let node_named = |name: &str| -> Result<NodeId, std::io::Error> {
+            observation
+                .elements
+                .iter()
+                .find(|element| element.name.first().map(|span| span.text.as_str()) == Some(name))
+                .map(|element| element.node_id.clone())
+                .ok_or_else(|| std::io::Error::other(format!("missing observed node: {name}")))
+        };
+        let task = DriverTask::new(
+            url,
+            vec![
+                Action::Type {
+                    node: node_named("Name")?,
+                    text: "Grace".into(),
+                },
+                Action::Click {
+                    node: node_named("Finish")?,
+                },
+                Action::Extract {
+                    node: node_named("Summary")?,
+                },
+            ],
+        );
+        let first_runner = AgentRunner::new_plaintext_unsafe(&journal_path, ids.clone());
+        let first = first_runner
+            .run_driver_task(&mut first_driver, &task)
+            .await?;
+        let final_state = first_driver
+            .evaluate_script(
+                r#"(() => ({
+                    name: document.querySelector('#name').value,
+                    finished: document.body.dataset.finished,
+                    summary: document.querySelector('#summary').textContent.trim()
+                }))()"#,
+                true,
+            )
+            .await?;
+        first_driver.close().await?;
+
+        assert_eq!(first.status, AgentRunStatus::Completed);
+        assert_eq!(first.actions_completed, 3);
+        assert_eq!(final_state["name"], serde_json::json!("Grace"));
+        assert_eq!(final_state["finished"], serde_json::json!("yes"));
+        assert_eq!(final_state["summary"], serde_json::json!("Grace"));
+        let entry_count = read_journal_entries(&journal_path)?.len();
+
+        let mut second_driver = FailingDriver::new(TransportFailurePoint::Goto);
+        let second_runner = AgentRunner::new_plaintext_unsafe(&journal_path, ids);
+        let second = second_runner
+            .run_driver_task(&mut second_driver, &task)
+            .await?;
+
+        assert_eq!(second.status, AgentRunStatus::AlreadyComplete);
+        assert_eq!(second.actions_completed, 3);
+        assert_eq!(read_journal_entries(&journal_path)?.len(), entry_count);
+        assert_eq!(second_driver.goto_calls, 0);
+        assert_eq!(second_driver.observe_calls, 0);
+        assert_eq!(second_driver.act_calls, 0);
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn runner_bounds_billion_laughs_skill_expansion() -> TestResult {
         let root = unique_dir("runner-billion-laughs")?;
         remove_dir_if_exists(&root)?;
