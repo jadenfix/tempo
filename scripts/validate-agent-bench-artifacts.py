@@ -24,6 +24,7 @@ EXPECTED_RUNNERS = {
     "synthetic-browser-use-dom",
     "real-playwright",
     "external-browser-use-dom-loop",
+    "real-browser-use",
 }
 TEMPO_RUNNER = "tempo-cdp-agent"
 RAW_CHROME_RUNNER = "raw-chrome-cdp"
@@ -33,6 +34,7 @@ AGENT_STYLE_RUNNERS = {
     "synthetic-browser-use-dom",
     "real-playwright",
     "external-browser-use-dom-loop",
+    "real-browser-use",
 }
 
 REQUIRED_METRIC_FIELDS = {
@@ -113,6 +115,9 @@ DERIVED_ARTIFACTS = {
     "external-browser-use-dom-loop.json",
     "external-browser-use-dom-loop.model-input.txt",
     "external-browser-use-dom-loop.trace.json",
+    "real-browser-use.json",
+    "real-browser-use.model-input.txt",
+    "real-browser-use.trace.json",
 }
 
 
@@ -320,7 +325,7 @@ def validate_metric(metric: dict[str, Any], iterations: int, output_dir: Path) -
                 "tempo-cdp-agent.max_compact_observation_bytes must be <= max_observation_bytes"
             )
 
-    if runner in {"real-playwright", "external-browser-use-dom-loop"}:
+    if runner in {"real-playwright", "external-browser-use-dom-loop", "real-browser-use"}:
         if metric.get("external_process") is not True:
             raise ValidationError(f"{runner}.external_process must be true")
         for field in ("runner_report", "runner_stdout", "runner_stderr"):
