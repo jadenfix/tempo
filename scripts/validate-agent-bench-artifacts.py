@@ -154,7 +154,17 @@ def require_int(metric: dict[str, Any], field: str, *, positive: bool = False) -
         raise ValidationError(f"{metric.get('runner', '<unknown>')}.{field} must be > 0")
 
 
-def validate_metric(metric: dict[str, Any], iterations: int) -> None:
+def artifact_path(output_dir: Path, stored_path: str) -> Path:
+    path = Path(stored_path)
+    if path.exists():
+        return path
+    candidate = output_dir / path.name
+    if candidate.exists():
+        return candidate
+    return path
+
+
+def validate_metric(metric: dict[str, Any], iterations: int, output_dir: Path) -> None:
     missing = REQUIRED_METRIC_FIELDS - set(metric)
     if missing:
         raise ValidationError(f"{metric.get('runner', '<unknown>')} metric missing fields: {sorted(missing)}")
@@ -191,7 +201,7 @@ def validate_metric(metric: dict[str, Any], iterations: int) -> None:
         for field in ("runner_report", "runner_stdout", "runner_stderr"):
             if not metric.get(field):
                 raise ValidationError(f"{runner}.{field} must be populated")
-        runner_report = Path(str(metric["runner_report"]))
+        runner_report = artifact_path(output_dir, str(metric["runner_report"]))
         if not runner_report.exists():
             raise ValidationError(f"{runner}.runner_report does not exist: {runner_report}")
         raw_report = json.loads(runner_report.read_text())
@@ -528,7 +538,7 @@ def validate_bench_json(output_dir: Path) -> tuple[int, list[dict[str, Any]]]:
     for metric in metrics:
         if not isinstance(metric, dict):
             raise ValidationError("each metric must be an object")
-        validate_metric(metric, iterations)
+        validate_metric(metric, iterations, output_dir)
 
     seen_pairs: set[tuple[str, int]] = set()
     for metric in metrics:
