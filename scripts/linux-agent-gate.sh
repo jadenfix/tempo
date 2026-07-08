@@ -137,20 +137,10 @@ docker run --rm \
         --smoke \
         --min-success-rate 1 \
         --output-dir \"\$BENCH_OUT\"
-      test -s \"\$BENCH_OUT/agent-browser-bench.json\"
-      test -s \"\$BENCH_OUT/agent-browser-bench.jsonl\"
-      test -s \"\$BENCH_OUT/agent-browser-bench-summary.json\"
-      test -s \"\$BENCH_OUT/tempo-journal.sqlite\"
-      test -s \"\$BENCH_OUT/replay.json\"
-      test -s \"\$BENCH_OUT/scorecard.json\"
-      test -s \"\$BENCH_OUT/amdahl.json\"
-      test -s \"\$BENCH_OUT/chrome-version.txt\"
-      test -s \"\$BENCH_OUT/real-playwright.json\"
-      test -s \"\$BENCH_OUT/real-playwright.model-input.txt\"
-      test -s \"\$BENCH_OUT/real-playwright.trace.json\"
-      test -s \"\$BENCH_OUT/external-browser-use-dom-loop.json\"
-      test -s \"\$BENCH_OUT/external-browser-use-dom-loop.model-input.txt\"
-      test -s \"\$BENCH_OUT/external-browser-use-dom-loop.trace.json\"
+      scripts/validate-agent-bench-artifacts.py \
+        --output-dir \"\$BENCH_OUT\" \
+        --expected-iterations 1 \
+        --require-derived-artifacts
       chmod -R a+rX \"\$BENCH_OUT\"
     else
       if [[ -n \"\${chromium_pid:-}\" ]]; then
