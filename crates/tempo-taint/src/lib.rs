@@ -149,7 +149,11 @@ pub fn serialize_compact_observation_for_model(observation: &CompiledObservation
         out.push_str(&observation.omitted.to_string());
     }
 
-    for element in &observation.elements {
+    for element in observation
+        .elements
+        .iter()
+        .filter(|element| compact_element_included(element))
+    {
         out.push('\n');
         append_compact_handle(observation, element, &mut out);
         out.push(' ');
@@ -159,6 +163,24 @@ pub fn serialize_compact_observation_for_model(observation: &CompiledObservation
     }
 
     out
+}
+
+fn compact_element_included(element: &tempo_schema::InteractiveElement) -> bool {
+    matches!(
+        element.role.as_str(),
+        "button"
+            | "checkbox"
+            | "combobox"
+            | "link"
+            | "menuitem"
+            | "option"
+            | "radio"
+            | "searchbox"
+            | "status"
+            | "switch"
+            | "tab"
+            | "textbox"
+    )
 }
 
 fn append_compact_handle(
@@ -628,6 +650,38 @@ mod tests {
         assert_eq!(compact, "obs s=1 o=2\n#1 button n=p:\"Pay now\"");
         assert!(!compact.contains("https://taint.test"));
         assert!(!compact.contains("node:submit"));
+    }
+
+    #[test]
+    fn compact_serializer_omits_non_actionable_headings() {
+        let mut observation = observation_with_spans(
+            "node:submit",
+            vec![span(Provenance::Page, "Pay now")],
+            Vec::new(),
+        );
+        observation.elements.push(InteractiveElement {
+            node_id: NodeId("node:heading".into()),
+            role: "heading".into(),
+            name: vec![span(Provenance::Page, "Checkout")],
+            value: Vec::new(),
+            bounds: None,
+            rank: 0.5,
+        });
+        observation.elements.push(InteractiveElement {
+            node_id: NodeId("node:status".into()),
+            role: "status".into(),
+            name: vec![span(Provenance::Page, "Waiting")],
+            value: Vec::new(),
+            bounds: None,
+            rank: 0.5,
+        });
+
+        let compact = serialize_compact_observation_for_model(&observation);
+
+        assert!(compact.contains("@node:submit button"));
+        assert!(compact.contains("@node:status status"));
+        assert!(!compact.contains("Checkout"));
+        assert!(!compact.contains("node:heading"));
     }
 
     #[test]

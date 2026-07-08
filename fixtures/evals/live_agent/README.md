@@ -27,11 +27,14 @@ the durable observation journal, not the prompt projection; when an engine
 supplies marks, stable `node_id` strings also stay out of the prompt projection,
 with `@node-id` fallback handles reserved for unmarked observations and resolved
 before execution. `max_observation_*` keeps that durable structured JSON cost visible.
-`observations` counts durable observations, while `model_input_observations`
-counts the subset supplied to planning/deciding; post-action verification
-observations remain auditable and policy-relevant without inflating model prompt
-cost. Multi-observation model loops report total model-facing input in
-`model_input_*` and largest single-observation size in `max_observation_*`.
+`max_compact_observation_*` records the same compact projection for every
+journaled observation so compact agent-facing state is ranked separately from
+full audit JSON. `observations` counts durable observations, while
+`model_input_observations` counts the subset supplied to planning/deciding;
+post-action verification observations remain auditable and policy-relevant
+without inflating model prompt cost. Multi-observation model loops report total
+model-facing input in `model_input_*` and largest single-observation size in
+`max_observation_*`.
 `--full` repeats the case five times by default and writes
 `agent-browser-bench-summary.json` with per-runner success rate, failure-mode
 counts, retry totals, and p50/p95/max stats. It also writes
