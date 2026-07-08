@@ -257,6 +257,7 @@ impl CdpTempoDriver {
                 return Err(map_cdp_error(error));
             }
         };
+        close_unmanaged_pages(&browser, &page).await;
         let request_policy_task = match install_request_policy(
             &page,
             browser_hardening_policy.clone(),
@@ -1237,6 +1238,17 @@ fn is_policy_proxy_arg(arg: &str) -> bool {
         .map(|(name, _value)| name)
         .unwrap_or(arg);
     CDP_POLICY_PROXY_ARGS.contains(&name)
+}
+
+async fn close_unmanaged_pages(browser: &Browser, managed_page: &Page) {
+    let managed_target_id = managed_page.target_id().clone();
+    if let Ok(pages) = browser.pages().await {
+        for page in pages {
+            if page.target_id() != &managed_target_id {
+                let _ = page.close().await;
+            }
+        }
+    }
 }
 
 fn default_cdp_launch_args(policy_proxy_addr: SocketAddr) -> Vec<String> {
