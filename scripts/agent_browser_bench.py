@@ -12,6 +12,7 @@ import shutil
 import socketserver
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -357,47 +358,51 @@ def run_cdp_baseline(chrome: str, url: str, runner: str, snapshot: str | None) -
     success = False
     with RssSampler(os.getpid()) as sampler:
         try:
-            args = ["--disable-gpu", "--disable-dev-shm-usage"]
+            args = ["--disable-gpu", "--disable-dev-shm-usage", "--use-mock-keychain"]
             if os.environ.get("TEMPO_CDP_NO_SANDBOX") == "1":
                 args.append("--no-sandbox")
             with sync_playwright() as playwright:
-                browser = playwright.chromium.launch(
-                    executable_path=chrome,
-                    headless=True,
-                    args=args,
-                )
-                try:
-                    page = browser.new_page()
-                    page.goto(url, wait_until="load", timeout=15000)
-                    cdp = page.context.new_cdp_session(page)
-                    cdp.send("Runtime.enable")
-                    cdp.send("Accessibility.enable")
-                    if snapshot == "ax":
-                        tree = cdp.send("Accessibility.getFullAXTree")
-                        lines: list[str] = []
-                        for node in tree.get("nodes", []):
-                            role = node.get("role", {}).get("value")
-                            name = node.get("name", {}).get("value", "")
-                            if role and name:
-                                lines.append(f'- {role} "{name}"')
-                        model_input = "\n".join(lines)
-                    elif snapshot == "browser_use_dom":
-                        model_input = str(page.evaluate(browser_use_snapshot_expression()))
-                    result = cdp.send(
-                        "Runtime.evaluate",
-                        {
-                            "expression": checkout_expression(),
-                            "returnByValue": True,
-                            "awaitPromise": True,
-                        },
+                with tempfile.TemporaryDirectory(prefix=f"tempo-{runner}-profile-") as profile_dir:
+                    context = playwright.chromium.launch_persistent_context(
+                        user_data_dir=profile_dir,
+                        executable_path=chrome,
+                        headless=True,
+                        args=args,
                     )
-                    if "exceptionDetails" in result:
-                        raise RuntimeError(f"runtime exception: {result['exceptionDetails']}")
-                    success = bool(
-                        page.evaluate("document.querySelector('#status').dataset.done === 'true'")
-                    )
-                finally:
-                    browser.close()
+                    try:
+                        page = context.new_page()
+                        page.goto(url, wait_until="load", timeout=15000)
+                        cdp = page.context.new_cdp_session(page)
+                        cdp.send("Runtime.enable")
+                        cdp.send("Accessibility.enable")
+                        if snapshot == "ax":
+                            tree = cdp.send("Accessibility.getFullAXTree")
+                            lines: list[str] = []
+                            for node in tree.get("nodes", []):
+                                role = node.get("role", {}).get("value")
+                                name = node.get("name", {}).get("value", "")
+                                if role and name:
+                                    lines.append(f'- {role} "{name}"')
+                            model_input = "\n".join(lines)
+                        elif snapshot == "browser_use_dom":
+                            model_input = str(page.evaluate(browser_use_snapshot_expression()))
+                        result = cdp.send(
+                            "Runtime.evaluate",
+                            {
+                                "expression": checkout_expression(),
+                                "returnByValue": True,
+                                "awaitPromise": True,
+                            },
+                        )
+                        if "exceptionDetails" in result:
+                            raise RuntimeError(f"runtime exception: {result['exceptionDetails']}")
+                        success = bool(
+                            page.evaluate(
+                                "document.querySelector('#status').dataset.done === 'true'"
+                            )
+                        )
+                    finally:
+                        context.close()
         except Exception as error:  # noqa: BLE001
             failure_mode = type(error).__name__
     wall = now_ms() - started
