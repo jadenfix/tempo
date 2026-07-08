@@ -140,6 +140,58 @@ async fn real_beatboxd_process_lane_is_unavailable_until_sandbox_exists() -> Tes
 }
 
 #[tokio::test]
+async fn real_beatboxd_integration_contract_keeps_exec_fail_closed() -> TestResult {
+    let beatboxd = RealBeatboxd::spawn().await?;
+    let executor = ToolExecClient::new(beatboxd.base_url());
+
+    let capabilities = executor.capabilities().await?;
+    let exec_capability = capabilities
+        .get("lanes")
+        .and_then(|lanes| lanes.as_array())
+        .and_then(|lanes| {
+            lanes
+                .iter()
+                .find(|lane| lane.get("lane").and_then(|lane| lane.as_str()) == Some("exec"))
+        })
+        .ok_or("capabilities must include exec lane")?;
+    assert_eq!(
+        exec_capability
+            .get("available")
+            .and_then(|available| available.as_bool()),
+        Some(false)
+    );
+    assert_eq!(
+        exec_capability
+            .get("substrate")
+            .and_then(|substrate| substrate.as_str()),
+        Some("os_jail")
+    );
+
+    let integration = executor.integration().await?;
+    let exec_contract = integration
+        .lanes
+        .iter()
+        .find(|lane| lane.lane == Lane::Exec)
+        .ok_or("integration contract must include exec lane")?;
+
+    assert_eq!(exec_contract.status, "planned_fail_closed");
+    assert_eq!(exec_contract.substrate, "os_jail");
+    assert_eq!(exec_contract.sync_endpoint.as_deref(), Some("/v1/execute"));
+    assert_eq!(exec_contract.job_endpoint.as_deref(), Some("/v1/jobs"));
+    assert!(exec_contract.mcp_tool.is_none());
+    assert_eq!(exec_contract.accepted_sources, vec!["inline exec source"]);
+    assert_contract_mentions(
+        &exec_contract.guarantees,
+        &["explicit unavailable-lane result", "not runnable"],
+    );
+    assert_contract_mentions(
+        &exec_contract.required_next_steps,
+        &["command/package", "process", "filesystem", "network", "teardown"],
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn real_beatboxd_tainted_canary_denies_import_egress() -> TestResult {
     let beatboxd = RealBeatboxd::spawn().await?;
     let canary = CanaryEndpoint::spawn().await?;
@@ -232,6 +284,16 @@ fn beatbox_api_error_message(error: ToolExecError, expected_code: &str) -> TestR
             Ok(message)
         }
         other => Err(format!("expected beatbox API error, got {other}").into()),
+    }
+}
+
+fn assert_contract_mentions(actual: &[String], needles: &[&str]) {
+    let joined = actual.join("\n");
+    for needle in needles {
+        assert!(
+            joined.contains(needle),
+            "contract steps {actual:?} must mention {needle}"
+        );
     }
 }
 

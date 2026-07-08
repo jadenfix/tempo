@@ -255,6 +255,12 @@ def artifact_path(output_dir: Path, stored_path: str) -> Path:
     path = Path(stored_path)
     if path.exists():
         return path
+    parts = path.parts
+    for index, part in enumerate(parts):
+        if part.startswith("iteration-"):
+            candidate = output_dir.joinpath(*parts[index:])
+            if candidate.exists():
+                return candidate
     candidate = output_dir / path.name
     if candidate.exists():
         return candidate
@@ -331,9 +337,10 @@ def validate_metric(metric: dict[str, Any], iterations: int, output_dir: Path) -
         for field in ("runner_report", "runner_stdout", "runner_stderr"):
             if not metric.get(field):
                 raise ValidationError(f"{runner}.{field} must be populated")
+            artifact = artifact_path(output_dir, str(metric[field]))
+            if not artifact.exists():
+                raise ValidationError(f"{runner}.{field} does not exist: {artifact}")
         runner_report = artifact_path(output_dir, str(metric["runner_report"]))
-        if not runner_report.exists():
-            raise ValidationError(f"{runner}.runner_report does not exist: {runner_report}")
         raw_report = json.loads(runner_report.read_text())
         require_int(raw_report, "observations", positive=True)
         require_int(raw_report, "model_input_observations", positive=True)

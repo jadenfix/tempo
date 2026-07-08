@@ -185,9 +185,13 @@ Local runs can set `TEMPO_LINUX_AGENT_DOCKER_CACHE_BACKEND=local` with
 The same Linux gate runs the live beatbox-backed `tempo-toolexec` tests. At the
 pinned beatbox milestone the executable sandbox lane is W0 Wasm, so live tests
 prove real HTTP execution, async jobs, import-egress denial, and filesystem
-workspace/mount policy denial. Process-spawn denial is tracked as an explicit
-`Exec` lane-unavailable assertion until beatbox grows a process-capable sandbox
-lane.
+workspace/mount policy denial. Tempo also fetches beatbox's integration contract
+and asserts that the `Exec` lane is `planned_fail_closed`, backed by an `os_jail`
+contract and explicit next steps for command admission plus process, filesystem,
+network, and teardown isolation. Agent CLI/process execution must stay on that
+unavailable-lane path until beatbox publishes a runnable process sandbox; the W0
+Wasm lane is bounded by wall time and fuel rather than an unenforceable native
+CPU ceiling.
 
 ## Operations & governance
 
