@@ -59,6 +59,13 @@ require(
     '        --expected-iterations ${BENCH_EXPECTED_ITERATIONS} \\' in text,
     'Docker command must expand BENCH_EXPECTED_ITERATIONS on the host',
 )
+require(
+    'TEMPO_LINUX_AGENT_CACHE_DIR' in text
+    and 'cargo-registry:/usr/local/cargo/registry' in text
+    and 'cargo-git:/usr/local/cargo/git' in text
+    and 'target:/target' in text,
+    'Docker command must support a host-backed Linux agent cache directory',
+)
 smoke_job = job_block("docker-smoke-amd64")
 full_job = job_block("docker-full-amd64")
 smoke_if = job_if("docker-smoke-amd64", smoke_job)
@@ -82,6 +89,16 @@ require(
     'TEMPO_LINUX_AGENT_REQUIRE_LIVE_CDP: "1"' in smoke_job,
     'smoke job must require live CDP',
 )
+require(
+    'TEMPO_LINUX_AGENT_CACHE_DIR: .tempo-linux-agent-cache' in smoke_job,
+    'smoke job must enable the host-backed Linux agent cache',
+)
+require(
+    'uses: actions/cache@v4' in smoke_job
+    and 'path: .tempo-linux-agent-cache' in smoke_job
+    and 'linux-agent-' in smoke_job,
+    'smoke job must cache Linux agent build artifacts',
+)
 require('run: scripts/linux-agent-gate.sh --smoke' in smoke_job, 'smoke job must run --smoke')
 require(
     artifact_names(smoke_job) == {"linux-agent-browser-bench"},
@@ -102,6 +119,16 @@ require(
 require(
     'TEMPO_LINUX_AGENT_REQUIRE_LIVE_CDP: "1"' in full_job,
     'full job must require live CDP',
+)
+require(
+    'TEMPO_LINUX_AGENT_CACHE_DIR: .tempo-linux-agent-cache' in full_job,
+    'full job must enable the host-backed Linux agent cache',
+)
+require(
+    'uses: actions/cache@v4' in full_job
+    and 'path: .tempo-linux-agent-cache' in full_job
+    and 'linux-agent-' in full_job,
+    'full job must cache Linux agent build artifacts',
 )
 require('run: scripts/linux-agent-gate.sh --full' in full_job, 'full job must run --full')
 require(

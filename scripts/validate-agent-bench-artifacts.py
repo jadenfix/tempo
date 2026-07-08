@@ -236,6 +236,8 @@ def expected_summary(metrics: list[dict[str, Any]]) -> dict[str, Any]:
             "total_model_input_tokens",
             "max_observation_bytes",
             "max_observation_tokens",
+            "max_model_input_bytes",
+            "max_model_input_tokens",
         ):
             if any(field in metric for metric in runner_metrics):
                 runner_summary[field] = summarize_int_field(runner_metrics, field)
@@ -260,6 +262,11 @@ def expected_gap_report(metrics: list[dict[str, Any]], summary: dict[str, Any]) 
         ("max_rss_bytes_p95", "lower_is_better", runners),
         ("retry_count_total", "lower_is_better", runners),
         ("failure_count", "lower_is_better", runners),
+        (
+            "model_input_tokens_p95",
+            "lower_is_better",
+            sorted(runner for runner in runners if runner in AGENT_STYLE_RUNNERS),
+        ),
         (
             "max_observation_tokens_p95",
             "lower_is_better",
@@ -349,7 +356,8 @@ def expected_gap_report(metrics: list[dict[str, Any]], summary: dict[str, Any]) 
         "agent_style_runners": sorted(AGENT_STYLE_RUNNERS),
         "comparison_notes": [
             "raw-chrome-cdp is excluded from observation-token and agent-step categories because it has no model-facing observation stream.",
-            "max_observation_tokens_p95 compares the largest single observation per run; total_model_input_tokens_p95 is row-level only until every agent runner records true total stream cost.",
+            "model_input_tokens_p95 ranks the compact model-facing input each runner presents to an agent; max_observation_tokens_p95 keeps Tempo's durable structured observation cost visible.",
+            "max_observation_tokens_p95 compares the largest single durable observation per run; total_model_input_tokens_p95 is row-level only until every agent runner records true total stream cost.",
             "cpu_time_ms_p95 is row-level only until every runner uses the same resource-accounting scope.",
             "Positive deltas mean Tempo is behind that comparison target; negative deltas mean Tempo is ahead.",
         ],

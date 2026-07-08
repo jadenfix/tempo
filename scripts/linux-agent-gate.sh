@@ -59,10 +59,28 @@ fi
 
 COMMON_MOUNTS=(
   -v "$ROOT:/work"
-  -v tempo-cargo-registry:/usr/local/cargo/registry
-  -v tempo-cargo-git:/usr/local/cargo/git
-  -v tempo-target-linux-agent:/target
 )
+
+if [[ -n "${TEMPO_LINUX_AGENT_CACHE_DIR:-}" ]]; then
+  CACHE_DIR="$TEMPO_LINUX_AGENT_CACHE_DIR"
+  case "$CACHE_DIR" in
+    /*) ;;
+    *) CACHE_DIR="$ROOT/$CACHE_DIR" ;;
+  esac
+  mkdir -p "$CACHE_DIR/cargo-registry" "$CACHE_DIR/cargo-git" "$CACHE_DIR/target"
+  COMMON_ENV+=(-e "TEMPO_LINUX_AGENT_CACHE_DIR=${TEMPO_LINUX_AGENT_CACHE_DIR}")
+  COMMON_MOUNTS+=(
+    -v "$CACHE_DIR/cargo-registry:/usr/local/cargo/registry"
+    -v "$CACHE_DIR/cargo-git:/usr/local/cargo/git"
+    -v "$CACHE_DIR/target:/target"
+  )
+else
+  COMMON_MOUNTS+=(
+    -v tempo-cargo-registry:/usr/local/cargo/registry
+    -v tempo-cargo-git:/usr/local/cargo/git
+    -v tempo-target-linux-agent:/target
+  )
+fi
 
 if [[ "$MODE" == "--shell" ]]; then
   exec docker run --rm -it \
@@ -91,7 +109,7 @@ docker run --rm \
   -w /work \
   "$IMAGE" \
   bash -c "set -euo pipefail
-    trap 'chmod -R a+rX /work/target/linux-agent-gate/agent-browser-bench 2>/dev/null || true' EXIT
+    trap 'chmod -R a+rX /work/target/linux-agent-gate/agent-browser-bench 2>/dev/null || true; if [[ -n \"\${TEMPO_LINUX_AGENT_CACHE_DIR:-}\" ]]; then chmod -R a+rwX /usr/local/cargo/registry /usr/local/cargo/git /target 2>/dev/null || true; fi' EXIT
     rustc --version
     cargo --version
     cargo fmt --all --check
