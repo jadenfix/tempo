@@ -93,13 +93,17 @@ Real agent/browser benchmark artifacts are generated with:
 scripts/agent-browser-bench.sh --smoke --output-dir target/agent-browser-bench
 ```
 
-That harness serves `fixtures/evals/live_agent/checkout.html` and drives the
-same task through Tempo CDP, raw Chrome CDP, synthetic CDP snapshots for
-continuity, and two external subprocess baselines: `real-playwright` via
-Playwright's Python API and `external-browser-use-dom-loop`, a browser-use-style
-indexed DOM observation/action loop. The latter is deliberately labeled as a
-DOM-loop baseline rather than a full browser-use LLM agent, which would require
-model credentials and a separate prompt contract. The harness writes:
+That script builds `tempo-cli` once when `TEMPO_CLI` is not already set, then the
+Python harness invokes the binary directly for the measured Tempo run and
+derived artifacts. This keeps the latency/RSS comparison focused on
+agent/browser runtime instead of repeated Cargo wrapper startup. The harness
+serves `fixtures/evals/live_agent/checkout.html` and drives the same task
+through Tempo CDP, raw Chrome CDP, synthetic CDP snapshots for continuity, and
+two external subprocess baselines: `real-playwright` via Playwright's Python API
+and `external-browser-use-dom-loop`, a browser-use-style indexed DOM
+observation/action loop. The latter is deliberately labeled as a DOM-loop
+baseline rather than a full browser-use LLM agent, which would require model
+credentials and a separate prompt contract. The harness writes:
 
 - `agent-browser-bench.json[l]` with success, wall time, CPU time, sampled
   process-tree max RSS, step count, retry count, failure mode, and model-facing

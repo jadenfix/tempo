@@ -44,6 +44,34 @@ if ! command -v python3 >/dev/null 2>&1; then
   exit 127
 fi
 
+if [[ -z "${TEMPO_CLI:-}" ]]; then
+  cargo build -p tempo-cli
+  TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
+  if [[ -n "${CARGO_BUILD_TARGET:-}" ]]; then
+    TEMPO_CLI="${TARGET_DIR}/${CARGO_BUILD_TARGET}/debug/tempo-cli"
+  else
+    TEMPO_CLI="${TARGET_DIR}/debug/tempo-cli"
+  fi
+  if [[ ! -x "$TEMPO_CLI" ]]; then
+    while IFS= read -r DISCOVERED_TEMPO_CLI; do
+      if [[ -x "$DISCOVERED_TEMPO_CLI" ]]; then
+        TEMPO_CLI="$DISCOVERED_TEMPO_CLI"
+        break
+      fi
+    done < <(find "$TARGET_DIR" -path "*/debug/tempo-cli" -type f -print 2>/dev/null || true)
+  fi
+  export TEMPO_CLI
+fi
+if [[ "$TEMPO_CLI" == */* ]]; then
+  TEMPO_CLI_PATH="$TEMPO_CLI"
+else
+  TEMPO_CLI_PATH="$(command -v "$TEMPO_CLI" || true)"
+fi
+if [[ -z "$TEMPO_CLI_PATH" || ! -x "$TEMPO_CLI_PATH" ]]; then
+  echo "TEMPO_CLI is not executable or on PATH: $TEMPO_CLI" >&2
+  exit 127
+fi
+
 if [[ -z "${TEMPO_CDP_CHROME:-}" ]]; then
   TEMPO_CDP_CHROME="$(scripts/setup-cdp-chrome.sh)"
   export TEMPO_CDP_CHROME
