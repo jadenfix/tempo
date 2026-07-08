@@ -21,13 +21,17 @@ The harness drives the same checkout task through:
 The generated benchmark artifact records success, wall time, CPU time, sampled
 process-tree max RSS, step count, retry count, failure mode, and model-facing
 bytes/tokens for each runner. Tempo reports `model_input_*` from its compact
-taint-preserving prompt projection and keeps durable structured JSON cost in
-`max_observation_*`. `observations` counts durable observations, while
-`model_input_observations` counts the subset supplied to planning/deciding;
-post-action verification observations remain auditable and policy-relevant
-without inflating model prompt cost. Multi-observation model loops report total
-model-facing input in `model_input_*` and largest single-observation size in
-`max_observation_*`.
+taint-preserving prompt projection: set-of-marks handles such as `#1`, role,
+short provenance prefixes, and accessible name/value text. The full URL stays in
+the durable observation journal, not the prompt projection; when an engine
+supplies marks, stable `node_id` strings also stay out of the prompt projection,
+with `@node-id` fallback handles reserved for unmarked observations and resolved
+before execution. `max_observation_*` keeps that durable structured JSON cost visible.
+`observations` counts durable observations, while `model_input_observations`
+counts the subset supplied to planning/deciding; post-action verification
+observations remain auditable and policy-relevant without inflating model prompt
+cost. Multi-observation model loops report total model-facing input in
+`model_input_*` and largest single-observation size in `max_observation_*`.
 `--full` repeats the case five times by default and writes
 `agent-browser-bench-summary.json` with per-runner success rate, failure-mode
 counts, retry totals, and p50/p95/max stats. It also writes

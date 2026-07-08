@@ -29,8 +29,9 @@ use std::time::Duration;
 use tempo_act::{detect_human_takeover, execute_action, ExecutionStatus};
 use tempo_driver::{DriverTrait, TransportError};
 use tempo_policy::Origin;
-use tempo_schema::{Action, CompiledObservation, HumanTakeover, ObservationDiff};
+use tempo_schema::{Action, CompiledObservation, HumanTakeover, NodeId, ObservationDiff};
 use tempo_session::{read_journal_entries, JournalEntry, JournalEvent, SessionJournal};
+use tempo_taint::serialize_compact_observation_for_model;
 use thiserror::Error;
 
 /// Default model for [`AnthropicDecider`].
@@ -381,7 +382,10 @@ impl Decider for AnthropicDecider {
                 tokio::time::sleep(self.config.retry_backoff.saturating_mul(1 << exponent)).await;
             }
             match self.attempt_decide(&body).await {
-                Ok(batch) => return Ok(batch),
+                Ok(mut batch) => match resolve_mark_handles(&mut batch, request.observation) {
+                    Ok(()) => return Ok(batch),
+                    Err(reason) => last_failure = Failure::Malformed(reason),
+                },
                 Err(AttemptError::Fatal(error)) => return Err(error),
                 Err(AttemptError::Retryable(failure)) => last_failure = failure,
             }
@@ -499,9 +503,12 @@ fn decider_system_text(goal: &str) -> String {
     format!(
         "You drive a web browser through the structured tempo action space.\n\
          Decide the next batch of actions that makes progress toward the goal, \
-         using only NodeIds present in the current observation. Call the \
-         `decide_actions` tool exactly once per turn. When the goal is complete, \
-         set `done` to true and return an empty `actions` array.\n\nGoal: {goal}"
+         using only handles present in the current observation. Mark handles \
+         like #1 are valid action node values and resolve to durable NodeIds \
+         before execution; fallback handles like @node:id are also valid when \
+         present. Call the `decide_actions` tool exactly once per turn. When \
+         the goal is complete, set `done` to true and return an empty `actions` \
+         array.\n\nGoal: {goal}"
     )
 }
 
@@ -542,9 +549,7 @@ fn decide_request_body(
     config: &AnthropicConfig,
     request: &DecisionRequest<'_>,
 ) -> Result<serde_json::Value, DeciderError> {
-    let observation = serde_json::to_string(request.observation).map_err(|error| {
-        DeciderError::Config(format!("observation failed to serialize: {error}"))
-    })?;
+    let observation = serialize_compact_observation_for_model(request.observation);
     Ok(serde_json::json!({
         "model": config.model,
         "max_tokens": config.max_output_tokens,
@@ -635,6 +640,57 @@ fn parse_decided_batch(response: &serde_json::Value) -> Result<DecidedBatch, Str
             cache_read_input_tokens,
         },
     })
+}
+
+fn resolve_mark_handles(
+    batch: &mut DecidedBatch,
+    observation: &CompiledObservation,
+) -> Result<(), String> {
+    for action in &mut batch.actions {
+        match action {
+            Action::Click { node }
+            | Action::Type { node, .. }
+            | Action::Select { node, .. }
+            | Action::Extract { node } => {
+                *node = resolve_mark_handle(node, observation)?;
+            }
+            Action::Goto { .. }
+            | Action::Scroll { .. }
+            | Action::Wait { .. }
+            | Action::Skill { .. } => {}
+        }
+    }
+    Ok(())
+}
+
+fn resolve_mark_handle(node: &NodeId, observation: &CompiledObservation) -> Result<NodeId, String> {
+    if let Some(label) = node.0.strip_prefix('#') {
+        let mark = label
+            .parse::<u32>()
+            .map_err(|_| format!("decision referenced invalid mark handle {}", node.0))?;
+        return observation
+            .marks
+            .iter()
+            .find_map(|(node_id, candidate)| (*candidate == mark).then(|| node_id.clone()))
+            .ok_or_else(|| format!("decision referenced unknown mark handle {}", node.0));
+    }
+
+    if let Some(raw_node_id) = node.0.strip_prefix('@') {
+        let resolved = NodeId(raw_node_id.into());
+        if observation
+            .elements
+            .iter()
+            .any(|element| element.node_id == resolved)
+        {
+            return Ok(resolved);
+        }
+        return Err(format!(
+            "decision referenced unknown fallback handle {}",
+            node.0
+        ));
+    }
+
+    Ok(node.clone())
 }
 
 /// One model-decided task: where to start and what to accomplish.
@@ -2005,9 +2061,14 @@ mod tests {
             serde_json::to_string(&first["system"])?,
             serde_json::to_string(&first["tools"])?
         );
+        let first_messages = serde_json::to_string(&first["messages"])?;
+        let second_messages = serde_json::to_string(&second["messages"])?;
         assert!(!first_stable.contains("step-one"));
-        assert!(serde_json::to_string(&first["messages"])?.contains("step-one"));
-        assert!(serde_json::to_string(&second["messages"])?.contains("step-two"));
+        assert!(!first_messages.contains("step-one"));
+        assert!(!second_messages.contains("step-two"));
+        assert!(first_messages.contains("obs s=1"));
+        assert!(first_messages.contains("@submit button n=p:\\\"Submit\\\""));
+        assert!(second_messages.contains("obs s=2"));
         Ok(())
     }
 
@@ -2459,6 +2520,104 @@ mod tests {
         assert!(batch.actions.is_empty());
         assert_eq!(batch.usage.cache_read_input_tokens, 1);
         Ok(())
+    }
+
+    #[test]
+    fn resolve_mark_handles_rewrites_model_handles_to_durable_node_ids() -> TestResult {
+        let mut obs = observation("https://example.com", 1);
+        obs.marks = vec![(NodeId("submit".into()), 1)];
+        let mut batch = DecidedBatch {
+            actions: vec![
+                Action::Click {
+                    node: NodeId("#1".into()),
+                },
+                Action::Type {
+                    node: NodeId("#1".into()),
+                    text: "hello".into(),
+                },
+                Action::Select {
+                    node: NodeId("other".into()),
+                    value: "yes".into(),
+                },
+                Action::Extract {
+                    node: NodeId("@submit".into()),
+                },
+            ],
+            rationale: None,
+            usage: DecisionUsage {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_read_input_tokens: 0,
+            },
+        };
+
+        resolve_mark_handles(&mut batch, &obs)
+            .map_err(|reason| -> Box<dyn Error> { reason.into() })?;
+
+        assert_eq!(batch.actions[0], click("submit"));
+        assert_eq!(
+            batch.actions[1],
+            Action::Type {
+                node: NodeId("submit".into()),
+                text: "hello".into(),
+            }
+        );
+        assert_eq!(
+            batch.actions[2],
+            Action::Select {
+                node: NodeId("other".into()),
+                value: "yes".into(),
+            }
+        );
+        assert_eq!(
+            batch.actions[3],
+            Action::Extract {
+                node: NodeId("submit".into()),
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_mark_handles_rejects_unknown_model_handles() {
+        let obs = observation("https://example.com", 1);
+        let mut batch = DecidedBatch {
+            actions: vec![Action::Click {
+                node: NodeId("#1".into()),
+            }],
+            rationale: None,
+            usage: DecisionUsage {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_read_input_tokens: 0,
+            },
+        };
+
+        assert_eq!(
+            resolve_mark_handles(&mut batch, &obs),
+            Err("decision referenced unknown mark handle #1".into())
+        );
+    }
+
+    #[test]
+    fn resolve_mark_handles_rejects_unknown_fallback_handles() {
+        let obs = observation("https://example.com", 1);
+        let mut batch = DecidedBatch {
+            actions: vec![Action::Click {
+                node: NodeId("@missing".into()),
+            }],
+            rationale: None,
+            usage: DecisionUsage {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_read_input_tokens: 0,
+            },
+        };
+
+        assert_eq!(
+            resolve_mark_handles(&mut batch, &obs),
+            Err("decision referenced unknown fallback handle @missing".into())
+        );
     }
 
     /// Live end-to-end decide against the real Messages API. Hermetic CI never
