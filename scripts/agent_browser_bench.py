@@ -898,6 +898,7 @@ def benchmark_gap_report(metrics: list[dict], summary: dict) -> dict:
     category_specs = [
         ("success_rate", "higher_is_better", runners),
         ("wall_clock_ms_p95", "lower_is_better", runners),
+        ("steady_state_wall_clock_ms_p95", "lower_is_better", runners),
         ("max_rss_bytes_p95", "lower_is_better", runners),
         ("retry_count_total", "lower_is_better", runners),
         ("failure_count", "lower_is_better", runners),
@@ -925,7 +926,11 @@ def benchmark_gap_report(metrics: list[dict], summary: dict) -> dict:
     categories = []
     gaps_to_close = []
     for name, direction, category_runners in category_specs:
-        participants = [runner for runner in category_runners if runner in row_by_runner]
+        participants = [
+            runner
+            for runner in category_runners
+            if runner in row_by_runner and row_by_runner[runner].get(name) is not None
+        ]
         ranked = sorted(
             (
                 {
@@ -1004,6 +1009,7 @@ def benchmark_gap_report(metrics: list[dict], summary: dict) -> dict:
             "max_observation_tokens_p95 keeps Tempo's full durable structured audit JSON cost visible and is intentionally separate from compact model-facing projections.",
             "max_observation_tokens_p95 compares the largest single durable observation per run; total_model_input_tokens_p95 is row-level only until every agent runner records true total stream cost.",
             "cpu_time_ms_p95 is row-level only until every runner uses the same resource-accounting scope.",
+            "cold_start_wall_clock_ms reports iteration 1; steady_state_wall_clock_ms_p95 ranks iteration 2+ only and is omitted for one-iteration smoke artifacts.",
             "Positive deltas mean Tempo is behind that comparison target; negative deltas mean Tempo is ahead.",
         ],
         "rows": rows,
@@ -1021,6 +1027,8 @@ def comparison_row(runner: str, runner_summary: dict, runner_metrics: list[dict]
         "retry_count_total": int(runner_summary["retry_count_total"]),
         "wall_clock_ms_p50": int(runner_summary["wall_clock_ms"]["p50"]),
         "wall_clock_ms_p95": int(runner_summary["wall_clock_ms"]["p95"]),
+        "cold_start_wall_clock_ms": cold_start_wall_clock_ms(runner_metrics),
+        "steady_state_wall_clock_ms_p95": steady_state_wall_clock_ms_p95(runner_metrics),
         "cpu_time_ms_p95": percentile(
             [
                 int(metric.get("cpu_user_ms", 0)) + int(metric.get("cpu_system_ms", 0))
@@ -1053,6 +1061,27 @@ def comparison_row(runner: str, runner_summary: dict, runner_metrics: list[dict]
         ),
         "step_count_p95": int(runner_summary["step_count"]["p95"]),
     }
+
+
+def cold_start_wall_clock_ms(runner_metrics: list[dict]) -> int | None:
+    first = next(
+        (
+            metric
+            for metric in sorted(runner_metrics, key=lambda item: int(item.get("iteration", 0)))
+            if int(metric.get("iteration", 0)) == 1
+        ),
+        None,
+    )
+    return int(first["wall_clock_ms"]) if first else None
+
+
+def steady_state_wall_clock_ms_p95(runner_metrics: list[dict]) -> int | None:
+    values = [
+        int(metric["wall_clock_ms"])
+        for metric in runner_metrics
+        if int(metric.get("iteration", 0)) > 1
+    ]
+    return percentile(values, 0.95) if values else None
 
 
 def category_sort_key(entry: dict, direction: str) -> tuple[float, str]:

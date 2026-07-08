@@ -120,9 +120,8 @@ not a hosted model credential or prompt contract. The harness writes:
   durable structured JSON cost visible. `observations` counts durable
   observations, while `max_compact_observation_*` records the same compact
   projection for every journaled observation so the report can compare compact
-  agent-facing state separately from full audit JSON. `observations` counts durable
-  observations, while
-  `model_input_observations` counts the subset supplied to planning/deciding;
+  agent-facing state separately from full audit JSON. `model_input_observations`
+  counts the subset supplied to planning/deciding;
   post-action verification observations remain auditable and policy-relevant
   without inflating model prompt cost. Multi-observation model loops report
   total model-facing input in `model_input_*` and their largest single
@@ -134,9 +133,10 @@ not a hosted model credential or prompt contract. The harness writes:
 - `agent-browser-bench-gaps.json` with deterministic category rankings and
   Tempo deltas against raw Chrome plus Playwright, browser-use-style, and real
   browser-use package agent baselines. It calls out gaps to close for success
-  rate, latency, RSS,
-  retries, failures, model-facing tokens, compact-observation tokens, largest
-  durable observation tokens, and agent step count. CPU is reported row-level
+  rate, all-iteration latency, steady-state iteration 2+ latency, RSS, retries,
+  failures, model-facing tokens, compact-observation tokens, largest durable
+  observation tokens, and agent step count. Cold-start iteration-1 latency is
+  reported row-level so first-run cost stays visible. CPU is reported row-level
   until every runner uses the same resource-accounting scope. Raw Chrome is
   deliberately excluded from observation-token and agent-step categories because
   it has no model-facing observation stream. Row-level total model-input token

@@ -93,18 +93,26 @@ def render_status_markdown(
             "",
             "## Runner Summary",
             "",
-            "| Runner | Success | Wall p95 | RSS p95 | Model Tokens p95 | Retries | Failures |",
-            "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+            "| Runner | Success | Cold Wall | Wall p95 | Steady Wall p95 | RSS p95 | Model Tokens p95 | Retries | Failures |",
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
     )
     for row in rows:
         if not isinstance(row, dict):
             continue
         lines.append(
-            "| {runner} | {success} | {wall} | {rss} | {tokens} | {retries} | {failures} |".format(
+            "| {runner} | {success} | {cold_wall} | {wall} | {steady_wall} | {rss} | {tokens} | {retries} | {failures} |".format(
                 runner=row.get("runner", "-"),
                 success=format_rate(row.get("success_rate")),
+                cold_wall=format_value(
+                    "cold_start_wall_clock_ms",
+                    row.get("cold_start_wall_clock_ms"),
+                ),
                 wall=format_value("wall_clock_ms_p95", row.get("wall_clock_ms_p95")),
+                steady_wall=format_value(
+                    "steady_state_wall_clock_ms_p95",
+                    row.get("steady_state_wall_clock_ms_p95"),
+                ),
                 rss=format_value("max_rss_bytes_p95", row.get("max_rss_bytes_p95")),
                 tokens=format_value("model_input_tokens_p95", row.get("model_input_tokens_p95")),
                 retries=row.get("retry_count_total", "-"),
