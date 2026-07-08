@@ -505,9 +505,10 @@ fn decider_system_text(goal: &str) -> String {
          Decide the next batch of actions that makes progress toward the goal, \
          using only handles present in the current observation. Mark handles \
          like #1 are valid action node values and resolve to durable NodeIds \
-         before execution. Call the `decide_actions` tool exactly once per turn. \
-         When the goal is complete, set `done` to true and return an empty \
-         `actions` array.\n\nGoal: {goal}"
+         before execution; fallback handles like @node:id are also valid when \
+         present. Call the `decide_actions` tool exactly once per turn. When \
+         the goal is complete, set `done` to true and return an empty `actions` \
+         array.\n\nGoal: {goal}"
     )
 }
 
@@ -663,17 +664,33 @@ fn resolve_mark_handles(
 }
 
 fn resolve_mark_handle(node: &NodeId, observation: &CompiledObservation) -> Result<NodeId, String> {
-    let Some(label) = node.0.strip_prefix('#') else {
-        return Ok(node.clone());
-    };
-    let mark = label
-        .parse::<u32>()
-        .map_err(|_| format!("decision referenced invalid mark handle {}", node.0))?;
-    observation
-        .marks
-        .iter()
-        .find_map(|(node_id, candidate)| (*candidate == mark).then(|| node_id.clone()))
-        .ok_or_else(|| format!("decision referenced unknown mark handle {}", node.0))
+    if let Some(label) = node.0.strip_prefix('#') {
+        let mark = label
+            .parse::<u32>()
+            .map_err(|_| format!("decision referenced invalid mark handle {}", node.0))?;
+        return observation
+            .marks
+            .iter()
+            .find_map(|(node_id, candidate)| (*candidate == mark).then(|| node_id.clone()))
+            .ok_or_else(|| format!("decision referenced unknown mark handle {}", node.0));
+    }
+
+    if let Some(raw_node_id) = node.0.strip_prefix('@') {
+        let resolved = NodeId(raw_node_id.into());
+        if observation
+            .elements
+            .iter()
+            .any(|element| element.node_id == resolved)
+        {
+            return Ok(resolved);
+        }
+        return Err(format!(
+            "decision referenced unknown fallback handle {}",
+            node.0
+        ));
+    }
+
+    Ok(node.clone())
 }
 
 /// One model-decided task: where to start and what to accomplish.
@@ -2522,6 +2539,9 @@ mod tests {
                     node: NodeId("other".into()),
                     value: "yes".into(),
                 },
+                Action::Extract {
+                    node: NodeId("@submit".into()),
+                },
             ],
             rationale: None,
             usage: DecisionUsage {
@@ -2549,6 +2569,12 @@ mod tests {
                 value: "yes".into(),
             }
         );
+        assert_eq!(
+            batch.actions[3],
+            Action::Extract {
+                node: NodeId("submit".into()),
+            }
+        );
         Ok(())
     }
 
@@ -2570,6 +2596,27 @@ mod tests {
         assert_eq!(
             resolve_mark_handles(&mut batch, &obs),
             Err("decision referenced unknown mark handle #1".into())
+        );
+    }
+
+    #[test]
+    fn resolve_mark_handles_rejects_unknown_fallback_handles() {
+        let obs = observation("https://example.com", 1);
+        let mut batch = DecidedBatch {
+            actions: vec![Action::Click {
+                node: NodeId("@missing".into()),
+            }],
+            rationale: None,
+            usage: DecisionUsage {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_read_input_tokens: 0,
+            },
+        };
+
+        assert_eq!(
+            resolve_mark_handles(&mut batch, &obs),
+            Err("decision referenced unknown fallback handle @missing".into())
         );
     }
 
