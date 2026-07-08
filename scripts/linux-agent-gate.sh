@@ -40,11 +40,96 @@ esac
 
 PLATFORM="${TEMPO_LINUX_AGENT_PLATFORM:-$DEFAULT_PLATFORM}"
 
-docker build \
-  --platform "$PLATFORM" \
-  -f "$ROOT/docker/linux-agent.Dockerfile" \
-  -t "$IMAGE" \
-  "$ROOT"
+BUILD_ARGS=(
+  --platform "$PLATFORM"
+  -f "$ROOT/docker/linux-agent.Dockerfile"
+  -t "$IMAGE"
+)
+
+DOCKER_CACHE_BACKEND="${TEMPO_LINUX_AGENT_DOCKER_CACHE_BACKEND:-}"
+if [[ -z "$DOCKER_CACHE_BACKEND" && -n "${TEMPO_LINUX_AGENT_DOCKER_CACHE_DIR:-}" ]]; then
+  DOCKER_CACHE_BACKEND="local"
+fi
+
+if [[ -n "$DOCKER_CACHE_BACKEND" ]]; then
+  if ! docker buildx version >/dev/null 2>&1; then
+    echo "docker buildx is required when Docker layer caching is enabled" >&2
+    exit 127
+  fi
+  BUILD_CACHE_ARGS=()
+  DOCKER_CACHE_DIR=""
+  DOCKER_CACHE_NEXT=""
+  case "$DOCKER_CACHE_BACKEND" in
+    gha)
+      DOCKER_CACHE_SCOPE="${TEMPO_LINUX_AGENT_DOCKER_CACHE_SCOPE:-linux-agent}"
+      BUILD_CACHE_ARGS=(
+        --cache-from "type=gha,scope=${DOCKER_CACHE_SCOPE}"
+        --cache-to "type=gha,scope=${DOCKER_CACHE_SCOPE},mode=max"
+      )
+      ;;
+    local)
+      if [[ -z "${TEMPO_LINUX_AGENT_DOCKER_CACHE_DIR:-}" ]]; then
+        echo "TEMPO_LINUX_AGENT_DOCKER_CACHE_DIR is required for local Docker layer caching" >&2
+        exit 2
+      fi
+      DOCKER_CACHE_DIR="$TEMPO_LINUX_AGENT_DOCKER_CACHE_DIR"
+      case "$DOCKER_CACHE_DIR" in
+        /*) ;;
+        *) DOCKER_CACHE_DIR="$ROOT/$DOCKER_CACHE_DIR" ;;
+      esac
+      DOCKER_CACHE_NEXT="${DOCKER_CACHE_DIR}.next"
+      mkdir -p "$(dirname "$DOCKER_CACHE_DIR")"
+      rm -rf "$DOCKER_CACHE_NEXT"
+      BUILD_CACHE_ARGS=(
+        --cache-to "type=local,dest=${DOCKER_CACHE_NEXT},mode=max"
+      )
+      if [[ -f "$DOCKER_CACHE_DIR/index.json" ]]; then
+        BUILD_CACHE_ARGS+=(--cache-from "type=local,src=${DOCKER_CACHE_DIR}")
+      fi
+      ;;
+    *)
+      echo "unsupported TEMPO_LINUX_AGENT_DOCKER_CACHE_BACKEND: ${DOCKER_CACHE_BACKEND}" >&2
+      echo "supported values: gha, local" >&2
+      exit 2
+      ;;
+  esac
+  BUILDER_NAME="${TEMPO_LINUX_AGENT_BUILDX_BUILDER:-tempo-linux-agent-cache-$$}"
+  BUILDER_CREATED=0
+  if [[ -z "${TEMPO_LINUX_AGENT_BUILDX_BUILDER:-}" ]]; then
+    docker buildx create \
+      --name "$BUILDER_NAME" \
+      --driver docker-container \
+      --use \
+      >/dev/null
+    BUILDER_CREATED=1
+  fi
+  docker buildx inspect "$BUILDER_NAME" --bootstrap >/dev/null
+  BUILD_STATUS=0
+  docker buildx build \
+    --builder "$BUILDER_NAME" \
+    --load \
+    "${BUILD_CACHE_ARGS[@]}" \
+    "${BUILD_ARGS[@]}" \
+    "$ROOT" || BUILD_STATUS=$?
+  if [[ "$BUILDER_CREATED" == "1" ]]; then
+    docker buildx rm "$BUILDER_NAME" >/dev/null 2>&1 || true
+  fi
+  if [[ "$BUILD_STATUS" != "0" ]]; then
+    if [[ -n "$DOCKER_CACHE_NEXT" ]]; then
+      rm -rf "$DOCKER_CACHE_NEXT"
+    fi
+    exit "$BUILD_STATUS"
+  fi
+  if [[ -n "$DOCKER_CACHE_DIR" ]]; then
+    rm -rf "$DOCKER_CACHE_DIR"
+    mv "$DOCKER_CACHE_NEXT" "$DOCKER_CACHE_DIR"
+    chmod -R a+rwX "$DOCKER_CACHE_DIR" 2>/dev/null || true
+  fi
+else
+  docker build \
+    "${BUILD_ARGS[@]}" \
+    "$ROOT"
+fi
 
 COMMON_ENV=(
   -e PATH=/opt/tempo-agent-bench/bin:/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin

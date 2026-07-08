@@ -66,6 +66,18 @@ require(
     and 'target:/target' in text,
     'Docker command must support a host-backed Linux agent cache directory',
 )
+require(
+    'TEMPO_LINUX_AGENT_DOCKER_CACHE_BACKEND' in text
+    and 'docker buildx build' in text
+    and '--driver docker-container' in text
+    and 'docker buildx inspect "$BUILDER_NAME" --bootstrap' in text
+    and 'docker buildx rm "$BUILDER_NAME"' in text
+    and '--cache-to "type=gha,scope=${DOCKER_CACHE_SCOPE},mode=max"' in text
+    and '--cache-from "type=gha,scope=${DOCKER_CACHE_SCOPE}"' in text
+    and '--cache-to "type=local,dest=${DOCKER_CACHE_NEXT},mode=max"' in text
+    and '--cache-from "type=local,src=${DOCKER_CACHE_DIR}"' in text,
+    'Docker command must support GitHub Actions and local Docker layer cache backends',
+)
 smoke_job = job_block("docker-smoke-amd64")
 full_job = job_block("docker-full-amd64")
 smoke_if = job_if("docker-smoke-amd64", smoke_job)
@@ -95,9 +107,20 @@ require(
 )
 require(
     'uses: actions/cache@v4' in smoke_job
-    and 'path: .tempo-linux-agent-cache' in smoke_job
+    and '.tempo-linux-agent-cache' in smoke_job
     and 'linux-agent-' in smoke_job,
-    'smoke job must cache Linux agent build artifacts',
+    'smoke job must cache Linux agent Cargo build artifacts',
+)
+require(
+    'TEMPO_LINUX_AGENT_DOCKER_CACHE_BACKEND: gha' in smoke_job
+    and 'TEMPO_LINUX_AGENT_DOCKER_CACHE_SCOPE:' in smoke_job,
+    'smoke job must enable GitHub Actions Docker layer caching',
+)
+require(
+    'scripts/agent_bench_runners/*.py' in smoke_job
+    and 'scripts/requirements-agent-bench.txt' in smoke_job
+    and 'scripts/validate-agent-bench-artifacts.py' in smoke_job,
+    'smoke job cache key must include benchmark dependency and runner surface',
 )
 require('run: scripts/linux-agent-gate.sh --smoke' in smoke_job, 'smoke job must run --smoke')
 require(
@@ -126,9 +149,20 @@ require(
 )
 require(
     'uses: actions/cache@v4' in full_job
-    and 'path: .tempo-linux-agent-cache' in full_job
+    and '.tempo-linux-agent-cache' in full_job
     and 'linux-agent-' in full_job,
-    'full job must cache Linux agent build artifacts',
+    'full job must cache Linux agent Cargo build artifacts',
+)
+require(
+    'TEMPO_LINUX_AGENT_DOCKER_CACHE_BACKEND: gha' in full_job
+    and 'TEMPO_LINUX_AGENT_DOCKER_CACHE_SCOPE:' in full_job,
+    'full job must enable GitHub Actions Docker layer caching',
+)
+require(
+    'scripts/agent_bench_runners/*.py' in full_job
+    and 'scripts/requirements-agent-bench.txt' in full_job
+    and 'scripts/validate-agent-bench-artifacts.py' in full_job,
+    'full job cache key must include benchmark dependency and runner surface',
 )
 require('run: scripts/linux-agent-gate.sh --full' in full_job, 'full job must run --full')
 require(
