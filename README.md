@@ -59,8 +59,8 @@ Testing into `.local/` and run the browser-backed smoke gates:
 scripts/test-live-cdp.sh
 ```
 
-To run the broader live-CDP suite, including known-longer child browsing-context
-coverage:
+To run the broader live-CDP suite, including child browsing-context storage
+isolation and agent resume/journal replay coverage:
 
 ```
 scripts/test-live-cdp.sh --full
