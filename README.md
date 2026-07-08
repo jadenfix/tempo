@@ -93,17 +93,20 @@ Real agent/browser benchmark artifacts are generated with:
 scripts/agent-browser-bench.sh --smoke --output-dir target/agent-browser-bench
 ```
 
-That script builds `tempo-cli` once when `TEMPO_CLI` is not already set, then the
-Python harness invokes the binary directly for the measured Tempo run and
-derived artifacts. This keeps the latency/RSS comparison focused on
+That script requires Python 3.11 or newer for the real `browser-use` package
+lane; set `TEMPO_AGENT_BENCH_PYTHON=/path/to/python3.11` if your default
+`python3` is older. It builds `tempo-cli` once when `TEMPO_CLI` is not already
+set, then the Python harness invokes the binary directly for the measured Tempo
+run and derived artifacts. This keeps the latency/RSS comparison focused on
 agent/browser runtime instead of repeated Cargo wrapper startup. The harness
 serves `fixtures/evals/live_agent/checkout.html` and drives the same task
 through Tempo CDP, raw Chrome CDP, synthetic CDP snapshots for continuity, and
-two external subprocess baselines: `real-playwright` via Playwright's Python API
-and `external-browser-use-dom-loop`, a browser-use-style indexed DOM
-observation/action loop. The latter is deliberately labeled as a DOM-loop
-baseline rather than a full browser-use LLM agent, which would require model
-credentials and a separate prompt contract. The harness writes:
+three external subprocess baselines: `real-playwright` via Playwright's Python
+API, `external-browser-use-dom-loop` as a browser-use-style indexed DOM loop,
+and `real-browser-use` via the actual `browser-use` package's browser/session
+and tool APIs. The `real-browser-use` lane is deterministic and no-LLM: it uses
+browser-use's model-facing browser state plus built-in `input`/`click` tools,
+not a hosted model credential or prompt contract. The harness writes:
 
 - `agent-browser-bench.json[l]` with success, wall time, CPU time, sampled
   process-tree max RSS, step count, retry count, failure mode, and model-facing
@@ -129,8 +132,9 @@ credentials and a separate prompt contract. The harness writes:
   RSS, step count, and model-facing bytes/tokens. `--smoke` runs one iteration;
   `--full` runs five by default, and `--iterations N` overrides either mode.
 - `agent-browser-bench-gaps.json` with deterministic category rankings and
-  Tempo deltas against raw Chrome plus Playwright/browser-use-style agent
-  baselines. It calls out gaps to close for success rate, latency, RSS,
+  Tempo deltas against raw Chrome plus Playwright, browser-use-style, and real
+  browser-use package agent baselines. It calls out gaps to close for success
+  rate, latency, RSS,
   retries, failures, model-facing tokens, compact-observation tokens, largest
   durable observation tokens, and agent step count. CPU is reported row-level
   until every runner uses the same resource-accounting scope. Raw Chrome is
@@ -138,9 +142,10 @@ credentials and a separate prompt contract. The harness writes:
   it has no model-facing observation stream. Row-level total model-input token
   p95 is included only where the runner reports a comparable model-facing stream
   cost.
-- `real-playwright.json` and `external-browser-use-dom-loop.json`, plus each
-  runner's stdout/stderr logs, model-input text, and action trace, so CI proves
-  the external subprocess lanes ran and leaves auditable model-facing evidence.
+- `real-playwright.json`, `external-browser-use-dom-loop.json`, and
+  `real-browser-use.json`, plus each runner's stdout/stderr logs, model-input
+  text, and action trace, so CI proves the external subprocess lanes ran and
+  leaves auditable model-facing evidence.
 - `chrome-version.txt` and matching fields in the benchmark JSON so floating
   Chrome-for-Testing resolution is captured with each artifact set.
 - `tempo-journal.sqlite`, `replay.json`, and `tempo-run.json` so the run is

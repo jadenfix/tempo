@@ -1,5 +1,6 @@
+browser-use==0.13.3
 greenlet==3.2.5; python_version < "3.10"
 greenlet==3.5.3; python_version >= "3.10"
 playwright==1.60.0
 pyee==13.0.1
-typing-extensions==4.16.0
+typing-extensions==4.15.0

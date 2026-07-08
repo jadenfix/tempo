@@ -17,6 +17,9 @@ The harness drives the same checkout task through:
   (`external-browser-use-dom-loop`) that observes indexed interactive DOM lines
   and acts from those observations. This is a deterministic browser-use-format
   control loop, not the full browser-use LLM agent package.
+- A real external `browser-use` package subprocess (`real-browser-use`) that
+  observes browser-use's model-facing state and drives the built-in
+  browser-use `input` and `click` tools without requiring an LLM credential.
 
 The generated benchmark artifact records success, wall time, CPU time, sampled
 process-tree max RSS, step count, retry count, failure mode, and model-facing
@@ -39,7 +42,8 @@ model-facing input in `model_input_*` and largest single-observation size in
 `agent-browser-bench-summary.json` with per-runner success rate, failure-mode
 counts, retry totals, and p50/p95/max stats. It also writes
 `agent-browser-bench-gaps.json`, a deterministic comparison report that ranks
-Tempo against raw Chrome, Playwright, and browser-use-style baselines for
+Tempo against raw Chrome, Playwright, browser-use-style, and real browser-use
+package baselines for
 success, latency, RSS, retries, failures, model-facing tokens, largest durable
 observation tokens, and agent step count. CPU is reported row-level until every
 runner uses the same resource-accounting scope. Row-level total model-input

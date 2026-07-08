@@ -33,6 +33,7 @@ AGENT_STYLE_RUNNERS = {
     "synthetic-browser-use-dom",
     "real-playwright",
     "external-browser-use-dom-loop",
+    "real-browser-use",
 }
 
 
@@ -760,6 +761,11 @@ def clean_output_dir(output_dir: Path) -> None:
         "external-browser-use-dom-loop.stderr.log",
         "external-browser-use-dom-loop.model-input.txt",
         "external-browser-use-dom-loop.trace.json",
+        "real-browser-use.json",
+        "real-browser-use.stdout.log",
+        "real-browser-use.stderr.log",
+        "real-browser-use.model-input.txt",
+        "real-browser-use.trace.json",
     ]:
         path = output_dir / name
         if path.exists():
@@ -1234,6 +1240,13 @@ def main() -> int:
                     url,
                     "external-browser-use-dom-loop",
                     "browser_use_dom_loop.py",
+                    iteration_dir,
+                ),
+                run_external_baseline(
+                    args.chrome,
+                    url,
+                    "real-browser-use",
+                    "browser_use_package.py",
                     iteration_dir,
                 ),
             ]

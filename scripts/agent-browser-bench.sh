@@ -39,10 +39,30 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if ! command -v python3 >/dev/null 2>&1; then
-  echo "python3 is required for the live browser benchmark harness" >&2
+if [[ -n "${TEMPO_AGENT_BENCH_PYTHON:-}" ]]; then
+  PYTHON_BIN="$TEMPO_AGENT_BENCH_PYTHON"
+elif [[ -x /opt/tempo-agent-bench/bin/python ]]; then
+  PYTHON_BIN=/opt/tempo-agent-bench/bin/python
+else
+  PYTHON_BIN=python3
+fi
+if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+  echo "$PYTHON_BIN is required for the live browser benchmark harness" >&2
   exit 127
 fi
+PYTHON_VERSION="$("$PYTHON_BIN" - <<'PY'
+import sys
+print(f"{sys.version_info.major}.{sys.version_info.minor}")
+PY
+)"
+case "$PYTHON_VERSION" in
+  3.11 | 3.12 | 3.13 | 3.14 | 3.15 | 3.16 | 3.17 | 3.18 | 3.19) ;;
+  *)
+    echo "Python >=3.11 is required for the real browser-use benchmark lane; got $PYTHON_VERSION from $PYTHON_BIN" >&2
+    echo "Set TEMPO_AGENT_BENCH_PYTHON to a Python 3.11+ interpreter if your default python3 is older." >&2
+    exit 1
+    ;;
+esac
 
 if [[ -z "${TEMPO_CLI:-}" ]]; then
   cargo build -p tempo-cli
@@ -88,7 +108,7 @@ if [[ ${#GATES[@]} -gt 0 ]]; then
   PY_ARGS+=("${GATES[@]}")
 fi
 
-python3 scripts/agent_browser_bench.py \
+"$PYTHON_BIN" scripts/agent_browser_bench.py \
   "${PY_ARGS[@]}" \
   --chrome "$TEMPO_CDP_CHROME" \
   --output-dir "$OUTPUT_DIR"
