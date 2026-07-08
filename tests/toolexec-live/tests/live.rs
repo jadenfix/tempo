@@ -118,8 +118,16 @@ async fn real_beatboxd_tainted_canary_denies_import_egress() -> TestResult {
     assert!(report.passed(), "{:?}", report.violations);
     assert!(report.policy_net_denied);
     assert!(report.secrets_empty);
+    assert!(report.filesystem_mounts_empty);
+    assert!(report.process_limited_to_single_pid);
+    assert!(report.double_jail_requested);
+    assert!(report.beatbox_status_denied);
     assert_eq!(report.beatbox_status, ExecutionStatus::Denied);
     assert!(report.beatbox_egress_empty);
+    assert_eq!(
+        report.beatbox_isolation_downgrades,
+        vec!["double_jail_unavailable_in_initial_wasm_lane".to_string()]
+    );
     assert_eq!(report.canary_hit_count, 0);
     Ok(())
 }
