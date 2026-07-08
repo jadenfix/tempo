@@ -740,7 +740,7 @@ def validate_iteration_dir(iteration_dir: Path, iteration: int) -> list[dict[str
     for metric in metrics:
         if metric.get("iteration") != iteration:
             raise ValidationError(f"{iteration_dir} metric has wrong iteration: {metric}")
-        validate_metric(metric, iteration)
+        validate_metric(metric, iteration, iteration_dir)
     if load_jsonl(iteration_dir / "agent-browser-bench.jsonl") != metrics:
         raise ValidationError(f"{iteration_dir}/agent-browser-bench.jsonl does not match metrics")
     return metrics
