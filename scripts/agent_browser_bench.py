@@ -272,6 +272,8 @@ def run_tempo(url: str, chrome: str, output_dir: Path) -> dict:
     report = {}
     if run_report.exists():
         report = json.loads(run_report.read_text())
+    if "model_input_observations" not in report:
+        raise RuntimeError("tempo run report missing model_input_observations")
     success = report.get("status", {}).get("state") in {"completed", "already_complete"}
     metric = {
         "runner": "tempo-cdp-agent",
@@ -315,6 +317,7 @@ def run_tempo(url: str, chrome: str, output_dir: Path) -> dict:
             )
         ),
         "observations": int(report.get("observations", 0)),
+        "model_input_observations": int(report["model_input_observations"]),
         "journal": str(journal),
         "run_report": str(run_report),
         "tempo_cli": cmd[0],
@@ -453,6 +456,7 @@ def run_cdp_baseline(chrome: str, url: str, runner: str, snapshot: str | None) -
         "model_input_bytes": byte_count,
         "model_input_tokens": estimated_tokens(byte_count),
         "observations": 1 if snapshot else 0,
+        "model_input_observations": 1 if snapshot else 0,
         "adapter": "playwright-cdp-session",
     }
     if snapshot:
@@ -531,6 +535,9 @@ def run_external_baseline(
         "model_input_bytes": int(report.get("model_input_bytes", 0)),
         "model_input_tokens": int(report.get("model_input_tokens", 0)),
         "observations": int(report.get("observations", 0)),
+        "model_input_observations": int(
+            report.get("model_input_observations", report.get("observations", 0))
+        ),
         "adapter": str(report.get("adapter", script_name)),
         "external_process": True,
         "runner_report": str(report_path),
@@ -634,6 +641,9 @@ def summarize_metrics(metrics: list[dict]) -> dict:
             "max_rss_bytes": summarize_int_field(runner_metrics, "max_rss_bytes"),
             "model_input_bytes": summarize_int_field(runner_metrics, "model_input_bytes"),
             "model_input_tokens": summarize_int_field(runner_metrics, "model_input_tokens"),
+            "model_input_observations": summarize_int_field(
+                runner_metrics, "model_input_observations"
+            ),
             "step_count": summarize_int_field(runner_metrics, "step_count"),
             "retry_count_total": sum(int(metric.get("retry_count", 0)) for metric in runner_metrics),
         }
@@ -879,11 +889,14 @@ def optional_percentile(values: list[int | None], pct: float) -> int | None:
 
 
 def comparable_total_model_input_tokens(metric: dict) -> int | None:
-    if int(metric.get("observations", 0)) == 0:
+    model_observations = int(
+        metric.get("model_input_observations", metric.get("observations", 0))
+    )
+    if model_observations == 0:
         return None
     if "total_model_input_tokens" in metric:
         return int(metric["total_model_input_tokens"])
-    if int(metric.get("observations", 0)) <= 1:
+    if model_observations <= 1:
         return int(metric.get("model_input_tokens", 0))
     return None
 
@@ -971,6 +984,9 @@ def amdahl_summary(metrics: list[dict]) -> dict:
                 ),
                 "agent_overhead_ms": wall_ms - baseline_wall_ms if baseline_wall_ms > 0 else None,
                 "model_input_tokens": int(metric.get("model_input_tokens", 0)),
+                "model_input_observations": int(
+                    metric.get("model_input_observations", metric.get("observations", 0))
+                ),
                 "success": bool(metric.get("success")),
             }
         )

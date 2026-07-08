@@ -109,9 +109,12 @@ credentials and a separate prompt contract. The harness writes:
   process-tree max RSS, step count, retry count, failure mode, and model-facing
   bytes/tokens. Tempo reports `model_input_*` from its compact taint-preserving
   prompt projection and keeps durable structured JSON cost in
-  `max_observation_*`; multi-observation loops report total model-facing input
-  in `model_input_*` and their largest single observation in
-  `max_observation_*`.
+  `max_observation_*`. `observations` counts durable observations, while
+  `model_input_observations` counts the subset supplied to planning/deciding;
+  post-action verification observations remain auditable and policy-relevant
+  without inflating model prompt cost. Multi-observation model loops report
+  total model-facing input in `model_input_*` and their largest single
+  observation in `max_observation_*`.
 - `agent-browser-bench-summary.json` with per-runner run count, success rate,
   failure-mode counts, retry totals, and p50/p95/max stats for latency, CPU,
   RSS, step count, and model-facing bytes/tokens. `--smoke` runs one iteration;
@@ -124,7 +127,7 @@ credentials and a separate prompt contract. The harness writes:
   same resource-accounting scope. Raw Chrome is deliberately excluded from
   observation-token and agent-step categories because it has no model-facing
   observation stream. Row-level total model-input token p95 is included only
-  where the runner reports a comparable total stream cost.
+  where the runner reports a comparable model-facing stream cost.
 - `real-playwright.json` and `external-browser-use-dom-loop.json`, plus each
   runner's stdout/stderr logs, model-input text, and action trace, so CI proves
   the external subprocess lanes ran and leaves auditable model-facing evidence.

@@ -46,6 +46,7 @@ REQUIRED_METRIC_FIELDS = {
     "model_input_bytes",
     "model_input_tokens",
     "observations",
+    "model_input_observations",
     "cpu_user_ms",
     "cpu_system_ms",
     "max_rss_bytes",
@@ -59,6 +60,7 @@ INT_FIELDS = {
     "model_input_bytes",
     "model_input_tokens",
     "observations",
+    "model_input_observations",
     "cpu_user_ms",
     "cpu_system_ms",
     "max_rss_bytes",
@@ -72,6 +74,7 @@ SUMMARY_INT_FIELDS = {
     "max_rss_bytes",
     "model_input_bytes",
     "model_input_tokens",
+    "model_input_observations",
     "step_count",
 }
 
@@ -151,7 +154,17 @@ def require_int(metric: dict[str, Any], field: str, *, positive: bool = False) -
         raise ValidationError(f"{metric.get('runner', '<unknown>')}.{field} must be > 0")
 
 
-def validate_metric(metric: dict[str, Any], iterations: int) -> None:
+def artifact_path(output_dir: Path, stored_path: str) -> Path:
+    path = Path(stored_path)
+    if path.exists():
+        return path
+    candidate = output_dir / path.name
+    if candidate.exists():
+        return candidate
+    return path
+
+
+def validate_metric(metric: dict[str, Any], iterations: int, output_dir: Path) -> None:
     missing = REQUIRED_METRIC_FIELDS - set(metric)
     if missing:
         raise ValidationError(f"{metric.get('runner', '<unknown>')} metric missing fields: {sorted(missing)}")
@@ -176,6 +189,11 @@ def validate_metric(metric: dict[str, Any], iterations: int) -> None:
         require_int(metric, "model_input_bytes", positive=True)
         require_int(metric, "model_input_tokens", positive=True)
         require_int(metric, "observations", positive=True)
+        require_int(metric, "model_input_observations", positive=True)
+        if int(metric["model_input_observations"]) > int(metric["observations"]):
+            raise ValidationError(
+                f"{runner}.model_input_observations must be <= observations"
+            )
 
     if runner in {"real-playwright", "external-browser-use-dom-loop"}:
         if metric.get("external_process") is not True:
@@ -183,6 +201,16 @@ def validate_metric(metric: dict[str, Any], iterations: int) -> None:
         for field in ("runner_report", "runner_stdout", "runner_stderr"):
             if not metric.get(field):
                 raise ValidationError(f"{runner}.{field} must be populated")
+        runner_report = artifact_path(output_dir, str(metric["runner_report"]))
+        if not runner_report.exists():
+            raise ValidationError(f"{runner}.runner_report does not exist: {runner_report}")
+        raw_report = json.loads(runner_report.read_text())
+        require_int(raw_report, "observations", positive=True)
+        require_int(raw_report, "model_input_observations", positive=True)
+        if int(raw_report["model_input_observations"]) > int(raw_report["observations"]):
+            raise ValidationError(
+                f"{runner}.runner_report model_input_observations must be <= observations"
+            )
 
 
 def percentile(values: list[int], pct: float) -> int:
@@ -226,6 +254,9 @@ def expected_summary(metrics: list[dict[str, Any]]) -> dict[str, Any]:
             "max_rss_bytes": summarize_int_field(runner_metrics, "max_rss_bytes"),
             "model_input_bytes": summarize_int_field(runner_metrics, "model_input_bytes"),
             "model_input_tokens": summarize_int_field(runner_metrics, "model_input_tokens"),
+            "model_input_observations": summarize_int_field(
+                runner_metrics, "model_input_observations"
+            ),
             "step_count": summarize_int_field(runner_metrics, "step_count"),
             "retry_count_total": sum(
                 int(metric.get("retry_count", 0)) for metric in runner_metrics
@@ -432,11 +463,14 @@ def optional_percentile(values: list[int | None], pct: float) -> int | None:
 
 
 def comparable_total_model_input_tokens(metric: dict[str, Any]) -> int | None:
-    if int(metric.get("observations", 0)) == 0:
+    model_observations = int(
+        metric.get("model_input_observations", metric.get("observations", 0))
+    )
+    if model_observations == 0:
         return None
     if "total_model_input_tokens" in metric:
         return int(metric["total_model_input_tokens"])
-    if int(metric.get("observations", 0)) <= 1:
+    if model_observations <= 1:
         return int(metric.get("model_input_tokens", 0))
     return None
 
@@ -504,7 +538,7 @@ def validate_bench_json(output_dir: Path) -> tuple[int, list[dict[str, Any]]]:
     for metric in metrics:
         if not isinstance(metric, dict):
             raise ValidationError("each metric must be an object")
-        validate_metric(metric, iterations)
+        validate_metric(metric, iterations, output_dir)
 
     seen_pairs: set[tuple[str, int]] = set()
     for metric in metrics:

@@ -112,6 +112,8 @@ def run(url: str, chrome: str, output: Path) -> dict:
         "model_input_tokens": estimated_tokens(byte_count),
         "total_model_input_bytes": byte_count,
         "total_model_input_tokens": estimated_tokens(byte_count),
+        "observations": 1,
+        "model_input_observations": 1,
         "max_observation_bytes": byte_count,
         "max_observation_tokens": estimated_tokens(byte_count),
         "observations": observations,
