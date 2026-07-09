@@ -663,6 +663,9 @@ def validate_metric(metric: dict[str, Any], iterations: int, output_dir: Path) -
                 "tempo-cdp-agent.cdp_browser_profile_contract must be "
                 "automation-default or browser-realistic"
             )
+        benchmark_profile = metric.get("cdp_benchmark_profile")
+        if benchmark_profile is not None and not isinstance(benchmark_profile, str):
+            raise ValidationError("tempo-cdp-agent.cdp_benchmark_profile must be a string")
         launch_dimensions = {
             "cdp_type_dispatch": {"key-events", "insert-text"},
             "cdp_browser_context": {"incognito-context", "fresh-profile"},
@@ -697,7 +700,10 @@ def validate_metric(metric: dict[str, Any], iterations: int, output_dir: Path) -
                 raise ValidationError(
                     "tempo-cdp-agent.cdp_lifecycle_overrides must be a string list"
                 )
-            if metric.get("cdp_launch_profile") == "playwright-lifecycle":
+            if metric.get("cdp_launch_profile") in {
+                "playwright-lifecycle",
+                "agent-automation",
+            }:
                 expected_overrides = [
                     "BackForwardCache",
                     "PaintHolding",
@@ -706,22 +712,53 @@ def validate_metric(metric: dict[str, Any], iterations: int, output_dir: Path) -
                 if lifecycle_overrides != expected_overrides:
                     raise ValidationError(
                         "tempo-cdp-agent.cdp_lifecycle_overrides must label the "
-                        "Playwright lifecycle overrides"
+                        "documented lifecycle overrides"
                     )
                 if profile_contract != "automation-default":
                     raise ValidationError(
-                        "tempo-cdp-agent Playwright lifecycle rows must be marked "
+                        "tempo-cdp-agent lifecycle override rows must be marked "
                         "automation-default"
                     )
             elif lifecycle_overrides:
                 raise ValidationError(
                     "tempo-cdp-agent.cdp_lifecycle_overrides must be empty without "
-                    "the Playwright lifecycle profile"
+                    "a lifecycle override profile"
                 )
             elif profile_contract == "automation-default":
                 raise ValidationError(
                     "tempo-cdp-agent automation-default rows must name lifecycle overrides"
                 )
+        if metric.get("cdp_launch_profile") == "agent-automation":
+            expected_agent_automation = {
+                "cdp_benchmark_profile": {"agent-automation", "all"},
+                "cdp_type_dispatch": "insert-text",
+                "cdp_browser_context": "fresh-profile",
+                "cdp_browser_cache": "disabled",
+                "cdp_desktop_integration": "default",
+                "cdp_compositor_stages": "browser-default",
+                "cdp_headless_mode": "new-headless",
+                "cdp_browser_profile_contract": "automation-default",
+            }
+            for field, expected_value in expected_agent_automation.items():
+                actual_value = metric.get(field)
+                if isinstance(expected_value, set):
+                    if actual_value not in expected_value:
+                        raise ValidationError(
+                            f"tempo-cdp-agent agent-automation rows must set {field} "
+                            f"to one of {sorted(expected_value)}, got {actual_value!r}"
+                        )
+                elif actual_value != expected_value:
+                    raise ValidationError(
+                        f"tempo-cdp-agent agent-automation rows must set {field}="
+                        f"{expected_value!r}, got {actual_value!r}"
+                    )
+        if benchmark_profile in {"agent-automation", "all"} and metric.get(
+            "cdp_launch_profile"
+        ) != "agent-automation":
+            raise ValidationError(
+                "tempo-cdp-agent agent-automation/all benchmark profile rows must "
+                "use cdp_launch_profile=agent-automation"
+            )
         require_int(metric, "max_compact_observation_bytes", positive=True)
         require_int(metric, "max_compact_observation_tokens", positive=True)
         if int(metric["max_compact_observation_bytes"]) > int(metric["max_observation_bytes"]):
@@ -1463,6 +1500,7 @@ def comparison_row(
             row.pop(field, None)
     if "cdp_browser_profile_contract" in first_metric:
         for field in (
+            "cdp_benchmark_profile",
             "cdp_browser_profile_contract",
             "cdp_launch_profile",
             "cdp_lifecycle_overrides",
@@ -1842,6 +1880,7 @@ def legacy_profile_status_markdown(
         if not isinstance(row, dict):
             continue
         for field in (
+            "cdp_benchmark_profile",
             "cdp_browser_profile_contract",
             "cdp_launch_profile",
             "cdp_lifecycle_overrides",

@@ -83,6 +83,8 @@ require(
     and 'TEMPO_CDP_BENCH_CURRENT_THREAD_RUNTIME=1' in text
     and 'TEMPO_CDP_BENCH_NO_FORCED_COMPOSITOR=1' in text
     and 'TEMPO_CDP_BENCH_HEADLESS_FLAG=1' in text
+    and 'agent-automation | all)' in text
+    and 'TEMPO_CDP_BENCH_AGENT_AUTOMATION=1' in text
     and '-e "TEMPO_LINUX_AGENT_BENCH_PROFILE=${BENCH_PROFILE}"' in text,
     'Docker command must support named browser benchmark optimization profiles',
 )
@@ -150,6 +152,7 @@ require(
     and 'runtime' in workflow
     and 'no-forced-compositor' in workflow
     and 'headless-flag' in workflow
+    and 'agent-automation' in workflow
     and 'TEMPO_LINUX_AGENT_BENCH_PROFILE:' in smoke_job
     and "inputs.benchmark_profile || 'default'" in smoke_job,
     'smoke job must pass the workflow benchmark profile into the gate',
