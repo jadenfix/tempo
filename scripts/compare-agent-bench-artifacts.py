@@ -21,6 +21,9 @@ DEFAULT_METRICS = (
     "wall_clock_ms_p95",
     "steady_state_wall_clock_ms_p95",
     "runner_internal_wall_clock_ms_p95",
+    "tempo_driver_launch_ms_p95",
+    "tempo_agent_run_ms_p95",
+    "tempo_driver_close_ms_p95",
     "cpu_time_ms_p95",
     "max_rss_bytes_p95",
     "browser_rss_bytes_p95",
@@ -98,6 +101,24 @@ def load_iterations(path: Path) -> int | None:
     return int(iterations) if isinstance(iterations, int) and not isinstance(iterations, bool) else None
 
 
+def validate_runner_sets(
+    baseline_rows: dict[str, dict[str, Any]],
+    candidate_rows: dict[str, dict[str, Any]],
+) -> None:
+    baseline_runners = set(baseline_rows)
+    candidate_runners = set(candidate_rows)
+    if baseline_runners == candidate_runners:
+        return
+    missing = sorted(baseline_runners - candidate_runners)
+    extra = sorted(candidate_runners - baseline_runners)
+    details = []
+    if missing:
+        details.append(f"missing candidate runners: {', '.join(missing)}")
+    if extra:
+        details.append(f"extra candidate runners: {', '.join(extra)}")
+    raise CompareError("runner sets differ; " + "; ".join(details))
+
+
 def number(row: dict[str, Any], metric: str) -> float | None:
     value = row.get(metric)
     if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -165,6 +186,23 @@ def compare_rows(
                 }
             )
     return rows
+
+
+def common_numeric_metrics(
+    baseline_rows: dict[str, dict[str, Any]],
+    candidate_rows: dict[str, dict[str, Any]],
+) -> list[str]:
+    metrics: set[str] = set()
+    for runner in sorted(set(baseline_rows) & set(candidate_rows)):
+        baseline_row = baseline_rows[runner]
+        candidate_row = candidate_rows[runner]
+        for metric in set(baseline_row) & set(candidate_row):
+            if (
+                number(baseline_row, metric) is not None
+                and number(candidate_row, metric) is not None
+            ):
+                metrics.add(metric)
+    return sorted(metrics)
 
 
 def format_number(value: float | None) -> str:
@@ -248,6 +286,22 @@ def parse_args() -> argparse.Namespace:
         help="Metric field to compare. May be repeated. Defaults to common p95 fields.",
     )
     parser.add_argument(
+        "--all-common-numeric-metrics",
+        action="store_true",
+        help=(
+            "Compare every numeric metric present in both artifacts for each common "
+            "runner instead of the curated default list."
+        ),
+    )
+    parser.add_argument(
+        "--allow-partial-runner-overlap",
+        action="store_true",
+        help=(
+            "Compare only runners present in both artifacts. By default, runner sets "
+            "must match so partial artifacts cannot hide missing data."
+        ),
+    )
+    parser.add_argument(
         "--relative-noise-threshold",
         type=float,
         default=0.05,
@@ -275,12 +329,22 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     try:
+        if args.metrics and args.all_common_numeric_metrics:
+            raise CompareError("use --metric or --all-common-numeric-metrics, not both")
         baseline_dir = artifact_dir(args.baseline_dir)
         candidate_dir = artifact_dir(args.candidate_dir)
-        metrics = args.metrics or list(DEFAULT_METRICS)
+        baseline_rows = load_rows(baseline_dir)
+        candidate_rows = load_rows(candidate_dir)
+        if not args.allow_partial_runner_overlap:
+            validate_runner_sets(baseline_rows, candidate_rows)
+        metrics = (
+            common_numeric_metrics(baseline_rows, candidate_rows)
+            if args.all_common_numeric_metrics
+            else args.metrics or list(DEFAULT_METRICS)
+        )
         rows = compare_rows(
-            load_rows(baseline_dir),
-            load_rows(candidate_dir),
+            baseline_rows,
+            candidate_rows,
             metrics,
             args.relative_noise_threshold,
             args.absolute_noise_threshold,
