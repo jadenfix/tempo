@@ -91,10 +91,10 @@ esac
 reject_unsafe_host_env
 
 case "$BENCH_PROFILE" in
-  default | lifecycle | key-events | insert-text | no-incognito | cache | desktop | runtime | no-forced-compositor | headless-flag | trusted-policy | trusted-parity | agent-automation | all) ;;
+  default | lifecycle | key-events | insert-text | no-incognito | cache | desktop | runtime | no-forced-compositor | headless-flag | trusted-policy | trusted-parity | trusted-browser-default | agent-automation | all) ;;
   *)
     echo "unsupported TEMPO_LINUX_AGENT_BENCH_PROFILE: ${BENCH_PROFILE}" >&2
-    echo "supported values: default, lifecycle, key-events, insert-text, no-incognito, cache, desktop, runtime, no-forced-compositor, headless-flag, trusted-policy, trusted-parity, agent-automation, all" >&2
+    echo "supported values: default, lifecycle, key-events, insert-text, no-incognito, cache, desktop, runtime, no-forced-compositor, headless-flag, trusted-policy, trusted-parity, trusted-browser-default, agent-automation, all" >&2
     exit 2
     ;;
 esac
@@ -258,6 +258,12 @@ case "$BENCH_PROFILE" in
       -e TEMPO_CDP_BENCH_TRUSTED_POLICY=1
       -e TEMPO_CDP_BENCH_NO_INCOGNITO=1
       -e TEMPO_CDP_BENCH_PLAYWRIGHT_LIFECYCLE_ARGS=1
+    )
+    ;;
+  trusted-browser-default)
+    COMMON_ENV+=(
+      -e TEMPO_CDP_BENCH_TRUSTED_POLICY=1
+      -e TEMPO_CDP_BENCH_NO_FORCED_COMPOSITOR=1
     )
     ;;
   agent-automation | all)

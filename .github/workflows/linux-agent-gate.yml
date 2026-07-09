@@ -27,6 +27,7 @@ on:
           - headless-flag
           - trusted-policy
           - trusted-parity
+          - trusted-browser-default
           - agent-automation
           - all
         default: default

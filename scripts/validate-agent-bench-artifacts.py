@@ -754,10 +754,12 @@ def validate_metric(metric: dict[str, Any], iterations: int, output_dir: Path) -
         if metric.get("cdp_request_policy_grace") == "trusted-settled" and benchmark_profile not in {
             "trusted-policy",
             "trusted-parity",
+            "trusted-browser-default",
         }:
             raise ValidationError(
                 "tempo-cdp-agent trusted-settled request policy rows must use "
-                "cdp_benchmark_profile='trusted-policy' or 'trusted-parity'"
+                "cdp_benchmark_profile='trusted-policy', 'trusted-parity', "
+                "or 'trusted-browser-default'"
             )
         if benchmark_profile == "trusted-parity":
             expected_trusted_parity = {
@@ -771,6 +773,18 @@ def validate_metric(metric: dict[str, Any], iterations: int, output_dir: Path) -
                 if actual_value != expected_value:
                     raise ValidationError(
                         f"tempo-cdp-agent trusted-parity rows must set {field}="
+                        f"{expected_value!r}, got {actual_value!r}"
+                    )
+        if benchmark_profile == "trusted-browser-default":
+            expected_trusted_browser_default = {
+                "cdp_request_policy_grace": "trusted-settled",
+                "cdp_compositor_stages": "browser-default",
+            }
+            for field, expected_value in expected_trusted_browser_default.items():
+                actual_value = metric.get(field)
+                if actual_value != expected_value:
+                    raise ValidationError(
+                        f"tempo-cdp-agent trusted-browser-default rows must set {field}="
                         f"{expected_value!r}, got {actual_value!r}"
                     )
         compositor_stages = metric.get("cdp_compositor_stages")
