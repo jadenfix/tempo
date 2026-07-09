@@ -1471,6 +1471,14 @@ impl AgentRunner {
         }
 
         if !matches!(action, Action::Goto { .. })
+            && let Ok(Some(url)) = driver.current_url().await
+        {
+            return self
+                .origin_for_url("post-action current URL", &url)
+                .map(|origin| (origin, None));
+        }
+
+        if !matches!(action, Action::Goto { .. })
             && let Ok(value) = driver.evaluate_script(CURRENT_LOCATION_SCRIPT, true).await
             && let Some(url) = value.as_str()
         {
@@ -3006,6 +3014,11 @@ mod tests {
             driver.observe_calls, 0,
             "the runner should execute from the current observation seq without issuing a redundant full observe"
         );
+        assert_eq!(driver.current_url_calls, 1);
+        assert_eq!(
+            driver.evaluate_script_calls, 0,
+            "the runner should use the direct current_url primitive when available"
+        );
 
         remove_dir_if_exists(&root)?;
         Ok(())
@@ -3098,7 +3111,12 @@ mod tests {
         );
         assert_eq!(
             driver.observe_calls, 0,
-            "origin refresh should use window.location.href without a redundant full observe"
+            "origin refresh should use direct current_url without a redundant full observe"
+        );
+        assert_eq!(driver.current_url_calls, 1);
+        assert_eq!(
+            driver.evaluate_script_calls, 0,
+            "origin refresh should not evaluate JavaScript when direct current_url is available"
         );
         assert_eq!(report.steps[0].observation_budget, None);
         assert_eq!(
@@ -3145,6 +3163,11 @@ mod tests {
         assert_eq!(
             driver.observe_calls, 1,
             "the fallback records one post-action observe without a redundant pre-action observe"
+        );
+        assert_eq!(driver.current_url_calls, 1);
+        assert_eq!(
+            driver.evaluate_script_calls, 1,
+            "location-script fallback should run before the audit observation"
         );
         let entries = read_journal_entries(&journal_path)?;
         let observation_events = entries
@@ -3574,7 +3597,8 @@ mod tests {
             }],
         );
         let mut driver = FailingDriver::new(TransportFailurePoint::PostActionObserve)
-            .with_elements(vec![button("submit")]);
+            .with_elements(vec![button("submit")])
+            .with_current_location_unavailable();
         let runner = AgentRunner::new_plaintext_unsafe(
             &journal_path,
             AgentRunIds::new(
@@ -5133,6 +5157,8 @@ mod tests {
         goto_calls: usize,
         observe_calls: usize,
         act_calls: usize,
+        current_url_calls: usize,
+        evaluate_script_calls: usize,
     }
 
     impl FailingDriver {
@@ -5145,6 +5171,8 @@ mod tests {
                 goto_calls: 0,
                 observe_calls: 0,
                 act_calls: 0,
+                current_url_calls: 0,
+                evaluate_script_calls: 0,
             }
         }
 
@@ -5229,11 +5257,20 @@ mod tests {
             self.inner.extract(node).await
         }
 
+        async fn current_url(&mut self) -> Result<Option<String>, TransportError> {
+            self.current_url_calls += 1;
+            if !self.current_location_available {
+                return Ok(None);
+            }
+            self.inner.current_url().await
+        }
+
         async fn evaluate_script(
             &mut self,
             expression: &str,
             await_promise: bool,
         ) -> Result<serde_json::Value, TransportError> {
+            self.evaluate_script_calls += 1;
             if self.failure == TransportFailurePoint::PostActionObserve
                 || !self.current_location_available
             {

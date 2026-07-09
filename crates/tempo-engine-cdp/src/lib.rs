@@ -1471,6 +1471,10 @@ impl DriverTrait for CdpTempoDriver {
         Ok(extracted)
     }
 
+    async fn current_url(&mut self) -> Result<Option<String>, TransportError> {
+        self.enforce_current_url_policy().await.map(Some)
+    }
+
     async fn evaluate_script(
         &mut self,
         expression: &str,
