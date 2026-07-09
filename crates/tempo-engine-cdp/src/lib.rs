@@ -31,7 +31,7 @@ use chromiumoxide::cdp::js_protocol::runtime::{
 use chromiumoxide::error::CdpError;
 use chromiumoxide::page::Page;
 use futures::{future::join_all, StreamExt};
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -2860,35 +2860,33 @@ fn diff_from_base(
         };
     };
 
-    let before: HashMap<_, _> = base
+    let before: HashMap<&str, &InteractiveElement> = base
         .elements
         .iter()
-        .map(|element| (element.node_id.0.clone(), element))
-        .collect();
-    let after: HashMap<_, _> = current
-        .elements
-        .iter()
-        .map(|element| (element.node_id.0.clone(), element))
+        .map(|element| (element.node_id.0.as_str(), element))
         .collect();
 
-    let added = after
+    let current_ids: HashSet<&str> = current
+        .elements
         .iter()
-        .filter(|(node, _)| !before.contains_key(*node))
-        .map(|(_, element)| (*element).clone())
+        .map(|element| element.node_id.0.as_str())
         .collect();
-    let removed = before
+
+    let mut added = Vec::new();
+    let mut changed = Vec::new();
+    for element in &current.elements {
+        match before.get(element.node_id.0.as_str()) {
+            None => added.push(element.clone()),
+            Some(previous) if *previous != element => changed.push(element.clone()),
+            Some(_) => {}
+        }
+    }
+
+    let removed = base
+        .elements
         .iter()
-        .filter(|(node, _)| !after.contains_key(*node))
-        .map(|(_, element)| element.node_id.clone())
-        .collect();
-    let changed = after
-        .iter()
-        .filter_map(|(node, element)| {
-            before
-                .get(node)
-                .filter(|previous| *previous != element)
-                .map(|_| (*element).clone())
-        })
+        .filter(|element| !current_ids.contains(element.node_id.0.as_str()))
+        .map(|element| element.node_id.clone())
         .collect();
 
     ObservationDiff {
