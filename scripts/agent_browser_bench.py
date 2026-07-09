@@ -619,6 +619,16 @@ def tempo_final_oracle(journal: Path) -> dict:
     }
 
 
+def tempo_final_oracle_from_report(report: dict, journal: Path) -> dict:
+    final_page_state = report.get("final_page_state")
+    if isinstance(final_page_state, dict):
+        final_page_state.setdefault("source", "tempo-final-page-state")
+        return final_page_state
+    fallback = tempo_final_oracle(journal)
+    fallback["error"] = "missing_final_page_state"
+    return fallback
+
+
 def checkout_oracle_from_page(page: object, source: str) -> dict:
     value = page.evaluate(
         """() => {
@@ -693,7 +703,7 @@ def run_tempo(url: str, chrome: str, output_dir: Path) -> dict:
     web_metrics = report.get("web_performance_metrics")
     if not isinstance(web_metrics, dict):
         raise RuntimeError("tempo run report missing web_performance_metrics")
-    final_oracle = tempo_final_oracle(journal)
+    final_oracle = tempo_final_oracle_from_report(report, journal)
     success = (
         report.get("status", {}).get("state") in {"completed", "already_complete"}
         and final_oracle.get("submitted") is True

@@ -6,6 +6,7 @@
 
 use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde_json::Value;
 use std::collections::BTreeMap;
 use std::env;
 use std::fs::File;
@@ -919,6 +920,7 @@ struct RunCdpTaskReport {
     browser_performance_metrics: BTreeMap<String, f64>,
     web_performance_metrics_available: bool,
     web_performance_metrics: BTreeMap<String, u64>,
+    final_page_state: Value,
     actions_completed: usize,
     observations: usize,
     model_input_observations: usize,
@@ -988,6 +990,7 @@ impl RunCdpTaskReport {
         timings_ms: RunCdpTaskTimings,
         browser_performance_metrics: BTreeMap<String, f64>,
         web_performance_metrics: BTreeMap<String, u64>,
+        final_page_state: Value,
     ) -> Self {
         let browser_performance_metrics_available = !browser_performance_metrics.is_empty();
         let web_performance_metrics_available = !web_performance_metrics.is_empty();
@@ -1000,6 +1003,7 @@ impl RunCdpTaskReport {
             browser_performance_metrics,
             web_performance_metrics_available,
             web_performance_metrics,
+            final_page_state,
             actions_completed: report.actions_completed,
             observations: report.observations,
             model_input_observations: report.model_input_observations,
@@ -1072,6 +1076,7 @@ fn run_cdp_task(config: RunCdpTaskConfig) -> Result<RunCdpTaskReport, CliError> 
             timings_ms,
             BTreeMap::new(),
             BTreeMap::new(),
+            Value::Null,
         ));
     }
 
@@ -1106,6 +1111,7 @@ fn run_cdp_task(config: RunCdpTaskConfig) -> Result<RunCdpTaskReport, CliError> 
         timings_ms.agent_run_ms = Some(elapsed_ms(agent_run_started));
         let browser_performance_metrics_result = driver.browser_performance_metrics().await;
         let web_performance_metrics_result = collect_web_performance_metrics(&mut driver).await;
+        let final_page_state = collect_final_page_state(&mut driver).await;
         let driver_close_started = Instant::now();
         let close_result = driver.close().await;
         timings_ms.driver_close_ms = Some(elapsed_ms(driver_close_started));
@@ -1119,9 +1125,30 @@ fn run_cdp_task(config: RunCdpTaskConfig) -> Result<RunCdpTaskReport, CliError> 
             timings_ms,
             browser_performance_metrics,
             web_performance_metrics,
+            final_page_state,
         ))
     })
 }
+
+const FINAL_PAGE_STATE_SCRIPT: &str = r#"
+(() => {
+  const email = document.querySelector('#email')?.value || '';
+  const remember = document.querySelector('#remember')?.getAttribute('aria-checked') === 'true';
+  const status = document.querySelector('#status');
+  const statusText = status?.textContent?.trim() || '';
+  const statusDone = status?.dataset?.done === 'true';
+  return {
+    email_value: email,
+    email_matches: email === 'agent@example.com',
+    remember_checked: remember,
+    remember_checked_inferred: false,
+    status_text: statusText,
+    status_done: statusDone,
+    submitted: email === 'agent@example.com' && remember && statusDone && statusText === 'Order submitted',
+    source: 'tempo-final-page-state'
+  };
+})()
+"#;
 
 const WEB_PERFORMANCE_METRIC_NAMES: &[&str] = &[
     "navigation_start_ms",
@@ -1248,6 +1275,22 @@ async fn collect_web_performance_metrics(
         metrics.insert((*key).to_string(), value);
     }
     Ok(metrics)
+}
+
+async fn collect_final_page_state(driver: &mut dyn DriverTrait) -> Value {
+    match driver.evaluate_script(FINAL_PAGE_STATE_SCRIPT, true).await {
+        Ok(value) if value.is_object() => value,
+        Ok(_) => serde_json::json!({
+            "submitted": false,
+            "source": "tempo-final-page-state",
+            "error": "final_state_script_returned_non_object"
+        }),
+        Err(error) => serde_json::json!({
+            "submitted": false,
+            "source": "tempo-final-page-state",
+            "error": error.to_string()
+        }),
+    }
 }
 
 fn non_negative_f64_to_u64(value: f64) -> Option<u64> {

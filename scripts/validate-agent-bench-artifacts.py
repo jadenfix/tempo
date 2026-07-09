@@ -1368,6 +1368,8 @@ def validate_tempo_derived_artifacts(
         raise ValidationError("tempo-run.json browser_performance_metrics must match tempo metric")
     if run_report.get("web_performance_metrics") != tempo.get("web_performance_metrics"):
         raise ValidationError("tempo-run.json web_performance_metrics must match tempo metric")
+    if run_report.get("final_page_state") != tempo.get("final_oracle"):
+        raise ValidationError("tempo-run.json final_page_state must match tempo metric final_oracle")
     require_applied_steps(run_report_path, run_report.get("steps"), int(tempo["step_count"]))
 
     journal_count = sqlite_journal_entry_count(journal_path)
