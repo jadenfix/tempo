@@ -22,6 +22,7 @@ from agent_bench_status import STATUS_ARTIFACT, render_status_markdown
 
 
 ROOT = Path(__file__).resolve().parents[1]
+PROC_ROOT = Path(os.environ.get("TEMPO_PROC_ROOT", "/proc"))
 FIXTURE_DIR = ROOT / "fixtures" / "evals" / "live_agent"
 FIXTURE_HTML = FIXTURE_DIR / "checkout.html"
 FIXTURE_ACTIONS = FIXTURE_DIR / "checkout-actions.json"
@@ -330,6 +331,34 @@ class RssSampler:
 
 
 def descendants(root_pid: int) -> set[int]:
+    if PROC_ROOT.is_dir():
+        return proc_descendants(root_pid)
+    return subprocess_descendants(root_pid)
+
+
+def proc_descendants(root_pid: int) -> set[int]:
+    children_by_parent: dict[int, list[int]] = {}
+    for status_path in PROC_ROOT.glob("[0-9]*/status"):
+        try:
+            pid = int(status_path.parent.name)
+            fields = proc_status_fields(status_path)
+            ppid = int(fields.get("PPid", "0"))
+        except (OSError, ValueError):
+            continue
+        children_by_parent.setdefault(ppid, []).append(pid)
+
+    found: set[int] = set()
+    pending = [root_pid]
+    while pending:
+        parent = pending.pop()
+        for child in children_by_parent.get(parent, []):
+            if child not in found:
+                found.add(child)
+                pending.append(child)
+    return found
+
+
+def subprocess_descendants(root_pid: int) -> set[int]:
     found: set[int] = set()
     pending = [root_pid]
     while pending:
@@ -366,6 +395,63 @@ def rss_snapshot(
 ) -> tuple[int, dict[str, int], dict[str, int], dict[str, int], list[dict[str, object]]]:
     if not pids:
         return 0, {}, {}, {}, []
+    if PROC_ROOT.is_dir():
+        return proc_rss_snapshot(pids)
+    return subprocess_rss_snapshot(pids)
+
+
+def proc_rss_snapshot(
+    pids: set[int],
+) -> tuple[int, dict[str, int], dict[str, int], dict[str, int], list[dict[str, object]]]:
+    total_bytes = 0
+    by_command: dict[str, int] = {}
+    by_process_type: dict[str, int] = {}
+    process_count_by_type: dict[str, int] = {}
+    processes: list[dict[str, object]] = []
+    for pid in sorted(pids):
+        proc_dir = PROC_ROOT / str(pid)
+        try:
+            fields = proc_status_fields(proc_dir / "status")
+            ppid = int(fields.get("PPid", "0"))
+            rss_kib = int(fields.get("VmRSS", "0 kB").split()[0])
+        except (OSError, ValueError, IndexError):
+            continue
+        if rss_kib <= 0:
+            continue
+        args = proc_cmdline(proc_dir / "cmdline")
+        fallback_command = Path(args.split()[0]).name if args else ""
+        command = proc_comm(proc_dir / "comm") or fallback_command
+        command = Path(command).name or command or "<unknown>"
+        process_type = classify_process_type(command, args)
+        rss_bytes_for_process = rss_kib * 1024
+        total_bytes += rss_bytes_for_process
+        by_command[command] = by_command.get(command, 0) + rss_bytes_for_process
+        by_process_type[process_type] = (
+            by_process_type.get(process_type, 0) + rss_bytes_for_process
+        )
+        process_count_by_type[process_type] = process_count_by_type.get(process_type, 0) + 1
+        processes.append(
+            {
+                "pid": pid,
+                "ppid": ppid,
+                "command": command,
+                "process_type": process_type,
+                "rss_bytes": rss_bytes_for_process,
+                "args": truncate_process_args(args),
+            }
+        )
+    return (
+        total_bytes,
+        dict(sorted(by_command.items())),
+        dict(sorted(by_process_type.items())),
+        dict(sorted(process_count_by_type.items())),
+        sorted(processes, key=lambda process: (str(process["process_type"]), int(process["pid"]))),
+    )
+
+
+def subprocess_rss_snapshot(
+    pids: set[int],
+) -> tuple[int, dict[str, int], dict[str, int], dict[str, int], list[dict[str, object]]]:
     args_by_pid = process_args_by_pid(pids)
     try:
         completed = subprocess.run(
@@ -460,7 +546,7 @@ def pss_uss_snapshot(
 
 
 def smaps_rollup_memory_kib(pid: int) -> tuple[int, int]:
-    path = Path("/proc") / str(pid) / "smaps_rollup"
+    path = PROC_ROOT / str(pid) / "smaps_rollup"
     try:
         lines = path.read_text(errors="ignore").splitlines()
     except OSError:
@@ -489,6 +575,12 @@ def smaps_rollup_memory_kib(pid: int) -> tuple[int, int]:
 
 
 def process_args_by_pid(pids: set[int]) -> dict[int, str]:
+    if PROC_ROOT.is_dir():
+        return {
+            pid: args
+            for pid in pids
+            if (args := proc_cmdline(PROC_ROOT / str(pid) / "cmdline"))
+        }
     try:
         completed = subprocess.run(
             [
@@ -516,6 +608,30 @@ def process_args_by_pid(pids: set[int]) -> dict[int, str]:
             continue
         args_by_pid[pid] = fields[1]
     return args_by_pid
+
+
+def proc_status_fields(path: Path) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    for line in path.read_text(errors="ignore").splitlines():
+        name, sep, value = line.partition(":")
+        if sep:
+            fields[name] = value.strip()
+    return fields
+
+
+def proc_cmdline(path: Path) -> str:
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return ""
+    return " ".join(part.decode(errors="replace") for part in data.split(b"\0") if part)
+
+
+def proc_comm(path: Path) -> str:
+    try:
+        return path.read_text(errors="ignore").strip()
+    except OSError:
+        return ""
 
 
 def classify_process_type(command: str, args: str) -> str:
