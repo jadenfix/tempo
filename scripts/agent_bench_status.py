@@ -51,7 +51,11 @@ def render_status_markdown(
     for category in categories:
         name = str(category.get("name", "unknown"))
         best = category.get("best") if isinstance(category.get("best"), dict) else {}
-        best_runner = best.get("runner", "-")
+        best_runners = category.get("best_runners")
+        if isinstance(best_runners, list) and best_runners:
+            best_runner = ", ".join(str(runner) for runner in best_runners)
+        else:
+            best_runner = best.get("runner", "-")
         best_value = best.get("value")
         lines.append(
             "| {name} | {direction} | {tempo} | {best_runner} {best_value} | {rank} | {raw_delta} | {best_delta} |".format(

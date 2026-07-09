@@ -1722,7 +1722,6 @@ def benchmark_gap_report(metrics: list[dict], summary: dict) -> dict:
             "lower_is_better",
             sorted(runner for runner in runners if runner in AGENT_STYLE_RUNNERS),
         ),
-        ("cpu_time_ms_p95", "lower_is_better", runners),
     ]
     ranked_category_fields = {name for name, _direction, _runners in category_specs}
     for field_name in RANKED_WEB_PERFORMANCE_ROW_FIELDS:
