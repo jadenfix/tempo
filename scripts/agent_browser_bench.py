@@ -854,6 +854,11 @@ def run_tempo(url: str, chrome: str, output_dir: Path) -> dict:
         "cdp_type_dispatch": (
             "insert-text" if env.get("TEMPO_CDP_BENCH_INSERT_TEXT_TYPE") == "1" else "key-events"
         ),
+        "cdp_browser_context": (
+            "fresh-profile"
+            if env.get("TEMPO_CDP_BENCH_NO_INCOGNITO") == "1"
+            else "incognito-context"
+        ),
         "tempo_phase_timings_ms": timings,
         "browser_performance_metrics_available": bool(
             report.get("browser_performance_metrics_available")

@@ -104,6 +104,9 @@ pub const TEMPO_CDP_BENCH_PLAYWRIGHT_LIFECYCLE_ARGS_ENV: &str =
 /// Benchmark-only text dispatch profile that uses CDP `Input.insertText`
 /// instead of per-character key events for semantic Type actions.
 pub const TEMPO_CDP_BENCH_INSERT_TEXT_TYPE_ENV: &str = "TEMPO_CDP_BENCH_INSERT_TEXT_TYPE";
+/// Benchmark-only launch profile that uses the fresh temp `user_data_dir`
+/// directly instead of adding an incognito BrowserContext on top.
+pub const TEMPO_CDP_BENCH_NO_INCOGNITO_ENV: &str = "TEMPO_CDP_BENCH_NO_INCOGNITO";
 
 /// Launch configuration for the CDP fallback lane.
 #[derive(Clone, Debug)]
@@ -123,6 +126,9 @@ pub struct CdpConfig {
     /// Benchmark-only Type dispatch mode. Defaults off until event-semantics
     /// tests prove it can become the normal semantic Type path.
     pub bench_insert_text_type: bool,
+    /// Benchmark-only launch mode that relies on Tempo's fresh temp profile for
+    /// storage isolation instead of wrapping it in an incognito context.
+    pub bench_no_incognito: bool,
 }
 
 impl CdpConfig {
@@ -179,15 +185,29 @@ impl CdpConfig {
         self
     }
 
+    pub fn with_bench_no_incognito(mut self) -> Self {
+        self.bench_no_incognito = true;
+        self
+    }
+
+    pub fn with_bench_no_incognito_env_opt_in(mut self) -> Self {
+        if env_flag_enabled(TEMPO_CDP_BENCH_NO_INCOGNITO_ENV) {
+            self.bench_no_incognito = true;
+        }
+        self
+    }
+
     fn browser_config(&self, user_data_dir: &Path) -> Result<BrowserConfig, TransportError> {
         let mut builder = BrowserConfig::builder()
             .headless_mode(HeadlessMode::New)
             .launch_timeout(self.launch_timeout)
             .request_timeout(CDP_REQUEST_TIMEOUT)
             .user_data_dir(user_data_dir)
-            .incognito()
             .enable_request_intercept()
             .disable_cache();
+        if !self.bench_no_incognito {
+            builder = builder.incognito();
+        }
         if self.no_sandbox {
             builder = builder.no_sandbox();
         }
@@ -222,6 +242,7 @@ impl Default for CdpConfig {
             launch_timeout: Duration::from_secs(20),
             args: Vec::new(),
             bench_insert_text_type: false,
+            bench_no_incognito: false,
         }
     }
 }
@@ -4436,6 +4457,19 @@ mod tests {
     }
 
     #[test]
+    fn default_launch_keeps_incognito_until_bench_no_incognito_opt_in() {
+        assert!(
+            !CdpConfig::default().bench_no_incognito,
+            "default CDP launches must keep the incognito BrowserContext"
+        );
+        let config = CdpConfig::default().with_bench_no_incognito_env_opt_in();
+        assert_eq!(
+            config.bench_no_incognito,
+            env_flag_enabled(TEMPO_CDP_BENCH_NO_INCOGNITO_ENV)
+        );
+    }
+
+    #[test]
     fn cdp_launch_stays_sandboxed_unless_explicitly_opted_out() {
         assert!(
             !CdpConfig::default().no_sandbox,
@@ -4701,6 +4735,73 @@ mod tests {
         accept_task.await?;
         assert!(!accepted.load(Ordering::SeqCst));
         driver.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_cdp_bench_no_incognito_keeps_fresh_profile_storage_isolated(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(chrome) = std::env::var_os("TEMPO_CDP_CHROME") else {
+            eprintln!("skipping live CDP no-incognito storage test; TEMPO_CDP_CHROME is unset");
+            return Ok(());
+        };
+        let fixture = serve_policy_fixture()?;
+        let config = CdpConfig::default()
+            .with_executable(chrome.to_string_lossy())
+            .with_no_sandbox_env_opt_in();
+        let storage_url = fixture.allowed_url("/storage");
+
+        let mut writer = CdpTempoDriver::launch_with(config.clone().with_bench_no_incognito())
+            .await?
+            .allow_private_network_access();
+        assert!(
+            !writer.browser.is_incognito(),
+            "benchmark no-incognito profile must not create an incognito BrowserContext"
+        );
+        writer
+            .goto(&storage_url)
+            .await
+            .map_err(|error| std::io::Error::other(format!("writer navigation failed: {error}")))?;
+        let written = writer
+            .evaluate_script(
+                r#"Promise.resolve((() => {
+                    localStorage.setItem('tempo-cdp-bench-no-incognito', 'profile-one');
+                    return {
+                        value: localStorage.getItem('tempo-cdp-bench-no-incognito')
+                    };
+                })())"#,
+                true,
+            )
+            .await
+            .map_err(|error| {
+                std::io::Error::other(format!("writer storage probe failed: {error}"))
+            })?;
+        writer.close().await?;
+        assert_eq!(written, serde_json::json!({ "value": "profile-one" }));
+
+        let mut reader = CdpTempoDriver::launch_with(config.with_bench_no_incognito())
+            .await?
+            .allow_private_network_access();
+        assert!(
+            !reader.browser.is_incognito(),
+            "benchmark no-incognito profile must not create an incognito BrowserContext"
+        );
+        reader
+            .goto(&storage_url)
+            .await
+            .map_err(|error| std::io::Error::other(format!("reader navigation failed: {error}")))?;
+        let isolated = reader
+            .evaluate_script(
+                "Promise.resolve({ value: localStorage.getItem('tempo-cdp-bench-no-incognito') })",
+                true,
+            )
+            .await
+            .map_err(|error| {
+                std::io::Error::other(format!("reader storage probe failed: {error}"))
+            })?;
+        reader.close().await?;
+
+        assert_eq!(isolated, serde_json::json!({ "value": null }));
         Ok(())
     }
 
@@ -5271,6 +5372,242 @@ mod tests {
             matches!(outcome, StepOutcome::StepError { .. }),
             "expected recoverable StepError for malformed legacy NodeId, got {outcome:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn live_cdp_type_action_preserves_editor_semantics(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(chrome) = std::env::var_os("TEMPO_CDP_CHROME") else {
+            eprintln!("skipping live CDP Type semantics test; TEMPO_CDP_CHROME is unset");
+            return Ok(());
+        };
+
+        assert_live_cdp_type_action_semantics(chrome.to_string_lossy().as_ref(), false).await
+    }
+
+    #[tokio::test]
+    async fn live_cdp_insert_text_type_action_preserves_editor_semantics(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(chrome) = std::env::var_os("TEMPO_CDP_CHROME") else {
+            eprintln!(
+                "skipping live CDP insertText Type semantics test; TEMPO_CDP_CHROME is unset"
+            );
+            return Ok(());
+        };
+
+        assert_live_cdp_type_action_semantics(chrome.to_string_lossy().as_ref(), true).await
+    }
+
+    async fn assert_live_cdp_type_action_semantics(
+        chrome: &str,
+        bench_insert_text_type: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = CdpConfig::default()
+            .with_executable(chrome)
+            .with_no_sandbox_env_opt_in();
+        config.bench_insert_text_type = bench_insert_text_type;
+        let mut driver = CdpTempoDriver::launch_with(config).await?;
+        driver
+            .evaluate_script(
+                r#"(() => {
+                    document.body.innerHTML = `
+                        <label for="email">Email</label>
+                        <input id="email" type="email" aria-label="Email">
+                        <input id="readonly" aria-label="Readonly" value="fixed" readonly>
+                        <input id="disabled" aria-label="Disabled" value="blocked" disabled>
+                        <input id="max" aria-label="Max" maxlength="5">
+                        <input id="number" type="number" aria-label="Number">
+                        <div id="editable" role="textbox" aria-label="Editable"
+                             contenteditable="true" tabindex="0"></div>
+                    `;
+                    window.__typeEvents = [];
+                    const record = (scope, id, event) => {
+                        window.__typeEvents.push({
+                            scope,
+                            target: id,
+                            type: event.type,
+                            trusted: event.isTrusted,
+                            data: 'data' in event ? event.data : null,
+                            inputType: 'inputType' in event ? event.inputType : null,
+                            key: 'key' in event ? event.key : null
+                        });
+                    };
+                    for (const element of document.querySelectorAll('input, [contenteditable]')) {
+                        for (const type of ['keydown', 'beforeinput', 'input', 'keyup']) {
+                            element.addEventListener(type, (event) => record('element', element.id, event));
+                        }
+                    }
+                    for (const type of ['keydown', 'keyup']) {
+                        document.addEventListener(type, (event) => {
+                            record('document', event.target && event.target.id || '', event);
+                        }, true);
+                    }
+                    return true;
+                })()"#,
+                true,
+            )
+            .await?;
+        let observation = driver.observe().await?;
+        let email_node = node_named(&observation, "Email")?;
+        let readonly_node = node_named(&observation, "Readonly")?;
+        let disabled_node = node_named(&observation, "Disabled")?;
+        let max_node = node_named(&observation, "Max")?;
+        let number_node = node_named(&observation, "Number")?;
+        let editable_node = node_named(&observation, "Editable")?;
+
+        type_action_must_apply(&mut driver, &email_node, "alice@example.com").await?;
+        let after_email = type_fixture_state(&mut driver).await?;
+        assert_eq!(
+            string_field(&after_email, "email")?,
+            "alice@example.com",
+            "ordinary input type=email should accept Type text"
+        );
+        assert_trusted_input_events(&after_email, "email");
+        assert_document_key_events(&after_email, bench_insert_text_type);
+
+        let _ = driver
+            .act(&Action::Type {
+                node: readonly_node,
+                text: "MUTATE".into(),
+            })
+            .await;
+        let _ = driver
+            .act(&Action::Type {
+                node: disabled_node,
+                text: "MUTATE".into(),
+            })
+            .await;
+        type_action_must_apply(&mut driver, &max_node, "abcdef").await?;
+        type_action_must_apply(&mut driver, &number_node, "a1b2c3").await?;
+        type_action_must_apply(&mut driver, &editable_node, "Hello").await?;
+
+        let final_state = type_fixture_state(&mut driver).await?;
+        assert_eq!(
+            string_field(&final_state, "email")?,
+            "alice@example.com",
+            "readonly/disabled Type attempts must not leak text into the previous focus target"
+        );
+        assert_eq!(string_field(&final_state, "readonly")?, "fixed");
+        assert_eq!(string_field(&final_state, "disabled")?, "blocked");
+        assert_eq!(string_field(&final_state, "max")?, "abcde");
+        assert_eq!(string_field(&final_state, "number")?, "123");
+        assert_eq!(string_field(&final_state, "editable")?, "Hello");
+        assert_trusted_input_events(&final_state, "editable");
+
+        driver.close().await?;
+        Ok(())
+    }
+
+    async fn type_action_must_apply(
+        driver: &mut CdpTempoDriver,
+        node: &NodeId,
+        text: &str,
+    ) -> Result<(), TransportError> {
+        let outcome = driver
+            .act(&Action::Type {
+                node: node.clone(),
+                text: text.to_string(),
+            })
+            .await?;
+        assert!(
+            matches!(outcome, StepOutcome::Applied { .. }),
+            "expected Type action to apply, got {outcome:?}"
+        );
+        Ok(())
+    }
+
+    async fn type_fixture_state(
+        driver: &mut CdpTempoDriver,
+    ) -> Result<serde_json::Value, TransportError> {
+        driver
+            .evaluate_script(
+                r#"(() => ({
+                    email: document.getElementById('email').value,
+                    readonly: document.getElementById('readonly').value,
+                    disabled: document.getElementById('disabled').value,
+                    max: document.getElementById('max').value,
+                    number: document.getElementById('number').value,
+                    editable: document.getElementById('editable').textContent,
+                    events: window.__typeEvents
+                }))()"#,
+                true,
+            )
+            .await
+    }
+
+    fn node_named(observation: &CompiledObservation, name: &str) -> Result<NodeId, std::io::Error> {
+        observation
+            .elements
+            .iter()
+            .find(|element| element.name.first().map(|span| span.text.as_str()) == Some(name))
+            .map(|element| element.node_id.clone())
+            .ok_or_else(|| std::io::Error::other(format!("missing {name} node")))
+    }
+
+    fn string_field<'a>(
+        value: &'a serde_json::Value,
+        field: &str,
+    ) -> Result<&'a str, std::io::Error> {
+        value
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| std::io::Error::other(format!("missing string field {field}")))
+    }
+
+    fn events(value: &serde_json::Value) -> &[serde_json::Value] {
+        value
+            .get("events")
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    fn assert_trusted_input_events(value: &serde_json::Value, target: &str) {
+        let events = events(value);
+        assert!(
+            events.iter().any(|event| is_event(event, target, "input")),
+            "expected at least one input event for {target}"
+        );
+        for event_type in ["beforeinput", "input"] {
+            for event in events
+                .iter()
+                .filter(|event| is_event(event, target, event_type))
+            {
+                assert_eq!(
+                    event.get("trusted").and_then(serde_json::Value::as_bool),
+                    Some(true),
+                    "{event_type} events for {target} should be trusted: {event:?}"
+                );
+            }
+        }
+    }
+
+    fn assert_document_key_events(value: &serde_json::Value, bench_insert_text_type: bool) {
+        let document_key_events = events(value).iter().filter(|event| {
+            event.get("scope").and_then(serde_json::Value::as_str) == Some("document")
+                && matches!(
+                    event.get("type").and_then(serde_json::Value::as_str),
+                    Some("keydown" | "keyup")
+                )
+        });
+        let document_key_event_count = document_key_events.count();
+        if bench_insert_text_type {
+            assert_eq!(
+                document_key_event_count, 0,
+                "Input.insertText Type dispatch should not synthesize document keydown/keyup events"
+            );
+        } else {
+            assert!(
+                document_key_event_count > 0,
+                "keyboard Type dispatch should synthesize document keydown/keyup events"
+            );
+        }
+    }
+
+    fn is_event(event: &serde_json::Value, target: &str, event_type: &str) -> bool {
+        event.get("scope").and_then(serde_json::Value::as_str) == Some("element")
+            && event.get("target").and_then(serde_json::Value::as_str) == Some(target)
+            && event.get("type").and_then(serde_json::Value::as_str) == Some(event_type)
     }
 
     #[tokio::test]
