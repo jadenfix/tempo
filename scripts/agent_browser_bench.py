@@ -804,7 +804,7 @@ def browser_use_snapshot_expression() -> str:
 
 def web_performance_expression() -> str:
     return r"""
-    (() => {
+    (async () => {
       const n = (value) => Number.isFinite(Number(value)) ? Math.round(Number(value)) : 0;
       const nav = performance.getEntriesByType('navigation')[0] || null;
       const resources = performance.getEntriesByType('resource');
@@ -812,7 +812,27 @@ def web_performance_expression() -> str:
       for (const entry of performance.getEntriesByType('paint')) {
         paints[entry.name] = n(entry.startTime);
       }
-      const longTasks = performance.getEntriesByType('longtask');
+      const longTasks = await (async () => {
+        const supported = window.PerformanceObserver?.supportedEntryTypes || [];
+        if (!supported.includes('longtask')) return [];
+        return await new Promise((resolve) => {
+          const entries = [];
+          let observer = null;
+          const finish = () => {
+            if (observer) observer.disconnect();
+            resolve(entries);
+          };
+          try {
+            observer = new PerformanceObserver((list) => {
+              entries.push(...list.getEntries());
+            });
+            observer.observe({ type: 'longtask', buffered: true });
+            setTimeout(finish, 0);
+          } catch (_error) {
+            finish();
+          }
+        });
+      })();
       const sum = (entries, field) => entries.reduce((total, entry) => total + n(entry[field]), 0);
       const max = (entries, field) => entries.reduce((largest, entry) => Math.max(largest, n(entry[field])), 0);
       return {
@@ -936,6 +956,7 @@ def run_cdp_baseline(chrome: str, url: str, runner: str, snapshot: str | None) -
                         context.close()
         except Exception as error:  # noqa: BLE001
             failure_mode = type(error).__name__
+            success = False
     wall = now_ms() - started
     usage = combined_usage_delta(before_self, before_children, usage_self(), usage_children())
     usage["max_rss_bytes"] = sampler.max_rss_bytes
@@ -1630,6 +1651,24 @@ def browser_performance_metric_names(metrics: list[dict]) -> list[str]:
     return sorted(names)
 
 
+def assert_browser_performance_metric_key_coverage(metrics: list[dict]) -> None:
+    expected_names = set(browser_performance_metric_names(metrics))
+    for metric in metrics:
+        runner = str(metric.get("runner", "<unknown>"))
+        iteration = int(metric.get("iteration", 0))
+        browser_metrics = metric.get("browser_performance_metrics")
+        if not isinstance(browser_metrics, dict):
+            raise RuntimeError(f"{runner} iteration {iteration} missing browser_performance_metrics")
+        names = set(str(name) for name in browser_metrics)
+        if names != expected_names:
+            missing = sorted(expected_names - names)
+            extra = sorted(names - expected_names)
+            raise RuntimeError(
+                f"{runner} iteration {iteration} CDP metric key coverage mismatch: "
+                f"missing={missing} extra={extra}"
+            )
+
+
 def browser_performance_metric_row_field(metric_name: str) -> str:
     if metric_name in BROWSER_PERFORMANCE_ROW_FIELDS:
         return BROWSER_PERFORMANCE_ROW_FIELDS[metric_name]
@@ -1900,6 +1939,7 @@ def main() -> int:
             write_jsonl(iteration_dir / "agent-browser-bench.jsonl", iteration_metrics)
             derive_artifacts(iteration_dir, iteration_metrics, url)
             metrics.extend(iteration_metrics)
+        assert_browser_performance_metric_key_coverage(metrics)
         summary = summarize_metrics(metrics)
         root_report = {
             "url": url,

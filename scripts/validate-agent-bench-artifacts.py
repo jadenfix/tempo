@@ -497,6 +497,24 @@ def validate_web_performance_metrics(metric: dict[str, Any]) -> None:
         require_int(metric, field)
 
 
+def validate_browser_performance_metric_key_coverage(metrics: list[dict[str, Any]]) -> None:
+    expected_names = set(browser_performance_metric_names(metrics))
+    for metric in metrics:
+        runner = str(metric.get("runner", "<unknown>"))
+        iteration = int(metric.get("iteration", 0))
+        browser_metrics = metric.get("browser_performance_metrics")
+        if not isinstance(browser_metrics, dict):
+            raise ValidationError(f"{runner} iteration {iteration} missing browser_performance_metrics")
+        names = set(str(name) for name in browser_metrics)
+        if names != expected_names:
+            missing = sorted(expected_names - names)
+            extra = sorted(names - expected_names)
+            raise ValidationError(
+                f"{runner} iteration {iteration} CDP metric key coverage mismatch: "
+                f"missing={missing} extra={extra}"
+            )
+
+
 def validate_tempo_phase_timings(metric: dict[str, Any]) -> None:
     timings = metric.get("tempo_phase_timings_ms")
     if not isinstance(timings, dict):
@@ -1178,6 +1196,7 @@ def validate_bench_json(output_dir: Path) -> tuple[int, list[dict[str, Any]]]:
         missing = sorted(expected_pairs - seen_pairs)
         extra = sorted(seen_pairs - expected_pairs)
         raise ValidationError(f"runner/iteration coverage mismatch: missing={missing}, extra={extra}")
+    validate_browser_performance_metric_key_coverage(metrics)
 
     summary = report.get("summary")
     if not isinstance(summary, dict):

@@ -118,13 +118,33 @@ WEB_PERFORMANCE_ROW_FIELDS = {
 
 def web_performance_metrics(page: object) -> dict:
     value = page.evaluate(
-        """() => {
+        """async () => {
           const n = (value) => Number.isFinite(Number(value)) ? Math.round(Number(value)) : 0;
           const nav = performance.getEntriesByType('navigation')[0] || null;
           const resources = performance.getEntriesByType('resource');
           const paints = {};
           for (const entry of performance.getEntriesByType('paint')) paints[entry.name] = n(entry.startTime);
-          const longTasks = performance.getEntriesByType('longtask');
+          const longTasks = await (async () => {
+            const supported = window.PerformanceObserver?.supportedEntryTypes || [];
+            if (!supported.includes('longtask')) return [];
+            return await new Promise((resolve) => {
+              const entries = [];
+              let observer = null;
+              const finish = () => {
+                if (observer) observer.disconnect();
+                resolve(entries);
+              };
+              try {
+                observer = new PerformanceObserver((list) => {
+                  entries.push(...list.getEntries());
+                });
+                observer.observe({ type: 'longtask', buffered: true });
+                setTimeout(finish, 0);
+              } catch (_error) {
+                finish();
+              }
+            });
+          })();
           const sum = (entries, field) => entries.reduce((total, entry) => total + n(entry[field]), 0);
           const max = (entries, field) => entries.reduce((largest, entry) => Math.max(largest, n(entry[field])), 0);
           return {
@@ -286,6 +306,7 @@ def run(url: str, chrome: str, output: Path) -> dict:
                     context.close()
     except Exception as error:  # noqa: BLE001
         failure_mode = type(error).__name__
+        success = False
     wall_ms = int((time.monotonic() - started) * 1000)
     observation_bytes = [len(snapshot.encode("utf-8")) for snapshot in snapshots]
     max_bytes = max(observation_bytes) if observation_bytes else 0
