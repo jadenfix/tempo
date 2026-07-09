@@ -39,11 +39,56 @@ AGENT_STYLE_RUNNERS = {
     "real-browser-use",
 }
 
+BROWSER_PERFORMANCE_METRIC_NAMES = [
+    "Documents",
+    "Frames",
+    "JSEventListeners",
+    "Nodes",
+    "LayoutCount",
+    "RecalcStyleCount",
+    "LayoutDuration",
+    "RecalcStyleDuration",
+    "ScriptDuration",
+    "TaskDuration",
+    "JSHeapUsedSize",
+    "JSHeapTotalSize",
+]
+
+BROWSER_PERFORMANCE_ROW_FIELDS = {
+    "Documents": "browser_documents_p95",
+    "Frames": "browser_frames_p95",
+    "JSEventListeners": "browser_js_event_listeners_p95",
+    "Nodes": "browser_nodes_p95",
+    "LayoutCount": "browser_layout_count_p95",
+    "RecalcStyleCount": "browser_recalc_style_count_p95",
+    "LayoutDuration": "browser_layout_duration_ms_p95",
+    "RecalcStyleDuration": "browser_recalc_style_duration_ms_p95",
+    "ScriptDuration": "browser_script_duration_ms_p95",
+    "TaskDuration": "browser_task_duration_ms_p95",
+    "JSHeapUsedSize": "browser_js_heap_used_bytes_p95",
+    "JSHeapTotalSize": "browser_js_heap_total_bytes_p95",
+}
+
+WEB_PERFORMANCE_ROW_FIELDS = {
+    "navigation_duration_ms": "web_navigation_duration_ms_p95",
+    "dom_content_loaded_ms": "web_dom_content_loaded_ms_p95",
+    "load_event_ms": "web_load_event_ms_p95",
+    "response_end_ms": "web_response_end_ms_p95",
+    "resource_count": "web_resource_count_p95",
+    "resource_transfer_size_bytes": "web_resource_transfer_size_bytes_p95",
+    "resource_decoded_body_size_bytes": "web_resource_decoded_body_size_bytes_p95",
+    "first_paint_ms": "web_first_paint_ms_p95",
+    "first_contentful_paint_ms": "web_first_contentful_paint_ms_p95",
+    "long_task_count": "web_long_task_count_p95",
+    "long_task_duration_ms": "web_long_task_duration_ms_p95",
+}
+
 REQUIRED_METRIC_FIELDS = {
     "runner",
     "suite",
     "case_id",
     "success",
+    "final_oracle",
     "wall_clock_ms",
     "step_count",
     "retry_count",
@@ -89,6 +134,7 @@ SUMMARY_INT_FIELDS = {
     "max_rss_bytes",
     "model_input_bytes",
     "model_input_tokens",
+    "observations",
     "model_input_observations",
     "step_count",
 }
@@ -283,6 +329,7 @@ def validate_metric(metric: dict[str, Any], iterations: int, output_dir: Path) -
         raise ValidationError(f"{runner}.case_id must be checkout-submit")
     if metric["success"] is not True:
         raise ValidationError(f"{runner} did not report success: {metric}")
+    validate_final_oracle(runner, metric.get("final_oracle"))
     if metric["failure_mode"] not in (None, ""):
         raise ValidationError(f"{runner}.failure_mode must be empty on success")
 
@@ -327,12 +374,19 @@ def validate_metric(metric: dict[str, Any], iterations: int, output_dir: Path) -
             )
 
     if runner == "tempo-cdp-agent":
+        if metric.get("tempo_engine") != "cdp":
+            raise ValidationError(
+                f"tempo-cdp-agent.tempo_engine must be cdp, got {metric.get('tempo_engine')!r}"
+            )
         require_int(metric, "max_compact_observation_bytes", positive=True)
         require_int(metric, "max_compact_observation_tokens", positive=True)
         if int(metric["max_compact_observation_bytes"]) > int(metric["max_observation_bytes"]):
             raise ValidationError(
                 "tempo-cdp-agent.max_compact_observation_bytes must be <= max_observation_bytes"
             )
+        validate_tempo_phase_timings(metric)
+    validate_browser_performance_metrics(metric)
+    validate_web_performance_metrics(metric)
 
     if runner in {"real-playwright", "external-browser-use-dom-loop", "real-browser-use"}:
         if metric.get("external_process") is not True:
@@ -345,12 +399,124 @@ def validate_metric(metric: dict[str, Any], iterations: int, output_dir: Path) -
                 raise ValidationError(f"{runner}.{field} does not exist: {artifact}")
         runner_report = artifact_path(output_dir, str(metric["runner_report"]))
         raw_report = json.loads(runner_report.read_text())
+        if raw_report.get("success") is not True:
+            raise ValidationError(f"{runner}.runner_report success must be true")
+        if raw_report.get("final_oracle") != metric.get("final_oracle"):
+            raise ValidationError(f"{runner}.runner_report final_oracle must match metric")
         require_int(raw_report, "observations", positive=True)
         require_int(raw_report, "model_input_observations", positive=True)
         if int(raw_report["model_input_observations"]) > int(raw_report["observations"]):
             raise ValidationError(
                 f"{runner}.runner_report model_input_observations must be <= observations"
             )
+        for field in (
+            "model_input_bytes",
+            "model_input_tokens",
+            "total_model_input_bytes",
+            "total_model_input_tokens",
+            "max_observation_bytes",
+            "max_observation_tokens",
+            *BROWSER_PERFORMANCE_ROW_FIELDS.values(),
+            *WEB_PERFORMANCE_ROW_FIELDS.values(),
+        ):
+            if field in raw_report and field in metric and int(raw_report[field]) != int(metric[field]):
+                raise ValidationError(f"{runner}.{field} must match runner_report")
+
+
+def validate_final_oracle(runner: str, oracle: Any) -> None:
+    if not isinstance(oracle, dict):
+        raise ValidationError(f"{runner}.final_oracle must be an object")
+    if oracle.get("submitted") is not True:
+        raise ValidationError(f"{runner}.final_oracle.submitted must be true: {oracle}")
+    if oracle.get("email_matches") is not True:
+        raise ValidationError(f"{runner}.final_oracle.email_matches must be true: {oracle}")
+    if oracle.get("status_done") is not True:
+        raise ValidationError(f"{runner}.final_oracle.status_done must be true: {oracle}")
+    if oracle.get("status_text") != "Order submitted":
+        raise ValidationError(f"{runner}.final_oracle.status_text must be Order submitted: {oracle}")
+    if oracle.get("remember_checked") is not True and oracle.get("remember_checked_inferred") is not True:
+        raise ValidationError(f"{runner}.final_oracle remember state must be true or inferred: {oracle}")
+
+
+def validate_browser_performance_metrics(metric: dict[str, Any]) -> None:
+    runner = str(metric["runner"])
+    if metric.get("browser_performance_metrics_available") is not True:
+        raise ValidationError(f"{runner}.browser_performance_metrics_available must be true")
+    metrics = metric.get("browser_performance_metrics")
+    if not isinstance(metrics, dict) or not metrics:
+        raise ValidationError(f"{runner}.browser_performance_metrics must be populated")
+    for name, value in metrics.items():
+        if not isinstance(name, str):
+            raise ValidationError(f"{runner}.browser_performance_metrics keys must be strings")
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0:
+            raise ValidationError(f"{runner}.browser_performance_metrics.{name} must be >= 0")
+    for name in BROWSER_PERFORMANCE_METRIC_NAMES:
+        value = metrics.get(name)
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0:
+            raise ValidationError(f"{runner}.browser_performance_metrics.{name} must be >= 0")
+    for field in BROWSER_PERFORMANCE_ROW_FIELDS.values():
+        require_int(metric, field)
+
+
+def validate_web_performance_metrics(metric: dict[str, Any]) -> None:
+    runner = str(metric["runner"])
+    if metric.get("web_performance_metrics_available") is not True:
+        raise ValidationError(f"{runner}.web_performance_metrics_available must be true")
+    metrics = metric.get("web_performance_metrics")
+    if not isinstance(metrics, dict) or not metrics:
+        raise ValidationError(f"{runner}.web_performance_metrics must be populated")
+    for name in WEB_PERFORMANCE_ROW_FIELDS:
+        value = metrics.get(name)
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0:
+            raise ValidationError(f"{runner}.web_performance_metrics.{name} must be >= 0")
+    for field in WEB_PERFORMANCE_ROW_FIELDS.values():
+        require_int(metric, field)
+
+
+def validate_tempo_phase_timings(metric: dict[str, Any]) -> None:
+    timings = metric.get("tempo_phase_timings_ms")
+    if not isinstance(timings, dict):
+        raise ValidationError("tempo-cdp-agent.tempo_phase_timings_ms must be an object")
+    for field in (
+        "total_wall_clock_ms",
+        "runtime_setup_ms",
+        "structured_probe_ms",
+        "driver_launch_ms",
+        "agent_run_ms",
+        "driver_close_ms",
+    ):
+        value = timings.get(field)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ValidationError(f"tempo-cdp-agent.tempo_phase_timings_ms.{field} must be >= 0")
+        metric_field = f"tempo_{field}"
+        if metric.get(metric_field) != value:
+            raise ValidationError(
+                f"tempo-cdp-agent.{metric_field} must match tempo_phase_timings_ms.{field}"
+            )
+    for field in ("total_wall_clock_ms", "driver_launch_ms", "agent_run_ms"):
+        if int(timings[field]) <= 0:
+            raise ValidationError(f"tempo-cdp-agent.tempo_phase_timings_ms.{field} must be > 0")
+    child_total = int(timings["total_wall_clock_ms"])
+    outer_wall = int(metric["wall_clock_ms"])
+    if child_total > outer_wall + 250:
+        raise ValidationError(
+            "tempo-cdp-agent.tempo_phase_timings_ms.total_wall_clock_ms "
+            "must fit within benchmark wall_clock_ms"
+        )
+    measured_phase_sum = sum(
+        int(timings[field])
+        for field in (
+            "runtime_setup_ms",
+            "structured_probe_ms",
+            "driver_launch_ms",
+            "agent_run_ms",
+            "driver_close_ms",
+        )
+    )
+    if measured_phase_sum > child_total + 10:
+        raise ValidationError(
+            "tempo-cdp-agent phase timings must not exceed total_wall_clock_ms"
+        )
 
 
 def percentile(values: list[int], pct: float) -> int:
@@ -394,6 +560,7 @@ def expected_summary(metrics: list[dict[str, Any]]) -> dict[str, Any]:
             "max_rss_bytes": summarize_int_field(runner_metrics, "max_rss_bytes"),
             "model_input_bytes": summarize_int_field(runner_metrics, "model_input_bytes"),
             "model_input_tokens": summarize_int_field(runner_metrics, "model_input_tokens"),
+            "observations": summarize_int_field(runner_metrics, "observations"),
             "model_input_observations": summarize_int_field(
                 runner_metrics, "model_input_observations"
             ),
@@ -431,13 +598,55 @@ def expected_gap_report(metrics: list[dict[str, Any]], summary: dict[str, Any]) 
     row_by_runner = {row["runner"]: row for row in rows}
     category_specs = [
         ("success_rate", "higher_is_better", runners),
+        ("cold_start_wall_clock_ms", "lower_is_better", runners),
         ("wall_clock_ms_p95", "lower_is_better", runners),
+        ("runner_internal_wall_clock_ms_p95", "lower_is_better", runners),
         ("steady_state_wall_clock_ms_p95", "lower_is_better", runners),
         ("max_rss_bytes_p95", "lower_is_better", runners),
+        ("browser_rss_bytes_p95", "lower_is_better", runners),
+        ("process_count_at_peak_p95", "lower_is_better", runners),
+        ("browser_documents_p95", "lower_is_better", runners),
+        ("browser_frames_p95", "lower_is_better", runners),
+        ("browser_js_event_listeners_p95", "lower_is_better", runners),
+        ("browser_nodes_p95", "lower_is_better", runners),
+        ("browser_layout_count_p95", "lower_is_better", runners),
+        ("browser_recalc_style_count_p95", "lower_is_better", runners),
+        ("browser_layout_duration_ms_p95", "lower_is_better", runners),
+        ("browser_recalc_style_duration_ms_p95", "lower_is_better", runners),
+        ("browser_script_duration_ms_p95", "lower_is_better", runners),
+        ("browser_task_duration_ms_p95", "lower_is_better", runners),
+        ("browser_js_heap_used_bytes_p95", "lower_is_better", runners),
+        ("browser_js_heap_total_bytes_p95", "lower_is_better", runners),
+        ("web_navigation_duration_ms_p95", "lower_is_better", runners),
+        ("web_dom_content_loaded_ms_p95", "lower_is_better", runners),
+        ("web_load_event_ms_p95", "lower_is_better", runners),
+        ("web_response_end_ms_p95", "lower_is_better", runners),
+        ("web_resource_count_p95", "lower_is_better", runners),
+        ("web_resource_transfer_size_bytes_p95", "lower_is_better", runners),
+        ("web_resource_decoded_body_size_bytes_p95", "lower_is_better", runners),
+        ("web_first_paint_ms_p95", "lower_is_better", runners),
+        ("web_first_contentful_paint_ms_p95", "lower_is_better", runners),
+        ("web_long_task_count_p95", "lower_is_better", runners),
+        ("web_long_task_duration_ms_p95", "lower_is_better", runners),
         ("retry_count_total", "lower_is_better", runners),
         ("failure_count", "lower_is_better", runners),
         (
             "model_input_tokens_p95",
+            "lower_is_better",
+            sorted(runner for runner in runners if runner in AGENT_STYLE_RUNNERS),
+        ),
+        (
+            "total_model_input_tokens_p95",
+            "lower_is_better",
+            sorted(runner for runner in runners if runner in AGENT_STYLE_RUNNERS),
+        ),
+        (
+            "model_input_observations_p95",
+            "lower_is_better",
+            sorted(runner for runner in runners if runner in AGENT_STYLE_RUNNERS),
+        ),
+        (
+            "observations_p95",
             "lower_is_better",
             sorted(runner for runner in runners if runner in AGENT_STYLE_RUNNERS),
         ),
@@ -456,7 +665,13 @@ def expected_gap_report(metrics: list[dict[str, Any]], summary: dict[str, Any]) 
             "lower_is_better",
             sorted(runner for runner in runners if runner in AGENT_STYLE_RUNNERS),
         ),
+        ("cpu_time_ms_p95", "lower_is_better", runners),
     ]
+    ranked_browser_fields = set(BROWSER_PERFORMANCE_ROW_FIELDS.values())
+    for metric_name in browser_performance_metric_names(metrics):
+        field_name = browser_performance_metric_row_field(metric_name)
+        if field_name not in ranked_browser_fields:
+            category_specs.append((field_name, "lower_is_better", runners))
     categories = []
     gaps_to_close = []
     for name, direction, category_runners in category_specs:
@@ -541,9 +756,12 @@ def expected_gap_report(metrics: list[dict[str, Any]], summary: dict[str, Any]) 
             "raw-chrome-cdp is excluded from observation-token and agent-step categories because it has no model-facing observation stream.",
             "model_input_tokens_p95 ranks the full model-facing stream each runner presents to an agent; compact_observation_tokens_p95 ranks the largest compact observation projection per run.",
             "max_observation_tokens_p95 keeps Tempo's full durable structured audit JSON cost visible and is intentionally separate from compact model-facing projections.",
-            "max_observation_tokens_p95 compares the largest single durable observation per run; total_model_input_tokens_p95 is row-level only until every agent runner records true total stream cost.",
+            "max_observation_tokens_p95 compares the largest single durable observation per run; total_model_input_tokens_p95 ranks the cumulative model-facing stream where runners expose it.",
             "cpu_time_ms_p95 is row-level only until every runner uses the same resource-accounting scope.",
             "cold_start_wall_clock_ms reports iteration 1; steady_state_wall_clock_ms_p95 ranks iteration 2+ only and is omitted for one-iteration smoke artifacts.",
+            "CDP Performance.getMetrics fields are required and ranked for every runner in this CDP-backed benchmark.",
+            "Known CDP runtime fields use stable browser_* category names; any additional numeric Performance.getMetrics values are preserved and ranked as browser_cdp_* categories.",
+            "web_* categories come from the browser Performance Timeline APIs and are required for every runner, including Tempo.",
             "Positive deltas mean Tempo is behind that comparison target; negative deltas mean Tempo is ahead.",
         ],
         "rows": rows,
@@ -563,10 +781,78 @@ def comparison_row(
         "success_rate": float(runner_summary["success_rate"]),
         "failure_count": sum(int(count) for count in runner_summary["failure_modes"].values()),
         "retry_count_total": int(runner_summary["retry_count_total"]),
+        "browser_performance_metrics_available": all(
+            bool(metric.get("browser_performance_metrics_available"))
+            for metric in runner_metrics
+        ),
+        "browser_performance_metrics_unavailable_reason": first_unavailable_browser_metrics_reason(
+            runner_metrics
+        ),
         "wall_clock_ms_p50": int(runner_summary["wall_clock_ms"]["p50"]),
         "wall_clock_ms_p95": int(runner_summary["wall_clock_ms"]["p95"]),
+        "runner_internal_wall_clock_ms_p95": runner_internal_wall_clock_ms_p95(runner_metrics),
         "cold_start_wall_clock_ms": cold_start_wall_clock_ms(runner_metrics),
         "steady_state_wall_clock_ms_p95": steady_state_wall_clock_ms_p95(runner_metrics),
+        "tempo_total_wall_clock_ms_p95": optional_metric_percentile(
+            runner_metrics,
+            "tempo_total_wall_clock_ms",
+            0.95,
+        ),
+        "tempo_runtime_setup_ms_p95": optional_metric_percentile(
+            runner_metrics,
+            "tempo_runtime_setup_ms",
+            0.95,
+        ),
+        "tempo_structured_probe_ms_p95": optional_metric_percentile(
+            runner_metrics,
+            "tempo_structured_probe_ms",
+            0.95,
+        ),
+        "tempo_driver_launch_ms_p95": optional_metric_percentile(
+            runner_metrics,
+            "tempo_driver_launch_ms",
+            0.95,
+        ),
+        "tempo_agent_run_ms_p95": optional_metric_percentile(
+            runner_metrics,
+            "tempo_agent_run_ms",
+            0.95,
+        ),
+        "tempo_driver_close_ms_p95": optional_metric_percentile(
+            runner_metrics,
+            "tempo_driver_close_ms",
+            0.95,
+        ),
+        "browser_nodes_p95": optional_metric_percentile(
+            runner_metrics,
+            "browser_nodes_p95",
+            0.95,
+        ),
+        "browser_task_duration_ms_p95": optional_metric_percentile(
+            runner_metrics,
+            "browser_task_duration_ms_p95",
+            0.95,
+        ),
+        "browser_script_duration_ms_p95": optional_metric_percentile(
+            runner_metrics,
+            "browser_script_duration_ms_p95",
+            0.95,
+        ),
+        "browser_layout_duration_ms_p95": optional_metric_percentile(
+            runner_metrics,
+            "browser_layout_duration_ms_p95",
+            0.95,
+        ),
+        "browser_js_heap_used_bytes_p95": optional_metric_percentile(
+            runner_metrics,
+            "browser_js_heap_used_bytes_p95",
+            0.95,
+        ),
+        **{
+            field_name: optional_metric_percentile(runner_metrics, field_name, 0.95)
+            for field_name in BROWSER_PERFORMANCE_ROW_FIELDS.values()
+        },
+        **browser_performance_metric_percentile_fields(runner_metrics),
         "cpu_time_ms_p95": percentile(
             [
                 int(metric.get("cpu_user_ms", 0)) + int(metric.get("cpu_system_ms", 0))
@@ -597,6 +883,24 @@ def comparison_row(
             ],
             0.95,
         ),
+        "browser_rss_bytes_p95": percentile(
+            [browser_rss_bytes(metric) for metric in runner_metrics],
+            0.95,
+        ),
+        "process_count_at_peak_p95": percentile(
+            [int(metric.get("process_count_at_peak", 0)) for metric in runner_metrics],
+            0.95,
+        ),
+        "web_performance_metrics_available": all(
+            bool(metric.get("web_performance_metrics_available"))
+            for metric in runner_metrics
+        ),
+        **{
+            field_name: optional_metric_percentile(runner_metrics, field_name, 0.95)
+            for field_name in WEB_PERFORMANCE_ROW_FIELDS.values()
+        },
+        "observations_p95": int(runner_summary["observations"]["p95"]),
+        "model_input_observations_p95": int(runner_summary["model_input_observations"]["p95"]),
         "step_count_p95": int(runner_summary["step_count"]["p95"]),
     }
 
@@ -620,6 +924,106 @@ def steady_state_wall_clock_ms_p95(runner_metrics: list[dict[str, Any]]) -> int 
         if int(metric.get("iteration", 0)) > 1
     ]
     return percentile(values, 0.95) if values else None
+
+
+def runner_internal_wall_clock_ms_p95(runner_metrics: list[dict[str, Any]]) -> int | None:
+    values = []
+    for metric in runner_metrics:
+        if "tempo_total_wall_clock_ms" in metric:
+            values.append(int(metric["tempo_total_wall_clock_ms"]))
+        elif "child_wall_clock_ms" in metric:
+            values.append(int(metric["child_wall_clock_ms"]))
+        else:
+            values.append(int(metric["wall_clock_ms"]))
+    return percentile(values, 0.95) if values else None
+
+
+def browser_rss_bytes(metric: dict[str, Any]) -> int:
+    by_type = metric.get("rss_at_peak_by_process_type_bytes", {})
+    if not isinstance(by_type, dict):
+        return 0
+    return sum(
+        int(value)
+        for key, value in by_type.items()
+        if isinstance(key, str) and (key == "chrome-browser" or key.startswith("chrome-"))
+    )
+
+
+def browser_performance_metric_names(metrics: list[dict[str, Any]]) -> list[str]:
+    names = set()
+    for metric in metrics:
+        browser_metrics = metric.get("browser_performance_metrics")
+        if isinstance(browser_metrics, dict):
+            names.update(str(name) for name in browser_metrics)
+    return sorted(names)
+
+
+def browser_performance_metric_row_field(metric_name: str) -> str:
+    if metric_name in BROWSER_PERFORMANCE_ROW_FIELDS:
+        return BROWSER_PERFORMANCE_ROW_FIELDS[metric_name]
+    slug = "".join(char.lower() if char.isalnum() else "_" for char in metric_name).strip("_")
+    while "__" in slug:
+        slug = slug.replace("__", "_")
+    suffix = (
+        "ms"
+        if metric_name.endswith("Duration")
+        else "bytes"
+        if metric_name.endswith("Size")
+        else ""
+    )
+    suffix_part = f"_{suffix}" if suffix else ""
+    return f"browser_cdp_{slug}{suffix_part}_p95"
+
+
+def metric_value_to_int(name: str, value: int | float) -> int:
+    if name.endswith("Duration"):
+        return int(round(float(value) * 1000))
+    return int(round(float(value)))
+
+
+def browser_performance_metric_percentile_fields(
+    runner_metrics: list[dict[str, Any]],
+) -> dict[str, int | None]:
+    fields = {}
+    for metric_name in browser_performance_metric_names(runner_metrics):
+        field_name = browser_performance_metric_row_field(metric_name)
+        if field_name in BROWSER_PERFORMANCE_ROW_FIELDS.values():
+            continue
+        values = []
+        for metric in runner_metrics:
+            browser_metrics = metric.get("browser_performance_metrics")
+            if not isinstance(browser_metrics, dict) or metric_name not in browser_metrics:
+                values = []
+                break
+            raw_value = browser_metrics[metric_name]
+            if not isinstance(raw_value, (int, float)) or isinstance(raw_value, bool):
+                values = []
+                break
+            values.append(metric_value_to_int(metric_name, raw_value))
+        fields[field_name] = percentile(values, 0.95) if values else None
+    return fields
+
+
+def optional_metric_percentile(
+    runner_metrics: list[dict[str, Any]],
+    field: str,
+    pct: float,
+) -> int | None:
+    if not runner_metrics or any(field not in metric for metric in runner_metrics):
+        return None
+    return percentile([int(metric[field]) for metric in runner_metrics], pct)
+
+
+def first_unavailable_browser_metrics_reason(runner_metrics: list[dict[str, Any]]) -> str | None:
+    for metric in runner_metrics:
+        if not metric.get("browser_performance_metrics_available"):
+            return str(
+                metric.get(
+                    "browser_performance_metrics_unavailable_reason",
+                    "browser performance metrics unavailable",
+                )
+            )
+    return None
 
 
 def category_sort_key(entry: dict[str, Any], direction: str) -> tuple[float, str]:
@@ -859,6 +1263,16 @@ def validate_tempo_derived_artifacts(
         raise ValidationError("tempo-run.json model_input_observations must match tempo metric")
     if int(run_report.get("total_model_input_tokens", -1)) != int(tempo["model_input_tokens"]):
         raise ValidationError("tempo-run.json total_model_input_tokens must match tempo metric")
+    if run_report.get("timings_ms") != tempo.get("tempo_phase_timings_ms"):
+        raise ValidationError("tempo-run.json timings_ms must match tempo metric phase timings")
+    if run_report.get("browser_performance_metrics_available") is not True:
+        raise ValidationError("tempo-run.json browser_performance_metrics_available must be true")
+    if run_report.get("web_performance_metrics_available") is not True:
+        raise ValidationError("tempo-run.json web_performance_metrics_available must be true")
+    if run_report.get("browser_performance_metrics") != tempo.get("browser_performance_metrics"):
+        raise ValidationError("tempo-run.json browser_performance_metrics must match tempo metric")
+    if run_report.get("web_performance_metrics") != tempo.get("web_performance_metrics"):
+        raise ValidationError("tempo-run.json web_performance_metrics must match tempo metric")
     require_applied_steps(run_report_path, run_report.get("steps"), int(tempo["step_count"]))
 
     journal_count = sqlite_journal_entry_count(journal_path)

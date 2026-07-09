@@ -6,11 +6,13 @@
 
 use serde::de::DeserializeOwned;
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::env;
 use std::fs::File;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Instant;
 use tempo_agent::{
     step_triples_from_journal_entries, AgentRunEngine, AgentRunIds, AgentRunReport, AgentRunStatus,
     AgentRunner, ConfirmationMode, DriverTask, IdempotencyKey, StepTriple, StepTripleOutcome,
@@ -907,11 +909,16 @@ struct RunCdpTaskConfig {
     retention_policy: Option<DurableRetentionPolicy>,
 }
 
-#[derive(Debug, PartialEq, Eq, Serialize)]
+#[derive(Debug, PartialEq, Serialize)]
 struct RunCdpTaskReport {
     engine: String,
     journal: String,
     status: RunCdpTaskStatus,
+    timings_ms: RunCdpTaskTimings,
+    browser_performance_metrics_available: bool,
+    browser_performance_metrics: BTreeMap<String, f64>,
+    web_performance_metrics_available: bool,
+    web_performance_metrics: BTreeMap<String, u64>,
     actions_completed: usize,
     observations: usize,
     model_input_observations: usize,
@@ -924,6 +931,19 @@ struct RunCdpTaskReport {
     total_model_input_bytes: usize,
     total_model_input_tokens: usize,
     steps: Vec<RunCdpTaskStep>,
+}
+
+#[derive(Debug, Default, PartialEq, Eq, Serialize)]
+struct RunCdpTaskTimings {
+    total_wall_clock_ms: u64,
+    runtime_setup_ms: u64,
+    structured_probe_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    driver_launch_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_run_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    driver_close_ms: Option<u64>,
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize)]
@@ -963,11 +983,23 @@ struct RunCdpTaskStepOutcome {
 }
 
 impl RunCdpTaskReport {
-    fn from_agent_report(report: AgentRunReport) -> Self {
+    fn from_agent_report(
+        report: AgentRunReport,
+        timings_ms: RunCdpTaskTimings,
+        browser_performance_metrics: BTreeMap<String, f64>,
+        web_performance_metrics: BTreeMap<String, u64>,
+    ) -> Self {
+        let browser_performance_metrics_available = !browser_performance_metrics.is_empty();
+        let web_performance_metrics_available = !web_performance_metrics.is_empty();
         Self {
             engine: engine_name(report.engine),
             journal: report.journal_path.display().to_string(),
             status: run_status(&report.status),
+            timings_ms,
+            browser_performance_metrics_available,
+            browser_performance_metrics,
+            web_performance_metrics_available,
+            web_performance_metrics,
             actions_completed: report.actions_completed,
             observations: report.observations,
             model_input_observations: report.model_input_observations,
@@ -1000,16 +1032,22 @@ impl From<&tempo_agent::AgentStepReport> for RunCdpTaskStep {
 }
 
 fn run_cdp_task(config: RunCdpTaskConfig) -> Result<RunCdpTaskReport, CliError> {
+    let total_started = Instant::now();
     let mut structured_fast_path = config.structured_fast_path;
     if config.allow_private_network {
         structured_fast_path = structured_fast_path.allow_private_network_access();
     }
     let task = DriverTask::new(config.start_url.clone(), config.actions.clone());
 
+    let runtime_started = Instant::now();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    if let Some(decision) = structured_fast_path.probe_target(&config.start_url)
+    let runtime_setup_ms = elapsed_ms(runtime_started);
+    let structured_probe_started = Instant::now();
+    let structured_decision = structured_fast_path.probe_target(&config.start_url);
+    let structured_probe_ms = elapsed_ms(structured_probe_started);
+    if let Some(decision) = structured_decision
         && decision.skips_render()
         && decision.supports_driver_task(&task)
     {
@@ -1020,17 +1058,37 @@ fn run_cdp_task(config: RunCdpTaskConfig) -> Result<RunCdpTaskReport, CliError> 
         .with_confirmation_mode(config.confirmation_mode)
         .with_structured_fast_path(structured_fast_path);
         let runner = with_retention_policy(runner, config.retention_policy.clone());
+        let agent_run_started = Instant::now();
         let report = runtime.block_on(runner.run_structured_task(&task, decision))?;
-        return Ok(RunCdpTaskReport::from_agent_report(report));
+        let timings_ms = RunCdpTaskTimings {
+            total_wall_clock_ms: elapsed_ms(total_started),
+            runtime_setup_ms,
+            structured_probe_ms,
+            agent_run_ms: Some(elapsed_ms(agent_run_started)),
+            ..RunCdpTaskTimings::default()
+        };
+        return Ok(RunCdpTaskReport::from_agent_report(
+            report,
+            timings_ms,
+            BTreeMap::new(),
+            BTreeMap::new(),
+        ));
     }
 
     runtime.block_on(async move {
+        let mut timings_ms = RunCdpTaskTimings {
+            runtime_setup_ms,
+            structured_probe_ms,
+            ..RunCdpTaskTimings::default()
+        };
         let mut cdp_config = CdpConfig::default().with_no_sandbox_env_opt_in();
         if let Some(chrome) = config.chrome {
             cdp_config = cdp_config.with_executable(chrome);
         }
         cdp_config = cdp_config.with_no_sandbox_env_opt_in();
+        let driver_launch_started = Instant::now();
         let mut driver = CdpTempoDriver::launch_with(cdp_config).await?;
+        timings_ms.driver_launch_ms = Some(elapsed_ms(driver_launch_started));
         if config.allow_private_network {
             driver = driver.allow_private_network_access();
         }
@@ -1043,12 +1101,104 @@ fn run_cdp_task(config: RunCdpTaskConfig) -> Result<RunCdpTaskReport, CliError> 
         .with_structured_fast_path(StructuredFastPath::disabled());
         let runner = with_retention_policy(runner, config.retention_policy);
 
+        let agent_run_started = Instant::now();
         let run_result = runner.run_driver_task(&mut driver, &task).await;
+        timings_ms.agent_run_ms = Some(elapsed_ms(agent_run_started));
+        let browser_performance_metrics_result = driver.browser_performance_metrics().await;
+        let web_performance_metrics_result = collect_web_performance_metrics(&mut driver).await;
+        let driver_close_started = Instant::now();
         let close_result = driver.close().await;
+        timings_ms.driver_close_ms = Some(elapsed_ms(driver_close_started));
         let report = run_result?;
+        let browser_performance_metrics = browser_performance_metrics_result?;
+        let web_performance_metrics = web_performance_metrics_result?;
         close_result?;
-        Ok(RunCdpTaskReport::from_agent_report(report))
+        timings_ms.total_wall_clock_ms = elapsed_ms(total_started);
+        Ok(RunCdpTaskReport::from_agent_report(
+            report,
+            timings_ms,
+            browser_performance_metrics,
+            web_performance_metrics,
+        ))
     })
+}
+
+const WEB_PERFORMANCE_METRIC_NAMES: &[&str] = &[
+    "navigation_duration_ms",
+    "dom_content_loaded_ms",
+    "load_event_ms",
+    "response_end_ms",
+    "resource_count",
+    "resource_transfer_size_bytes",
+    "resource_decoded_body_size_bytes",
+    "first_paint_ms",
+    "first_contentful_paint_ms",
+    "long_task_count",
+    "long_task_duration_ms",
+];
+
+const WEB_PERFORMANCE_SCRIPT: &str = r#"
+(() => {
+  const n = (value) => Number.isFinite(Number(value)) ? Math.round(Number(value)) : 0;
+  const nav = performance.getEntriesByType('navigation')[0] || null;
+  const resources = performance.getEntriesByType('resource');
+  const paints = {};
+  for (const entry of performance.getEntriesByType('paint')) {
+    paints[entry.name] = n(entry.startTime);
+  }
+  const longTasks = performance.getEntriesByType('longtask');
+  const sum = (entries, field) => entries.reduce((total, entry) => total + n(entry[field]), 0);
+  return {
+    navigation_duration_ms: nav ? n(nav.duration) : 0,
+    dom_content_loaded_ms: nav ? n(nav.domContentLoadedEventEnd) : 0,
+    load_event_ms: nav ? n(nav.loadEventEnd) : 0,
+    response_end_ms: nav ? n(nav.responseEnd) : 0,
+    resource_count: resources.length,
+    resource_transfer_size_bytes: sum(resources, 'transferSize'),
+    resource_decoded_body_size_bytes: sum(resources, 'decodedBodySize'),
+    first_paint_ms: paints['first-paint'] || 0,
+    first_contentful_paint_ms: paints['first-contentful-paint'] || 0,
+    long_task_count: longTasks.length,
+    long_task_duration_ms: sum(longTasks, 'duration')
+  };
+})()
+"#;
+
+async fn collect_web_performance_metrics(
+    driver: &mut dyn DriverTrait,
+) -> Result<BTreeMap<String, u64>, CliError> {
+    let value = driver
+        .evaluate_script(WEB_PERFORMANCE_SCRIPT, false)
+        .await?;
+    let object = value.as_object().ok_or_else(|| {
+        CliError::Usage("web performance metric script returned non-object".into())
+    })?;
+    let mut metrics = BTreeMap::new();
+    for key in WEB_PERFORMANCE_METRIC_NAMES {
+        let value = object
+            .get(*key)
+            .and_then(|value| {
+                value
+                    .as_u64()
+                    .or_else(|| value.as_i64().and_then(|number| u64::try_from(number).ok()))
+                    .or_else(|| value.as_f64().and_then(non_negative_f64_to_u64))
+            })
+            .unwrap_or(0);
+        metrics.insert((*key).to_string(), value);
+    }
+    Ok(metrics)
+}
+
+fn non_negative_f64_to_u64(value: f64) -> Option<u64> {
+    if value.is_finite() && value >= 0.0 && value <= u64::MAX as f64 {
+        Some(value.round() as u64)
+    } else {
+        None
+    }
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 fn with_retention_policy(
@@ -2005,6 +2155,13 @@ mod tests {
         assert_eq!(report.status.lane, Some("mcp"));
         assert_eq!(report.status.signal, Some("mcp_catalog"));
         assert_eq!(report.observations, 0);
+        assert_eq!(report.timings_ms.driver_launch_ms, None);
+        assert_eq!(report.timings_ms.driver_close_ms, None);
+        assert!(report.timings_ms.agent_run_ms.is_some());
+        assert!(!report.browser_performance_metrics_available);
+        assert!(report.browser_performance_metrics.is_empty());
+        assert!(!report.web_performance_metrics_available);
+        assert!(report.web_performance_metrics.is_empty());
         assert!(report.steps.is_empty());
         let entries = tempo_session::read_journal_entries_with_retention_policy(
             dir.join("session.jsonl"),
