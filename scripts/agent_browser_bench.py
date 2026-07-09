@@ -1080,9 +1080,12 @@ def cdp_launch_profile(
     *,
     has_agent_automation_profile: bool,
     has_playwright_lifecycle: bool,
+    has_min_process_profile: bool,
 ) -> str:
     if has_agent_automation_profile:
         return "agent-automation"
+    if has_min_process_profile:
+        return "bench-min-process"
     if has_playwright_lifecycle:
         return "playwright-lifecycle"
     return "tempo-default"
@@ -1185,6 +1188,7 @@ def run_tempo(url: str, chrome: str, output_dir: Path) -> dict:
     )
     has_agent_automation_profile = env.get("TEMPO_CDP_BENCH_AGENT_AUTOMATION") == "1"
     has_playwright_lifecycle = env.get("TEMPO_CDP_BENCH_PLAYWRIGHT_LIFECYCLE_ARGS") == "1"
+    has_min_process_profile = env.get("TEMPO_CDP_BENCH_MIN_PROCESS") == "1"
     lifecycle_overrides = (
         ["BackForwardCache", "PaintHolding", "RenderDocument"]
         if has_playwright_lifecycle
@@ -1250,6 +1254,7 @@ def run_tempo(url: str, chrome: str, output_dir: Path) -> dict:
         "cdp_launch_profile": cdp_launch_profile(
             has_agent_automation_profile=has_agent_automation_profile,
             has_playwright_lifecycle=has_playwright_lifecycle,
+            has_min_process_profile=has_min_process_profile,
         ),
         "cdp_browser_profile_contract": (
             "automation-default" if has_playwright_lifecycle else "browser-realistic"

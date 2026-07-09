@@ -128,6 +128,9 @@ pub const TEMPO_CDP_BENCH_NO_FORCED_COMPOSITOR_ENV: &str = "TEMPO_CDP_BENCH_NO_F
 /// Chrome 132+ maps bare `--headless` to the modern Chrome headless
 /// implementation; old headless is a separate `chrome-headless-shell` binary.
 pub const TEMPO_CDP_BENCH_HEADLESS_FLAG_ENV: &str = "TEMPO_CDP_BENCH_HEADLESS_FLAG";
+/// Benchmark-only launch profile for measuring whether Chrome helper process
+/// reduction lowers cold-start and memory costs on the Linux agent fixture.
+pub const TEMPO_CDP_BENCH_MIN_PROCESS_ENV: &str = "TEMPO_CDP_BENCH_MIN_PROCESS";
 /// Benchmark-only trusted-fixture request-policy profile. This removes the
 /// request-event grace floor only when Tempo already runs with allow-all URL
 /// policy plus proxy-only request enforcement.
@@ -189,6 +192,10 @@ pub struct CdpConfig {
     /// Benchmark-only headless flag experiment. Defaults off so product launches
     /// pass Chrome's explicit newer headless flag.
     pub bench_headless_flag: bool,
+    /// Benchmark-only launch profile that asks Chrome to avoid optional helper
+    /// processes where possible. This is intentionally opt-in because process
+    /// topology can affect fidelity and crash diagnostics.
+    pub bench_min_process: bool,
     /// Initial URL policy installed before the browser starts issuing traffic.
     url_policy: UrlPolicy,
     /// Trusted-fixture optimization: rely on Tempo's mandatory policy proxy for
@@ -320,6 +327,18 @@ impl CdpConfig {
         self
     }
 
+    pub fn with_bench_min_process(mut self) -> Self {
+        self.bench_min_process = true;
+        self
+    }
+
+    pub fn with_bench_min_process_env_opt_in(mut self) -> Self {
+        if env_flag_enabled(TEMPO_CDP_BENCH_MIN_PROCESS_ENV) {
+            self.bench_min_process = true;
+        }
+        self
+    }
+
     pub fn with_bench_trusted_policy(mut self) -> Self {
         self.bench_trusted_policy = true;
         self
@@ -381,6 +400,9 @@ impl CdpConfig {
             launch_args.extend(desktop_suppression_launch_args());
             builder = builder.envs(desktop_suppression_env());
         }
+        if self.bench_min_process {
+            launch_args.extend(min_process_launch_args());
+        }
         if self.bench_no_forced_compositor {
             launch_args.retain(|arg| arg != "--run-all-compositor-stages-before-draw");
         }
@@ -429,6 +451,7 @@ impl Default for CdpConfig {
             bench_suppress_desktop: false,
             bench_no_forced_compositor: false,
             bench_headless_flag: false,
+            bench_min_process: false,
             url_policy: UrlPolicy::block_private(),
             proxy_only_request_policy: false,
             bench_trusted_policy: false,
@@ -1730,6 +1753,20 @@ fn desktop_suppression_launch_args() -> Vec<String> {
         "--no-service-autorun".to_string(),
         "--disable-search-engine-choice-screen".to_string(),
         "--disable-features=DialMediaRouteProvider,MediaRouter,OptimizationHints,TranslateUI"
+            .to_string(),
+    ]
+}
+
+fn min_process_launch_args() -> Vec<String> {
+    vec![
+        "--disable-breakpad".to_string(),
+        "--disable-crash-reporter".to_string(),
+        "--disable-component-extensions-with-background-pages".to_string(),
+        "--disable-ipc-flooding-protection".to_string(),
+        "--disable-renderer-backgrounding".to_string(),
+        "--disable-background-timer-throttling".to_string(),
+        "--renderer-process-limit=1".to_string(),
+        "--disable-features=AudioServiceOutOfProcess,Crashpad,OptimizationHints,TranslateUI"
             .to_string(),
     ]
 }
@@ -5376,6 +5413,38 @@ mod tests {
             "--disable-features=MediaRouter,PaintHolding,RenderDocument"
         );
         assert!(args.iter().any(|arg| arg == "--no-service-autorun"));
+    }
+
+    #[test]
+    fn min_process_launch_args_are_benchmark_only_and_merge_features(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        assert!(!CdpConfig::default().bench_min_process);
+
+        let temp = tempfile::tempdir()?;
+        let config = CdpConfig::default()
+            .with_bench_min_process()
+            .with_args(vec![
+                "--disable-features=PaintHolding,RenderDocument".to_string(),
+                "--no-service-autorun".to_string(),
+            ])
+            .browser_config(temp.path())?;
+        let rendered = format!("{config:?}");
+
+        for expected in [
+            "--disable-breakpad",
+            "--disable-crash-reporter",
+            "--disable-component-extensions-with-background-pages",
+            "--disable-renderer-backgrounding",
+            "--disable-background-timer-throttling",
+            "--renderer-process-limit=1",
+            "--no-service-autorun",
+        ] {
+            assert!(rendered.contains(expected), "missing {expected}");
+        }
+        assert!(rendered.contains(
+            "--disable-features=AudioServiceOutOfProcess,Crashpad,OptimizationHints,PaintHolding,RenderDocument,TranslateUI"
+        ));
+        Ok(())
     }
 
     #[test]

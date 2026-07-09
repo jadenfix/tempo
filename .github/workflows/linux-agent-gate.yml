@@ -25,10 +25,12 @@ on:
           - runtime
           - no-forced-compositor
           - headless-flag
+          - min-process
           - trusted-policy
           - trusted-parity
           - trusted-browser-default
           - trusted-loopback-direct
+          - trusted-min-process
           - agent-automation
           - all
         default: default
