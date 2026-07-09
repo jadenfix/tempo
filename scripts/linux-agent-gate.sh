@@ -91,10 +91,10 @@ esac
 reject_unsafe_host_env
 
 case "$BENCH_PROFILE" in
-  default | lifecycle | insert-text | no-incognito | cache | desktop | runtime | no-forced-compositor | headless-flag | agent-automation | all) ;;
+  default | lifecycle | key-events | insert-text | no-incognito | cache | desktop | runtime | no-forced-compositor | headless-flag | agent-automation | all) ;;
   *)
     echo "unsupported TEMPO_LINUX_AGENT_BENCH_PROFILE: ${BENCH_PROFILE}" >&2
-    echo "supported values: default, lifecycle, insert-text, no-incognito, cache, desktop, runtime, no-forced-compositor, headless-flag, agent-automation, all" >&2
+    echo "supported values: default, lifecycle, key-events, insert-text, no-incognito, cache, desktop, runtime, no-forced-compositor, headless-flag, agent-automation, all" >&2
     exit 2
     ;;
 esac
@@ -225,6 +225,9 @@ COMMON_ENV=(
 case "$BENCH_PROFILE" in
   lifecycle)
     COMMON_ENV+=(-e TEMPO_CDP_BENCH_PLAYWRIGHT_LIFECYCLE_ARGS=1)
+    ;;
+  key-events)
+    COMMON_ENV+=(-e TEMPO_CDP_KEY_EVENT_TYPE=1)
     ;;
   insert-text)
     COMMON_ENV+=(-e TEMPO_CDP_BENCH_INSERT_TEXT_TYPE=1)

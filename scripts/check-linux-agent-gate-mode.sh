@@ -76,6 +76,7 @@ require(
     'BENCH_PROFILE="${TEMPO_LINUX_AGENT_BENCH_PROFILE:-default}"' in text
     and 'unsupported TEMPO_LINUX_AGENT_BENCH_PROFILE' in text
     and 'TEMPO_CDP_BENCH_PLAYWRIGHT_LIFECYCLE_ARGS=1' in text
+    and 'TEMPO_CDP_KEY_EVENT_TYPE=1' in text
     and 'TEMPO_CDP_BENCH_INSERT_TEXT_TYPE=1' in text
     and 'TEMPO_CDP_BENCH_NO_INCOGNITO=1' in text
     and 'TEMPO_CDP_BENCH_ENABLE_CACHE=1' in text
@@ -148,6 +149,7 @@ require(
 )
 require(
     'benchmark_profile:' in workflow
+    and 'key-events' in workflow
     and 'desktop' in workflow
     and 'runtime' in workflow
     and 'no-forced-compositor' in workflow

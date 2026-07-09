@@ -1120,7 +1120,7 @@ fn run_cdp_task(config: RunCdpTaskConfig) -> Result<RunCdpTaskReport, CliError> 
         let mut cdp_config = CdpConfig::default()
             .with_no_sandbox_env_opt_in()
             .with_bench_playwright_lifecycle_env_opt_in()
-            .with_bench_insert_text_type_env_opt_in()
+            .with_type_dispatch_env_opt_ins()
             .with_bench_no_incognito_env_opt_in()
             .with_bench_enable_cache_env_opt_in()
             .with_bench_suppress_desktop_env_opt_in()
