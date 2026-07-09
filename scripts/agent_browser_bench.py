@@ -846,6 +846,11 @@ def run_tempo(url: str, chrome: str, output_dir: Path) -> dict:
         "tempo_cli": cmd[0],
         "tempo_cli_prebuilt": cmd[0] != "cargo",
         "tempo_engine": str(report.get("engine", "")),
+        "cdp_launch_profile": (
+            "playwright-lifecycle"
+            if env.get("TEMPO_CDP_BENCH_PLAYWRIGHT_LIFECYCLE_ARGS") == "1"
+            else "tempo-default"
+        ),
         "tempo_phase_timings_ms": timings,
         "browser_performance_metrics_available": bool(
             report.get("browser_performance_metrics_available")

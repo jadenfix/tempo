@@ -96,6 +96,10 @@ const TIMED_OUT_NAVIGATION_RECOVERY_INTERVAL: Duration = Duration::from_millis(5
 
 /// Explicit opt-out for Chromium sandboxing in constrained CI/container setups.
 pub const TEMPO_CDP_NO_SANDBOX_ENV: &str = "TEMPO_CDP_NO_SANDBOX";
+/// Benchmark-only Chrome lifecycle profile used to compare Tempo against
+/// Playwright baselines with matching BFCache/RenderDocument behavior.
+pub const TEMPO_CDP_BENCH_PLAYWRIGHT_LIFECYCLE_ARGS_ENV: &str =
+    "TEMPO_CDP_BENCH_PLAYWRIGHT_LIFECYCLE_ARGS";
 
 /// Launch configuration for the CDP fallback lane.
 #[derive(Clone, Debug)]
@@ -130,6 +134,11 @@ impl CdpConfig {
         self
     }
 
+    pub fn with_args(mut self, args: impl IntoIterator<Item = String>) -> Self {
+        self.args.extend(args);
+        self
+    }
+
     /// Honor the explicit no-sandbox opt-in environment variable.
     ///
     /// This keeps production/default launches sandboxed while allowing live CI
@@ -138,6 +147,19 @@ impl CdpConfig {
     pub fn with_no_sandbox_env_opt_in(self) -> Self {
         if env_flag_enabled(TEMPO_CDP_NO_SANDBOX_ENV) {
             self.with_no_sandbox_for_ci()
+        } else {
+            self
+        }
+    }
+
+    /// Honor the explicit benchmark opt-in for Playwright-like lifecycle flags.
+    ///
+    /// This is intentionally separate from production defaults: the experiment
+    /// is about isolating Chrome process lifecycle differences in browser
+    /// metrics, not weakening Tempo's normal hardened launch profile.
+    pub fn with_bench_playwright_lifecycle_env_opt_in(self) -> Self {
+        if env_flag_enabled(TEMPO_CDP_BENCH_PLAYWRIGHT_LIFECYCLE_ARGS_ENV) {
+            self.with_args(playwright_lifecycle_launch_args())
         } else {
             self
         }
@@ -1282,6 +1304,13 @@ fn default_cdp_launch_args(policy_proxy_addr: SocketAddr) -> Vec<String> {
         "--disable-quic".to_string(),
         "--dns-prefetch-disable".to_string(),
         "--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1".to_string(),
+    ]
+}
+
+fn playwright_lifecycle_launch_args() -> Vec<String> {
+    vec![
+        "--disable-back-forward-cache".to_string(),
+        "--disable-features=PaintHolding,RenderDocument".to_string(),
     ]
 }
 
@@ -4359,6 +4388,17 @@ mod tests {
         assert!(args
             .iter()
             .any(|arg| arg == "--proxy-server=http://127.0.0.1:9001"));
+    }
+
+    #[test]
+    fn playwright_lifecycle_launch_args_match_browser_baseline_lifecycle_flags() {
+        let args = playwright_lifecycle_launch_args();
+
+        assert!(args.iter().any(|arg| arg == "--disable-back-forward-cache"));
+        assert!(args
+            .iter()
+            .any(|arg| arg == "--disable-features=PaintHolding,RenderDocument"));
+        assert!(!args.iter().any(|arg| is_policy_proxy_arg(arg)));
     }
 
     #[test]

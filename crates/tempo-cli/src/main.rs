@@ -1086,11 +1086,12 @@ fn run_cdp_task(config: RunCdpTaskConfig) -> Result<RunCdpTaskReport, CliError> 
             structured_probe_ms,
             ..RunCdpTaskTimings::default()
         };
-        let mut cdp_config = CdpConfig::default().with_no_sandbox_env_opt_in();
+        let mut cdp_config = CdpConfig::default()
+            .with_no_sandbox_env_opt_in()
+            .with_bench_playwright_lifecycle_env_opt_in();
         if let Some(chrome) = config.chrome {
             cdp_config = cdp_config.with_executable(chrome);
         }
-        cdp_config = cdp_config.with_no_sandbox_env_opt_in();
         let driver_launch_started = Instant::now();
         let mut driver = CdpTempoDriver::launch_with(cdp_config).await?;
         timings_ms.driver_launch_ms = Some(elapsed_ms(driver_launch_started));
