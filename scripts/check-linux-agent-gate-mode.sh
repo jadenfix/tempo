@@ -41,6 +41,12 @@ def artifact_names(block: str) -> set[str]:
     return set(re.findall(r"^          name: ([^\n]+)$", block, flags=re.M))
 
 
+require(
+    "cancel-in-progress: true" in workflow
+    and "github.event.pull_request.number || format('{0}-{1}-{2}', github.ref, inputs.mode || 'scheduled', inputs.benchmark_profile || 'default')" in workflow,
+    'workflow concurrency must cancel superseded PR runs while allowing separate workflow_dispatch benchmark profiles to run in parallel',
+)
+
 match = re.search(
     r'if \[\[ "\$MODE" == "--full" \]\]; then\n(?P<full>.*?)\nelse\n(?P<smoke>.*?)\nfi',
     text,
@@ -51,7 +57,7 @@ require(match is not None, 'missing full/smoke mode branch')
 full = match.group('full')
 smoke = match.group('smoke')
 require('BENCH_MODE="--full"' in full, 'full mode must run benchmark --full')
-require('BENCH_EXPECTED_ITERATIONS="5"' in full, 'full mode must validate five iterations')
+require('BENCH_EXPECTED_ITERATIONS="7"' in full, 'full mode must validate seven iterations')
 require('BENCH_MODE="--smoke"' in smoke, 'smoke mode must run benchmark --smoke')
 require('BENCH_EXPECTED_ITERATIONS="1"' in smoke, 'smoke mode must validate one iteration')
 require('        ${BENCH_MODE} \\' in text, 'Docker command must expand BENCH_MODE on the host')
@@ -65,6 +71,20 @@ require(
     and 'cargo-git:/usr/local/cargo/git' in text
     and 'target:/target' in text,
     'Docker command must support a host-backed Linux agent cache directory',
+)
+require(
+    'BENCH_PROFILE="${TEMPO_LINUX_AGENT_BENCH_PROFILE:-default}"' in text
+    and 'unsupported TEMPO_LINUX_AGENT_BENCH_PROFILE' in text
+    and 'TEMPO_CDP_BENCH_PLAYWRIGHT_LIFECYCLE_ARGS=1' in text
+    and 'TEMPO_CDP_BENCH_INSERT_TEXT_TYPE=1' in text
+    and 'TEMPO_CDP_BENCH_NO_INCOGNITO=1' in text
+    and 'TEMPO_CDP_BENCH_ENABLE_CACHE=1' in text
+    and 'TEMPO_CDP_BENCH_SUPPRESS_DESKTOP=1' in text
+    and 'TEMPO_CDP_BENCH_CURRENT_THREAD_RUNTIME=1' in text
+    and 'TEMPO_CDP_BENCH_NO_FORCED_COMPOSITOR=1' in text
+    and 'TEMPO_CDP_BENCH_HEADLESS_FLAG=1' in text
+    and '-e "TEMPO_LINUX_AGENT_BENCH_PROFILE=${BENCH_PROFILE}"' in text,
+    'Docker command must support named browser benchmark optimization profiles',
 )
 require(
     'TEMPO_LINUX_AGENT_DOCKER_CACHE_BACKEND' in text
@@ -125,6 +145,20 @@ require(
     'smoke job must enable GitHub Actions Docker layer caching',
 )
 require(
+    'benchmark_profile:' in workflow
+    and 'desktop' in workflow
+    and 'runtime' in workflow
+    and 'no-forced-compositor' in workflow
+    and 'headless-flag' in workflow
+    and 'TEMPO_LINUX_AGENT_BENCH_PROFILE:' in smoke_job
+    and "inputs.benchmark_profile || 'default'" in smoke_job,
+    'smoke job must pass the workflow benchmark profile into the gate',
+)
+require(
+    'TEMPO_CDP_BENCH_CURRENT_THREAD_RUNTIME=1' in text,
+    'Linux agent gate must wire the runtime benchmark profile',
+)
+require(
     'scripts/agent_bench_runners/*.py' in smoke_job
     and 'scripts/requirements-agent-bench.txt' in smoke_job
     and 'scripts/validate-agent-bench-artifacts.py' in smoke_job,
@@ -165,6 +199,11 @@ require(
     'TEMPO_LINUX_AGENT_DOCKER_CACHE_BACKEND: gha' in full_job
     and 'TEMPO_LINUX_AGENT_DOCKER_CACHE_SCOPE:' in full_job,
     'full job must enable GitHub Actions Docker layer caching',
+)
+require(
+    'TEMPO_LINUX_AGENT_BENCH_PROFILE:' in full_job
+    and "inputs.benchmark_profile || 'default'" in full_job,
+    'full job must pass the workflow benchmark profile into the gate',
 )
 require(
     'scripts/agent_bench_runners/*.py' in full_job

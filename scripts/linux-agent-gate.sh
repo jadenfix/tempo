@@ -5,6 +5,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 IMAGE="${TEMPO_LINUX_AGENT_IMAGE:-tempo-linux-agent:rust-1.96.1}"
 MODE="${1:---smoke}"
 ALLOW_UNSAFE_HOST_ENV="${TEMPO_AGENT_BENCH_ALLOW_UNSAFE_HOST_ENV:-}"
+BENCH_PROFILE="${TEMPO_LINUX_AGENT_BENCH_PROFILE:-default}"
 UNSAFE_HOST_ENV_KEYS=(
   ANTHROPIC_API_KEY
   AWS_ACCESS_KEY_ID
@@ -88,6 +89,15 @@ case "$MODE" in
 esac
 
 reject_unsafe_host_env
+
+case "$BENCH_PROFILE" in
+  default | lifecycle | insert-text | no-incognito | cache | desktop | runtime | no-forced-compositor | headless-flag | all) ;;
+  *)
+    echo "unsupported TEMPO_LINUX_AGENT_BENCH_PROFILE: ${BENCH_PROFILE}" >&2
+    echo "supported values: default, lifecycle, insert-text, no-incognito, cache, desktop, runtime, no-forced-compositor, headless-flag, all" >&2
+    exit 2
+    ;;
+esac
 
 if ! command -v docker >/dev/null 2>&1; then
   echo "docker is required for the Linux agent gate" >&2
@@ -209,7 +219,43 @@ COMMON_ENV=(
   -e CARGO_TARGET_DIR=/target
   -e TEMPO_CDP_CHROME_CACHE=/target/chrome-for-testing
   -e TEMPO_CDP_NO_SANDBOX=1
+  -e "TEMPO_LINUX_AGENT_BENCH_PROFILE=${BENCH_PROFILE}"
 )
+
+case "$BENCH_PROFILE" in
+  lifecycle)
+    COMMON_ENV+=(-e TEMPO_CDP_BENCH_PLAYWRIGHT_LIFECYCLE_ARGS=1)
+    ;;
+  insert-text)
+    COMMON_ENV+=(-e TEMPO_CDP_BENCH_INSERT_TEXT_TYPE=1)
+    ;;
+  no-incognito)
+    COMMON_ENV+=(-e TEMPO_CDP_BENCH_NO_INCOGNITO=1)
+    ;;
+  cache)
+    COMMON_ENV+=(-e TEMPO_CDP_BENCH_ENABLE_CACHE=1)
+    ;;
+  desktop)
+    COMMON_ENV+=(-e TEMPO_CDP_BENCH_SUPPRESS_DESKTOP=1)
+    ;;
+  runtime)
+    COMMON_ENV+=(-e TEMPO_CDP_BENCH_CURRENT_THREAD_RUNTIME=1)
+    ;;
+  no-forced-compositor)
+    COMMON_ENV+=(-e TEMPO_CDP_BENCH_NO_FORCED_COMPOSITOR=1)
+    ;;
+  headless-flag)
+    COMMON_ENV+=(-e TEMPO_CDP_BENCH_HEADLESS_FLAG=1)
+    ;;
+  all)
+    COMMON_ENV+=(
+      -e TEMPO_CDP_BENCH_PLAYWRIGHT_LIFECYCLE_ARGS=1
+      -e TEMPO_CDP_BENCH_INSERT_TEXT_TYPE=1
+      -e TEMPO_CDP_BENCH_NO_INCOGNITO=1
+      -e TEMPO_CDP_BENCH_NO_FORCED_COMPOSITOR=1
+    )
+    ;;
+esac
 
 if [[ -n "${TEMPO_LINUX_AGENT_REQUIRE_LIVE_CDP:-}" ]]; then
   COMMON_ENV+=(-e "TEMPO_LINUX_AGENT_REQUIRE_LIVE_CDP=${TEMPO_LINUX_AGENT_REQUIRE_LIVE_CDP}")
@@ -250,7 +296,7 @@ fi
 if [[ "$MODE" == "--full" ]]; then
   INNER_MODE="--full"
   BENCH_MODE="--full"
-  BENCH_EXPECTED_ITERATIONS="5"
+  BENCH_EXPECTED_ITERATIONS="7"
 else
   INNER_MODE="--smoke"
   BENCH_MODE="--smoke"

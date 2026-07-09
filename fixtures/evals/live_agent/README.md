@@ -51,7 +51,8 @@ durable and model-facing observation counts, largest durable observation tokens,
 and agent step count. The stable CDP dashboard fields cover the comparable
 document/frame/listener/node/layout/script/task/heap subset, and any additional
 numeric CDP metrics Chrome returns must be present for every runner/iteration,
-are preserved, and are ranked as `browser_cdp_*` gap categories. The Web
+and are preserved as `browser_cdp_*` row fields until promoted into the stable
+ranked contract. The Web
 Performance contract is a fixed aggregate set: detailed navigation phase
 timings, resource transfer/encoded/decoded bytes, resource duration
 totals/maxes, paint timing, and long-task count/duration/max. Long tasks are

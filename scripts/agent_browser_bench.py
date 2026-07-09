@@ -16,12 +16,15 @@ import sys
 import tempfile
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 from agent_bench_status import STATUS_ARTIFACT, render_status_markdown
 
 
 ROOT = Path(__file__).resolve().parents[1]
+PROC_ROOT = Path(os.environ.get("TEMPO_PROC_ROOT", "/proc"))
+CLK_TCK = os.sysconf(os.sysconf_names["SC_CLK_TCK"]) if "SC_CLK_TCK" in os.sysconf_names else 100
 FIXTURE_DIR = ROOT / "fixtures" / "evals" / "live_agent"
 FIXTURE_HTML = FIXTURE_DIR / "checkout.html"
 FIXTURE_ACTIONS = FIXTURE_DIR / "checkout-actions.json"
@@ -30,6 +33,15 @@ SUITE = "live-agent-browser-bench"
 CASE_ID = "checkout-submit"
 TEMPO_RUNNER = "tempo-cdp-agent"
 RAW_CHROME_RUNNER = "raw-chrome-cdp"
+DEFAULT_RUNNER_ORDER = (
+    "tempo-cdp-agent",
+    "raw-chrome-cdp",
+    "synthetic-playwright-ax",
+    "synthetic-browser-use-dom",
+    "real-playwright",
+    "external-browser-use-dom-loop",
+    "real-browser-use",
+)
 AGENT_STYLE_RUNNERS = {
     "tempo-cdp-agent",
     "synthetic-playwright-ax",
@@ -38,6 +50,7 @@ AGENT_STYLE_RUNNERS = {
     "external-browser-use-dom-loop",
     "real-browser-use",
 }
+TEMPO_RUNTIME_FLAVORS = {"multi-thread", "current-thread"}
 BROWSER_PERFORMANCE_METRIC_NAMES = [
     "Documents",
     "Frames",
@@ -100,6 +113,44 @@ WEB_PERFORMANCE_ROW_FIELDS = {
     "long_task_duration_ms": "web_long_task_duration_ms_p95",
     "long_task_max_duration_ms": "web_long_task_max_duration_ms_p95",
 }
+TEMPO_CDP_OBSERVATION_COUNTER_FIELDS = (
+    "snapshot_since_count",
+    "record_snapshot_count",
+    "ax_full_tree_count",
+    "ax_partial_tree_count",
+    "observe_count",
+    "observe_diff_count",
+    "act_batch_count",
+)
+RANKED_WEB_PERFORMANCE_ROW_FIELDS = (
+    "web_navigation_duration_ms_p95",
+    "web_fetch_start_ms_p95",
+    "web_request_start_ms_p95",
+    "web_response_start_ms_p95",
+    "web_response_end_ms_p95",
+    "web_dom_interactive_ms_p95",
+    "web_dom_content_loaded_start_ms_p95",
+    "web_dom_content_loaded_ms_p95",
+    "web_dom_complete_ms_p95",
+    "web_load_event_start_ms_p95",
+    "web_load_event_ms_p95",
+    "web_resource_duration_ms_p95",
+    "web_resource_max_duration_ms_p95",
+    "web_resource_response_end_ms_p95",
+    "web_first_paint_ms_p95",
+    "web_first_contentful_paint_ms_p95",
+    "web_long_task_count_p95",
+    "web_long_task_duration_ms_p95",
+    "web_long_task_max_duration_ms_p95",
+)
+PROCESS_TREE_COUNTER_FIELDS = (
+    "process_tree_cpu_user_ms",
+    "process_tree_cpu_system_ms",
+    "process_tree_minor_page_faults",
+    "process_tree_major_page_faults",
+    "process_tree_voluntary_context_switches",
+    "process_tree_nonvoluntary_context_switches",
+)
 CHECKOUT_ORACLE_EMAIL = "agent@example.com"
 CHECKOUT_ORACLE_STATUS = "Order submitted"
 ALLOW_UNSAFE_HOST_ENV = "TEMPO_AGENT_BENCH_ALLOW_UNSAFE_HOST_ENV"
@@ -233,9 +284,15 @@ class RssSampler:
         self.peak_pss_by_process_type_bytes: dict[str, int] = {}
         self.peak_uss_by_process_type_bytes: dict[str, int] = {}
         self.rss_peak_elapsed_ms = 0
+        self.max_process_count = 0
+        self.max_process_count_by_type: dict[str, int] = {}
+        self.processes_at_max_count: list[dict[str, object]] = []
         self.process_count_at_peak = 0
         self.process_count_at_peak_by_type: dict[str, int] = {}
         self.processes_at_peak: list[dict[str, object]] = []
+        self._first_process_counters: dict[tuple[int, int | None], dict[str, int]] = {}
+        self._latest_process_counters: dict[tuple[int, int | None], dict[str, int]] = {}
+        self._latest_process_type: dict[tuple[int, int | None], str] = {}
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
 
@@ -255,22 +312,27 @@ class RssSampler:
 
     def sample(self) -> None:
         pids = descendants(self.root_pid)
-        if self.root_pid != os.getpid():
-            pids.add(self.root_pid)
+        pids.add(self.root_pid)
         rss, by_command, by_process_type, process_count_by_type, processes = rss_snapshot(pids)
         process_type_by_pid = {
             int(process["pid"]): str(process["process_type"]) for process in processes
         }
+        self._observe_process_counters(processes)
         pss, uss, pss_by_process_type, uss_by_process_type = pss_uss_snapshot(
             pids,
             process_type_by_pid,
         )
+        process_count = sum(process_count_by_type.values())
+        if process_count > self.max_process_count:
+            self.max_process_count = process_count
+            self.max_process_count_by_type = process_count_by_type
+            self.processes_at_max_count = processes
         if rss > self.max_rss_bytes:
             self.max_rss_bytes = rss
             self.rss_at_peak_by_command_bytes = by_command
             self.rss_at_peak_by_process_type_bytes = by_process_type
             self.rss_peak_elapsed_ms = int((time.monotonic() - self.started) * 1000)
-            self.process_count_at_peak = sum(process_count_by_type.values())
+            self.process_count_at_peak = process_count
             self.process_count_at_peak_by_type = process_count_by_type
             self.processes_at_peak = processes
         for command, command_rss in by_command.items():
@@ -292,8 +354,40 @@ class RssSampler:
             if process_type_uss > self.peak_uss_by_process_type_bytes.get(process_type, 0):
                 self.peak_uss_by_process_type_bytes[process_type] = process_type_uss
 
+    def _observe_process_counters(self, processes: list[dict[str, object]]) -> None:
+        for process in processes:
+            pid = int(process["pid"])
+            starttime = process.get("process_starttime_ticks")
+            identity = (pid, int(starttime) if isinstance(starttime, int) else None)
+            counters = {
+                field: int(process[field])
+                for field in PROCESS_TREE_COUNTER_FIELDS
+                if field in process
+            }
+            if len(counters) != len(PROCESS_TREE_COUNTER_FIELDS):
+                continue
+            self._first_process_counters.setdefault(identity, counters)
+            self._latest_process_counters[identity] = counters
+            self._latest_process_type[identity] = str(process["process_type"])
+
+    def process_counter_deltas(self) -> tuple[dict[str, int], dict[str, dict[str, int]]]:
+        totals = {field: 0 for field in PROCESS_TREE_COUNTER_FIELDS}
+        by_process_type = {field: {} for field in PROCESS_TREE_COUNTER_FIELDS}
+        for identity, latest in self._latest_process_counters.items():
+            first = self._first_process_counters.get(identity, {})
+            process_type = self._latest_process_type.get(identity, "<unknown>")
+            for field in PROCESS_TREE_COUNTER_FIELDS:
+                delta = max(0, int(latest.get(field, 0)) - int(first.get(field, 0)))
+                totals[field] += delta
+                if delta:
+                    field_by_type = by_process_type[field]
+                    field_by_type[process_type] = field_by_type.get(process_type, 0) + delta
+        return totals, by_process_type
+
     def metric_fields(self) -> dict[str, object]:
-        return {
+        fields = {
+            "sampler_root_pid": self.root_pid,
+            "sampler_root_included": True,
             "rss_at_peak_by_command_bytes": dict(
                 sorted(self.rss_at_peak_by_command_bytes.items())
             ),
@@ -321,15 +415,58 @@ class RssSampler:
                 sorted(self.peak_uss_by_process_type_bytes.items())
             ),
             "rss_peak_elapsed_ms": self.rss_peak_elapsed_ms,
+            "max_process_count": self.max_process_count,
+            "max_process_count_by_type": dict(sorted(self.max_process_count_by_type.items())),
+            "processes_at_max_count": self.processes_at_max_count,
             "process_count_at_peak": self.process_count_at_peak,
             "process_count_at_peak_by_type": dict(
                 sorted(self.process_count_at_peak_by_type.items())
             ),
             "processes_at_peak": self.processes_at_peak,
         }
+        if self._latest_process_counters:
+            counter_totals, counter_by_process_type = self.process_counter_deltas()
+            fields.update(counter_totals)
+            fields.update(
+                {
+                    f"{field}_by_process_type": dict(
+                        sorted(counter_by_process_type[field].items())
+                    )
+                    for field in PROCESS_TREE_COUNTER_FIELDS
+                }
+            )
+        return fields
 
 
 def descendants(root_pid: int) -> set[int]:
+    if PROC_ROOT.is_dir():
+        return proc_descendants(root_pid)
+    return subprocess_descendants(root_pid)
+
+
+def proc_descendants(root_pid: int) -> set[int]:
+    children_by_parent: dict[int, list[int]] = {}
+    for status_path in PROC_ROOT.glob("[0-9]*/status"):
+        try:
+            pid = int(status_path.parent.name)
+            fields = proc_status_fields(status_path)
+            ppid = int(fields.get("PPid", "0"))
+        except (OSError, ValueError):
+            continue
+        children_by_parent.setdefault(ppid, []).append(pid)
+
+    found: set[int] = set()
+    pending = [root_pid]
+    while pending:
+        parent = pending.pop()
+        for child in children_by_parent.get(parent, []):
+            if child not in found:
+                found.add(child)
+                pending.append(child)
+    return found
+
+
+def subprocess_descendants(root_pid: int) -> set[int]:
     found: set[int] = set()
     pending = [root_pid]
     while pending:
@@ -366,6 +503,66 @@ def rss_snapshot(
 ) -> tuple[int, dict[str, int], dict[str, int], dict[str, int], list[dict[str, object]]]:
     if not pids:
         return 0, {}, {}, {}, []
+    if PROC_ROOT.is_dir():
+        return proc_rss_snapshot(pids)
+    return subprocess_rss_snapshot(pids)
+
+
+def proc_rss_snapshot(
+    pids: set[int],
+) -> tuple[int, dict[str, int], dict[str, int], dict[str, int], list[dict[str, object]]]:
+    total_bytes = 0
+    by_command: dict[str, int] = {}
+    by_process_type: dict[str, int] = {}
+    process_count_by_type: dict[str, int] = {}
+    processes: list[dict[str, object]] = []
+    for pid in sorted(pids):
+        proc_dir = PROC_ROOT / str(pid)
+        try:
+            fields = proc_status_fields(proc_dir / "status")
+            ppid = int(fields.get("PPid", "0"))
+            rss_kib = int(fields.get("VmRSS", "0 kB").split()[0])
+        except (OSError, ValueError, IndexError):
+            continue
+        if rss_kib <= 0:
+            continue
+        args = proc_cmdline(proc_dir / "cmdline")
+        fallback_command = Path(args.split()[0]).name if args else ""
+        command = proc_comm(proc_dir / "comm") or fallback_command
+        command = Path(command).name or command or "<unknown>"
+        process_type = classify_process_type(command, args)
+        rss_bytes_for_process = rss_kib * 1024
+        proc_counters = proc_stat_counters(proc_dir / "stat")
+        if proc_counters:
+            proc_counters.update(proc_status_context_switches(fields))
+        total_bytes += rss_bytes_for_process
+        by_command[command] = by_command.get(command, 0) + rss_bytes_for_process
+        by_process_type[process_type] = (
+            by_process_type.get(process_type, 0) + rss_bytes_for_process
+        )
+        process_count_by_type[process_type] = process_count_by_type.get(process_type, 0) + 1
+        process = {
+            "pid": pid,
+            "ppid": ppid,
+            "command": command,
+            "process_type": process_type,
+            "rss_bytes": rss_bytes_for_process,
+            "args": truncate_process_args(args),
+        }
+        process.update(proc_counters)
+        processes.append(process)
+    return (
+        total_bytes,
+        dict(sorted(by_command.items())),
+        dict(sorted(by_process_type.items())),
+        dict(sorted(process_count_by_type.items())),
+        sorted(processes, key=lambda process: (str(process["process_type"]), int(process["pid"]))),
+    )
+
+
+def subprocess_rss_snapshot(
+    pids: set[int],
+) -> tuple[int, dict[str, int], dict[str, int], dict[str, int], list[dict[str, object]]]:
     args_by_pid = process_args_by_pid(pids)
     try:
         completed = subprocess.run(
@@ -460,7 +657,7 @@ def pss_uss_snapshot(
 
 
 def smaps_rollup_memory_kib(pid: int) -> tuple[int, int]:
-    path = Path("/proc") / str(pid) / "smaps_rollup"
+    path = PROC_ROOT / str(pid) / "smaps_rollup"
     try:
         lines = path.read_text(errors="ignore").splitlines()
     except OSError:
@@ -489,6 +686,12 @@ def smaps_rollup_memory_kib(pid: int) -> tuple[int, int]:
 
 
 def process_args_by_pid(pids: set[int]) -> dict[int, str]:
+    if PROC_ROOT.is_dir():
+        return {
+            pid: args
+            for pid in pids
+            if (args := proc_cmdline(PROC_ROOT / str(pid) / "cmdline"))
+        }
     try:
         completed = subprocess.run(
             [
@@ -516,6 +719,69 @@ def process_args_by_pid(pids: set[int]) -> dict[int, str]:
             continue
         args_by_pid[pid] = fields[1]
     return args_by_pid
+
+
+def proc_status_fields(path: Path) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    for line in path.read_text(errors="ignore").splitlines():
+        name, sep, value = line.partition(":")
+        if sep:
+            fields[name] = value.strip()
+    return fields
+
+
+def proc_stat_counters(path: Path) -> dict[str, int]:
+    try:
+        data = path.read_text(errors="ignore")
+    except OSError:
+        return {}
+    marker = data.rfind(") ")
+    if marker < 0:
+        return {}
+    fields = data[marker + 2 :].split()
+    try:
+        minor_faults = int(fields[7])
+        major_faults = int(fields[9])
+        user_ticks = int(fields[11])
+        system_ticks = int(fields[12])
+        starttime_ticks = int(fields[19])
+    except (IndexError, ValueError):
+        return {}
+    return {
+        "process_starttime_ticks": starttime_ticks,
+        "process_tree_cpu_user_ms": int(user_ticks * 1000 / CLK_TCK),
+        "process_tree_cpu_system_ms": int(system_ticks * 1000 / CLK_TCK),
+        "process_tree_minor_page_faults": minor_faults,
+        "process_tree_major_page_faults": major_faults,
+    }
+
+
+def proc_status_context_switches(fields: dict[str, str]) -> dict[str, int]:
+    counters = {}
+    for proc_field, metric_field in (
+        ("voluntary_ctxt_switches", "process_tree_voluntary_context_switches"),
+        ("nonvoluntary_ctxt_switches", "process_tree_nonvoluntary_context_switches"),
+    ):
+        try:
+            counters[metric_field] = int(fields.get(proc_field, "0"))
+        except ValueError:
+            counters[metric_field] = 0
+    return counters
+
+
+def proc_cmdline(path: Path) -> str:
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return ""
+    return " ".join(part.decode(errors="replace") for part in data.split(b"\0") if part)
+
+
+def proc_comm(path: Path) -> str:
+    try:
+        return path.read_text(errors="ignore").strip()
+    except OSError:
+        return ""
 
 
 def classify_process_type(command: str, args: str) -> str:
@@ -786,10 +1052,32 @@ def run_tempo(url: str, chrome: str, output_dir: Path) -> dict:
     web_metrics = report.get("web_performance_metrics")
     if not isinstance(web_metrics, dict):
         raise RuntimeError("tempo run report missing web_performance_metrics")
+    cdp_observation_counters = report.get("cdp_observation_counters")
+    if not isinstance(cdp_observation_counters, dict):
+        raise RuntimeError("tempo run report missing cdp_observation_counters")
+    missing_counter_fields = [
+        field
+        for field in TEMPO_CDP_OBSERVATION_COUNTER_FIELDS
+        if field not in cdp_observation_counters
+    ]
+    if missing_counter_fields:
+        raise RuntimeError(
+            "tempo run report cdp_observation_counters missing fields: "
+            f"{missing_counter_fields}"
+        )
+    runtime_flavor = report.get("runtime_flavor")
+    if runtime_flavor not in TEMPO_RUNTIME_FLAVORS:
+        raise RuntimeError(f"tempo run report missing valid runtime_flavor: {runtime_flavor!r}")
     final_oracle = tempo_final_oracle_from_report(report, journal)
     success = (
         report.get("status", {}).get("state") in {"completed", "already_complete"}
         and final_oracle.get("submitted") is True
+    )
+    has_playwright_lifecycle = env.get("TEMPO_CDP_BENCH_PLAYWRIGHT_LIFECYCLE_ARGS") == "1"
+    lifecycle_overrides = (
+        ["BackForwardCache", "PaintHolding", "RenderDocument"]
+        if has_playwright_lifecycle
+        else []
     )
     metric = {
         "runner": "tempo-cdp-agent",
@@ -846,12 +1134,44 @@ def run_tempo(url: str, chrome: str, output_dir: Path) -> dict:
         "tempo_cli": cmd[0],
         "tempo_cli_prebuilt": cmd[0] != "cargo",
         "tempo_engine": str(report.get("engine", "")),
+        "tempo_runtime_flavor": runtime_flavor,
+        "cdp_launch_profile": (
+            "playwright-lifecycle" if has_playwright_lifecycle else "tempo-default"
+        ),
+        "cdp_browser_profile_contract": (
+            "automation-default" if has_playwright_lifecycle else "browser-realistic"
+        ),
+        "cdp_lifecycle_overrides": lifecycle_overrides,
+        "cdp_type_dispatch": (
+            "insert-text" if env.get("TEMPO_CDP_BENCH_INSERT_TEXT_TYPE") == "1" else "key-events"
+        ),
+        "cdp_browser_context": (
+            "fresh-profile"
+            if env.get("TEMPO_CDP_BENCH_NO_INCOGNITO") == "1"
+            else "incognito-context"
+        ),
+        "cdp_browser_cache": (
+            "enabled" if env.get("TEMPO_CDP_BENCH_ENABLE_CACHE") == "1" else "disabled"
+        ),
+        "cdp_desktop_integration": (
+            "suppressed" if env.get("TEMPO_CDP_BENCH_SUPPRESS_DESKTOP") == "1" else "default"
+        ),
+        "cdp_compositor_stages": (
+            "browser-default"
+            if env.get("TEMPO_CDP_BENCH_NO_FORCED_COMPOSITOR") == "1"
+            else "forced-before-draw"
+        ),
+        "cdp_headless_mode": (
+            "headless-flag" if env.get("TEMPO_CDP_BENCH_HEADLESS_FLAG") == "1" else "new-headless"
+        ),
         "tempo_phase_timings_ms": timings,
         "browser_performance_metrics_available": bool(
             report.get("browser_performance_metrics_available")
         ),
         "browser_performance_metrics": browser_metrics,
     }
+    for field in TEMPO_CDP_OBSERVATION_COUNTER_FIELDS:
+        metric[f"cdp_{field}"] = int(cdp_observation_counters[field])
     apply_browser_performance_metrics(metric, browser_metrics)
     apply_web_performance_metrics(
         metric,
@@ -904,36 +1224,25 @@ def apply_browser_performance_metrics(metric: dict, metrics: dict[str, int | flo
             metric[field_name] = metric_value_to_int(source_name, metrics[source_name])
 
 
-def run_cdp_action(cdp: object, action: dict) -> dict:
-    kind = action.get("kind")
-    selector = str(action.get("node", ""))
-    if kind == "type":
-        text = str(action.get("text", ""))
-        expression = """
-            (() => {
-              const selector = __SELECTOR__;
-              const text = __TEXT__;
-              const element = document.querySelector(selector);
-              if (!element) return { applied: false, reason: 'missing selector', selector };
-              element.focus();
-              element.value = text;
-              element.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: text }));
-              element.dispatchEvent(new Event('change', { bubbles: true }));
-              return { applied: true, kind: 'type', selector, text };
-            })()
-        """.replace("__SELECTOR__", json.dumps(selector)).replace("__TEXT__", json.dumps(text))
-    elif kind == "click":
-        expression = """
-            (() => {
-              const selector = __SELECTOR__;
-              const element = document.querySelector(selector);
-              if (!element) return { applied: false, reason: 'missing selector', selector };
-              element.click();
-              return { applied: true, kind: 'click', selector };
-            })()
-        """.replace("__SELECTOR__", json.dumps(selector))
-    else:
-        raise RuntimeError(f"unsupported checkout action: {action}")
+def cdp_element_center(cdp: object, selector: str) -> dict:
+    expression = """
+        (() => {
+          const selector = __SELECTOR__;
+          const element = document.querySelector(selector);
+          if (!element) return { found: false, reason: 'missing selector', selector };
+          element.scrollIntoView({ block: 'center', inline: 'center' });
+          const rect = element.getBoundingClientRect();
+          if (rect.width <= 0 || rect.height <= 0) {
+            return { found: false, reason: 'empty bounding box', selector };
+          }
+          return {
+            found: true,
+            selector,
+            x: Math.round(rect.left + rect.width / 2),
+            y: Math.round(rect.top + rect.height / 2)
+          };
+        })()
+    """.replace("__SELECTOR__", json.dumps(selector))
     result = cdp.send(
         "Runtime.evaluate",
         {
@@ -945,9 +1254,59 @@ def run_cdp_action(cdp: object, action: dict) -> dict:
     if "exceptionDetails" in result:
         raise RuntimeError(f"runtime exception: {result['exceptionDetails']}")
     value = result.get("result", {}).get("value")
-    if not isinstance(value, dict) or value.get("applied") is not True:
-        raise RuntimeError(f"action failed: {value}")
+    if not isinstance(value, dict) or value.get("found") is not True:
+        raise RuntimeError(f"selector failed: {value}")
     return value
+
+
+def cdp_click_at(cdp: object, x: int, y: int) -> None:
+    cdp.send("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": x, "y": y})
+    cdp.send(
+        "Input.dispatchMouseEvent",
+        {
+            "type": "mousePressed",
+            "x": x,
+            "y": y,
+            "button": "left",
+            "clickCount": 1,
+        },
+    )
+    cdp.send(
+        "Input.dispatchMouseEvent",
+        {
+            "type": "mouseReleased",
+            "x": x,
+            "y": y,
+            "button": "left",
+            "clickCount": 1,
+        },
+    )
+
+
+def run_cdp_action(cdp: object, action: dict) -> dict:
+    kind = action.get("kind")
+    selector = str(action.get("node", ""))
+    center = cdp_element_center(cdp, selector)
+    x = int(center["x"])
+    y = int(center["y"])
+    if kind == "type":
+        text = str(action.get("text", ""))
+        cdp_click_at(cdp, x, y)
+        # CDP input-domain text insertion is closer to browser automation than
+        # direct DOM value assignment, but it is still not a keydown/keyup stream.
+        cdp.send("Input.insertText", {"text": text})
+        return {
+            "applied": True,
+            "kind": "type",
+            "selector": selector,
+            "text": text,
+            "x": x,
+            "y": y,
+        }
+    if kind == "click":
+        cdp_click_at(cdp, x, y)
+        return {"applied": True, "kind": "click", "selector": selector, "x": x, "y": y}
+    raise RuntimeError(f"unsupported checkout action: {action}")
 
 
 def browser_use_snapshot_expression() -> str:
@@ -1092,6 +1451,7 @@ def run_cdp_baseline(chrome: str, url: str, runner: str, snapshot: str | None) -
     browser_metrics: dict[str, int | float] = {}
     web_metrics: dict[str, int] = {}
     action_trace: list[dict] = []
+    checkout_actions = load_checkout_actions()
     final_oracle: dict = {"submitted": False, "source": runner}
     success = False
     with RssSampler(os.getpid()) as sampler:
@@ -1126,7 +1486,7 @@ def run_cdp_baseline(chrome: str, url: str, runner: str, snapshot: str | None) -
                             model_input = "\n".join(lines)
                         elif snapshot == "browser_use_dom":
                             model_input = str(page.evaluate(browser_use_snapshot_expression()))
-                        for index, action in enumerate(load_checkout_actions()):
+                        for index, action in enumerate(checkout_actions):
                             action_result = run_cdp_action(cdp, action)
                             action_trace.append(
                                 {
@@ -1161,7 +1521,7 @@ def run_cdp_baseline(chrome: str, url: str, runner: str, snapshot: str | None) -
         "final_oracle": final_oracle,
         "action_trace": action_trace,
         "wall_clock_ms": wall,
-        "step_count": 3,
+        "step_count": len(action_trace),
         "retry_count": 0,
         "failure_mode": failure_mode,
         "model_input_bytes": byte_count,
@@ -1169,6 +1529,7 @@ def run_cdp_baseline(chrome: str, url: str, runner: str, snapshot: str | None) -
         "observations": 1 if snapshot else 0,
         "model_input_observations": 1 if snapshot else 0,
         "adapter": "playwright-cdp-session",
+        "cdp_action_mode": "input-events",
     }
     apply_browser_performance_metrics(metric, browser_metrics)
     apply_web_performance_metrics(metric, web_metrics)
@@ -1427,6 +1788,13 @@ def summarize_metrics(metrics: list[dict]) -> dict:
             summary[runner]["max_model_input_tokens"] = summarize_int_field(
                 runner_metrics, "max_model_input_tokens"
             )
+        for field in PROCESS_TREE_COUNTER_FIELDS:
+            if any(field in metric for metric in runner_metrics):
+                summary[runner][field] = summarize_int_field(runner_metrics, field)
+        for field in TEMPO_CDP_OBSERVATION_COUNTER_FIELDS:
+            metric_field = f"cdp_{field}"
+            if any(metric_field in metric for metric in runner_metrics):
+                summary[runner][metric_field] = summarize_int_field(runner_metrics, metric_field)
     return summary
 
 
@@ -1466,6 +1834,16 @@ def summarize_int_field(metrics: list[dict], field: str) -> dict:
     }
 
 
+def rotate_runner_plan(
+    runner_plan: list[tuple[str, Callable[[], dict]]],
+    iteration: int,
+) -> list[tuple[str, Callable[[], dict]]]:
+    if not runner_plan:
+        return []
+    offset = (iteration - 1) % len(runner_plan)
+    return runner_plan[offset:] + runner_plan[:offset]
+
+
 def benchmark_gap_report(metrics: list[dict], summary: dict) -> dict:
     runners = sorted(summary)
     rows = [
@@ -1485,11 +1863,24 @@ def benchmark_gap_report(metrics: list[dict], summary: dict) -> dict:
         ("steady_state_wall_clock_ms_p95", "lower_is_better", runners),
         ("max_rss_bytes_p95", "lower_is_better", runners),
         ("browser_rss_bytes_p95", "lower_is_better", runners),
+        ("browser_peak_rss_bytes_p95", "lower_is_better", runners),
         ("max_pss_bytes_p95", "lower_is_better", runners),
         ("browser_pss_bytes_p95", "lower_is_better", runners),
+        ("browser_peak_pss_bytes_p95", "lower_is_better", runners),
         ("max_uss_bytes_p95", "lower_is_better", runners),
         ("browser_uss_bytes_p95", "lower_is_better", runners),
-        ("process_count_at_peak_p95", "lower_is_better", runners),
+        ("browser_peak_uss_bytes_p95", "lower_is_better", runners),
+        ("max_process_count_p95", "lower_is_better", runners),
+        ("process_tree_cpu_time_ms_p95", "lower_is_better", runners),
+        ("browser_process_tree_cpu_time_ms_p95", "lower_is_better", runners),
+        ("process_tree_minor_page_faults_p95", "lower_is_better", runners),
+        ("browser_process_tree_minor_page_faults_p95", "lower_is_better", runners),
+        ("process_tree_major_page_faults_p95", "lower_is_better", runners),
+        ("browser_process_tree_major_page_faults_p95", "lower_is_better", runners),
+        ("process_tree_voluntary_context_switches_p95", "lower_is_better", runners),
+        ("browser_process_tree_voluntary_context_switches_p95", "lower_is_better", runners),
+        ("process_tree_nonvoluntary_context_switches_p95", "lower_is_better", runners),
+        ("browser_process_tree_nonvoluntary_context_switches_p95", "lower_is_better", runners),
         ("browser_documents_p95", "lower_is_better", runners),
         ("browser_frames_p95", "lower_is_better", runners),
         ("browser_js_event_listeners_p95", "lower_is_better", runners),
@@ -1506,9 +1897,6 @@ def benchmark_gap_report(metrics: list[dict], summary: dict) -> dict:
         ("web_dom_content_loaded_ms_p95", "lower_is_better", runners),
         ("web_load_event_ms_p95", "lower_is_better", runners),
         ("web_response_end_ms_p95", "lower_is_better", runners),
-        ("web_resource_count_p95", "lower_is_better", runners),
-        ("web_resource_transfer_size_bytes_p95", "lower_is_better", runners),
-        ("web_resource_decoded_body_size_bytes_p95", "lower_is_better", runners),
         ("web_first_paint_ms_p95", "lower_is_better", runners),
         ("web_first_contentful_paint_ms_p95", "lower_is_better", runners),
         ("web_long_task_count_p95", "lower_is_better", runners),
@@ -1550,15 +1938,9 @@ def benchmark_gap_report(metrics: list[dict], summary: dict) -> dict:
             "lower_is_better",
             sorted(runner for runner in runners if runner in AGENT_STYLE_RUNNERS),
         ),
-        ("cpu_time_ms_p95", "lower_is_better", runners),
     ]
-    ranked_browser_fields = set(BROWSER_PERFORMANCE_ROW_FIELDS.values())
-    for metric_name in browser_performance_metric_names(metrics):
-        field_name = browser_performance_metric_row_field(metric_name)
-        if field_name not in ranked_browser_fields:
-            category_specs.append((field_name, "lower_is_better", runners))
     ranked_category_fields = {name for name, _direction, _runners in category_specs}
-    for field_name in WEB_PERFORMANCE_ROW_FIELDS.values():
+    for field_name in RANKED_WEB_PERFORMANCE_ROW_FIELDS:
         if field_name not in ranked_category_fields:
             category_specs.append((field_name, "lower_is_better", runners))
             ranked_category_fields.add(field_name)
@@ -1636,24 +2018,58 @@ def benchmark_gap_report(metrics: list[dict], summary: dict) -> dict:
                     "delta_to_match": comparison_delta(tempo_value, best_value, direction),
                 }
             )
+    comparison_notes = [
+        "raw-chrome-cdp is excluded from observation-token and agent-step categories because it has no model-facing observation stream.",
+        "raw/synthetic CDP baselines dispatch Chrome input events for checkout actions; they do not mutate form state through direct DOM assignment.",
+        "model_input_tokens_p95 ranks the full model-facing stream each runner presents to an agent; compact_observation_tokens_p95 ranks the largest compact observation projection per run.",
+        "max_observation_tokens_p95 keeps Tempo's full durable structured audit JSON cost visible and is intentionally separate from compact model-facing projections.",
+        "max_observation_tokens_p95 compares the largest single durable observation per run; total_model_input_tokens_p95 ranks the cumulative model-facing stream where runners expose it.",
+        "cpu_time_ms_p95 is row-level only until every runner uses the same resource-accounting scope.",
+        "cold_start_wall_clock_ms reports iteration 1; steady_state_wall_clock_ms_p95 ranks iteration 2+ only and is omitted for one-iteration smoke artifacts.",
+    ]
+    if any("runner_order" in metric for metric in metrics):
+        comparison_notes.append(
+            "Benchmark runner order rotates per iteration to reduce deterministic warm-cache/order bias; each metric row records runner_order and runner_order_index."
+        )
+    if any(metric.get("sampler_root_included") is True for metric in metrics):
+        comparison_notes.append(
+            "Process-tree memory/process metrics include each runner root process and its descendants; rows record sampler_root_included so subprocess and in-process lanes expose their accounting scope."
+        )
+    if any(
+        metric.get("cdp_browser_profile_contract") == "automation-default"
+        for metric in metrics
+    ):
+        comparison_notes.append(
+            "Tempo rows marked cdp_browser_profile_contract=automation-default use Playwright-style lifecycle overrides and must not be presented as stock Chrome lifecycle performance."
+        )
+    if any(metric.get("cdp_compositor_stages") == "browser-default" for metric in metrics):
+        comparison_notes.append(
+            "Tempo rows marked cdp_compositor_stages=browser-default omit Tempo's historical --run-all-compositor-stages-before-draw launch arg; compare layout/paint metrics before considering a default change."
+        )
+    if any(
+        any(field in metric for field in PROCESS_TREE_COUNTER_FIELDS)
+        for metric in metrics
+    ):
+        comparison_notes.append(
+            "process_tree_* categories come from Linux /proc first-seen to latest-seen deltas across each runner root process and descendants; browser_process_tree_* sums only Chrome process types."
+        )
+    comparison_notes.extend(
+        [
+            "CDP Performance.getMetrics fields are required and ranked for every runner in this CDP-backed benchmark.",
+            "Known CDP runtime fields use stable browser_* category names; any additional numeric Performance.getMetrics values are preserved as browser_cdp_* row fields but not ranked until promoted to the stable contract.",
+            "web_* categories come from the browser Performance Timeline APIs and are required for every runner, including Tempo.",
+            "Web resource count and byte fields are preserved as parity/integrity metrics, not ranked lower-is-better optimization categories.",
+            "browser_rss_bytes_p95/browser_pss_bytes_p95/browser_uss_bytes_p95 report Chrome memory at the process-tree RSS/PSS/USS peak; browser_peak_* fields report Chrome process-type peaks even when they occur at a different sample.",
+            "Positive deltas mean Tempo is behind that comparison target; negative deltas mean Tempo is ahead.",
+        ]
+    )
     return {
         "suite": SUITE,
         "case_id": CASE_ID,
         "tempo_runner": TEMPO_RUNNER,
         "baseline_runner": RAW_CHROME_RUNNER,
         "agent_style_runners": sorted(AGENT_STYLE_RUNNERS),
-        "comparison_notes": [
-            "raw-chrome-cdp is excluded from observation-token and agent-step categories because it has no model-facing observation stream.",
-            "model_input_tokens_p95 ranks the full model-facing stream each runner presents to an agent; compact_observation_tokens_p95 ranks the largest compact observation projection per run.",
-            "max_observation_tokens_p95 keeps Tempo's full durable structured audit JSON cost visible and is intentionally separate from compact model-facing projections.",
-            "max_observation_tokens_p95 compares the largest single durable observation per run; total_model_input_tokens_p95 ranks the cumulative model-facing stream where runners expose it.",
-            "cpu_time_ms_p95 is row-level only until every runner uses the same resource-accounting scope.",
-            "cold_start_wall_clock_ms reports iteration 1; steady_state_wall_clock_ms_p95 ranks iteration 2+ only and is omitted for one-iteration smoke artifacts.",
-            "CDP Performance.getMetrics fields are required and ranked for every runner in this CDP-backed benchmark.",
-            "Known CDP runtime fields use stable browser_* category names; any additional numeric Performance.getMetrics values are preserved and ranked as browser_cdp_* categories.",
-            "web_* categories come from the browser Performance Timeline APIs and are required for every runner, including Tempo.",
-            "Positive deltas mean Tempo is behind that comparison target; negative deltas mean Tempo is ahead.",
-        ],
+        "comparison_notes": comparison_notes,
         "rows": rows,
         "categories": categories,
         "gaps_to_close": gaps_to_close,
@@ -1661,7 +2077,7 @@ def benchmark_gap_report(metrics: list[dict], summary: dict) -> dict:
 
 
 def comparison_row(runner: str, runner_summary: dict, runner_metrics: list[dict]) -> dict:
-    return {
+    row = {
         "runner": runner,
         "runs": int(runner_summary["runs"]),
         "success_rate": float(runner_summary["success_rate"]),
@@ -1743,6 +2159,13 @@ def comparison_row(runner: str, runner_summary: dict, runner_metrics: list[dict]
             [browser_rss_bytes(metric) for metric in runner_metrics],
             0.95,
         ),
+        "browser_peak_rss_bytes_p95": percentile(
+            [
+                browser_memory_bytes(metric, "peak_rss_by_process_type_bytes")
+                for metric in runner_metrics
+            ],
+            0.95,
+        ),
         "max_pss_bytes_p95": optional_metric_percentile(
             runner_metrics,
             "max_pss_bytes",
@@ -1751,6 +2174,13 @@ def comparison_row(runner: str, runner_summary: dict, runner_metrics: list[dict]
         "browser_pss_bytes_p95": optional_percentile(
             [
                 browser_memory_bytes(metric, "pss_at_peak_by_process_type_bytes")
+                for metric in runner_metrics
+            ],
+            0.95,
+        ),
+        "browser_peak_pss_bytes_p95": optional_percentile(
+            [
+                browser_memory_bytes(metric, "peak_pss_by_process_type_bytes")
                 for metric in runner_metrics
             ],
             0.95,
@@ -1767,9 +2197,63 @@ def comparison_row(runner: str, runner_summary: dict, runner_metrics: list[dict]
             ],
             0.95,
         ),
+        "browser_peak_uss_bytes_p95": optional_percentile(
+            [
+                browser_memory_bytes(metric, "peak_uss_by_process_type_bytes")
+                for metric in runner_metrics
+            ],
+            0.95,
+        ),
         "process_count_at_peak_p95": percentile(
             [int(metric.get("process_count_at_peak", 0)) for metric in runner_metrics],
             0.95,
+        ),
+        "max_process_count_p95": percentile(
+            [
+                int(metric.get("max_process_count", metric.get("process_count_at_peak", 0)))
+                for metric in runner_metrics
+            ],
+            0.95,
+        ),
+        "process_tree_cpu_time_ms_p95": process_tree_cpu_time_ms_p95(runner_metrics),
+        "browser_process_tree_cpu_time_ms_p95": browser_process_tree_cpu_time_ms_p95(
+            runner_metrics
+        ),
+        "process_tree_minor_page_faults_p95": optional_metric_percentile(
+            runner_metrics,
+            "process_tree_minor_page_faults",
+            0.95,
+        ),
+        "browser_process_tree_minor_page_faults_p95": browser_process_counter_p95(
+            runner_metrics,
+            "process_tree_minor_page_faults_by_process_type",
+        ),
+        "process_tree_major_page_faults_p95": optional_metric_percentile(
+            runner_metrics,
+            "process_tree_major_page_faults",
+            0.95,
+        ),
+        "browser_process_tree_major_page_faults_p95": browser_process_counter_p95(
+            runner_metrics,
+            "process_tree_major_page_faults_by_process_type",
+        ),
+        "process_tree_voluntary_context_switches_p95": optional_metric_percentile(
+            runner_metrics,
+            "process_tree_voluntary_context_switches",
+            0.95,
+        ),
+        "browser_process_tree_voluntary_context_switches_p95": browser_process_counter_p95(
+            runner_metrics,
+            "process_tree_voluntary_context_switches_by_process_type",
+        ),
+        "process_tree_nonvoluntary_context_switches_p95": optional_metric_percentile(
+            runner_metrics,
+            "process_tree_nonvoluntary_context_switches",
+            0.95,
+        ),
+        "browser_process_tree_nonvoluntary_context_switches_p95": browser_process_counter_p95(
+            runner_metrics,
+            "process_tree_nonvoluntary_context_switches_by_process_type",
         ),
         "web_performance_metrics_available": all(
             bool(metric.get("web_performance_metrics_available"))
@@ -1815,6 +2299,36 @@ def comparison_row(runner: str, runner_summary: dict, runner_metrics: list[dict]
         "model_input_observations_p95": int(runner_summary["model_input_observations"]["p95"]),
         "step_count_p95": int(runner_summary["step_count"]["p95"]),
     }
+    first_metric = runner_metrics[0] if runner_metrics else {}
+    for field in (
+        "process_tree_cpu_time_ms_p95",
+        "browser_process_tree_cpu_time_ms_p95",
+        "process_tree_minor_page_faults_p95",
+        "browser_process_tree_minor_page_faults_p95",
+        "process_tree_major_page_faults_p95",
+        "browser_process_tree_major_page_faults_p95",
+        "process_tree_voluntary_context_switches_p95",
+        "browser_process_tree_voluntary_context_switches_p95",
+        "process_tree_nonvoluntary_context_switches_p95",
+        "browser_process_tree_nonvoluntary_context_switches_p95",
+    ):
+        if row.get(field) is None:
+            row.pop(field, None)
+    if "cdp_browser_profile_contract" in first_metric:
+        for field in (
+            "cdp_browser_profile_contract",
+            "cdp_launch_profile",
+            "cdp_lifecycle_overrides",
+            "cdp_type_dispatch",
+            "cdp_browser_context",
+            "cdp_browser_cache",
+            "cdp_desktop_integration",
+            "cdp_compositor_stages",
+            "cdp_headless_mode",
+        ):
+            if field in first_metric:
+                row[field] = first_metric[field]
+    return row
 
 
 def cold_start_wall_clock_ms(runner_metrics: list[dict]) -> int | None:
@@ -1848,6 +2362,59 @@ def runner_internal_wall_clock_ms_p95(runner_metrics: list[dict]) -> int | None:
         else:
             values.append(int(metric["wall_clock_ms"]))
     return percentile(values, 0.95) if values else None
+
+
+def process_tree_cpu_time_ms_p95(runner_metrics: list[dict]) -> int | None:
+    values = []
+    for metric in runner_metrics:
+        if (
+            "process_tree_cpu_user_ms" not in metric
+            or "process_tree_cpu_system_ms" not in metric
+        ):
+            return None
+        values.append(
+            int(metric["process_tree_cpu_user_ms"])
+            + int(metric["process_tree_cpu_system_ms"])
+        )
+    return percentile(values, 0.95) if values else None
+
+
+def browser_process_tree_cpu_time_ms_p95(runner_metrics: list[dict]) -> int | None:
+    values = []
+    for metric in runner_metrics:
+        user = browser_process_counter(
+            metric,
+            "process_tree_cpu_user_ms_by_process_type",
+        )
+        system = browser_process_counter(
+            metric,
+            "process_tree_cpu_system_ms_by_process_type",
+        )
+        if user is None or system is None:
+            return None
+        values.append(user + system)
+    return percentile(values, 0.95) if values else None
+
+
+def browser_process_counter_p95(runner_metrics: list[dict], field: str) -> int | None:
+    values = []
+    for metric in runner_metrics:
+        value = browser_process_counter(metric, field)
+        if value is None:
+            return None
+        values.append(value)
+    return percentile(values, 0.95) if values else None
+
+
+def browser_process_counter(metric: dict, field: str) -> int | None:
+    by_type = metric.get(field)
+    if not isinstance(by_type, dict):
+        return None
+    return sum(
+        int(value)
+        for key, value in by_type.items()
+        if isinstance(key, str) and (key == "chrome-browser" or key.startswith("chrome-"))
+    )
 
 
 def browser_rss_bytes(metric: dict) -> int:
@@ -2094,7 +2661,10 @@ def main() -> int:
         "--iterations",
         type=int,
         default=None,
-        help="number of benchmark iterations; defaults to 1 for smoke and 5 for --full",
+        help=(
+            "number of benchmark iterations; defaults to 1 for smoke and one "
+            "complete runner-order cycle for --full"
+        ),
     )
     parser.add_argument("--min-success-rate", type=float, default=None)
     parser.add_argument("--max-p95-wall-ms", type=int, default=None)
@@ -2112,7 +2682,11 @@ def main() -> int:
     output_dir = Path(args.output_dir)
     assert_safe_output_dir(output_dir)
     clean_output_dir(output_dir)
-    iterations = args.iterations if args.iterations is not None else (5 if args.full else 1)
+    iterations = (
+        args.iterations
+        if args.iterations is not None
+        else (len(DEFAULT_RUNNER_ORDER) if args.full else 1)
+    )
     if iterations < 1:
         raise RuntimeError("--iterations must be >= 1")
     resolved_chrome_version = chrome_version(args.chrome)
@@ -2120,43 +2694,82 @@ def main() -> int:
     with StaticServer(FIXTURE_DIR) as server:
         url = f"{server.base_url}/checkout.html"
         metrics = []
+        runner_orders: dict[str, list[str]] = {}
         for iteration in range(1, iterations + 1):
             iteration_dir = output_dir if iterations == 1 else output_dir / f"iteration-{iteration:03d}"
             clean_output_dir(iteration_dir)
-            iteration_metrics = [
-                run_tempo(url, args.chrome, iteration_dir),
-                run_cdp_baseline(args.chrome, url, "raw-chrome-cdp", None),
-                run_cdp_baseline(args.chrome, url, "synthetic-playwright-ax", "ax"),
-                run_cdp_baseline(args.chrome, url, "synthetic-browser-use-dom", "browser_use_dom"),
-                run_external_baseline(
-                    args.chrome,
-                    url,
+            runner_plan: list[tuple[str, Callable[[], dict]]] = [
+                ("tempo-cdp-agent", lambda: run_tempo(url, args.chrome, iteration_dir)),
+                ("raw-chrome-cdp", lambda: run_cdp_baseline(args.chrome, url, "raw-chrome-cdp", None)),
+                (
+                    "synthetic-playwright-ax",
+                    lambda: run_cdp_baseline(args.chrome, url, "synthetic-playwright-ax", "ax"),
+                ),
+                (
+                    "synthetic-browser-use-dom",
+                    lambda: run_cdp_baseline(
+                        args.chrome,
+                        url,
+                        "synthetic-browser-use-dom",
+                        "browser_use_dom",
+                    ),
+                ),
+                (
                     "real-playwright",
-                    "playwright_checkout.py",
-                    iteration_dir,
+                    lambda: run_external_baseline(
+                        args.chrome,
+                        url,
+                        "real-playwright",
+                        "playwright_checkout.py",
+                        iteration_dir,
+                    ),
                 ),
-                run_external_baseline(
-                    args.chrome,
-                    url,
+                (
                     "external-browser-use-dom-loop",
-                    "browser_use_dom_loop.py",
-                    iteration_dir,
+                    lambda: run_external_baseline(
+                        args.chrome,
+                        url,
+                        "external-browser-use-dom-loop",
+                        "browser_use_dom_loop.py",
+                        iteration_dir,
+                    ),
                 ),
-                run_external_baseline(
-                    args.chrome,
-                    url,
+                (
                     "real-browser-use",
-                    "browser_use_package.py",
-                    iteration_dir,
+                    lambda: run_external_baseline(
+                        args.chrome,
+                        url,
+                        "real-browser-use",
+                        "browser_use_package.py",
+                        iteration_dir,
+                    ),
                 ),
             ]
-            for metric in iteration_metrics:
+            if tuple(runner for runner, _run in runner_plan) != DEFAULT_RUNNER_ORDER:
+                raise RuntimeError("runner plan order does not match DEFAULT_RUNNER_ORDER")
+            ordered_runner_plan = rotate_runner_plan(runner_plan, iteration)
+            runner_order = [runner for runner, _run in ordered_runner_plan]
+            runner_orders[str(iteration)] = runner_order
+            iteration_metrics = []
+            for runner_order_index, (expected_runner, run_runner) in enumerate(
+                ordered_runner_plan,
+                start=1,
+            ):
+                metric = run_runner()
+                if metric.get("runner") != expected_runner:
+                    raise RuntimeError(
+                        f"runner plan expected {expected_runner}, got {metric.get('runner')}"
+                    )
                 metric["iteration"] = iteration
+                metric["runner_order"] = runner_order
+                metric["runner_order_index"] = runner_order_index
+                iteration_metrics.append(metric)
             write_json(
                 iteration_dir / "agent-browser-bench.json",
                 {
                     "url": url,
                     "iteration": iteration,
+                    "runner_order": runner_order,
                     "chrome": args.chrome,
                     "chrome_version": resolved_chrome_version,
                     "metrics": iteration_metrics,
@@ -2172,6 +2785,7 @@ def main() -> int:
             "iterations": iterations,
             "chrome": args.chrome,
             "chrome_version": resolved_chrome_version,
+            "runner_orders": runner_orders,
             "metrics": metrics,
             "summary": summary,
         }

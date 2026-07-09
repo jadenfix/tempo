@@ -8,7 +8,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use tempo_act::{execute_action, execute_batch, ExecutionStatus};
+use tempo_act::{
+    execute_action, execute_action_since, execute_batch, execute_batch_since, ExecutionStatus,
+};
 use tempo_driver::{DriverTrait, Engine, StepOutcome, TransportError};
 use tempo_handshake::{probe_http_origin, LaneDecision, ProbeHit};
 pub use tempo_handshake::{HttpProbeConfig, Lane as StructuredLane, StructuredSignal};
@@ -891,6 +893,7 @@ impl AgentRunner {
         }
 
         let mut current_origin;
+        let mut current_observation_seq;
         if !has_session_started(&initial_entries) {
             if let Some(decision) = self.structured_fast_path.probe_target(&task.start_url)
                 && decision.skips_render()
@@ -906,6 +909,7 @@ impl AgentRunner {
                 .goto(&task.start_url)
                 .await
                 .map_err(|source| journal_transport_error(&mut agent, "initial goto", source))?;
+            current_observation_seq = Some(observation.seq);
             current_origin = self.origin_for_url("initial observation", &observation.url)?;
             agent.record_session_started(task.start_url.clone())?;
             self.record_observation(
@@ -919,6 +923,7 @@ impl AgentRunner {
                 .observe()
                 .await
                 .map_err(|source| journal_transport_error(&mut agent, "resume observe", source))?;
+            current_observation_seq = Some(observation.seq);
             current_origin = self.origin_for_url("resume observation", &observation.url)?;
             self.record_observation(
                 &mut agent,
@@ -1007,17 +1012,32 @@ impl AgentRunner {
             agent.plan_next_step()?;
 
             let execution = match &compiled_skill {
-                Some(skill) => execute_batch(driver, &skill.batch)
-                    .await
-                    .map_err(|source| {
-                        journal_transport_error(&mut agent, "execute skill", source)
-                    })?,
-                None => execute_action(driver, &planned.action)
-                    .await
-                    .map_err(|source| {
-                        journal_transport_error(&mut agent, "execute action", source)
-                    })?,
+                Some(skill) => match current_observation_seq {
+                    Some(base_seq) => execute_batch_since(driver, &skill.batch, base_seq)
+                        .await
+                        .map_err(|source| {
+                            journal_transport_error(&mut agent, "execute skill", source)
+                        })?,
+                    None => execute_batch(driver, &skill.batch)
+                        .await
+                        .map_err(|source| {
+                            journal_transport_error(&mut agent, "execute skill", source)
+                        })?,
+                },
+                None => match current_observation_seq {
+                    Some(base_seq) => execute_action_since(driver, &planned.action, base_seq)
+                        .await
+                        .map_err(|source| {
+                            journal_transport_error(&mut agent, "execute action", source)
+                        })?,
+                    None => execute_action(driver, &planned.action)
+                        .await
+                        .map_err(|source| {
+                            journal_transport_error(&mut agent, "execute action", source)
+                        })?,
+                },
             };
+            current_observation_seq = Some(execution.seq);
             // A batch StepError still fails the step. `PartiallyApplied` is a
             // StepError whose earlier actions already grounded — it must fail
             // the step exactly like a plain StepError (never a replayable no-op).
@@ -1457,6 +1477,14 @@ impl AgentRunner {
     {
         if !side_effects_may_have_occurred {
             return Ok((current_origin.cloned(), None));
+        }
+
+        if !matches!(action, Action::Goto { .. })
+            && let Ok(Some(url)) = driver.current_url().await
+        {
+            return self
+                .origin_for_url("post-action current URL", &url)
+                .map(|origin| (origin, None));
         }
 
         if !matches!(action, Action::Goto { .. })
@@ -2992,9 +3020,60 @@ mod tests {
         assert_eq!(report.observations, 1);
         assert_eq!(report.steps[0].observation_budget, None);
         assert_eq!(
-            driver.observe_calls, 1,
-            "execute_action should still ground from a pre-action observe, but the runner should not issue a redundant post-action full observe"
+            driver.observe_calls, 0,
+            "the runner should execute from the current observation seq without issuing a redundant full observe"
         );
+        assert_eq!(driver.current_url_calls, 1);
+        assert_eq!(
+            driver.evaluate_script_calls, 0,
+            "the runner should use the direct current_url primitive when available"
+        );
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runner_reuses_current_observation_seq_across_plain_actions() -> TestResult {
+        let root = unique_dir("runner-action-since-current-seq")?;
+        remove_dir_if_exists(&root)?;
+        fs::create_dir_all(&root)?;
+        let journal_path = root.join("session.jsonl");
+        let task = DriverTask::new(
+            "https://example.com",
+            vec![
+                Action::Click {
+                    node: NodeId("submit".into()),
+                },
+                Action::Click {
+                    node: NodeId("submit".into()),
+                },
+                Action::Click {
+                    node: NodeId("submit".into()),
+                },
+            ],
+        );
+        let mut driver =
+            FailingDriver::new(TransportFailurePoint::None).with_elements(vec![button("submit")]);
+        let runner = AgentRunner::new_plaintext_unsafe(
+            &journal_path,
+            AgentRunIds::new(
+                "run-action-since-current-seq",
+                "session-action-since-current-seq",
+            ),
+        );
+
+        let report = runner.run_driver_task(&mut driver, &task).await?;
+
+        assert_eq!(report.status, AgentRunStatus::Completed);
+        assert_eq!(report.actions_completed, 3);
+        assert_eq!(driver.act_calls, 3);
+        assert_eq!(driver.observe_calls, 0);
+        assert_eq!(report.observations, 1);
+        assert!(report
+            .steps
+            .iter()
+            .all(|step| step.observation_budget.is_none()));
 
         remove_dir_if_exists(&root)?;
         Ok(())
@@ -3040,8 +3119,13 @@ mod tests {
             "the second click should be denied before driver execution"
         );
         assert_eq!(
-            driver.observe_calls, 1,
-            "origin refresh should use window.location.href without a redundant full observe"
+            driver.observe_calls, 0,
+            "origin refresh should use direct current_url without a redundant full observe"
+        );
+        assert_eq!(driver.current_url_calls, 1);
+        assert_eq!(
+            driver.evaluate_script_calls, 0,
+            "origin refresh should not evaluate JavaScript when direct current_url is available"
         );
         assert_eq!(report.steps[0].observation_budget, None);
         assert_eq!(
@@ -3086,8 +3170,13 @@ mod tests {
         assert_eq!(report.model_input_observations, 1);
         assert!(report.steps[0].observation_budget.is_some());
         assert_eq!(
-            driver.observe_calls, 2,
-            "execute_action performs one pre-action observe and the fallback records one post-action observe"
+            driver.observe_calls, 1,
+            "the fallback records one post-action observe without a redundant pre-action observe"
+        );
+        assert_eq!(driver.current_url_calls, 1);
+        assert_eq!(
+            driver.evaluate_script_calls, 1,
+            "location-script fallback should run before the audit observation"
         );
         let entries = read_journal_entries(&journal_path)?;
         let observation_events = entries
@@ -3517,7 +3606,8 @@ mod tests {
             }],
         );
         let mut driver = FailingDriver::new(TransportFailurePoint::PostActionObserve)
-            .with_elements(vec![button("submit")]);
+            .with_elements(vec![button("submit")])
+            .with_current_location_unavailable();
         let runner = AgentRunner::new_plaintext_unsafe(
             &journal_path,
             AgentRunIds::new(
@@ -3596,6 +3686,46 @@ mod tests {
             &entry.event,
             JournalEvent::StepApplied { action, .. } if action == &skill_action
         )));
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runner_reuses_current_observation_seq_for_skill_batches() -> TestResult {
+        let root = unique_dir("runner-skill-batch-since-current-seq")?;
+        remove_dir_if_exists(&root)?;
+        fs::create_dir_all(&root)?;
+        let skills_root = root.join("skills");
+        let store = SkillStore::open(&skills_root)?;
+        store.put(&click_skill("click_saved_target", "1"))?;
+        let journal_path = root.join("session.jsonl");
+        let skill_action = Action::Skill {
+            name: "click_saved_target".into(),
+            input: serde_json::json!({"target": "submit"}),
+        };
+        let task = DriverTask::new("https://example.com", vec![skill_action]);
+        let mut driver =
+            FailingDriver::new(TransportFailurePoint::None).with_elements(vec![button("submit")]);
+        let runner = AgentRunner::new_plaintext_unsafe(
+            &journal_path,
+            AgentRunIds::new(
+                "run-skill-batch-since-current-seq",
+                "session-skill-batch-since-current-seq",
+            ),
+        )
+        .with_skill_store(&skills_root);
+
+        let report = runner.run_driver_task(&mut driver, &task).await?;
+
+        assert_eq!(report.status, AgentRunStatus::Completed);
+        assert_eq!(report.actions_completed, 1);
+        assert_eq!(driver.act_calls, 1);
+        assert_eq!(
+            driver.observe_calls, 0,
+            "skill batches should execute from the current observation seq without a redundant full observe"
+        );
+        assert_eq!(report.observations, 1);
 
         remove_dir_if_exists(&root)?;
         Ok(())
@@ -5076,6 +5206,8 @@ mod tests {
         goto_calls: usize,
         observe_calls: usize,
         act_calls: usize,
+        current_url_calls: usize,
+        evaluate_script_calls: usize,
     }
 
     impl FailingDriver {
@@ -5088,6 +5220,8 @@ mod tests {
                 goto_calls: 0,
                 observe_calls: 0,
                 act_calls: 0,
+                current_url_calls: 0,
+                evaluate_script_calls: 0,
             }
         }
 
@@ -5123,7 +5257,7 @@ mod tests {
 
         async fn observe(&mut self) -> Result<CompiledObservation, TransportError> {
             self.observe_calls += 1;
-            if self.failure == TransportFailurePoint::PostActionObserve && self.observe_calls == 2 {
+            if self.failure == TransportFailurePoint::PostActionObserve && self.act_calls > 0 {
                 return Err(TransportError::EngineGone);
             }
             self.inner.observe().await
@@ -5172,11 +5306,20 @@ mod tests {
             self.inner.extract(node).await
         }
 
+        async fn current_url(&mut self) -> Result<Option<String>, TransportError> {
+            self.current_url_calls += 1;
+            if !self.current_location_available {
+                return Ok(None);
+            }
+            self.inner.current_url().await
+        }
+
         async fn evaluate_script(
             &mut self,
             expression: &str,
             await_promise: bool,
         ) -> Result<serde_json::Value, TransportError> {
+            self.evaluate_script_calls += 1;
             if self.failure == TransportFailurePoint::PostActionObserve
                 || !self.current_location_available
             {

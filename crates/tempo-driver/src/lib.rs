@@ -128,6 +128,13 @@ pub trait DriverTrait: Send + Sync {
     /// Typed extraction of a subtree rooted at `node`.
     async fn extract(&mut self, node: &NodeId) -> Result<serde_json::Value, TransportError>;
 
+    /// Return the active browsing context URL when the engine can expose it
+    /// directly. Engines that do not have a cheap primitive return `None` and
+    /// callers may fall back to JavaScript evaluation or a full observation.
+    async fn current_url(&mut self) -> Result<Option<String>, TransportError> {
+        Ok(None)
+    }
+
     /// Evaluate a JavaScript expression in the active browsing context.
     async fn evaluate_script(
         &mut self,
@@ -328,6 +335,10 @@ impl DriverTrait for TestDriver {
             return Ok(serde_json::Value::Null);
         }
         Ok(serde_json::json!({ "node": node.0 }))
+    }
+
+    async fn current_url(&mut self) -> Result<Option<String>, TransportError> {
+        Ok(Some(self.url.clone()))
     }
 
     async fn evaluate_script(
@@ -570,6 +581,18 @@ mod tests {
 
         assert!(bytes.starts_with(PNG_SIGNATURE));
         assert!(bytes.len() > PNG_SIGNATURE.len());
+        Ok(())
+    }
+
+    #[test]
+    fn test_driver_reports_current_url() -> Result<(), String> {
+        let mut driver = TestDriver::new();
+        futures::executor::block_on(driver.goto("https://example.com"))
+            .map_err(|e| e.to_string())?;
+        let current_url =
+            futures::executor::block_on(driver.current_url()).map_err(|e| e.to_string())?;
+
+        assert_eq!(current_url.as_deref(), Some("https://example.com"));
         Ok(())
     }
 

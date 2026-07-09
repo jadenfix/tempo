@@ -19,6 +19,7 @@ use chromiumoxide::cdp::browser_protocol::fetch::{
     ContinueRequestParams, EnableParams as FetchEnableParams, EventRequestPaused,
     FailRequestParams, RequestPattern, RequestStage,
 };
+use chromiumoxide::cdp::browser_protocol::input::InsertTextParams;
 use chromiumoxide::cdp::browser_protocol::network::ErrorReason;
 use chromiumoxide::cdp::browser_protocol::page::{
     CaptureScreenshotParams, CreateIsolatedWorldParams, NavigateParams,
@@ -30,7 +31,7 @@ use chromiumoxide::cdp::js_protocol::runtime::{
 use chromiumoxide::error::CdpError;
 use chromiumoxide::page::Page;
 use futures::{future::join_all, StreamExt};
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -96,6 +97,46 @@ const TIMED_OUT_NAVIGATION_RECOVERY_INTERVAL: Duration = Duration::from_millis(5
 
 /// Explicit opt-out for Chromium sandboxing in constrained CI/container setups.
 pub const TEMPO_CDP_NO_SANDBOX_ENV: &str = "TEMPO_CDP_NO_SANDBOX";
+/// Benchmark-only Chrome lifecycle profile used to compare Tempo against
+/// Playwright baselines with matching BFCache/RenderDocument behavior.
+pub const TEMPO_CDP_BENCH_PLAYWRIGHT_LIFECYCLE_ARGS_ENV: &str =
+    "TEMPO_CDP_BENCH_PLAYWRIGHT_LIFECYCLE_ARGS";
+/// Benchmark-only text dispatch profile that uses CDP `Input.insertText`
+/// instead of per-character key events for semantic Type actions.
+pub const TEMPO_CDP_BENCH_INSERT_TEXT_TYPE_ENV: &str = "TEMPO_CDP_BENCH_INSERT_TEXT_TYPE";
+/// Benchmark-only launch profile that uses the fresh temp `user_data_dir`
+/// directly instead of adding an incognito BrowserContext on top.
+pub const TEMPO_CDP_BENCH_NO_INCOGNITO_ENV: &str = "TEMPO_CDP_BENCH_NO_INCOGNITO";
+/// Benchmark-only cache profile used to compare against Playwright/raw Chrome
+/// baselines that do not force `Network.setCacheDisabled(true)`.
+pub const TEMPO_CDP_BENCH_ENABLE_CACHE_ENV: &str = "TEMPO_CDP_BENCH_ENABLE_CACHE";
+/// Benchmark-only launch profile that suppresses Linux desktop-integration
+/// helper probes so process-count metrics stay focused on browser work.
+pub const TEMPO_CDP_BENCH_SUPPRESS_DESKTOP_ENV: &str = "TEMPO_CDP_BENCH_SUPPRESS_DESKTOP";
+/// Benchmark-only compositor profile used to measure whether forcing all
+/// compositor stages before draw inflates layout/paint metrics.
+pub const TEMPO_CDP_BENCH_NO_FORCED_COMPOSITOR_ENV: &str = "TEMPO_CDP_BENCH_NO_FORCED_COMPOSITOR";
+/// Benchmark-only headless flag profile used to compare chromiumoxide's bare
+/// `--headless` launch arg against Tempo's normal `--headless=new` launch.
+///
+/// Chrome 132+ maps bare `--headless` to the modern Chrome headless
+/// implementation; old headless is a separate `chrome-headless-shell` binary.
+pub const TEMPO_CDP_BENCH_HEADLESS_FLAG_ENV: &str = "TEMPO_CDP_BENCH_HEADLESS_FLAG";
+
+/// Driver-local counters for CDP observation work.
+///
+/// These are intentionally Tempo-only instrumentation counters for benchmark
+/// evidence, not part of the engine-agnostic driver contract.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CdpObservationCounters {
+    pub snapshot_since_count: usize,
+    pub record_snapshot_count: usize,
+    pub ax_full_tree_count: usize,
+    pub ax_partial_tree_count: usize,
+    pub observe_count: usize,
+    pub observe_diff_count: usize,
+    pub act_batch_count: usize,
+}
 
 /// Launch configuration for the CDP fallback lane.
 #[derive(Clone, Debug)]
@@ -112,6 +153,32 @@ pub struct CdpConfig {
     /// Extra Chromium command-line arguments. Intended for narrowly scoped
     /// fixtures and platform integration knobs.
     pub args: Vec<String>,
+    /// Benchmark-only Type dispatch mode. Defaults off until event-semantics
+    /// tests prove it can become the normal semantic Type path.
+    pub bench_insert_text_type: bool,
+    /// Benchmark-only launch mode that relies on Tempo's fresh temp profile for
+    /// storage isolation instead of wrapping it in an incognito context.
+    pub bench_no_incognito: bool,
+    /// Benchmark-only cache mode. Defaults off so production/local launches keep
+    /// the historical no-cache isolation behavior.
+    pub bench_enable_cache: bool,
+    /// Benchmark-only Linux desktop-integration suppression. This is scoped to
+    /// synthetic browser benchmarks because production launches should inherit
+    /// the user's desktop environment normally.
+    pub bench_suppress_desktop: bool,
+    /// Benchmark-only launch mode that omits
+    /// `--run-all-compositor-stages-before-draw`. Defaults off so screenshots
+    /// and visual settling keep the historical deterministic launch profile.
+    pub bench_no_forced_compositor: bool,
+    /// Benchmark-only headless flag experiment. Defaults off so product launches
+    /// pass Chrome's explicit newer headless flag.
+    pub bench_headless_flag: bool,
+    /// Initial URL policy installed before the browser starts issuing traffic.
+    url_policy: UrlPolicy,
+    /// Trusted-fixture optimization: rely on Tempo's mandatory policy proxy for
+    /// HTTP(S) request enforcement instead of also pausing every request via
+    /// CDP Fetch interception.
+    proxy_only_request_policy: bool,
 }
 
 impl CdpConfig {
@@ -130,6 +197,11 @@ impl CdpConfig {
         self
     }
 
+    pub fn with_args(mut self, args: impl IntoIterator<Item = String>) -> Self {
+        self.args.extend(args);
+        self
+    }
+
     /// Honor the explicit no-sandbox opt-in environment variable.
     ///
     /// This keeps production/default launches sandboxed while allowing live CI
@@ -143,23 +215,128 @@ impl CdpConfig {
         }
     }
 
+    /// Honor the explicit benchmark opt-in for Playwright-like lifecycle flags.
+    ///
+    /// This is intentionally separate from production defaults: the experiment
+    /// is about isolating Chrome process lifecycle differences in browser
+    /// metrics, not weakening Tempo's normal hardened launch profile.
+    pub fn with_bench_playwright_lifecycle_env_opt_in(self) -> Self {
+        if env_flag_enabled(TEMPO_CDP_BENCH_PLAYWRIGHT_LIFECYCLE_ARGS_ENV) {
+            self.with_args(playwright_lifecycle_launch_args())
+        } else {
+            self
+        }
+    }
+
+    pub fn with_bench_insert_text_type_env_opt_in(mut self) -> Self {
+        if env_flag_enabled(TEMPO_CDP_BENCH_INSERT_TEXT_TYPE_ENV) {
+            self.bench_insert_text_type = true;
+        }
+        self
+    }
+
+    pub fn with_bench_no_incognito(mut self) -> Self {
+        self.bench_no_incognito = true;
+        self
+    }
+
+    pub fn with_bench_no_incognito_env_opt_in(mut self) -> Self {
+        if env_flag_enabled(TEMPO_CDP_BENCH_NO_INCOGNITO_ENV) {
+            self.bench_no_incognito = true;
+        }
+        self
+    }
+
+    pub fn with_bench_enable_cache(mut self) -> Self {
+        self.bench_enable_cache = true;
+        self
+    }
+
+    pub fn with_bench_enable_cache_env_opt_in(mut self) -> Self {
+        if env_flag_enabled(TEMPO_CDP_BENCH_ENABLE_CACHE_ENV) {
+            self.bench_enable_cache = true;
+        }
+        self
+    }
+
+    pub fn with_bench_suppress_desktop(mut self) -> Self {
+        self.bench_suppress_desktop = true;
+        self
+    }
+
+    pub fn with_bench_suppress_desktop_env_opt_in(mut self) -> Self {
+        if env_flag_enabled(TEMPO_CDP_BENCH_SUPPRESS_DESKTOP_ENV) {
+            self.bench_suppress_desktop = true;
+        }
+        self
+    }
+
+    pub fn with_bench_no_forced_compositor(mut self) -> Self {
+        self.bench_no_forced_compositor = true;
+        self
+    }
+
+    pub fn with_bench_no_forced_compositor_env_opt_in(mut self) -> Self {
+        if env_flag_enabled(TEMPO_CDP_BENCH_NO_FORCED_COMPOSITOR_ENV) {
+            self.bench_no_forced_compositor = true;
+        }
+        self
+    }
+
+    pub fn with_bench_headless_flag(mut self) -> Self {
+        self.bench_headless_flag = true;
+        self
+    }
+
+    pub fn with_bench_headless_flag_env_opt_in(mut self) -> Self {
+        if env_flag_enabled(TEMPO_CDP_BENCH_HEADLESS_FLAG_ENV) {
+            self.bench_headless_flag = true;
+        }
+        self
+    }
+
+    pub fn with_allow_all_url_policy(mut self) -> Self {
+        self.url_policy = UrlPolicy::allow_all();
+        self
+    }
+
+    pub fn with_proxy_only_request_policy(mut self) -> Self {
+        self.proxy_only_request_policy = true;
+        self
+    }
+
     fn browser_config(&self, user_data_dir: &Path) -> Result<BrowserConfig, TransportError> {
         let mut builder = BrowserConfig::builder()
-            .headless_mode(HeadlessMode::New)
+            .headless_mode(if self.bench_headless_flag {
+                HeadlessMode::True
+            } else {
+                HeadlessMode::New
+            })
             .launch_timeout(self.launch_timeout)
             .request_timeout(CDP_REQUEST_TIMEOUT)
-            .user_data_dir(user_data_dir)
-            .incognito()
-            .enable_request_intercept()
-            .disable_cache();
+            .user_data_dir(user_data_dir);
+        if !self.bench_enable_cache {
+            builder = builder.disable_cache();
+        }
+        if !self.bench_no_incognito {
+            builder = builder.incognito();
+        }
         if self.no_sandbox {
             builder = builder.no_sandbox();
         }
         if let Some(path) = &self.executable {
             builder = builder.chrome_executable(path);
         }
-        if !self.args.is_empty() {
-            builder = builder.args(self.args.clone());
+        let mut launch_args = self.args.clone();
+        if self.bench_suppress_desktop {
+            launch_args.extend(desktop_suppression_launch_args());
+            builder = builder.envs(desktop_suppression_env());
+        }
+        if self.bench_no_forced_compositor {
+            launch_args.retain(|arg| arg != "--run-all-compositor-stages-before-draw");
+        }
+        if !launch_args.is_empty() {
+            builder = builder.args(normalize_chromium_launch_args(launch_args));
         }
         builder.build().map_err(TransportError::Other)
     }
@@ -185,6 +362,14 @@ impl Default for CdpConfig {
             no_sandbox: false,
             launch_timeout: Duration::from_secs(20),
             args: Vec::new(),
+            bench_insert_text_type: false,
+            bench_no_incognito: false,
+            bench_enable_cache: false,
+            bench_suppress_desktop: false,
+            bench_no_forced_compositor: false,
+            bench_headless_flag: false,
+            url_policy: UrlPolicy::block_private(),
+            proxy_only_request_policy: false,
         }
     }
 }
@@ -208,6 +393,7 @@ pub struct CdpTempoDriver {
     browser_hardening_policy: Arc<Mutex<BrowserHardeningPolicy>>,
     blocked_request_url: Arc<Mutex<Option<String>>>,
     request_policy_tracker: Arc<RequestPolicyTracker>,
+    observation_counters: Mutex<CdpObservationCounters>,
     /// Cached isolated-world execution context for the stability probe.
     /// Invalidated by navigation; recreated on demand.
     probe_context: Mutex<Option<ExecutionContextId>>,
@@ -228,8 +414,10 @@ impl CdpTempoDriver {
             .map_err(|error| {
                 TransportError::Other(format!("failed to create private CDP profile: {error}"))
             })?;
-        let url_policy = Arc::new(Mutex::new(UrlPolicy::block_private()));
-        let browser_hardening_policy = Arc::new(Mutex::new(BrowserHardeningPolicy::standard()));
+        let url_policy = Arc::new(Mutex::new(config.url_policy.clone()));
+        let browser_hardening_policy = Arc::new(Mutex::new(
+            BrowserHardeningPolicy::standard().with_url_policy(config.url_policy.clone()),
+        ));
         let blocked_request_url = Arc::new(Mutex::new(None));
         let request_policy_tracker = Arc::new(RequestPolicyTracker::new());
         let policy_proxy = PolicyProxy::start(
@@ -258,20 +446,24 @@ impl CdpTempoDriver {
             }
         };
         close_unmanaged_pages(&browser, &page).await;
-        let request_policy_task = match install_request_policy(
-            &page,
-            browser_hardening_policy.clone(),
-            blocked_request_url.clone(),
-            request_policy_tracker.clone(),
-        )
-        .await
-        {
-            Ok(task) => task,
-            Err(error) => {
-                let _ = browser.close().await;
-                let _ = browser.wait().await;
-                handler_task.abort();
-                return Err(error);
+        let request_policy_task = if launch_config.proxy_only_request_policy {
+            None
+        } else {
+            match install_request_policy(
+                &page,
+                browser_hardening_policy.clone(),
+                blocked_request_url.clone(),
+                request_policy_tracker.clone(),
+            )
+            .await
+            {
+                Ok(task) => Some(task),
+                Err(error) => {
+                    let _ = browser.close().await;
+                    let _ = browser.wait().await;
+                    handler_task.abort();
+                    return Err(error);
+                }
             }
         };
 
@@ -279,7 +471,7 @@ impl CdpTempoDriver {
             browser,
             page: Some(page),
             handler_task,
-            request_policy_task: Some(request_policy_task),
+            request_policy_task,
             policy_proxy: Some(policy_proxy),
             browser_context_id: None,
             profile_dir: Some(profile_dir),
@@ -293,6 +485,7 @@ impl CdpTempoDriver {
             browser_hardening_policy,
             blocked_request_url,
             request_policy_tracker,
+            observation_counters: Mutex::new(CdpObservationCounters::default()),
             probe_context: Mutex::new(None),
         })
     }
@@ -312,6 +505,19 @@ impl CdpTempoDriver {
             .into_iter()
             .map(|metric| (metric.name, metric.value))
             .collect())
+    }
+
+    pub fn observation_counters(&self) -> CdpObservationCounters {
+        self.observation_counters
+            .lock()
+            .map(|counters| *counters)
+            .unwrap_or_default()
+    }
+
+    fn increment_observation_counter(&self, update: impl FnOnce(&mut CdpObservationCounters)) {
+        if let Ok(mut counters) = self.observation_counters.lock() {
+            update(&mut counters);
+        }
     }
 
     /// Override the shared pre-navigation URL policy used by the CDP lane.
@@ -475,6 +681,7 @@ impl CdpTempoDriver {
     }
 
     async fn snapshot_since(&self, cursor: u64) -> Result<(String, String), TransportError> {
+        self.increment_observation_counter(|counters| counters.snapshot_since_count += 1);
         let url = self.current_url().await?;
         self.enforce_current_url_policy_value(&url)?;
         self.enforce_no_blocked_request_since(cursor)?;
@@ -495,6 +702,7 @@ impl CdpTempoDriver {
         dom_html: String,
         _http_status: Option<u16>,
     ) -> Result<Arc<CompiledObservation>, TransportError> {
+        self.increment_observation_counter(|counters| counters.record_snapshot_count += 1);
         self.seq += 1;
         let (mut compiled, selectors_by_node) =
             compile_observation(&mut self.stable_id_mapper, url, dom_html, self.seq);
@@ -634,18 +842,22 @@ impl CdpTempoDriver {
             .new_page(page_params)
             .await
             .map_err(map_cdp_error)?;
-        let new_policy_task = match install_request_policy(
-            &new_page,
-            self.browser_hardening_policy.clone(),
-            self.blocked_request_url.clone(),
-            self.request_policy_tracker.clone(),
-        )
-        .await
-        {
-            Ok(task) => task,
-            Err(error) => {
-                let _ = new_page.close().await;
-                return Err(error);
+        let new_policy_task = if self.launch_config.proxy_only_request_policy {
+            None
+        } else {
+            match install_request_policy(
+                &new_page,
+                self.browser_hardening_policy.clone(),
+                self.blocked_request_url.clone(),
+                self.request_policy_tracker.clone(),
+            )
+            .await
+            {
+                Ok(task) => Some(task),
+                Err(error) => {
+                    let _ = new_page.close().await;
+                    return Err(error);
+                }
             }
         };
 
@@ -653,7 +865,7 @@ impl CdpTempoDriver {
             task.abort();
         }
         let old_page = self.page.replace(new_page);
-        self.request_policy_task = Some(new_policy_task);
+        self.request_policy_task = new_policy_task;
         if let Ok(mut guard) = self.probe_context.lock() {
             *guard = None;
         }
@@ -733,6 +945,7 @@ impl CdpTempoDriver {
         // observation hot path (#299). `fetch_relatives(false)` scopes the reply
         // to the queried node alone — no ancestors, siblings, or children — so
         // the response describes exactly that element's own AX node.
+        self.increment_observation_counter(|counters| counters.ax_partial_tree_count += 1);
         let ax_nodes = match page
             .execute(
                 GetPartialAxTreeParams::builder()
@@ -835,6 +1048,115 @@ impl CdpTempoDriver {
         })
     }
 
+    async fn click_node_via_dom_activation(
+        &mut self,
+        node: &NodeId,
+        cursor: u64,
+    ) -> Result<NodeGrounding, TransportError> {
+        if let Some(selector) = self.selector_for_node(node) {
+            if self
+                .click_selector_via_dom_activation(&selector, cursor)
+                .await?
+            {
+                return Ok(NodeGrounding {
+                    target: selector,
+                    grounded: true,
+                });
+            }
+
+            if let Some(refreshed) = self.refresh_selector_for_node(node).await?
+                && refreshed != selector
+            {
+                let grounded = self
+                    .click_selector_via_dom_activation(&refreshed, cursor)
+                    .await?;
+                return Ok(NodeGrounding {
+                    target: refreshed,
+                    grounded,
+                });
+            }
+
+            return Ok(NodeGrounding {
+                target: selector,
+                grounded: false,
+            });
+        }
+
+        let refreshed = self.refresh_selector_for_node(node).await?;
+        let Some(selector) = refreshed else {
+            return Ok(NodeGrounding {
+                target: node.0.clone(),
+                grounded: false,
+            });
+        };
+        let grounded = self
+            .click_selector_via_dom_activation(&selector, cursor)
+            .await?;
+        Ok(NodeGrounding {
+            target: selector,
+            grounded,
+        })
+    }
+
+    async fn click_selector_via_dom_activation(
+        &self,
+        selector: &str,
+        cursor: u64,
+    ) -> Result<bool, TransportError> {
+        self.enforce_current_url_policy().await?;
+        for recreate in [false, true] {
+            let Some(context_id) = self.probe_context_id(recreate, cursor).await? else {
+                return self
+                    .click_selector_via_cdp_grounded_dom_activation(selector)
+                    .await;
+            };
+            let params = EvaluateParams::builder()
+                .expression(click_selector_activation_script(selector)?)
+                .context_id(context_id)
+                .return_by_value(true)
+                .build()
+                .map_err(|error| TransportError::Other(error.to_string()))?;
+            let evaluated = match self.page()?.execute(params).await {
+                Ok(response) => response.result,
+                Err(error) if !recreate => {
+                    self.enforce_no_blocked_request_soon_since(cursor).await?;
+                    if is_execution_context_gone_msg(&error.to_string()) {
+                        continue;
+                    }
+                    return Err(map_cdp_error(error));
+                }
+                Err(error) => return Err(map_cdp_error(error)),
+            };
+            if evaluated.exception_details.is_some() {
+                return Err(TransportError::Other(
+                    "click activation script threw an exception".into(),
+                ));
+            }
+            let Some(value) = evaluated.result.value else {
+                if !recreate {
+                    continue;
+                }
+                return Err(TransportError::Other(
+                    "click activation result missing value".into(),
+                ));
+            };
+            return map_dom_click_activation_value(value);
+        }
+        Err(TransportError::Other(
+            "click activation isolated world unavailable".into(),
+        ))
+    }
+
+    async fn click_selector_via_cdp_grounded_dom_activation(
+        &self,
+        selector: &str,
+    ) -> Result<bool, TransportError> {
+        self.with_element(selector, |element| async move {
+            click_element_via_dom_activation(element).await
+        })
+        .await
+    }
+
     async fn extract_with_selector(
         &self,
         selector: &str,
@@ -848,87 +1170,71 @@ impl CdpTempoDriver {
             .map_err(|error| TransportError::Other(error.to_string()))
     }
 
-    async fn node_outcome_since(
-        &mut self,
-        previous_seq: u64,
-        target: &str,
-        grounded: bool,
-        cursor: u64,
-    ) -> Result<StepOutcome, TransportError> {
-        let compiled = self.record_current_observation_since(cursor).await?;
-        if grounded {
-            Ok(StepOutcome::Applied {
-                diff: diff_from_base(
-                    history_base(&self.history, previous_seq),
-                    compiled.as_ref(),
-                    previous_seq,
-                ),
-            })
-        } else {
-            Ok(StepOutcome::StepError {
-                reason: format!("node not found: {target}"),
-            })
-        }
-    }
-
-    async fn settle_after_batch_action(
+    async fn settle_after_batch_action_since(
         &mut self,
         quiescence: QuiescencePolicy,
+        cursor: u64,
     ) -> Result<Arc<CompiledObservation>, TransportError> {
         match quiescence {
             QuiescencePolicy::FixedMillis(millis) => {
-                let cursor = self.request_policy_cursor();
                 tokio::time::sleep(Duration::from_millis(millis)).await;
                 self.enforce_no_blocked_request_soon_since(cursor).await?;
                 self.record_current_observation_since(cursor).await
             }
             QuiescencePolicy::Composite => {
-                self.wait_for_composite_quiescence().await?;
-                self.record_current_observation().await
+                self.wait_for_composite_quiescence_since(cursor).await?;
+                self.record_current_observation_since(cursor).await
             }
         }
     }
 
-    async fn run_one(&mut self, action: &Action) -> Result<StepOutcome, TransportError> {
-        let previous_seq = self.seq;
+    async fn perform_one_action(
+        &mut self,
+        action: &Action,
+    ) -> Result<PerformedAction, TransportError> {
         match action {
             Action::Goto { url } => {
                 let compiled = self.goto_recorded(url).await?;
-                Ok(StepOutcome::Applied {
-                    diff: diff_from_base(
-                        history_base(&self.history, previous_seq),
-                        compiled.as_ref(),
-                        previous_seq,
-                    ),
-                })
+                Ok(PerformedAction::Snapshot { compiled })
             }
             Action::Click { node } => {
                 let cursor = self.request_policy_cursor();
-                let grounding = self
-                    .with_node_element(node, |element| async move {
-                        click_element_via_dom_activation(element).await
-                    })
-                    .await?;
+                let grounding = self.click_node_via_dom_activation(node, cursor).await?;
                 self.enforce_no_blocked_request_soon_since(cursor).await?;
-                self.node_outcome_since(previous_seq, &grounding.target, grounding.grounded, cursor)
-                    .await
+                Ok(performed_node_outcome(
+                    &grounding.target,
+                    grounding.grounded,
+                    cursor,
+                ))
             }
             Action::Type { node, text } => {
                 let cursor = self.request_policy_cursor();
                 let text = text.clone();
+                let use_insert_text = self.launch_config.bench_insert_text_type;
+                let page = self.page()?.clone();
                 let grounding = self
                     .with_node_element(node, |element| {
                         let text = text.clone();
+                        let page = page.clone();
                         async move {
                             element.focus().await.map_err(map_cdp_error)?;
-                            element.type_str(&text).await.map_err(map_cdp_error)?;
+                            if use_insert_text {
+                                page.execute(InsertTextParams::new(text))
+                                    .await
+                                    .map_err(map_cdp_error)?;
+                            } else {
+                                element.type_str(&text).await.map_err(map_cdp_error)?;
+                            }
                             Ok(())
                         }
                     })
                     .await?;
                 self.enforce_no_blocked_request_soon_since(cursor).await?;
-                self.node_outcome_since(previous_seq, &grounding.target, grounding.grounded, cursor)
-                    .await
+                Ok(performed_node_outcome(
+                    &grounding.target,
+                    grounding.grounded,
+                    cursor,
+                ))
             }
             Action::Select { node, value } => {
                 let cursor = self.request_policy_cursor();
@@ -951,8 +1257,11 @@ impl CdpTempoDriver {
                     })
                     .await?;
                 self.enforce_no_blocked_request_soon_since(cursor).await?;
-                self.node_outcome_since(previous_seq, &grounding.target, grounding.grounded, cursor)
-                    .await
+                Ok(performed_node_outcome(
+                    &grounding.target,
+                    grounding.grounded,
+                    cursor,
+                ))
             }
             Action::Scroll { x, y } => {
                 self.enforce_current_url_policy().await?;
@@ -962,27 +1271,13 @@ impl CdpTempoDriver {
                     .await
                     .map_err(map_cdp_error)?;
                 self.enforce_no_blocked_request_soon_since(cursor).await?;
-                let compiled = self.record_current_observation_since(cursor).await?;
-                Ok(StepOutcome::Applied {
-                    diff: diff_from_base(
-                        history_base(&self.history, previous_seq),
-                        compiled.as_ref(),
-                        previous_seq,
-                    ),
-                })
+                Ok(PerformedAction::Applied { cursor })
             }
             Action::Wait { millis } => {
                 let cursor = self.request_policy_cursor();
                 tokio::time::sleep(Duration::from_millis(*millis)).await;
                 self.enforce_no_blocked_request_soon_since(cursor).await?;
-                let compiled = self.record_current_observation_since(cursor).await?;
-                Ok(StepOutcome::Applied {
-                    diff: diff_from_base(
-                        history_base(&self.history, previous_seq),
-                        compiled.as_ref(),
-                        previous_seq,
-                    ),
-                })
+                Ok(PerformedAction::Applied { cursor })
             }
             Action::Extract { node } => {
                 let cursor = self.request_policy_cursor();
@@ -990,16 +1285,49 @@ impl CdpTempoDriver {
                     .with_node_element(node, |_element| async move { Ok(()) })
                     .await?;
                 self.enforce_no_blocked_request_soon_since(cursor).await?;
-                self.node_outcome_since(previous_seq, &grounding.target, grounding.grounded, cursor)
-                    .await
+                Ok(performed_node_outcome(
+                    &grounding.target,
+                    grounding.grounded,
+                    cursor,
+                ))
             }
-            Action::Skill { name, .. } => Ok(StepOutcome::StepError {
+            Action::Skill { name, .. } => Ok(PerformedAction::StepError {
                 reason: format!("skill action {name:?} is handled by tempo-skills, not CDP"),
             }),
         }
     }
 
+    async fn run_one(&mut self, action: &Action) -> Result<StepOutcome, TransportError> {
+        let previous_seq = self.seq;
+        match self.perform_one_action(action).await? {
+            PerformedAction::Snapshot { compiled } => Ok(StepOutcome::Applied {
+                diff: diff_from_base(
+                    history_base(&self.history, previous_seq),
+                    compiled.as_ref(),
+                    previous_seq,
+                ),
+            }),
+            PerformedAction::Applied { cursor } => {
+                let compiled = self.record_current_observation_since(cursor).await?;
+                Ok(StepOutcome::Applied {
+                    diff: diff_from_base(
+                        history_base(&self.history, previous_seq),
+                        compiled.as_ref(),
+                        previous_seq,
+                    ),
+                })
+            }
+            PerformedAction::StepError { reason } => Ok(StepOutcome::StepError { reason }),
+        }
+    }
+
+    #[cfg(test)]
     async fn wait_for_composite_quiescence(&self) -> Result<(), TransportError> {
+        let cursor = self.request_policy_cursor();
+        self.wait_for_composite_quiescence_since(cursor).await
+    }
+
+    async fn wait_for_composite_quiescence_since(&self, cursor: u64) -> Result<(), TransportError> {
         let deadline = Instant::now() + Duration::from_secs(2);
         let mut tracker = CompositeQuiescenceTracker::new(3);
 
@@ -1015,7 +1343,6 @@ impl CdpTempoDriver {
             // probe-reported href on the isolated path, or an explicit
             // page.url() on the fallback path) — no separate per-poll
             // round-trip here.
-            let cursor = self.request_policy_cursor();
             let sample = self.sample_page_stability_since(cursor).await?;
             if tracker.observe(sample) {
                 return Ok(());
@@ -1285,6 +1612,63 @@ fn default_cdp_launch_args(policy_proxy_addr: SocketAddr) -> Vec<String> {
     ]
 }
 
+fn playwright_lifecycle_launch_args() -> Vec<String> {
+    vec![
+        "--disable-back-forward-cache".to_string(),
+        "--disable-features=PaintHolding,RenderDocument".to_string(),
+    ]
+}
+
+fn desktop_suppression_launch_args() -> Vec<String> {
+    vec![
+        "--no-service-autorun".to_string(),
+        "--disable-search-engine-choice-screen".to_string(),
+        "--disable-features=DialMediaRouteProvider,MediaRouter,OptimizationHints,TranslateUI"
+            .to_string(),
+    ]
+}
+
+fn normalize_chromium_launch_args(args: Vec<String>) -> Vec<String> {
+    let mut merged_disable_features = BTreeSet::new();
+    let mut normalized = Vec::with_capacity(args.len());
+    for arg in args {
+        if let Some(features) = arg.strip_prefix("--disable-features=") {
+            for feature in features
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                merged_disable_features.insert(feature.to_string());
+            }
+        } else {
+            normalized.push(arg);
+        }
+    }
+    if !merged_disable_features.is_empty() {
+        normalized.push(format!(
+            "--disable-features={}",
+            merged_disable_features
+                .into_iter()
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+    }
+    normalized
+}
+
+fn desktop_suppression_env() -> Vec<(String, String)> {
+    vec![
+        ("BROWSER".to_string(), "true".to_string()),
+        (
+            "PATH".to_string(),
+            "/usr/local/sbin:/usr/local/bin:/sbin:/bin".to_string(),
+        ),
+        ("XDG_CURRENT_DESKTOP".to_string(), "tempo-bench".to_string()),
+        ("XDG_SESSION_DESKTOP".to_string(), "tempo-bench".to_string()),
+        ("XDG_UTILS_DEBUG_LEVEL".to_string(), "0".to_string()),
+    ]
+}
+
 impl Drop for CdpTempoDriver {
     fn drop(&mut self) {
         self.handler_task.abort();
@@ -1306,10 +1690,12 @@ impl DriverTrait for CdpTempoDriver {
     }
 
     async fn observe(&mut self) -> Result<CompiledObservation, TransportError> {
+        self.increment_observation_counter(|counters| counters.observe_count += 1);
         Ok(self.record_current_observation().await?.as_ref().clone())
     }
 
     async fn observe_diff(&mut self, since_seq: u64) -> Result<ObservationDiff, TransportError> {
+        self.increment_observation_counter(|counters| counters.observe_diff_count += 1);
         let observation = self.record_current_observation().await?;
         Ok(diff_from_base(
             history_base(&self.history, since_seq),
@@ -1323,20 +1709,29 @@ impl DriverTrait for CdpTempoDriver {
     }
 
     async fn act_batch(&mut self, batch: &ActionBatch) -> Result<StepOutcome, TransportError> {
+        self.increment_observation_counter(|counters| counters.act_batch_count += 1);
         let batch_base_seq = self.seq;
         let mut last_settled = None;
         for action in &batch.actions {
-            let outcome = self.run_one(action).await?;
-            if matches!(outcome, StepOutcome::StepError { .. }) {
-                return Ok(outcome);
-            }
-            if matches!(action, Action::Goto { .. }) {
-                last_settled = self.history.get(&self.seq).cloned();
-            } else {
-                last_settled = Some(self.settle_after_batch_action(batch.quiescence).await?);
+            match self.perform_one_action(action).await? {
+                PerformedAction::Snapshot { compiled } => {
+                    last_settled = Some(compiled);
+                }
+                PerformedAction::Applied { cursor } => {
+                    last_settled = Some(
+                        self.settle_after_batch_action_since(batch.quiescence, cursor)
+                            .await?,
+                    );
+                }
+                PerformedAction::StepError { reason } => {
+                    return Ok(StepOutcome::StepError { reason });
+                }
             }
         }
 
+        // `ActionBatch` settles after each non-navigation action so later
+        // NodeIds resolve against a fresh observation. The batch path skips the
+        // single-action immediate snapshot and records only the settled one.
         let compiled = match last_settled {
             Some(compiled) => compiled,
             None => self.record_current_observation().await?,
@@ -1396,6 +1791,10 @@ impl DriverTrait for CdpTempoDriver {
         }
 
         Ok(extracted)
+    }
+
+    async fn current_url(&mut self) -> Result<Option<String>, TransportError> {
+        self.enforce_current_url_policy().await.map(Some)
     }
 
     async fn evaluate_script(
@@ -2050,6 +2449,11 @@ async fn connect_policy_target(
 ) -> Result<TcpStream, PolicyProxyConnectError> {
     enforce_browser_hardening_policy(url, policy)
         .map_err(|_error| PolicyProxyConnectError::PolicyBlocked)?;
+    if policy.url_policy().is_allow_all() {
+        return TcpStream::connect((host, port))
+            .await
+            .map_err(|_error| PolicyProxyConnectError::UpstreamUnavailable);
+    }
     let mut addrs = tokio::net::lookup_host((host, port))
         .await
         .map_err(|_error| PolicyProxyConnectError::UpstreamUnavailable)?
@@ -2167,10 +2571,8 @@ fn map_cdp_error(error: CdpError) -> TransportError {
     TransportError::Other(error.to_string())
 }
 
-// Chromiumoxide's high-level Element::click waits on an IntersectionObserver
-// during scroll-into-view and can wedge in macOS/new-headless live runs. DOM
-// activation keeps the CDP lane bounded while still exercising page click
-// handlers and default anchor/button activation.
+// Fallback for environments where an isolated-world click script cannot be
+// created. Selector lookup stays CDP-owned; only activation runs as element JS.
 async fn click_element_via_dom_activation(
     element: chromiumoxide::Element,
 ) -> Result<(), TransportError> {
@@ -2204,6 +2606,92 @@ async fn click_element_via_dom_activation(
         return Err(TransportError::Other(message));
     }
     Ok(())
+}
+
+#[derive(Debug)]
+struct DomClickActivationResult {
+    status: String,
+    error: Option<String>,
+}
+
+fn click_selector_activation_script(selector: &str) -> Result<String, TransportError> {
+    let selector_json = serde_json::to_string(selector)
+        .map_err(|error| TransportError::Other(error.to_string()))?;
+    Ok(format!(
+        r#"(() => {{
+  const selector = {selector_json};
+  let element = null;
+  try {{
+    element = document.querySelector(selector);
+  }} catch (error) {{
+    return {{
+      status: "invalid_selector",
+      error: String(error && error.message ? error.message : error),
+    }};
+  }}
+
+  if (!element) {{
+    return {{ status: "missing_selector" }};
+  }}
+
+  if (!element.isConnected) {{
+    return {{
+      status: "detached",
+      error: "Node is detached from document",
+    }};
+  }}
+
+  if (element.nodeType !== Node.ELEMENT_NODE) {{
+    return {{
+      status: "non_element",
+      error: "Node is not of type HTMLElement",
+    }};
+  }}
+
+  element.scrollIntoView({{
+    block: "center",
+    inline: "center",
+    behavior: "instant",
+  }});
+  element.click();
+  return {{ status: "applied" }};
+}})()"#
+    ))
+}
+
+fn map_dom_click_activation_result(
+    result: DomClickActivationResult,
+) -> Result<bool, TransportError> {
+    match result.status.as_str() {
+        "applied" => Ok(true),
+        "missing_selector" | "invalid_selector" => Ok(false),
+        "detached" | "non_element" => Err(TransportError::Other(
+            result.error.unwrap_or_else(|| "click failed".to_string()),
+        )),
+        other => Err(TransportError::Other(format!(
+            "unknown click activation status: {other}"
+        ))),
+    }
+}
+
+fn map_dom_click_activation_value(value: serde_json::Value) -> Result<bool, TransportError> {
+    let Some(object) = value.as_object() else {
+        return Err(TransportError::Other(
+            "invalid click activation result: expected object".into(),
+        ));
+    };
+    let Some(status) = object.get("status").and_then(|value| value.as_str()) else {
+        return Err(TransportError::Other(
+            "invalid click activation result: missing status".into(),
+        ));
+    };
+    map_dom_click_activation_result(DomClickActivationResult {
+        status: status.to_string(),
+        error: object
+            .get("error")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+    })
 }
 
 fn navigation_urls_match(requested_url: &str, current_url: &str) -> bool {
@@ -2250,6 +2738,13 @@ fn is_selector_grounding_miss_msg(message: &str) -> bool {
         || lowered.contains("dom error while querying")
 }
 
+fn is_execution_context_gone_msg(message: &str) -> bool {
+    let lowered = message.to_lowercase();
+    lowered.contains("cannot find context")
+        || lowered.contains("execution context was destroyed")
+        || lowered.contains("context with specified id")
+}
+
 fn is_uninteresting_ax_node_msg(message: &str) -> bool {
     message.to_lowercase().contains("uninteresting")
 }
@@ -2258,6 +2753,34 @@ fn is_uninteresting_ax_node_msg(message: &str) -> bool {
 struct NodeGrounding {
     target: String,
     grounded: bool,
+}
+
+#[derive(Clone, Debug)]
+enum PerformedAction {
+    /// Navigation already recorded its destination snapshot as part of
+    /// `goto_recorded`.
+    Snapshot {
+        compiled: Arc<CompiledObservation>,
+    },
+    /// Non-navigation action applied. The cursor is the request-policy point
+    /// captured before the action, reused by single-action callers for the
+    /// post-action snapshot.
+    Applied {
+        cursor: u64,
+    },
+    StepError {
+        reason: String,
+    },
+}
+
+fn performed_node_outcome(target: &str, grounded: bool, cursor: u64) -> PerformedAction {
+    if grounded {
+        PerformedAction::Applied { cursor }
+    } else {
+        PerformedAction::StepError {
+            reason: format!("node not found: {target}"),
+        }
+    }
 }
 
 fn grounded_selector(
@@ -2689,11 +3212,30 @@ where
 /// selects which elements become set-of-marks labels, so enrichment covers the
 /// same elements that survive into the compiled observation.
 fn top_ranked_indices(elements: &[InteractiveElement], limit: usize) -> Vec<usize> {
-    let mut indices: Vec<usize> = (0..elements.len()).collect();
-    // Stable sort by rank descending; equal ranks retain their original
-    // (document) order, matching the marks compositor's selection.
-    indices.sort_by(|&a, &b| elements[b].rank.total_cmp(&elements[a].rank));
-    indices.truncate(limit);
+    if limit == 0 || elements.is_empty() {
+        return Vec::new();
+    }
+
+    let mut indices: Vec<usize> = Vec::with_capacity(limit.min(elements.len()));
+    for index in 0..elements.len() {
+        let insertion = indices.iter().position(|&selected| {
+            elements[index]
+                .rank
+                .total_cmp(&elements[selected].rank)
+                .is_gt()
+        });
+        match insertion {
+            Some(position) => {
+                indices.insert(position, index);
+                if indices.len() > limit {
+                    indices.pop();
+                }
+            }
+            None if indices.len() < limit => indices.push(index),
+            None => {}
+        }
+    }
+
     // Enrich in document order for deterministic, natural traversal.
     indices.sort_unstable();
     indices
@@ -2731,35 +3273,33 @@ fn diff_from_base(
         };
     };
 
-    let before: HashMap<_, _> = base
+    let before: HashMap<&str, &InteractiveElement> = base
         .elements
         .iter()
-        .map(|element| (element.node_id.0.clone(), element))
-        .collect();
-    let after: HashMap<_, _> = current
-        .elements
-        .iter()
-        .map(|element| (element.node_id.0.clone(), element))
+        .map(|element| (element.node_id.0.as_str(), element))
         .collect();
 
-    let added = after
+    let current_ids: HashSet<&str> = current
+        .elements
         .iter()
-        .filter(|(node, _)| !before.contains_key(*node))
-        .map(|(_, element)| (*element).clone())
+        .map(|element| element.node_id.0.as_str())
         .collect();
-    let removed = before
+
+    let mut added = Vec::new();
+    let mut changed = Vec::new();
+    for element in &current.elements {
+        match before.get(element.node_id.0.as_str()) {
+            None => added.push(element.clone()),
+            Some(previous) if *previous != element => changed.push(element.clone()),
+            Some(_) => {}
+        }
+    }
+
+    let removed = base
+        .elements
         .iter()
-        .filter(|(node, _)| !after.contains_key(*node))
-        .map(|(_, element)| element.node_id.clone())
-        .collect();
-    let changed = after
-        .iter()
-        .filter_map(|(node, element)| {
-            before
-                .get(node)
-                .filter(|previous| *previous != element)
-                .map(|_| (*element).clone())
-        })
+        .filter(|element| !current_ids.contains(element.node_id.0.as_str()))
+        .map(|element| element.node_id.clone())
         .collect();
 
     ObservationDiff {
@@ -3804,6 +4344,61 @@ mod tests {
     }
 
     #[test]
+    fn click_selector_activation_script_json_encodes_selector(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let selector = "[id=\"save\"]";
+        let script = click_selector_activation_script(selector)?;
+        let encoded = serde_json::to_string(selector)?;
+
+        assert!(script.contains(&format!("const selector = {encoded};")));
+        assert!(script.contains("document.querySelector(selector)"));
+        assert!(script.contains(r#"status: "invalid_selector""#));
+        assert!(script.contains(r#"status: "missing_selector""#));
+        assert!(script.contains(r#"status: "applied""#));
+        Ok(())
+    }
+
+    #[test]
+    fn dom_click_activation_result_maps_misses_without_transport_error() {
+        let missing = map_dom_click_activation_result(DomClickActivationResult {
+            status: "missing_selector".into(),
+            error: None,
+        });
+        assert!(matches!(missing, Ok(false)));
+
+        let invalid = map_dom_click_activation_result(DomClickActivationResult {
+            status: "invalid_selector".into(),
+            error: Some("not a valid selector".into()),
+        });
+        assert!(matches!(invalid, Ok(false)));
+
+        let applied = map_dom_click_activation_result(DomClickActivationResult {
+            status: "applied".into(),
+            error: None,
+        });
+        assert!(matches!(applied, Ok(true)));
+    }
+
+    #[test]
+    fn dom_click_activation_result_keeps_element_failures_hard() {
+        let detached = map_dom_click_activation_result(DomClickActivationResult {
+            status: "detached".into(),
+            error: Some("Node is detached from document".into()),
+        });
+        assert!(
+            matches!(detached, Err(TransportError::Other(message)) if message == "Node is detached from document")
+        );
+
+        let malformed = map_dom_click_activation_result(DomClickActivationResult {
+            status: "surprise".into(),
+            error: None,
+        });
+        assert!(
+            matches!(malformed, Err(TransportError::Other(message)) if message.contains("unknown click activation status"))
+        );
+    }
+
+    #[test]
     fn compiled_observation_uses_stable_ids_with_private_selector_lookup() {
         let mut mapper = StableIdMapper::new();
         let (first, first_lookup) = compile_observation(
@@ -4362,6 +4957,184 @@ mod tests {
     }
 
     #[test]
+    fn no_forced_compositor_profile_omits_forced_compositor_arg(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let launch_args = default_cdp_launch_args(SocketAddr::from(([127, 0, 0, 1], 9001)));
+        let default_config = CdpConfig::default()
+            .with_args(launch_args.clone())
+            .browser_config(temp.path())?;
+        assert!(
+            format!("{default_config:?}").contains("--run-all-compositor-stages-before-draw"),
+            "default CDP launches must keep the historical compositor determinism arg"
+        );
+
+        let profile_config = CdpConfig::default()
+            .with_bench_no_forced_compositor()
+            .with_args(launch_args)
+            .browser_config(temp.path())?;
+        assert!(
+            !format!("{profile_config:?}").contains("--run-all-compositor-stages-before-draw"),
+            "no-forced-compositor benchmark profile must omit the forced compositor arg"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn browser_config_leaves_request_interception_to_tempo_policy_layer(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let config = CdpConfig::default().browser_config(temp.path())?;
+
+        assert!(
+            !config.request_intercept,
+            "Tempo installs Fetch interception explicitly in install_request_policy"
+        );
+        assert!(
+            !config.cache_enabled,
+            "launch keeps the previous no-cache behavior while avoiding duplicate Fetch.enable"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn benchmark_cache_profile_leaves_chrome_cache_enabled(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let config = CdpConfig::default()
+            .with_bench_enable_cache()
+            .browser_config(temp.path())?;
+
+        assert!(config.cache_enabled);
+        Ok(())
+    }
+
+    #[test]
+    fn playwright_lifecycle_launch_args_match_browser_baseline_lifecycle_flags() {
+        let args = playwright_lifecycle_launch_args();
+
+        assert!(args.iter().any(|arg| arg == "--disable-back-forward-cache"));
+        assert!(args
+            .iter()
+            .any(|arg| arg == "--disable-features=PaintHolding,RenderDocument"));
+        assert!(!args.iter().any(|arg| is_policy_proxy_arg(arg)));
+    }
+
+    #[test]
+    fn normalizes_duplicate_disable_features_launch_args() {
+        let args = normalize_chromium_launch_args(vec![
+            "--disable-features=PaintHolding,RenderDocument".to_string(),
+            "--no-service-autorun".to_string(),
+            "--disable-features=MediaRouter,PaintHolding".to_string(),
+        ]);
+        let disable_features = args
+            .iter()
+            .filter(|arg| arg.starts_with("--disable-features="))
+            .collect::<Vec<_>>();
+
+        assert_eq!(disable_features.len(), 1);
+        assert_eq!(
+            disable_features[0],
+            "--disable-features=MediaRouter,PaintHolding,RenderDocument"
+        );
+        assert!(args.iter().any(|arg| arg == "--no-service-autorun"));
+    }
+
+    #[test]
+    fn desktop_suppression_profile_is_explicit_and_benchmark_only(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        assert!(!CdpConfig::default().bench_suppress_desktop);
+
+        let temp = tempfile::tempdir()?;
+        let config = CdpConfig::default()
+            .with_bench_suppress_desktop()
+            .browser_config(temp.path())?;
+        let Some(envs) = config.process_envs.as_ref() else {
+            return Err("desktop suppression must set Chrome child env vars".into());
+        };
+
+        assert_eq!(envs.get("BROWSER").map(String::as_str), Some("true"));
+        assert_eq!(
+            envs.get("PATH").map(String::as_str),
+            Some("/usr/local/sbin:/usr/local/bin:/sbin:/bin")
+        );
+        assert_eq!(
+            envs.get("XDG_CURRENT_DESKTOP").map(String::as_str),
+            Some("tempo-bench")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn default_launch_uses_new_headless_until_headless_flag_benchmark_opt_in(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        assert!(
+            !CdpConfig::default().bench_headless_flag,
+            "default CDP launches must keep Chrome's newer headless mode"
+        );
+
+        let temp = tempfile::tempdir()?;
+        let default_config = CdpConfig::default().browser_config(temp.path())?;
+        assert!(
+            format!("{default_config:?}").contains("headless: New"),
+            "default CDP launches should use chromiumoxide HeadlessMode::New"
+        );
+
+        let headless_flag_config = CdpConfig::default()
+            .with_bench_headless_flag()
+            .browser_config(temp.path())?;
+        assert!(
+            format!("{headless_flag_config:?}").contains("headless: True"),
+            "headless-flag benchmark profile should use chromiumoxide HeadlessMode::True"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cdp_config_defaults_to_fetch_request_policy_and_block_private() {
+        let config = CdpConfig::default();
+
+        assert!(!config.url_policy.is_allow_all());
+        assert!(
+            !config.proxy_only_request_policy,
+            "default launches must keep Fetch request interception installed"
+        );
+    }
+
+    #[test]
+    fn trusted_proxy_only_policy_requires_explicit_config() {
+        let config = CdpConfig::default()
+            .with_allow_all_url_policy()
+            .with_proxy_only_request_policy();
+
+        assert!(config.url_policy.is_allow_all());
+        assert!(config.proxy_only_request_policy);
+    }
+
+    #[test]
+    fn default_type_dispatch_uses_key_events_until_bench_insert_text_opt_in() {
+        assert!(!CdpConfig::default().bench_insert_text_type);
+        let config = CdpConfig::default().with_bench_insert_text_type_env_opt_in();
+        assert_eq!(
+            config.bench_insert_text_type,
+            env_flag_enabled(TEMPO_CDP_BENCH_INSERT_TEXT_TYPE_ENV)
+        );
+    }
+
+    #[test]
+    fn default_launch_keeps_incognito_until_bench_no_incognito_opt_in() {
+        assert!(
+            !CdpConfig::default().bench_no_incognito,
+            "default CDP launches must keep the incognito BrowserContext"
+        );
+        let config = CdpConfig::default().with_bench_no_incognito_env_opt_in();
+        assert_eq!(
+            config.bench_no_incognito,
+            env_flag_enabled(TEMPO_CDP_BENCH_NO_INCOGNITO_ENV)
+        );
+    }
+
+    #[test]
     fn cdp_launch_stays_sandboxed_unless_explicitly_opted_out() {
         assert!(
             !CdpConfig::default().no_sandbox,
@@ -4519,6 +5292,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn policy_proxy_allow_all_forwards_http_loopback(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let origin = TokioTcpListener::bind(("127.0.0.1", 0)).await?;
+        let origin_addr = origin.local_addr()?;
+        let origin_task = tokio::spawn(async move {
+            let (mut stream, _peer) = origin.accept().await?;
+            let mut request = [0_u8; 512];
+            let read = stream.read(&mut request).await?;
+            let request = std::str::from_utf8(&request[..read])
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
+            if !request.starts_with("GET /ok HTTP/1.1") {
+                return Err(std::io::Error::other(format!(
+                    "unexpected forwarded request: {request:?}"
+                )));
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await?;
+            Ok::<(), std::io::Error>(())
+        });
+
+        let blocked_request_url = Arc::new(Mutex::new(None));
+        let request_policy_tracker = Arc::new(RequestPolicyTracker::new());
+        let cursor = request_policy_tracker.cursor();
+        let proxy = PolicyProxy::start(
+            Arc::new(Mutex::new(
+                BrowserHardeningPolicy::standard().with_url_policy(UrlPolicy::allow_all()),
+            )),
+            blocked_request_url.clone(),
+            request_policy_tracker.clone(),
+        )
+        .await?;
+        let mut client = TcpStream::connect(proxy.addr).await?;
+        let request = format!(
+            "GET http://{origin_addr}/ok HTTP/1.1\r\nHost: {origin_addr}\r\nConnection: close\r\n\r\n"
+        );
+        client.write_all(request.as_bytes()).await?;
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await?;
+        let response = std::str::from_utf8(&response)?;
+
+        assert!(response.starts_with("HTTP/1.1 204 No Content"));
+        assert_eq!(
+            blocked_request_url
+                .lock()
+                .map_err(|_error| std::io::Error::other("blocked URL lock poisoned"))?
+                .as_deref(),
+            None
+        );
+        assert!(!request_policy_tracker.has_blocked_since(cursor));
+        origin_task.await??;
+        drop(proxy);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn policy_proxy_blocks_browser_hardening_risky_downloads(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let origin = TokioTcpListener::bind(("127.0.0.1", 0)).await?;
@@ -4627,6 +5458,73 @@ mod tests {
         accept_task.await?;
         assert!(!accepted.load(Ordering::SeqCst));
         driver.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_cdp_bench_no_incognito_keeps_fresh_profile_storage_isolated(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(chrome) = std::env::var_os("TEMPO_CDP_CHROME") else {
+            eprintln!("skipping live CDP no-incognito storage test; TEMPO_CDP_CHROME is unset");
+            return Ok(());
+        };
+        let fixture = serve_policy_fixture()?;
+        let config = CdpConfig::default()
+            .with_executable(chrome.to_string_lossy())
+            .with_no_sandbox_env_opt_in();
+        let storage_url = fixture.allowed_url("/storage");
+
+        let mut writer = CdpTempoDriver::launch_with(config.clone().with_bench_no_incognito())
+            .await?
+            .allow_private_network_access();
+        assert!(
+            !writer.browser.is_incognito(),
+            "benchmark no-incognito profile must not create an incognito BrowserContext"
+        );
+        writer
+            .goto(&storage_url)
+            .await
+            .map_err(|error| std::io::Error::other(format!("writer navigation failed: {error}")))?;
+        let written = writer
+            .evaluate_script(
+                r#"Promise.resolve((() => {
+                    localStorage.setItem('tempo-cdp-bench-no-incognito', 'profile-one');
+                    return {
+                        value: localStorage.getItem('tempo-cdp-bench-no-incognito')
+                    };
+                })())"#,
+                true,
+            )
+            .await
+            .map_err(|error| {
+                std::io::Error::other(format!("writer storage probe failed: {error}"))
+            })?;
+        writer.close().await?;
+        assert_eq!(written, serde_json::json!({ "value": "profile-one" }));
+
+        let mut reader = CdpTempoDriver::launch_with(config.with_bench_no_incognito())
+            .await?
+            .allow_private_network_access();
+        assert!(
+            !reader.browser.is_incognito(),
+            "benchmark no-incognito profile must not create an incognito BrowserContext"
+        );
+        reader
+            .goto(&storage_url)
+            .await
+            .map_err(|error| std::io::Error::other(format!("reader navigation failed: {error}")))?;
+        let isolated = reader
+            .evaluate_script(
+                "Promise.resolve({ value: localStorage.getItem('tempo-cdp-bench-no-incognito') })",
+                true,
+            )
+            .await
+            .map_err(|error| {
+                std::io::Error::other(format!("reader storage probe failed: {error}"))
+            })?;
+        reader.close().await?;
+
+        assert_eq!(isolated, serde_json::json!({ "value": null }));
         Ok(())
     }
 
@@ -4950,7 +5848,8 @@ mod tests {
         // the *current* page blocked without any further navigation.
         driver = driver.with_url_policy(UrlPolicy::block_private());
 
-        // Click through with_element: must fail AND must not have clicked.
+        // Click through the selector activation path: must fail AND must not
+        // have clicked.
         let click_result = driver
             .act(&Action::Click {
                 node: save_node.clone(),
@@ -4990,7 +5889,7 @@ mod tests {
                 )
                 .await?,
             serde_json::json!("unset"),
-            "blocked-policy click still landed on the page: with_element's own \
+            "blocked-policy click still landed on the page: the click path's \
              URL-policy guard did not fire before the click"
         );
         let blocked_scroll_y = driver
@@ -5030,6 +5929,54 @@ mod tests {
             "allow-case scroll control did not move the page; the scroll probe is broken"
         );
 
+        driver.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_cdp_click_selector_lookup_ignores_page_query_selector_patch(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(chrome) = std::env::var_os("TEMPO_CDP_CHROME") else {
+            eprintln!("skipping live CDP querySelector isolation test; TEMPO_CDP_CHROME is unset");
+            return Ok(());
+        };
+        let url = serve_query_selector_patch_fixture()?;
+        let config = CdpConfig::default()
+            .with_executable(chrome.to_string_lossy())
+            .with_no_sandbox_env_opt_in();
+        let mut driver = CdpTempoDriver::launch_with(config)
+            .await?
+            .allow_private_network_access();
+
+        let observation = driver.goto(&url).await?;
+        let save_node = observation
+            .elements
+            .iter()
+            .find(|element| {
+                element.role == "button"
+                    && element.name.first().map(|span| span.text.as_str()) == Some("Save")
+            })
+            .map(|element| element.node_id.clone())
+            .ok_or_else(|| std::io::Error::other("missing save button"))?;
+
+        assert!(matches!(
+            driver.act(&Action::Click { node: save_node }).await?,
+            StepOutcome::Applied { .. }
+        ));
+        let state = driver
+            .evaluate_script(
+                "Promise.resolve({
+                    save: document.body.dataset.save ?? 'unset',
+                    trap: document.body.dataset.trap ?? 'unset',
+                    querySelectorCalled: document.body.dataset.querySelectorCalled ?? 'unset',
+                })",
+                true,
+            )
+            .await?;
+
+        assert_eq!(state["save"], serde_json::json!("yes"));
+        assert_eq!(state["trap"], serde_json::json!("unset"));
+        assert_eq!(state["querySelectorCalled"], serde_json::json!("unset"));
         driver.close().await?;
         Ok(())
     }
@@ -5200,6 +6147,242 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn live_cdp_type_action_preserves_editor_semantics(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(chrome) = std::env::var_os("TEMPO_CDP_CHROME") else {
+            eprintln!("skipping live CDP Type semantics test; TEMPO_CDP_CHROME is unset");
+            return Ok(());
+        };
+
+        assert_live_cdp_type_action_semantics(chrome.to_string_lossy().as_ref(), false).await
+    }
+
+    #[tokio::test]
+    async fn live_cdp_insert_text_type_action_preserves_editor_semantics(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(chrome) = std::env::var_os("TEMPO_CDP_CHROME") else {
+            eprintln!(
+                "skipping live CDP insertText Type semantics test; TEMPO_CDP_CHROME is unset"
+            );
+            return Ok(());
+        };
+
+        assert_live_cdp_type_action_semantics(chrome.to_string_lossy().as_ref(), true).await
+    }
+
+    async fn assert_live_cdp_type_action_semantics(
+        chrome: &str,
+        bench_insert_text_type: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = CdpConfig::default()
+            .with_executable(chrome)
+            .with_no_sandbox_env_opt_in();
+        config.bench_insert_text_type = bench_insert_text_type;
+        let mut driver = CdpTempoDriver::launch_with(config).await?;
+        driver
+            .evaluate_script(
+                r#"(() => {
+                    document.body.innerHTML = `
+                        <label for="email">Email</label>
+                        <input id="email" type="email" aria-label="Email">
+                        <input id="readonly" aria-label="Readonly" value="fixed" readonly>
+                        <input id="disabled" aria-label="Disabled" value="blocked" disabled>
+                        <input id="max" aria-label="Max" maxlength="5">
+                        <input id="number" type="number" aria-label="Number">
+                        <div id="editable" role="textbox" aria-label="Editable"
+                             contenteditable="true" tabindex="0"></div>
+                    `;
+                    window.__typeEvents = [];
+                    const record = (scope, id, event) => {
+                        window.__typeEvents.push({
+                            scope,
+                            target: id,
+                            type: event.type,
+                            trusted: event.isTrusted,
+                            data: 'data' in event ? event.data : null,
+                            inputType: 'inputType' in event ? event.inputType : null,
+                            key: 'key' in event ? event.key : null
+                        });
+                    };
+                    for (const element of document.querySelectorAll('input, [contenteditable]')) {
+                        for (const type of ['keydown', 'beforeinput', 'input', 'keyup']) {
+                            element.addEventListener(type, (event) => record('element', element.id, event));
+                        }
+                    }
+                    for (const type of ['keydown', 'keyup']) {
+                        document.addEventListener(type, (event) => {
+                            record('document', event.target && event.target.id || '', event);
+                        }, true);
+                    }
+                    return true;
+                })()"#,
+                true,
+            )
+            .await?;
+        let observation = driver.observe().await?;
+        let email_node = node_named(&observation, "Email")?;
+        let readonly_node = node_named(&observation, "Readonly")?;
+        let disabled_node = node_named(&observation, "Disabled")?;
+        let max_node = node_named(&observation, "Max")?;
+        let number_node = node_named(&observation, "Number")?;
+        let editable_node = node_named(&observation, "Editable")?;
+
+        type_action_must_apply(&mut driver, &email_node, "alice@example.com").await?;
+        let after_email = type_fixture_state(&mut driver).await?;
+        assert_eq!(
+            string_field(&after_email, "email")?,
+            "alice@example.com",
+            "ordinary input type=email should accept Type text"
+        );
+        assert_trusted_input_events(&after_email, "email");
+        assert_document_key_events(&after_email, bench_insert_text_type);
+
+        let _ = driver
+            .act(&Action::Type {
+                node: readonly_node,
+                text: "MUTATE".into(),
+            })
+            .await;
+        let _ = driver
+            .act(&Action::Type {
+                node: disabled_node,
+                text: "MUTATE".into(),
+            })
+            .await;
+        type_action_must_apply(&mut driver, &max_node, "abcdef").await?;
+        type_action_must_apply(&mut driver, &number_node, "a1b2c3").await?;
+        type_action_must_apply(&mut driver, &editable_node, "Hello").await?;
+
+        let final_state = type_fixture_state(&mut driver).await?;
+        assert_eq!(
+            string_field(&final_state, "email")?,
+            "alice@example.com",
+            "readonly/disabled Type attempts must not leak text into the previous focus target"
+        );
+        assert_eq!(string_field(&final_state, "readonly")?, "fixed");
+        assert_eq!(string_field(&final_state, "disabled")?, "blocked");
+        assert_eq!(string_field(&final_state, "max")?, "abcde");
+        assert_eq!(string_field(&final_state, "number")?, "123");
+        assert_eq!(string_field(&final_state, "editable")?, "Hello");
+        assert_trusted_input_events(&final_state, "editable");
+
+        driver.close().await?;
+        Ok(())
+    }
+
+    async fn type_action_must_apply(
+        driver: &mut CdpTempoDriver,
+        node: &NodeId,
+        text: &str,
+    ) -> Result<(), TransportError> {
+        let outcome = driver
+            .act(&Action::Type {
+                node: node.clone(),
+                text: text.to_string(),
+            })
+            .await?;
+        assert!(
+            matches!(outcome, StepOutcome::Applied { .. }),
+            "expected Type action to apply, got {outcome:?}"
+        );
+        Ok(())
+    }
+
+    async fn type_fixture_state(
+        driver: &mut CdpTempoDriver,
+    ) -> Result<serde_json::Value, TransportError> {
+        driver
+            .evaluate_script(
+                r#"(() => ({
+                    email: document.getElementById('email').value,
+                    readonly: document.getElementById('readonly').value,
+                    disabled: document.getElementById('disabled').value,
+                    max: document.getElementById('max').value,
+                    number: document.getElementById('number').value,
+                    editable: document.getElementById('editable').textContent,
+                    events: window.__typeEvents
+                }))()"#,
+                true,
+            )
+            .await
+    }
+
+    fn node_named(observation: &CompiledObservation, name: &str) -> Result<NodeId, std::io::Error> {
+        observation
+            .elements
+            .iter()
+            .find(|element| element.name.first().map(|span| span.text.as_str()) == Some(name))
+            .map(|element| element.node_id.clone())
+            .ok_or_else(|| std::io::Error::other(format!("missing {name} node")))
+    }
+
+    fn string_field<'a>(
+        value: &'a serde_json::Value,
+        field: &str,
+    ) -> Result<&'a str, std::io::Error> {
+        value
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| std::io::Error::other(format!("missing string field {field}")))
+    }
+
+    fn events(value: &serde_json::Value) -> &[serde_json::Value] {
+        value
+            .get("events")
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    fn assert_trusted_input_events(value: &serde_json::Value, target: &str) {
+        let events = events(value);
+        assert!(
+            events.iter().any(|event| is_event(event, target, "input")),
+            "expected at least one input event for {target}"
+        );
+        for event_type in ["beforeinput", "input"] {
+            for event in events
+                .iter()
+                .filter(|event| is_event(event, target, event_type))
+            {
+                assert_eq!(
+                    event.get("trusted").and_then(serde_json::Value::as_bool),
+                    Some(true),
+                    "{event_type} events for {target} should be trusted: {event:?}"
+                );
+            }
+        }
+    }
+
+    fn assert_document_key_events(value: &serde_json::Value, bench_insert_text_type: bool) {
+        let document_key_events = events(value).iter().filter(|event| {
+            event.get("scope").and_then(serde_json::Value::as_str) == Some("document")
+                && matches!(
+                    event.get("type").and_then(serde_json::Value::as_str),
+                    Some("keydown" | "keyup")
+                )
+        });
+        let document_key_event_count = document_key_events.count();
+        if bench_insert_text_type {
+            assert_eq!(
+                document_key_event_count, 0,
+                "Input.insertText Type dispatch should not synthesize document keydown/keyup events"
+            );
+        } else {
+            assert!(
+                document_key_event_count > 0,
+                "keyboard Type dispatch should synthesize document keydown/keyup events"
+            );
+        }
+    }
+
+    fn is_event(event: &serde_json::Value, target: &str, event_type: &str) -> bool {
+        event.get("scope").and_then(serde_json::Value::as_str) == Some("element")
+            && event.get("target").and_then(serde_json::Value::as_str) == Some(target)
+            && event.get("type").and_then(serde_json::Value::as_str) == Some(event_type)
+    }
+
+    #[tokio::test]
     async fn live_cdp_child_browsing_context_isolates_storage(
     ) -> Result<(), Box<dyn std::error::Error>> {
         const CHILD_CONTEXT_OP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -5363,6 +6546,49 @@ mod tests {
         Ok(format!("http://{addr}/"))
     }
 
+    fn serve_query_selector_patch_fixture() -> Result<String, std::io::Error> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+
+        std::thread::spawn(move || {
+            let body = r#"<!doctype html>
+                <html>
+                  <body>
+                    <button id="save" onclick="document.body.dataset.save='yes'">
+                      <span>Save</span>
+                    </button>
+                    <button id="trap" onclick="document.body.dataset.trap='yes'">
+                      <span>Trap</span>
+                    </button>
+                    <script>
+                      const nativeQuerySelector = document.querySelector.bind(document);
+                      document.querySelector = function(selector) {
+                        document.body.dataset.querySelectorCalled = 'yes';
+                        if (selector === '[id="save"]') {
+                          return document.getElementById('trap');
+                        }
+                        return nativeQuerySelector(selector);
+                      };
+                    </script>
+                  </body>
+                </html>"#;
+            for stream in listener.incoming().take(16) {
+                let Ok(mut stream) = stream else {
+                    continue;
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+
+        Ok(format!("http://{addr}/"))
+    }
+
     struct PolicyFixture {
         origin: String,
         private_url: String,
@@ -5482,6 +6708,7 @@ mod tests {
         // Cap of 2: the two highest ranks are the three 0.9s; ties break by
         // document order, so indices 1 and 2 win and are returned in order.
         assert_eq!(top_ranked_indices(&elements, 2), vec![1, 2]);
+        assert_eq!(top_ranked_indices(&elements, 0), Vec::<usize>::new());
         // A cap at/above the length keeps every index in document order.
         assert_eq!(top_ranked_indices(&elements, 16), vec![0, 1, 2, 3, 4]);
     }
