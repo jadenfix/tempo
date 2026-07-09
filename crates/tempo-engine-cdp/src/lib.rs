@@ -397,6 +397,7 @@ pub struct CdpTempoDriver {
     history: BTreeMap<u64, Arc<CompiledObservation>>,
     stable_id_mapper: StableIdMapper,
     selectors_by_node: BTreeMap<NodeId, String>,
+    ax_summary_cache: Mutex<HashMap<AxSummaryCacheKey, AxSummary>>,
     url_policy: Arc<Mutex<UrlPolicy>>,
     browser_hardening_policy: Arc<Mutex<BrowserHardeningPolicy>>,
     blocked_request_url: Arc<Mutex<Option<String>>>,
@@ -489,6 +490,7 @@ impl CdpTempoDriver {
             history: BTreeMap::new(),
             stable_id_mapper: StableIdMapper::new(),
             selectors_by_node: BTreeMap::new(),
+            ax_summary_cache: Mutex::new(HashMap::new()),
             url_policy,
             browser_hardening_policy,
             blocked_request_url,
@@ -712,10 +714,12 @@ impl CdpTempoDriver {
     ) -> Result<Arc<CompiledObservation>, TransportError> {
         self.increment_observation_counter(|counters| counters.record_snapshot_count += 1);
         self.seq += 1;
+        let dom_hash = fnv1a64(dom_html.as_bytes());
         let (mut compiled, selectors_by_node) =
             compile_observation(&mut self.stable_id_mapper, url, dom_html, self.seq);
         self.selectors_by_node = selectors_by_node;
-        self.enrich_observation_from_ax_tree(&mut compiled).await?;
+        self.enrich_observation_from_ax_tree(&mut compiled, dom_hash)
+            .await?;
         // Finish the live observation the same way the fixture compiler does:
         // rank-sort, apply the byte/token budget, and populate set-of-marks labels.
         // Run after enrichment so the budget accounts for enriched AX names/values.
@@ -886,6 +890,7 @@ impl CdpTempoDriver {
     async fn enrich_observation_from_ax_tree(
         &self,
         observation: &mut CompiledObservation,
+        dom_hash: u64,
     ) -> Result<(), TransportError> {
         if observation.elements.is_empty() {
             return Ok(());
@@ -907,11 +912,12 @@ impl CdpTempoDriver {
         enrich_elements(
             &mut observation.elements,
             MAX_AX_ENRICHED_ELEMENTS,
-            |node_id| async move {
-                let Some(selector) = self.selectors_by_node.get(&node_id).cloned() else {
+            |element| async move {
+                let Some(selector) = self.selectors_by_node.get(&element.node_id).cloned() else {
                     return Ok(None);
                 };
-                self.ax_summary_for_selector(root, &selector).await
+                self.ax_summary_for_selector(root, &selector, &element, dom_hash)
+                    .await
             },
         )
         .await
@@ -929,7 +935,14 @@ impl CdpTempoDriver {
         &self,
         root: DomNodeId,
         selector: &str,
+        raw_element: &InteractiveElement,
+        dom_hash: u64,
     ) -> Result<Option<AxSummary>, TransportError> {
+        let cache_key = AxSummaryCacheKey::from_element(dom_hash, selector, raw_element);
+        if let Some(summary) = cached_ax_summary(&self.ax_summary_cache, &cache_key) {
+            return Ok(Some(summary));
+        }
+
         let page = self.page()?;
         let queried = match page.execute(QuerySelectorParams::new(root, selector)).await {
             Ok(response) => response.result,
@@ -974,7 +987,14 @@ impl CdpTempoDriver {
             Err(error) => return Err(map_cdp_error(error)),
         };
 
-        Ok(sole_ax_summary(&ax_nodes))
+        let summary = sole_ax_summary(&ax_nodes);
+        remember_cacheable_ax_summary(
+            &self.ax_summary_cache,
+            cache_key,
+            raw_element,
+            summary.as_ref(),
+        );
+        Ok(summary)
     }
 
     async fn with_element<F, Fut>(&self, selector: &str, op: F) -> Result<bool, TransportError>
@@ -3081,11 +3101,113 @@ fn push_spans_text(output: &mut String, spans: &[TaintSpan]) {
     }
 }
 
+fn spans_text(spans: &[TaintSpan]) -> String {
+    let mut output = String::new();
+    push_spans_text(&mut output, spans);
+    output
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct AxSummary {
     role: Option<String>,
     name: Option<String>,
     value: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct AxSummaryCacheKey {
+    dom_hash: u64,
+    selector: String,
+    raw_role: String,
+    raw_name: String,
+    raw_value: String,
+}
+
+impl AxSummaryCacheKey {
+    fn from_element(dom_hash: u64, selector: &str, element: &InteractiveElement) -> Self {
+        Self {
+            dom_hash,
+            selector: selector.to_string(),
+            raw_role: element.role.clone(),
+            raw_name: spans_text(&element.name),
+            raw_value: spans_text(&element.value),
+        }
+    }
+}
+
+fn cached_ax_summary(
+    cache: &Mutex<HashMap<AxSummaryCacheKey, AxSummary>>,
+    key: &AxSummaryCacheKey,
+) -> Option<AxSummary> {
+    cache.lock().ok()?.get(key).cloned()
+}
+
+fn remember_cacheable_ax_summary(
+    cache: &Mutex<HashMap<AxSummaryCacheKey, AxSummary>>,
+    key: AxSummaryCacheKey,
+    raw_element: &InteractiveElement,
+    summary: Option<&AxSummary>,
+) {
+    let Some(summary) = summary else {
+        return;
+    };
+    if !ax_summary_cacheable_raw_element(raw_element) {
+        return;
+    }
+    if !ax_summary_preserves_raw_dom_fallback(raw_element, summary) {
+        return;
+    }
+    if let Ok(mut cache) = cache.lock() {
+        cache.insert(key, summary.clone());
+    }
+}
+
+fn ax_summary_preserves_raw_dom_fallback(
+    raw_element: &InteractiveElement,
+    summary: &AxSummary,
+) -> bool {
+    if summary
+        .role
+        .as_deref()
+        .is_some_and(|role| role != raw_element.role)
+    {
+        return false;
+    }
+    if summary
+        .name
+        .as_deref()
+        .is_some_and(|name| name != spans_text(&raw_element.name))
+    {
+        return false;
+    }
+    if summary
+        .value
+        .as_deref()
+        .is_some_and(|value| value != spans_text(&raw_element.value))
+    {
+        return false;
+    }
+    true
+}
+
+fn ax_summary_cacheable_raw_element(raw_element: &InteractiveElement) -> bool {
+    !matches!(
+        raw_element.role.as_str(),
+        "checkbox"
+            | "combobox"
+            | "listbox"
+            | "menuitemcheckbox"
+            | "menuitemradio"
+            | "option"
+            | "progressbar"
+            | "radio"
+            | "scrollbar"
+            | "searchbox"
+            | "slider"
+            | "spinbutton"
+            | "switch"
+            | "textbox"
+    ) && raw_element.value.is_empty()
 }
 
 /// The AX summary of the single node described by a `GetPartialAXTree` reply
@@ -3185,7 +3307,7 @@ async fn enrich_elements<F, Fut>(
     mut lookup: F,
 ) -> Result<(), TransportError>
 where
-    F: FnMut(NodeId) -> Fut,
+    F: FnMut(InteractiveElement) -> Fut,
     Fut: std::future::Future<Output = Result<Option<AxSummary>, TransportError>>,
 {
     let mut jobs = Vec::new();
@@ -3193,8 +3315,7 @@ where
         let Some(element) = elements.get(index) else {
             continue;
         };
-        let node_id = element.node_id.clone();
-        jobs.push((index, lookup(node_id)));
+        jobs.push((index, lookup(element.clone())));
     }
 
     // The selected set is capped at `max_enriched`, so running these lookups
@@ -6704,6 +6825,68 @@ mod tests {
         }
     }
 
+    fn dom_equivalent_summary() -> AxSummary {
+        AxSummary {
+            role: Some("button".to_string()),
+            name: Some("orig".to_string()),
+            value: None,
+        }
+    }
+
+    #[test]
+    fn enrichment_reuses_dom_equivalent_ax_summary_with_same_dom_hash() {
+        let cache = Mutex::new(HashMap::new());
+        let element = sample_element("#stable", 1.0);
+        let key = AxSummaryCacheKey::from_element(42, "#save", &element);
+        let summary = dom_equivalent_summary();
+
+        remember_cacheable_ax_summary(&cache, key.clone(), &element, Some(&summary));
+
+        assert_eq!(cached_ax_summary(&cache, &key), Some(summary));
+    }
+
+    #[test]
+    fn enrichment_does_not_cache_ax_overlay_that_changes_dom_fallback() {
+        let cache = Mutex::new(HashMap::new());
+        let element = sample_element("#stable", 1.0);
+        let key = AxSummaryCacheKey::from_element(42, "#save", &element);
+        let overlay = enriched_summary();
+
+        remember_cacheable_ax_summary(&cache, key.clone(), &element, Some(&overlay));
+
+        assert_eq!(cached_ax_summary(&cache, &key), None);
+    }
+
+    #[test]
+    fn enrichment_does_not_cache_mutable_form_role() {
+        let cache = Mutex::new(HashMap::new());
+        let mut element = sample_element("#email", 1.0);
+        element.role = "textbox".to_string();
+        let key = AxSummaryCacheKey::from_element(42, "#email", &element);
+        let summary = AxSummary {
+            role: Some("textbox".to_string()),
+            name: Some("orig".to_string()),
+            value: None,
+        };
+
+        remember_cacheable_ax_summary(&cache, key.clone(), &element, Some(&summary));
+
+        assert_eq!(cached_ax_summary(&cache, &key), None);
+    }
+
+    #[test]
+    fn enrichment_invalidates_cache_when_dom_hash_changes() {
+        let cache = Mutex::new(HashMap::new());
+        let element = sample_element("#stable", 1.0);
+        let original_key = AxSummaryCacheKey::from_element(42, "#save", &element);
+        let changed_dom_key = AxSummaryCacheKey::from_element(43, "#save", &element);
+        let summary = dom_equivalent_summary();
+
+        remember_cacheable_ax_summary(&cache, original_key, &element, Some(&summary));
+
+        assert_eq!(cached_ax_summary(&cache, &changed_dom_key), None);
+    }
+
     #[test]
     fn top_ranked_indices_picks_highest_ranks_in_document_order() {
         let elements = vec![
@@ -6737,8 +6920,8 @@ mod tests {
             .collect();
 
         let mut calls: Vec<String> = Vec::new();
-        enrich_elements(&mut elements, MAX_AX_ENRICHED_ELEMENTS, |node_id| {
-            calls.push(node_id.0);
+        enrich_elements(&mut elements, MAX_AX_ENRICHED_ELEMENTS, |element| {
+            calls.push(element.node_id.0);
             async move { Ok::<_, TransportError>(Some(enriched_summary())) }
         })
         .await?;
@@ -6780,14 +6963,10 @@ mod tests {
         let element_count = elements.len();
 
         let mut calls = 0usize;
-        enrich_elements(
-            &mut elements,
-            MAX_AX_ENRICHED_ELEMENTS,
-            |_node_id: NodeId| {
-                calls += 1;
-                async move { Ok::<_, TransportError>(Some(enriched_summary())) }
-            },
-        )
+        enrich_elements(&mut elements, MAX_AX_ENRICHED_ELEMENTS, |_element| {
+            calls += 1;
+            async move { Ok::<_, TransportError>(Some(enriched_summary())) }
+        })
         .await?;
 
         // Under the cap, every element is enriched exactly once.
@@ -6812,7 +6991,7 @@ mod tests {
         enrich_elements(&mut elements, MAX_AX_ENRICHED_ELEMENTS, {
             let in_flight = in_flight.clone();
             let max_in_flight = max_in_flight.clone();
-            move |_node_id: NodeId| {
+            move |_element| {
                 let in_flight = in_flight.clone();
                 let max_in_flight = max_in_flight.clone();
                 async move {
