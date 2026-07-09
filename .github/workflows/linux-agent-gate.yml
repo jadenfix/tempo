@@ -21,6 +21,7 @@ on:
           - no-incognito
           - cache
           - desktop
+          - runtime
           - all
         default: default
   schedule:

@@ -74,6 +74,7 @@ require(
     and 'TEMPO_CDP_BENCH_NO_INCOGNITO=1' in text
     and 'TEMPO_CDP_BENCH_ENABLE_CACHE=1' in text
     and 'TEMPO_CDP_BENCH_SUPPRESS_DESKTOP=1' in text
+    and 'TEMPO_CDP_BENCH_CURRENT_THREAD_RUNTIME=1' in text
     and '-e "TEMPO_LINUX_AGENT_BENCH_PROFILE=${BENCH_PROFILE}"' in text,
     'Docker command must support named browser benchmark optimization profiles',
 )
@@ -138,9 +139,14 @@ require(
 require(
     'benchmark_profile:' in workflow
     and 'desktop' in workflow
+    and 'runtime' in workflow
     and 'TEMPO_LINUX_AGENT_BENCH_PROFILE:' in smoke_job
     and "inputs.benchmark_profile || 'default'" in smoke_job,
     'smoke job must pass the workflow benchmark profile into the gate',
+)
+require(
+    'TEMPO_CDP_BENCH_CURRENT_THREAD_RUNTIME=1' in text,
+    'Linux agent gate must wire the runtime benchmark profile',
 )
 require(
     'scripts/agent_bench_runners/*.py' in smoke_job

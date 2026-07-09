@@ -40,6 +40,8 @@ use tempo_session::{
 use tempo_taint::{run_taint_gate, TaintRedTeamCase};
 use thiserror::Error;
 
+const TEMPO_CDP_BENCH_CURRENT_THREAD_RUNTIME_ENV: &str = "TEMPO_CDP_BENCH_CURRENT_THREAD_RUNTIME";
+
 const USAGE: &str = "\
 tempo-cli
 
@@ -915,6 +917,7 @@ struct RunCdpTaskReport {
     engine: String,
     journal: String,
     status: RunCdpTaskStatus,
+    runtime_flavor: &'static str,
     timings_ms: RunCdpTaskTimings,
     browser_performance_metrics_available: bool,
     browser_performance_metrics: BTreeMap<String, f64>,
@@ -998,6 +1001,7 @@ impl RunCdpTaskReport {
             engine: engine_name(report.engine),
             journal: report.journal_path.display().to_string(),
             status: run_status(&report.status),
+            runtime_flavor: run_cdp_task_runtime_flavor(),
             timings_ms,
             browser_performance_metrics_available,
             browser_performance_metrics,
@@ -1044,9 +1048,7 @@ fn run_cdp_task(config: RunCdpTaskConfig) -> Result<RunCdpTaskReport, CliError> 
     let task = DriverTask::new(config.start_url.clone(), config.actions.clone());
 
     let runtime_started = Instant::now();
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
+    let runtime = build_run_cdp_task_runtime()?;
     let runtime_setup_ms = elapsed_ms(runtime_started);
     let structured_probe_started = Instant::now();
     let structured_decision = structured_fast_path.probe_target(&config.start_url);
@@ -1134,6 +1136,37 @@ fn run_cdp_task(config: RunCdpTaskConfig) -> Result<RunCdpTaskReport, CliError> 
             final_page_state,
         ))
     })
+}
+
+fn run_cdp_task_uses_current_thread_runtime() -> bool {
+    env_flag_enabled(TEMPO_CDP_BENCH_CURRENT_THREAD_RUNTIME_ENV)
+}
+
+fn run_cdp_task_runtime_flavor() -> &'static str {
+    if run_cdp_task_uses_current_thread_runtime() {
+        "current-thread"
+    } else {
+        "multi-thread"
+    }
+}
+
+fn build_run_cdp_task_runtime() -> Result<tokio::runtime::Runtime, io::Error> {
+    if run_cdp_task_uses_current_thread_runtime() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+    } else {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+    }
+}
+
+fn env_flag_enabled(name: &str) -> bool {
+    matches!(
+        env::var(name).as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
+    )
 }
 
 const WEB_PERFORMANCE_METRIC_NAMES: &[&str] = &[
@@ -2263,6 +2296,7 @@ mod tests {
         })?;
 
         assert_eq!(report.engine, "structured");
+        assert_eq!(report.runtime_flavor, run_cdp_task_runtime_flavor());
         assert_eq!(report.status.state, "structured_fast_path");
         assert_eq!(report.status.lane, Some("mcp"));
         assert_eq!(report.status.signal, Some("mcp_catalog"));
