@@ -11,6 +11,7 @@ replay or inspect the run.
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import sqlite3
 from pathlib import Path
@@ -624,6 +625,52 @@ def validate_metric(metric: dict[str, Any], iterations: int, output_dir: Path) -
                 "tempo-cdp-agent.tempo_runtime_flavor must be one of "
                 f"{sorted(TEMPO_RUNTIME_FLAVORS)}, got {metric.get('tempo_runtime_flavor')!r}"
             )
+        profile_contract = metric.get("cdp_browser_profile_contract")
+        if profile_contract is not None and profile_contract not in {
+            "automation-default",
+            "browser-realistic",
+        }:
+            raise ValidationError(
+                "tempo-cdp-agent.cdp_browser_profile_contract must be "
+                "automation-default or browser-realistic"
+            )
+        lifecycle_overrides = metric.get("cdp_lifecycle_overrides")
+        if profile_contract == "automation-default" and lifecycle_overrides is None:
+            raise ValidationError(
+                "tempo-cdp-agent automation-default rows must name lifecycle overrides"
+            )
+        if lifecycle_overrides is not None:
+            if not isinstance(lifecycle_overrides, list) or not all(
+                isinstance(value, str) for value in lifecycle_overrides
+            ):
+                raise ValidationError(
+                    "tempo-cdp-agent.cdp_lifecycle_overrides must be a string list"
+                )
+            if metric.get("cdp_launch_profile") == "playwright-lifecycle":
+                expected_overrides = [
+                    "BackForwardCache",
+                    "PaintHolding",
+                    "RenderDocument",
+                ]
+                if lifecycle_overrides != expected_overrides:
+                    raise ValidationError(
+                        "tempo-cdp-agent.cdp_lifecycle_overrides must label the "
+                        "Playwright lifecycle overrides"
+                    )
+                if profile_contract != "automation-default":
+                    raise ValidationError(
+                        "tempo-cdp-agent Playwright lifecycle rows must be marked "
+                        "automation-default"
+                    )
+            elif lifecycle_overrides:
+                raise ValidationError(
+                    "tempo-cdp-agent.cdp_lifecycle_overrides must be empty without "
+                    "the Playwright lifecycle profile"
+                )
+            elif profile_contract == "automation-default":
+                raise ValidationError(
+                    "tempo-cdp-agent automation-default rows must name lifecycle overrides"
+                )
         require_int(metric, "max_compact_observation_bytes", positive=True)
         require_int(metric, "max_compact_observation_tokens", positive=True)
         if int(metric["max_compact_observation_bytes"]) > int(metric["max_observation_bytes"]):
@@ -1069,6 +1116,13 @@ def expected_gap_report(metrics: list[dict[str, Any]], summary: dict[str, Any]) 
         comparison_notes.append(
             "Process-tree memory/process metrics include each runner root process and its descendants; rows record sampler_root_included so subprocess and in-process lanes expose their accounting scope."
         )
+    if any(
+        metric.get("cdp_browser_profile_contract") == "automation-default"
+        for metric in metrics
+    ):
+        comparison_notes.append(
+            "Tempo rows marked cdp_browser_profile_contract=automation-default use Playwright-style lifecycle overrides and must not be presented as stock Chrome lifecycle performance."
+        )
     comparison_notes.extend(
         [
             "CDP Performance.getMetrics fields are required and ranked for every runner in this CDP-backed benchmark.",
@@ -1097,7 +1151,7 @@ def comparison_row(
     runner_summary: dict[str, Any],
     runner_metrics: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    return {
+    row = {
         "runner": runner,
         "runs": int(runner_summary["runs"]),
         "success_rate": float(runner_summary["success_rate"]),
@@ -1277,6 +1331,16 @@ def comparison_row(
         "model_input_observations_p95": int(runner_summary["model_input_observations"]["p95"]),
         "step_count_p95": int(runner_summary["step_count"]["p95"]),
     }
+    first_metric = runner_metrics[0] if runner_metrics else {}
+    if "cdp_browser_profile_contract" in first_metric:
+        for field in (
+            "cdp_browser_profile_contract",
+            "cdp_launch_profile",
+            "cdp_lifecycle_overrides",
+        ):
+            if field in first_metric:
+                row[field] = first_metric[field]
+    return row
 
 
 def cold_start_wall_clock_ms(runner_metrics: list[dict[str, Any]]) -> int | None:
@@ -1556,12 +1620,43 @@ def validate_bench_json(output_dir: Path) -> tuple[int, list[dict[str, Any]]]:
     if chrome_version.get("version") != report["chrome_version"]:
         raise ValidationError("chrome-version.txt version does not match report")
 
-    expected_status = render_status_markdown(report, summary, gap_report, chrome_version)
     require_file(output_dir / STATUS_ARTIFACT)
-    if (output_dir / STATUS_ARTIFACT).read_text() != expected_status:
+    actual_status = (output_dir / STATUS_ARTIFACT).read_text()
+    expected_status = render_status_markdown(report, summary, gap_report, chrome_version)
+    if actual_status != expected_status and actual_status != legacy_profile_status_markdown(
+        report,
+        summary,
+        gap_report,
+        chrome_version,
+    ):
         raise ValidationError(f"{STATUS_ARTIFACT} does not match report summary")
 
     return iterations, metrics
+
+
+def legacy_profile_status_markdown(
+    report: dict[str, Any],
+    summary: dict[str, Any],
+    gap_report: dict[str, Any],
+    chrome_version: dict[str, Any],
+) -> str:
+    legacy_gap_report = copy.deepcopy(gap_report)
+    rows = legacy_gap_report.get("rows")
+    if not isinstance(rows, list):
+        return ""
+    removed = False
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        for field in (
+            "cdp_browser_profile_contract",
+            "cdp_launch_profile",
+            "cdp_lifecycle_overrides",
+        ):
+            removed = row.pop(field, None) is not None or removed
+    if not removed:
+        return ""
+    return render_status_markdown(report, summary, legacy_gap_report, chrome_version)
 
 
 def validate_iteration_dir(iteration_dir: Path, iteration: int) -> list[dict[str, Any]]:
