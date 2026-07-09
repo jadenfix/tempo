@@ -150,6 +150,13 @@ PROCESS_TREE_COUNTER_FIELDS = (
     "process_tree_major_page_faults",
     "process_tree_voluntary_context_switches",
     "process_tree_nonvoluntary_context_switches",
+    "process_tree_io_read_chars",
+    "process_tree_io_write_chars",
+    "process_tree_io_read_syscalls",
+    "process_tree_io_write_syscalls",
+    "process_tree_io_storage_read_bytes",
+    "process_tree_io_storage_write_bytes",
+    "process_tree_io_cancelled_write_bytes",
 )
 CHECKOUT_ORACLE_EMAIL = "agent@example.com"
 CHECKOUT_ORACLE_STATUS = "Order submitted"
@@ -535,6 +542,7 @@ def proc_rss_snapshot(
         proc_counters = proc_stat_counters(proc_dir / "stat")
         if proc_counters:
             proc_counters.update(proc_status_context_switches(fields))
+            proc_counters.update(proc_io_counters(proc_dir / "io"))
         total_bytes += rss_bytes_for_process
         by_command[command] = by_command.get(command, 0) + rss_bytes_for_process
         by_process_type[process_type] = (
@@ -769,6 +777,35 @@ def proc_status_context_switches(fields: dict[str, str]) -> dict[str, int]:
     return counters
 
 
+def proc_io_counters(path: Path) -> dict[str, int]:
+    counter_names = {
+        "rchar": "process_tree_io_read_chars",
+        "wchar": "process_tree_io_write_chars",
+        "syscr": "process_tree_io_read_syscalls",
+        "syscw": "process_tree_io_write_syscalls",
+        "read_bytes": "process_tree_io_storage_read_bytes",
+        "write_bytes": "process_tree_io_storage_write_bytes",
+        "cancelled_write_bytes": "process_tree_io_cancelled_write_bytes",
+    }
+    counters = {field: 0 for field in counter_names.values()}
+    try:
+        lines = path.read_text(errors="ignore").splitlines()
+    except OSError:
+        return counters
+    for line in lines:
+        name, sep, value = line.partition(":")
+        if not sep:
+            continue
+        metric_field = counter_names.get(name.strip())
+        if metric_field is None:
+            continue
+        try:
+            counters[metric_field] = max(0, int(value.strip()))
+        except ValueError:
+            counters[metric_field] = 0
+    return counters
+
+
 def proc_cmdline(path: Path) -> str:
     try:
         data = path.read_bytes()
@@ -785,13 +822,15 @@ def proc_comm(path: Path) -> str:
 
 
 def classify_process_type(command: str, args: str) -> str:
+    command_lower = command.lower()
+    args_lower = args.lower()
     if "tempo-cli" in command:
         return "tempo-cli"
-    if "python" in command.lower() or command in {"MainThread"}:
+    if "python" in command_lower or command in {"MainThread"}:
         return "python-harness"
     if command == "node":
         return "playwright-node"
-    if "chrome" in command.lower() or "chrome" in args.lower():
+    if is_chromium_process(command_lower, args_lower):
         for prefix in ("--type=", " --type="):
             marker = args.find(prefix)
             if marker >= 0:
@@ -799,6 +838,18 @@ def classify_process_type(command: str, args: str) -> str:
                 return f"chrome-{process_type}" if process_type else "chrome-child"
         return "chrome-browser"
     return command or "<unknown>"
+
+
+def is_chromium_process(command_lower: str, args_lower: str) -> bool:
+    browser_markers = (
+        "chrome",
+        "chromium",
+        "chrome_crashpad_handler",
+        "crashpad_handler",
+        "msedge",
+        "microsoft-edge",
+    )
+    return any(marker in command_lower or marker in args_lower for marker in browser_markers)
 
 
 def truncate_process_args(args: str) -> str:
@@ -1896,6 +1947,20 @@ def benchmark_gap_report(metrics: list[dict], summary: dict) -> dict:
         ("browser_process_tree_voluntary_context_switches_p95", "lower_is_better", runners),
         ("process_tree_nonvoluntary_context_switches_p95", "lower_is_better", runners),
         ("browser_process_tree_nonvoluntary_context_switches_p95", "lower_is_better", runners),
+        ("process_tree_io_read_chars_p95", "lower_is_better", runners),
+        ("browser_process_tree_io_read_chars_p95", "lower_is_better", runners),
+        ("process_tree_io_write_chars_p95", "lower_is_better", runners),
+        ("browser_process_tree_io_write_chars_p95", "lower_is_better", runners),
+        ("process_tree_io_read_syscalls_p95", "lower_is_better", runners),
+        ("browser_process_tree_io_read_syscalls_p95", "lower_is_better", runners),
+        ("process_tree_io_write_syscalls_p95", "lower_is_better", runners),
+        ("browser_process_tree_io_write_syscalls_p95", "lower_is_better", runners),
+        ("process_tree_io_storage_read_bytes_p95", "lower_is_better", runners),
+        ("browser_process_tree_io_storage_read_bytes_p95", "lower_is_better", runners),
+        ("process_tree_io_storage_write_bytes_p95", "lower_is_better", runners),
+        ("browser_process_tree_io_storage_write_bytes_p95", "lower_is_better", runners),
+        ("process_tree_io_cancelled_write_bytes_p95", "lower_is_better", runners),
+        ("browser_process_tree_io_cancelled_write_bytes_p95", "lower_is_better", runners),
         ("browser_documents_p95", "lower_is_better", runners),
         ("browser_frames_p95", "lower_is_better", runners),
         ("browser_js_event_listeners_p95", "lower_is_better", runners),
@@ -2067,6 +2132,13 @@ def benchmark_gap_report(metrics: list[dict], summary: dict) -> dict:
     ):
         comparison_notes.append(
             "process_tree_* categories come from Linux /proc first-seen to latest-seen deltas across each runner root process and descendants; browser_process_tree_* sums only Chrome process types."
+        )
+    if any(
+        any(str(field).startswith("process_tree_io_") for field in metric)
+        for metric in metrics
+    ):
+        comparison_notes.append(
+            "process_tree_io_* categories come from Linux /proc/<pid>/io first-seen to latest-seen deltas; storage byte fields track actual storage-layer I/O while char/syscall fields include requested task I/O."
         )
     comparison_notes.extend(
         [
@@ -2270,6 +2342,7 @@ def comparison_row(runner: str, runner_summary: dict, runner_metrics: list[dict]
             runner_metrics,
             "process_tree_nonvoluntary_context_switches_by_process_type",
         ),
+        **process_tree_counter_percentile_fields(runner_metrics),
         "web_performance_metrics_available": all(
             bool(metric.get("web_performance_metrics_available"))
             for metric in runner_metrics
@@ -2326,6 +2399,20 @@ def comparison_row(runner: str, runner_summary: dict, runner_metrics: list[dict]
         "browser_process_tree_voluntary_context_switches_p95",
         "process_tree_nonvoluntary_context_switches_p95",
         "browser_process_tree_nonvoluntary_context_switches_p95",
+        "process_tree_io_read_chars_p95",
+        "browser_process_tree_io_read_chars_p95",
+        "process_tree_io_write_chars_p95",
+        "browser_process_tree_io_write_chars_p95",
+        "process_tree_io_read_syscalls_p95",
+        "browser_process_tree_io_read_syscalls_p95",
+        "process_tree_io_write_syscalls_p95",
+        "browser_process_tree_io_write_syscalls_p95",
+        "process_tree_io_storage_read_bytes_p95",
+        "browser_process_tree_io_storage_read_bytes_p95",
+        "process_tree_io_storage_write_bytes_p95",
+        "browser_process_tree_io_storage_write_bytes_p95",
+        "process_tree_io_cancelled_write_bytes_p95",
+        "browser_process_tree_io_cancelled_write_bytes_p95",
     ):
         if row.get(field) is None:
             row.pop(field, None)
@@ -2420,6 +2507,27 @@ def browser_process_counter_p95(runner_metrics: list[dict], field: str) -> int |
             return None
         values.append(value)
     return percentile(values, 0.95) if values else None
+
+
+def process_tree_counter_percentile_fields(runner_metrics: list[dict]) -> dict[str, int | None]:
+    fields = {}
+    explicitly_ranked = {
+        "process_tree_cpu_user_ms",
+        "process_tree_cpu_system_ms",
+        "process_tree_minor_page_faults",
+        "process_tree_major_page_faults",
+        "process_tree_voluntary_context_switches",
+        "process_tree_nonvoluntary_context_switches",
+    }
+    for field in PROCESS_TREE_COUNTER_FIELDS:
+        if field in explicitly_ranked:
+            continue
+        fields[f"{field}_p95"] = optional_metric_percentile(runner_metrics, field, 0.95)
+        fields[f"browser_{field}_p95"] = browser_process_counter_p95(
+            runner_metrics,
+            f"{field}_by_process_type",
+        )
+    return fields
 
 
 def browser_process_counter(metric: dict, field: str) -> int | None:
