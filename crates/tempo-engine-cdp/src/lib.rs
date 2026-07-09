@@ -999,6 +999,115 @@ impl CdpTempoDriver {
         })
     }
 
+    async fn click_node_via_dom_activation(
+        &mut self,
+        node: &NodeId,
+        cursor: u64,
+    ) -> Result<NodeGrounding, TransportError> {
+        if let Some(selector) = self.selector_for_node(node) {
+            if self
+                .click_selector_via_dom_activation(&selector, cursor)
+                .await?
+            {
+                return Ok(NodeGrounding {
+                    target: selector,
+                    grounded: true,
+                });
+            }
+
+            if let Some(refreshed) = self.refresh_selector_for_node(node).await?
+                && refreshed != selector
+            {
+                let grounded = self
+                    .click_selector_via_dom_activation(&refreshed, cursor)
+                    .await?;
+                return Ok(NodeGrounding {
+                    target: refreshed,
+                    grounded,
+                });
+            }
+
+            return Ok(NodeGrounding {
+                target: selector,
+                grounded: false,
+            });
+        }
+
+        let refreshed = self.refresh_selector_for_node(node).await?;
+        let Some(selector) = refreshed else {
+            return Ok(NodeGrounding {
+                target: node.0.clone(),
+                grounded: false,
+            });
+        };
+        let grounded = self
+            .click_selector_via_dom_activation(&selector, cursor)
+            .await?;
+        Ok(NodeGrounding {
+            target: selector,
+            grounded,
+        })
+    }
+
+    async fn click_selector_via_dom_activation(
+        &self,
+        selector: &str,
+        cursor: u64,
+    ) -> Result<bool, TransportError> {
+        self.enforce_current_url_policy().await?;
+        for recreate in [false, true] {
+            let Some(context_id) = self.probe_context_id(recreate, cursor).await? else {
+                return self
+                    .click_selector_via_cdp_grounded_dom_activation(selector)
+                    .await;
+            };
+            let params = EvaluateParams::builder()
+                .expression(click_selector_activation_script(selector)?)
+                .context_id(context_id)
+                .return_by_value(true)
+                .build()
+                .map_err(|error| TransportError::Other(error.to_string()))?;
+            let evaluated = match self.page()?.execute(params).await {
+                Ok(response) => response.result,
+                Err(error) if !recreate => {
+                    self.enforce_no_blocked_request_soon_since(cursor).await?;
+                    if is_execution_context_gone_msg(&error.to_string()) {
+                        continue;
+                    }
+                    return Err(map_cdp_error(error));
+                }
+                Err(error) => return Err(map_cdp_error(error)),
+            };
+            if evaluated.exception_details.is_some() {
+                return Err(TransportError::Other(
+                    "click activation script threw an exception".into(),
+                ));
+            }
+            let Some(value) = evaluated.result.value else {
+                if !recreate {
+                    continue;
+                }
+                return Err(TransportError::Other(
+                    "click activation result missing value".into(),
+                ));
+            };
+            return map_dom_click_activation_value(value);
+        }
+        Err(TransportError::Other(
+            "click activation isolated world unavailable".into(),
+        ))
+    }
+
+    async fn click_selector_via_cdp_grounded_dom_activation(
+        &self,
+        selector: &str,
+    ) -> Result<bool, TransportError> {
+        self.with_element(selector, |element| async move {
+            click_element_via_dom_activation(element).await
+        })
+        .await
+    }
+
     async fn extract_with_selector(
         &self,
         selector: &str,
@@ -1041,11 +1150,7 @@ impl CdpTempoDriver {
             }
             Action::Click { node } => {
                 let cursor = self.request_policy_cursor();
-                let grounding = self
-                    .with_node_element(node, |element| async move {
-                        click_element_via_dom_activation(element).await
-                    })
-                    .await?;
+                let grounding = self.click_node_via_dom_activation(node, cursor).await?;
                 self.enforce_no_blocked_request_soon_since(cursor).await?;
                 Ok(performed_node_outcome(
                     &grounding.target,
@@ -2417,10 +2522,8 @@ fn map_cdp_error(error: CdpError) -> TransportError {
     TransportError::Other(error.to_string())
 }
 
-// Chromiumoxide's high-level Element::click waits on an IntersectionObserver
-// during scroll-into-view and can wedge in macOS/new-headless live runs. DOM
-// activation keeps the CDP lane bounded while still exercising page click
-// handlers and default anchor/button activation.
+// Fallback for environments where an isolated-world click script cannot be
+// created. Selector lookup stays CDP-owned; only activation runs as element JS.
 async fn click_element_via_dom_activation(
     element: chromiumoxide::Element,
 ) -> Result<(), TransportError> {
@@ -2454,6 +2557,92 @@ async fn click_element_via_dom_activation(
         return Err(TransportError::Other(message));
     }
     Ok(())
+}
+
+#[derive(Debug)]
+struct DomClickActivationResult {
+    status: String,
+    error: Option<String>,
+}
+
+fn click_selector_activation_script(selector: &str) -> Result<String, TransportError> {
+    let selector_json = serde_json::to_string(selector)
+        .map_err(|error| TransportError::Other(error.to_string()))?;
+    Ok(format!(
+        r#"(() => {{
+  const selector = {selector_json};
+  let element = null;
+  try {{
+    element = document.querySelector(selector);
+  }} catch (error) {{
+    return {{
+      status: "invalid_selector",
+      error: String(error && error.message ? error.message : error),
+    }};
+  }}
+
+  if (!element) {{
+    return {{ status: "missing_selector" }};
+  }}
+
+  if (!element.isConnected) {{
+    return {{
+      status: "detached",
+      error: "Node is detached from document",
+    }};
+  }}
+
+  if (element.nodeType !== Node.ELEMENT_NODE) {{
+    return {{
+      status: "non_element",
+      error: "Node is not of type HTMLElement",
+    }};
+  }}
+
+  element.scrollIntoView({{
+    block: "center",
+    inline: "center",
+    behavior: "instant",
+  }});
+  element.click();
+  return {{ status: "applied" }};
+}})()"#
+    ))
+}
+
+fn map_dom_click_activation_result(
+    result: DomClickActivationResult,
+) -> Result<bool, TransportError> {
+    match result.status.as_str() {
+        "applied" => Ok(true),
+        "missing_selector" | "invalid_selector" => Ok(false),
+        "detached" | "non_element" => Err(TransportError::Other(
+            result.error.unwrap_or_else(|| "click failed".to_string()),
+        )),
+        other => Err(TransportError::Other(format!(
+            "unknown click activation status: {other}"
+        ))),
+    }
+}
+
+fn map_dom_click_activation_value(value: serde_json::Value) -> Result<bool, TransportError> {
+    let Some(object) = value.as_object() else {
+        return Err(TransportError::Other(
+            "invalid click activation result: expected object".into(),
+        ));
+    };
+    let Some(status) = object.get("status").and_then(|value| value.as_str()) else {
+        return Err(TransportError::Other(
+            "invalid click activation result: missing status".into(),
+        ));
+    };
+    map_dom_click_activation_result(DomClickActivationResult {
+        status: status.to_string(),
+        error: object
+            .get("error")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+    })
 }
 
 fn navigation_urls_match(requested_url: &str, current_url: &str) -> bool {
@@ -2498,6 +2687,13 @@ fn is_selector_grounding_miss_msg(message: &str) -> bool {
         || lowered.contains("invalid selector")
         || lowered.contains("not a valid selector")
         || lowered.contains("dom error while querying")
+}
+
+fn is_execution_context_gone_msg(message: &str) -> bool {
+    let lowered = message.to_lowercase();
+    lowered.contains("cannot find context")
+        || lowered.contains("execution context was destroyed")
+        || lowered.contains("context with specified id")
 }
 
 fn is_uninteresting_ax_node_msg(message: &str) -> bool {
@@ -4099,6 +4295,61 @@ mod tests {
     }
 
     #[test]
+    fn click_selector_activation_script_json_encodes_selector(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let selector = "[id=\"save\"]";
+        let script = click_selector_activation_script(selector)?;
+        let encoded = serde_json::to_string(selector)?;
+
+        assert!(script.contains(&format!("const selector = {encoded};")));
+        assert!(script.contains("document.querySelector(selector)"));
+        assert!(script.contains(r#"status: "invalid_selector""#));
+        assert!(script.contains(r#"status: "missing_selector""#));
+        assert!(script.contains(r#"status: "applied""#));
+        Ok(())
+    }
+
+    #[test]
+    fn dom_click_activation_result_maps_misses_without_transport_error() {
+        let missing = map_dom_click_activation_result(DomClickActivationResult {
+            status: "missing_selector".into(),
+            error: None,
+        });
+        assert!(matches!(missing, Ok(false)));
+
+        let invalid = map_dom_click_activation_result(DomClickActivationResult {
+            status: "invalid_selector".into(),
+            error: Some("not a valid selector".into()),
+        });
+        assert!(matches!(invalid, Ok(false)));
+
+        let applied = map_dom_click_activation_result(DomClickActivationResult {
+            status: "applied".into(),
+            error: None,
+        });
+        assert!(matches!(applied, Ok(true)));
+    }
+
+    #[test]
+    fn dom_click_activation_result_keeps_element_failures_hard() {
+        let detached = map_dom_click_activation_result(DomClickActivationResult {
+            status: "detached".into(),
+            error: Some("Node is detached from document".into()),
+        });
+        assert!(
+            matches!(detached, Err(TransportError::Other(message)) if message == "Node is detached from document")
+        );
+
+        let malformed = map_dom_click_activation_result(DomClickActivationResult {
+            status: "surprise".into(),
+            error: None,
+        });
+        assert!(
+            matches!(malformed, Err(TransportError::Other(message)) if message.contains("unknown click activation status"))
+        );
+    }
+
+    #[test]
     fn compiled_observation_uses_stable_ids_with_private_selector_lookup() {
         let mut mapper = StableIdMapper::new();
         let (first, first_lookup) = compile_observation(
@@ -5499,7 +5750,8 @@ mod tests {
         // the *current* page blocked without any further navigation.
         driver = driver.with_url_policy(UrlPolicy::block_private());
 
-        // Click through with_element: must fail AND must not have clicked.
+        // Click through the selector activation path: must fail AND must not
+        // have clicked.
         let click_result = driver
             .act(&Action::Click {
                 node: save_node.clone(),
@@ -5539,7 +5791,7 @@ mod tests {
                 )
                 .await?,
             serde_json::json!("unset"),
-            "blocked-policy click still landed on the page: with_element's own \
+            "blocked-policy click still landed on the page: the click path's \
              URL-policy guard did not fire before the click"
         );
         let blocked_scroll_y = driver
@@ -5579,6 +5831,54 @@ mod tests {
             "allow-case scroll control did not move the page; the scroll probe is broken"
         );
 
+        driver.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_cdp_click_selector_lookup_ignores_page_query_selector_patch(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(chrome) = std::env::var_os("TEMPO_CDP_CHROME") else {
+            eprintln!("skipping live CDP querySelector isolation test; TEMPO_CDP_CHROME is unset");
+            return Ok(());
+        };
+        let url = serve_query_selector_patch_fixture()?;
+        let config = CdpConfig::default()
+            .with_executable(chrome.to_string_lossy())
+            .with_no_sandbox_env_opt_in();
+        let mut driver = CdpTempoDriver::launch_with(config)
+            .await?
+            .allow_private_network_access();
+
+        let observation = driver.goto(&url).await?;
+        let save_node = observation
+            .elements
+            .iter()
+            .find(|element| {
+                element.role == "button"
+                    && element.name.first().map(|span| span.text.as_str()) == Some("Save")
+            })
+            .map(|element| element.node_id.clone())
+            .ok_or_else(|| std::io::Error::other("missing save button"))?;
+
+        assert!(matches!(
+            driver.act(&Action::Click { node: save_node }).await?,
+            StepOutcome::Applied { .. }
+        ));
+        let state = driver
+            .evaluate_script(
+                "Promise.resolve({
+                    save: document.body.dataset.save ?? 'unset',
+                    trap: document.body.dataset.trap ?? 'unset',
+                    querySelectorCalled: document.body.dataset.querySelectorCalled ?? 'unset',
+                })",
+                true,
+            )
+            .await?;
+
+        assert_eq!(state["save"], serde_json::json!("yes"));
+        assert_eq!(state["trap"], serde_json::json!("unset"));
+        assert_eq!(state["querySelectorCalled"], serde_json::json!("unset"));
         driver.close().await?;
         Ok(())
     }
@@ -6129,6 +6429,49 @@ mod tests {
                       <span>Save</span>
                     </button>
                     <div style="height: 4000px"></div>
+                  </body>
+                </html>"#;
+            for stream in listener.incoming().take(16) {
+                let Ok(mut stream) = stream else {
+                    continue;
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+
+        Ok(format!("http://{addr}/"))
+    }
+
+    fn serve_query_selector_patch_fixture() -> Result<String, std::io::Error> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+
+        std::thread::spawn(move || {
+            let body = r#"<!doctype html>
+                <html>
+                  <body>
+                    <button id="save" onclick="document.body.dataset.save='yes'">
+                      <span>Save</span>
+                    </button>
+                    <button id="trap" onclick="document.body.dataset.trap='yes'">
+                      <span>Trap</span>
+                    </button>
+                    <script>
+                      const nativeQuerySelector = document.querySelector.bind(document);
+                      document.querySelector = function(selector) {
+                        document.body.dataset.querySelectorCalled = 'yes';
+                        if (selector === '[id="save"]') {
+                          return document.getElementById('trap');
+                        }
+                        return nativeQuerySelector(selector);
+                      };
+                    </script>
                   </body>
                 </html>"#;
             for stream in listener.incoming().take(16) {
