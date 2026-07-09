@@ -321,6 +321,17 @@ def validate_processes_at_peak(metric: dict[str, Any]) -> None:
         )
 
 
+def validate_optional_memory_total(metric: dict[str, Any], total_field: str, map_field: str) -> None:
+    if total_field not in metric and map_field not in metric:
+        return
+    runner = metric.get("runner", "<unknown>")
+    require_int(metric, total_field)
+    require_int_map(metric, map_field)
+    total = sum(int(value) for value in metric[map_field].values())
+    if total != int(metric[total_field]):
+        raise ValidationError(f"{runner}.{map_field} sum must equal {total_field}")
+
+
 def artifact_path(output_dir: Path, stored_path: str) -> Path:
     path = Path(stored_path)
     if path.exists():
@@ -361,6 +372,11 @@ def validate_metric(metric: dict[str, Any], iterations: int, output_dir: Path) -
     require_int_map(metric, "rss_at_peak_by_process_type_bytes", positive=True)
     require_int_map(metric, "peak_rss_by_process_type_bytes", positive=True)
     require_int_map(metric, "process_count_at_peak_by_type", positive=True)
+    validate_optional_memory_total(metric, "max_pss_bytes", "pss_at_peak_by_process_type_bytes")
+    validate_optional_memory_total(metric, "max_uss_bytes", "uss_at_peak_by_process_type_bytes")
+    for field in ("peak_pss_by_process_type_bytes", "peak_uss_by_process_type_bytes"):
+        if field in metric:
+            require_int_map(metric, field)
     rss_at_peak_total = sum(int(value) for value in metric["rss_at_peak_by_command_bytes"].values())
     if rss_at_peak_total != int(metric["max_rss_bytes"]):
         raise ValidationError(

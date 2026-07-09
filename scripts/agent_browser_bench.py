@@ -147,6 +147,12 @@ class RssSampler:
         self.peak_rss_by_command_bytes: dict[str, int] = {}
         self.rss_at_peak_by_process_type_bytes: dict[str, int] = {}
         self.peak_rss_by_process_type_bytes: dict[str, int] = {}
+        self.max_pss_bytes = 0
+        self.max_uss_bytes = 0
+        self.pss_at_peak_by_process_type_bytes: dict[str, int] = {}
+        self.uss_at_peak_by_process_type_bytes: dict[str, int] = {}
+        self.peak_pss_by_process_type_bytes: dict[str, int] = {}
+        self.peak_uss_by_process_type_bytes: dict[str, int] = {}
         self.rss_peak_elapsed_ms = 0
         self.process_count_at_peak = 0
         self.process_count_at_peak_by_type: dict[str, int] = {}
@@ -173,6 +179,13 @@ class RssSampler:
         if self.root_pid != os.getpid():
             pids.add(self.root_pid)
         rss, by_command, by_process_type, process_count_by_type, processes = rss_snapshot(pids)
+        process_type_by_pid = {
+            int(process["pid"]): str(process["process_type"]) for process in processes
+        }
+        pss, uss, pss_by_process_type, uss_by_process_type = pss_uss_snapshot(
+            pids,
+            process_type_by_pid,
+        )
         if rss > self.max_rss_bytes:
             self.max_rss_bytes = rss
             self.rss_at_peak_by_command_bytes = by_command
@@ -187,6 +200,18 @@ class RssSampler:
         for process_type, process_type_rss in by_process_type.items():
             if process_type_rss > self.peak_rss_by_process_type_bytes.get(process_type, 0):
                 self.peak_rss_by_process_type_bytes[process_type] = process_type_rss
+        if pss > self.max_pss_bytes:
+            self.max_pss_bytes = pss
+            self.pss_at_peak_by_process_type_bytes = pss_by_process_type
+        if uss > self.max_uss_bytes:
+            self.max_uss_bytes = uss
+            self.uss_at_peak_by_process_type_bytes = uss_by_process_type
+        for process_type, process_type_pss in pss_by_process_type.items():
+            if process_type_pss > self.peak_pss_by_process_type_bytes.get(process_type, 0):
+                self.peak_pss_by_process_type_bytes[process_type] = process_type_pss
+        for process_type, process_type_uss in uss_by_process_type.items():
+            if process_type_uss > self.peak_uss_by_process_type_bytes.get(process_type, 0):
+                self.peak_uss_by_process_type_bytes[process_type] = process_type_uss
 
     def metric_fields(self) -> dict[str, object]:
         return {
@@ -201,6 +226,20 @@ class RssSampler:
             ),
             "peak_rss_by_process_type_bytes": dict(
                 sorted(self.peak_rss_by_process_type_bytes.items())
+            ),
+            "max_pss_bytes": self.max_pss_bytes,
+            "max_uss_bytes": self.max_uss_bytes,
+            "pss_at_peak_by_process_type_bytes": dict(
+                sorted(self.pss_at_peak_by_process_type_bytes.items())
+            ),
+            "uss_at_peak_by_process_type_bytes": dict(
+                sorted(self.uss_at_peak_by_process_type_bytes.items())
+            ),
+            "peak_pss_by_process_type_bytes": dict(
+                sorted(self.peak_pss_by_process_type_bytes.items())
+            ),
+            "peak_uss_by_process_type_bytes": dict(
+                sorted(self.peak_uss_by_process_type_bytes.items())
             ),
             "rss_peak_elapsed_ms": self.rss_peak_elapsed_ms,
             "process_count_at_peak": self.process_count_at_peak,
@@ -310,6 +349,64 @@ def rss_snapshot(
         dict(sorted(process_count_by_type.items())),
         sorted(processes, key=lambda process: (str(process["process_type"]), int(process["pid"]))),
     )
+
+
+def pss_uss_snapshot(
+    pids: set[int],
+    process_type_by_pid: dict[int, str],
+) -> tuple[int, int, dict[str, int], dict[str, int]]:
+    total_pss_kib = 0
+    total_uss_kib = 0
+    pss_by_process_type: dict[str, int] = {}
+    uss_by_process_type: dict[str, int] = {}
+    for pid in pids:
+        pss_kib, uss_kib = smaps_rollup_memory_kib(pid)
+        if pss_kib <= 0 and uss_kib <= 0:
+            continue
+        process_type = process_type_by_pid.get(pid, "<unknown>")
+        total_pss_kib += pss_kib
+        total_uss_kib += uss_kib
+        pss_by_process_type[process_type] = (
+            pss_by_process_type.get(process_type, 0) + pss_kib * 1024
+        )
+        uss_by_process_type[process_type] = (
+            uss_by_process_type.get(process_type, 0) + uss_kib * 1024
+        )
+    return (
+        total_pss_kib * 1024,
+        total_uss_kib * 1024,
+        dict(sorted(pss_by_process_type.items())),
+        dict(sorted(uss_by_process_type.items())),
+    )
+
+
+def smaps_rollup_memory_kib(pid: int) -> tuple[int, int]:
+    path = Path("/proc") / str(pid) / "smaps_rollup"
+    try:
+        lines = path.read_text(errors="ignore").splitlines()
+    except OSError:
+        return 0, 0
+    pss_kib = 0
+    private_clean_kib = 0
+    private_dirty_kib = 0
+    for line in lines:
+        name, sep, value = line.partition(":")
+        if not sep:
+            continue
+        fields = value.strip().split()
+        if not fields:
+            continue
+        try:
+            kib = int(fields[0])
+        except ValueError:
+            continue
+        if name == "Pss":
+            pss_kib = kib
+        elif name == "Private_Clean":
+            private_clean_kib = kib
+        elif name == "Private_Dirty":
+            private_dirty_kib = kib
+    return pss_kib, private_clean_kib + private_dirty_kib
 
 
 def process_args_by_pid(pids: set[int]) -> dict[int, str]:
@@ -1294,6 +1391,10 @@ def benchmark_gap_report(metrics: list[dict], summary: dict) -> dict:
         ("steady_state_wall_clock_ms_p95", "lower_is_better", runners),
         ("max_rss_bytes_p95", "lower_is_better", runners),
         ("browser_rss_bytes_p95", "lower_is_better", runners),
+        ("max_pss_bytes_p95", "lower_is_better", runners),
+        ("browser_pss_bytes_p95", "lower_is_better", runners),
+        ("max_uss_bytes_p95", "lower_is_better", runners),
+        ("browser_uss_bytes_p95", "lower_is_better", runners),
         ("process_count_at_peak_p95", "lower_is_better", runners),
         ("browser_documents_p95", "lower_is_better", runners),
         ("browser_frames_p95", "lower_is_better", runners),
@@ -1548,6 +1649,30 @@ def comparison_row(runner: str, runner_summary: dict, runner_metrics: list[dict]
             [browser_rss_bytes(metric) for metric in runner_metrics],
             0.95,
         ),
+        "max_pss_bytes_p95": optional_metric_percentile(
+            runner_metrics,
+            "max_pss_bytes",
+            0.95,
+        ),
+        "browser_pss_bytes_p95": optional_percentile(
+            [
+                browser_memory_bytes(metric, "pss_at_peak_by_process_type_bytes")
+                for metric in runner_metrics
+            ],
+            0.95,
+        ),
+        "max_uss_bytes_p95": optional_metric_percentile(
+            runner_metrics,
+            "max_uss_bytes",
+            0.95,
+        ),
+        "browser_uss_bytes_p95": optional_percentile(
+            [
+                browser_memory_bytes(metric, "uss_at_peak_by_process_type_bytes")
+                for metric in runner_metrics
+            ],
+            0.95,
+        ),
         "process_count_at_peak_p95": percentile(
             [int(metric.get("process_count_at_peak", 0)) for metric in runner_metrics],
             0.95,
@@ -1632,7 +1757,11 @@ def runner_internal_wall_clock_ms_p95(runner_metrics: list[dict]) -> int | None:
 
 
 def browser_rss_bytes(metric: dict) -> int:
-    by_type = metric.get("rss_at_peak_by_process_type_bytes", {})
+    return browser_memory_bytes(metric, "rss_at_peak_by_process_type_bytes")
+
+
+def browser_memory_bytes(metric: dict, field: str) -> int:
+    by_type = metric.get(field, {})
     if not isinstance(by_type, dict):
         return 0
     return sum(
