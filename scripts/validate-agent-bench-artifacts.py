@@ -103,6 +103,27 @@ WEB_PERFORMANCE_ROW_FIELDS = {
     "long_task_duration_ms": "web_long_task_duration_ms_p95",
     "long_task_max_duration_ms": "web_long_task_max_duration_ms_p95",
 }
+RANKED_WEB_PERFORMANCE_ROW_FIELDS = (
+    "web_navigation_duration_ms_p95",
+    "web_fetch_start_ms_p95",
+    "web_request_start_ms_p95",
+    "web_response_start_ms_p95",
+    "web_response_end_ms_p95",
+    "web_dom_interactive_ms_p95",
+    "web_dom_content_loaded_start_ms_p95",
+    "web_dom_content_loaded_ms_p95",
+    "web_dom_complete_ms_p95",
+    "web_load_event_start_ms_p95",
+    "web_load_event_ms_p95",
+    "web_resource_duration_ms_p95",
+    "web_resource_max_duration_ms_p95",
+    "web_resource_response_end_ms_p95",
+    "web_first_paint_ms_p95",
+    "web_first_contentful_paint_ms_p95",
+    "web_long_task_count_p95",
+    "web_long_task_duration_ms_p95",
+    "web_long_task_max_duration_ms_p95",
+)
 
 REQUIRED_METRIC_FIELDS = {
     "runner",
@@ -126,6 +147,8 @@ REQUIRED_METRIC_FIELDS = {
     "rss_at_peak_by_process_type_bytes",
     "peak_rss_by_process_type_bytes",
     "rss_peak_elapsed_ms",
+    "max_process_count",
+    "max_process_count_by_type",
     "process_count_at_peak",
     "process_count_at_peak_by_type",
     "processes_at_peak",
@@ -144,6 +167,7 @@ INT_FIELDS = {
     "cpu_system_ms",
     "max_rss_bytes",
     "rss_peak_elapsed_ms",
+    "max_process_count",
     "process_count_at_peak",
     "iteration",
 }
@@ -396,6 +420,16 @@ def validate_metric(metric: dict[str, Any], iterations: int, output_dir: Path) -
         raise ValidationError(
             f"{runner}.process_count_at_peak_by_type sum must equal process_count_at_peak"
         )
+    require_int_map(metric, "max_process_count_by_type", positive=True)
+    max_process_count_total = sum(
+        int(value) for value in metric["max_process_count_by_type"].values()
+    )
+    if max_process_count_total != int(metric["max_process_count"]):
+        raise ValidationError(
+            f"{runner}.max_process_count_by_type sum must equal max_process_count"
+        )
+    if int(metric["max_process_count"]) < int(metric["process_count_at_peak"]):
+        raise ValidationError(f"{runner}.max_process_count must be >= process_count_at_peak")
     validate_processes_at_peak(metric)
     if not 1 <= int(metric["iteration"]) <= iterations:
         raise ValidationError(f"{runner}.iteration is outside expected range: {metric['iteration']}")
@@ -697,7 +731,7 @@ def expected_gap_report(metrics: list[dict[str, Any]], summary: dict[str, Any]) 
         ("browser_pss_bytes_p95", "lower_is_better", runners),
         ("max_uss_bytes_p95", "lower_is_better", runners),
         ("browser_uss_bytes_p95", "lower_is_better", runners),
-        ("process_count_at_peak_p95", "lower_is_better", runners),
+        ("max_process_count_p95", "lower_is_better", runners),
         ("browser_documents_p95", "lower_is_better", runners),
         ("browser_frames_p95", "lower_is_better", runners),
         ("browser_js_event_listeners_p95", "lower_is_better", runners),
@@ -760,13 +794,8 @@ def expected_gap_report(metrics: list[dict[str, Any]], summary: dict[str, Any]) 
         ),
         ("cpu_time_ms_p95", "lower_is_better", runners),
     ]
-    ranked_browser_fields = set(BROWSER_PERFORMANCE_ROW_FIELDS.values())
-    for metric_name in browser_performance_metric_names(metrics):
-        field_name = browser_performance_metric_row_field(metric_name)
-        if field_name not in ranked_browser_fields:
-            category_specs.append((field_name, "lower_is_better", runners))
     ranked_category_fields = {name for name, _direction, _runners in category_specs}
-    for field_name in WEB_PERFORMANCE_ROW_FIELDS.values():
+    for field_name in RANKED_WEB_PERFORMANCE_ROW_FIELDS:
         if field_name not in ranked_category_fields:
             category_specs.append((field_name, "lower_is_better", runners))
             ranked_category_fields.add(field_name)
@@ -1011,6 +1040,13 @@ def comparison_row(
         ),
         "process_count_at_peak_p95": percentile(
             [int(metric.get("process_count_at_peak", 0)) for metric in runner_metrics],
+            0.95,
+        ),
+        "max_process_count_p95": percentile(
+            [
+                int(metric.get("max_process_count", metric.get("process_count_at_peak", 0)))
+                for metric in runner_metrics
+            ],
             0.95,
         ),
         "web_performance_metrics_available": all(

@@ -101,6 +101,27 @@ WEB_PERFORMANCE_ROW_FIELDS = {
     "long_task_duration_ms": "web_long_task_duration_ms_p95",
     "long_task_max_duration_ms": "web_long_task_max_duration_ms_p95",
 }
+RANKED_WEB_PERFORMANCE_ROW_FIELDS = (
+    "web_navigation_duration_ms_p95",
+    "web_fetch_start_ms_p95",
+    "web_request_start_ms_p95",
+    "web_response_start_ms_p95",
+    "web_response_end_ms_p95",
+    "web_dom_interactive_ms_p95",
+    "web_dom_content_loaded_start_ms_p95",
+    "web_dom_content_loaded_ms_p95",
+    "web_dom_complete_ms_p95",
+    "web_load_event_start_ms_p95",
+    "web_load_event_ms_p95",
+    "web_resource_duration_ms_p95",
+    "web_resource_max_duration_ms_p95",
+    "web_resource_response_end_ms_p95",
+    "web_first_paint_ms_p95",
+    "web_first_contentful_paint_ms_p95",
+    "web_long_task_count_p95",
+    "web_long_task_duration_ms_p95",
+    "web_long_task_max_duration_ms_p95",
+)
 CHECKOUT_ORACLE_EMAIL = "agent@example.com"
 CHECKOUT_ORACLE_STATUS = "Order submitted"
 ALLOW_UNSAFE_HOST_ENV = "TEMPO_AGENT_BENCH_ALLOW_UNSAFE_HOST_ENV"
@@ -234,6 +255,8 @@ class RssSampler:
         self.peak_pss_by_process_type_bytes: dict[str, int] = {}
         self.peak_uss_by_process_type_bytes: dict[str, int] = {}
         self.rss_peak_elapsed_ms = 0
+        self.max_process_count = 0
+        self.max_process_count_by_type: dict[str, int] = {}
         self.process_count_at_peak = 0
         self.process_count_at_peak_by_type: dict[str, int] = {}
         self.processes_at_peak: list[dict[str, object]] = []
@@ -266,12 +289,16 @@ class RssSampler:
             pids,
             process_type_by_pid,
         )
+        process_count = sum(process_count_by_type.values())
+        if process_count > self.max_process_count:
+            self.max_process_count = process_count
+            self.max_process_count_by_type = process_count_by_type
         if rss > self.max_rss_bytes:
             self.max_rss_bytes = rss
             self.rss_at_peak_by_command_bytes = by_command
             self.rss_at_peak_by_process_type_bytes = by_process_type
             self.rss_peak_elapsed_ms = int((time.monotonic() - self.started) * 1000)
-            self.process_count_at_peak = sum(process_count_by_type.values())
+            self.process_count_at_peak = process_count
             self.process_count_at_peak_by_type = process_count_by_type
             self.processes_at_peak = processes
         for command, command_rss in by_command.items():
@@ -322,6 +349,8 @@ class RssSampler:
                 sorted(self.peak_uss_by_process_type_bytes.items())
             ),
             "rss_peak_elapsed_ms": self.rss_peak_elapsed_ms,
+            "max_process_count": self.max_process_count,
+            "max_process_count_by_type": dict(sorted(self.max_process_count_by_type.items())),
             "process_count_at_peak": self.process_count_at_peak,
             "process_count_at_peak_by_type": dict(
                 sorted(self.process_count_at_peak_by_type.items())
@@ -1618,7 +1647,7 @@ def benchmark_gap_report(metrics: list[dict], summary: dict) -> dict:
         ("browser_pss_bytes_p95", "lower_is_better", runners),
         ("max_uss_bytes_p95", "lower_is_better", runners),
         ("browser_uss_bytes_p95", "lower_is_better", runners),
-        ("process_count_at_peak_p95", "lower_is_better", runners),
+        ("max_process_count_p95", "lower_is_better", runners),
         ("browser_documents_p95", "lower_is_better", runners),
         ("browser_frames_p95", "lower_is_better", runners),
         ("browser_js_event_listeners_p95", "lower_is_better", runners),
@@ -1681,13 +1710,8 @@ def benchmark_gap_report(metrics: list[dict], summary: dict) -> dict:
         ),
         ("cpu_time_ms_p95", "lower_is_better", runners),
     ]
-    ranked_browser_fields = set(BROWSER_PERFORMANCE_ROW_FIELDS.values())
-    for metric_name in browser_performance_metric_names(metrics):
-        field_name = browser_performance_metric_row_field(metric_name)
-        if field_name not in ranked_browser_fields:
-            category_specs.append((field_name, "lower_is_better", runners))
     ranked_category_fields = {name for name, _direction, _runners in category_specs}
-    for field_name in WEB_PERFORMANCE_ROW_FIELDS.values():
+    for field_name in RANKED_WEB_PERFORMANCE_ROW_FIELDS:
         if field_name not in ranked_category_fields:
             category_specs.append((field_name, "lower_is_better", runners))
             ranked_category_fields.add(field_name)
@@ -1898,6 +1922,13 @@ def comparison_row(runner: str, runner_summary: dict, runner_metrics: list[dict]
         ),
         "process_count_at_peak_p95": percentile(
             [int(metric.get("process_count_at_peak", 0)) for metric in runner_metrics],
+            0.95,
+        ),
+        "max_process_count_p95": percentile(
+            [
+                int(metric.get("max_process_count", metric.get("process_count_at_peak", 0)))
+                for metric in runner_metrics
+            ],
             0.95,
         ),
         "web_performance_metrics_available": all(

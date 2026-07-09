@@ -127,7 +127,7 @@ def render_status_markdown(
             "",
             "## Browser Metrics",
             "",
-            "| Runner | Browser Perf | Internal Wall p95 | Browser RSS p95 | Proc Count p95 | Nodes p95 | Task p95 | JS Heap p95 | Model Obs p95 | Total Tokens p95 |",
+            "| Runner | Browser Perf | Internal Wall p95 | Browser RSS p95 | Max Proc p95 | Nodes p95 | Task p95 | JS Heap p95 | Model Obs p95 | Total Tokens p95 |",
             "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
     )
@@ -148,8 +148,8 @@ def render_status_markdown(
                 ),
                 browser_rss=format_value("browser_rss_bytes_p95", row.get("browser_rss_bytes_p95")),
                 proc_count=format_value(
-                    "process_count_at_peak_p95",
-                    row.get("process_count_at_peak_p95"),
+                    "max_process_count_p95",
+                    row.get("max_process_count_p95"),
                 ),
                 nodes=format_value("browser_nodes_p95", row.get("browser_nodes_p95")),
                 task=format_value(
