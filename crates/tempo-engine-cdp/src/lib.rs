@@ -114,6 +114,21 @@ pub const TEMPO_CDP_BENCH_ENABLE_CACHE_ENV: &str = "TEMPO_CDP_BENCH_ENABLE_CACHE
 /// helper probes so process-count metrics stay focused on browser work.
 pub const TEMPO_CDP_BENCH_SUPPRESS_DESKTOP_ENV: &str = "TEMPO_CDP_BENCH_SUPPRESS_DESKTOP";
 
+/// Driver-local counters for CDP observation work.
+///
+/// These are intentionally Tempo-only instrumentation counters for benchmark
+/// evidence, not part of the engine-agnostic driver contract.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CdpObservationCounters {
+    pub snapshot_since_count: usize,
+    pub record_snapshot_count: usize,
+    pub ax_full_tree_count: usize,
+    pub ax_partial_tree_count: usize,
+    pub observe_count: usize,
+    pub observe_diff_count: usize,
+    pub act_batch_count: usize,
+}
+
 /// Launch configuration for the CDP fallback lane.
 #[derive(Clone, Debug)]
 pub struct CdpConfig {
@@ -329,6 +344,7 @@ pub struct CdpTempoDriver {
     browser_hardening_policy: Arc<Mutex<BrowserHardeningPolicy>>,
     blocked_request_url: Arc<Mutex<Option<String>>>,
     request_policy_tracker: Arc<RequestPolicyTracker>,
+    observation_counters: Mutex<CdpObservationCounters>,
     /// Cached isolated-world execution context for the stability probe.
     /// Invalidated by navigation; recreated on demand.
     probe_context: Mutex<Option<ExecutionContextId>>,
@@ -420,6 +436,7 @@ impl CdpTempoDriver {
             browser_hardening_policy,
             blocked_request_url,
             request_policy_tracker,
+            observation_counters: Mutex::new(CdpObservationCounters::default()),
             probe_context: Mutex::new(None),
         })
     }
@@ -439,6 +456,19 @@ impl CdpTempoDriver {
             .into_iter()
             .map(|metric| (metric.name, metric.value))
             .collect())
+    }
+
+    pub fn observation_counters(&self) -> CdpObservationCounters {
+        self.observation_counters
+            .lock()
+            .map(|counters| *counters)
+            .unwrap_or_default()
+    }
+
+    fn increment_observation_counter(&self, update: impl FnOnce(&mut CdpObservationCounters)) {
+        if let Ok(mut counters) = self.observation_counters.lock() {
+            update(&mut counters);
+        }
     }
 
     /// Override the shared pre-navigation URL policy used by the CDP lane.
@@ -602,6 +632,7 @@ impl CdpTempoDriver {
     }
 
     async fn snapshot_since(&self, cursor: u64) -> Result<(String, String), TransportError> {
+        self.increment_observation_counter(|counters| counters.snapshot_since_count += 1);
         let url = self.current_url().await?;
         self.enforce_current_url_policy_value(&url)?;
         self.enforce_no_blocked_request_since(cursor)?;
@@ -622,6 +653,7 @@ impl CdpTempoDriver {
         dom_html: String,
         _http_status: Option<u16>,
     ) -> Result<Arc<CompiledObservation>, TransportError> {
+        self.increment_observation_counter(|counters| counters.record_snapshot_count += 1);
         self.seq += 1;
         let (mut compiled, selectors_by_node) =
             compile_observation(&mut self.stable_id_mapper, url, dom_html, self.seq);
@@ -864,6 +896,7 @@ impl CdpTempoDriver {
         // observation hot path (#299). `fetch_relatives(false)` scopes the reply
         // to the queried node alone — no ancestors, siblings, or children — so
         // the response describes exactly that element's own AX node.
+        self.increment_observation_counter(|counters| counters.ax_partial_tree_count += 1);
         let ax_nodes = match page
             .execute(
                 GetPartialAxTreeParams::builder()
@@ -1503,10 +1536,12 @@ impl DriverTrait for CdpTempoDriver {
     }
 
     async fn observe(&mut self) -> Result<CompiledObservation, TransportError> {
+        self.increment_observation_counter(|counters| counters.observe_count += 1);
         Ok(self.record_current_observation().await?.as_ref().clone())
     }
 
     async fn observe_diff(&mut self, since_seq: u64) -> Result<ObservationDiff, TransportError> {
+        self.increment_observation_counter(|counters| counters.observe_diff_count += 1);
         let observation = self.record_current_observation().await?;
         Ok(diff_from_base(
             history_base(&self.history, since_seq),
@@ -1520,6 +1555,7 @@ impl DriverTrait for CdpTempoDriver {
     }
 
     async fn act_batch(&mut self, batch: &ActionBatch) -> Result<StepOutcome, TransportError> {
+        self.increment_observation_counter(|counters| counters.act_batch_count += 1);
         let batch_base_seq = self.seq;
         let mut last_settled = None;
         for action in &batch.actions {

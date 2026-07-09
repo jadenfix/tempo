@@ -24,7 +24,7 @@ use tempo_compat::{
     CompatGateBudget, CompatThresholds, InjectionCaseResult, InjectionRateViolation,
 };
 use tempo_driver::{DriverTrait, TransportError};
-use tempo_engine_cdp::{CdpConfig, CdpTempoDriver};
+use tempo_engine_cdp::{CdpConfig, CdpObservationCounters, CdpTempoDriver};
 use tempo_evals::{
     eval_record_from_session_journal_with_retention_policy, read_eval_records, write_scorecard,
     EvalBudget, EvalError, Lane, Scorecard, SessionEvalDescriptor,
@@ -935,6 +935,7 @@ struct RunCdpTaskReport {
     max_model_input_tokens: usize,
     total_model_input_bytes: usize,
     total_model_input_tokens: usize,
+    cdp_observation_counters: RunCdpTaskCdpObservationCounters,
     steps: Vec<RunCdpTaskStep>,
 }
 
@@ -949,6 +950,17 @@ struct RunCdpTaskTimings {
     agent_run_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     driver_close_ms: Option<u64>,
+}
+
+#[derive(Debug, Default, PartialEq, Eq, Serialize)]
+struct RunCdpTaskCdpObservationCounters {
+    snapshot_since_count: usize,
+    record_snapshot_count: usize,
+    ax_full_tree_count: usize,
+    ax_partial_tree_count: usize,
+    observe_count: usize,
+    observe_diff_count: usize,
+    act_batch_count: usize,
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize)]
@@ -994,6 +1006,7 @@ impl RunCdpTaskReport {
         browser_performance_metrics: BTreeMap<String, f64>,
         web_performance_metrics: BTreeMap<String, u64>,
         final_page_state: Value,
+        cdp_observation_counters: CdpObservationCounters,
     ) -> Self {
         let browser_performance_metrics_available = !browser_performance_metrics.is_empty();
         let web_performance_metrics_available = !web_performance_metrics.is_empty();
@@ -1019,7 +1032,22 @@ impl RunCdpTaskReport {
             max_model_input_tokens: report.max_model_input_tokens,
             total_model_input_bytes: report.total_model_input_bytes,
             total_model_input_tokens: report.total_model_input_tokens,
+            cdp_observation_counters: cdp_observation_counters.into(),
             steps: report.steps.iter().map(RunCdpTaskStep::from).collect(),
+        }
+    }
+}
+
+impl From<CdpObservationCounters> for RunCdpTaskCdpObservationCounters {
+    fn from(counters: CdpObservationCounters) -> Self {
+        Self {
+            snapshot_since_count: counters.snapshot_since_count,
+            record_snapshot_count: counters.record_snapshot_count,
+            ax_full_tree_count: counters.ax_full_tree_count,
+            ax_partial_tree_count: counters.ax_partial_tree_count,
+            observe_count: counters.observe_count,
+            observe_diff_count: counters.observe_diff_count,
+            act_batch_count: counters.act_batch_count,
         }
     }
 }
@@ -1079,6 +1107,7 @@ fn run_cdp_task(config: RunCdpTaskConfig) -> Result<RunCdpTaskReport, CliError> 
             BTreeMap::new(),
             BTreeMap::new(),
             Value::Null,
+            CdpObservationCounters::default(),
         ));
     }
 
@@ -1120,6 +1149,7 @@ fn run_cdp_task(config: RunCdpTaskConfig) -> Result<RunCdpTaskReport, CliError> 
         timings_ms.agent_run_ms = Some(elapsed_ms(agent_run_started));
         let browser_performance_metrics_result = driver.browser_performance_metrics().await;
         let benchmark_page_report_result = collect_benchmark_page_report(&mut driver).await;
+        let cdp_observation_counters = driver.observation_counters();
         let driver_close_started = Instant::now();
         let close_result = driver.close().await;
         timings_ms.driver_close_ms = Some(elapsed_ms(driver_close_started));
@@ -1134,6 +1164,7 @@ fn run_cdp_task(config: RunCdpTaskConfig) -> Result<RunCdpTaskReport, CliError> 
             browser_performance_metrics,
             web_performance_metrics,
             final_page_state,
+            cdp_observation_counters,
         ))
     })
 }
@@ -2301,6 +2332,10 @@ mod tests {
         assert_eq!(report.status.lane, Some("mcp"));
         assert_eq!(report.status.signal, Some("mcp_catalog"));
         assert_eq!(report.observations, 0);
+        assert_eq!(
+            report.cdp_observation_counters,
+            RunCdpTaskCdpObservationCounters::default()
+        );
         assert_eq!(report.timings_ms.driver_launch_ms, None);
         assert_eq!(report.timings_ms.driver_close_ms, None);
         assert!(report.timings_ms.agent_run_ms.is_some());
