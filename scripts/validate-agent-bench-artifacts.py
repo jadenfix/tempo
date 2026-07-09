@@ -149,6 +149,14 @@ RANKED_WEB_PERFORMANCE_ROW_FIELDS = (
     "web_long_task_duration_ms_p95",
     "web_long_task_max_duration_ms_p95",
 )
+PROCESS_TREE_COUNTER_FIELDS = (
+    "process_tree_cpu_user_ms",
+    "process_tree_cpu_system_ms",
+    "process_tree_minor_page_faults",
+    "process_tree_major_page_faults",
+    "process_tree_voluntary_context_switches",
+    "process_tree_nonvoluntary_context_switches",
+)
 
 REQUIRED_METRIC_FIELDS = {
     "runner",
@@ -439,6 +447,13 @@ def validate_processes_snapshot(
             raise ValidationError(f"{runner}.{field}[{index}].rss_bytes must be > 0")
         if not isinstance(args, str):
             raise ValidationError(f"{runner}.{field}[{index}].args must be a string")
+        for counter_field in PROCESS_TREE_COUNTER_FIELDS:
+            if counter_field in process:
+                value = process[counter_field]
+                if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                    raise ValidationError(
+                        f"{runner}.{field}[{index}].{counter_field} must be >= 0"
+                    )
 
         rss_total += rss_bytes
         by_command[command] = by_command.get(command, 0) + rss_bytes
@@ -497,6 +512,19 @@ def validate_optional_memory_total(metric: dict[str, Any], total_field: str, map
     total = sum(int(value) for value in metric[map_field].values())
     if total != int(metric[total_field]):
         raise ValidationError(f"{runner}.{map_field} sum must equal {total_field}")
+
+
+def validate_optional_process_tree_counters(metric: dict[str, Any]) -> None:
+    if not any(field in metric for field in PROCESS_TREE_COUNTER_FIELDS):
+        return
+    runner = metric.get("runner", "<unknown>")
+    for field in PROCESS_TREE_COUNTER_FIELDS:
+        map_field = f"{field}_by_process_type"
+        require_int(metric, field)
+        require_int_map(metric, map_field)
+        total = sum(int(value) for value in metric[map_field].values())
+        if total != int(metric[field]):
+            raise ValidationError(f"{runner}.{map_field} sum must equal {field}")
 
 
 def tempo_metric_has_cdp_observation_counters(metric: dict[str, Any]) -> bool:
@@ -594,6 +622,7 @@ def validate_metric(metric: dict[str, Any], iterations: int, output_dir: Path) -
         raise ValidationError(f"{runner}.sampler_root_included must be true when present")
     if "sampler_root_pid" in metric:
         require_int(metric, "sampler_root_pid", positive=True)
+    validate_optional_process_tree_counters(metric)
 
     if runner != "raw-chrome-cdp":
         require_int(metric, "model_input_bytes", positive=True)
@@ -927,6 +956,9 @@ def expected_summary(metrics: list[dict[str, Any]]) -> dict[str, Any]:
         ):
             if any(field in metric for metric in runner_metrics):
                 runner_summary[field] = summarize_int_field(runner_metrics, field)
+        for field in PROCESS_TREE_COUNTER_FIELDS:
+            if any(field in metric for metric in runner_metrics):
+                runner_summary[field] = summarize_int_field(runner_metrics, field)
         for field in TEMPO_CDP_OBSERVATION_COUNTER_FIELDS:
             metric_field = f"cdp_{field}"
             if any(metric_field in metric for metric in runner_metrics):
@@ -962,6 +994,16 @@ def expected_gap_report(metrics: list[dict[str, Any]], summary: dict[str, Any]) 
         ("browser_uss_bytes_p95", "lower_is_better", runners),
         ("browser_peak_uss_bytes_p95", "lower_is_better", runners),
         ("max_process_count_p95", "lower_is_better", runners),
+        ("process_tree_cpu_time_ms_p95", "lower_is_better", runners),
+        ("browser_process_tree_cpu_time_ms_p95", "lower_is_better", runners),
+        ("process_tree_minor_page_faults_p95", "lower_is_better", runners),
+        ("browser_process_tree_minor_page_faults_p95", "lower_is_better", runners),
+        ("process_tree_major_page_faults_p95", "lower_is_better", runners),
+        ("browser_process_tree_major_page_faults_p95", "lower_is_better", runners),
+        ("process_tree_voluntary_context_switches_p95", "lower_is_better", runners),
+        ("browser_process_tree_voluntary_context_switches_p95", "lower_is_better", runners),
+        ("process_tree_nonvoluntary_context_switches_p95", "lower_is_better", runners),
+        ("browser_process_tree_nonvoluntary_context_switches_p95", "lower_is_better", runners),
         ("browser_documents_p95", "lower_is_better", runners),
         ("browser_frames_p95", "lower_is_better", runners),
         ("browser_js_event_listeners_p95", "lower_is_better", runners),
@@ -1122,6 +1164,13 @@ def expected_gap_report(metrics: list[dict[str, Any]], summary: dict[str, Any]) 
     ):
         comparison_notes.append(
             "Tempo rows marked cdp_browser_profile_contract=automation-default use Playwright-style lifecycle overrides and must not be presented as stock Chrome lifecycle performance."
+        )
+    if any(
+        any(field in metric for field in PROCESS_TREE_COUNTER_FIELDS)
+        for metric in metrics
+    ):
+        comparison_notes.append(
+            "process_tree_* categories come from Linux /proc first-seen to latest-seen deltas across each runner root process and descendants; browser_process_tree_* sums only Chrome process types."
         )
     comparison_notes.extend(
         [
@@ -1319,6 +1368,46 @@ def comparison_row(
             ],
             0.95,
         ),
+        "process_tree_cpu_time_ms_p95": process_tree_cpu_time_ms_p95(runner_metrics),
+        "browser_process_tree_cpu_time_ms_p95": browser_process_tree_cpu_time_ms_p95(
+            runner_metrics
+        ),
+        "process_tree_minor_page_faults_p95": optional_metric_percentile(
+            runner_metrics,
+            "process_tree_minor_page_faults",
+            0.95,
+        ),
+        "browser_process_tree_minor_page_faults_p95": browser_process_counter_p95(
+            runner_metrics,
+            "process_tree_minor_page_faults_by_process_type",
+        ),
+        "process_tree_major_page_faults_p95": optional_metric_percentile(
+            runner_metrics,
+            "process_tree_major_page_faults",
+            0.95,
+        ),
+        "browser_process_tree_major_page_faults_p95": browser_process_counter_p95(
+            runner_metrics,
+            "process_tree_major_page_faults_by_process_type",
+        ),
+        "process_tree_voluntary_context_switches_p95": optional_metric_percentile(
+            runner_metrics,
+            "process_tree_voluntary_context_switches",
+            0.95,
+        ),
+        "browser_process_tree_voluntary_context_switches_p95": browser_process_counter_p95(
+            runner_metrics,
+            "process_tree_voluntary_context_switches_by_process_type",
+        ),
+        "process_tree_nonvoluntary_context_switches_p95": optional_metric_percentile(
+            runner_metrics,
+            "process_tree_nonvoluntary_context_switches",
+            0.95,
+        ),
+        "browser_process_tree_nonvoluntary_context_switches_p95": browser_process_counter_p95(
+            runner_metrics,
+            "process_tree_nonvoluntary_context_switches_by_process_type",
+        ),
         "web_performance_metrics_available": all(
             bool(metric.get("web_performance_metrics_available"))
             for metric in runner_metrics
@@ -1332,6 +1421,20 @@ def comparison_row(
         "step_count_p95": int(runner_summary["step_count"]["p95"]),
     }
     first_metric = runner_metrics[0] if runner_metrics else {}
+    for field in (
+        "process_tree_cpu_time_ms_p95",
+        "browser_process_tree_cpu_time_ms_p95",
+        "process_tree_minor_page_faults_p95",
+        "browser_process_tree_minor_page_faults_p95",
+        "process_tree_major_page_faults_p95",
+        "browser_process_tree_major_page_faults_p95",
+        "process_tree_voluntary_context_switches_p95",
+        "browser_process_tree_voluntary_context_switches_p95",
+        "process_tree_nonvoluntary_context_switches_p95",
+        "browser_process_tree_nonvoluntary_context_switches_p95",
+    ):
+        if row.get(field) is None:
+            row.pop(field, None)
     if "cdp_browser_profile_contract" in first_metric:
         for field in (
             "cdp_browser_profile_contract",
@@ -1374,6 +1477,64 @@ def runner_internal_wall_clock_ms_p95(runner_metrics: list[dict[str, Any]]) -> i
         else:
             values.append(int(metric["wall_clock_ms"]))
     return percentile(values, 0.95) if values else None
+
+
+def process_tree_cpu_time_ms_p95(runner_metrics: list[dict[str, Any]]) -> int | None:
+    values = []
+    for metric in runner_metrics:
+        if (
+            "process_tree_cpu_user_ms" not in metric
+            or "process_tree_cpu_system_ms" not in metric
+        ):
+            return None
+        values.append(
+            int(metric["process_tree_cpu_user_ms"])
+            + int(metric["process_tree_cpu_system_ms"])
+        )
+    return percentile(values, 0.95) if values else None
+
+
+def browser_process_tree_cpu_time_ms_p95(
+    runner_metrics: list[dict[str, Any]],
+) -> int | None:
+    values = []
+    for metric in runner_metrics:
+        user = browser_process_counter(
+            metric,
+            "process_tree_cpu_user_ms_by_process_type",
+        )
+        system = browser_process_counter(
+            metric,
+            "process_tree_cpu_system_ms_by_process_type",
+        )
+        if user is None or system is None:
+            return None
+        values.append(user + system)
+    return percentile(values, 0.95) if values else None
+
+
+def browser_process_counter_p95(
+    runner_metrics: list[dict[str, Any]],
+    field: str,
+) -> int | None:
+    values = []
+    for metric in runner_metrics:
+        value = browser_process_counter(metric, field)
+        if value is None:
+            return None
+        values.append(value)
+    return percentile(values, 0.95) if values else None
+
+
+def browser_process_counter(metric: dict[str, Any], field: str) -> int | None:
+    by_type = metric.get(field)
+    if not isinstance(by_type, dict):
+        return None
+    return sum(
+        int(value)
+        for key, value in by_type.items()
+        if isinstance(key, str) and (key == "chrome-browser" or key.startswith("chrome-"))
+    )
 
 
 def browser_rss_bytes(metric: dict[str, Any]) -> int:
