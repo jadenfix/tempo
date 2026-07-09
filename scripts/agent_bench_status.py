@@ -56,6 +56,31 @@ def render_status_markdown(
                 "Runner order rotates per iteration to reduce deterministic warm-cache/order bias.",
             ]
         )
+    tempo_rows = [
+        row for row in rows if isinstance(row, dict) and row.get("runner") == "tempo-cdp-agent"
+    ]
+    profile_counts: dict[str, int] = {}
+    launch_profiles: dict[str, int] = {}
+    lifecycle_overrides: set[str] = set()
+    for row in tempo_rows:
+        contract = row.get("cdp_browser_profile_contract")
+        if isinstance(contract, str) and contract:
+            profile_counts[contract] = profile_counts.get(contract, 0) + 1
+        launch_profile = row.get("cdp_launch_profile")
+        if isinstance(launch_profile, str) and launch_profile:
+            launch_profiles[launch_profile] = launch_profiles.get(launch_profile, 0) + 1
+        overrides = row.get("cdp_lifecycle_overrides")
+        if isinstance(overrides, list):
+            lifecycle_overrides.update(str(value) for value in overrides)
+    if profile_counts or launch_profiles:
+        lines.extend(["", "## Browser Profile Contract", ""])
+        for contract, count in sorted(profile_counts.items()):
+            lines.append(f"- `{contract}` Tempo rows: `{count}`")
+        for launch_profile, count in sorted(launch_profiles.items()):
+            lines.append(f"- `{launch_profile}` launch rows: `{count}`")
+        if lifecycle_overrides:
+            joined = ", ".join(f"`{value}`" for value in sorted(lifecycle_overrides))
+            lines.append(f"- Lifecycle overrides: {joined}")
     lines.extend(
         [
         "",

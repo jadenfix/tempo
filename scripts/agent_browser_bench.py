@@ -976,6 +976,12 @@ def run_tempo(url: str, chrome: str, output_dir: Path) -> dict:
         report.get("status", {}).get("state") in {"completed", "already_complete"}
         and final_oracle.get("submitted") is True
     )
+    has_playwright_lifecycle = env.get("TEMPO_CDP_BENCH_PLAYWRIGHT_LIFECYCLE_ARGS") == "1"
+    lifecycle_overrides = (
+        ["BackForwardCache", "PaintHolding", "RenderDocument"]
+        if has_playwright_lifecycle
+        else []
+    )
     metric = {
         "runner": "tempo-cdp-agent",
         "suite": SUITE,
@@ -1033,10 +1039,12 @@ def run_tempo(url: str, chrome: str, output_dir: Path) -> dict:
         "tempo_engine": str(report.get("engine", "")),
         "tempo_runtime_flavor": runtime_flavor,
         "cdp_launch_profile": (
-            "playwright-lifecycle"
-            if env.get("TEMPO_CDP_BENCH_PLAYWRIGHT_LIFECYCLE_ARGS") == "1"
-            else "tempo-default"
+            "playwright-lifecycle" if has_playwright_lifecycle else "tempo-default"
         ),
+        "cdp_browser_profile_contract": (
+            "automation-default" if has_playwright_lifecycle else "browser-realistic"
+        ),
+        "cdp_lifecycle_overrides": lifecycle_overrides,
         "cdp_type_dispatch": (
             "insert-text" if env.get("TEMPO_CDP_BENCH_INSERT_TEXT_TYPE") == "1" else "key-events"
         ),
@@ -1909,6 +1917,13 @@ def benchmark_gap_report(metrics: list[dict], summary: dict) -> dict:
         comparison_notes.append(
             "Process-tree memory/process metrics include each runner root process and its descendants; rows record sampler_root_included so subprocess and in-process lanes expose their accounting scope."
         )
+    if any(
+        metric.get("cdp_browser_profile_contract") == "automation-default"
+        for metric in metrics
+    ):
+        comparison_notes.append(
+            "Tempo rows marked cdp_browser_profile_contract=automation-default use Playwright-style lifecycle overrides and must not be presented as stock Chrome lifecycle performance."
+        )
     comparison_notes.extend(
         [
             "CDP Performance.getMetrics fields are required and ranked for every runner in this CDP-backed benchmark.",
@@ -1933,7 +1948,7 @@ def benchmark_gap_report(metrics: list[dict], summary: dict) -> dict:
 
 
 def comparison_row(runner: str, runner_summary: dict, runner_metrics: list[dict]) -> dict:
-    return {
+    row = {
         "runner": runner,
         "runs": int(runner_summary["runs"]),
         "success_rate": float(runner_summary["success_rate"]),
@@ -2115,6 +2130,16 @@ def comparison_row(runner: str, runner_summary: dict, runner_metrics: list[dict]
         "model_input_observations_p95": int(runner_summary["model_input_observations"]["p95"]),
         "step_count_p95": int(runner_summary["step_count"]["p95"]),
     }
+    first_metric = runner_metrics[0] if runner_metrics else {}
+    if "cdp_browser_profile_contract" in first_metric:
+        for field in (
+            "cdp_browser_profile_contract",
+            "cdp_launch_profile",
+            "cdp_lifecycle_overrides",
+        ):
+            if field in first_metric:
+                row[field] = first_metric[field]
+    return row
 
 
 def cold_start_wall_clock_ms(runner_metrics: list[dict]) -> int | None:
