@@ -25,7 +25,8 @@ Baseline: GitHub Actions run `28992985395`, Chrome for Testing
 
 | Commit | Experiment | Hypothesis | Proof Command | Result |
 | --- | --- | --- | --- | --- |
-| pending | Ledger setup | Make optimization history explicit before changing behavior. | n/a | pending |
+| `a5c96b0` | Ledger setup | Make optimization history explicit before changing behavior. | n/a | Committed. |
+| this commit | Cheap post-action origin refresh | Replacing redundant post-action full observes with a cheap `window.location.href` origin refresh should reduce `observations_p95`, agent-run wall time, and CPU while preserving origin policy. Falls back to the old full observe path when location is unavailable. | `cargo test -p tempo-agent -- --nocapture`; `cargo test -p tempo-cli run_cdp_task -- --nocapture`; `cargo fmt --check`; `git diff --check` | Local package tests passed. Benchmark proof pending. |
 
 ## Candidate Experiments
 

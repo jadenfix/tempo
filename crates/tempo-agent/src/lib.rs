@@ -51,6 +51,7 @@ const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
 const MCP_ACCEPT: &str = "application/json, text/event-stream";
 const MCP_PROTOCOL_VERSION_HEADER: &str = "MCP-Protocol-Version";
 const MCP_SESSION_ID_HEADER: &str = "Mcp-Session-Id";
+const CURRENT_LOCATION_SCRIPT: &str = "window.location.href";
 
 pub type StructuredFastPathProbe = fn(&str, HttpProbeConfig) -> Option<StructuredFastPathDecision>;
 
@@ -1019,9 +1020,11 @@ impl AgentRunner {
             };
             // A batch StepError still fails the step. `PartiallyApplied` is a
             // StepError whose earlier actions already grounded — it must fail
-            // the step exactly like a plain StepError (never a replayable no-op),
-            // but the side effects are already captured by the forced post-batch
-            // diff and the post-action observation below.
+            // the step exactly like a plain StepError (never a replayable no-op).
+            // The side effects are already captured by the execution diff; the
+            // post-action path refreshes origin cheaply unless the driver cannot
+            // expose the current URL without a full observation.
+            let side_effects_may_have_occurred = execution.applied_side_effects();
             let outcome = match execution.status {
                 ExecutionStatus::Applied => StepOutcome::Applied {
                     diff: execution.diff,
@@ -1032,16 +1035,17 @@ impl AgentRunner {
             let triple = agent.record_next_outcome(outcome)?;
             report.actions_completed += 1;
 
-            let observation = driver.observe().await.map_err(|source| {
-                journal_transport_error(&mut agent, "post-action observe", source)
-            })?;
-            current_origin = self.origin_for_url("post-action observation", &observation.url)?;
-            let observation_budget = self.record_observation(
-                &mut agent,
-                &mut report,
-                observation,
-                ObservationUse::AuditOnly,
-            )?;
+            let (next_origin, observation_budget) = self
+                .refresh_post_action_origin(
+                    &mut agent,
+                    &mut report,
+                    driver,
+                    current_origin.as_ref(),
+                    &planned.action,
+                    side_effects_may_have_occurred,
+                )
+                .await?;
+            current_origin = next_origin;
             let step_error = match &triple.outcome {
                 StepTripleOutcome::StepError { reason } => Some(reason.clone()),
                 StepTripleOutcome::Applied { .. } => None,
@@ -1050,7 +1054,7 @@ impl AgentRunner {
                 index,
                 policy,
                 triple,
-                observation_budget: Some(observation_budget),
+                observation_budget,
             });
 
             if let Some(reason) = step_error {
@@ -1437,6 +1441,41 @@ impl AgentRunner {
         }
         agent.record_observation(observation)?;
         Ok(budget)
+    }
+
+    async fn refresh_post_action_origin<D>(
+        &self,
+        agent: &mut AgentLoop,
+        report: &mut AgentRunReport,
+        driver: &mut D,
+        current_origin: Option<&Origin>,
+        action: &Action,
+        side_effects_may_have_occurred: bool,
+    ) -> Result<(Option<Origin>, Option<ObservationBudget>), AgentError>
+    where
+        D: DriverTrait + ?Sized,
+    {
+        if !side_effects_may_have_occurred {
+            return Ok((current_origin.cloned(), None));
+        }
+
+        if !matches!(action, Action::Goto { .. })
+            && let Ok(value) = driver.evaluate_script(CURRENT_LOCATION_SCRIPT, true).await
+            && let Some(url) = value.as_str()
+        {
+            return self
+                .origin_for_url("post-action location", url)
+                .map(|origin| (origin, None));
+        }
+
+        let observation = driver
+            .observe()
+            .await
+            .map_err(|source| journal_transport_error(agent, "post-action observe", source))?;
+        let origin = self.origin_for_url("post-action observation", &observation.url)?;
+        let budget =
+            self.record_observation(agent, report, observation, ObservationUse::AuditOnly)?;
+        Ok((origin, Some(budget)))
     }
 
     fn origin_for_step(
@@ -2890,15 +2929,19 @@ mod tests {
         assert_eq!(report.engine, Engine::Test);
         assert_eq!(report.status, AgentRunStatus::Completed);
         assert_eq!(report.actions_completed, 1);
-        assert_eq!(report.observations, 2);
+        assert_eq!(report.observations, 1);
         assert_eq!(report.model_input_observations, 1);
+        assert!(report.steps[0].observation_budget.is_none());
         assert!(report.max_observation_bytes > 0);
         assert!(report.max_compact_observation_bytes > 0);
         assert!(report.max_compact_observation_tokens > 0);
         assert!(report.max_compact_observation_bytes <= report.max_observation_bytes);
         assert!(report.max_model_input_bytes > 0);
         assert!(report.max_model_input_tokens > 0);
-        assert!(report.max_model_input_bytes < report.max_observation_bytes);
+        assert_eq!(
+            report.max_model_input_bytes,
+            report.max_compact_observation_bytes
+        );
         assert_eq!(report.total_model_input_bytes, report.max_model_input_bytes);
         assert_eq!(
             report.total_model_input_tokens,
@@ -2919,6 +2962,39 @@ mod tests {
             entries.last().map(|entry| &entry.event),
             Some(JournalEvent::SessionClosed)
         ));
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runner_refreshes_origin_without_post_action_full_observe() -> TestResult {
+        let root = unique_dir("runner-cheap-post-action-origin")?;
+        remove_dir_if_exists(&root)?;
+        fs::create_dir_all(&root)?;
+        let journal_path = root.join("session.jsonl");
+        let task = DriverTask::new(
+            "https://example.com",
+            vec![Action::Click {
+                node: NodeId("submit".into()),
+            }],
+        );
+        let mut driver =
+            FailingDriver::new(TransportFailurePoint::None).with_elements(vec![button("submit")]);
+        let runner = AgentRunner::new_plaintext_unsafe(
+            &journal_path,
+            AgentRunIds::new("run-cheap-origin", "session-cheap-origin"),
+        );
+
+        let report = runner.run_driver_task(&mut driver, &task).await?;
+
+        assert_eq!(report.status, AgentRunStatus::Completed);
+        assert_eq!(report.observations, 1);
+        assert_eq!(report.steps[0].observation_budget, None);
+        assert_eq!(
+            driver.observe_calls, 1,
+            "execute_action should still ground from a pre-action observe, but the runner should not issue a redundant post-action full observe"
+        );
 
         remove_dir_if_exists(&root)?;
         Ok(())
@@ -4392,6 +4468,7 @@ mod tests {
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum TransportFailurePoint {
+        None,
         Goto,
         Act,
         PostActionObserve,
@@ -4974,6 +5051,9 @@ mod tests {
             expression: &str,
             await_promise: bool,
         ) -> Result<serde_json::Value, TransportError> {
+            if self.failure == TransportFailurePoint::PostActionObserve {
+                return Ok(serde_json::Value::Null);
+            }
             self.inner.evaluate_script(expression, await_promise).await
         }
 
