@@ -42,12 +42,29 @@ def render_status_markdown(
         f"- Chrome: `{chrome_label}`",
         f"- Tempo best/tied categories: `{best_count}/{total_count}`",
         f"- Gaps to close: `{len(gaps)}`",
+    ]
+    runner_orders = report.get("runner_orders")
+    if isinstance(runner_orders, dict) and runner_orders:
+        lines.extend(["", "## Runner Order", ""])
+        for iteration, order in sorted(runner_orders.items(), key=lambda item: int(item[0])):
+            if isinstance(order, list):
+                joined_order = ", ".join(str(runner) for runner in order)
+                lines.append(f"- Iteration `{iteration}`: `{joined_order}`")
+        lines.extend(
+            [
+                "",
+                "Runner order rotates per iteration to reduce deterministic warm-cache/order bias.",
+            ]
+        )
+    lines.extend(
+        [
         "",
         "## Category Rankings",
         "",
         "| Category | Direction | Tempo | Best | Rank | Delta vs Raw Chrome | Delta vs Best |",
         "| --- | --- | ---: | --- | ---: | ---: | ---: |",
-    ]
+        ]
+    )
     for category in categories:
         name = str(category.get("name", "unknown"))
         best = category.get("best") if isinstance(category.get("best"), dict) else {}
