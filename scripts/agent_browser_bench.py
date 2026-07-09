@@ -452,6 +452,10 @@ def descendants(root_pid: int) -> set[int]:
 
 
 def proc_descendants(root_pid: int) -> set[int]:
+    children_descendants = proc_descendants_from_children(root_pid)
+    if children_descendants is not None:
+        return children_descendants
+
     children_by_parent: dict[int, list[int]] = {}
     for status_path in PROC_ROOT.glob("[0-9]*/status"):
         try:
@@ -471,6 +475,41 @@ def proc_descendants(root_pid: int) -> set[int]:
                 found.add(child)
                 pending.append(child)
     return found
+
+
+def proc_descendants_from_children(root_pid: int) -> set[int] | None:
+    root_children = proc_children(root_pid)
+    if root_children is None:
+        return None
+
+    found: set[int] = set()
+    pending = list(root_children)
+    while pending:
+        child = pending.pop()
+        if child in found:
+            continue
+        found.add(child)
+        grandchildren = proc_children(child)
+        if grandchildren:
+            pending.extend(grandchildren)
+    return found
+
+
+def proc_children(pid: int) -> list[int] | None:
+    path = PROC_ROOT / str(pid) / "task" / str(pid) / "children"
+    try:
+        data = path.read_text(errors="ignore").strip()
+    except OSError:
+        return None
+    if not data:
+        return []
+    children = []
+    for part in data.split():
+        try:
+            children.append(int(part))
+        except ValueError:
+            continue
+    return children
 
 
 def subprocess_descendants(root_pid: int) -> set[int]:
