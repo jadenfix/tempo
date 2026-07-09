@@ -8,7 +8,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use tempo_act::{execute_action, execute_action_since, execute_batch, ExecutionStatus};
+use tempo_act::{
+    execute_action, execute_action_since, execute_batch, execute_batch_since, ExecutionStatus,
+};
 use tempo_driver::{DriverTrait, Engine, StepOutcome, TransportError};
 use tempo_handshake::{probe_http_origin, LaneDecision, ProbeHit};
 pub use tempo_handshake::{HttpProbeConfig, Lane as StructuredLane, StructuredSignal};
@@ -1010,11 +1012,18 @@ impl AgentRunner {
             agent.plan_next_step()?;
 
             let execution = match &compiled_skill {
-                Some(skill) => execute_batch(driver, &skill.batch)
-                    .await
-                    .map_err(|source| {
-                        journal_transport_error(&mut agent, "execute skill", source)
-                    })?,
+                Some(skill) => match current_observation_seq {
+                    Some(base_seq) => execute_batch_since(driver, &skill.batch, base_seq)
+                        .await
+                        .map_err(|source| {
+                            journal_transport_error(&mut agent, "execute skill", source)
+                        })?,
+                    None => execute_batch(driver, &skill.batch)
+                        .await
+                        .map_err(|source| {
+                            journal_transport_error(&mut agent, "execute skill", source)
+                        })?,
+                },
                 None => match current_observation_seq {
                     Some(base_seq) => execute_action_since(driver, &planned.action, base_seq)
                         .await
@@ -3677,6 +3686,46 @@ mod tests {
             &entry.event,
             JournalEvent::StepApplied { action, .. } if action == &skill_action
         )));
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runner_reuses_current_observation_seq_for_skill_batches() -> TestResult {
+        let root = unique_dir("runner-skill-batch-since-current-seq")?;
+        remove_dir_if_exists(&root)?;
+        fs::create_dir_all(&root)?;
+        let skills_root = root.join("skills");
+        let store = SkillStore::open(&skills_root)?;
+        store.put(&click_skill("click_saved_target", "1"))?;
+        let journal_path = root.join("session.jsonl");
+        let skill_action = Action::Skill {
+            name: "click_saved_target".into(),
+            input: serde_json::json!({"target": "submit"}),
+        };
+        let task = DriverTask::new("https://example.com", vec![skill_action]);
+        let mut driver =
+            FailingDriver::new(TransportFailurePoint::None).with_elements(vec![button("submit")]);
+        let runner = AgentRunner::new_plaintext_unsafe(
+            &journal_path,
+            AgentRunIds::new(
+                "run-skill-batch-since-current-seq",
+                "session-skill-batch-since-current-seq",
+            ),
+        )
+        .with_skill_store(&skills_root);
+
+        let report = runner.run_driver_task(&mut driver, &task).await?;
+
+        assert_eq!(report.status, AgentRunStatus::Completed);
+        assert_eq!(report.actions_completed, 1);
+        assert_eq!(driver.act_calls, 1);
+        assert_eq!(
+            driver.observe_calls, 0,
+            "skill batches should execute from the current observation seq without a redundant full observe"
+        );
+        assert_eq!(report.observations, 1);
 
         remove_dir_if_exists(&root)?;
         Ok(())
