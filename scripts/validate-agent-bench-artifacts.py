@@ -480,6 +480,14 @@ def validate_metric(metric: dict[str, Any], iterations: int, output_dir: Path) -
                 f"{runner}.model_input_observations must be <= observations"
             )
 
+    if (
+        metric.get("adapter") == "playwright-cdp-session"
+        and metric.get("cdp_action_mode") != "input-events"
+    ):
+        raise ValidationError(
+            f"{runner}.cdp_action_mode must be input-events for Playwright CDP baselines"
+        )
+
     if runner == "tempo-cdp-agent":
         if metric.get("tempo_engine") != "cdp":
             raise ValidationError(
@@ -921,6 +929,7 @@ def expected_gap_report(metrics: list[dict[str, Any]], summary: dict[str, Any]) 
         "agent_style_runners": sorted(AGENT_STYLE_RUNNERS),
         "comparison_notes": [
             "raw-chrome-cdp is excluded from observation-token and agent-step categories because it has no model-facing observation stream.",
+            "raw/synthetic CDP baselines dispatch Chrome input events for checkout actions; they do not mutate form state through direct DOM assignment.",
             "model_input_tokens_p95 ranks the full model-facing stream each runner presents to an agent; compact_observation_tokens_p95 ranks the largest compact observation projection per run.",
             "max_observation_tokens_p95 keeps Tempo's full durable structured audit JSON cost visible and is intentionally separate from compact model-facing projections.",
             "max_observation_tokens_p95 compares the largest single durable observation per run; total_model_input_tokens_p95 ranks the cumulative model-facing stream where runners expose it.",

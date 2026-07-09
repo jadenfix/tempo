@@ -1076,36 +1076,25 @@ def apply_browser_performance_metrics(metric: dict, metrics: dict[str, int | flo
             metric[field_name] = metric_value_to_int(source_name, metrics[source_name])
 
 
-def run_cdp_action(cdp: object, action: dict) -> dict:
-    kind = action.get("kind")
-    selector = str(action.get("node", ""))
-    if kind == "type":
-        text = str(action.get("text", ""))
-        expression = """
-            (() => {
-              const selector = __SELECTOR__;
-              const text = __TEXT__;
-              const element = document.querySelector(selector);
-              if (!element) return { applied: false, reason: 'missing selector', selector };
-              element.focus();
-              element.value = text;
-              element.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: text }));
-              element.dispatchEvent(new Event('change', { bubbles: true }));
-              return { applied: true, kind: 'type', selector, text };
-            })()
-        """.replace("__SELECTOR__", json.dumps(selector)).replace("__TEXT__", json.dumps(text))
-    elif kind == "click":
-        expression = """
-            (() => {
-              const selector = __SELECTOR__;
-              const element = document.querySelector(selector);
-              if (!element) return { applied: false, reason: 'missing selector', selector };
-              element.click();
-              return { applied: true, kind: 'click', selector };
-            })()
-        """.replace("__SELECTOR__", json.dumps(selector))
-    else:
-        raise RuntimeError(f"unsupported checkout action: {action}")
+def cdp_element_center(cdp: object, selector: str) -> dict:
+    expression = """
+        (() => {
+          const selector = __SELECTOR__;
+          const element = document.querySelector(selector);
+          if (!element) return { found: false, reason: 'missing selector', selector };
+          element.scrollIntoView({ block: 'center', inline: 'center' });
+          const rect = element.getBoundingClientRect();
+          if (rect.width <= 0 || rect.height <= 0) {
+            return { found: false, reason: 'empty bounding box', selector };
+          }
+          return {
+            found: true,
+            selector,
+            x: Math.round(rect.left + rect.width / 2),
+            y: Math.round(rect.top + rect.height / 2)
+          };
+        })()
+    """.replace("__SELECTOR__", json.dumps(selector))
     result = cdp.send(
         "Runtime.evaluate",
         {
@@ -1117,9 +1106,57 @@ def run_cdp_action(cdp: object, action: dict) -> dict:
     if "exceptionDetails" in result:
         raise RuntimeError(f"runtime exception: {result['exceptionDetails']}")
     value = result.get("result", {}).get("value")
-    if not isinstance(value, dict) or value.get("applied") is not True:
-        raise RuntimeError(f"action failed: {value}")
+    if not isinstance(value, dict) or value.get("found") is not True:
+        raise RuntimeError(f"selector failed: {value}")
     return value
+
+
+def cdp_click_at(cdp: object, x: int, y: int) -> None:
+    cdp.send("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": x, "y": y})
+    cdp.send(
+        "Input.dispatchMouseEvent",
+        {
+            "type": "mousePressed",
+            "x": x,
+            "y": y,
+            "button": "left",
+            "clickCount": 1,
+        },
+    )
+    cdp.send(
+        "Input.dispatchMouseEvent",
+        {
+            "type": "mouseReleased",
+            "x": x,
+            "y": y,
+            "button": "left",
+            "clickCount": 1,
+        },
+    )
+
+
+def run_cdp_action(cdp: object, action: dict) -> dict:
+    kind = action.get("kind")
+    selector = str(action.get("node", ""))
+    center = cdp_element_center(cdp, selector)
+    x = int(center["x"])
+    y = int(center["y"])
+    if kind == "type":
+        text = str(action.get("text", ""))
+        cdp_click_at(cdp, x, y)
+        cdp.send("Input.insertText", {"text": text})
+        return {
+            "applied": True,
+            "kind": "type",
+            "selector": selector,
+            "text": text,
+            "x": x,
+            "y": y,
+        }
+    if kind == "click":
+        cdp_click_at(cdp, x, y)
+        return {"applied": True, "kind": "click", "selector": selector, "x": x, "y": y}
+    raise RuntimeError(f"unsupported checkout action: {action}")
 
 
 def browser_use_snapshot_expression() -> str:
@@ -1341,6 +1378,7 @@ def run_cdp_baseline(chrome: str, url: str, runner: str, snapshot: str | None) -
         "observations": 1 if snapshot else 0,
         "model_input_observations": 1 if snapshot else 0,
         "adapter": "playwright-cdp-session",
+        "cdp_action_mode": "input-events",
     }
     apply_browser_performance_metrics(metric, browser_metrics)
     apply_web_performance_metrics(metric, web_metrics)
@@ -1810,6 +1848,7 @@ def benchmark_gap_report(metrics: list[dict], summary: dict) -> dict:
         "agent_style_runners": sorted(AGENT_STYLE_RUNNERS),
         "comparison_notes": [
             "raw-chrome-cdp is excluded from observation-token and agent-step categories because it has no model-facing observation stream.",
+            "raw/synthetic CDP baselines dispatch Chrome input events for checkout actions; they do not mutate form state through direct DOM assignment.",
             "model_input_tokens_p95 ranks the full model-facing stream each runner presents to an agent; compact_observation_tokens_p95 ranks the largest compact observation projection per run.",
             "max_observation_tokens_p95 keeps Tempo's full durable structured audit JSON cost visible and is intentionally separate from compact model-facing projections.",
             "max_observation_tokens_p95 compares the largest single durable observation per run; total_model_input_tokens_p95 ranks the cumulative model-facing stream where runners expose it.",
