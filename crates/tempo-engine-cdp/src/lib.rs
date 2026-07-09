@@ -113,6 +113,9 @@ pub const TEMPO_CDP_BENCH_ENABLE_CACHE_ENV: &str = "TEMPO_CDP_BENCH_ENABLE_CACHE
 /// Benchmark-only launch profile that suppresses Linux desktop-integration
 /// helper probes so process-count metrics stay focused on browser work.
 pub const TEMPO_CDP_BENCH_SUPPRESS_DESKTOP_ENV: &str = "TEMPO_CDP_BENCH_SUPPRESS_DESKTOP";
+/// Benchmark-only compositor profile used to measure whether forcing all
+/// compositor stages before draw inflates layout/paint metrics.
+pub const TEMPO_CDP_BENCH_NO_FORCED_COMPOSITOR_ENV: &str = "TEMPO_CDP_BENCH_NO_FORCED_COMPOSITOR";
 /// Benchmark-only headless flag profile used to compare chromiumoxide's bare
 /// `--headless` launch arg against Tempo's normal `--headless=new` launch.
 ///
@@ -163,6 +166,10 @@ pub struct CdpConfig {
     /// synthetic browser benchmarks because production launches should inherit
     /// the user's desktop environment normally.
     pub bench_suppress_desktop: bool,
+    /// Benchmark-only launch mode that omits
+    /// `--run-all-compositor-stages-before-draw`. Defaults off so screenshots
+    /// and visual settling keep the historical deterministic launch profile.
+    pub bench_no_forced_compositor: bool,
     /// Benchmark-only headless flag experiment. Defaults off so product launches
     /// pass Chrome's explicit newer headless flag.
     pub bench_headless_flag: bool,
@@ -264,6 +271,18 @@ impl CdpConfig {
         self
     }
 
+    pub fn with_bench_no_forced_compositor(mut self) -> Self {
+        self.bench_no_forced_compositor = true;
+        self
+    }
+
+    pub fn with_bench_no_forced_compositor_env_opt_in(mut self) -> Self {
+        if env_flag_enabled(TEMPO_CDP_BENCH_NO_FORCED_COMPOSITOR_ENV) {
+            self.bench_no_forced_compositor = true;
+        }
+        self
+    }
+
     pub fn with_bench_headless_flag(mut self) -> Self {
         self.bench_headless_flag = true;
         self
@@ -313,6 +332,9 @@ impl CdpConfig {
             launch_args.extend(desktop_suppression_launch_args());
             builder = builder.envs(desktop_suppression_env());
         }
+        if self.bench_no_forced_compositor {
+            launch_args.retain(|arg| arg != "--run-all-compositor-stages-before-draw");
+        }
         if !launch_args.is_empty() {
             builder = builder.args(normalize_chromium_launch_args(launch_args));
         }
@@ -344,6 +366,7 @@ impl Default for CdpConfig {
             bench_no_incognito: false,
             bench_enable_cache: false,
             bench_suppress_desktop: false,
+            bench_no_forced_compositor: false,
             bench_headless_flag: false,
             url_policy: UrlPolicy::block_private(),
             proxy_only_request_policy: false,
@@ -4931,6 +4954,30 @@ mod tests {
         assert!(args
             .iter()
             .any(|arg| arg == "--proxy-server=http://127.0.0.1:9001"));
+    }
+
+    #[test]
+    fn no_forced_compositor_profile_omits_forced_compositor_arg(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let launch_args = default_cdp_launch_args(SocketAddr::from(([127, 0, 0, 1], 9001)));
+        let default_config = CdpConfig::default()
+            .with_args(launch_args.clone())
+            .browser_config(temp.path())?;
+        assert!(
+            format!("{default_config:?}").contains("--run-all-compositor-stages-before-draw"),
+            "default CDP launches must keep the historical compositor determinism arg"
+        );
+
+        let profile_config = CdpConfig::default()
+            .with_bench_no_forced_compositor()
+            .with_args(launch_args)
+            .browser_config(temp.path())?;
+        assert!(
+            !format!("{profile_config:?}").contains("--run-all-compositor-stages-before-draw"),
+            "no-forced-compositor benchmark profile must omit the forced compositor arg"
+        );
+        Ok(())
     }
 
     #[test]

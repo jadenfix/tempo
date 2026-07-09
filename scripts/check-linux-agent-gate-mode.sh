@@ -41,6 +41,12 @@ def artifact_names(block: str) -> set[str]:
     return set(re.findall(r"^          name: ([^\n]+)$", block, flags=re.M))
 
 
+require(
+    "cancel-in-progress: true" in workflow
+    and "github.event.pull_request.number || format('{0}-{1}-{2}', github.ref, inputs.mode || 'scheduled', inputs.benchmark_profile || 'default')" in workflow,
+    'workflow concurrency must cancel superseded PR runs while allowing separate workflow_dispatch benchmark profiles to run in parallel',
+)
+
 match = re.search(
     r'if \[\[ "\$MODE" == "--full" \]\]; then\n(?P<full>.*?)\nelse\n(?P<smoke>.*?)\nfi',
     text,
@@ -75,6 +81,7 @@ require(
     and 'TEMPO_CDP_BENCH_ENABLE_CACHE=1' in text
     and 'TEMPO_CDP_BENCH_SUPPRESS_DESKTOP=1' in text
     and 'TEMPO_CDP_BENCH_CURRENT_THREAD_RUNTIME=1' in text
+    and 'TEMPO_CDP_BENCH_NO_FORCED_COMPOSITOR=1' in text
     and 'TEMPO_CDP_BENCH_HEADLESS_FLAG=1' in text
     and '-e "TEMPO_LINUX_AGENT_BENCH_PROFILE=${BENCH_PROFILE}"' in text,
     'Docker command must support named browser benchmark optimization profiles',
@@ -141,6 +148,7 @@ require(
     'benchmark_profile:' in workflow
     and 'desktop' in workflow
     and 'runtime' in workflow
+    and 'no-forced-compositor' in workflow
     and 'headless-flag' in workflow
     and 'TEMPO_LINUX_AGENT_BENCH_PROFILE:' in smoke_job
     and "inputs.benchmark_profile || 'default'" in smoke_job,
