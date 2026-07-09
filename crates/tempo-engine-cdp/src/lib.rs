@@ -64,6 +64,7 @@ use tokio::task::JoinHandle;
 /// so every element that actually survives into the marked observation is still
 /// enriched, while the long tail stays present but without an AX overlay.
 const MAX_AX_ENRICHED_ELEMENTS: usize = 16;
+const MAX_AX_SUMMARY_CACHE_ENTRIES: usize = 256;
 /// How many recent compiled observations to retain for diff bases. Diffs are only
 /// ever requested against recent seqs (`previous_seq`, `batch_base_seq`, a
 /// client-supplied `since_seq`), and `diff_from_base(None, ...)` already degrades a
@@ -3158,6 +3159,9 @@ fn remember_cacheable_ax_summary(
         return;
     }
     if let Ok(mut cache) = cache.lock() {
+        if !cache.contains_key(&key) && cache.len() >= MAX_AX_SUMMARY_CACHE_ENTRIES {
+            cache.clear();
+        }
         cache.insert(key, summary.clone());
     }
 }
@@ -3191,6 +3195,11 @@ fn ax_summary_preserves_raw_dom_fallback(
 }
 
 fn ax_summary_cacheable_raw_element(raw_element: &InteractiveElement) -> bool {
+    let raw_name = spans_text(&raw_element.name);
+    let raw_value = spans_text(&raw_element.value);
+    if raw_name.is_empty() && raw_value.is_empty() {
+        return false;
+    }
     !matches!(
         raw_element.role.as_str(),
         "checkbox"
@@ -6872,6 +6881,36 @@ mod tests {
         remember_cacheable_ax_summary(&cache, key.clone(), &element, Some(&summary));
 
         assert_eq!(cached_ax_summary(&cache, &key), None);
+    }
+
+    #[test]
+    fn enrichment_does_not_cache_nameless_button_like_element() {
+        let cache = Mutex::new(HashMap::new());
+        let mut element = sample_element("#go", 1.0);
+        element.name = Vec::new();
+        let key = AxSummaryCacheKey::from_element(42, "#go", &element);
+        let summary = AxSummary {
+            role: Some("button".to_string()),
+            name: None,
+            value: None,
+        };
+
+        remember_cacheable_ax_summary(&cache, key.clone(), &element, Some(&summary));
+
+        assert_eq!(cached_ax_summary(&cache, &key), None);
+    }
+
+    #[test]
+    fn enrichment_cache_is_bounded_for_long_lived_drivers() {
+        let cache = Mutex::new(HashMap::new());
+        let element = sample_element("#stable", 1.0);
+        let summary = dom_equivalent_summary();
+        for index in 0..=MAX_AX_SUMMARY_CACHE_ENTRIES {
+            let key = AxSummaryCacheKey::from_element(index as u64, "#stable", &element);
+            remember_cacheable_ax_summary(&cache, key, &element, Some(&summary));
+        }
+
+        assert!(cache.lock().expect("cache lock").len() <= MAX_AX_SUMMARY_CACHE_ENTRIES);
     }
 
     #[test]
