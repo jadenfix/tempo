@@ -26,6 +26,7 @@ on:
           - no-forced-compositor
           - headless-flag
           - trusted-policy
+          - trusted-parity
           - agent-automation
           - all
         default: default

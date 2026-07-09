@@ -751,14 +751,28 @@ def validate_metric(metric: dict[str, Any], iterations: int, output_dir: Path) -
                 raise ValidationError(
                     f"tempo-cdp-agent.{field} must be one of {sorted(expected_values)}, got {value!r}"
                 )
-        if (
-            metric.get("cdp_request_policy_grace") == "trusted-settled"
-            and benchmark_profile != "trusted-policy"
-        ):
+        if metric.get("cdp_request_policy_grace") == "trusted-settled" and benchmark_profile not in {
+            "trusted-policy",
+            "trusted-parity",
+        }:
             raise ValidationError(
                 "tempo-cdp-agent trusted-settled request policy rows must use "
-                "cdp_benchmark_profile='trusted-policy'"
+                "cdp_benchmark_profile='trusted-policy' or 'trusted-parity'"
             )
+        if benchmark_profile == "trusted-parity":
+            expected_trusted_parity = {
+                "cdp_request_policy_grace": "trusted-settled",
+                "cdp_browser_context": "fresh-profile",
+                "cdp_launch_profile": "playwright-lifecycle",
+                "cdp_browser_profile_contract": "automation-default",
+            }
+            for field, expected_value in expected_trusted_parity.items():
+                actual_value = metric.get(field)
+                if actual_value != expected_value:
+                    raise ValidationError(
+                        f"tempo-cdp-agent trusted-parity rows must set {field}="
+                        f"{expected_value!r}, got {actual_value!r}"
+                    )
         compositor_stages = metric.get("cdp_compositor_stages")
         if compositor_stages is not None and compositor_stages not in {
             "forced-before-draw",

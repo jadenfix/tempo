@@ -85,10 +85,24 @@ require(
     and 'TEMPO_CDP_BENCH_NO_FORCED_COMPOSITOR=1' in text
     and 'TEMPO_CDP_BENCH_HEADLESS_FLAG=1' in text
     and 'TEMPO_CDP_BENCH_TRUSTED_POLICY=1' in text
+    and 'trusted-parity)' in text
     and 'agent-automation | all)' in text
     and 'TEMPO_CDP_BENCH_AGENT_AUTOMATION=1' in text
     and '-e "TEMPO_LINUX_AGENT_BENCH_PROFILE=${BENCH_PROFILE}"' in text,
     'Docker command must support named browser benchmark optimization profiles',
+)
+trusted_parity_match = re.search(
+    r'^\s*trusted-parity\)\n(?P<body>.*?)\n\s*;;',
+    text,
+    flags=re.M | re.S,
+)
+require(trusted_parity_match is not None, 'Linux agent gate must wire trusted-parity profile')
+trusted_parity = trusted_parity_match.group('body')
+require(
+    'TEMPO_CDP_BENCH_TRUSTED_POLICY=1' in trusted_parity
+    and 'TEMPO_CDP_BENCH_NO_INCOGNITO=1' in trusted_parity
+    and 'TEMPO_CDP_BENCH_PLAYWRIGHT_LIFECYCLE_ARGS=1' in trusted_parity,
+    'trusted-parity profile must combine trusted policy, fresh profile, and lifecycle parity toggles',
 )
 require(
     'TEMPO_LINUX_AGENT_DOCKER_CACHE_BACKEND' in text
@@ -163,6 +177,7 @@ require(
     and 'no-forced-compositor' in workflow
     and 'headless-flag' in workflow
     and 'trusted-policy' in workflow
+    and 'trusted-parity' in workflow
     and 'agent-automation' in workflow
     and 'TEMPO_LINUX_AGENT_BENCH_PROFILE:' in smoke_job
     and "inputs.benchmark_profile || 'default'" in smoke_job,
