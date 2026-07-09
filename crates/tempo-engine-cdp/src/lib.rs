@@ -979,59 +979,32 @@ impl CdpTempoDriver {
             .map_err(|error| TransportError::Other(error.to_string()))
     }
 
-    async fn node_outcome_since(
-        &mut self,
-        previous_seq: u64,
-        target: &str,
-        grounded: bool,
-        cursor: u64,
-    ) -> Result<StepOutcome, TransportError> {
-        let compiled = self.record_current_observation_since(cursor).await?;
-        if grounded {
-            Ok(StepOutcome::Applied {
-                diff: diff_from_base(
-                    history_base(&self.history, previous_seq),
-                    compiled.as_ref(),
-                    previous_seq,
-                ),
-            })
-        } else {
-            Ok(StepOutcome::StepError {
-                reason: format!("node not found: {target}"),
-            })
-        }
-    }
-
-    async fn settle_after_batch_action(
+    async fn settle_after_batch_action_since(
         &mut self,
         quiescence: QuiescencePolicy,
+        cursor: u64,
     ) -> Result<Arc<CompiledObservation>, TransportError> {
         match quiescence {
             QuiescencePolicy::FixedMillis(millis) => {
-                let cursor = self.request_policy_cursor();
                 tokio::time::sleep(Duration::from_millis(millis)).await;
                 self.enforce_no_blocked_request_soon_since(cursor).await?;
                 self.record_current_observation_since(cursor).await
             }
             QuiescencePolicy::Composite => {
-                self.wait_for_composite_quiescence().await?;
-                self.record_current_observation().await
+                self.wait_for_composite_quiescence_since(cursor).await?;
+                self.record_current_observation_since(cursor).await
             }
         }
     }
 
-    async fn run_one(&mut self, action: &Action) -> Result<StepOutcome, TransportError> {
-        let previous_seq = self.seq;
+    async fn perform_one_action(
+        &mut self,
+        action: &Action,
+    ) -> Result<PerformedAction, TransportError> {
         match action {
             Action::Goto { url } => {
                 let compiled = self.goto_recorded(url).await?;
-                Ok(StepOutcome::Applied {
-                    diff: diff_from_base(
-                        history_base(&self.history, previous_seq),
-                        compiled.as_ref(),
-                        previous_seq,
-                    ),
-                })
+                Ok(PerformedAction::Snapshot { compiled })
             }
             Action::Click { node } => {
                 let cursor = self.request_policy_cursor();
@@ -1041,8 +1014,11 @@ impl CdpTempoDriver {
                     })
                     .await?;
                 self.enforce_no_blocked_request_soon_since(cursor).await?;
-                self.node_outcome_since(previous_seq, &grounding.target, grounding.grounded, cursor)
-                    .await
+                Ok(performed_node_outcome(
+                    &grounding.target,
+                    grounding.grounded,
+                    cursor,
+                ))
             }
             Action::Type { node, text } => {
                 let cursor = self.request_policy_cursor();
@@ -1067,8 +1043,11 @@ impl CdpTempoDriver {
                     })
                     .await?;
                 self.enforce_no_blocked_request_soon_since(cursor).await?;
-                self.node_outcome_since(previous_seq, &grounding.target, grounding.grounded, cursor)
-                    .await
+                Ok(performed_node_outcome(
+                    &grounding.target,
+                    grounding.grounded,
+                    cursor,
+                ))
             }
             Action::Select { node, value } => {
                 let cursor = self.request_policy_cursor();
@@ -1091,8 +1070,11 @@ impl CdpTempoDriver {
                     })
                     .await?;
                 self.enforce_no_blocked_request_soon_since(cursor).await?;
-                self.node_outcome_since(previous_seq, &grounding.target, grounding.grounded, cursor)
-                    .await
+                Ok(performed_node_outcome(
+                    &grounding.target,
+                    grounding.grounded,
+                    cursor,
+                ))
             }
             Action::Scroll { x, y } => {
                 self.enforce_current_url_policy().await?;
@@ -1102,27 +1084,13 @@ impl CdpTempoDriver {
                     .await
                     .map_err(map_cdp_error)?;
                 self.enforce_no_blocked_request_soon_since(cursor).await?;
-                let compiled = self.record_current_observation_since(cursor).await?;
-                Ok(StepOutcome::Applied {
-                    diff: diff_from_base(
-                        history_base(&self.history, previous_seq),
-                        compiled.as_ref(),
-                        previous_seq,
-                    ),
-                })
+                Ok(PerformedAction::Applied { cursor })
             }
             Action::Wait { millis } => {
                 let cursor = self.request_policy_cursor();
                 tokio::time::sleep(Duration::from_millis(*millis)).await;
                 self.enforce_no_blocked_request_soon_since(cursor).await?;
-                let compiled = self.record_current_observation_since(cursor).await?;
-                Ok(StepOutcome::Applied {
-                    diff: diff_from_base(
-                        history_base(&self.history, previous_seq),
-                        compiled.as_ref(),
-                        previous_seq,
-                    ),
-                })
+                Ok(PerformedAction::Applied { cursor })
             }
             Action::Extract { node } => {
                 let cursor = self.request_policy_cursor();
@@ -1130,16 +1098,49 @@ impl CdpTempoDriver {
                     .with_node_element(node, |_element| async move { Ok(()) })
                     .await?;
                 self.enforce_no_blocked_request_soon_since(cursor).await?;
-                self.node_outcome_since(previous_seq, &grounding.target, grounding.grounded, cursor)
-                    .await
+                Ok(performed_node_outcome(
+                    &grounding.target,
+                    grounding.grounded,
+                    cursor,
+                ))
             }
-            Action::Skill { name, .. } => Ok(StepOutcome::StepError {
+            Action::Skill { name, .. } => Ok(PerformedAction::StepError {
                 reason: format!("skill action {name:?} is handled by tempo-skills, not CDP"),
             }),
         }
     }
 
+    async fn run_one(&mut self, action: &Action) -> Result<StepOutcome, TransportError> {
+        let previous_seq = self.seq;
+        match self.perform_one_action(action).await? {
+            PerformedAction::Snapshot { compiled } => Ok(StepOutcome::Applied {
+                diff: diff_from_base(
+                    history_base(&self.history, previous_seq),
+                    compiled.as_ref(),
+                    previous_seq,
+                ),
+            }),
+            PerformedAction::Applied { cursor } => {
+                let compiled = self.record_current_observation_since(cursor).await?;
+                Ok(StepOutcome::Applied {
+                    diff: diff_from_base(
+                        history_base(&self.history, previous_seq),
+                        compiled.as_ref(),
+                        previous_seq,
+                    ),
+                })
+            }
+            PerformedAction::StepError { reason } => Ok(StepOutcome::StepError { reason }),
+        }
+    }
+
+    #[cfg(test)]
     async fn wait_for_composite_quiescence(&self) -> Result<(), TransportError> {
+        let cursor = self.request_policy_cursor();
+        self.wait_for_composite_quiescence_since(cursor).await
+    }
+
+    async fn wait_for_composite_quiescence_since(&self, cursor: u64) -> Result<(), TransportError> {
         let deadline = Instant::now() + Duration::from_secs(2);
         let mut tracker = CompositeQuiescenceTracker::new(3);
 
@@ -1155,7 +1156,6 @@ impl CdpTempoDriver {
             // probe-reported href on the isolated path, or an explicit
             // page.url() on the fallback path) — no separate per-poll
             // round-trip here.
-            let cursor = self.request_policy_cursor();
             let sample = self.sample_page_stability_since(cursor).await?;
             if tracker.observe(sample) {
                 return Ok(());
@@ -1523,17 +1523,25 @@ impl DriverTrait for CdpTempoDriver {
         let batch_base_seq = self.seq;
         let mut last_settled = None;
         for action in &batch.actions {
-            let outcome = self.run_one(action).await?;
-            if matches!(outcome, StepOutcome::StepError { .. }) {
-                return Ok(outcome);
-            }
-            if matches!(action, Action::Goto { .. }) {
-                last_settled = self.history.get(&self.seq).cloned();
-            } else {
-                last_settled = Some(self.settle_after_batch_action(batch.quiescence).await?);
+            match self.perform_one_action(action).await? {
+                PerformedAction::Snapshot { compiled } => {
+                    last_settled = Some(compiled);
+                }
+                PerformedAction::Applied { cursor } => {
+                    last_settled = Some(
+                        self.settle_after_batch_action_since(batch.quiescence, cursor)
+                            .await?,
+                    );
+                }
+                PerformedAction::StepError { reason } => {
+                    return Ok(StepOutcome::StepError { reason });
+                }
             }
         }
 
+        // `ActionBatch` settles after each non-navigation action so later
+        // NodeIds resolve against a fresh observation. The batch path skips the
+        // single-action immediate snapshot and records only the settled one.
         let compiled = match last_settled {
             Some(compiled) => compiled,
             None => self.record_current_observation().await?,
@@ -2464,6 +2472,34 @@ fn is_uninteresting_ax_node_msg(message: &str) -> bool {
 struct NodeGrounding {
     target: String,
     grounded: bool,
+}
+
+#[derive(Clone, Debug)]
+enum PerformedAction {
+    /// Navigation already recorded its destination snapshot as part of
+    /// `goto_recorded`.
+    Snapshot {
+        compiled: Arc<CompiledObservation>,
+    },
+    /// Non-navigation action applied. The cursor is the request-policy point
+    /// captured before the action, reused by single-action callers for the
+    /// post-action snapshot.
+    Applied {
+        cursor: u64,
+    },
+    StepError {
+        reason: String,
+    },
+}
+
+fn performed_node_outcome(target: &str, grounded: bool, cursor: u64) -> PerformedAction {
+    if grounded {
+        PerformedAction::Applied { cursor }
+    } else {
+        PerformedAction::StepError {
+            reason: format!("node not found: {target}"),
+        }
+    }
 }
 
 fn grounded_selector(
