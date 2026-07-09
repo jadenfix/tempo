@@ -70,17 +70,38 @@ BROWSER_PERFORMANCE_ROW_FIELDS = {
 }
 
 WEB_PERFORMANCE_ROW_FIELDS = {
+    "navigation_start_ms": "web_navigation_start_ms_p95",
     "navigation_duration_ms": "web_navigation_duration_ms_p95",
-    "dom_content_loaded_ms": "web_dom_content_loaded_ms_p95",
-    "load_event_ms": "web_load_event_ms_p95",
+    "worker_start_ms": "web_worker_start_ms_p95",
+    "redirect_start_ms": "web_redirect_start_ms_p95",
+    "redirect_end_ms": "web_redirect_end_ms_p95",
+    "fetch_start_ms": "web_fetch_start_ms_p95",
+    "domain_lookup_start_ms": "web_domain_lookup_start_ms_p95",
+    "domain_lookup_end_ms": "web_domain_lookup_end_ms_p95",
+    "connect_start_ms": "web_connect_start_ms_p95",
+    "connect_end_ms": "web_connect_end_ms_p95",
+    "secure_connection_start_ms": "web_secure_connection_start_ms_p95",
+    "request_start_ms": "web_request_start_ms_p95",
+    "response_start_ms": "web_response_start_ms_p95",
     "response_end_ms": "web_response_end_ms_p95",
+    "dom_interactive_ms": "web_dom_interactive_ms_p95",
+    "dom_content_loaded_start_ms": "web_dom_content_loaded_start_ms_p95",
+    "dom_content_loaded_ms": "web_dom_content_loaded_ms_p95",
+    "dom_complete_ms": "web_dom_complete_ms_p95",
+    "load_event_start_ms": "web_load_event_start_ms_p95",
+    "load_event_ms": "web_load_event_ms_p95",
     "resource_count": "web_resource_count_p95",
     "resource_transfer_size_bytes": "web_resource_transfer_size_bytes_p95",
+    "resource_encoded_body_size_bytes": "web_resource_encoded_body_size_bytes_p95",
     "resource_decoded_body_size_bytes": "web_resource_decoded_body_size_bytes_p95",
+    "resource_duration_ms": "web_resource_duration_ms_p95",
+    "resource_max_duration_ms": "web_resource_max_duration_ms_p95",
+    "resource_response_end_ms": "web_resource_response_end_ms_p95",
     "first_paint_ms": "web_first_paint_ms_p95",
     "first_contentful_paint_ms": "web_first_contentful_paint_ms_p95",
     "long_task_count": "web_long_task_count_p95",
     "long_task_duration_ms": "web_long_task_duration_ms_p95",
+    "long_task_max_duration_ms": "web_long_task_max_duration_ms_p95",
 }
 
 REQUIRED_METRIC_FIELDS = {
@@ -421,6 +442,9 @@ def validate_metric(metric: dict[str, Any], iterations: int, output_dir: Path) -
         ):
             if field in raw_report and field in metric and int(raw_report[field]) != int(metric[field]):
                 raise ValidationError(f"{runner}.{field} must match runner_report")
+        for field in ("browser_performance_metrics", "web_performance_metrics"):
+            if raw_report.get(field) != metric.get(field):
+                raise ValidationError(f"{runner}.{field} must match runner_report")
 
 
 def validate_final_oracle(runner: str, oracle: Any) -> None:
@@ -672,6 +696,11 @@ def expected_gap_report(metrics: list[dict[str, Any]], summary: dict[str, Any]) 
         field_name = browser_performance_metric_row_field(metric_name)
         if field_name not in ranked_browser_fields:
             category_specs.append((field_name, "lower_is_better", runners))
+    ranked_category_fields = {name for name, _direction, _runners in category_specs}
+    for field_name in WEB_PERFORMANCE_ROW_FIELDS.values():
+        if field_name not in ranked_category_fields:
+            category_specs.append((field_name, "lower_is_better", runners))
+            ranked_category_fields.add(field_name)
     categories = []
     gaps_to_close = []
     for name, direction, category_runners in category_specs:

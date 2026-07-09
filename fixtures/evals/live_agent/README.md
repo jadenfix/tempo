@@ -45,13 +45,16 @@ counts, retry totals, and p50/p95/max stats. It also writes
 Tempo against raw Chrome, Playwright, browser-use-style, and real browser-use
 package baselines for
 success, latency, CPU, RSS, retries, failures, CDP runtime metrics, Web
-Performance timing/resource/paint/long-task metrics, model-facing tokens,
+Performance navigation/resource/paint/long-task metrics, model-facing tokens,
 durable and model-facing observation counts, largest durable observation tokens,
 and agent step count. The stable CDP dashboard fields cover the comparable
 document/frame/listener/node/layout/script/task/heap subset, and any additional
 numeric CDP metrics Chrome returns are preserved and ranked as `browser_cdp_*`
-gap categories. Row-level total model-input token p95 is included where a runner
-reports a comparable model-facing stream cost. `agent-browser-bench-status.md`
+gap categories. Web Performance fields include detailed navigation phase
+timings, resource transfer/encoded/decoded bytes, resource duration totals/maxes,
+paint timing, and long-task count/duration/max. Row-level total model-input
+token p95 is included where a runner reports a comparable model-facing stream
+cost. `agent-browser-bench-status.md`
 renders the same ranking and gap data as a
 stable Markdown report for quick artifact review. It
 also emits Tempo `session-eval`, `replay`, `scorecard`, and `amdahl` artifacts

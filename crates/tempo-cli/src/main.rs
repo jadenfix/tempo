@@ -1124,17 +1124,38 @@ fn run_cdp_task(config: RunCdpTaskConfig) -> Result<RunCdpTaskReport, CliError> 
 }
 
 const WEB_PERFORMANCE_METRIC_NAMES: &[&str] = &[
+    "navigation_start_ms",
     "navigation_duration_ms",
-    "dom_content_loaded_ms",
-    "load_event_ms",
+    "worker_start_ms",
+    "redirect_start_ms",
+    "redirect_end_ms",
+    "fetch_start_ms",
+    "domain_lookup_start_ms",
+    "domain_lookup_end_ms",
+    "connect_start_ms",
+    "connect_end_ms",
+    "secure_connection_start_ms",
+    "request_start_ms",
+    "response_start_ms",
     "response_end_ms",
+    "dom_interactive_ms",
+    "dom_content_loaded_start_ms",
+    "dom_content_loaded_ms",
+    "dom_complete_ms",
+    "load_event_start_ms",
+    "load_event_ms",
     "resource_count",
     "resource_transfer_size_bytes",
+    "resource_encoded_body_size_bytes",
     "resource_decoded_body_size_bytes",
+    "resource_duration_ms",
+    "resource_max_duration_ms",
+    "resource_response_end_ms",
     "first_paint_ms",
     "first_contentful_paint_ms",
     "long_task_count",
     "long_task_duration_ms",
+    "long_task_max_duration_ms",
 ];
 
 const WEB_PERFORMANCE_SCRIPT: &str = r#"
@@ -1148,18 +1169,40 @@ const WEB_PERFORMANCE_SCRIPT: &str = r#"
   }
   const longTasks = performance.getEntriesByType('longtask');
   const sum = (entries, field) => entries.reduce((total, entry) => total + n(entry[field]), 0);
+  const max = (entries, field) => entries.reduce((largest, entry) => Math.max(largest, n(entry[field])), 0);
   return {
+    navigation_start_ms: nav ? n(nav.startTime) : 0,
     navigation_duration_ms: nav ? n(nav.duration) : 0,
-    dom_content_loaded_ms: nav ? n(nav.domContentLoadedEventEnd) : 0,
-    load_event_ms: nav ? n(nav.loadEventEnd) : 0,
+    worker_start_ms: nav ? n(nav.workerStart) : 0,
+    redirect_start_ms: nav ? n(nav.redirectStart) : 0,
+    redirect_end_ms: nav ? n(nav.redirectEnd) : 0,
+    fetch_start_ms: nav ? n(nav.fetchStart) : 0,
+    domain_lookup_start_ms: nav ? n(nav.domainLookupStart) : 0,
+    domain_lookup_end_ms: nav ? n(nav.domainLookupEnd) : 0,
+    connect_start_ms: nav ? n(nav.connectStart) : 0,
+    connect_end_ms: nav ? n(nav.connectEnd) : 0,
+    secure_connection_start_ms: nav ? n(nav.secureConnectionStart) : 0,
+    request_start_ms: nav ? n(nav.requestStart) : 0,
+    response_start_ms: nav ? n(nav.responseStart) : 0,
     response_end_ms: nav ? n(nav.responseEnd) : 0,
+    dom_interactive_ms: nav ? n(nav.domInteractive) : 0,
+    dom_content_loaded_start_ms: nav ? n(nav.domContentLoadedEventStart) : 0,
+    dom_content_loaded_ms: nav ? n(nav.domContentLoadedEventEnd) : 0,
+    dom_complete_ms: nav ? n(nav.domComplete) : 0,
+    load_event_start_ms: nav ? n(nav.loadEventStart) : 0,
+    load_event_ms: nav ? n(nav.loadEventEnd) : 0,
     resource_count: resources.length,
     resource_transfer_size_bytes: sum(resources, 'transferSize'),
+    resource_encoded_body_size_bytes: sum(resources, 'encodedBodySize'),
     resource_decoded_body_size_bytes: sum(resources, 'decodedBodySize'),
+    resource_duration_ms: sum(resources, 'duration'),
+    resource_max_duration_ms: max(resources, 'duration'),
+    resource_response_end_ms: max(resources, 'responseEnd'),
     first_paint_ms: paints['first-paint'] || 0,
     first_contentful_paint_ms: paints['first-contentful-paint'] || 0,
     long_task_count: longTasks.length,
-    long_task_duration_ms: sum(longTasks, 'duration')
+    long_task_duration_ms: sum(longTasks, 'duration'),
+    long_task_max_duration_ms: max(longTasks, 'duration')
   };
 })()
 "#;
