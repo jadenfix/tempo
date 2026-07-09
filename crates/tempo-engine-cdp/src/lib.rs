@@ -2127,6 +2127,11 @@ async fn connect_policy_target(
 ) -> Result<TcpStream, PolicyProxyConnectError> {
     enforce_browser_hardening_policy(url, policy)
         .map_err(|_error| PolicyProxyConnectError::PolicyBlocked)?;
+    if policy.url_policy().is_allow_all() {
+        return TcpStream::connect((host, port))
+            .await
+            .map_err(|_error| PolicyProxyConnectError::UpstreamUnavailable);
+    }
     let mut addrs = tokio::net::lookup_host((host, port))
         .await
         .map_err(|_error| PolicyProxyConnectError::UpstreamUnavailable)?
@@ -4661,6 +4666,64 @@ mod tests {
             Some(expected_blocked_url.as_str())
         );
         assert!(request_policy_tracker.has_blocked_since(cursor));
+        drop(proxy);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn policy_proxy_allow_all_forwards_http_loopback(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let origin = TokioTcpListener::bind(("127.0.0.1", 0)).await?;
+        let origin_addr = origin.local_addr()?;
+        let origin_task = tokio::spawn(async move {
+            let (mut stream, _peer) = origin.accept().await?;
+            let mut request = [0_u8; 512];
+            let read = stream.read(&mut request).await?;
+            let request = std::str::from_utf8(&request[..read])
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
+            if !request.starts_with("GET /ok HTTP/1.1") {
+                return Err(std::io::Error::other(format!(
+                    "unexpected forwarded request: {request:?}"
+                )));
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await?;
+            Ok::<(), std::io::Error>(())
+        });
+
+        let blocked_request_url = Arc::new(Mutex::new(None));
+        let request_policy_tracker = Arc::new(RequestPolicyTracker::new());
+        let cursor = request_policy_tracker.cursor();
+        let proxy = PolicyProxy::start(
+            Arc::new(Mutex::new(
+                BrowserHardeningPolicy::standard().with_url_policy(UrlPolicy::allow_all()),
+            )),
+            blocked_request_url.clone(),
+            request_policy_tracker.clone(),
+        )
+        .await?;
+        let mut client = TcpStream::connect(proxy.addr).await?;
+        let request = format!(
+            "GET http://{origin_addr}/ok HTTP/1.1\r\nHost: {origin_addr}\r\nConnection: close\r\n\r\n"
+        );
+        client.write_all(request.as_bytes()).await?;
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await?;
+        let response = std::str::from_utf8(&response)?;
+
+        assert!(response.starts_with("HTTP/1.1 204 No Content"));
+        assert_eq!(
+            blocked_request_url
+                .lock()
+                .map_err(|_error| std::io::Error::other("blocked URL lock poisoned"))?
+                .as_deref(),
+            None
+        );
+        assert!(!request_policy_tracker.has_blocked_since(cursor));
+        origin_task.await??;
         drop(proxy);
         Ok(())
     }
