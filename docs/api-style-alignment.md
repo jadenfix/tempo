@@ -54,7 +54,8 @@ GET    /v1/traces                        (outbound OTLP export — separate)
 **Gaps vs the unified language:**
 - No `projects/{project}/` parent scoping; resources are flat under `/sessions`.
 - No dotted `operationId` convention (`sessions.observe`, …) — OpenAPI is served
-  at `/openapi.json` but operationIds aren't the canonical `<collection>.<verb>`.
+  at `/openapi.json` but operationIds aren't the canonical
+  `projects.<collection>.<verb>` shape.
 - Actions are snake_case sub-paths (`act_batch`) not AIP custom verbs (`:act`).
 - No shared error envelope (the canonical `error.code/status/details/retryable`
   shape from `API_STYLE.md` §6).
@@ -78,18 +79,18 @@ local daemon.
 
 | Current | AIP target | operationId |
 |---|---|---|
-| `POST /sessions` | `POST /v1/{parent=projects/*}/sessions` | `sessions.create` |
-| `GET /sessions` | `GET /v1/{parent=projects/*}/sessions` | `sessions.list` |
-| `DELETE /sessions/{id}` | `POST /v1/{name=projects/*/sessions/*}:kill` | `sessions.kill` |
-| `POST /sessions/{id}/adopt` | `POST /v1/{name=.../sessions/*}:adopt` | `sessions.adopt` |
-| `POST /sessions/{id}/handoff` | `POST /v1/{name=.../sessions/*}:handoff` | `sessions.handoff` |
-| `GET /sessions/{id}/observe` | `GET  /v1/{name=.../sessions/*}:observe` | `sessions.observe` |
-| `POST /sessions/{id}/act_batch` | `POST /v1/{name=.../sessions/*}:act` | `sessions.act` |
-| `GET /sessions/{id}/screenshot` | `GET  /v1/{name=.../sessions/*}:screenshot` | `sessions.screenshot` |
-| `POST /sessions/{id}/surfaces` | `POST /v1/{parent=.../sessions/*}/surfaces` | `surfaces.register` |
-| `GET /sessions/{id}/events` (+ stream) | `GET /v1/{parent=.../sessions/*}/events` | `events.list` (+ `:stream` SSE) |
-| `POST /sessions/{id}/runs` | `POST /v1/{parent=.../sessions/*}/runs` → returns `Operation` | `runs.create` |
-| (poll runs/events) | `GET /v1/{name=projects/*/operations/*}` | `operations.get` |
+| `POST /sessions` | `POST /v1/{parent=projects/*}/sessions` | `projects.sessions.create` |
+| `GET /sessions` | `GET /v1/{parent=projects/*}/sessions` | `projects.sessions.list` |
+| `DELETE /sessions/{id}` | `POST /v1/{name=projects/*/sessions/*}:kill` | `projects.sessions.kill` |
+| `POST /sessions/{id}/adopt` | `POST /v1/{name=.../sessions/*}:adopt` | `projects.sessions.adopt` |
+| `POST /sessions/{id}/handoff` | `POST /v1/{name=.../sessions/*}:handoff` | `projects.sessions.handoff` |
+| `GET /sessions/{id}/observe` | `GET  /v1/{name=.../sessions/*}:observe` | `projects.sessions.observe` |
+| `POST /sessions/{id}/act_batch` | `POST /v1/{name=.../sessions/*}:act` | `projects.sessions.act` |
+| `GET /sessions/{id}/screenshot` | `GET  /v1/{name=.../sessions/*}:screenshot` | `projects.sessions.screenshot` |
+| `POST /sessions/{id}/surfaces` | `POST /v1/{parent=.../sessions/*}/surfaces` | `projects.surfaces.register` |
+| `GET /sessions/{id}/events` (+ stream) | `GET /v1/{parent=.../sessions/*}/events` | `projects.events.list` (+ `:stream` SSE) |
+| `POST /sessions/{id}/runs` | `POST /v1/{parent=.../sessions/*}/runs` → returns `Operation` | `projects.runs.create` |
+| (poll runs/events) | `GET /v1/{name=projects/*/operations/*}` | `projects.operations.get` |
 
 Custom verbs use `:` (`:act`, `:observe`, `:adopt`, `:handoff`, `:kill`), matching
 data-engine's `:ingest`/`:emit`/`:run` and AIP custom-method guidance.
@@ -100,28 +101,31 @@ data-engine's `:ingest`/`:emit`/`:run` and AIP custom-method guidance.
 
 1. **Parent scoping**: nest under `projects/{project}/...` (default `projects/default/`
    for the local daemon). Keeps list/create parent-scoped like every sibling.
-2. **operationId** = `<collection>.<verb>` (e.g. `sessions.act`, `runs.create`).
-   MCP tool name = operationId, 1:1 (`API_STYLE.md` §13).
+2. **operationId** = `projects.<collection>.<verb>` (e.g.
+   `projects.sessions.act`, `projects.runs.create`).
+   MCP exposes operationId-derived tool names; legacy/native MCP names may stay
+   as aliases during migration if the operationId names are present and
+   duplicate-free after service namespace projection (`API_STYLE.md` §13).
 3. **Custom verbs** `:act`, `:observe`, `:adopt`, `:handoff`, `:kill`, `:screenshot`
    (replace snake_case sub-paths).
 4. **Shared error envelope** (`API_STYLE.md` §6) verbatim — `error.code/status/
    message/details/request_id/retryable`, canonical codes only. No ad-hoc error
    JSON.
 5. **`Operation` model** for `/runs` (and any act/observe that can exceed
-   timeout): return `projects/.../operations/{id}`, poll `operations.get`,
+   timeout): return `projects/.../operations/{id}`, poll `projects.operations.get`,
    cancel `:cancel`. `events/stream` stays as the live SSE tail on the session.
 6. **`Idempotency-Key`** header on all mutating ops (create/act/run/adopt/handoff);
    **`If-Match` + ETag** on any mutable session state; **`update_mask`** on patches.
-7. **Cursor pagination** on `sessions.list` and `events.list` (`page_size`,
-   `page_token`, `next_page_token`, `total_size`).
+7. **Cursor pagination** on `projects.sessions.list` and `projects.events.list`
+   (`page_size`, `page_token`, `next_page_token`, `total_size`).
 8. **Committed OpenAPI + drift gate**: check the generated `openapi.json` into the
    repo and add a CI gate that `GET /openapi.json` == committed doc (the same gate
    data-engine/cradle/palette run). Regen clients in any contract PR.
 9. **Headers**: keep `Authorization: Bearer <token>` (already there); add
    `x-request-id` echoed on responses; RFC3339 UTC timestamps.
-10. **MCP**: one tool per `operationId`, `structuredContent` on results,
-    `isError:true` on failures, derived from the OpenAPI (no hand-maintained
-    catalog mirror).
+10. **MCP**: operationId-derived tools, `structuredContent` on results,
+    `isError:true` on failures, and a committed catalog fixture or generated
+    catalog that is drift-checked against the implementation.
 
 ---
 
