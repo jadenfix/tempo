@@ -65,6 +65,11 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-${{ github.job }}-linux-agent-
             ${{ runner.os }}-linux-agent-
+      - name: Free Docker build space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          docker system prune -af || true
+          df -h
       - name: Show Docker runtime
         run: |
           docker version
@@ -104,6 +109,11 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-${{ github.job }}-linux-agent-
             ${{ runner.os }}-linux-agent-
+      - name: Free Docker build space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          docker system prune -af || true
+          df -h
       - name: Show Docker runtime
         run: |
           docker version

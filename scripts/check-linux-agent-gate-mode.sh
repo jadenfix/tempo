@@ -149,6 +149,13 @@ require(
     'smoke job must enable GitHub Actions Docker layer caching',
 )
 require(
+    'Free Docker build space' in smoke_job
+    and 'Free Docker build space' in full_job
+    and 'docker system prune -af' in smoke_job
+    and 'docker system prune -af' in full_job,
+    'Linux agent workflow must free hosted-runner Docker build space before image import',
+)
+require(
     'benchmark_profile:' in workflow
     and 'key-events' in workflow
     and 'desktop' in workflow
