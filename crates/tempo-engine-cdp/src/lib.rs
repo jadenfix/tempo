@@ -550,6 +550,7 @@ impl CdpTempoDriver {
         &mut self,
         url: String,
         dom_html: String,
+        _http_status: Option<u16>,
     ) -> Result<Arc<CompiledObservation>, TransportError> {
         self.seq += 1;
         let (mut compiled, selectors_by_node) =
@@ -575,8 +576,9 @@ impl CdpTempoDriver {
         cursor: u64,
         url: String,
         dom_html: String,
+        http_status: Option<u16>,
     ) -> Result<Arc<CompiledObservation>, TransportError> {
-        let compiled = self.record_snapshot(url, dom_html).await?;
+        let compiled = self.record_snapshot(url, dom_html, http_status).await?;
         // Every `_since` caller has already served the full 25ms event grace
         // for this same cursor immediately after its action command returned
         // (click/type/select/scroll/wait/goto/fixed-millis), so this side only
@@ -601,7 +603,8 @@ impl CdpTempoDriver {
         cursor: u64,
     ) -> Result<Arc<CompiledObservation>, TransportError> {
         let (url, dom_html) = self.snapshot_since(cursor).await?;
-        self.record_snapshot_since(cursor, url, dom_html).await
+        self.record_snapshot_since(cursor, url, dom_html, None)
+            .await
     }
 
     async fn goto_recorded(
@@ -615,18 +618,39 @@ impl CdpTempoDriver {
             self.recreate_child_page_for_navigation().await?;
         }
         let page = self.page()?.clone();
-        match tokio::time::timeout(
-            CDP_NAVIGATION_AWAIT_TIMEOUT,
-            navigate_without_http_status(&page, url),
-        )
-        .await
-        {
-            Ok(Ok(())) | Ok(Err(CdpError::Timeout)) | Err(_) => {
-                self.recover_timed_out_navigation_since(cursor, url).await?;
+        let mut navigation_status = None;
+        if self.browser_context_id.is_some() {
+            match tokio::time::timeout(
+                CDP_NAVIGATION_AWAIT_TIMEOUT,
+                navigate_without_http_status(&page, url),
+            )
+            .await
+            {
+                Ok(Ok(())) | Ok(Err(CdpError::Timeout)) | Err(_) => {
+                    self.recover_timed_out_navigation_since(cursor, url).await?;
+                }
+                Ok(Err(error)) => {
+                    self.enforce_no_blocked_request_soon_since(cursor).await?;
+                    return Err(map_cdp_error(error));
+                }
             }
-            Ok(Err(error)) => {
-                self.enforce_no_blocked_request_soon_since(cursor).await?;
-                return Err(map_cdp_error(error));
+        } else {
+            match tokio::time::timeout(
+                CDP_NAVIGATION_AWAIT_TIMEOUT,
+                navigate_with_http_status(&page, url),
+            )
+            .await
+            {
+                Ok(Ok(status)) => {
+                    navigation_status = status;
+                }
+                Ok(Err(CdpError::Timeout)) | Err(_) => {
+                    self.recover_timed_out_navigation_since(cursor, url).await?;
+                }
+                Ok(Err(error)) => {
+                    self.enforce_no_blocked_request_soon_since(cursor).await?;
+                    return Err(map_cdp_error(error));
+                }
             }
         }
         self.enforce_no_blocked_request_soon_since(cursor).await?;
@@ -640,7 +664,7 @@ impl CdpTempoDriver {
         // the sampler still recreates on demand if this fails.
         let _ = self.probe_context_id(true, cursor).await;
         let (final_url, dom_html) = self.snapshot_since(cursor).await?;
-        self.record_snapshot_since(cursor, final_url, dom_html)
+        self.record_snapshot_since(cursor, final_url, dom_html, navigation_status)
             .await
     }
 
@@ -2183,6 +2207,19 @@ fn validate_screenshot_bytes(bytes: Vec<u8>) -> Result<Vec<u8>, TransportError> 
     Ok(bytes)
 }
 
+async fn navigate_with_http_status(page: &Page, url: &str) -> Result<Option<u16>, CdpError> {
+    let request = page
+        .http_future(NavigateParams {
+            url: url.to_string(),
+            transition_type: None,
+            frame_id: None,
+            referrer: None,
+            referrer_policy: None,
+        })?
+        .await?;
+    Ok(request.and_then(|request| request.response.as_ref().and_then(cdp_status_to_u16)))
+}
+
 async fn navigate_without_http_status(page: &Page, url: &str) -> Result<(), CdpError> {
     page.goto(NavigateParams {
         url: url.to_string(),
@@ -2193,6 +2230,14 @@ async fn navigate_without_http_status(page: &Page, url: &str) -> Result<(), CdpE
     })
     .await?;
     Ok(())
+}
+
+fn cdp_status_to_u16(
+    response: &chromiumoxide::cdp::browser_protocol::network::Response,
+) -> Option<u16> {
+    u16::try_from(response.status)
+        .ok()
+        .filter(|status| (100..=599).contains(status))
 }
 
 fn map_cdp_error(error: CdpError) -> TransportError {
