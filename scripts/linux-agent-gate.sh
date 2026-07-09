@@ -238,6 +238,7 @@ docker run --rm \
       wait \"\$chromium_pid\" >/dev/null 2>&1 || true
       cargo build -p tempo-engine-cdp --bin tempo-engined-cdp
       TEMPO_CDP_CHROME=\"\$CHROME_PATH\" scripts/test-live-cdp.sh ${INNER_MODE}
+      TEMPO_CDP_CHROME=\"\$CHROME_PATH\" cargo test -p tempo-engine-cdp --test tempod_live tempod_http_mcp_and_bidi_drive_live_cdp_browser -- --nocapture --test-threads=1
       TEMPO_CDP_CHROME=\"\$CHROME_PATH\" cargo test -p tempo-headless --test tempod_process live_cdp -- --nocapture --test-threads=1
       BENCH_OUT=/work/target/linux-agent-gate/agent-browser-bench
       TEMPO_CDP_CHROME=\"\$CHROME_PATH\" scripts/agent-browser-bench.sh \

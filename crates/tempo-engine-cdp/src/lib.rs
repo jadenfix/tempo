@@ -2226,13 +2226,15 @@ fn timed_out_navigation_recovered(
 
 fn env_flag_enabled(name: &str) -> bool {
     std::env::var(name)
-        .map(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
+        .map(|value| env_flag_value_enabled(&value))
         .unwrap_or(false)
+}
+
+fn env_flag_value_enabled(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 fn is_node_not_found_msg(message: &str) -> bool {
@@ -4357,6 +4359,27 @@ mod tests {
         assert!(args
             .iter()
             .any(|arg| arg == "--proxy-server=http://127.0.0.1:9001"));
+    }
+
+    #[test]
+    fn cdp_launch_stays_sandboxed_unless_explicitly_opted_out() {
+        assert!(
+            !CdpConfig::default().no_sandbox,
+            "default CDP launches must keep Chromium sandboxing enabled"
+        );
+        assert!(
+            CdpConfig::default().with_no_sandbox_for_ci().no_sandbox,
+            "no-sandbox must require the explicit CI/container opt-out"
+        );
+        for enabled in ["1", "true", "TRUE", "yes", "on", " On "] {
+            assert!(env_flag_value_enabled(enabled), "{enabled:?} must opt out");
+        }
+        for disabled in ["", "0", "false", "no", "off", "sandboxed"] {
+            assert!(
+                !env_flag_value_enabled(disabled),
+                "{disabled:?} must keep sandboxing enabled"
+            );
+        }
     }
 
     #[test]

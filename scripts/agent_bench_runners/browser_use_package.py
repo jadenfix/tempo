@@ -91,45 +91,108 @@ def metric_value_to_int(name: str, value: int | float) -> int:
 
 
 WEB_PERFORMANCE_ROW_FIELDS = {
+    "navigation_start_ms": "web_navigation_start_ms_p95",
     "navigation_duration_ms": "web_navigation_duration_ms_p95",
-    "dom_content_loaded_ms": "web_dom_content_loaded_ms_p95",
-    "load_event_ms": "web_load_event_ms_p95",
+    "worker_start_ms": "web_worker_start_ms_p95",
+    "redirect_start_ms": "web_redirect_start_ms_p95",
+    "redirect_end_ms": "web_redirect_end_ms_p95",
+    "fetch_start_ms": "web_fetch_start_ms_p95",
+    "domain_lookup_start_ms": "web_domain_lookup_start_ms_p95",
+    "domain_lookup_end_ms": "web_domain_lookup_end_ms_p95",
+    "connect_start_ms": "web_connect_start_ms_p95",
+    "connect_end_ms": "web_connect_end_ms_p95",
+    "secure_connection_start_ms": "web_secure_connection_start_ms_p95",
+    "request_start_ms": "web_request_start_ms_p95",
+    "response_start_ms": "web_response_start_ms_p95",
     "response_end_ms": "web_response_end_ms_p95",
+    "dom_interactive_ms": "web_dom_interactive_ms_p95",
+    "dom_content_loaded_start_ms": "web_dom_content_loaded_start_ms_p95",
+    "dom_content_loaded_ms": "web_dom_content_loaded_ms_p95",
+    "dom_complete_ms": "web_dom_complete_ms_p95",
+    "load_event_start_ms": "web_load_event_start_ms_p95",
+    "load_event_ms": "web_load_event_ms_p95",
     "resource_count": "web_resource_count_p95",
     "resource_transfer_size_bytes": "web_resource_transfer_size_bytes_p95",
+    "resource_encoded_body_size_bytes": "web_resource_encoded_body_size_bytes_p95",
     "resource_decoded_body_size_bytes": "web_resource_decoded_body_size_bytes_p95",
+    "resource_duration_ms": "web_resource_duration_ms_p95",
+    "resource_max_duration_ms": "web_resource_max_duration_ms_p95",
+    "resource_response_end_ms": "web_resource_response_end_ms_p95",
     "first_paint_ms": "web_first_paint_ms_p95",
     "first_contentful_paint_ms": "web_first_contentful_paint_ms_p95",
     "long_task_count": "web_long_task_count_p95",
     "long_task_duration_ms": "web_long_task_duration_ms_p95",
+    "long_task_max_duration_ms": "web_long_task_max_duration_ms_p95",
 }
 
 
 async def web_performance_metrics(page: Any) -> dict[str, Any]:
     value = await maybe_await(
         page.evaluate(
-            """() => JSON.stringify((() => {
+            """(...args) => (async () => JSON.stringify(await (async () => {
               const n = (value) => Number.isFinite(Number(value)) ? Math.round(Number(value)) : 0;
               const nav = performance.getEntriesByType('navigation')[0] || null;
               const resources = performance.getEntriesByType('resource');
               const paints = {};
               for (const entry of performance.getEntriesByType('paint')) paints[entry.name] = n(entry.startTime);
-              const longTasks = performance.getEntriesByType('longtask');
+              const longTasks = await (async () => {
+                const supported = window.PerformanceObserver?.supportedEntryTypes || [];
+                if (!supported.includes('longtask')) return [];
+                return await new Promise((resolve) => {
+                  const entries = [];
+                  let observer = null;
+                  const finish = () => {
+                    if (observer) observer.disconnect();
+                    resolve(entries);
+                  };
+                  try {
+                    observer = new PerformanceObserver((list) => {
+                      entries.push(...list.getEntries());
+                    });
+                    observer.observe({ type: 'longtask', buffered: true });
+                    setTimeout(finish, 0);
+                  } catch (_error) {
+                    finish();
+                  }
+                });
+              })();
               const sum = (entries, field) => entries.reduce((total, entry) => total + n(entry[field]), 0);
+              const max = (entries, field) => entries.reduce((largest, entry) => Math.max(largest, n(entry[field])), 0);
               return {
+                navigation_start_ms: nav ? n(nav.startTime) : 0,
                 navigation_duration_ms: nav ? n(nav.duration) : 0,
-                dom_content_loaded_ms: nav ? n(nav.domContentLoadedEventEnd) : 0,
-                load_event_ms: nav ? n(nav.loadEventEnd) : 0,
+                worker_start_ms: nav ? n(nav.workerStart) : 0,
+                redirect_start_ms: nav ? n(nav.redirectStart) : 0,
+                redirect_end_ms: nav ? n(nav.redirectEnd) : 0,
+                fetch_start_ms: nav ? n(nav.fetchStart) : 0,
+                domain_lookup_start_ms: nav ? n(nav.domainLookupStart) : 0,
+                domain_lookup_end_ms: nav ? n(nav.domainLookupEnd) : 0,
+                connect_start_ms: nav ? n(nav.connectStart) : 0,
+                connect_end_ms: nav ? n(nav.connectEnd) : 0,
+                secure_connection_start_ms: nav ? n(nav.secureConnectionStart) : 0,
+                request_start_ms: nav ? n(nav.requestStart) : 0,
+                response_start_ms: nav ? n(nav.responseStart) : 0,
                 response_end_ms: nav ? n(nav.responseEnd) : 0,
+                dom_interactive_ms: nav ? n(nav.domInteractive) : 0,
+                dom_content_loaded_start_ms: nav ? n(nav.domContentLoadedEventStart) : 0,
+                dom_content_loaded_ms: nav ? n(nav.domContentLoadedEventEnd) : 0,
+                dom_complete_ms: nav ? n(nav.domComplete) : 0,
+                load_event_start_ms: nav ? n(nav.loadEventStart) : 0,
+                load_event_ms: nav ? n(nav.loadEventEnd) : 0,
                 resource_count: resources.length,
                 resource_transfer_size_bytes: sum(resources, 'transferSize'),
+                resource_encoded_body_size_bytes: sum(resources, 'encodedBodySize'),
                 resource_decoded_body_size_bytes: sum(resources, 'decodedBodySize'),
+                resource_duration_ms: sum(resources, 'duration'),
+                resource_max_duration_ms: max(resources, 'duration'),
+                resource_response_end_ms: max(resources, 'responseEnd'),
                 first_paint_ms: paints['first-paint'] || 0,
                 first_contentful_paint_ms: paints['first-contentful-paint'] || 0,
                 long_task_count: longTasks.length,
-                long_task_duration_ms: sum(longTasks, 'duration')
+                long_task_duration_ms: sum(longTasks, 'duration'),
+                long_task_max_duration_ms: max(longTasks, 'duration')
               };
-            })())"""
+            })()))()"""
         )
     )
     if isinstance(value, str):
@@ -309,6 +372,7 @@ async def run_browser_use(url: str, chrome: str, output: Path) -> dict[str, Any]
             web_metrics = await web_performance_metrics(page)
     except Exception as error:  # noqa: BLE001
         failure_mode = type(error).__name__
+        success = False
         actions.append({"kind": "error", "error": str(error)})
     finally:
         if browser is not None:

@@ -136,8 +136,13 @@ not a hosted model credential or prompt contract. The harness writes:
   Performance Timeline metrics are captured for every benchmark runner,
   including Tempo's Rust CDP driver. The stable dashboard fields cover the
   comparable CDP document/frame/listener/node/layout/script/task/heap subset,
-  and any additional numeric CDP metrics Chrome returns are preserved and ranked
-  as `browser_cdp_*` gap categories.
+  and any additional numeric CDP metrics Chrome returns must be present for
+  every runner/iteration, are preserved, and are ranked as `browser_cdp_*` gap
+  categories. The Web Performance contract is a fixed aggregate set: detailed
+  navigation phase timings, resource transfer/encoded/decoded bytes, resource
+  duration totals/maxes, paint timing, and long-task count/duration/max. Long
+  tasks are collected with `PerformanceObserver` because they are not exposed by
+  `performance.getEntriesByType()`.
 - `agent-browser-bench-summary.json` with per-runner run count, success rate,
   failure-mode counts, retry totals, and p50/p95/max stats for latency, CPU,
   RSS, step count, and model-facing bytes/tokens. `--smoke` runs one iteration;
@@ -147,7 +152,7 @@ not a hosted model credential or prompt contract. The harness writes:
   browser-use package agent baselines. It calls out gaps to close for success
   rate, all-iteration latency, steady-state iteration 2+ latency, RSS, retries,
   failures, CPU, internal child/CLI wall time, browser RSS, process fanout, CDP
-  runtime metrics, Web Performance timing/resource/paint/long-task metrics,
+  runtime metrics, Web Performance navigation/resource/paint/long-task metrics,
   model-facing tokens, total model-facing tokens, durable and model-facing
   observation counts, compact-observation tokens, largest durable observation
   tokens, and agent step count. Cold-start iteration-1 latency is ranked so

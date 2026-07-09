@@ -67,17 +67,38 @@ BROWSER_PERFORMANCE_ROW_FIELDS = {
     "JSHeapTotalSize": "browser_js_heap_total_bytes_p95",
 }
 WEB_PERFORMANCE_ROW_FIELDS = {
+    "navigation_start_ms": "web_navigation_start_ms_p95",
     "navigation_duration_ms": "web_navigation_duration_ms_p95",
-    "dom_content_loaded_ms": "web_dom_content_loaded_ms_p95",
-    "load_event_ms": "web_load_event_ms_p95",
+    "worker_start_ms": "web_worker_start_ms_p95",
+    "redirect_start_ms": "web_redirect_start_ms_p95",
+    "redirect_end_ms": "web_redirect_end_ms_p95",
+    "fetch_start_ms": "web_fetch_start_ms_p95",
+    "domain_lookup_start_ms": "web_domain_lookup_start_ms_p95",
+    "domain_lookup_end_ms": "web_domain_lookup_end_ms_p95",
+    "connect_start_ms": "web_connect_start_ms_p95",
+    "connect_end_ms": "web_connect_end_ms_p95",
+    "secure_connection_start_ms": "web_secure_connection_start_ms_p95",
+    "request_start_ms": "web_request_start_ms_p95",
+    "response_start_ms": "web_response_start_ms_p95",
     "response_end_ms": "web_response_end_ms_p95",
+    "dom_interactive_ms": "web_dom_interactive_ms_p95",
+    "dom_content_loaded_start_ms": "web_dom_content_loaded_start_ms_p95",
+    "dom_content_loaded_ms": "web_dom_content_loaded_ms_p95",
+    "dom_complete_ms": "web_dom_complete_ms_p95",
+    "load_event_start_ms": "web_load_event_start_ms_p95",
+    "load_event_ms": "web_load_event_ms_p95",
     "resource_count": "web_resource_count_p95",
     "resource_transfer_size_bytes": "web_resource_transfer_size_bytes_p95",
+    "resource_encoded_body_size_bytes": "web_resource_encoded_body_size_bytes_p95",
     "resource_decoded_body_size_bytes": "web_resource_decoded_body_size_bytes_p95",
+    "resource_duration_ms": "web_resource_duration_ms_p95",
+    "resource_max_duration_ms": "web_resource_max_duration_ms_p95",
+    "resource_response_end_ms": "web_resource_response_end_ms_p95",
     "first_paint_ms": "web_first_paint_ms_p95",
     "first_contentful_paint_ms": "web_first_contentful_paint_ms_p95",
     "long_task_count": "web_long_task_count_p95",
     "long_task_duration_ms": "web_long_task_duration_ms_p95",
+    "long_task_max_duration_ms": "web_long_task_max_duration_ms_p95",
 }
 CHECKOUT_ORACLE_EMAIL = "agent@example.com"
 CHECKOUT_ORACLE_STATUS = "Order submitted"
@@ -783,7 +804,7 @@ def browser_use_snapshot_expression() -> str:
 
 def web_performance_expression() -> str:
     return r"""
-    (() => {
+    (async () => {
       const n = (value) => Number.isFinite(Number(value)) ? Math.round(Number(value)) : 0;
       const nav = performance.getEntriesByType('navigation')[0] || null;
       const resources = performance.getEntriesByType('resource');
@@ -791,20 +812,62 @@ def web_performance_expression() -> str:
       for (const entry of performance.getEntriesByType('paint')) {
         paints[entry.name] = n(entry.startTime);
       }
-      const longTasks = performance.getEntriesByType('longtask');
+      const longTasks = await (async () => {
+        const supported = window.PerformanceObserver?.supportedEntryTypes || [];
+        if (!supported.includes('longtask')) return [];
+        return await new Promise((resolve) => {
+          const entries = [];
+          let observer = null;
+          const finish = () => {
+            if (observer) observer.disconnect();
+            resolve(entries);
+          };
+          try {
+            observer = new PerformanceObserver((list) => {
+              entries.push(...list.getEntries());
+            });
+            observer.observe({ type: 'longtask', buffered: true });
+            setTimeout(finish, 0);
+          } catch (_error) {
+            finish();
+          }
+        });
+      })();
       const sum = (entries, field) => entries.reduce((total, entry) => total + n(entry[field]), 0);
+      const max = (entries, field) => entries.reduce((largest, entry) => Math.max(largest, n(entry[field])), 0);
       return {
+        navigation_start_ms: nav ? n(nav.startTime) : 0,
         navigation_duration_ms: nav ? n(nav.duration) : 0,
-        dom_content_loaded_ms: nav ? n(nav.domContentLoadedEventEnd) : 0,
-        load_event_ms: nav ? n(nav.loadEventEnd) : 0,
+        worker_start_ms: nav ? n(nav.workerStart) : 0,
+        redirect_start_ms: nav ? n(nav.redirectStart) : 0,
+        redirect_end_ms: nav ? n(nav.redirectEnd) : 0,
+        fetch_start_ms: nav ? n(nav.fetchStart) : 0,
+        domain_lookup_start_ms: nav ? n(nav.domainLookupStart) : 0,
+        domain_lookup_end_ms: nav ? n(nav.domainLookupEnd) : 0,
+        connect_start_ms: nav ? n(nav.connectStart) : 0,
+        connect_end_ms: nav ? n(nav.connectEnd) : 0,
+        secure_connection_start_ms: nav ? n(nav.secureConnectionStart) : 0,
+        request_start_ms: nav ? n(nav.requestStart) : 0,
+        response_start_ms: nav ? n(nav.responseStart) : 0,
         response_end_ms: nav ? n(nav.responseEnd) : 0,
+        dom_interactive_ms: nav ? n(nav.domInteractive) : 0,
+        dom_content_loaded_start_ms: nav ? n(nav.domContentLoadedEventStart) : 0,
+        dom_content_loaded_ms: nav ? n(nav.domContentLoadedEventEnd) : 0,
+        dom_complete_ms: nav ? n(nav.domComplete) : 0,
+        load_event_start_ms: nav ? n(nav.loadEventStart) : 0,
+        load_event_ms: nav ? n(nav.loadEventEnd) : 0,
         resource_count: resources.length,
         resource_transfer_size_bytes: sum(resources, 'transferSize'),
+        resource_encoded_body_size_bytes: sum(resources, 'encodedBodySize'),
         resource_decoded_body_size_bytes: sum(resources, 'decodedBodySize'),
+        resource_duration_ms: sum(resources, 'duration'),
+        resource_max_duration_ms: max(resources, 'duration'),
+        resource_response_end_ms: max(resources, 'responseEnd'),
         first_paint_ms: paints['first-paint'] || 0,
         first_contentful_paint_ms: paints['first-contentful-paint'] || 0,
         long_task_count: longTasks.length,
-        long_task_duration_ms: sum(longTasks, 'duration')
+        long_task_duration_ms: sum(longTasks, 'duration'),
+        long_task_max_duration_ms: max(longTasks, 'duration')
       };
     })()
     """
@@ -893,6 +956,7 @@ def run_cdp_baseline(chrome: str, url: str, runner: str, snapshot: str | None) -
                         context.close()
         except Exception as error:  # noqa: BLE001
             failure_mode = type(error).__name__
+            success = False
     wall = now_ms() - started
     usage = combined_usage_delta(before_self, before_children, usage_self(), usage_children())
     usage["max_rss_bytes"] = sampler.max_rss_bytes
@@ -1298,6 +1362,11 @@ def benchmark_gap_report(metrics: list[dict], summary: dict) -> dict:
         field_name = browser_performance_metric_row_field(metric_name)
         if field_name not in ranked_browser_fields:
             category_specs.append((field_name, "lower_is_better", runners))
+    ranked_category_fields = {name for name, _direction, _runners in category_specs}
+    for field_name in WEB_PERFORMANCE_ROW_FIELDS.values():
+        if field_name not in ranked_category_fields:
+            category_specs.append((field_name, "lower_is_better", runners))
+            ranked_category_fields.add(field_name)
     categories = []
     gaps_to_close = []
     for name, direction, category_runners in category_specs:
@@ -1582,6 +1651,24 @@ def browser_performance_metric_names(metrics: list[dict]) -> list[str]:
     return sorted(names)
 
 
+def assert_browser_performance_metric_key_coverage(metrics: list[dict]) -> None:
+    expected_names = set(browser_performance_metric_names(metrics))
+    for metric in metrics:
+        runner = str(metric.get("runner", "<unknown>"))
+        iteration = int(metric.get("iteration", 0))
+        browser_metrics = metric.get("browser_performance_metrics")
+        if not isinstance(browser_metrics, dict):
+            raise RuntimeError(f"{runner} iteration {iteration} missing browser_performance_metrics")
+        names = set(str(name) for name in browser_metrics)
+        if names != expected_names:
+            missing = sorted(expected_names - names)
+            extra = sorted(names - expected_names)
+            raise RuntimeError(
+                f"{runner} iteration {iteration} CDP metric key coverage mismatch: "
+                f"missing={missing} extra={extra}"
+            )
+
+
 def browser_performance_metric_row_field(metric_name: str) -> str:
     if metric_name in BROWSER_PERFORMANCE_ROW_FIELDS:
         return BROWSER_PERFORMANCE_ROW_FIELDS[metric_name]
@@ -1852,6 +1939,7 @@ def main() -> int:
             write_jsonl(iteration_dir / "agent-browser-bench.jsonl", iteration_metrics)
             derive_artifacts(iteration_dir, iteration_metrics, url)
             metrics.extend(iteration_metrics)
+        assert_browser_performance_metric_key_coverage(metrics)
         summary = summarize_metrics(metrics)
         root_report = {
             "url": url,
