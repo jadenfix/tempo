@@ -22,6 +22,7 @@ on:
           - cache
           - desktop
           - runtime
+          - headless-flag
           - all
         default: default
   schedule:

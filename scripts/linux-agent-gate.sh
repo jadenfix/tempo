@@ -91,10 +91,10 @@ esac
 reject_unsafe_host_env
 
 case "$BENCH_PROFILE" in
-  default | lifecycle | insert-text | no-incognito | cache | desktop | runtime | all) ;;
+  default | lifecycle | insert-text | no-incognito | cache | desktop | runtime | headless-flag | all) ;;
   *)
     echo "unsupported TEMPO_LINUX_AGENT_BENCH_PROFILE: ${BENCH_PROFILE}" >&2
-    echo "supported values: default, lifecycle, insert-text, no-incognito, cache, desktop, runtime, all" >&2
+    echo "supported values: default, lifecycle, insert-text, no-incognito, cache, desktop, runtime, headless-flag, all" >&2
     exit 2
     ;;
 esac
@@ -240,6 +240,9 @@ case "$BENCH_PROFILE" in
     ;;
   runtime)
     COMMON_ENV+=(-e TEMPO_CDP_BENCH_CURRENT_THREAD_RUNTIME=1)
+    ;;
+  headless-flag)
+    COMMON_ENV+=(-e TEMPO_CDP_BENCH_HEADLESS_FLAG=1)
     ;;
   all)
     COMMON_ENV+=(

@@ -1156,6 +1156,9 @@ def run_tempo(url: str, chrome: str, output_dir: Path) -> dict:
         "cdp_desktop_integration": (
             "suppressed" if env.get("TEMPO_CDP_BENCH_SUPPRESS_DESKTOP") == "1" else "default"
         ),
+        "cdp_headless_mode": (
+            "headless-flag" if env.get("TEMPO_CDP_BENCH_HEADLESS_FLAG") == "1" else "new-headless"
+        ),
         "tempo_phase_timings_ms": timings,
         "browser_performance_metrics_available": bool(
             report.get("browser_performance_metrics_available")
