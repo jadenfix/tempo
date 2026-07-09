@@ -303,6 +303,17 @@ impl CdpTempoDriver {
         self
     }
 
+    /// Return CDP `Performance.getMetrics` values for the active page.
+    pub async fn browser_performance_metrics(
+        &mut self,
+    ) -> Result<BTreeMap<String, f64>, TransportError> {
+        let metrics = self.page()?.metrics().await.map_err(map_cdp_error)?;
+        Ok(metrics
+            .into_iter()
+            .map(|metric| (metric.name, metric.value))
+            .collect())
+    }
+
     /// Override the shared pre-navigation URL policy used by the CDP lane.
     pub fn with_url_policy(mut self, url_policy: UrlPolicy) -> Self {
         self.set_url_policy(url_policy);

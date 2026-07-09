@@ -132,9 +132,9 @@ not a hosted model credential or prompt contract. The harness writes:
   shared checkout oracle (`agent@example.com`, remembered checkout, submitted
   status) and raw/synthetic CDP lanes replay the same `checkout-actions.json`
   action plan one step at a time rather than using a one-shot DOM mutation.
-  Browser runtime metrics from CDP `Performance.getMetrics` are captured for
-  Playwright/CDP/browser-use-style lanes; Tempo's missing Rust-driver export is
-  recorded explicitly instead of excluding that gap.
+  Browser runtime metrics from CDP `Performance.getMetrics` and browser
+  Performance Timeline metrics are captured for every benchmark runner,
+  including Tempo's Rust CDP driver.
 - `agent-browser-bench-summary.json` with per-runner run count, success rate,
   failure-mode counts, retry totals, and p50/p95/max stats for latency, CPU,
   RSS, step count, and model-facing bytes/tokens. `--smoke` runs one iteration;
@@ -143,7 +143,8 @@ not a hosted model credential or prompt contract. The harness writes:
   Tempo deltas against raw Chrome plus Playwright, browser-use-style, and real
   browser-use package agent baselines. It calls out gaps to close for success
   rate, all-iteration latency, steady-state iteration 2+ latency, RSS, retries,
-  failures, internal child/CLI wall time, browser RSS, process fanout,
+  failures, internal child/CLI wall time, browser RSS, process fanout, CDP
+  runtime metrics, Web Performance timing/resource/paint/long-task metrics,
   model-facing tokens, total model-facing tokens, model-facing observation
   count, compact-observation tokens, largest durable observation tokens, and
   agent step count. Cold-start iteration-1 latency is ranked so first-run cost

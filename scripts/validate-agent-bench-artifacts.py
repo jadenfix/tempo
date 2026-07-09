@@ -39,6 +39,35 @@ AGENT_STYLE_RUNNERS = {
     "real-browser-use",
 }
 
+BROWSER_PERFORMANCE_ROW_FIELDS = {
+    "Documents": "browser_documents_p95",
+    "Frames": "browser_frames_p95",
+    "JSEventListeners": "browser_js_event_listeners_p95",
+    "Nodes": "browser_nodes_p95",
+    "LayoutCount": "browser_layout_count_p95",
+    "RecalcStyleCount": "browser_recalc_style_count_p95",
+    "LayoutDuration": "browser_layout_duration_ms_p95",
+    "RecalcStyleDuration": "browser_recalc_style_duration_ms_p95",
+    "ScriptDuration": "browser_script_duration_ms_p95",
+    "TaskDuration": "browser_task_duration_ms_p95",
+    "JSHeapUsedSize": "browser_js_heap_used_bytes_p95",
+    "JSHeapTotalSize": "browser_js_heap_total_bytes_p95",
+}
+
+WEB_PERFORMANCE_ROW_FIELDS = {
+    "navigation_duration_ms": "web_navigation_duration_ms_p95",
+    "dom_content_loaded_ms": "web_dom_content_loaded_ms_p95",
+    "load_event_ms": "web_load_event_ms_p95",
+    "response_end_ms": "web_response_end_ms_p95",
+    "resource_count": "web_resource_count_p95",
+    "resource_transfer_size_bytes": "web_resource_transfer_size_bytes_p95",
+    "resource_decoded_body_size_bytes": "web_resource_decoded_body_size_bytes_p95",
+    "first_paint_ms": "web_first_paint_ms_p95",
+    "first_contentful_paint_ms": "web_first_contentful_paint_ms_p95",
+    "long_task_count": "web_long_task_count_p95",
+    "long_task_duration_ms": "web_long_task_duration_ms_p95",
+}
+
 REQUIRED_METRIC_FIELDS = {
     "runner",
     "suite",
@@ -341,9 +370,8 @@ def validate_metric(metric: dict[str, Any], iterations: int, output_dir: Path) -
                 "tempo-cdp-agent.max_compact_observation_bytes must be <= max_observation_bytes"
             )
         validate_tempo_phase_timings(metric)
-        validate_browser_performance_unavailable(metric)
-    else:
-        validate_browser_performance_metrics(metric)
+    validate_browser_performance_metrics(metric)
+    validate_web_performance_metrics(metric)
 
     if runner in {"real-playwright", "external-browser-use-dom-loop", "real-browser-use"}:
         if metric.get("external_process") is not True:
@@ -373,11 +401,8 @@ def validate_metric(metric: dict[str, Any], iterations: int, output_dir: Path) -
             "total_model_input_tokens",
             "max_observation_bytes",
             "max_observation_tokens",
-            "browser_nodes_p95",
-            "browser_task_duration_ms_p95",
-            "browser_script_duration_ms_p95",
-            "browser_layout_duration_ms_p95",
-            "browser_js_heap_used_bytes_p95",
+            *BROWSER_PERFORMANCE_ROW_FIELDS.values(),
+            *WEB_PERFORMANCE_ROW_FIELDS.values(),
         ):
             if field in raw_report and field in metric and int(raw_report[field]) != int(metric[field]):
                 raise ValidationError(f"{runner}.{field} must match runner_report")
@@ -398,14 +423,6 @@ def validate_final_oracle(runner: str, oracle: Any) -> None:
         raise ValidationError(f"{runner}.final_oracle remember state must be true or inferred: {oracle}")
 
 
-def validate_browser_performance_unavailable(metric: dict[str, Any]) -> None:
-    if metric.get("browser_performance_metrics_available") is not False:
-        raise ValidationError("tempo-cdp-agent browser performance availability must be false")
-    reason = metric.get("browser_performance_metrics_unavailable_reason")
-    if not isinstance(reason, str) or "Performance.getMetrics" not in reason:
-        raise ValidationError("tempo-cdp-agent must explain missing browser performance metrics")
-
-
 def validate_browser_performance_metrics(metric: dict[str, Any]) -> None:
     runner = str(metric["runner"])
     if metric.get("browser_performance_metrics_available") is not True:
@@ -417,11 +434,22 @@ def validate_browser_performance_metrics(metric: dict[str, Any]) -> None:
         value = metrics.get(name)
         if not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0:
             raise ValidationError(f"{runner}.browser_performance_metrics.{name} must be >= 0")
-    for field in (
-        "browser_nodes_p95",
-        "browser_task_duration_ms_p95",
-        "browser_js_heap_used_bytes_p95",
-    ):
+    for field in BROWSER_PERFORMANCE_ROW_FIELDS.values():
+        require_int(metric, field)
+
+
+def validate_web_performance_metrics(metric: dict[str, Any]) -> None:
+    runner = str(metric["runner"])
+    if metric.get("web_performance_metrics_available") is not True:
+        raise ValidationError(f"{runner}.web_performance_metrics_available must be true")
+    metrics = metric.get("web_performance_metrics")
+    if not isinstance(metrics, dict) or not metrics:
+        raise ValidationError(f"{runner}.web_performance_metrics must be populated")
+    for name in WEB_PERFORMANCE_ROW_FIELDS:
+        value = metrics.get(name)
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0:
+            raise ValidationError(f"{runner}.web_performance_metrics.{name} must be >= 0")
+    for field in WEB_PERFORMANCE_ROW_FIELDS.values():
         require_int(metric, field)
 
 
@@ -557,6 +585,29 @@ def expected_gap_report(metrics: list[dict[str, Any]], summary: dict[str, Any]) 
         ("max_rss_bytes_p95", "lower_is_better", runners),
         ("browser_rss_bytes_p95", "lower_is_better", runners),
         ("process_count_at_peak_p95", "lower_is_better", runners),
+        ("browser_documents_p95", "lower_is_better", runners),
+        ("browser_frames_p95", "lower_is_better", runners),
+        ("browser_js_event_listeners_p95", "lower_is_better", runners),
+        ("browser_nodes_p95", "lower_is_better", runners),
+        ("browser_layout_count_p95", "lower_is_better", runners),
+        ("browser_recalc_style_count_p95", "lower_is_better", runners),
+        ("browser_layout_duration_ms_p95", "lower_is_better", runners),
+        ("browser_recalc_style_duration_ms_p95", "lower_is_better", runners),
+        ("browser_script_duration_ms_p95", "lower_is_better", runners),
+        ("browser_task_duration_ms_p95", "lower_is_better", runners),
+        ("browser_js_heap_used_bytes_p95", "lower_is_better", runners),
+        ("browser_js_heap_total_bytes_p95", "lower_is_better", runners),
+        ("web_navigation_duration_ms_p95", "lower_is_better", runners),
+        ("web_dom_content_loaded_ms_p95", "lower_is_better", runners),
+        ("web_load_event_ms_p95", "lower_is_better", runners),
+        ("web_response_end_ms_p95", "lower_is_better", runners),
+        ("web_resource_count_p95", "lower_is_better", runners),
+        ("web_resource_transfer_size_bytes_p95", "lower_is_better", runners),
+        ("web_resource_decoded_body_size_bytes_p95", "lower_is_better", runners),
+        ("web_first_paint_ms_p95", "lower_is_better", runners),
+        ("web_first_contentful_paint_ms_p95", "lower_is_better", runners),
+        ("web_long_task_count_p95", "lower_is_better", runners),
+        ("web_long_task_duration_ms_p95", "lower_is_better", runners),
         ("retry_count_total", "lower_is_better", runners),
         ("failure_count", "lower_is_better", runners),
         (
@@ -677,7 +728,8 @@ def expected_gap_report(metrics: list[dict[str, Any]], summary: dict[str, Any]) 
             "max_observation_tokens_p95 compares the largest single durable observation per run; total_model_input_tokens_p95 ranks the cumulative model-facing stream where runners expose it.",
             "cpu_time_ms_p95 is row-level only until every runner uses the same resource-accounting scope.",
             "cold_start_wall_clock_ms reports iteration 1; steady_state_wall_clock_ms_p95 ranks iteration 2+ only and is omitted for one-iteration smoke artifacts.",
-            "browser_performance_metrics_available stays row-level so Tempo's missing CDP Performance.getMetrics export is visible instead of silently excluded from browser-runtime metrics.",
+            "CDP Performance.getMetrics fields are required and ranked for every runner in this CDP-backed benchmark.",
+            "web_* categories come from the browser Performance Timeline APIs and are required for every runner, including Tempo.",
             "Positive deltas mean Tempo is behind that comparison target; negative deltas mean Tempo is ahead.",
         ],
         "rows": rows,
@@ -764,6 +816,10 @@ def comparison_row(
             "browser_js_heap_used_bytes_p95",
             0.95,
         ),
+        **{
+            field_name: optional_metric_percentile(runner_metrics, field_name, 0.95)
+            for field_name in BROWSER_PERFORMANCE_ROW_FIELDS.values()
+        },
         "cpu_time_ms_p95": percentile(
             [
                 int(metric.get("cpu_user_ms", 0)) + int(metric.get("cpu_system_ms", 0))
@@ -802,6 +858,14 @@ def comparison_row(
             [int(metric.get("process_count_at_peak", 0)) for metric in runner_metrics],
             0.95,
         ),
+        "web_performance_metrics_available": all(
+            bool(metric.get("web_performance_metrics_available"))
+            for metric in runner_metrics
+        ),
+        **{
+            field_name: optional_metric_percentile(runner_metrics, field_name, 0.95)
+            for field_name in WEB_PERFORMANCE_ROW_FIELDS.values()
+        },
         "observations_p95": int(runner_summary["observations"]["p95"]),
         "model_input_observations_p95": int(runner_summary["model_input_observations"]["p95"]),
         "step_count_p95": int(runner_summary["step_count"]["p95"]),
@@ -1113,6 +1177,14 @@ def validate_tempo_derived_artifacts(
         raise ValidationError("tempo-run.json total_model_input_tokens must match tempo metric")
     if run_report.get("timings_ms") != tempo.get("tempo_phase_timings_ms"):
         raise ValidationError("tempo-run.json timings_ms must match tempo metric phase timings")
+    if run_report.get("browser_performance_metrics_available") is not True:
+        raise ValidationError("tempo-run.json browser_performance_metrics_available must be true")
+    if run_report.get("web_performance_metrics_available") is not True:
+        raise ValidationError("tempo-run.json web_performance_metrics_available must be true")
+    if run_report.get("browser_performance_metrics") != tempo.get("browser_performance_metrics"):
+        raise ValidationError("tempo-run.json browser_performance_metrics must match tempo metric")
+    if run_report.get("web_performance_metrics") != tempo.get("web_performance_metrics"):
+        raise ValidationError("tempo-run.json web_performance_metrics must match tempo metric")
     require_applied_steps(run_report_path, run_report.get("steps"), int(tempo["step_count"]))
 
     journal_count = sqlite_journal_entry_count(journal_path)

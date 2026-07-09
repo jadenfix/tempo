@@ -53,11 +53,31 @@ BROWSER_PERFORMANCE_METRIC_NAMES = [
     "JSHeapTotalSize",
 ]
 BROWSER_PERFORMANCE_ROW_FIELDS = {
+    "Documents": "browser_documents_p95",
+    "Frames": "browser_frames_p95",
+    "JSEventListeners": "browser_js_event_listeners_p95",
     "Nodes": "browser_nodes_p95",
-    "TaskDuration": "browser_task_duration_ms_p95",
-    "ScriptDuration": "browser_script_duration_ms_p95",
+    "LayoutCount": "browser_layout_count_p95",
+    "RecalcStyleCount": "browser_recalc_style_count_p95",
     "LayoutDuration": "browser_layout_duration_ms_p95",
+    "RecalcStyleDuration": "browser_recalc_style_duration_ms_p95",
+    "ScriptDuration": "browser_script_duration_ms_p95",
+    "TaskDuration": "browser_task_duration_ms_p95",
     "JSHeapUsedSize": "browser_js_heap_used_bytes_p95",
+    "JSHeapTotalSize": "browser_js_heap_total_bytes_p95",
+}
+WEB_PERFORMANCE_ROW_FIELDS = {
+    "navigation_duration_ms": "web_navigation_duration_ms_p95",
+    "dom_content_loaded_ms": "web_dom_content_loaded_ms_p95",
+    "load_event_ms": "web_load_event_ms_p95",
+    "response_end_ms": "web_response_end_ms_p95",
+    "resource_count": "web_resource_count_p95",
+    "resource_transfer_size_bytes": "web_resource_transfer_size_bytes_p95",
+    "resource_decoded_body_size_bytes": "web_resource_decoded_body_size_bytes_p95",
+    "first_paint_ms": "web_first_paint_ms_p95",
+    "first_contentful_paint_ms": "web_first_contentful_paint_ms_p95",
+    "long_task_count": "web_long_task_count_p95",
+    "long_task_duration_ms": "web_long_task_duration_ms_p95",
 }
 CHECKOUT_ORACLE_EMAIL = "agent@example.com"
 CHECKOUT_ORACLE_STATUS = "Order submitted"
@@ -549,6 +569,12 @@ def run_tempo(url: str, chrome: str, output_dir: Path) -> dict:
     timings = report.get("timings_ms")
     if not isinstance(timings, dict):
         raise RuntimeError("tempo run report missing timings_ms")
+    browser_metrics = report.get("browser_performance_metrics")
+    if not isinstance(browser_metrics, dict):
+        raise RuntimeError("tempo run report missing browser_performance_metrics")
+    web_metrics = report.get("web_performance_metrics")
+    if not isinstance(web_metrics, dict):
+        raise RuntimeError("tempo run report missing web_performance_metrics")
     final_oracle = tempo_final_oracle(journal)
     success = (
         report.get("status", {}).get("state") in {"completed", "already_complete"}
@@ -610,12 +636,20 @@ def run_tempo(url: str, chrome: str, output_dir: Path) -> dict:
         "tempo_cli_prebuilt": cmd[0] != "cargo",
         "tempo_engine": str(report.get("engine", "")),
         "tempo_phase_timings_ms": timings,
-        "browser_performance_metrics_available": False,
-        "browser_performance_metrics_unavailable_reason": (
-            "tempo-cdp-agent does not yet export CDP Performance.getMetrics from the Rust driver"
+        "browser_performance_metrics_available": bool(
+            report.get("browser_performance_metrics_available")
         ),
-        "browser_performance_metrics": {},
+        "browser_performance_metrics": browser_metrics,
     }
+    apply_browser_performance_metrics(metric, browser_metrics)
+    apply_web_performance_metrics(
+        metric,
+        {
+            key: int(web_metrics.get(key, 0))
+            for key in WEB_PERFORMANCE_ROW_FIELDS
+            if isinstance(web_metrics.get(key, 0), (int, float))
+        },
+    )
     for timing_name, metric_name in (
         ("total_wall_clock_ms", "tempo_total_wall_clock_ms"),
         ("runtime_setup_ms", "tempo_runtime_setup_ms"),
@@ -652,7 +686,7 @@ def metric_value_to_int(name: str, value: int | float) -> int:
 
 
 def apply_browser_performance_metrics(metric: dict, metrics: dict[str, int | float]) -> None:
-    metric["browser_performance_metrics_available"] = True
+    metric["browser_performance_metrics_available"] = bool(metrics)
     metric["browser_performance_metrics"] = dict(sorted(metrics.items()))
     for source_name, field_name in BROWSER_PERFORMANCE_ROW_FIELDS.items():
         if source_name in metrics:
@@ -747,6 +781,53 @@ def browser_use_snapshot_expression() -> str:
     """
 
 
+def web_performance_expression() -> str:
+    return r"""
+    (() => {
+      const n = (value) => Number.isFinite(Number(value)) ? Math.round(Number(value)) : 0;
+      const nav = performance.getEntriesByType('navigation')[0] || null;
+      const resources = performance.getEntriesByType('resource');
+      const paints = {};
+      for (const entry of performance.getEntriesByType('paint')) {
+        paints[entry.name] = n(entry.startTime);
+      }
+      const longTasks = performance.getEntriesByType('longtask');
+      const sum = (entries, field) => entries.reduce((total, entry) => total + n(entry[field]), 0);
+      return {
+        navigation_duration_ms: nav ? n(nav.duration) : 0,
+        dom_content_loaded_ms: nav ? n(nav.domContentLoadedEventEnd) : 0,
+        load_event_ms: nav ? n(nav.loadEventEnd) : 0,
+        response_end_ms: nav ? n(nav.responseEnd) : 0,
+        resource_count: resources.length,
+        resource_transfer_size_bytes: sum(resources, 'transferSize'),
+        resource_decoded_body_size_bytes: sum(resources, 'decodedBodySize'),
+        first_paint_ms: paints['first-paint'] || 0,
+        first_contentful_paint_ms: paints['first-contentful-paint'] || 0,
+        long_task_count: longTasks.length,
+        long_task_duration_ms: sum(longTasks, 'duration')
+      };
+    })()
+    """
+
+
+def web_performance_metrics(page: object) -> dict[str, int]:
+    value = page.evaluate(web_performance_expression())
+    if not isinstance(value, dict):
+        raise RuntimeError("web performance metrics returned non-object")
+    return {
+        key: int(value.get(key, 0))
+        for key in WEB_PERFORMANCE_ROW_FIELDS
+        if isinstance(value.get(key, 0), (int, float))
+    }
+
+
+def apply_web_performance_metrics(metric: dict, metrics: dict[str, int]) -> None:
+    metric["web_performance_metrics_available"] = bool(metrics)
+    metric["web_performance_metrics"] = dict(sorted(metrics.items()))
+    for source_name, field_name in WEB_PERFORMANCE_ROW_FIELDS.items():
+        metric[field_name] = int(metrics.get(source_name, 0))
+
+
 def run_cdp_baseline(chrome: str, url: str, runner: str, snapshot: str | None) -> dict:
     from playwright.sync_api import sync_playwright
 
@@ -756,6 +837,7 @@ def run_cdp_baseline(chrome: str, url: str, runner: str, snapshot: str | None) -
     failure_mode = None
     model_input = ""
     browser_metrics: dict[str, int | float] = {}
+    web_metrics: dict[str, int] = {}
     action_trace: list[dict] = []
     final_oracle: dict = {"submitted": False, "source": runner}
     success = False
@@ -806,6 +888,7 @@ def run_cdp_baseline(chrome: str, url: str, runner: str, snapshot: str | None) -
                         final_oracle = checkout_oracle_from_page(page, runner)
                         success = bool(final_oracle.get("submitted"))
                         browser_metrics = cdp_performance_metrics(cdp)
+                        web_metrics = web_performance_metrics(page)
                     finally:
                         context.close()
         except Exception as error:  # noqa: BLE001
@@ -833,6 +916,7 @@ def run_cdp_baseline(chrome: str, url: str, runner: str, snapshot: str | None) -
         "adapter": "playwright-cdp-session",
     }
     apply_browser_performance_metrics(metric, browser_metrics)
+    apply_web_performance_metrics(metric, web_metrics)
     if snapshot:
         metric.update(
             {
@@ -940,6 +1024,17 @@ def run_external_baseline(
         if isinstance(metrics, dict):
             metric["browser_performance_metrics"] = metrics
     for field_name in BROWSER_PERFORMANCE_ROW_FIELDS.values():
+        if field_name in report:
+            metric[field_name] = int(report[field_name])
+    if "web_performance_metrics_available" in report:
+        metric["web_performance_metrics_available"] = bool(
+            report["web_performance_metrics_available"]
+        )
+    if "web_performance_metrics" in report:
+        metrics = report["web_performance_metrics"]
+        if isinstance(metrics, dict):
+            metric["web_performance_metrics"] = metrics
+    for field_name in WEB_PERFORMANCE_ROW_FIELDS.values():
         if field_name in report:
             metric[field_name] = int(report[field_name])
     for key in ("model_input_path", "action_trace_path"):
@@ -1136,6 +1231,29 @@ def benchmark_gap_report(metrics: list[dict], summary: dict) -> dict:
         ("max_rss_bytes_p95", "lower_is_better", runners),
         ("browser_rss_bytes_p95", "lower_is_better", runners),
         ("process_count_at_peak_p95", "lower_is_better", runners),
+        ("browser_documents_p95", "lower_is_better", runners),
+        ("browser_frames_p95", "lower_is_better", runners),
+        ("browser_js_event_listeners_p95", "lower_is_better", runners),
+        ("browser_nodes_p95", "lower_is_better", runners),
+        ("browser_layout_count_p95", "lower_is_better", runners),
+        ("browser_recalc_style_count_p95", "lower_is_better", runners),
+        ("browser_layout_duration_ms_p95", "lower_is_better", runners),
+        ("browser_recalc_style_duration_ms_p95", "lower_is_better", runners),
+        ("browser_script_duration_ms_p95", "lower_is_better", runners),
+        ("browser_task_duration_ms_p95", "lower_is_better", runners),
+        ("browser_js_heap_used_bytes_p95", "lower_is_better", runners),
+        ("browser_js_heap_total_bytes_p95", "lower_is_better", runners),
+        ("web_navigation_duration_ms_p95", "lower_is_better", runners),
+        ("web_dom_content_loaded_ms_p95", "lower_is_better", runners),
+        ("web_load_event_ms_p95", "lower_is_better", runners),
+        ("web_response_end_ms_p95", "lower_is_better", runners),
+        ("web_resource_count_p95", "lower_is_better", runners),
+        ("web_resource_transfer_size_bytes_p95", "lower_is_better", runners),
+        ("web_resource_decoded_body_size_bytes_p95", "lower_is_better", runners),
+        ("web_first_paint_ms_p95", "lower_is_better", runners),
+        ("web_first_contentful_paint_ms_p95", "lower_is_better", runners),
+        ("web_long_task_count_p95", "lower_is_better", runners),
+        ("web_long_task_duration_ms_p95", "lower_is_better", runners),
         ("retry_count_total", "lower_is_better", runners),
         ("failure_count", "lower_is_better", runners),
         (
@@ -1256,7 +1374,8 @@ def benchmark_gap_report(metrics: list[dict], summary: dict) -> dict:
             "max_observation_tokens_p95 compares the largest single durable observation per run; total_model_input_tokens_p95 ranks the cumulative model-facing stream where runners expose it.",
             "cpu_time_ms_p95 is row-level only until every runner uses the same resource-accounting scope.",
             "cold_start_wall_clock_ms reports iteration 1; steady_state_wall_clock_ms_p95 ranks iteration 2+ only and is omitted for one-iteration smoke artifacts.",
-            "browser_performance_metrics_available stays row-level so Tempo's missing CDP Performance.getMetrics export is visible instead of silently excluded from browser-runtime metrics.",
+            "CDP Performance.getMetrics fields are required and ranked for every runner in this CDP-backed benchmark.",
+            "web_* categories come from the browser Performance Timeline APIs and are required for every runner, including Tempo.",
             "Positive deltas mean Tempo is behind that comparison target; negative deltas mean Tempo is ahead.",
         ],
         "rows": rows,
@@ -1339,6 +1458,10 @@ def comparison_row(runner: str, runner_summary: dict, runner_metrics: list[dict]
             "browser_js_heap_used_bytes_p95",
             0.95,
         ),
+        **{
+            field_name: optional_metric_percentile(runner_metrics, field_name, 0.95)
+            for field_name in BROWSER_PERFORMANCE_ROW_FIELDS.values()
+        },
         "browser_rss_bytes_p95": percentile(
             [browser_rss_bytes(metric) for metric in runner_metrics],
             0.95,
@@ -1347,6 +1470,14 @@ def comparison_row(runner: str, runner_summary: dict, runner_metrics: list[dict]
             [int(metric.get("process_count_at_peak", 0)) for metric in runner_metrics],
             0.95,
         ),
+        "web_performance_metrics_available": all(
+            bool(metric.get("web_performance_metrics_available"))
+            for metric in runner_metrics
+        ),
+        **{
+            field_name: optional_metric_percentile(runner_metrics, field_name, 0.95)
+            for field_name in WEB_PERFORMANCE_ROW_FIELDS.values()
+        },
         "cpu_time_ms_p95": percentile(
             [
                 int(metric.get("cpu_user_ms", 0)) + int(metric.get("cpu_system_ms", 0))

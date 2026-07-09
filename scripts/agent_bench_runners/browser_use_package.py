@@ -103,6 +103,56 @@ def metric_value_to_int(name: str, value: int | float) -> int:
     return int(round(float(value)))
 
 
+WEB_PERFORMANCE_ROW_FIELDS = {
+    "navigation_duration_ms": "web_navigation_duration_ms_p95",
+    "dom_content_loaded_ms": "web_dom_content_loaded_ms_p95",
+    "load_event_ms": "web_load_event_ms_p95",
+    "response_end_ms": "web_response_end_ms_p95",
+    "resource_count": "web_resource_count_p95",
+    "resource_transfer_size_bytes": "web_resource_transfer_size_bytes_p95",
+    "resource_decoded_body_size_bytes": "web_resource_decoded_body_size_bytes_p95",
+    "first_paint_ms": "web_first_paint_ms_p95",
+    "first_contentful_paint_ms": "web_first_contentful_paint_ms_p95",
+    "long_task_count": "web_long_task_count_p95",
+    "long_task_duration_ms": "web_long_task_duration_ms_p95",
+}
+
+
+async def web_performance_metrics(page: Any) -> dict[str, Any]:
+    value = await maybe_await(
+        page.evaluate(
+            """() => JSON.stringify((() => {
+              const n = (value) => Number.isFinite(Number(value)) ? Math.round(Number(value)) : 0;
+              const nav = performance.getEntriesByType('navigation')[0] || null;
+              const resources = performance.getEntriesByType('resource');
+              const paints = {};
+              for (const entry of performance.getEntriesByType('paint')) paints[entry.name] = n(entry.startTime);
+              const longTasks = performance.getEntriesByType('longtask');
+              const sum = (entries, field) => entries.reduce((total, entry) => total + n(entry[field]), 0);
+              return {
+                navigation_duration_ms: nav ? n(nav.duration) : 0,
+                dom_content_loaded_ms: nav ? n(nav.domContentLoadedEventEnd) : 0,
+                load_event_ms: nav ? n(nav.loadEventEnd) : 0,
+                response_end_ms: nav ? n(nav.responseEnd) : 0,
+                resource_count: resources.length,
+                resource_transfer_size_bytes: sum(resources, 'transferSize'),
+                resource_decoded_body_size_bytes: sum(resources, 'decodedBodySize'),
+                first_paint_ms: paints['first-paint'] || 0,
+                first_contentful_paint_ms: paints['first-contentful-paint'] || 0,
+                long_task_count: longTasks.length,
+                long_task_duration_ms: sum(longTasks, 'duration')
+              };
+            })())"""
+        )
+    )
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return {}
+    return value if isinstance(value, dict) else {}
+
+
 async def maybe_await(value: Any) -> Any:
     if inspect.isawaitable(value):
         return await value
@@ -206,6 +256,7 @@ async def run_browser_use(url: str, chrome: str, output: Path) -> dict[str, Any]
     browser = None
     final_oracle: dict[str, Any] = {"submitted": False, "source": "real-browser-use"}
     browser_metrics: dict[str, Any] = {}
+    web_metrics: dict[str, Any] = {}
     try:
         with tempfile.TemporaryDirectory(prefix="tempo-real-browser-use-profile-") as profile_dir:
             browser = BrowserSession(
@@ -268,6 +319,7 @@ async def run_browser_use(url: str, chrome: str, output: Path) -> dict[str, Any]
             final_oracle = await checkout_oracle_from_page(page)
             success = bool(final_oracle.get("submitted"))
             browser_metrics = await cdp_performance_metrics(browser)
+            web_metrics = await web_performance_metrics(page)
     except Exception as error:  # noqa: BLE001
         failure_mode = type(error).__name__
         actions.append({"kind": "error", "error": str(error)})
@@ -318,14 +370,25 @@ async def run_browser_use(url: str, chrome: str, output: Path) -> dict[str, Any]
     report["browser_performance_metrics_available"] = True
     report["browser_performance_metrics"] = browser_metrics
     for source_name, field_name in {
+        "Documents": "browser_documents_p95",
+        "Frames": "browser_frames_p95",
+        "JSEventListeners": "browser_js_event_listeners_p95",
         "Nodes": "browser_nodes_p95",
-        "TaskDuration": "browser_task_duration_ms_p95",
-        "ScriptDuration": "browser_script_duration_ms_p95",
+        "LayoutCount": "browser_layout_count_p95",
+        "RecalcStyleCount": "browser_recalc_style_count_p95",
         "LayoutDuration": "browser_layout_duration_ms_p95",
+        "RecalcStyleDuration": "browser_recalc_style_duration_ms_p95",
+        "ScriptDuration": "browser_script_duration_ms_p95",
+        "TaskDuration": "browser_task_duration_ms_p95",
         "JSHeapUsedSize": "browser_js_heap_used_bytes_p95",
+        "JSHeapTotalSize": "browser_js_heap_total_bytes_p95",
     }.items():
         if source_name in browser_metrics:
             report[field_name] = metric_value_to_int(source_name, browser_metrics[source_name])
+    report["web_performance_metrics_available"] = bool(web_metrics)
+    report["web_performance_metrics"] = web_metrics
+    for source_name, field_name in WEB_PERFORMANCE_ROW_FIELDS.items():
+        report[field_name] = int(web_metrics.get(source_name, 0))
     return report
 
 

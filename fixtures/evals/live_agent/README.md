@@ -44,7 +44,8 @@ counts, retry totals, and p50/p95/max stats. It also writes
 `agent-browser-bench-gaps.json`, a deterministic comparison report that ranks
 Tempo against raw Chrome, Playwright, browser-use-style, and real browser-use
 package baselines for
-success, latency, RSS, retries, failures, model-facing tokens, largest durable
+success, latency, RSS, retries, failures, CDP runtime metrics, Web Performance
+timing/resource/paint/long-task metrics, model-facing tokens, largest durable
 observation tokens, and agent step count. CPU is reported row-level until every
 runner uses the same resource-accounting scope. Row-level total model-input
 token p95 is included where a runner reports a comparable model-facing stream

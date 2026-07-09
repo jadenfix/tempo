@@ -169,6 +169,110 @@ def render_status_markdown(
             )
         )
 
+    lines.extend(
+        [
+            "",
+            "## CDP Runtime Metrics",
+            "",
+            "| Runner | Documents | Frames | JS Listeners | Nodes | Layout Count | Recalc Count | Layout Dur | Recalc Dur | Script Dur | Task Dur | JS Heap Used | JS Heap Total |",
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        ]
+    )
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        lines.append(
+            "| {runner} | {documents} | {frames} | {listeners} | {nodes} | {layout_count} | {recalc_count} | {layout_duration} | {recalc_duration} | {script_duration} | {task_duration} | {heap_used} | {heap_total} |".format(
+                runner=row.get("runner", "-"),
+                documents=format_value("browser_documents_p95", row.get("browser_documents_p95")),
+                frames=format_value("browser_frames_p95", row.get("browser_frames_p95")),
+                listeners=format_value(
+                    "browser_js_event_listeners_p95",
+                    row.get("browser_js_event_listeners_p95"),
+                ),
+                nodes=format_value("browser_nodes_p95", row.get("browser_nodes_p95")),
+                layout_count=format_value(
+                    "browser_layout_count_p95",
+                    row.get("browser_layout_count_p95"),
+                ),
+                recalc_count=format_value(
+                    "browser_recalc_style_count_p95",
+                    row.get("browser_recalc_style_count_p95"),
+                ),
+                layout_duration=format_value(
+                    "browser_layout_duration_ms_p95",
+                    row.get("browser_layout_duration_ms_p95"),
+                ),
+                recalc_duration=format_value(
+                    "browser_recalc_style_duration_ms_p95",
+                    row.get("browser_recalc_style_duration_ms_p95"),
+                ),
+                script_duration=format_value(
+                    "browser_script_duration_ms_p95",
+                    row.get("browser_script_duration_ms_p95"),
+                ),
+                task_duration=format_value(
+                    "browser_task_duration_ms_p95",
+                    row.get("browser_task_duration_ms_p95"),
+                ),
+                heap_used=format_value(
+                    "browser_js_heap_used_bytes_p95",
+                    row.get("browser_js_heap_used_bytes_p95"),
+                ),
+                heap_total=format_value(
+                    "browser_js_heap_total_bytes_p95",
+                    row.get("browser_js_heap_total_bytes_p95"),
+                ),
+            )
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Web Performance Metrics",
+            "",
+            "| Runner | Web Perf | Nav p95 | DCL p95 | Load p95 | Response p95 | Resources p95 | Transfer p95 | FCP p95 | Long Tasks p95 | Long Task Dur p95 |",
+            "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        ]
+    )
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        web_perf = "yes" if row.get("web_performance_metrics_available") else "no"
+        lines.append(
+            "| {runner} | {web_perf} | {nav} | {dcl} | {load} | {response} | {resources} | {transfer} | {fcp} | {long_count} | {long_duration} |".format(
+                runner=row.get("runner", "-"),
+                web_perf=web_perf,
+                nav=format_value(
+                    "web_navigation_duration_ms_p95",
+                    row.get("web_navigation_duration_ms_p95"),
+                ),
+                dcl=format_value(
+                    "web_dom_content_loaded_ms_p95",
+                    row.get("web_dom_content_loaded_ms_p95"),
+                ),
+                load=format_value("web_load_event_ms_p95", row.get("web_load_event_ms_p95")),
+                response=format_value(
+                    "web_response_end_ms_p95",
+                    row.get("web_response_end_ms_p95"),
+                ),
+                resources=format_value("web_resource_count_p95", row.get("web_resource_count_p95")),
+                transfer=format_value(
+                    "web_resource_transfer_size_bytes_p95",
+                    row.get("web_resource_transfer_size_bytes_p95"),
+                ),
+                fcp=format_value(
+                    "web_first_contentful_paint_ms_p95",
+                    row.get("web_first_contentful_paint_ms_p95"),
+                ),
+                long_count=format_value("web_long_task_count_p95", row.get("web_long_task_count_p95")),
+                long_duration=format_value(
+                    "web_long_task_duration_ms_p95",
+                    row.get("web_long_task_duration_ms_p95"),
+                ),
+            )
+        )
+
     tempo_row = next(
         (row for row in rows if isinstance(row, dict) and row.get("runner") == "tempo-cdp-agent"),
         None,
