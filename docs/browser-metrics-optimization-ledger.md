@@ -26,7 +26,7 @@ Baseline: GitHub Actions run `28992985395`, Chrome for Testing
 | Commit | Experiment | Hypothesis | Proof Command | Result |
 | --- | --- | --- | --- | --- |
 | `a5c96b0` | Ledger setup | Make optimization history explicit before changing behavior. | n/a | Committed. |
-| this commit | Cheap post-action origin refresh | Replacing redundant post-action full observes with a cheap `window.location.href` origin refresh should reduce `observations_p95`, agent-run wall time, and CPU while preserving origin policy. Falls back to the old full observe path when location is unavailable. | `cargo test -p tempo-agent -- --nocapture`; `cargo test -p tempo-cli run_cdp_task -- --nocapture`; `cargo fmt --check`; `git diff --check` | Local package tests passed. Benchmark proof pending. |
+| `22d7106` | Cheap post-action origin refresh | Replacing redundant post-action full observes with a cheap `window.location.href` origin refresh should reduce `observations_p95`, agent-run wall time, and CPU while preserving origin policy. Falls back to the old full observe path when location is unavailable. | `cargo test -p tempo-agent -- --nocapture`; `cargo test -p tempo-cli run_cdp_task -- --nocapture`; `cargo fmt --check`; `git diff --check`; direct local `tempo-cli run-cdp-task` against `checkout.html` | Local package tests passed. Direct run completed 3 actions with `observations=1`, `model_input_observations=1`, `total_model_input_tokens=27`, `agent_run_ms=350`, browser/web metrics available. Full cross-runner benchmark proof pending in CI because local `python3` is 3.9. |
 
 ## Candidate Experiments
 
