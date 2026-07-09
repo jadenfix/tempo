@@ -257,6 +257,7 @@ class RssSampler:
         self.rss_peak_elapsed_ms = 0
         self.max_process_count = 0
         self.max_process_count_by_type: dict[str, int] = {}
+        self.processes_at_max_count: list[dict[str, object]] = []
         self.process_count_at_peak = 0
         self.process_count_at_peak_by_type: dict[str, int] = {}
         self.processes_at_peak: list[dict[str, object]] = []
@@ -293,6 +294,7 @@ class RssSampler:
         if process_count > self.max_process_count:
             self.max_process_count = process_count
             self.max_process_count_by_type = process_count_by_type
+            self.processes_at_max_count = processes
         if rss > self.max_rss_bytes:
             self.max_rss_bytes = rss
             self.rss_at_peak_by_command_bytes = by_command
@@ -351,6 +353,7 @@ class RssSampler:
             "rss_peak_elapsed_ms": self.rss_peak_elapsed_ms,
             "max_process_count": self.max_process_count,
             "max_process_count_by_type": dict(sorted(self.max_process_count_by_type.items())),
+            "processes_at_max_count": self.processes_at_max_count,
             "process_count_at_peak": self.process_count_at_peak,
             "process_count_at_peak_by_type": dict(
                 sorted(self.process_count_at_peak_by_type.items())
@@ -1006,6 +1009,9 @@ def run_tempo(url: str, chrome: str, output_dir: Path) -> dict:
         ),
         "cdp_browser_cache": (
             "enabled" if env.get("TEMPO_CDP_BENCH_ENABLE_CACHE") == "1" else "disabled"
+        ),
+        "cdp_desktop_integration": (
+            "suppressed" if env.get("TEMPO_CDP_BENCH_SUPPRESS_DESKTOP") == "1" else "default"
         ),
         "tempo_phase_timings_ms": timings,
         "browser_performance_metrics_available": bool(

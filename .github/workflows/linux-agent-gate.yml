@@ -20,6 +20,7 @@ on:
           - insert-text
           - no-incognito
           - cache
+          - desktop
           - all
         default: default
   schedule:

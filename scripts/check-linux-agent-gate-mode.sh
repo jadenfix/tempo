@@ -73,6 +73,7 @@ require(
     and 'TEMPO_CDP_BENCH_INSERT_TEXT_TYPE=1' in text
     and 'TEMPO_CDP_BENCH_NO_INCOGNITO=1' in text
     and 'TEMPO_CDP_BENCH_ENABLE_CACHE=1' in text
+    and 'TEMPO_CDP_BENCH_SUPPRESS_DESKTOP=1' in text
     and '-e "TEMPO_LINUX_AGENT_BENCH_PROFILE=${BENCH_PROFILE}"' in text,
     'Docker command must support named browser benchmark optimization profiles',
 )
@@ -136,6 +137,7 @@ require(
 )
 require(
     'benchmark_profile:' in workflow
+    and 'desktop' in workflow
     and 'TEMPO_LINUX_AGENT_BENCH_PROFILE:' in smoke_job
     and "inputs.benchmark_profile || 'default'" in smoke_job,
     'smoke job must pass the workflow benchmark profile into the gate',

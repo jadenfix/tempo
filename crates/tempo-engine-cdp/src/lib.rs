@@ -110,6 +110,9 @@ pub const TEMPO_CDP_BENCH_NO_INCOGNITO_ENV: &str = "TEMPO_CDP_BENCH_NO_INCOGNITO
 /// Benchmark-only cache profile used to compare against Playwright/raw Chrome
 /// baselines that do not force `Network.setCacheDisabled(true)`.
 pub const TEMPO_CDP_BENCH_ENABLE_CACHE_ENV: &str = "TEMPO_CDP_BENCH_ENABLE_CACHE";
+/// Benchmark-only launch profile that suppresses Linux desktop-integration
+/// helper probes so process-count metrics stay focused on browser work.
+pub const TEMPO_CDP_BENCH_SUPPRESS_DESKTOP_ENV: &str = "TEMPO_CDP_BENCH_SUPPRESS_DESKTOP";
 
 /// Launch configuration for the CDP fallback lane.
 #[derive(Clone, Debug)]
@@ -135,6 +138,10 @@ pub struct CdpConfig {
     /// Benchmark-only cache mode. Defaults off so production/local launches keep
     /// the historical no-cache isolation behavior.
     pub bench_enable_cache: bool,
+    /// Benchmark-only Linux desktop-integration suppression. This is scoped to
+    /// synthetic browser benchmarks because production launches should inherit
+    /// the user's desktop environment normally.
+    pub bench_suppress_desktop: bool,
     /// Initial URL policy installed before the browser starts issuing traffic.
     url_policy: UrlPolicy,
     /// Trusted-fixture optimization: rely on Tempo's mandatory policy proxy for
@@ -221,6 +228,18 @@ impl CdpConfig {
         self
     }
 
+    pub fn with_bench_suppress_desktop(mut self) -> Self {
+        self.bench_suppress_desktop = true;
+        self
+    }
+
+    pub fn with_bench_suppress_desktop_env_opt_in(mut self) -> Self {
+        if env_flag_enabled(TEMPO_CDP_BENCH_SUPPRESS_DESKTOP_ENV) {
+            self.bench_suppress_desktop = true;
+        }
+        self
+    }
+
     pub fn with_allow_all_url_policy(mut self) -> Self {
         self.url_policy = UrlPolicy::allow_all();
         self
@@ -249,8 +268,13 @@ impl CdpConfig {
         if let Some(path) = &self.executable {
             builder = builder.chrome_executable(path);
         }
-        if !self.args.is_empty() {
-            builder = builder.args(self.args.clone());
+        let mut launch_args = self.args.clone();
+        if self.bench_suppress_desktop {
+            launch_args.extend(desktop_suppression_launch_args());
+            builder = builder.envs(desktop_suppression_env());
+        }
+        if !launch_args.is_empty() {
+            builder = builder.args(normalize_chromium_launch_args(launch_args));
         }
         builder.build().map_err(TransportError::Other)
     }
@@ -279,6 +303,7 @@ impl Default for CdpConfig {
             bench_insert_text_type: false,
             bench_no_incognito: false,
             bench_enable_cache: false,
+            bench_suppress_desktop: false,
             url_policy: UrlPolicy::block_private(),
             proxy_only_request_policy: false,
         }
@@ -1404,6 +1429,56 @@ fn playwright_lifecycle_launch_args() -> Vec<String> {
     vec![
         "--disable-back-forward-cache".to_string(),
         "--disable-features=PaintHolding,RenderDocument".to_string(),
+    ]
+}
+
+fn desktop_suppression_launch_args() -> Vec<String> {
+    vec![
+        "--no-service-autorun".to_string(),
+        "--disable-search-engine-choice-screen".to_string(),
+        "--disable-features=DialMediaRouteProvider,MediaRouter,OptimizationHints,TranslateUI"
+            .to_string(),
+    ]
+}
+
+fn normalize_chromium_launch_args(args: Vec<String>) -> Vec<String> {
+    let mut merged_disable_features = BTreeSet::new();
+    let mut normalized = Vec::with_capacity(args.len());
+    for arg in args {
+        if let Some(features) = arg.strip_prefix("--disable-features=") {
+            for feature in features
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                merged_disable_features.insert(feature.to_string());
+            }
+        } else {
+            normalized.push(arg);
+        }
+    }
+    if !merged_disable_features.is_empty() {
+        normalized.push(format!(
+            "--disable-features={}",
+            merged_disable_features
+                .into_iter()
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+    }
+    normalized
+}
+
+fn desktop_suppression_env() -> Vec<(String, String)> {
+    vec![
+        ("BROWSER".to_string(), "true".to_string()),
+        (
+            "PATH".to_string(),
+            "/usr/local/sbin:/usr/local/bin:/sbin:/bin".to_string(),
+        ),
+        ("XDG_CURRENT_DESKTOP".to_string(), "tempo-bench".to_string()),
+        ("XDG_SESSION_DESKTOP".to_string(), "tempo-bench".to_string()),
+        ("XDG_UTILS_DEBUG_LEVEL".to_string(), "0".to_string()),
     ]
 }
 
@@ -4547,6 +4622,52 @@ mod tests {
             .iter()
             .any(|arg| arg == "--disable-features=PaintHolding,RenderDocument"));
         assert!(!args.iter().any(|arg| is_policy_proxy_arg(arg)));
+    }
+
+    #[test]
+    fn normalizes_duplicate_disable_features_launch_args() {
+        let args = normalize_chromium_launch_args(vec![
+            "--disable-features=PaintHolding,RenderDocument".to_string(),
+            "--no-service-autorun".to_string(),
+            "--disable-features=MediaRouter,PaintHolding".to_string(),
+        ]);
+        let disable_features = args
+            .iter()
+            .filter(|arg| arg.starts_with("--disable-features="))
+            .collect::<Vec<_>>();
+
+        assert_eq!(disable_features.len(), 1);
+        assert_eq!(
+            disable_features[0],
+            "--disable-features=MediaRouter,PaintHolding,RenderDocument"
+        );
+        assert!(args.iter().any(|arg| arg == "--no-service-autorun"));
+    }
+
+    #[test]
+    fn desktop_suppression_profile_is_explicit_and_benchmark_only(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        assert!(!CdpConfig::default().bench_suppress_desktop);
+
+        let temp = tempfile::tempdir()?;
+        let config = CdpConfig::default()
+            .with_bench_suppress_desktop()
+            .browser_config(temp.path())?;
+        let envs = config
+            .process_envs
+            .as_ref()
+            .expect("desktop suppression must set Chrome child env vars");
+
+        assert_eq!(envs.get("BROWSER").map(String::as_str), Some("true"));
+        assert_eq!(
+            envs.get("PATH").map(String::as_str),
+            Some("/usr/local/sbin:/usr/local/bin:/sbin:/bin")
+        );
+        assert_eq!(
+            envs.get("XDG_CURRENT_DESKTOP").map(String::as_str),
+            Some("tempo-bench")
+        );
+        Ok(())
     }
 
     #[test]
