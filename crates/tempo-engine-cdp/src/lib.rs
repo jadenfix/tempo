@@ -129,6 +129,12 @@ pub struct CdpConfig {
     /// Benchmark-only launch mode that relies on Tempo's fresh temp profile for
     /// storage isolation instead of wrapping it in an incognito context.
     pub bench_no_incognito: bool,
+    /// Initial URL policy installed before the browser starts issuing traffic.
+    url_policy: UrlPolicy,
+    /// Trusted-fixture optimization: rely on Tempo's mandatory policy proxy for
+    /// HTTP(S) request enforcement instead of also pausing every request via
+    /// CDP Fetch interception.
+    proxy_only_request_policy: bool,
 }
 
 impl CdpConfig {
@@ -197,6 +203,16 @@ impl CdpConfig {
         self
     }
 
+    pub fn with_allow_all_url_policy(mut self) -> Self {
+        self.url_policy = UrlPolicy::allow_all();
+        self
+    }
+
+    pub fn with_proxy_only_request_policy(mut self) -> Self {
+        self.proxy_only_request_policy = true;
+        self
+    }
+
     fn browser_config(&self, user_data_dir: &Path) -> Result<BrowserConfig, TransportError> {
         let mut builder = BrowserConfig::builder()
             .headless_mode(HeadlessMode::New)
@@ -242,6 +258,8 @@ impl Default for CdpConfig {
             args: Vec::new(),
             bench_insert_text_type: false,
             bench_no_incognito: false,
+            url_policy: UrlPolicy::block_private(),
+            proxy_only_request_policy: false,
         }
     }
 }
@@ -285,8 +303,10 @@ impl CdpTempoDriver {
             .map_err(|error| {
                 TransportError::Other(format!("failed to create private CDP profile: {error}"))
             })?;
-        let url_policy = Arc::new(Mutex::new(UrlPolicy::block_private()));
-        let browser_hardening_policy = Arc::new(Mutex::new(BrowserHardeningPolicy::standard()));
+        let url_policy = Arc::new(Mutex::new(config.url_policy.clone()));
+        let browser_hardening_policy = Arc::new(Mutex::new(
+            BrowserHardeningPolicy::standard().with_url_policy(config.url_policy.clone()),
+        ));
         let blocked_request_url = Arc::new(Mutex::new(None));
         let request_policy_tracker = Arc::new(RequestPolicyTracker::new());
         let policy_proxy = PolicyProxy::start(
@@ -315,20 +335,24 @@ impl CdpTempoDriver {
             }
         };
         close_unmanaged_pages(&browser, &page).await;
-        let request_policy_task = match install_request_policy(
-            &page,
-            browser_hardening_policy.clone(),
-            blocked_request_url.clone(),
-            request_policy_tracker.clone(),
-        )
-        .await
-        {
-            Ok(task) => task,
-            Err(error) => {
-                let _ = browser.close().await;
-                let _ = browser.wait().await;
-                handler_task.abort();
-                return Err(error);
+        let request_policy_task = if launch_config.proxy_only_request_policy {
+            None
+        } else {
+            match install_request_policy(
+                &page,
+                browser_hardening_policy.clone(),
+                blocked_request_url.clone(),
+                request_policy_tracker.clone(),
+            )
+            .await
+            {
+                Ok(task) => Some(task),
+                Err(error) => {
+                    let _ = browser.close().await;
+                    let _ = browser.wait().await;
+                    handler_task.abort();
+                    return Err(error);
+                }
             }
         };
 
@@ -336,7 +360,7 @@ impl CdpTempoDriver {
             browser,
             page: Some(page),
             handler_task,
-            request_policy_task: Some(request_policy_task),
+            request_policy_task,
             policy_proxy: Some(policy_proxy),
             browser_context_id: None,
             profile_dir: Some(profile_dir),
@@ -691,18 +715,22 @@ impl CdpTempoDriver {
             .new_page(page_params)
             .await
             .map_err(map_cdp_error)?;
-        let new_policy_task = match install_request_policy(
-            &new_page,
-            self.browser_hardening_policy.clone(),
-            self.blocked_request_url.clone(),
-            self.request_policy_tracker.clone(),
-        )
-        .await
-        {
-            Ok(task) => task,
-            Err(error) => {
-                let _ = new_page.close().await;
-                return Err(error);
+        let new_policy_task = if self.launch_config.proxy_only_request_policy {
+            None
+        } else {
+            match install_request_policy(
+                &new_page,
+                self.browser_hardening_policy.clone(),
+                self.blocked_request_url.clone(),
+                self.request_policy_tracker.clone(),
+            )
+            .await
+            {
+                Ok(task) => Some(task),
+                Err(error) => {
+                    let _ = new_page.close().await;
+                    return Err(error);
+                }
             }
         };
 
@@ -710,7 +738,7 @@ impl CdpTempoDriver {
             task.abort();
         }
         let old_page = self.page.replace(new_page);
-        self.request_policy_task = Some(new_policy_task);
+        self.request_policy_task = new_policy_task;
         if let Ok(mut guard) = self.probe_context.lock() {
             *guard = None;
         }
@@ -4488,6 +4516,27 @@ mod tests {
             .iter()
             .any(|arg| arg == "--disable-features=PaintHolding,RenderDocument"));
         assert!(!args.iter().any(|arg| is_policy_proxy_arg(arg)));
+    }
+
+    #[test]
+    fn cdp_config_defaults_to_fetch_request_policy_and_block_private() {
+        let config = CdpConfig::default();
+
+        assert!(!config.url_policy.is_allow_all());
+        assert!(
+            !config.proxy_only_request_policy,
+            "default launches must keep Fetch request interception installed"
+        );
+    }
+
+    #[test]
+    fn trusted_proxy_only_policy_requires_explicit_config() {
+        let config = CdpConfig::default()
+            .with_allow_all_url_policy()
+            .with_proxy_only_request_policy();
+
+        assert!(config.url_policy.is_allow_all());
+        assert!(config.proxy_only_request_policy);
     }
 
     #[test]

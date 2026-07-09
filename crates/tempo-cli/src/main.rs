@@ -1094,12 +1094,14 @@ fn run_cdp_task(config: RunCdpTaskConfig) -> Result<RunCdpTaskReport, CliError> 
         if let Some(chrome) = config.chrome {
             cdp_config = cdp_config.with_executable(chrome);
         }
+        if config.allow_private_network {
+            cdp_config = cdp_config
+                .with_allow_all_url_policy()
+                .with_proxy_only_request_policy();
+        }
         let driver_launch_started = Instant::now();
         let mut driver = CdpTempoDriver::launch_with(cdp_config).await?;
         timings_ms.driver_launch_ms = Some(elapsed_ms(driver_launch_started));
-        if config.allow_private_network {
-            driver = driver.allow_private_network_access();
-        }
 
         let runner = AgentRunner::new(
             &config.journal,
