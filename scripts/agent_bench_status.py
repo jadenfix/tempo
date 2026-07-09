@@ -61,6 +61,22 @@ def render_status_markdown(
     ]
     profile_counts: dict[str, int] = {}
     launch_profiles: dict[str, int] = {}
+    launch_dimensions: dict[str, dict[str, int]] = {
+        "type dispatch": {},
+        "browser context": {},
+        "browser cache": {},
+        "desktop integration": {},
+        "compositor": {},
+        "headless mode": {},
+    }
+    dimension_fields = {
+        "cdp_type_dispatch": "type dispatch",
+        "cdp_browser_context": "browser context",
+        "cdp_browser_cache": "browser cache",
+        "cdp_desktop_integration": "desktop integration",
+        "cdp_compositor_stages": "compositor",
+        "cdp_headless_mode": "headless mode",
+    }
     lifecycle_overrides: set[str] = set()
     for row in tempo_rows:
         contract = row.get("cdp_browser_profile_contract")
@@ -69,15 +85,27 @@ def render_status_markdown(
         launch_profile = row.get("cdp_launch_profile")
         if isinstance(launch_profile, str) and launch_profile:
             launch_profiles[launch_profile] = launch_profiles.get(launch_profile, 0) + 1
+        for field, label in dimension_fields.items():
+            value = row.get(field)
+            if isinstance(value, str) and value:
+                counts = launch_dimensions[label]
+                counts[value] = counts.get(value, 0) + 1
         overrides = row.get("cdp_lifecycle_overrides")
         if isinstance(overrides, list):
             lifecycle_overrides.update(str(value) for value in overrides)
-    if profile_counts or launch_profiles:
+    if (
+        profile_counts
+        or launch_profiles
+        or any(counts for counts in launch_dimensions.values())
+    ):
         lines.extend(["", "## Browser Profile Contract", ""])
         for contract, count in sorted(profile_counts.items()):
             lines.append(f"- `{contract}` Tempo rows: `{count}`")
         for launch_profile, count in sorted(launch_profiles.items()):
             lines.append(f"- `{launch_profile}` launch rows: `{count}`")
+        for label, counts in launch_dimensions.items():
+            for value, count in sorted(counts.items()):
+                lines.append(f"- `{value}` {label} rows: `{count}`")
         if lifecycle_overrides:
             joined = ", ".join(f"`{value}`" for value in sorted(lifecycle_overrides))
             lines.append(f"- Lifecycle overrides: {joined}")

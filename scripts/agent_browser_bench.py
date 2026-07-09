@@ -1156,6 +1156,11 @@ def run_tempo(url: str, chrome: str, output_dir: Path) -> dict:
         "cdp_desktop_integration": (
             "suppressed" if env.get("TEMPO_CDP_BENCH_SUPPRESS_DESKTOP") == "1" else "default"
         ),
+        "cdp_compositor_stages": (
+            "browser-default"
+            if env.get("TEMPO_CDP_BENCH_NO_FORCED_COMPOSITOR") == "1"
+            else "forced-before-draw"
+        ),
         "cdp_headless_mode": (
             "headless-flag" if env.get("TEMPO_CDP_BENCH_HEADLESS_FLAG") == "1" else "new-headless"
         ),
@@ -2037,6 +2042,10 @@ def benchmark_gap_report(metrics: list[dict], summary: dict) -> dict:
         comparison_notes.append(
             "Tempo rows marked cdp_browser_profile_contract=automation-default use Playwright-style lifecycle overrides and must not be presented as stock Chrome lifecycle performance."
         )
+    if any(metric.get("cdp_compositor_stages") == "browser-default" for metric in metrics):
+        comparison_notes.append(
+            "Tempo rows marked cdp_compositor_stages=browser-default omit Tempo's historical --run-all-compositor-stages-before-draw launch arg; compare layout/paint metrics before considering a default change."
+        )
     if any(
         any(field in metric for field in PROCESS_TREE_COUNTER_FIELDS)
         for metric in metrics
@@ -2310,6 +2319,12 @@ def comparison_row(runner: str, runner_summary: dict, runner_metrics: list[dict]
             "cdp_browser_profile_contract",
             "cdp_launch_profile",
             "cdp_lifecycle_overrides",
+            "cdp_type_dispatch",
+            "cdp_browser_context",
+            "cdp_browser_cache",
+            "cdp_desktop_integration",
+            "cdp_compositor_stages",
+            "cdp_headless_mode",
         ):
             if field in first_metric:
                 row[field] = first_metric[field]

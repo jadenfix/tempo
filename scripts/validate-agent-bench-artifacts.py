@@ -663,6 +663,28 @@ def validate_metric(metric: dict[str, Any], iterations: int, output_dir: Path) -
                 "tempo-cdp-agent.cdp_browser_profile_contract must be "
                 "automation-default or browser-realistic"
             )
+        launch_dimensions = {
+            "cdp_type_dispatch": {"key-events", "insert-text"},
+            "cdp_browser_context": {"incognito-context", "fresh-profile"},
+            "cdp_browser_cache": {"disabled", "enabled"},
+            "cdp_desktop_integration": {"default", "suppressed"},
+            "cdp_headless_mode": {"new-headless", "headless-flag"},
+        }
+        for field, expected_values in launch_dimensions.items():
+            value = metric.get(field)
+            if value is not None and value not in expected_values:
+                raise ValidationError(
+                    f"tempo-cdp-agent.{field} must be one of {sorted(expected_values)}, got {value!r}"
+                )
+        compositor_stages = metric.get("cdp_compositor_stages")
+        if compositor_stages is not None and compositor_stages not in {
+            "forced-before-draw",
+            "browser-default",
+        }:
+            raise ValidationError(
+                "tempo-cdp-agent.cdp_compositor_stages must be "
+                "forced-before-draw or browser-default"
+            )
         lifecycle_overrides = metric.get("cdp_lifecycle_overrides")
         if profile_contract == "automation-default" and lifecycle_overrides is None:
             raise ValidationError(
@@ -1165,6 +1187,10 @@ def expected_gap_report(metrics: list[dict[str, Any]], summary: dict[str, Any]) 
         comparison_notes.append(
             "Tempo rows marked cdp_browser_profile_contract=automation-default use Playwright-style lifecycle overrides and must not be presented as stock Chrome lifecycle performance."
         )
+    if any(metric.get("cdp_compositor_stages") == "browser-default" for metric in metrics):
+        comparison_notes.append(
+            "Tempo rows marked cdp_compositor_stages=browser-default omit Tempo's historical --run-all-compositor-stages-before-draw launch arg; compare layout/paint metrics before considering a default change."
+        )
     if any(
         any(field in metric for field in PROCESS_TREE_COUNTER_FIELDS)
         for metric in metrics
@@ -1440,6 +1466,12 @@ def comparison_row(
             "cdp_browser_profile_contract",
             "cdp_launch_profile",
             "cdp_lifecycle_overrides",
+            "cdp_type_dispatch",
+            "cdp_browser_context",
+            "cdp_browser_cache",
+            "cdp_desktop_integration",
+            "cdp_compositor_stages",
+            "cdp_headless_mode",
         ):
             if field in first_metric:
                 row[field] = first_metric[field]
@@ -1813,6 +1845,12 @@ def legacy_profile_status_markdown(
             "cdp_browser_profile_contract",
             "cdp_launch_profile",
             "cdp_lifecycle_overrides",
+            "cdp_type_dispatch",
+            "cdp_browser_context",
+            "cdp_browser_cache",
+            "cdp_desktop_integration",
+            "cdp_compositor_stages",
+            "cdp_headless_mode",
         ):
             removed = row.pop(field, None) is not None or removed
     if not removed:

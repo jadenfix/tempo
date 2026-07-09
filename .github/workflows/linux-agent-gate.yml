@@ -22,6 +22,7 @@ on:
           - cache
           - desktop
           - runtime
+          - no-forced-compositor
           - headless-flag
           - all
         default: default
@@ -32,7 +33,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: linux-agent-gate-${{ github.event.pull_request.number || github.ref }}
+  group: linux-agent-gate-${{ github.event.pull_request.number || format('{0}-{1}-{2}', github.ref, inputs.mode || 'scheduled', inputs.benchmark_profile || 'default') }}
   cancel-in-progress: true
 
 jobs:
