@@ -102,6 +102,22 @@ WEB_PERFORMANCE_ROW_FIELDS = {
 }
 CHECKOUT_ORACLE_EMAIL = "agent@example.com"
 CHECKOUT_ORACLE_STATUS = "Order submitted"
+ALLOW_UNSAFE_HOST_ENV = "TEMPO_AGENT_BENCH_ALLOW_UNSAFE_HOST_ENV"
+UNSAFE_HOST_ENV_KEYS = {
+    "ANTHROPIC_API_KEY",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "GOOGLE_API_KEY",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "OPENAI_API_KEY",
+    "TEMPO_DURABLE_ENCRYPTION_KEY_HEX",
+    "TEMPO_OTLP_ENDPOINT",
+    "TEMPO_TEMPOD_AUTH_TOKEN",
+    "TEMPO_TEMPOD_AUTH_TOKEN_FILE",
+    "TEMPO_THREAT_DOMAIN_METADATA_URL",
+    "TEMPO_THREAT_DOMAIN_PUBLIC_KEYS",
+    "TEMPO_THREAT_DOMAIN_URL",
+}
 
 
 class QuietHandler(http.server.SimpleHTTPRequestHandler):
@@ -111,6 +127,31 @@ class QuietHandler(http.server.SimpleHTTPRequestHandler):
 
 class ThreadingServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
+
+
+def unsafe_host_env_keys() -> list[str]:
+    return sorted(key for key in UNSAFE_HOST_ENV_KEYS if os.environ.get(key))
+
+
+def assert_safe_benchmark_environment() -> None:
+    if os.environ.get(ALLOW_UNSAFE_HOST_ENV) == "1":
+        return
+    present = unsafe_host_env_keys()
+    if present:
+        joined = ", ".join(present)
+        raise RuntimeError(
+            "refusing to run browser benchmark with ambient production/secret env vars: "
+            f"{joined}. Unset them, or set {ALLOW_UNSAFE_HOST_ENV}=1 for an intentional "
+            "unsafe-env run."
+        )
+
+
+def benchmark_child_env() -> dict[str, str]:
+    env = os.environ.copy()
+    if os.environ.get(ALLOW_UNSAFE_HOST_ENV) != "1":
+        for key in UNSAFE_HOST_ENV_KEYS:
+            env.pop(key, None)
+    return env
 
 
 class StaticServer:
@@ -660,7 +701,7 @@ def checkout_oracle_from_page(page: object, source: str) -> dict:
 def run_tempo(url: str, chrome: str, output_dir: Path) -> dict:
     journal = output_dir / "tempo-journal.sqlite"
     run_report = output_dir / "tempo-run.json"
-    env = os.environ.copy()
+    env = benchmark_child_env()
     env["TEMPO_CDP_CHROME"] = chrome
     env.setdefault("TEMPO_CDP_NO_SANDBOX", "1")
     env.setdefault("TEMPO_DURABLE_RETENTION", "plaintext-unsafe")
@@ -1115,7 +1156,7 @@ def run_external_baseline(
     stdout_path = output_dir / f"{runner}.stdout.log"
     stderr_path = output_dir / f"{runner}.stderr.log"
     script_path = RUNNER_DIR / script_name
-    env = os.environ.copy()
+    env = benchmark_child_env()
     env.setdefault("TEMPO_CDP_NO_SANDBOX", "1")
     before = usage_children()
     started = now_ms()
@@ -1914,7 +1955,7 @@ def comparison_rank(tempo_value: int | float, ranked: list[dict], direction: str
 
 
 def derive_artifacts(output_dir: Path, metrics: list[dict], url: str) -> None:
-    env = os.environ.copy()
+    env = benchmark_child_env()
     env.setdefault("TEMPO_DURABLE_RETENTION", "plaintext-unsafe")
     tempo = next((metric for metric in metrics if metric["runner"] == TEMPO_RUNNER), None)
     chrome = next((metric for metric in metrics if metric["runner"] == RAW_CHROME_RUNNER), None)
@@ -2022,6 +2063,8 @@ def main() -> int:
     parser.add_argument("--chrome", required=True)
     parser.add_argument("--output-dir", required=True)
     args = parser.parse_args()
+
+    assert_safe_benchmark_environment()
 
     if not FIXTURE_HTML.exists():
         raise RuntimeError(f"missing fixture: {FIXTURE_HTML}")
