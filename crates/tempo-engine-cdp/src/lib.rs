@@ -128,6 +128,10 @@ pub const TEMPO_CDP_BENCH_NO_FORCED_COMPOSITOR_ENV: &str = "TEMPO_CDP_BENCH_NO_F
 /// Chrome 132+ maps bare `--headless` to the modern Chrome headless
 /// implementation; old headless is a separate `chrome-headless-shell` binary.
 pub const TEMPO_CDP_BENCH_HEADLESS_FLAG_ENV: &str = "TEMPO_CDP_BENCH_HEADLESS_FLAG";
+/// Benchmark-only trusted-fixture request-policy profile. This removes the
+/// request-event grace floor only when Tempo already runs with allow-all URL
+/// policy plus proxy-only request enforcement.
+pub const TEMPO_CDP_BENCH_TRUSTED_POLICY_ENV: &str = "TEMPO_CDP_BENCH_TRUSTED_POLICY";
 
 /// Driver-local counters for CDP observation work.
 ///
@@ -186,6 +190,9 @@ pub struct CdpConfig {
     /// HTTP(S) request enforcement instead of also pausing every request via
     /// CDP Fetch interception.
     proxy_only_request_policy: bool,
+    /// Benchmark-only trusted-fixture mode that drains request-policy state
+    /// without paying the event-grace floor after every action.
+    bench_trusted_policy: bool,
 }
 
 impl CdpConfig {
@@ -304,6 +311,18 @@ impl CdpConfig {
         self
     }
 
+    pub fn with_bench_trusted_policy(mut self) -> Self {
+        self.bench_trusted_policy = true;
+        self
+    }
+
+    pub fn with_bench_trusted_policy_env_opt_in(mut self) -> Self {
+        if env_flag_enabled(TEMPO_CDP_BENCH_TRUSTED_POLICY_ENV) {
+            self.bench_trusted_policy = true;
+        }
+        self
+    }
+
     pub fn with_allow_all_url_policy(mut self) -> Self {
         self.url_policy = UrlPolicy::allow_all();
         self
@@ -362,6 +381,12 @@ impl CdpConfig {
         }
         Ok(())
     }
+
+    fn uses_trusted_policy_fast_settle(&self) -> bool {
+        self.bench_trusted_policy
+            && self.proxy_only_request_policy
+            && self.url_policy.is_allow_all()
+    }
 }
 
 impl Default for CdpConfig {
@@ -379,6 +404,7 @@ impl Default for CdpConfig {
             bench_headless_flag: false,
             url_policy: UrlPolicy::block_private(),
             proxy_only_request_policy: false,
+            bench_trusted_policy: false,
         }
     }
 }
@@ -616,7 +642,11 @@ impl CdpTempoDriver {
         &self,
         cursor: u64,
     ) -> Result<(), TransportError> {
-        wait_for_no_blocked_request_since(&self.request_policy_tracker, cursor).await
+        if self.launch_config.uses_trusted_policy_fast_settle() {
+            wait_for_no_blocked_request_settled(&self.request_policy_tracker, cursor).await
+        } else {
+            wait_for_no_blocked_request_since(&self.request_policy_tracker, cursor).await
+        }
     }
 
     async fn map_cdp_result_since<T>(
@@ -5364,6 +5394,37 @@ mod tests {
 
         assert!(config.url_policy.is_allow_all());
         assert!(config.proxy_only_request_policy);
+    }
+
+    #[test]
+    fn trusted_policy_fast_settle_requires_benchmark_allow_all_and_proxy_only() {
+        assert!(!CdpConfig::default().uses_trusted_policy_fast_settle());
+        assert!(
+            !CdpConfig::default()
+                .with_bench_trusted_policy()
+                .uses_trusted_policy_fast_settle(),
+            "benchmark opt-in alone must not remove the request-event grace"
+        );
+        assert!(
+            !CdpConfig::default()
+                .with_bench_trusted_policy()
+                .with_allow_all_url_policy()
+                .uses_trusted_policy_fast_settle(),
+            "allow-all without proxy-only still needs the request-event grace"
+        );
+        assert!(
+            !CdpConfig::default()
+                .with_bench_trusted_policy()
+                .with_proxy_only_request_policy()
+                .uses_trusted_policy_fast_settle(),
+            "proxy-only without allow-all still needs the request-event grace"
+        );
+
+        let trusted_fixture = CdpConfig::default()
+            .with_bench_trusted_policy()
+            .with_allow_all_url_policy()
+            .with_proxy_only_request_policy();
+        assert!(trusted_fixture.uses_trusted_policy_fast_settle());
     }
 
     #[test]

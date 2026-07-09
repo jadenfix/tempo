@@ -76,6 +76,7 @@ def render_status_markdown(
         "cdp_desktop_integration": "desktop integration",
         "cdp_compositor_stages": "compositor",
         "cdp_headless_mode": "headless mode",
+        "cdp_request_policy_grace": "request policy settle",
     }
     lifecycle_overrides: set[str] = set()
     for row in tempo_rows:

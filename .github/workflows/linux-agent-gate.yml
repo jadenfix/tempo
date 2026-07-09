@@ -25,6 +25,7 @@ on:
           - runtime
           - no-forced-compositor
           - headless-flag
+          - trusted-policy
           - agent-automation
           - all
         default: default

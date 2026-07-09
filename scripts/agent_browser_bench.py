@@ -1277,6 +1277,11 @@ def run_tempo(url: str, chrome: str, output_dir: Path) -> dict:
         "cdp_headless_mode": (
             "headless-flag" if env.get("TEMPO_CDP_BENCH_HEADLESS_FLAG") == "1" else "new-headless"
         ),
+        "cdp_request_policy_grace": (
+            "trusted-settled"
+            if env.get("TEMPO_CDP_BENCH_TRUSTED_POLICY") == "1"
+            else "event-grace"
+        ),
         "tempo_phase_timings_ms": timings,
         "browser_performance_metrics_available": bool(
             report.get("browser_performance_metrics_available")
@@ -2475,6 +2480,7 @@ def comparison_row(runner: str, runner_summary: dict, runner_metrics: list[dict]
             "cdp_desktop_integration",
             "cdp_compositor_stages",
             "cdp_headless_mode",
+            "cdp_request_policy_grace",
         ):
             if field in first_metric:
                 row[field] = first_metric[field]
