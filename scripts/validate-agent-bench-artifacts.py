@@ -30,6 +30,15 @@ EXPECTED_RUNNERS = {
 }
 TEMPO_RUNNER = "tempo-cdp-agent"
 RAW_CHROME_RUNNER = "raw-chrome-cdp"
+DEFAULT_RUNNER_ORDER = (
+    "tempo-cdp-agent",
+    "raw-chrome-cdp",
+    "synthetic-playwright-ax",
+    "synthetic-browser-use-dom",
+    "real-playwright",
+    "external-browser-use-dom-loop",
+    "real-browser-use",
+)
 TEMPO_RUNTIME_FLAVORS = {"multi-thread", "current-thread"}
 AGENT_STYLE_RUNNERS = {
     "tempo-cdp-agent",
@@ -297,6 +306,91 @@ def require_int_map(metric: dict[str, Any], field: str, *, positive: bool = Fals
             raise ValidationError(f"{runner}.{field}.{key} must be > 0")
 
 
+def validate_runner_order_value(value: Any, *, context: str) -> list[str]:
+    if not isinstance(value, list):
+        raise ValidationError(f"{context} must be an array")
+    runners = [str(runner) for runner in value]
+    if set(runners) != EXPECTED_RUNNERS or len(runners) != len(EXPECTED_RUNNERS):
+        raise ValidationError(
+            f"{context} must be a one-per-runner permutation: got {runners}"
+        )
+    return runners
+
+
+def expected_runner_order(iteration: int) -> list[str]:
+    offset = (iteration - 1) % len(DEFAULT_RUNNER_ORDER)
+    return list(DEFAULT_RUNNER_ORDER[offset:] + DEFAULT_RUNNER_ORDER[:offset])
+
+
+def validate_runner_order_fields(metric: dict[str, Any]) -> None:
+    has_order = "runner_order" in metric
+    has_index = "runner_order_index" in metric
+    if has_order != has_index:
+        raise ValidationError(
+            f"{metric.get('runner', '<unknown>')} must include runner_order and "
+            "runner_order_index together"
+        )
+    if not has_order:
+        return
+    runner = str(metric["runner"])
+    runner_order = validate_runner_order_value(
+        metric["runner_order"],
+        context=f"{runner}.runner_order",
+    )
+    expected_order = expected_runner_order(int(metric["iteration"]))
+    if runner_order != expected_order:
+        raise ValidationError(
+            f"{runner}.runner_order must match expected rotation for iteration "
+            f"{metric['iteration']}: expected={expected_order} got={runner_order}"
+        )
+    require_int(metric, "runner_order_index", positive=True)
+    index = int(metric["runner_order_index"])
+    if index > len(runner_order):
+        raise ValidationError(f"{runner}.runner_order_index is outside runner_order")
+    if runner_order[index - 1] != runner:
+        raise ValidationError(
+            f"{runner}.runner_order_index points to {runner_order[index - 1]}"
+        )
+
+
+def validate_runner_orders_report(
+    report: dict[str, Any],
+    metrics: list[dict[str, Any]],
+    iterations: int,
+) -> None:
+    runner_orders = report.get("runner_orders")
+    if runner_orders is None:
+        return
+    if not isinstance(runner_orders, dict):
+        raise ValidationError("agent-browser-bench.json runner_orders must be an object")
+    expected_keys = {str(iteration) for iteration in range(1, iterations + 1)}
+    if set(runner_orders) != expected_keys:
+        raise ValidationError(
+            "agent-browser-bench.json runner_orders keys must match iterations"
+        )
+    for iteration_key in sorted(runner_orders, key=int):
+        runner_order = validate_runner_order_value(
+            runner_orders[iteration_key],
+            context=f"runner_orders[{iteration_key}]",
+        )
+        iteration = int(iteration_key)
+        expected_order = expected_runner_order(iteration)
+        if runner_order != expected_order:
+            raise ValidationError(
+                f"runner_orders[{iteration_key}] must match expected rotation: "
+                f"expected={expected_order} got={runner_order}"
+            )
+        iteration_metrics = [
+            metric for metric in metrics if int(metric["iteration"]) == iteration
+        ]
+        for metric in iteration_metrics:
+            if metric.get("runner_order") != runner_order:
+                raise ValidationError(
+                    f"{metric['runner']} iteration {iteration} runner_order must "
+                    "match root runner_orders"
+                )
+
+
 def validate_processes_snapshot(
     metric: dict[str, Any],
     field: str,
@@ -494,6 +588,11 @@ def validate_metric(metric: dict[str, Any], iterations: int, output_dir: Path) -
     validate_processes_at_peak(metric)
     if not 1 <= int(metric["iteration"]) <= iterations:
         raise ValidationError(f"{runner}.iteration is outside expected range: {metric['iteration']}")
+    validate_runner_order_fields(metric)
+    if "sampler_root_included" in metric and metric["sampler_root_included"] is not True:
+        raise ValidationError(f"{runner}.sampler_root_included must be true when present")
+    if "sampler_root_pid" in metric:
+        require_int(metric, "sampler_root_pid", positive=True)
 
     if runner != "raw-chrome-cdp":
         require_int(metric, "model_input_bytes", positive=True)
@@ -953,27 +1052,40 @@ def expected_gap_report(metrics: list[dict[str, Any]], summary: dict[str, Any]) 
                     "delta_to_match": comparison_delta(tempo_value, best_value, direction),
                 }
             )
-    return {
-        "suite": "live-agent-browser-bench",
-        "case_id": "checkout-submit",
-        "tempo_runner": TEMPO_RUNNER,
-        "baseline_runner": RAW_CHROME_RUNNER,
-        "agent_style_runners": sorted(AGENT_STYLE_RUNNERS),
-        "comparison_notes": [
-            "raw-chrome-cdp is excluded from observation-token and agent-step categories because it has no model-facing observation stream.",
-            "raw/synthetic CDP baselines dispatch Chrome input events for checkout actions; they do not mutate form state through direct DOM assignment.",
-            "model_input_tokens_p95 ranks the full model-facing stream each runner presents to an agent; compact_observation_tokens_p95 ranks the largest compact observation projection per run.",
-            "max_observation_tokens_p95 keeps Tempo's full durable structured audit JSON cost visible and is intentionally separate from compact model-facing projections.",
-            "max_observation_tokens_p95 compares the largest single durable observation per run; total_model_input_tokens_p95 ranks the cumulative model-facing stream where runners expose it.",
-            "cpu_time_ms_p95 is row-level only until every runner uses the same resource-accounting scope.",
-            "cold_start_wall_clock_ms reports iteration 1; steady_state_wall_clock_ms_p95 ranks iteration 2+ only and is omitted for one-iteration smoke artifacts.",
+    comparison_notes = [
+        "raw-chrome-cdp is excluded from observation-token and agent-step categories because it has no model-facing observation stream.",
+        "raw/synthetic CDP baselines dispatch Chrome input events for checkout actions; they do not mutate form state through direct DOM assignment.",
+        "model_input_tokens_p95 ranks the full model-facing stream each runner presents to an agent; compact_observation_tokens_p95 ranks the largest compact observation projection per run.",
+        "max_observation_tokens_p95 keeps Tempo's full durable structured audit JSON cost visible and is intentionally separate from compact model-facing projections.",
+        "max_observation_tokens_p95 compares the largest single durable observation per run; total_model_input_tokens_p95 ranks the cumulative model-facing stream where runners expose it.",
+        "cpu_time_ms_p95 is row-level only until every runner uses the same resource-accounting scope.",
+        "cold_start_wall_clock_ms reports iteration 1; steady_state_wall_clock_ms_p95 ranks iteration 2+ only and is omitted for one-iteration smoke artifacts.",
+    ]
+    if any("runner_order" in metric for metric in metrics):
+        comparison_notes.append(
+            "Benchmark runner order rotates per iteration to reduce deterministic warm-cache/order bias; each metric row records runner_order and runner_order_index."
+        )
+    if any(metric.get("sampler_root_included") is True for metric in metrics):
+        comparison_notes.append(
+            "Process-tree memory/process metrics include each runner root process and its descendants; rows record sampler_root_included so subprocess and in-process lanes expose their accounting scope."
+        )
+    comparison_notes.extend(
+        [
             "CDP Performance.getMetrics fields are required and ranked for every runner in this CDP-backed benchmark.",
             "Known CDP runtime fields use stable browser_* category names; any additional numeric Performance.getMetrics values are preserved as browser_cdp_* row fields but not ranked until promoted to the stable contract.",
             "web_* categories come from the browser Performance Timeline APIs and are required for every runner, including Tempo.",
             "Web resource count and byte fields are preserved as parity/integrity metrics, not ranked lower-is-better optimization categories.",
             "browser_rss_bytes_p95/browser_pss_bytes_p95/browser_uss_bytes_p95 report Chrome memory at the process-tree RSS/PSS/USS peak; browser_peak_* fields report Chrome process-type peaks even when they occur at a different sample.",
             "Positive deltas mean Tempo is behind that comparison target; negative deltas mean Tempo is ahead.",
-        ],
+        ]
+    )
+    return {
+        "suite": "live-agent-browser-bench",
+        "case_id": "checkout-submit",
+        "tempo_runner": TEMPO_RUNNER,
+        "baseline_runner": RAW_CHROME_RUNNER,
+        "agent_style_runners": sorted(AGENT_STYLE_RUNNERS),
+        "comparison_notes": comparison_notes,
         "rows": rows,
         "categories": categories,
         "gaps_to_close": gaps_to_close,
@@ -1415,6 +1527,7 @@ def validate_bench_json(output_dir: Path) -> tuple[int, list[dict[str, Any]]]:
         missing = sorted(expected_pairs - seen_pairs)
         extra = sorted(seen_pairs - expected_pairs)
         raise ValidationError(f"runner/iteration coverage mismatch: missing={missing}, extra={extra}")
+    validate_runner_orders_report(report, metrics, iterations)
     validate_browser_performance_metric_key_coverage(metrics)
 
     summary = report.get("summary")
@@ -1462,6 +1575,22 @@ def validate_iteration_dir(iteration_dir: Path, iteration: int) -> list[dict[str
         if metric.get("iteration") != iteration:
             raise ValidationError(f"{iteration_dir} metric has wrong iteration: {metric}")
         validate_metric(metric, iteration, iteration_dir)
+    if "runner_order" in report:
+        runner_order = validate_runner_order_value(
+            report["runner_order"],
+            context=f"{iteration_dir}/runner_order",
+        )
+        expected_order = expected_runner_order(iteration)
+        if runner_order != expected_order:
+            raise ValidationError(
+                f"{iteration_dir}/runner_order must match expected rotation: "
+                f"expected={expected_order} got={runner_order}"
+            )
+        for metric in metrics:
+            if metric.get("runner_order") != runner_order:
+                raise ValidationError(
+                    f"{iteration_dir} {metric['runner']} runner_order must match iteration report"
+                )
     if load_jsonl(iteration_dir / "agent-browser-bench.jsonl") != metrics:
         raise ValidationError(f"{iteration_dir}/agent-browser-bench.jsonl does not match metrics")
     return metrics

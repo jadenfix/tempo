@@ -16,6 +16,7 @@ import sys
 import tempfile
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 from agent_bench_status import STATUS_ARTIFACT, render_status_markdown
@@ -31,6 +32,15 @@ SUITE = "live-agent-browser-bench"
 CASE_ID = "checkout-submit"
 TEMPO_RUNNER = "tempo-cdp-agent"
 RAW_CHROME_RUNNER = "raw-chrome-cdp"
+DEFAULT_RUNNER_ORDER = (
+    "tempo-cdp-agent",
+    "raw-chrome-cdp",
+    "synthetic-playwright-ax",
+    "synthetic-browser-use-dom",
+    "real-playwright",
+    "external-browser-use-dom-loop",
+    "real-browser-use",
+)
 AGENT_STYLE_RUNNERS = {
     "tempo-cdp-agent",
     "synthetic-playwright-ax",
@@ -290,8 +300,7 @@ class RssSampler:
 
     def sample(self) -> None:
         pids = descendants(self.root_pid)
-        if self.root_pid != os.getpid():
-            pids.add(self.root_pid)
+        pids.add(self.root_pid)
         rss, by_command, by_process_type, process_count_by_type, processes = rss_snapshot(pids)
         process_type_by_pid = {
             int(process["pid"]): str(process["process_type"]) for process in processes
@@ -334,6 +343,8 @@ class RssSampler:
 
     def metric_fields(self) -> dict[str, object]:
         return {
+            "sampler_root_pid": self.root_pid,
+            "sampler_root_included": True,
             "rss_at_peak_by_command_bytes": dict(
                 sorted(self.rss_at_peak_by_command_bytes.items())
             ),
@@ -1707,6 +1718,16 @@ def summarize_int_field(metrics: list[dict], field: str) -> dict:
     }
 
 
+def rotate_runner_plan(
+    runner_plan: list[tuple[str, Callable[[], dict]]],
+    iteration: int,
+) -> list[tuple[str, Callable[[], dict]]]:
+    if not runner_plan:
+        return []
+    offset = (iteration - 1) % len(runner_plan)
+    return runner_plan[offset:] + runner_plan[:offset]
+
+
 def benchmark_gap_report(metrics: list[dict], summary: dict) -> dict:
     runners = sorted(summary)
     rows = [
@@ -1871,27 +1892,40 @@ def benchmark_gap_report(metrics: list[dict], summary: dict) -> dict:
                     "delta_to_match": comparison_delta(tempo_value, best_value, direction),
                 }
             )
-    return {
-        "suite": SUITE,
-        "case_id": CASE_ID,
-        "tempo_runner": TEMPO_RUNNER,
-        "baseline_runner": RAW_CHROME_RUNNER,
-        "agent_style_runners": sorted(AGENT_STYLE_RUNNERS),
-        "comparison_notes": [
-            "raw-chrome-cdp is excluded from observation-token and agent-step categories because it has no model-facing observation stream.",
-            "raw/synthetic CDP baselines dispatch Chrome input events for checkout actions; they do not mutate form state through direct DOM assignment.",
-            "model_input_tokens_p95 ranks the full model-facing stream each runner presents to an agent; compact_observation_tokens_p95 ranks the largest compact observation projection per run.",
-            "max_observation_tokens_p95 keeps Tempo's full durable structured audit JSON cost visible and is intentionally separate from compact model-facing projections.",
-            "max_observation_tokens_p95 compares the largest single durable observation per run; total_model_input_tokens_p95 ranks the cumulative model-facing stream where runners expose it.",
-            "cpu_time_ms_p95 is row-level only until every runner uses the same resource-accounting scope.",
-            "cold_start_wall_clock_ms reports iteration 1; steady_state_wall_clock_ms_p95 ranks iteration 2+ only and is omitted for one-iteration smoke artifacts.",
+    comparison_notes = [
+        "raw-chrome-cdp is excluded from observation-token and agent-step categories because it has no model-facing observation stream.",
+        "raw/synthetic CDP baselines dispatch Chrome input events for checkout actions; they do not mutate form state through direct DOM assignment.",
+        "model_input_tokens_p95 ranks the full model-facing stream each runner presents to an agent; compact_observation_tokens_p95 ranks the largest compact observation projection per run.",
+        "max_observation_tokens_p95 keeps Tempo's full durable structured audit JSON cost visible and is intentionally separate from compact model-facing projections.",
+        "max_observation_tokens_p95 compares the largest single durable observation per run; total_model_input_tokens_p95 ranks the cumulative model-facing stream where runners expose it.",
+        "cpu_time_ms_p95 is row-level only until every runner uses the same resource-accounting scope.",
+        "cold_start_wall_clock_ms reports iteration 1; steady_state_wall_clock_ms_p95 ranks iteration 2+ only and is omitted for one-iteration smoke artifacts.",
+    ]
+    if any("runner_order" in metric for metric in metrics):
+        comparison_notes.append(
+            "Benchmark runner order rotates per iteration to reduce deterministic warm-cache/order bias; each metric row records runner_order and runner_order_index."
+        )
+    if any(metric.get("sampler_root_included") is True for metric in metrics):
+        comparison_notes.append(
+            "Process-tree memory/process metrics include each runner root process and its descendants; rows record sampler_root_included so subprocess and in-process lanes expose their accounting scope."
+        )
+    comparison_notes.extend(
+        [
             "CDP Performance.getMetrics fields are required and ranked for every runner in this CDP-backed benchmark.",
             "Known CDP runtime fields use stable browser_* category names; any additional numeric Performance.getMetrics values are preserved as browser_cdp_* row fields but not ranked until promoted to the stable contract.",
             "web_* categories come from the browser Performance Timeline APIs and are required for every runner, including Tempo.",
             "Web resource count and byte fields are preserved as parity/integrity metrics, not ranked lower-is-better optimization categories.",
             "browser_rss_bytes_p95/browser_pss_bytes_p95/browser_uss_bytes_p95 report Chrome memory at the process-tree RSS/PSS/USS peak; browser_peak_* fields report Chrome process-type peaks even when they occur at a different sample.",
             "Positive deltas mean Tempo is behind that comparison target; negative deltas mean Tempo is ahead.",
-        ],
+        ]
+    )
+    return {
+        "suite": SUITE,
+        "case_id": CASE_ID,
+        "tempo_runner": TEMPO_RUNNER,
+        "baseline_runner": RAW_CHROME_RUNNER,
+        "agent_style_runners": sorted(AGENT_STYLE_RUNNERS),
+        "comparison_notes": comparison_notes,
         "rows": rows,
         "categories": categories,
         "gaps_to_close": gaps_to_close,
@@ -2360,7 +2394,10 @@ def main() -> int:
         "--iterations",
         type=int,
         default=None,
-        help="number of benchmark iterations; defaults to 1 for smoke and 5 for --full",
+        help=(
+            "number of benchmark iterations; defaults to 1 for smoke and one "
+            "complete runner-order cycle for --full"
+        ),
     )
     parser.add_argument("--min-success-rate", type=float, default=None)
     parser.add_argument("--max-p95-wall-ms", type=int, default=None)
@@ -2378,7 +2415,11 @@ def main() -> int:
     output_dir = Path(args.output_dir)
     assert_safe_output_dir(output_dir)
     clean_output_dir(output_dir)
-    iterations = args.iterations if args.iterations is not None else (5 if args.full else 1)
+    iterations = (
+        args.iterations
+        if args.iterations is not None
+        else (len(DEFAULT_RUNNER_ORDER) if args.full else 1)
+    )
     if iterations < 1:
         raise RuntimeError("--iterations must be >= 1")
     resolved_chrome_version = chrome_version(args.chrome)
@@ -2386,43 +2427,82 @@ def main() -> int:
     with StaticServer(FIXTURE_DIR) as server:
         url = f"{server.base_url}/checkout.html"
         metrics = []
+        runner_orders: dict[str, list[str]] = {}
         for iteration in range(1, iterations + 1):
             iteration_dir = output_dir if iterations == 1 else output_dir / f"iteration-{iteration:03d}"
             clean_output_dir(iteration_dir)
-            iteration_metrics = [
-                run_tempo(url, args.chrome, iteration_dir),
-                run_cdp_baseline(args.chrome, url, "raw-chrome-cdp", None),
-                run_cdp_baseline(args.chrome, url, "synthetic-playwright-ax", "ax"),
-                run_cdp_baseline(args.chrome, url, "synthetic-browser-use-dom", "browser_use_dom"),
-                run_external_baseline(
-                    args.chrome,
-                    url,
+            runner_plan: list[tuple[str, Callable[[], dict]]] = [
+                ("tempo-cdp-agent", lambda: run_tempo(url, args.chrome, iteration_dir)),
+                ("raw-chrome-cdp", lambda: run_cdp_baseline(args.chrome, url, "raw-chrome-cdp", None)),
+                (
+                    "synthetic-playwright-ax",
+                    lambda: run_cdp_baseline(args.chrome, url, "synthetic-playwright-ax", "ax"),
+                ),
+                (
+                    "synthetic-browser-use-dom",
+                    lambda: run_cdp_baseline(
+                        args.chrome,
+                        url,
+                        "synthetic-browser-use-dom",
+                        "browser_use_dom",
+                    ),
+                ),
+                (
                     "real-playwright",
-                    "playwright_checkout.py",
-                    iteration_dir,
+                    lambda: run_external_baseline(
+                        args.chrome,
+                        url,
+                        "real-playwright",
+                        "playwright_checkout.py",
+                        iteration_dir,
+                    ),
                 ),
-                run_external_baseline(
-                    args.chrome,
-                    url,
+                (
                     "external-browser-use-dom-loop",
-                    "browser_use_dom_loop.py",
-                    iteration_dir,
+                    lambda: run_external_baseline(
+                        args.chrome,
+                        url,
+                        "external-browser-use-dom-loop",
+                        "browser_use_dom_loop.py",
+                        iteration_dir,
+                    ),
                 ),
-                run_external_baseline(
-                    args.chrome,
-                    url,
+                (
                     "real-browser-use",
-                    "browser_use_package.py",
-                    iteration_dir,
+                    lambda: run_external_baseline(
+                        args.chrome,
+                        url,
+                        "real-browser-use",
+                        "browser_use_package.py",
+                        iteration_dir,
+                    ),
                 ),
             ]
-            for metric in iteration_metrics:
+            if tuple(runner for runner, _run in runner_plan) != DEFAULT_RUNNER_ORDER:
+                raise RuntimeError("runner plan order does not match DEFAULT_RUNNER_ORDER")
+            ordered_runner_plan = rotate_runner_plan(runner_plan, iteration)
+            runner_order = [runner for runner, _run in ordered_runner_plan]
+            runner_orders[str(iteration)] = runner_order
+            iteration_metrics = []
+            for runner_order_index, (expected_runner, run_runner) in enumerate(
+                ordered_runner_plan,
+                start=1,
+            ):
+                metric = run_runner()
+                if metric.get("runner") != expected_runner:
+                    raise RuntimeError(
+                        f"runner plan expected {expected_runner}, got {metric.get('runner')}"
+                    )
                 metric["iteration"] = iteration
+                metric["runner_order"] = runner_order
+                metric["runner_order_index"] = runner_order_index
+                iteration_metrics.append(metric)
             write_json(
                 iteration_dir / "agent-browser-bench.json",
                 {
                     "url": url,
                     "iteration": iteration,
+                    "runner_order": runner_order,
                     "chrome": args.chrome,
                     "chrome_version": resolved_chrome_version,
                     "metrics": iteration_metrics,
@@ -2438,6 +2518,7 @@ def main() -> int:
             "iterations": iterations,
             "chrome": args.chrome,
             "chrome_version": resolved_chrome_version,
+            "runner_orders": runner_orders,
             "metrics": metrics,
             "summary": summary,
         }
