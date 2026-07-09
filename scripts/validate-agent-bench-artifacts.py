@@ -538,6 +538,64 @@ def validate_tempo_metric_cdp_observation_counters(metric: dict[str, Any]) -> No
         require_int(metric, f"cdp_{field}")
 
 
+def normalize_tempo_cdp_counter_field(field: str) -> str:
+    normalized = field.strip()
+    if normalized.startswith("cdp_"):
+        normalized = normalized[4:]
+    if normalized not in TEMPO_CDP_OBSERVATION_COUNTER_FIELDS:
+        raise ValidationError(
+            f"unsupported Tempo CDP counter {field!r}; expected one of "
+            f"{', '.join(TEMPO_CDP_OBSERVATION_COUNTER_FIELDS)}"
+        )
+    return f"cdp_{normalized}"
+
+
+def parse_counter_expectations(values: list[str] | None, option: str) -> dict[str, int]:
+    expectations: dict[str, int] = {}
+    for value in values or []:
+        if "=" not in value:
+            raise ValidationError(f"{option} values must be FIELD=VALUE, got {value!r}")
+        field, raw_expected = value.split("=", 1)
+        field_name = normalize_tempo_cdp_counter_field(field)
+        try:
+            expected = int(raw_expected)
+        except ValueError as error:
+            raise ValidationError(
+                f"{option} value for {field!r} must be an integer, got {raw_expected!r}"
+            ) from error
+        if expected < 0:
+            raise ValidationError(f"{option} value for {field!r} must be >= 0")
+        expectations[field_name] = expected
+    return expectations
+
+
+def validate_tempo_cdp_counter_expectations(
+    metrics: list[dict[str, Any]],
+    exact: dict[str, int],
+    maximum: dict[str, int],
+    source: str,
+) -> None:
+    if not exact and not maximum:
+        return
+    tempo_metrics = [metric for metric in metrics if metric.get("runner") == TEMPO_RUNNER]
+    if not tempo_metrics:
+        raise ValidationError(f"{source} missing tempo-cdp-agent metric")
+    for index, metric in enumerate(tempo_metrics, start=1):
+        validate_tempo_metric_cdp_observation_counters(metric)
+        for field, expected in exact.items():
+            actual = int(metric[field])
+            if actual != expected:
+                raise ValidationError(
+                    f"{source} tempo-cdp-agent row {index} {field} must be {expected}, got {actual}"
+                )
+        for field, max_value in maximum.items():
+            actual = int(metric[field])
+            if actual > max_value:
+                raise ValidationError(
+                    f"{source} tempo-cdp-agent row {index} {field} must be <= {max_value}, got {actual}"
+                )
+
+
 def artifact_path(output_dir: Path, stored_path: str) -> Path:
     path = Path(stored_path)
     if path.exists():
@@ -2101,9 +2159,18 @@ def validate_artifacts(
     iterations: int,
     root_metrics: list[dict[str, Any]],
     require_derived_artifacts: bool,
+    exact_tempo_cdp_counters: dict[str, int],
+    max_tempo_cdp_counters: dict[str, int],
 ) -> None:
     for name in ROOT_ARTIFACTS:
         require_file(output_dir / name)
+
+    validate_tempo_cdp_counter_expectations(
+        root_metrics,
+        exact_tempo_cdp_counters,
+        max_tempo_cdp_counters,
+        str(output_dir / "agent-browser-bench.json"),
+    )
 
     iteration_dirs = sorted(output_dir.glob("iteration-*"))
     if iteration_dirs:
@@ -2111,7 +2178,14 @@ def validate_artifacts(
             raise ValidationError(f"expected {iterations} iteration dirs, got {len(iteration_dirs)}")
         iteration_metrics = []
         for index, iteration_dir in enumerate(iteration_dirs, start=1):
-            iteration_metrics.extend(validate_iteration_dir(iteration_dir, index))
+            current_metrics = validate_iteration_dir(iteration_dir, index)
+            validate_tempo_cdp_counter_expectations(
+                current_metrics,
+                exact_tempo_cdp_counters,
+                max_tempo_cdp_counters,
+                str(iteration_dir / "agent-browser-bench.json"),
+            )
+            iteration_metrics.extend(current_metrics)
             if require_derived_artifacts:
                 for name in DERIVED_ARTIFACTS:
                     require_file(iteration_dir / name)
@@ -2133,6 +2207,26 @@ def main() -> int:
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--expected-iterations", type=int, default=None)
     parser.add_argument("--require-derived-artifacts", action="store_true")
+    parser.add_argument(
+        "--expect-tempo-cdp-counter",
+        action="append",
+        default=[],
+        metavar="FIELD=VALUE",
+        help=(
+            "Require every tempo-cdp-agent row to have an exact CDP observation "
+            "counter value. FIELD may omit the cdp_ prefix."
+        ),
+    )
+    parser.add_argument(
+        "--max-tempo-cdp-counter",
+        action="append",
+        default=[],
+        metavar="FIELD=VALUE",
+        help=(
+            "Require every tempo-cdp-agent row to have a CDP observation counter "
+            "value less than or equal to VALUE. FIELD may omit the cdp_ prefix."
+        ),
+    )
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -2141,7 +2235,22 @@ def main() -> int:
         raise ValidationError(
             f"expected {args.expected_iterations} iterations, report contains {iterations}"
         )
-    validate_artifacts(output_dir, iterations, metrics, args.require_derived_artifacts)
+    exact_tempo_cdp_counters = parse_counter_expectations(
+        args.expect_tempo_cdp_counter,
+        "--expect-tempo-cdp-counter",
+    )
+    max_tempo_cdp_counters = parse_counter_expectations(
+        args.max_tempo_cdp_counter,
+        "--max-tempo-cdp-counter",
+    )
+    validate_artifacts(
+        output_dir,
+        iterations,
+        metrics,
+        args.require_derived_artifacts,
+        exact_tempo_cdp_counters,
+        max_tempo_cdp_counters,
+    )
     print(f"validated agent browser benchmark artifacts: {output_dir}")
     return 0
 

@@ -64,6 +64,7 @@ use tokio::task::JoinHandle;
 /// so every element that actually survives into the marked observation is still
 /// enriched, while the long tail stays present but without an AX overlay.
 const MAX_AX_ENRICHED_ELEMENTS: usize = 16;
+const MAX_AX_SUMMARY_CACHE_ENTRIES: usize = 256;
 /// How many recent compiled observations to retain for diff bases. Diffs are only
 /// ever requested against recent seqs (`previous_seq`, `batch_base_seq`, a
 /// client-supplied `since_seq`), and `diff_from_base(None, ...)` already degrades a
@@ -397,6 +398,8 @@ pub struct CdpTempoDriver {
     history: BTreeMap<u64, Arc<CompiledObservation>>,
     stable_id_mapper: StableIdMapper,
     selectors_by_node: BTreeMap<NodeId, String>,
+    ax_cache_scopes_by_node: BTreeMap<NodeId, AxSummaryCacheScope>,
+    ax_summary_cache: Mutex<HashMap<AxSummaryCacheKey, AxSummary>>,
     url_policy: Arc<Mutex<UrlPolicy>>,
     browser_hardening_policy: Arc<Mutex<BrowserHardeningPolicy>>,
     blocked_request_url: Arc<Mutex<Option<String>>>,
@@ -489,6 +492,8 @@ impl CdpTempoDriver {
             history: BTreeMap::new(),
             stable_id_mapper: StableIdMapper::new(),
             selectors_by_node: BTreeMap::new(),
+            ax_cache_scopes_by_node: BTreeMap::new(),
+            ax_summary_cache: Mutex::new(HashMap::new()),
             url_policy,
             browser_hardening_policy,
             blocked_request_url,
@@ -712,10 +717,13 @@ impl CdpTempoDriver {
     ) -> Result<Arc<CompiledObservation>, TransportError> {
         self.increment_observation_counter(|counters| counters.record_snapshot_count += 1);
         self.seq += 1;
-        let (mut compiled, selectors_by_node) =
+        let dom_hash = fnv1a64(dom_html.as_bytes());
+        let (mut compiled, selectors_by_node, ax_cache_scopes_by_node) =
             compile_observation(&mut self.stable_id_mapper, url, dom_html, self.seq);
         self.selectors_by_node = selectors_by_node;
-        self.enrich_observation_from_ax_tree(&mut compiled).await?;
+        self.ax_cache_scopes_by_node = ax_cache_scopes_by_node;
+        self.enrich_observation_from_ax_tree(&mut compiled, dom_hash)
+            .await?;
         // Finish the live observation the same way the fixture compiler does:
         // rank-sort, apply the byte/token budget, and populate set-of-marks labels.
         // Run after enrichment so the budget accounts for enriched AX names/values.
@@ -886,6 +894,7 @@ impl CdpTempoDriver {
     async fn enrich_observation_from_ax_tree(
         &self,
         observation: &mut CompiledObservation,
+        dom_hash: u64,
     ) -> Result<(), TransportError> {
         if observation.elements.is_empty() {
             return Ok(());
@@ -907,11 +916,17 @@ impl CdpTempoDriver {
         enrich_elements(
             &mut observation.elements,
             MAX_AX_ENRICHED_ELEMENTS,
-            |node_id| async move {
-                let Some(selector) = self.selectors_by_node.get(&node_id).cloned() else {
+            |element| async move {
+                let Some(selector) = self.selectors_by_node.get(&element.node_id).cloned() else {
                     return Ok(None);
                 };
-                self.ax_summary_for_selector(root, &selector).await
+                let scope = self
+                    .ax_cache_scopes_by_node
+                    .get(&element.node_id)
+                    .copied()
+                    .unwrap_or(AxSummaryCacheScope::Document(dom_hash));
+                self.ax_summary_for_selector(root, &selector, &element, scope)
+                    .await
             },
         )
         .await
@@ -929,7 +944,14 @@ impl CdpTempoDriver {
         &self,
         root: DomNodeId,
         selector: &str,
+        raw_element: &InteractiveElement,
+        cache_scope: AxSummaryCacheScope,
     ) -> Result<Option<AxSummary>, TransportError> {
+        let cache_key = AxSummaryCacheKey::from_element(cache_scope, selector, raw_element);
+        if let Some(summary) = cached_ax_summary(&self.ax_summary_cache, &cache_key) {
+            return Ok(Some(summary));
+        }
+
         let page = self.page()?;
         let queried = match page.execute(QuerySelectorParams::new(root, selector)).await {
             Ok(response) => response.result,
@@ -974,7 +996,14 @@ impl CdpTempoDriver {
             Err(error) => return Err(map_cdp_error(error)),
         };
 
-        Ok(sole_ax_summary(&ax_nodes))
+        let summary = sole_ax_summary(&ax_nodes);
+        remember_cacheable_ax_summary(
+            &self.ax_summary_cache,
+            cache_key,
+            raw_element,
+            summary.as_ref(),
+        );
+        Ok(summary)
     }
 
     async fn with_element<F, Fut>(&self, selector: &str, op: F) -> Result<bool, TransportError>
@@ -3025,18 +3054,29 @@ fn compile_observation(
     url: String,
     dom_html: String,
     seq: u64,
-) -> (CompiledObservation, BTreeMap<NodeId, String>) {
-    let mut elements = extract_interactive_elements(&dom_html);
+) -> (
+    CompiledObservation,
+    BTreeMap<NodeId, String>,
+    BTreeMap<NodeId, AxSummaryCacheScope>,
+) {
+    let dom_hash = fnv1a64(dom_html.as_bytes());
+    let extracted = extract_interactive_elements_with_ax_cache_scopes(&dom_html, dom_hash);
+    let mut elements: Vec<_> = extracted
+        .iter()
+        .map(|extracted| extracted.element.clone())
+        .collect();
     let raw_elements: Vec<_> = elements
         .iter()
         .map(raw_element_from_selector_element)
         .collect();
     let node_ids = mapper.map_snapshot(seq, &raw_elements);
     let mut selectors_by_node = BTreeMap::new();
-    for (element, node_id) in elements.iter_mut().zip(node_ids) {
+    let mut ax_cache_scopes_by_node = BTreeMap::new();
+    for ((element, extracted), node_id) in elements.iter_mut().zip(extracted).zip(node_ids) {
         let selector = element.node_id.0.clone();
         element.node_id = node_id.clone();
-        selectors_by_node.insert(node_id, selector);
+        selectors_by_node.insert(node_id.clone(), selector);
+        ax_cache_scopes_by_node.insert(node_id, extracted.ax_cache_scope);
     }
 
     (
@@ -3049,6 +3089,7 @@ fn compile_observation(
             marks: Vec::new(),
         },
         selectors_by_node,
+        ax_cache_scopes_by_node,
     )
 }
 
@@ -3081,11 +3122,188 @@ fn push_spans_text(output: &mut String, spans: &[TaintSpan]) {
     }
 }
 
+fn spans_text(spans: &[TaintSpan]) -> String {
+    let mut output = String::new();
+    push_spans_text(&mut output, spans);
+    output
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct AxSummary {
     role: Option<String>,
     name: Option<String>,
     value: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum AxSummaryCacheScope {
+    Document(u64),
+    Element(u64),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct AxSummaryCacheKey {
+    scope: AxSummaryCacheScope,
+    selector: String,
+    raw_role: String,
+    raw_name: String,
+    raw_value: String,
+}
+
+impl AxSummaryCacheKey {
+    fn from_element(
+        scope: AxSummaryCacheScope,
+        selector: &str,
+        element: &InteractiveElement,
+    ) -> Self {
+        Self {
+            scope,
+            selector: selector.to_string(),
+            raw_role: element.role.clone(),
+            raw_name: spans_text(&element.name),
+            raw_value: spans_text(&element.value),
+        }
+    }
+}
+
+fn cached_ax_summary(
+    cache: &Mutex<HashMap<AxSummaryCacheKey, AxSummary>>,
+    key: &AxSummaryCacheKey,
+) -> Option<AxSummary> {
+    cache.lock().ok()?.get(key).cloned()
+}
+
+fn remember_cacheable_ax_summary(
+    cache: &Mutex<HashMap<AxSummaryCacheKey, AxSummary>>,
+    key: AxSummaryCacheKey,
+    raw_element: &InteractiveElement,
+    summary: Option<&AxSummary>,
+) {
+    let Some(summary) = summary else {
+        return;
+    };
+    if !ax_summary_cacheable_raw_element(raw_element) {
+        return;
+    }
+    if !ax_summary_preserves_raw_dom_fallback(raw_element, summary) {
+        return;
+    }
+    if let Ok(mut cache) = cache.lock() {
+        if !cache.contains_key(&key) && cache.len() >= MAX_AX_SUMMARY_CACHE_ENTRIES {
+            cache.clear();
+        }
+        cache.insert(key, summary.clone());
+    }
+}
+
+fn ax_summary_preserves_raw_dom_fallback(
+    raw_element: &InteractiveElement,
+    summary: &AxSummary,
+) -> bool {
+    if summary
+        .role
+        .as_deref()
+        .is_some_and(|role| role != raw_element.role)
+    {
+        return false;
+    }
+    if summary
+        .name
+        .as_deref()
+        .is_some_and(|name| name != spans_text(&raw_element.name))
+    {
+        return false;
+    }
+    if summary
+        .value
+        .as_deref()
+        .is_some_and(|value| value != spans_text(&raw_element.value))
+    {
+        return false;
+    }
+    true
+}
+
+fn ax_summary_cacheable_raw_element(raw_element: &InteractiveElement) -> bool {
+    let raw_name = spans_text(&raw_element.name);
+    let raw_value = spans_text(&raw_element.value);
+    if raw_name.is_empty() && raw_value.is_empty() {
+        return false;
+    }
+    !matches!(
+        raw_element.role.as_str(),
+        "checkbox"
+            | "combobox"
+            | "listbox"
+            | "menuitemcheckbox"
+            | "menuitemradio"
+            | "option"
+            | "progressbar"
+            | "radio"
+            | "scrollbar"
+            | "searchbox"
+            | "slider"
+            | "spinbutton"
+            | "switch"
+            | "textbox"
+    ) && raw_element.value.is_empty()
+}
+
+fn ax_summary_cache_scope_for_element(
+    tag: &str,
+    attrs: &BTreeMap<String, String>,
+    element: &InteractiveElement,
+    dom_hash: u64,
+) -> AxSummaryCacheScope {
+    if !ax_summary_cacheable_raw_element(element) {
+        return AxSummaryCacheScope::Document(dom_hash);
+    }
+    if attrs.keys().any(|key| key.starts_with("aria-")) {
+        return AxSummaryCacheScope::Document(dom_hash);
+    }
+
+    let mut signature = String::new();
+    signature.push_str("tag=");
+    signature.push_str(tag);
+    signature.push('\n');
+    signature.push_str("selector=");
+    signature.push_str(&element.node_id.0);
+    signature.push('\n');
+    signature.push_str("role=");
+    signature.push_str(&element.role);
+    signature.push('\n');
+    signature.push_str("name=");
+    push_spans_text(&mut signature, &element.name);
+    signature.push('\n');
+    signature.push_str("value=");
+    push_spans_text(&mut signature, &element.value);
+    signature.push('\n');
+
+    for key in [
+        "alt",
+        "class",
+        "disabled",
+        "hidden",
+        "href",
+        "id",
+        "inert",
+        "name",
+        "placeholder",
+        "role",
+        "style",
+        "title",
+        "type",
+        "value",
+    ] {
+        if let Some(value) = attrs.get(key) {
+            signature.push_str(key);
+            signature.push('=');
+            signature.push_str(value);
+            signature.push('\n');
+        }
+    }
+
+    AxSummaryCacheScope::Element(fnv1a64(signature.as_bytes()))
 }
 
 /// The AX summary of the single node described by a `GetPartialAXTree` reply
@@ -3185,7 +3403,7 @@ async fn enrich_elements<F, Fut>(
     mut lookup: F,
 ) -> Result<(), TransportError>
 where
-    F: FnMut(NodeId) -> Fut,
+    F: FnMut(InteractiveElement) -> Fut,
     Fut: std::future::Future<Output = Result<Option<AxSummary>, TransportError>>,
 {
     let mut jobs = Vec::new();
@@ -3193,8 +3411,7 @@ where
         let Some(element) = elements.get(index) else {
             continue;
         };
-        let node_id = element.node_id.clone();
-        jobs.push((index, lookup(node_id)));
+        jobs.push((index, lookup(element.clone())));
     }
 
     // The selected set is capped at `max_enriched`, so running these lookups
@@ -3320,7 +3537,25 @@ fn diff_from_base(
     }
 }
 
+#[derive(Clone, Debug)]
+struct ExtractedInteractiveElement {
+    element: InteractiveElement,
+    ax_cache_scope: AxSummaryCacheScope,
+}
+
+#[cfg(test)]
 fn extract_interactive_elements(html: &str) -> Vec<InteractiveElement> {
+    let dom_hash = fnv1a64(html.as_bytes());
+    extract_interactive_elements_with_ax_cache_scopes(html, dom_hash)
+        .into_iter()
+        .map(|extracted| extracted.element)
+        .collect()
+}
+
+fn extract_interactive_elements_with_ax_cache_scopes(
+    html: &str,
+    dom_hash: u64,
+) -> Vec<ExtractedInteractiveElement> {
     // Track the open-element stack so `:nth-of-type` fallback indices are scoped
     // to siblings under the same parent (issue #104), not a document-global
     // counter. Each frame records how many of each tag have opened directly
@@ -3435,7 +3670,7 @@ fn extract_interactive_elements(html: &str) -> Vec<InteractiveElement> {
                         }]
                     })
                     .unwrap_or_default();
-                elements.push(InteractiveElement {
+                let element = InteractiveElement {
                     node_id: NodeId(selector),
                     role,
                     name: vec![TaintSpan {
@@ -3445,6 +3680,12 @@ fn extract_interactive_elements(html: &str) -> Vec<InteractiveElement> {
                     value,
                     bounds: None,
                     rank: 0.5,
+                };
+                let ax_cache_scope =
+                    ax_summary_cache_scope_for_element(&tag, &attrs, &element, dom_hash);
+                elements.push(ExtractedInteractiveElement {
+                    element,
+                    ax_cache_scope,
                 });
                 carried_noninteractive += 1;
             }
@@ -3464,7 +3705,7 @@ fn extract_interactive_elements(html: &str) -> Vec<InteractiveElement> {
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| implicit_role(&tag, &attrs));
 
-        elements.push(InteractiveElement {
+        let element = InteractiveElement {
             node_id: NodeId(selector),
             role,
             name: vec![TaintSpan {
@@ -3482,6 +3723,11 @@ fn extract_interactive_elements(html: &str) -> Vec<InteractiveElement> {
                 .unwrap_or_default(),
             bounds: None,
             rank: rank_for(&tag, role_attr),
+        };
+        let ax_cache_scope = ax_summary_cache_scope_for_element(&tag, &attrs, &element, dom_hash);
+        elements.push(ExtractedInteractiveElement {
+            element,
+            ax_cache_scope,
         });
     }
 
@@ -3941,7 +4187,7 @@ mod tests {
               <input name="q">
             </main>
         "#;
-        let (raw, _) =
+        let (raw, _, _) =
             compile_observation(&mut mapper, "https://example.test/".into(), html.into(), 1);
         // Raw extractor emits document order and no marks.
         assert!(raw.marks.is_empty());
@@ -3964,7 +4210,8 @@ mod tests {
         let big: String = (0..400)
             .map(|i| format!("<button id=\"b{i}\">Button number {i}</button>"))
             .collect();
-        let (raw_big, _) = compile_observation(&mut mapper, "https://example.test/".into(), big, 2);
+        let (raw_big, _, _) =
+            compile_observation(&mut mapper, "https://example.test/".into(), big, 2);
         let raw_count = raw_big.elements.len();
         assert!(raw_count > 200, "fixture should extract all 400 buttons");
         let finished_big = tempo_observe::finalize_observation(
@@ -4409,7 +4656,7 @@ mod tests {
     #[test]
     fn compiled_observation_uses_stable_ids_with_private_selector_lookup() {
         let mut mapper = StableIdMapper::new();
-        let (first, first_lookup) = compile_observation(
+        let (first, first_lookup, _) = compile_observation(
             &mut mapper,
             "https://example.test".into(),
             r#"<button id="save">Save</button>"#.into(),
@@ -4423,7 +4670,7 @@ mod tests {
             Some("[id=\"save\"]")
         );
 
-        let (second, second_lookup) = compile_observation(
+        let (second, second_lookup, _) = compile_observation(
             &mut mapper,
             "https://example.test".into(),
             r#"<button id="renamed">Save</button>"#.into(),
@@ -6704,6 +6951,169 @@ mod tests {
         }
     }
 
+    fn dom_equivalent_summary() -> AxSummary {
+        AxSummary {
+            role: Some("button".to_string()),
+            name: Some("orig".to_string()),
+            value: None,
+        }
+    }
+
+    #[test]
+    fn enrichment_reuses_dom_equivalent_ax_summary_with_same_dom_hash() {
+        let cache = Mutex::new(HashMap::new());
+        let element = sample_element("#stable", 1.0);
+        let key =
+            AxSummaryCacheKey::from_element(AxSummaryCacheScope::Document(42), "#save", &element);
+        let summary = dom_equivalent_summary();
+
+        remember_cacheable_ax_summary(&cache, key.clone(), &element, Some(&summary));
+
+        assert_eq!(cached_ax_summary(&cache, &key), Some(summary));
+    }
+
+    #[test]
+    fn enrichment_does_not_cache_ax_overlay_that_changes_dom_fallback() {
+        let cache = Mutex::new(HashMap::new());
+        let element = sample_element("#stable", 1.0);
+        let key =
+            AxSummaryCacheKey::from_element(AxSummaryCacheScope::Document(42), "#save", &element);
+        let overlay = enriched_summary();
+
+        remember_cacheable_ax_summary(&cache, key.clone(), &element, Some(&overlay));
+
+        assert_eq!(cached_ax_summary(&cache, &key), None);
+    }
+
+    #[test]
+    fn enrichment_does_not_cache_mutable_form_role() {
+        let cache = Mutex::new(HashMap::new());
+        let mut element = sample_element("#email", 1.0);
+        element.role = "textbox".to_string();
+        let key =
+            AxSummaryCacheKey::from_element(AxSummaryCacheScope::Document(42), "#email", &element);
+        let summary = AxSummary {
+            role: Some("textbox".to_string()),
+            name: Some("orig".to_string()),
+            value: None,
+        };
+
+        remember_cacheable_ax_summary(&cache, key.clone(), &element, Some(&summary));
+
+        assert_eq!(cached_ax_summary(&cache, &key), None);
+    }
+
+    #[test]
+    fn enrichment_does_not_cache_nameless_button_like_element() {
+        let cache = Mutex::new(HashMap::new());
+        let mut element = sample_element("#go", 1.0);
+        element.name = Vec::new();
+        let key =
+            AxSummaryCacheKey::from_element(AxSummaryCacheScope::Document(42), "#go", &element);
+        let summary = AxSummary {
+            role: Some("button".to_string()),
+            name: None,
+            value: None,
+        };
+
+        remember_cacheable_ax_summary(&cache, key.clone(), &element, Some(&summary));
+
+        assert_eq!(cached_ax_summary(&cache, &key), None);
+    }
+
+    #[test]
+    fn enrichment_cache_is_bounded_for_long_lived_drivers() {
+        let cache = Mutex::new(HashMap::new());
+        let element = sample_element("#stable", 1.0);
+        let summary = dom_equivalent_summary();
+        for index in 0..=MAX_AX_SUMMARY_CACHE_ENTRIES {
+            let key = AxSummaryCacheKey::from_element(
+                AxSummaryCacheScope::Document(index as u64),
+                "#stable",
+                &element,
+            );
+            remember_cacheable_ax_summary(&cache, key, &element, Some(&summary));
+        }
+
+        assert!(matches!(
+            cache
+                .lock()
+                .map(|cache| cache.len() <= MAX_AX_SUMMARY_CACHE_ENTRIES),
+            Ok(true)
+        ));
+    }
+
+    #[test]
+    fn enrichment_invalidates_cache_when_dom_hash_changes() {
+        let cache = Mutex::new(HashMap::new());
+        let element = sample_element("#stable", 1.0);
+        let original_key =
+            AxSummaryCacheKey::from_element(AxSummaryCacheScope::Document(42), "#save", &element);
+        let changed_dom_key =
+            AxSummaryCacheKey::from_element(AxSummaryCacheScope::Document(43), "#save", &element);
+        let summary = dom_equivalent_summary();
+
+        remember_cacheable_ax_summary(&cache, original_key, &element, Some(&summary));
+
+        assert_eq!(cached_ax_summary(&cache, &changed_dom_key), None);
+    }
+
+    #[test]
+    fn enrichment_reuses_element_scoped_summary_across_document_hash_changes() {
+        let cache = Mutex::new(HashMap::new());
+        let element = sample_element("#stable", 1.0);
+        let scope = AxSummaryCacheScope::Element(7);
+        let original_key = AxSummaryCacheKey::from_element(scope, "#save", &element);
+        let changed_document_key = AxSummaryCacheKey::from_element(scope, "#save", &element);
+        let summary = dom_equivalent_summary();
+
+        remember_cacheable_ax_summary(&cache, original_key, &element, Some(&summary));
+
+        assert_eq!(
+            cached_ax_summary(&cache, &changed_document_key),
+            Some(summary)
+        );
+    }
+
+    #[test]
+    fn enrichment_keeps_document_scope_for_aria_labelledby() {
+        let element = sample_element("#labelled", 1.0);
+        let attrs = BTreeMap::from([("aria-labelledby".to_string(), "label".to_string())]);
+
+        assert_eq!(
+            ax_summary_cache_scope_for_element("button", &attrs, &element, 42),
+            AxSummaryCacheScope::Document(42)
+        );
+    }
+
+    #[test]
+    fn enrichment_keeps_document_scope_for_mutable_controls() {
+        let mut element = sample_element("#email", 1.0);
+        element.role = "textbox".to_string();
+        let attrs = BTreeMap::from([("name".to_string(), "email".to_string())]);
+
+        assert_eq!(
+            ax_summary_cache_scope_for_element("input", &attrs, &element, 42),
+            AxSummaryCacheScope::Document(42)
+        );
+    }
+
+    #[test]
+    fn enrichment_element_scope_changes_when_raw_name_changes() {
+        let attrs = BTreeMap::from([("id".to_string(), "pay".to_string())]);
+        let first = sample_element("#pay", 1.0);
+        let mut second = sample_element("#pay", 1.0);
+        second.name = vec![TaintSpan {
+            provenance: Provenance::Page,
+            text: "Pay now".to_string(),
+        }];
+
+        assert_ne!(
+            ax_summary_cache_scope_for_element("button", &attrs, &first, 42),
+            ax_summary_cache_scope_for_element("button", &attrs, &second, 43)
+        );
+    }
+
     #[test]
     fn top_ranked_indices_picks_highest_ranks_in_document_order() {
         let elements = vec![
@@ -6737,8 +7147,8 @@ mod tests {
             .collect();
 
         let mut calls: Vec<String> = Vec::new();
-        enrich_elements(&mut elements, MAX_AX_ENRICHED_ELEMENTS, |node_id| {
-            calls.push(node_id.0);
+        enrich_elements(&mut elements, MAX_AX_ENRICHED_ELEMENTS, |element| {
+            calls.push(element.node_id.0);
             async move { Ok::<_, TransportError>(Some(enriched_summary())) }
         })
         .await?;
@@ -6780,14 +7190,10 @@ mod tests {
         let element_count = elements.len();
 
         let mut calls = 0usize;
-        enrich_elements(
-            &mut elements,
-            MAX_AX_ENRICHED_ELEMENTS,
-            |_node_id: NodeId| {
-                calls += 1;
-                async move { Ok::<_, TransportError>(Some(enriched_summary())) }
-            },
-        )
+        enrich_elements(&mut elements, MAX_AX_ENRICHED_ELEMENTS, |_element| {
+            calls += 1;
+            async move { Ok::<_, TransportError>(Some(enriched_summary())) }
+        })
         .await?;
 
         // Under the cap, every element is enriched exactly once.
@@ -6812,7 +7218,7 @@ mod tests {
         enrich_elements(&mut elements, MAX_AX_ENRICHED_ELEMENTS, {
             let in_flight = in_flight.clone();
             let max_in_flight = max_in_flight.clone();
-            move |_node_id: NodeId| {
+            move |_element| {
                 let in_flight = in_flight.clone();
                 let max_in_flight = max_in_flight.clone();
                 async move {
