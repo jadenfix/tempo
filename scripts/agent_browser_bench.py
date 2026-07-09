@@ -1282,6 +1282,11 @@ def run_tempo(url: str, chrome: str, output_dir: Path) -> dict:
             if env.get("TEMPO_CDP_BENCH_TRUSTED_POLICY") == "1"
             else "event-grace"
         ),
+        "cdp_request_policy_transport": (
+            "direct-loopback"
+            if env.get("TEMPO_CDP_BENCH_TRUSTED_LOOPBACK_DIRECT") == "1"
+            else "policy-proxy"
+        ),
         "tempo_phase_timings_ms": timings,
         "browser_performance_metrics_available": bool(
             report.get("browser_performance_metrics_available")
@@ -2481,6 +2486,7 @@ def comparison_row(runner: str, runner_summary: dict, runner_metrics: list[dict]
             "cdp_compositor_stages",
             "cdp_headless_mode",
             "cdp_request_policy_grace",
+            "cdp_request_policy_transport",
         ):
             if field in first_metric:
                 row[field] = first_metric[field]

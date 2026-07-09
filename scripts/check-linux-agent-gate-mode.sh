@@ -85,8 +85,10 @@ require(
     and 'TEMPO_CDP_BENCH_NO_FORCED_COMPOSITOR=1' in text
     and 'TEMPO_CDP_BENCH_HEADLESS_FLAG=1' in text
     and 'TEMPO_CDP_BENCH_TRUSTED_POLICY=1' in text
+    and 'TEMPO_CDP_BENCH_TRUSTED_LOOPBACK_DIRECT=1' in text
     and 'trusted-parity)' in text
     and 'trusted-browser-default)' in text
+    and 'trusted-loopback-direct)' in text
     and 'agent-automation | all)' in text
     and 'TEMPO_CDP_BENCH_AGENT_AUTOMATION=1' in text
     and '-e "TEMPO_LINUX_AGENT_BENCH_PROFILE=${BENCH_PROFILE}"' in text,
@@ -119,6 +121,21 @@ require(
     'TEMPO_CDP_BENCH_TRUSTED_POLICY=1' in trusted_browser_default
     and 'TEMPO_CDP_BENCH_NO_FORCED_COMPOSITOR=1' in trusted_browser_default,
     'trusted-browser-default profile must combine trusted policy and browser-default compositor toggles',
+)
+trusted_loopback_direct_match = re.search(
+    r'^\s*trusted-loopback-direct\)\n(?P<body>.*?)\n\s*;;',
+    text,
+    flags=re.M | re.S,
+)
+require(
+    trusted_loopback_direct_match is not None,
+    'Linux agent gate must wire trusted-loopback-direct profile',
+)
+trusted_loopback_direct = trusted_loopback_direct_match.group('body')
+require(
+    'TEMPO_CDP_BENCH_TRUSTED_POLICY=1' in trusted_loopback_direct
+    and 'TEMPO_CDP_BENCH_TRUSTED_LOOPBACK_DIRECT=1' in trusted_loopback_direct,
+    'trusted-loopback-direct profile must combine trusted policy and direct loopback transport toggles',
 )
 require(
     'TEMPO_LINUX_AGENT_DOCKER_CACHE_BACKEND' in text
@@ -195,6 +212,7 @@ require(
     and 'trusted-policy' in workflow
     and 'trusted-parity' in workflow
     and 'trusted-browser-default' in workflow
+    and 'trusted-loopback-direct' in workflow
     and 'agent-automation' in workflow
     and 'TEMPO_LINUX_AGENT_BENCH_PROFILE:' in smoke_job
     and "inputs.benchmark_profile || 'default'" in smoke_job,

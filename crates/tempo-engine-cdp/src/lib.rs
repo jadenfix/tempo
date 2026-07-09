@@ -132,6 +132,11 @@ pub const TEMPO_CDP_BENCH_HEADLESS_FLAG_ENV: &str = "TEMPO_CDP_BENCH_HEADLESS_FL
 /// request-event grace floor only when Tempo already runs with allow-all URL
 /// policy plus proxy-only request enforcement.
 pub const TEMPO_CDP_BENCH_TRUSTED_POLICY_ENV: &str = "TEMPO_CDP_BENCH_TRUSTED_POLICY";
+/// Benchmark-only trusted-fixture transport profile. This bypasses Tempo's
+/// local policy proxy for allow-all loopback fixtures so we can measure the
+/// proxy/interception tax without changing default product enforcement.
+pub const TEMPO_CDP_BENCH_TRUSTED_LOOPBACK_DIRECT_ENV: &str =
+    "TEMPO_CDP_BENCH_TRUSTED_LOOPBACK_DIRECT";
 
 /// Driver-local counters for CDP observation work.
 ///
@@ -193,6 +198,10 @@ pub struct CdpConfig {
     /// Benchmark-only trusted-fixture mode that drains request-policy state
     /// without paying the event-grace floor after every action.
     bench_trusted_policy: bool,
+    /// Benchmark-only trusted-fixture transport mode that bypasses the local
+    /// policy proxy after the caller has explicitly selected allow-all
+    /// private-network access and proxy-only request enforcement.
+    bench_trusted_loopback_direct: bool,
 }
 
 impl CdpConfig {
@@ -323,6 +332,18 @@ impl CdpConfig {
         self
     }
 
+    pub fn with_bench_trusted_loopback_direct(mut self) -> Self {
+        self.bench_trusted_loopback_direct = true;
+        self
+    }
+
+    pub fn with_bench_trusted_loopback_direct_env_opt_in(mut self) -> Self {
+        if env_flag_enabled(TEMPO_CDP_BENCH_TRUSTED_LOOPBACK_DIRECT_ENV) {
+            self.bench_trusted_loopback_direct = true;
+        }
+        self
+    }
+
     pub fn with_allow_all_url_policy(mut self) -> Self {
         self.url_policy = UrlPolicy::allow_all();
         self
@@ -387,6 +408,12 @@ impl CdpConfig {
             && self.proxy_only_request_policy
             && self.url_policy.is_allow_all()
     }
+
+    fn uses_trusted_loopback_direct_request_policy(&self) -> bool {
+        self.bench_trusted_loopback_direct
+            && self.proxy_only_request_policy
+            && self.url_policy.is_allow_all()
+    }
 }
 
 impl Default for CdpConfig {
@@ -405,6 +432,7 @@ impl Default for CdpConfig {
             url_policy: UrlPolicy::block_private(),
             proxy_only_request_policy: false,
             bench_trusted_policy: false,
+            bench_trusted_loopback_direct: false,
         }
     }
 }
@@ -457,17 +485,23 @@ impl CdpTempoDriver {
         ));
         let blocked_request_url = Arc::new(Mutex::new(None));
         let request_policy_tracker = Arc::new(RequestPolicyTracker::new());
-        let policy_proxy = PolicyProxy::start(
-            browser_hardening_policy.clone(),
-            blocked_request_url.clone(),
-            request_policy_tracker.clone(),
-        )
-        .await?;
         let launch_config = config.clone();
+        let policy_proxy = if launch_config.uses_trusted_loopback_direct_request_policy() {
+            None
+        } else {
+            Some(
+                PolicyProxy::start(
+                    browser_hardening_policy.clone(),
+                    blocked_request_url.clone(),
+                    request_policy_tracker.clone(),
+                )
+                .await?,
+            )
+        };
         let mut config = config;
-        config
-            .args
-            .extend(default_cdp_launch_args(policy_proxy.addr));
+        config.args.extend(default_cdp_launch_args(
+            policy_proxy.as_ref().map(|proxy| proxy.addr),
+        ));
         let browser_config = config.browser_config(profile_dir.path())?;
         let (mut browser, mut handler) = Browser::launch(browser_config)
             .await
@@ -509,7 +543,7 @@ impl CdpTempoDriver {
             page: Some(page),
             handler_task,
             request_policy_task,
-            policy_proxy: Some(policy_proxy),
+            policy_proxy,
             browser_context_id: None,
             profile_dir: Some(profile_dir),
             launch_config,
@@ -1656,8 +1690,8 @@ async fn close_unmanaged_pages(browser: &Browser, managed_page: &Page) {
     }
 }
 
-fn default_cdp_launch_args(policy_proxy_addr: SocketAddr) -> Vec<String> {
-    vec![
+fn default_cdp_launch_args(policy_proxy_addr: Option<SocketAddr>) -> Vec<String> {
+    let mut args = vec![
         "--disable-gpu".to_string(),
         "--disable-dev-shm-usage".to_string(),
         "--disable-background-networking".to_string(),
@@ -1671,12 +1705,17 @@ fn default_cdp_launch_args(policy_proxy_addr: SocketAddr) -> Vec<String> {
         "--no-startup-window".to_string(),
         "--run-all-compositor-stages-before-draw".to_string(),
         "--use-mock-keychain".to_string(),
-        format!("--proxy-server=http://{policy_proxy_addr}"),
-        "--proxy-bypass-list=<-loopback>".to_string(),
         "--disable-quic".to_string(),
         "--dns-prefetch-disable".to_string(),
         "--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1".to_string(),
-    ]
+    ];
+    if let Some(policy_proxy_addr) = policy_proxy_addr {
+        args.push(format!("--proxy-server=http://{policy_proxy_addr}"));
+        args.push("--proxy-bypass-list=<-loopback>".to_string());
+    } else {
+        args.push("--no-proxy-server".to_string());
+    }
+    args
 }
 
 fn playwright_lifecycle_launch_args() -> Vec<String> {
@@ -5213,7 +5252,7 @@ mod tests {
 
     #[test]
     fn default_launch_args_keep_policy_proxy_and_headless_ci_parity() {
-        let args = default_cdp_launch_args(SocketAddr::from(([127, 0, 0, 1], 9001)));
+        let args = default_cdp_launch_args(Some(SocketAddr::from(([127, 0, 0, 1], 9001))));
 
         for expected in [
             "--disable-gpu",
@@ -5242,10 +5281,24 @@ mod tests {
     }
 
     #[test]
+    fn direct_loopback_launch_args_omit_policy_proxy_but_keep_dns_guard() {
+        let args = default_cdp_launch_args(None);
+
+        assert!(!args.iter().any(|arg| arg.starts_with("--proxy-server=")));
+        assert!(!args
+            .iter()
+            .any(|arg| arg == "--proxy-bypass-list=<-loopback>"));
+        assert!(args.iter().any(|arg| arg == "--no-proxy-server"));
+        assert!(args
+            .iter()
+            .any(|arg| arg == "--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1"));
+    }
+
+    #[test]
     fn no_forced_compositor_profile_omits_forced_compositor_arg(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempfile::tempdir()?;
-        let launch_args = default_cdp_launch_args(SocketAddr::from(([127, 0, 0, 1], 9001)));
+        let launch_args = default_cdp_launch_args(Some(SocketAddr::from(([127, 0, 0, 1], 9001))));
         let default_config = CdpConfig::default()
             .with_args(launch_args.clone())
             .browser_config(temp.path())?;
@@ -5425,6 +5478,37 @@ mod tests {
             .with_allow_all_url_policy()
             .with_proxy_only_request_policy();
         assert!(trusted_fixture.uses_trusted_policy_fast_settle());
+    }
+
+    #[test]
+    fn trusted_loopback_direct_requires_benchmark_allow_all_and_proxy_only() {
+        assert!(!CdpConfig::default().uses_trusted_loopback_direct_request_policy());
+        assert!(
+            !CdpConfig::default()
+                .with_bench_trusted_loopback_direct()
+                .uses_trusted_loopback_direct_request_policy(),
+            "benchmark opt-in alone must not bypass the policy proxy"
+        );
+        assert!(
+            !CdpConfig::default()
+                .with_bench_trusted_loopback_direct()
+                .with_allow_all_url_policy()
+                .uses_trusted_loopback_direct_request_policy(),
+            "allow-all without proxy-only must not bypass the policy proxy"
+        );
+        assert!(
+            !CdpConfig::default()
+                .with_bench_trusted_loopback_direct()
+                .with_proxy_only_request_policy()
+                .uses_trusted_loopback_direct_request_policy(),
+            "proxy-only without allow-all must not bypass the policy proxy"
+        );
+
+        let trusted_fixture = CdpConfig::default()
+            .with_bench_trusted_loopback_direct()
+            .with_allow_all_url_policy()
+            .with_proxy_only_request_policy();
+        assert!(trusted_fixture.uses_trusted_loopback_direct_request_policy());
     }
 
     #[test]

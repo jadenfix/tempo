@@ -744,6 +744,7 @@ def validate_metric(metric: dict[str, Any], iterations: int, output_dir: Path) -
             "cdp_desktop_integration": {"default", "suppressed"},
             "cdp_headless_mode": {"new-headless", "headless-flag"},
             "cdp_request_policy_grace": {"event-grace", "trusted-settled"},
+            "cdp_request_policy_transport": {"policy-proxy", "direct-loopback"},
         }
         for field, expected_values in launch_dimensions.items():
             value = metric.get(field)
@@ -755,11 +756,12 @@ def validate_metric(metric: dict[str, Any], iterations: int, output_dir: Path) -
             "trusted-policy",
             "trusted-parity",
             "trusted-browser-default",
+            "trusted-loopback-direct",
         }:
             raise ValidationError(
                 "tempo-cdp-agent trusted-settled request policy rows must use "
                 "cdp_benchmark_profile='trusted-policy', 'trusted-parity', "
-                "or 'trusted-browser-default'"
+                "'trusted-browser-default', or 'trusted-loopback-direct'"
             )
         if benchmark_profile == "trusted-parity":
             expected_trusted_parity = {
@@ -787,6 +789,23 @@ def validate_metric(metric: dict[str, Any], iterations: int, output_dir: Path) -
                         f"tempo-cdp-agent trusted-browser-default rows must set {field}="
                         f"{expected_value!r}, got {actual_value!r}"
                     )
+        if benchmark_profile == "trusted-loopback-direct":
+            expected_trusted_loopback_direct = {
+                "cdp_request_policy_grace": "trusted-settled",
+                "cdp_request_policy_transport": "direct-loopback",
+            }
+            for field, expected_value in expected_trusted_loopback_direct.items():
+                actual_value = metric.get(field)
+                if actual_value != expected_value:
+                    raise ValidationError(
+                        f"tempo-cdp-agent trusted-loopback-direct rows must set {field}="
+                        f"{expected_value!r}, got {actual_value!r}"
+                    )
+        elif metric.get("cdp_request_policy_transport") == "direct-loopback":
+            raise ValidationError(
+                "tempo-cdp-agent direct-loopback transport rows must use "
+                "cdp_benchmark_profile='trusted-loopback-direct'"
+            )
         compositor_stages = metric.get("cdp_compositor_stages")
         if compositor_stages is not None and compositor_stages not in {
             "forced-before-draw",
@@ -1655,6 +1674,7 @@ def comparison_row(
             "cdp_compositor_stages",
             "cdp_headless_mode",
             "cdp_request_policy_grace",
+            "cdp_request_policy_transport",
         ):
             if field in first_metric:
                 row[field] = first_metric[field]
@@ -2059,6 +2079,7 @@ def legacy_profile_status_markdown(
             "cdp_compositor_stages",
             "cdp_headless_mode",
             "cdp_request_policy_grace",
+            "cdp_request_policy_transport",
         ):
             removed = row.pop(field, None) is not None or removed
     if not removed:

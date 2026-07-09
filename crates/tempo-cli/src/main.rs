@@ -1126,7 +1126,8 @@ fn run_cdp_task(config: RunCdpTaskConfig) -> Result<RunCdpTaskReport, CliError> 
             .with_bench_suppress_desktop_env_opt_in()
             .with_bench_no_forced_compositor_env_opt_in()
             .with_bench_headless_flag_env_opt_in()
-            .with_bench_trusted_policy_env_opt_in();
+            .with_bench_trusted_policy_env_opt_in()
+            .with_bench_trusted_loopback_direct_env_opt_in();
         if let Some(chrome) = config.chrome {
             cdp_config = cdp_config.with_executable(chrome);
         }

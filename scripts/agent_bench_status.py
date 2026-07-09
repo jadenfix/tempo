@@ -69,6 +69,7 @@ def render_status_markdown(
         "compositor": {},
         "headless mode": {},
         "request policy settle": {},
+        "request policy transport": {},
     }
     dimension_fields = {
         "cdp_type_dispatch": "type dispatch",
@@ -78,6 +79,7 @@ def render_status_markdown(
         "cdp_compositor_stages": "compositor",
         "cdp_headless_mode": "headless mode",
         "cdp_request_policy_grace": "request policy settle",
+        "cdp_request_policy_transport": "request policy transport",
     }
     lifecycle_overrides: set[str] = set()
     for row in tempo_rows:

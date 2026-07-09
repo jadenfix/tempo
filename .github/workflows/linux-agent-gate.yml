@@ -28,6 +28,7 @@ on:
           - trusted-policy
           - trusted-parity
           - trusted-browser-default
+          - trusted-loopback-direct
           - agent-automation
           - all
         default: default
