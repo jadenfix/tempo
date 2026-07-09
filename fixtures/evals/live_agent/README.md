@@ -65,3 +65,8 @@ stable Markdown report for quick artifact review. It
 also emits Tempo `session-eval`, `replay`, `scorecard`, and `amdahl` artifacts
 from the real journal, external runner model-input/action traces, and
 `chrome-version.txt` so benchmark runs stay tied to durable agent evidence.
+For PR artifact comparisons, `scripts/compare-agent-bench-artifacts.py` reads
+two benchmark artifact directories, reports per-runner p95 deltas, and labels
+each delta as noise, regression, or improvement with configurable thresholds.
+Use `--fail-on-regression` when the comparison should fail CI or block PR
+readiness.
