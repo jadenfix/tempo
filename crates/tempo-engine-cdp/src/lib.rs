@@ -6910,7 +6910,12 @@ mod tests {
             remember_cacheable_ax_summary(&cache, key, &element, Some(&summary));
         }
 
-        assert!(cache.lock().expect("cache lock").len() <= MAX_AX_SUMMARY_CACHE_ENTRIES);
+        assert!(matches!(
+            cache
+                .lock()
+                .map(|cache| cache.len() <= MAX_AX_SUMMARY_CACHE_ENTRIES),
+            Ok(true)
+        ));
     }
 
     #[test]
