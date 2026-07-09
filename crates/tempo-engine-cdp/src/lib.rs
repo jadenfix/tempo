@@ -4653,10 +4653,9 @@ mod tests {
         let config = CdpConfig::default()
             .with_bench_suppress_desktop()
             .browser_config(temp.path())?;
-        let envs = config
-            .process_envs
-            .as_ref()
-            .expect("desktop suppression must set Chrome child env vars");
+        let Some(envs) = config.process_envs.as_ref() else {
+            return Err("desktop suppression must set Chrome child env vars".into());
+        };
 
         assert_eq!(envs.get("BROWSER").map(String::as_str), Some("true"));
         assert_eq!(
