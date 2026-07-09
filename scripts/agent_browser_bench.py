@@ -1144,6 +1144,8 @@ def run_cdp_action(cdp: object, action: dict) -> dict:
     if kind == "type":
         text = str(action.get("text", ""))
         cdp_click_at(cdp, x, y)
+        # CDP input-domain text insertion is closer to browser automation than
+        # direct DOM value assignment, but it is still not a keydown/keyup stream.
         cdp.send("Input.insertText", {"text": text})
         return {
             "applied": True,
@@ -1301,6 +1303,7 @@ def run_cdp_baseline(chrome: str, url: str, runner: str, snapshot: str | None) -
     browser_metrics: dict[str, int | float] = {}
     web_metrics: dict[str, int] = {}
     action_trace: list[dict] = []
+    checkout_actions = load_checkout_actions()
     final_oracle: dict = {"submitted": False, "source": runner}
     success = False
     with RssSampler(os.getpid()) as sampler:
@@ -1335,7 +1338,7 @@ def run_cdp_baseline(chrome: str, url: str, runner: str, snapshot: str | None) -
                             model_input = "\n".join(lines)
                         elif snapshot == "browser_use_dom":
                             model_input = str(page.evaluate(browser_use_snapshot_expression()))
-                        for index, action in enumerate(load_checkout_actions()):
+                        for index, action in enumerate(checkout_actions):
                             action_result = run_cdp_action(cdp, action)
                             action_trace.append(
                                 {
@@ -1370,7 +1373,7 @@ def run_cdp_baseline(chrome: str, url: str, runner: str, snapshot: str | None) -
         "final_oracle": final_oracle,
         "action_trace": action_trace,
         "wall_clock_ms": wall,
-        "step_count": 3,
+        "step_count": len(action_trace),
         "retry_count": 0,
         "failure_mode": failure_mode,
         "model_input_bytes": byte_count,

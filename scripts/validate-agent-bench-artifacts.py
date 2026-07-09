@@ -39,6 +39,11 @@ AGENT_STYLE_RUNNERS = {
     "external-browser-use-dom-loop",
     "real-browser-use",
 }
+PLAYWRIGHT_CDP_BASELINE_RUNNERS = {
+    "raw-chrome-cdp",
+    "synthetic-playwright-ax",
+    "synthetic-browser-use-dom",
+}
 
 BROWSER_PERFORMANCE_METRIC_NAMES = [
     "Documents",
@@ -480,13 +485,15 @@ def validate_metric(metric: dict[str, Any], iterations: int, output_dir: Path) -
                 f"{runner}.model_input_observations must be <= observations"
             )
 
-    if (
-        metric.get("adapter") == "playwright-cdp-session"
-        and metric.get("cdp_action_mode") != "input-events"
-    ):
-        raise ValidationError(
-            f"{runner}.cdp_action_mode must be input-events for Playwright CDP baselines"
-        )
+    if runner in PLAYWRIGHT_CDP_BASELINE_RUNNERS:
+        if metric.get("adapter") != "playwright-cdp-session":
+            raise ValidationError(
+                f"{runner}.adapter must be playwright-cdp-session for CDP baselines"
+            )
+        if metric.get("cdp_action_mode") != "input-events":
+            raise ValidationError(
+                f"{runner}.cdp_action_mode must be input-events for Playwright CDP baselines"
+            )
 
     if runner == "tempo-cdp-agent":
         if metric.get("tempo_engine") != "cdp":
