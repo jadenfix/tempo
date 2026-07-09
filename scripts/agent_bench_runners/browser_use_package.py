@@ -67,11 +67,19 @@ async def checkout_oracle_from_page(page: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {"submitted": False, "source": "real-browser-use"}
 
 
-async def cdp_performance_metrics(browser: Any) -> dict[str, Any]:
-    cdp_session = await maybe_await(browser.get_or_create_cdp_session(focus=False))
+async def browser_cdp_session(browser: Any) -> Any:
+    return await maybe_await(browser.get_or_create_cdp_session(focus=False))
+
+
+async def enable_cdp_performance(cdp_session: Any) -> None:
     cdp_client = cdp_session.cdp_client
     session_id = cdp_session.session_id
     await maybe_await(cdp_client.send.Performance.enable(session_id=session_id))
+
+
+async def cdp_performance_metrics(cdp_session: Any) -> dict[str, Any]:
+    cdp_client = cdp_session.cdp_client
+    session_id = cdp_session.session_id
     response = await maybe_await(cdp_client.send.Performance.getMetrics(session_id=session_id))
     metrics = response.get("metrics", []) if isinstance(response, dict) else []
     return {
@@ -304,6 +312,7 @@ async def run_browser_use(url: str, chrome: str, output: Path) -> dict[str, Any]
     final_status = ""
     started = time.monotonic()
     browser = None
+    cdp_session = None
     final_oracle: dict[str, Any] = {"submitted": False, "source": "real-browser-use"}
     browser_metrics: dict[str, Any] = {}
     web_metrics: dict[str, Any] = {}
@@ -321,6 +330,11 @@ async def run_browser_use(url: str, chrome: str, output: Path) -> dict[str, Any]
             )
             tools = Tools()
             await maybe_await(browser.start())
+            try:
+                cdp_session = await browser_cdp_session(browser)
+                await enable_cdp_performance(cdp_session)
+            except Exception:  # noqa: BLE001
+                cdp_session = None
             await maybe_await(browser.navigate_to(url))
 
             state, selector_map = await snapshot(browser)
@@ -368,7 +382,10 @@ async def run_browser_use(url: str, chrome: str, output: Path) -> dict[str, Any]
             success, final_status = await wait_for_done(page)
             final_oracle = await checkout_oracle_from_page(page)
             success = bool(final_oracle.get("submitted"))
-            browser_metrics = await cdp_performance_metrics(browser)
+            if cdp_session is None:
+                cdp_session = await browser_cdp_session(browser)
+                await enable_cdp_performance(cdp_session)
+            browser_metrics = await cdp_performance_metrics(cdp_session)
             web_metrics = await web_performance_metrics(page)
     except Exception as error:  # noqa: BLE001
         failure_mode = type(error).__name__

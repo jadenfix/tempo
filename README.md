@@ -121,9 +121,10 @@ not a hosted model credential or prompt contract. The harness writes:
   observations, while `max_compact_observation_*` records the same compact
   projection for every journaled observation so the report can compare compact
   agent-facing state separately from full audit JSON. `model_input_observations`
-  counts the subset supplied to planning/deciding;
-  post-action verification observations remain auditable and policy-relevant
-  without inflating model prompt cost. Multi-observation model loops report
+  counts the subset supplied to planning/deciding. Post-action verification
+  remains policy-relevant through the action diff and refreshed current origin;
+  when the driver cannot expose the current location cheaply, Tempo falls back
+  to a journaled audit-only observation. Multi-observation model loops report
   total model-facing input in `model_input_*` and their largest single
   observation in `max_observation_*`. Tempo also carries `tempo_phase_timings_ms`
   from `tempo-run.json`, including runtime setup, structured-probe, CDP driver

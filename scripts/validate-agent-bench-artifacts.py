@@ -478,8 +478,14 @@ def validate_browser_performance_metrics(metric: dict[str, Any]) -> None:
         value = metrics.get(name)
         if not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0:
             raise ValidationError(f"{runner}.browser_performance_metrics.{name} must be >= 0")
-    for field in BROWSER_PERFORMANCE_ROW_FIELDS.values():
+    for source_name, field in BROWSER_PERFORMANCE_ROW_FIELDS.items():
         require_int(metric, field)
+        expected = metric_value_to_int(source_name, metrics[source_name])
+        if int(metric[field]) != expected:
+            raise ValidationError(
+                f"{runner}.{field} must equal browser_performance_metrics.{source_name} "
+                f"converted to row units: expected {expected}, got {metric[field]}"
+            )
 
 
 def validate_web_performance_metrics(metric: dict[str, Any]) -> None:
@@ -489,12 +495,37 @@ def validate_web_performance_metrics(metric: dict[str, Any]) -> None:
     metrics = metric.get("web_performance_metrics")
     if not isinstance(metrics, dict) or not metrics:
         raise ValidationError(f"{runner}.web_performance_metrics must be populated")
+    names = set(str(name) for name in metrics)
+    expected_names = set(WEB_PERFORMANCE_ROW_FIELDS)
+    if names != expected_names:
+        missing = sorted(expected_names - names)
+        extra = sorted(names - expected_names)
+        raise ValidationError(
+            f"{runner}.web_performance_metrics key coverage mismatch: "
+            f"missing={missing} extra={extra}"
+        )
     for name in WEB_PERFORMANCE_ROW_FIELDS:
         value = metrics.get(name)
         if not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0:
             raise ValidationError(f"{runner}.web_performance_metrics.{name} must be >= 0")
-    for field in WEB_PERFORMANCE_ROW_FIELDS.values():
+    if int(metrics["first_contentful_paint_ms"]) <= 0:
+        raise ValidationError(
+            f"{runner}.web_performance_metrics.first_contentful_paint_ms must be > 0"
+        )
+    for source_name, field in WEB_PERFORMANCE_ROW_FIELDS.items():
         require_int(metric, field)
+        expected = metric_value_to_int(source_name, metrics[source_name])
+        if int(metric[field]) != expected:
+            raise ValidationError(
+                f"{runner}.{field} must equal web_performance_metrics.{source_name} "
+                f"converted to row units: expected {expected}, got {metric[field]}"
+            )
+
+
+def metric_value_to_int(name: str, value: int | float) -> int:
+    if name.endswith("Duration"):
+        return int(round(float(value) * 1000))
+    return int(round(float(value)))
 
 
 def validate_browser_performance_metric_key_coverage(metrics: list[dict[str, Any]]) -> None:

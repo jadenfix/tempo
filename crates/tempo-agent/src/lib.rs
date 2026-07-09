@@ -3001,6 +3001,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runner_refreshes_cross_origin_click_before_next_policy_gate() -> TestResult {
+        let root = unique_dir("runner-cross-origin-cheap-refresh")?;
+        remove_dir_if_exists(&root)?;
+        fs::create_dir_all(&root)?;
+        let journal_path = root.join("session.jsonl");
+        let destination = "https://blocked.example/after-click";
+        let task = DriverTask::new(
+            "https://example.com",
+            vec![
+                Action::Click {
+                    node: NodeId("submit".into()),
+                },
+                Action::Click {
+                    node: NodeId("submit".into()),
+                },
+            ],
+        );
+        let mut driver = FailingDriver::new(TransportFailurePoint::None)
+            .with_elements(vec![button("submit")])
+            .with_post_action_url(destination);
+        let runner = AgentRunner::new_plaintext_unsafe(
+            &journal_path,
+            AgentRunIds::new("run-cross-origin-refresh", "session-cross-origin-refresh"),
+        )
+        .with_origin_policy(OriginPolicy::new(vec![OriginRule::new(
+            Origin::parse("https://blocked.example")?,
+            SideEffect::Write,
+            OriginRuleMode::Block,
+        )]));
+
+        let report = runner.run_driver_task(&mut driver, &task).await?;
+
+        assert!(matches!(report.status, AgentRunStatus::PolicyDenied { .. }));
+        assert_eq!(report.actions_completed, 2);
+        assert_eq!(
+            driver.act_calls, 1,
+            "the second click should be denied before driver execution"
+        );
+        assert_eq!(
+            driver.observe_calls, 1,
+            "origin refresh should use window.location.href without a redundant full observe"
+        );
+        assert_eq!(report.steps[0].observation_budget, None);
+        assert_eq!(
+            report.steps[1].policy.origin.as_deref(),
+            Some("https://blocked.example:443")
+        );
+        assert!(report.steps[1].policy.denied);
+        assert_eq!(report.steps[1].policy.origin_rules_matched, 1);
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runner_records_post_action_audit_observation_when_location_script_unavailable(
+    ) -> TestResult {
+        let root = unique_dir("runner-post-action-observe-fallback")?;
+        remove_dir_if_exists(&root)?;
+        fs::create_dir_all(&root)?;
+        let journal_path = root.join("session.jsonl");
+        let task = DriverTask::new(
+            "https://example.com",
+            vec![Action::Click {
+                node: NodeId("submit".into()),
+            }],
+        );
+        let mut driver = FailingDriver::new(TransportFailurePoint::None)
+            .with_elements(vec![button("submit")])
+            .with_current_location_unavailable();
+        let runner = AgentRunner::new_plaintext_unsafe(
+            &journal_path,
+            AgentRunIds::new(
+                "run-post-action-observe-fallback",
+                "session-post-action-observe-fallback",
+            ),
+        );
+
+        let report = runner.run_driver_task(&mut driver, &task).await?;
+
+        assert_eq!(report.status, AgentRunStatus::Completed);
+        assert_eq!(report.observations, 2);
+        assert_eq!(report.model_input_observations, 1);
+        assert!(report.steps[0].observation_budget.is_some());
+        assert_eq!(
+            driver.observe_calls, 2,
+            "execute_action performs one pre-action observe and the fallback records one post-action observe"
+        );
+        let entries = read_journal_entries(&journal_path)?;
+        let observation_events = entries
+            .iter()
+            .filter(|entry| matches!(entry.event, JournalEvent::Observation { .. }))
+            .count();
+        assert_eq!(observation_events, 2);
+
+        remove_dir_if_exists(&root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn runner_writes_encrypted_journal_when_retention_policy_is_secure() -> TestResult {
         let root = unique_dir("runner-encrypted")?;
         remove_dir_if_exists(&root)?;
@@ -4971,6 +5071,8 @@ mod tests {
     struct FailingDriver {
         inner: TestDriver,
         failure: TransportFailurePoint,
+        current_location_available: bool,
+        post_action_url: Option<String>,
         goto_calls: usize,
         observe_calls: usize,
         act_calls: usize,
@@ -4981,6 +5083,8 @@ mod tests {
             Self {
                 inner: TestDriver::new(),
                 failure,
+                current_location_available: true,
+                post_action_url: None,
                 goto_calls: 0,
                 observe_calls: 0,
                 act_calls: 0,
@@ -4989,6 +5093,16 @@ mod tests {
 
         fn with_elements(mut self, elements: Vec<InteractiveElement>) -> Self {
             self.inner = self.inner.with_elements(elements);
+            self
+        }
+
+        fn with_current_location_unavailable(mut self) -> Self {
+            self.current_location_available = false;
+            self
+        }
+
+        fn with_post_action_url(mut self, url: impl Into<String>) -> Self {
+            self.post_action_url = Some(url.into());
             self
         }
     }
@@ -5027,7 +5141,13 @@ mod tests {
             if self.failure == TransportFailurePoint::Act {
                 return Err(TransportError::Other("act failed".into()));
             }
-            self.inner.act(action).await
+            let outcome = self.inner.act(action).await?;
+            if matches!(outcome, StepOutcome::Applied { .. })
+                && let Some(url) = self.post_action_url.clone()
+            {
+                let _ = self.inner.goto(&url).await?;
+            }
+            Ok(outcome)
         }
 
         async fn act_batch(&mut self, batch: &ActionBatch) -> Result<StepOutcome, TransportError> {
@@ -5035,7 +5155,13 @@ mod tests {
             if self.failure == TransportFailurePoint::Act {
                 return Err(TransportError::Other("act failed".into()));
             }
-            self.inner.act_batch(batch).await
+            let outcome = self.inner.act_batch(batch).await?;
+            if matches!(outcome, StepOutcome::Applied { .. })
+                && let Some(url) = self.post_action_url.clone()
+            {
+                let _ = self.inner.goto(&url).await?;
+            }
+            Ok(outcome)
         }
 
         async fn fork(&mut self) -> Result<Box<dyn DriverTrait>, tempo_driver::Unsupported> {
@@ -5051,7 +5177,9 @@ mod tests {
             expression: &str,
             await_promise: bool,
         ) -> Result<serde_json::Value, TransportError> {
-            if self.failure == TransportFailurePoint::PostActionObserve {
+            if self.failure == TransportFailurePoint::PostActionObserve
+                || !self.current_location_available
+            {
                 return Ok(serde_json::Value::Null);
             }
             self.inner.evaluate_script(expression, await_promise).await
