@@ -693,6 +693,10 @@ def expected_gap_report(metrics: list[dict[str, Any]], summary: dict[str, Any]) 
         ("steady_state_wall_clock_ms_p95", "lower_is_better", runners),
         ("max_rss_bytes_p95", "lower_is_better", runners),
         ("browser_rss_bytes_p95", "lower_is_better", runners),
+        ("max_pss_bytes_p95", "lower_is_better", runners),
+        ("browser_pss_bytes_p95", "lower_is_better", runners),
+        ("max_uss_bytes_p95", "lower_is_better", runners),
+        ("browser_uss_bytes_p95", "lower_is_better", runners),
         ("process_count_at_peak_p95", "lower_is_better", runners),
         ("browser_documents_p95", "lower_is_better", runners),
         ("browser_frames_p95", "lower_is_better", runners),
@@ -981,6 +985,30 @@ def comparison_row(
             [browser_rss_bytes(metric) for metric in runner_metrics],
             0.95,
         ),
+        "max_pss_bytes_p95": optional_metric_percentile(
+            runner_metrics,
+            "max_pss_bytes",
+            0.95,
+        ),
+        "browser_pss_bytes_p95": optional_percentile(
+            [
+                browser_memory_bytes(metric, "pss_at_peak_by_process_type_bytes")
+                for metric in runner_metrics
+            ],
+            0.95,
+        ),
+        "max_uss_bytes_p95": optional_metric_percentile(
+            runner_metrics,
+            "max_uss_bytes",
+            0.95,
+        ),
+        "browser_uss_bytes_p95": optional_percentile(
+            [
+                browser_memory_bytes(metric, "uss_at_peak_by_process_type_bytes")
+                for metric in runner_metrics
+            ],
+            0.95,
+        ),
         "process_count_at_peak_p95": percentile(
             [int(metric.get("process_count_at_peak", 0)) for metric in runner_metrics],
             0.95,
@@ -1033,7 +1061,11 @@ def runner_internal_wall_clock_ms_p95(runner_metrics: list[dict[str, Any]]) -> i
 
 
 def browser_rss_bytes(metric: dict[str, Any]) -> int:
-    by_type = metric.get("rss_at_peak_by_process_type_bytes", {})
+    return browser_memory_bytes(metric, "rss_at_peak_by_process_type_bytes")
+
+
+def browser_memory_bytes(metric: dict[str, Any], field: str) -> int:
+    by_type = metric.get(field, {})
     if not isinstance(by_type, dict):
         return 0
     return sum(
