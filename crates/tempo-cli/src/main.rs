@@ -1088,7 +1088,8 @@ fn run_cdp_task(config: RunCdpTaskConfig) -> Result<RunCdpTaskReport, CliError> 
         };
         let mut cdp_config = CdpConfig::default()
             .with_no_sandbox_env_opt_in()
-            .with_bench_playwright_lifecycle_env_opt_in();
+            .with_bench_playwright_lifecycle_env_opt_in()
+            .with_bench_insert_text_type_env_opt_in();
         if let Some(chrome) = config.chrome {
             cdp_config = cdp_config.with_executable(chrome);
         }

@@ -19,6 +19,7 @@ use chromiumoxide::cdp::browser_protocol::fetch::{
     ContinueRequestParams, EnableParams as FetchEnableParams, EventRequestPaused,
     FailRequestParams, RequestPattern, RequestStage,
 };
+use chromiumoxide::cdp::browser_protocol::input::InsertTextParams;
 use chromiumoxide::cdp::browser_protocol::network::ErrorReason;
 use chromiumoxide::cdp::browser_protocol::page::{
     CaptureScreenshotParams, CreateIsolatedWorldParams, NavigateParams,
@@ -100,6 +101,9 @@ pub const TEMPO_CDP_NO_SANDBOX_ENV: &str = "TEMPO_CDP_NO_SANDBOX";
 /// Playwright baselines with matching BFCache/RenderDocument behavior.
 pub const TEMPO_CDP_BENCH_PLAYWRIGHT_LIFECYCLE_ARGS_ENV: &str =
     "TEMPO_CDP_BENCH_PLAYWRIGHT_LIFECYCLE_ARGS";
+/// Benchmark-only text dispatch profile that uses CDP `Input.insertText`
+/// instead of per-character key events for semantic Type actions.
+pub const TEMPO_CDP_BENCH_INSERT_TEXT_TYPE_ENV: &str = "TEMPO_CDP_BENCH_INSERT_TEXT_TYPE";
 
 /// Launch configuration for the CDP fallback lane.
 #[derive(Clone, Debug)]
@@ -116,6 +120,9 @@ pub struct CdpConfig {
     /// Extra Chromium command-line arguments. Intended for narrowly scoped
     /// fixtures and platform integration knobs.
     pub args: Vec<String>,
+    /// Benchmark-only Type dispatch mode. Defaults off until event-semantics
+    /// tests prove it can become the normal semantic Type path.
+    pub bench_insert_text_type: bool,
 }
 
 impl CdpConfig {
@@ -165,6 +172,13 @@ impl CdpConfig {
         }
     }
 
+    pub fn with_bench_insert_text_type_env_opt_in(mut self) -> Self {
+        if env_flag_enabled(TEMPO_CDP_BENCH_INSERT_TEXT_TYPE_ENV) {
+            self.bench_insert_text_type = true;
+        }
+        self
+    }
+
     fn browser_config(&self, user_data_dir: &Path) -> Result<BrowserConfig, TransportError> {
         let mut builder = BrowserConfig::builder()
             .headless_mode(HeadlessMode::New)
@@ -207,6 +221,7 @@ impl Default for CdpConfig {
             no_sandbox: false,
             launch_timeout: Duration::from_secs(20),
             args: Vec::new(),
+            bench_insert_text_type: false,
         }
     }
 }
@@ -938,12 +953,21 @@ impl CdpTempoDriver {
             Action::Type { node, text } => {
                 let cursor = self.request_policy_cursor();
                 let text = text.clone();
+                let use_insert_text = self.launch_config.bench_insert_text_type;
+                let page = self.page()?.clone();
                 let grounding = self
                     .with_node_element(node, |element| {
                         let text = text.clone();
+                        let page = page.clone();
                         async move {
                             element.focus().await.map_err(map_cdp_error)?;
-                            element.type_str(&text).await.map_err(map_cdp_error)?;
+                            if use_insert_text {
+                                page.execute(InsertTextParams::new(text))
+                                    .await
+                                    .map_err(map_cdp_error)?;
+                            } else {
+                                element.type_str(&text).await.map_err(map_cdp_error)?;
+                            }
                             Ok(())
                         }
                     })
@@ -4399,6 +4423,16 @@ mod tests {
             .iter()
             .any(|arg| arg == "--disable-features=PaintHolding,RenderDocument"));
         assert!(!args.iter().any(|arg| is_policy_proxy_arg(arg)));
+    }
+
+    #[test]
+    fn default_type_dispatch_uses_key_events_until_bench_insert_text_opt_in() {
+        assert!(!CdpConfig::default().bench_insert_text_type);
+        let config = CdpConfig::default().with_bench_insert_text_type_env_opt_in();
+        assert_eq!(
+            config.bench_insert_text_type,
+            env_flag_enabled(TEMPO_CDP_BENCH_INSERT_TEXT_TYPE_ENV)
+        );
     }
 
     #[test]
