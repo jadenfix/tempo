@@ -127,8 +127,8 @@ def render_status_markdown(
             "",
             "## Browser Metrics",
             "",
-            "| Runner | Browser Perf | Internal Wall p95 | Browser RSS p95 | Max Proc p95 | Nodes p95 | Task p95 | JS Heap p95 | Model Obs p95 | Total Tokens p95 |",
-            "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+            "| Runner | Browser Perf | Internal Wall p95 | Browser RSS p95 | Browser Peak RSS p95 | Max Proc p95 | Nodes p95 | Task p95 | JS Heap p95 | Model Obs p95 | Total Tokens p95 |",
+            "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
     )
     for row in rows:
@@ -139,7 +139,7 @@ def render_status_markdown(
         if reason:
             perf = f"no ({reason})"
         lines.append(
-            "| {runner} | {perf} | {internal_wall} | {browser_rss} | {proc_count} | {nodes} | {task} | {heap} | {model_obs} | {total_tokens} |".format(
+            "| {runner} | {perf} | {internal_wall} | {browser_rss} | {browser_peak_rss} | {proc_count} | {nodes} | {task} | {heap} | {model_obs} | {total_tokens} |".format(
                 runner=row.get("runner", "-"),
                 perf=perf,
                 internal_wall=format_value(
@@ -147,6 +147,10 @@ def render_status_markdown(
                     row.get("runner_internal_wall_clock_ms_p95"),
                 ),
                 browser_rss=format_value("browser_rss_bytes_p95", row.get("browser_rss_bytes_p95")),
+                browser_peak_rss=format_value(
+                    "browser_peak_rss_bytes_p95",
+                    row.get("browser_peak_rss_bytes_p95"),
+                ),
                 proc_count=format_value(
                     "max_process_count_p95",
                     row.get("max_process_count_p95"),

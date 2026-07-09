@@ -762,10 +762,13 @@ def expected_gap_report(metrics: list[dict[str, Any]], summary: dict[str, Any]) 
         ("steady_state_wall_clock_ms_p95", "lower_is_better", runners),
         ("max_rss_bytes_p95", "lower_is_better", runners),
         ("browser_rss_bytes_p95", "lower_is_better", runners),
+        ("browser_peak_rss_bytes_p95", "lower_is_better", runners),
         ("max_pss_bytes_p95", "lower_is_better", runners),
         ("browser_pss_bytes_p95", "lower_is_better", runners),
+        ("browser_peak_pss_bytes_p95", "lower_is_better", runners),
         ("max_uss_bytes_p95", "lower_is_better", runners),
         ("browser_uss_bytes_p95", "lower_is_better", runners),
+        ("browser_peak_uss_bytes_p95", "lower_is_better", runners),
         ("max_process_count_p95", "lower_is_better", runners),
         ("browser_documents_p95", "lower_is_better", runners),
         ("browser_frames_p95", "lower_is_better", runners),
@@ -783,9 +786,6 @@ def expected_gap_report(metrics: list[dict[str, Any]], summary: dict[str, Any]) 
         ("web_dom_content_loaded_ms_p95", "lower_is_better", runners),
         ("web_load_event_ms_p95", "lower_is_better", runners),
         ("web_response_end_ms_p95", "lower_is_better", runners),
-        ("web_resource_count_p95", "lower_is_better", runners),
-        ("web_resource_transfer_size_bytes_p95", "lower_is_better", runners),
-        ("web_resource_decoded_body_size_bytes_p95", "lower_is_better", runners),
         ("web_first_paint_ms_p95", "lower_is_better", runners),
         ("web_first_contentful_paint_ms_p95", "lower_is_better", runners),
         ("web_long_task_count_p95", "lower_is_better", runners),
@@ -922,8 +922,10 @@ def expected_gap_report(metrics: list[dict[str, Any]], summary: dict[str, Any]) 
             "cpu_time_ms_p95 is row-level only until every runner uses the same resource-accounting scope.",
             "cold_start_wall_clock_ms reports iteration 1; steady_state_wall_clock_ms_p95 ranks iteration 2+ only and is omitted for one-iteration smoke artifacts.",
             "CDP Performance.getMetrics fields are required and ranked for every runner in this CDP-backed benchmark.",
-            "Known CDP runtime fields use stable browser_* category names; any additional numeric Performance.getMetrics values are preserved and ranked as browser_cdp_* categories.",
+            "Known CDP runtime fields use stable browser_* category names; any additional numeric Performance.getMetrics values are preserved as browser_cdp_* row fields but not ranked until promoted to the stable contract.",
             "web_* categories come from the browser Performance Timeline APIs and are required for every runner, including Tempo.",
+            "Web resource count and byte fields are preserved as parity/integrity metrics, not ranked lower-is-better optimization categories.",
+            "browser_rss_bytes_p95/browser_pss_bytes_p95/browser_uss_bytes_p95 report Chrome memory at the process-tree RSS/PSS/USS peak; browser_peak_* fields report Chrome process-type peaks even when they occur at a different sample.",
             "Positive deltas mean Tempo is behind that comparison target; negative deltas mean Tempo is ahead.",
         ],
         "rows": rows,
@@ -1049,6 +1051,13 @@ def comparison_row(
             [browser_rss_bytes(metric) for metric in runner_metrics],
             0.95,
         ),
+        "browser_peak_rss_bytes_p95": percentile(
+            [
+                browser_memory_bytes(metric, "peak_rss_by_process_type_bytes")
+                for metric in runner_metrics
+            ],
+            0.95,
+        ),
         "max_pss_bytes_p95": optional_metric_percentile(
             runner_metrics,
             "max_pss_bytes",
@@ -1061,6 +1070,13 @@ def comparison_row(
             ],
             0.95,
         ),
+        "browser_peak_pss_bytes_p95": optional_percentile(
+            [
+                browser_memory_bytes(metric, "peak_pss_by_process_type_bytes")
+                for metric in runner_metrics
+            ],
+            0.95,
+        ),
         "max_uss_bytes_p95": optional_metric_percentile(
             runner_metrics,
             "max_uss_bytes",
@@ -1069,6 +1085,13 @@ def comparison_row(
         "browser_uss_bytes_p95": optional_percentile(
             [
                 browser_memory_bytes(metric, "uss_at_peak_by_process_type_bytes")
+                for metric in runner_metrics
+            ],
+            0.95,
+        ),
+        "browser_peak_uss_bytes_p95": optional_percentile(
+            [
+                browser_memory_bytes(metric, "peak_uss_by_process_type_bytes")
                 for metric in runner_metrics
             ],
             0.95,
