@@ -496,20 +496,28 @@ def proc_descendants_from_children(root_pid: int) -> set[int] | None:
 
 
 def proc_children(pid: int) -> list[int] | None:
-    path = PROC_ROOT / str(pid) / "task" / str(pid) / "children"
-    try:
-        data = path.read_text(errors="ignore").strip()
-    except OSError:
+    task_dir = PROC_ROOT / str(pid) / "task"
+    if not task_dir.is_dir():
         return None
-    if not data:
-        return []
-    children = []
-    for part in data.split():
+
+    children = set()
+    readable_files = 0
+    for path in task_dir.glob("*/children"):
         try:
-            children.append(int(part))
-        except ValueError:
+            data = path.read_text(errors="ignore").strip()
+        except OSError:
             continue
-    return children
+        readable_files += 1
+        if not data:
+            continue
+        for part in data.split():
+            try:
+                children.add(int(part))
+            except ValueError:
+                continue
+    if readable_files == 0:
+        return None
+    return sorted(children)
 
 
 def subprocess_descendants(root_pid: int) -> set[int]:
