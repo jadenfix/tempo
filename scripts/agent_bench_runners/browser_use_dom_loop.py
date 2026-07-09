@@ -32,6 +32,67 @@ def launch_args() -> list[str]:
     return args
 
 
+def checkout_oracle_from_page(page: object) -> dict:
+    value = page.evaluate(
+        """() => {
+          const email = document.querySelector('#email')?.value || '';
+          const remember = document.querySelector('#remember')?.getAttribute('aria-checked') === 'true';
+          const status = document.querySelector('#status');
+          const statusText = status?.textContent?.trim() || '';
+          const statusDone = status?.dataset?.done === 'true';
+          return {
+            email_value: email,
+            email_matches: email === 'agent@example.com',
+            remember_checked: remember,
+            remember_checked_inferred: false,
+            status_text: statusText,
+            status_done: statusDone,
+            submitted: email === 'agent@example.com' && remember && statusDone && statusText === 'Order submitted',
+            source: 'external-browser-use-dom-loop'
+          };
+        }"""
+    )
+    return (
+        value
+        if isinstance(value, dict)
+        else {"submitted": False, "source": "external-browser-use-dom-loop"}
+    )
+
+
+def cdp_performance_metrics(page: object) -> dict:
+    cdp = page.context.new_cdp_session(page)
+    cdp.send("Performance.enable")
+    response = cdp.send("Performance.getMetrics")
+    metrics = response.get("metrics", []) if isinstance(response, dict) else []
+    wanted = {
+        "Documents",
+        "Frames",
+        "JSEventListeners",
+        "Nodes",
+        "LayoutCount",
+        "RecalcStyleCount",
+        "LayoutDuration",
+        "RecalcStyleDuration",
+        "ScriptDuration",
+        "TaskDuration",
+        "JSHeapUsedSize",
+        "JSHeapTotalSize",
+    }
+    return {
+        str(metric["name"]): metric["value"]
+        for metric in metrics
+        if isinstance(metric, dict)
+        and metric.get("name") in wanted
+        and isinstance(metric.get("value"), (int, float))
+    }
+
+
+def metric_value_to_int(name: str, value: int | float) -> int:
+    if name.endswith("Duration"):
+        return int(round(float(value) * 1000))
+    return int(round(float(value)))
+
+
 DOM_SERIALIZER = r"""
 (() => {
   const roleFor = (element) => {
@@ -102,6 +163,8 @@ def run(url: str, chrome: str, output: Path) -> dict:
     step_count = 0
     final_status = ""
     started = time.monotonic()
+    final_oracle: dict = {"submitted": False, "source": "external-browser-use-dom-loop"}
+    browser_metrics: dict = {}
     try:
         with sync_playwright() as playwright:
             with tempfile.TemporaryDirectory(prefix="tempo-browser-use-dom-profile-") as profile_dir:
@@ -141,7 +204,9 @@ def run(url: str, chrome: str, output: Path) -> dict:
                         timeout=5000,
                     )
                     final_status = page.locator("#status").inner_text(timeout=5000)
-                    success = page.locator("#status").get_attribute("data-done") == "true"
+                    final_oracle = checkout_oracle_from_page(page)
+                    success = bool(final_oracle.get("submitted"))
+                    browser_metrics = cdp_performance_metrics(page)
                 finally:
                     context.close()
     except Exception as error:  # noqa: BLE001
@@ -158,11 +223,13 @@ def run(url: str, chrome: str, output: Path) -> dict:
         {
             "actions": actions,
             "final_status": final_status,
+            "final_oracle": final_oracle,
             "success": success,
         },
     )
-    return {
+    report = {
         "success": success,
+        "final_oracle": final_oracle,
         "wall_clock_ms": wall_ms,
         "step_count": step_count,
         "retry_count": 0,
@@ -181,6 +248,18 @@ def run(url: str, chrome: str, output: Path) -> dict:
         "model_input_path": str(model_input_path),
         "action_trace_path": str(action_trace_path),
     }
+    report["browser_performance_metrics_available"] = True
+    report["browser_performance_metrics"] = browser_metrics
+    for source_name, field_name in {
+        "Nodes": "browser_nodes_p95",
+        "TaskDuration": "browser_task_duration_ms_p95",
+        "ScriptDuration": "browser_script_duration_ms_p95",
+        "LayoutDuration": "browser_layout_duration_ms_p95",
+        "JSHeapUsedSize": "browser_js_heap_used_bytes_p95",
+    }.items():
+        if source_name in browser_metrics:
+            report[field_name] = metric_value_to_int(source_name, browser_metrics[source_name])
+    return report
 
 
 def main() -> int:

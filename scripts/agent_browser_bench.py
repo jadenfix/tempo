@@ -9,6 +9,7 @@ import json
 import os
 import resource
 import shutil
+import sqlite3
 import socketserver
 import subprocess
 import sys
@@ -37,6 +38,29 @@ AGENT_STYLE_RUNNERS = {
     "external-browser-use-dom-loop",
     "real-browser-use",
 }
+BROWSER_PERFORMANCE_METRIC_NAMES = [
+    "Documents",
+    "Frames",
+    "JSEventListeners",
+    "Nodes",
+    "LayoutCount",
+    "RecalcStyleCount",
+    "LayoutDuration",
+    "RecalcStyleDuration",
+    "ScriptDuration",
+    "TaskDuration",
+    "JSHeapUsedSize",
+    "JSHeapTotalSize",
+]
+BROWSER_PERFORMANCE_ROW_FIELDS = {
+    "Nodes": "browser_nodes_p95",
+    "TaskDuration": "browser_task_duration_ms_p95",
+    "ScriptDuration": "browser_script_duration_ms_p95",
+    "LayoutDuration": "browser_layout_duration_ms_p95",
+    "JSHeapUsedSize": "browser_js_heap_used_bytes_p95",
+}
+CHECKOUT_ORACLE_EMAIL = "agent@example.com"
+CHECKOUT_ORACLE_STATUS = "Order submitted"
 
 
 class QuietHandler(http.server.SimpleHTTPRequestHandler):
@@ -386,6 +410,102 @@ def chrome_version(chrome: str) -> str:
     return completed.stdout.strip() or f"unknown: exit_{completed.returncode}"
 
 
+def load_checkout_actions() -> list[dict]:
+    value = json.loads(FIXTURE_ACTIONS.read_text())
+    if not isinstance(value, list):
+        raise RuntimeError(f"{FIXTURE_ACTIONS} must contain an action array")
+    return value
+
+
+def text_values(parts: object) -> list[str]:
+    if not isinstance(parts, list):
+        return []
+    values = []
+    for part in parts:
+        if isinstance(part, dict) and isinstance(part.get("text"), str):
+            values.append(part["text"])
+    return values
+
+
+def checkout_oracle_from_observation(observation: dict) -> dict:
+    email_ok = False
+    status_ok = False
+    for element in observation.get("elements", []):
+        if not isinstance(element, dict):
+            continue
+        role = element.get("role")
+        names = text_values(element.get("name"))
+        values = text_values(element.get("value"))
+        if role == "textbox" and "Email" in names and CHECKOUT_ORACLE_EMAIL in values:
+            email_ok = True
+        if role == "status" and CHECKOUT_ORACLE_STATUS in names:
+            status_ok = True
+    return {
+        "email_value": CHECKOUT_ORACLE_EMAIL if email_ok else "",
+        "email_matches": email_ok,
+        "remember_checked": True if status_ok else None,
+        "remember_checked_inferred": status_ok,
+        "status_text": CHECKOUT_ORACLE_STATUS if status_ok else "",
+        "status_done": status_ok,
+        "submitted": email_ok and status_ok,
+        "source": "tempo-final-observation",
+    }
+
+
+def tempo_final_oracle(journal: Path) -> dict:
+    try:
+        connection = sqlite3.connect(journal)
+        try:
+            rows = connection.execute(
+                "select event_json from journal_entries order by seq desc"
+            ).fetchall()
+        finally:
+            connection.close()
+    except sqlite3.Error as error:
+        return {
+            "submitted": False,
+            "source": "tempo-final-observation",
+            "error": type(error).__name__,
+        }
+    for (event_json,) in rows:
+        try:
+            event = json.loads(event_json)
+        except json.JSONDecodeError:
+            continue
+        if event.get("kind") == "observation" and isinstance(event.get("observation"), dict):
+            return checkout_oracle_from_observation(event["observation"])
+    return {
+        "submitted": False,
+        "source": "tempo-final-observation",
+        "error": "missing_final_observation",
+    }
+
+
+def checkout_oracle_from_page(page: object, source: str) -> dict:
+    value = page.evaluate(
+        """() => {
+          const email = document.querySelector('#email')?.value || '';
+          const remember = document.querySelector('#remember')?.getAttribute('aria-checked') === 'true';
+          const status = document.querySelector('#status');
+          const statusText = status?.textContent?.trim() || '';
+          const statusDone = status?.dataset?.done === 'true';
+          return {
+            email_value: email,
+            email_matches: email === 'agent@example.com',
+            remember_checked: remember,
+            remember_checked_inferred: false,
+            status_text: statusText,
+            status_done: statusDone,
+            submitted: email === 'agent@example.com' && remember && statusDone && statusText === 'Order submitted'
+          };
+        }"""
+    )
+    if not isinstance(value, dict):
+        value = {"submitted": False, "error": "oracle_eval_returned_non_object"}
+    value["source"] = source
+    return value
+
+
 def run_tempo(url: str, chrome: str, output_dir: Path) -> dict:
     journal = output_dir / "tempo-journal.sqlite"
     run_report = output_dir / "tempo-run.json"
@@ -426,12 +546,20 @@ def run_tempo(url: str, chrome: str, output_dir: Path) -> dict:
         report = json.loads(run_report.read_text())
     if "model_input_observations" not in report:
         raise RuntimeError("tempo run report missing model_input_observations")
-    success = report.get("status", {}).get("state") in {"completed", "already_complete"}
+    timings = report.get("timings_ms")
+    if not isinstance(timings, dict):
+        raise RuntimeError("tempo run report missing timings_ms")
+    final_oracle = tempo_final_oracle(journal)
+    success = (
+        report.get("status", {}).get("state") in {"completed", "already_complete"}
+        and final_oracle.get("submitted") is True
+    )
     metric = {
         "runner": "tempo-cdp-agent",
         "suite": SUITE,
         "case_id": CASE_ID,
         "success": bool(success),
+        "final_oracle": final_oracle,
         "wall_clock_ms": wall,
         "step_count": int(report.get("actions_completed", 0)),
         "retry_count": 0,
@@ -480,22 +608,101 @@ def run_tempo(url: str, chrome: str, output_dir: Path) -> dict:
         "run_report": str(run_report),
         "tempo_cli": cmd[0],
         "tempo_cli_prebuilt": cmd[0] != "cargo",
+        "tempo_engine": str(report.get("engine", "")),
+        "tempo_phase_timings_ms": timings,
+        "browser_performance_metrics_available": False,
+        "browser_performance_metrics_unavailable_reason": (
+            "tempo-cdp-agent does not yet export CDP Performance.getMetrics from the Rust driver"
+        ),
+        "browser_performance_metrics": {},
     }
+    for timing_name, metric_name in (
+        ("total_wall_clock_ms", "tempo_total_wall_clock_ms"),
+        ("runtime_setup_ms", "tempo_runtime_setup_ms"),
+        ("structured_probe_ms", "tempo_structured_probe_ms"),
+        ("driver_launch_ms", "tempo_driver_launch_ms"),
+        ("agent_run_ms", "tempo_agent_run_ms"),
+        ("driver_close_ms", "tempo_driver_close_ms"),
+    ):
+        if timing_name in timings:
+            metric[metric_name] = int(timings[timing_name])
     metric.update(usage)
     return metric
 
 
-def checkout_expression() -> str:
-    return """
-        (() => {
-          const email = document.querySelector('#email');
-          email.value = 'agent@example.com';
-          email.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: email.value }));
-          document.querySelector('#remember').click();
-          document.querySelector('#pay').click();
-          return document.querySelector('#status').dataset.done === 'true';
-        })()
-        """
+def cdp_performance_metrics(cdp: object) -> dict[str, int | float]:
+    cdp.send("Performance.enable")
+    response = cdp.send("Performance.getMetrics")
+    metrics = response.get("metrics", []) if isinstance(response, dict) else []
+    values = {}
+    for metric in metrics:
+        if not isinstance(metric, dict):
+            continue
+        name = metric.get("name")
+        value = metric.get("value")
+        if name in BROWSER_PERFORMANCE_METRIC_NAMES and isinstance(value, (int, float)):
+            values[str(name)] = value
+    return values
+
+
+def metric_value_to_int(name: str, value: int | float) -> int:
+    if name.endswith("Duration"):
+        return int(round(float(value) * 1000))
+    return int(round(float(value)))
+
+
+def apply_browser_performance_metrics(metric: dict, metrics: dict[str, int | float]) -> None:
+    metric["browser_performance_metrics_available"] = True
+    metric["browser_performance_metrics"] = dict(sorted(metrics.items()))
+    for source_name, field_name in BROWSER_PERFORMANCE_ROW_FIELDS.items():
+        if source_name in metrics:
+            metric[field_name] = metric_value_to_int(source_name, metrics[source_name])
+
+
+def run_cdp_action(cdp: object, action: dict) -> dict:
+    kind = action.get("kind")
+    selector = str(action.get("node", ""))
+    if kind == "type":
+        text = str(action.get("text", ""))
+        expression = """
+            (() => {
+              const selector = __SELECTOR__;
+              const text = __TEXT__;
+              const element = document.querySelector(selector);
+              if (!element) return { applied: false, reason: 'missing selector', selector };
+              element.focus();
+              element.value = text;
+              element.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: text }));
+              element.dispatchEvent(new Event('change', { bubbles: true }));
+              return { applied: true, kind: 'type', selector, text };
+            })()
+        """.replace("__SELECTOR__", json.dumps(selector)).replace("__TEXT__", json.dumps(text))
+    elif kind == "click":
+        expression = """
+            (() => {
+              const selector = __SELECTOR__;
+              const element = document.querySelector(selector);
+              if (!element) return { applied: false, reason: 'missing selector', selector };
+              element.click();
+              return { applied: true, kind: 'click', selector };
+            })()
+        """.replace("__SELECTOR__", json.dumps(selector))
+    else:
+        raise RuntimeError(f"unsupported checkout action: {action}")
+    result = cdp.send(
+        "Runtime.evaluate",
+        {
+            "expression": expression,
+            "returnByValue": True,
+            "awaitPromise": True,
+        },
+    )
+    if "exceptionDetails" in result:
+        raise RuntimeError(f"runtime exception: {result['exceptionDetails']}")
+    value = result.get("result", {}).get("value")
+    if not isinstance(value, dict) or value.get("applied") is not True:
+        raise RuntimeError(f"action failed: {value}")
+    return value
 
 
 def browser_use_snapshot_expression() -> str:
@@ -548,6 +755,9 @@ def run_cdp_baseline(chrome: str, url: str, runner: str, snapshot: str | None) -
     started = now_ms()
     failure_mode = None
     model_input = ""
+    browser_metrics: dict[str, int | float] = {}
+    action_trace: list[dict] = []
+    final_oracle: dict = {"submitted": False, "source": runner}
     success = False
     with RssSampler(os.getpid()) as sampler:
         try:
@@ -564,8 +774,9 @@ def run_cdp_baseline(chrome: str, url: str, runner: str, snapshot: str | None) -
                     )
                     try:
                         page = context.new_page()
-                        page.goto(url, wait_until="load", timeout=15000)
                         cdp = page.context.new_cdp_session(page)
+                        cdp.send("Performance.enable")
+                        page.goto(url, wait_until="load", timeout=15000)
                         cdp.send("Runtime.enable")
                         cdp.send("Accessibility.enable")
                         if snapshot == "ax":
@@ -579,21 +790,22 @@ def run_cdp_baseline(chrome: str, url: str, runner: str, snapshot: str | None) -
                             model_input = "\n".join(lines)
                         elif snapshot == "browser_use_dom":
                             model_input = str(page.evaluate(browser_use_snapshot_expression()))
-                        result = cdp.send(
-                            "Runtime.evaluate",
-                            {
-                                "expression": checkout_expression(),
-                                "returnByValue": True,
-                                "awaitPromise": True,
-                            },
-                        )
-                        if "exceptionDetails" in result:
-                            raise RuntimeError(f"runtime exception: {result['exceptionDetails']}")
-                        success = bool(
-                            page.evaluate(
-                                "document.querySelector('#status').dataset.done === 'true'"
+                        for index, action in enumerate(load_checkout_actions()):
+                            action_result = run_cdp_action(cdp, action)
+                            action_trace.append(
+                                {
+                                    "index": index,
+                                    "action": action,
+                                    "result": action_result,
+                                }
                             )
+                        page.wait_for_function(
+                            "document.querySelector('#status')?.dataset.done === 'true'",
+                            timeout=5000,
                         )
+                        final_oracle = checkout_oracle_from_page(page, runner)
+                        success = bool(final_oracle.get("submitted"))
+                        browser_metrics = cdp_performance_metrics(cdp)
                     finally:
                         context.close()
         except Exception as error:  # noqa: BLE001
@@ -608,6 +820,8 @@ def run_cdp_baseline(chrome: str, url: str, runner: str, snapshot: str | None) -
         "suite": SUITE,
         "case_id": CASE_ID,
         "success": success,
+        "final_oracle": final_oracle,
+        "action_trace": action_trace,
         "wall_clock_ms": wall,
         "step_count": 3,
         "retry_count": 0,
@@ -618,6 +832,7 @@ def run_cdp_baseline(chrome: str, url: str, runner: str, snapshot: str | None) -
         "model_input_observations": 1 if snapshot else 0,
         "adapter": "playwright-cdp-session",
     }
+    apply_browser_performance_metrics(metric, browser_metrics)
     if snapshot:
         metric.update(
             {
@@ -686,6 +901,7 @@ def run_external_baseline(
         "suite": SUITE,
         "case_id": CASE_ID,
         "success": success,
+        "final_oracle": report.get("final_oracle", {}),
         "wall_clock_ms": wall,
         "child_wall_clock_ms": int(report.get("wall_clock_ms", 0)),
         "step_count": int(report.get("step_count", 0)),
@@ -711,6 +927,21 @@ def run_external_baseline(
         metric["max_observation_bytes"] = int(report["max_observation_bytes"])
     if "max_observation_tokens" in report:
         metric["max_observation_tokens"] = int(report["max_observation_tokens"])
+    if "browser_performance_metrics_available" in report:
+        metric["browser_performance_metrics_available"] = bool(
+            report["browser_performance_metrics_available"]
+        )
+    if "browser_performance_metrics_unavailable_reason" in report:
+        metric["browser_performance_metrics_unavailable_reason"] = str(
+            report["browser_performance_metrics_unavailable_reason"]
+        )
+    if "browser_performance_metrics" in report:
+        metrics = report["browser_performance_metrics"]
+        if isinstance(metrics, dict):
+            metric["browser_performance_metrics"] = metrics
+    for field_name in BROWSER_PERFORMANCE_ROW_FIELDS.values():
+        if field_name in report:
+            metric[field_name] = int(report[field_name])
     for key in ("model_input_path", "action_trace_path"):
         if key in report:
             metric[key] = str(report[key])
@@ -807,6 +1038,7 @@ def summarize_metrics(metrics: list[dict]) -> dict:
             "max_rss_bytes": summarize_int_field(runner_metrics, "max_rss_bytes"),
             "model_input_bytes": summarize_int_field(runner_metrics, "model_input_bytes"),
             "model_input_tokens": summarize_int_field(runner_metrics, "model_input_tokens"),
+            "observations": summarize_int_field(runner_metrics, "observations"),
             "model_input_observations": summarize_int_field(
                 runner_metrics, "model_input_observations"
             ),
@@ -897,13 +1129,27 @@ def benchmark_gap_report(metrics: list[dict], summary: dict) -> dict:
     row_by_runner = {row["runner"]: row for row in rows}
     category_specs = [
         ("success_rate", "higher_is_better", runners),
+        ("cold_start_wall_clock_ms", "lower_is_better", runners),
         ("wall_clock_ms_p95", "lower_is_better", runners),
+        ("runner_internal_wall_clock_ms_p95", "lower_is_better", runners),
         ("steady_state_wall_clock_ms_p95", "lower_is_better", runners),
         ("max_rss_bytes_p95", "lower_is_better", runners),
+        ("browser_rss_bytes_p95", "lower_is_better", runners),
+        ("process_count_at_peak_p95", "lower_is_better", runners),
         ("retry_count_total", "lower_is_better", runners),
         ("failure_count", "lower_is_better", runners),
         (
             "model_input_tokens_p95",
+            "lower_is_better",
+            sorted(runner for runner in runners if runner in AGENT_STYLE_RUNNERS),
+        ),
+        (
+            "total_model_input_tokens_p95",
+            "lower_is_better",
+            sorted(runner for runner in runners if runner in AGENT_STYLE_RUNNERS),
+        ),
+        (
+            "model_input_observations_p95",
             "lower_is_better",
             sorted(runner for runner in runners if runner in AGENT_STYLE_RUNNERS),
         ),
@@ -1007,9 +1253,10 @@ def benchmark_gap_report(metrics: list[dict], summary: dict) -> dict:
             "raw-chrome-cdp is excluded from observation-token and agent-step categories because it has no model-facing observation stream.",
             "model_input_tokens_p95 ranks the full model-facing stream each runner presents to an agent; compact_observation_tokens_p95 ranks the largest compact observation projection per run.",
             "max_observation_tokens_p95 keeps Tempo's full durable structured audit JSON cost visible and is intentionally separate from compact model-facing projections.",
-            "max_observation_tokens_p95 compares the largest single durable observation per run; total_model_input_tokens_p95 is row-level only until every agent runner records true total stream cost.",
+            "max_observation_tokens_p95 compares the largest single durable observation per run; total_model_input_tokens_p95 ranks the cumulative model-facing stream where runners expose it.",
             "cpu_time_ms_p95 is row-level only until every runner uses the same resource-accounting scope.",
             "cold_start_wall_clock_ms reports iteration 1; steady_state_wall_clock_ms_p95 ranks iteration 2+ only and is omitted for one-iteration smoke artifacts.",
+            "browser_performance_metrics_available stays row-level so Tempo's missing CDP Performance.getMetrics export is visible instead of silently excluded from browser-runtime metrics.",
             "Positive deltas mean Tempo is behind that comparison target; negative deltas mean Tempo is ahead.",
         ],
         "rows": rows,
@@ -1025,10 +1272,81 @@ def comparison_row(runner: str, runner_summary: dict, runner_metrics: list[dict]
         "success_rate": float(runner_summary["success_rate"]),
         "failure_count": sum(int(count) for count in runner_summary["failure_modes"].values()),
         "retry_count_total": int(runner_summary["retry_count_total"]),
+        "browser_performance_metrics_available": all(
+            bool(metric.get("browser_performance_metrics_available"))
+            for metric in runner_metrics
+        ),
+        "browser_performance_metrics_unavailable_reason": first_unavailable_browser_metrics_reason(
+            runner_metrics
+        ),
         "wall_clock_ms_p50": int(runner_summary["wall_clock_ms"]["p50"]),
         "wall_clock_ms_p95": int(runner_summary["wall_clock_ms"]["p95"]),
+        "runner_internal_wall_clock_ms_p95": runner_internal_wall_clock_ms_p95(runner_metrics),
         "cold_start_wall_clock_ms": cold_start_wall_clock_ms(runner_metrics),
         "steady_state_wall_clock_ms_p95": steady_state_wall_clock_ms_p95(runner_metrics),
+        "tempo_total_wall_clock_ms_p95": optional_metric_percentile(
+            runner_metrics,
+            "tempo_total_wall_clock_ms",
+            0.95,
+        ),
+        "tempo_runtime_setup_ms_p95": optional_metric_percentile(
+            runner_metrics,
+            "tempo_runtime_setup_ms",
+            0.95,
+        ),
+        "tempo_structured_probe_ms_p95": optional_metric_percentile(
+            runner_metrics,
+            "tempo_structured_probe_ms",
+            0.95,
+        ),
+        "tempo_driver_launch_ms_p95": optional_metric_percentile(
+            runner_metrics,
+            "tempo_driver_launch_ms",
+            0.95,
+        ),
+        "tempo_agent_run_ms_p95": optional_metric_percentile(
+            runner_metrics,
+            "tempo_agent_run_ms",
+            0.95,
+        ),
+        "tempo_driver_close_ms_p95": optional_metric_percentile(
+            runner_metrics,
+            "tempo_driver_close_ms",
+            0.95,
+        ),
+        "browser_nodes_p95": optional_metric_percentile(
+            runner_metrics,
+            "browser_nodes_p95",
+            0.95,
+        ),
+        "browser_task_duration_ms_p95": optional_metric_percentile(
+            runner_metrics,
+            "browser_task_duration_ms_p95",
+            0.95,
+        ),
+        "browser_script_duration_ms_p95": optional_metric_percentile(
+            runner_metrics,
+            "browser_script_duration_ms_p95",
+            0.95,
+        ),
+        "browser_layout_duration_ms_p95": optional_metric_percentile(
+            runner_metrics,
+            "browser_layout_duration_ms_p95",
+            0.95,
+        ),
+        "browser_js_heap_used_bytes_p95": optional_metric_percentile(
+            runner_metrics,
+            "browser_js_heap_used_bytes_p95",
+            0.95,
+        ),
+        "browser_rss_bytes_p95": percentile(
+            [browser_rss_bytes(metric) for metric in runner_metrics],
+            0.95,
+        ),
+        "process_count_at_peak_p95": percentile(
+            [int(metric.get("process_count_at_peak", 0)) for metric in runner_metrics],
+            0.95,
+        ),
         "cpu_time_ms_p95": percentile(
             [
                 int(metric.get("cpu_user_ms", 0)) + int(metric.get("cpu_system_ms", 0))
@@ -1059,6 +1377,10 @@ def comparison_row(runner: str, runner_summary: dict, runner_metrics: list[dict]
             ],
             0.95,
         ),
+        "observations_p95": int(runner_summary["observations"]["p95"])
+        if "observations" in runner_summary
+        else None,
+        "model_input_observations_p95": int(runner_summary["model_input_observations"]["p95"]),
         "step_count_p95": int(runner_summary["step_count"]["p95"]),
     }
 
@@ -1082,6 +1404,51 @@ def steady_state_wall_clock_ms_p95(runner_metrics: list[dict]) -> int | None:
         if int(metric.get("iteration", 0)) > 1
     ]
     return percentile(values, 0.95) if values else None
+
+
+def runner_internal_wall_clock_ms_p95(runner_metrics: list[dict]) -> int | None:
+    values = []
+    for metric in runner_metrics:
+        if "tempo_total_wall_clock_ms" in metric:
+            values.append(int(metric["tempo_total_wall_clock_ms"]))
+        elif "child_wall_clock_ms" in metric:
+            values.append(int(metric["child_wall_clock_ms"]))
+        else:
+            values.append(int(metric["wall_clock_ms"]))
+    return percentile(values, 0.95) if values else None
+
+
+def browser_rss_bytes(metric: dict) -> int:
+    by_type = metric.get("rss_at_peak_by_process_type_bytes", {})
+    if not isinstance(by_type, dict):
+        return 0
+    return sum(
+        int(value)
+        for key, value in by_type.items()
+        if isinstance(key, str) and (key == "chrome-browser" or key.startswith("chrome-"))
+    )
+
+
+def optional_metric_percentile(
+    runner_metrics: list[dict],
+    field: str,
+    pct: float,
+) -> int | None:
+    if not runner_metrics or any(field not in metric for metric in runner_metrics):
+        return None
+    return percentile([int(metric[field]) for metric in runner_metrics], pct)
+
+
+def first_unavailable_browser_metrics_reason(runner_metrics: list[dict]) -> str | None:
+    for metric in runner_metrics:
+        if not metric.get("browser_performance_metrics_available"):
+            return str(
+                metric.get(
+                    "browser_performance_metrics_unavailable_reason",
+                    "browser performance metrics unavailable",
+                )
+            )
+    return None
 
 
 def category_sort_key(entry: dict, direction: str) -> tuple[float, str]:

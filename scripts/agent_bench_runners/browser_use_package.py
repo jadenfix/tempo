@@ -36,6 +36,73 @@ def launch_args() -> list[str]:
     return args
 
 
+async def checkout_oracle_from_page(page: Any) -> dict[str, Any]:
+    value = await maybe_await(
+        page.evaluate(
+            """() => JSON.stringify({
+              email_value: document.querySelector('#email')?.value || '',
+              email_matches: (document.querySelector('#email')?.value || '') === 'agent@example.com',
+              remember_checked: document.querySelector('#remember')?.getAttribute('aria-checked') === 'true',
+              remember_checked_inferred: false,
+              status_text: document.querySelector('#status')?.textContent?.trim() || '',
+              status_done: document.querySelector('#status')?.dataset?.done === 'true',
+              submitted:
+                (document.querySelector('#email')?.value || '') === 'agent@example.com' &&
+                document.querySelector('#remember')?.getAttribute('aria-checked') === 'true' &&
+                document.querySelector('#status')?.dataset?.done === 'true' &&
+                (document.querySelector('#status')?.textContent?.trim() || '') === 'Order submitted',
+              source: 'real-browser-use'
+            })"""
+        )
+    )
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return {
+                "submitted": False,
+                "source": "real-browser-use",
+                "error": "oracle_eval_returned_non_json",
+            }
+    return value if isinstance(value, dict) else {"submitted": False, "source": "real-browser-use"}
+
+
+async def cdp_performance_metrics(browser: Any) -> dict[str, Any]:
+    cdp_session = await maybe_await(browser.get_or_create_cdp_session(focus=False))
+    cdp_client = cdp_session.cdp_client
+    session_id = cdp_session.session_id
+    await maybe_await(cdp_client.send.Performance.enable(session_id=session_id))
+    response = await maybe_await(cdp_client.send.Performance.getMetrics(session_id=session_id))
+    metrics = response.get("metrics", []) if isinstance(response, dict) else []
+    wanted = {
+        "Documents",
+        "Frames",
+        "JSEventListeners",
+        "Nodes",
+        "LayoutCount",
+        "RecalcStyleCount",
+        "LayoutDuration",
+        "RecalcStyleDuration",
+        "ScriptDuration",
+        "TaskDuration",
+        "JSHeapUsedSize",
+        "JSHeapTotalSize",
+    }
+    return {
+        str(metric["name"]): metric["value"]
+        for metric in metrics
+        if isinstance(metric, dict)
+        and metric.get("name") in wanted
+        and isinstance(metric.get("value"), (int, float))
+    }
+
+
+def metric_value_to_int(name: str, value: int | float) -> int:
+    if name.endswith("Duration"):
+        return int(round(float(value) * 1000))
+    return int(round(float(value)))
+
+
 async def maybe_await(value: Any) -> Any:
     if inspect.isawaitable(value):
         return await value
@@ -137,6 +204,8 @@ async def run_browser_use(url: str, chrome: str, output: Path) -> dict[str, Any]
     final_status = ""
     started = time.monotonic()
     browser = None
+    final_oracle: dict[str, Any] = {"submitted": False, "source": "real-browser-use"}
+    browser_metrics: dict[str, Any] = {}
     try:
         with tempfile.TemporaryDirectory(prefix="tempo-real-browser-use-profile-") as profile_dir:
             browser = BrowserSession(
@@ -196,6 +265,9 @@ async def run_browser_use(url: str, chrome: str, output: Path) -> dict[str, Any]
             if page is None:
                 raise RuntimeError("browser-use did not expose a current page")
             success, final_status = await wait_for_done(page)
+            final_oracle = await checkout_oracle_from_page(page)
+            success = bool(final_oracle.get("submitted"))
+            browser_metrics = await cdp_performance_metrics(browser)
     except Exception as error:  # noqa: BLE001
         failure_mode = type(error).__name__
         actions.append({"kind": "error", "error": str(error)})
@@ -219,11 +291,13 @@ async def run_browser_use(url: str, chrome: str, output: Path) -> dict[str, Any]
             "actions": actions,
             "adapter": "browser-use.package",
             "final_status": final_status,
+            "final_oracle": final_oracle,
             "success": success,
         },
     )
-    return {
+    report = {
         "success": success,
+        "final_oracle": final_oracle,
         "wall_clock_ms": wall_ms,
         "step_count": step_count,
         "retry_count": 0,
@@ -241,6 +315,18 @@ async def run_browser_use(url: str, chrome: str, output: Path) -> dict[str, Any]
         "model_input_path": str(model_input_path),
         "action_trace_path": str(action_trace_path),
     }
+    report["browser_performance_metrics_available"] = True
+    report["browser_performance_metrics"] = browser_metrics
+    for source_name, field_name in {
+        "Nodes": "browser_nodes_p95",
+        "TaskDuration": "browser_task_duration_ms_p95",
+        "ScriptDuration": "browser_script_duration_ms_p95",
+        "LayoutDuration": "browser_layout_duration_ms_p95",
+        "JSHeapUsedSize": "browser_js_heap_used_bytes_p95",
+    }.items():
+        if source_name in browser_metrics:
+            report[field_name] = metric_value_to_int(source_name, browser_metrics[source_name])
+    return report
 
 
 def run(url: str, chrome: str, output: Path) -> dict[str, Any]:

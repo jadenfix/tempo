@@ -125,7 +125,16 @@ not a hosted model credential or prompt contract. The harness writes:
   post-action verification observations remain auditable and policy-relevant
   without inflating model prompt cost. Multi-observation model loops report
   total model-facing input in `model_input_*` and their largest single
-  observation in `max_observation_*`.
+  observation in `max_observation_*`. Tempo also carries `tempo_phase_timings_ms`
+  from `tempo-run.json`, including runtime setup, structured-probe, CDP driver
+  launch, agent-run, and driver-close timing, so cold-start and steady-state
+  gaps are attributable to concrete phases. Every runner must also pass the
+  shared checkout oracle (`agent@example.com`, remembered checkout, submitted
+  status) and raw/synthetic CDP lanes replay the same `checkout-actions.json`
+  action plan one step at a time rather than using a one-shot DOM mutation.
+  Browser runtime metrics from CDP `Performance.getMetrics` are captured for
+  Playwright/CDP/browser-use-style lanes; Tempo's missing Rust-driver export is
+  recorded explicitly instead of excluding that gap.
 - `agent-browser-bench-summary.json` with per-runner run count, success rate,
   failure-mode counts, retry totals, and p50/p95/max stats for latency, CPU,
   RSS, step count, and model-facing bytes/tokens. `--smoke` runs one iteration;
@@ -134,13 +143,15 @@ not a hosted model credential or prompt contract. The harness writes:
   Tempo deltas against raw Chrome plus Playwright, browser-use-style, and real
   browser-use package agent baselines. It calls out gaps to close for success
   rate, all-iteration latency, steady-state iteration 2+ latency, RSS, retries,
-  failures, model-facing tokens, compact-observation tokens, largest durable
-  observation tokens, and agent step count. Cold-start iteration-1 latency is
-  reported row-level so first-run cost stays visible. CPU is reported row-level
-  until every runner uses the same resource-accounting scope. Raw Chrome is
+  failures, internal child/CLI wall time, browser RSS, process fanout,
+  model-facing tokens, total model-facing tokens, model-facing observation
+  count, compact-observation tokens, largest durable observation tokens, and
+  agent step count. Cold-start iteration-1 latency is ranked so first-run cost
+  stays visible. CPU is reported row-level until every runner uses the same
+  resource-accounting scope. Raw Chrome is
   deliberately excluded from observation-token and agent-step categories because
-  it has no model-facing observation stream. Row-level total model-input token
-  p95 is included only where the runner reports a comparable model-facing stream
+  it has no model-facing observation stream. Total model-input token p95 is
+  ranked for agent-style runners that report a comparable model-facing stream
   cost.
 - `agent-browser-bench-status.md` with the same rankings rendered as a stable
   Markdown status table, so CI artifacts show which categories Tempo already

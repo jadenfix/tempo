@@ -120,6 +120,106 @@ def render_status_markdown(
             )
         )
 
+    lines.extend(
+        [
+            "",
+            "## Browser Metrics",
+            "",
+            "| Runner | Browser Perf | Internal Wall p95 | Browser RSS p95 | Proc Count p95 | Nodes p95 | Task p95 | JS Heap p95 | Model Obs p95 | Total Tokens p95 |",
+            "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        ]
+    )
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        perf = "yes" if row.get("browser_performance_metrics_available") else "no"
+        reason = row.get("browser_performance_metrics_unavailable_reason")
+        if reason:
+            perf = f"no ({reason})"
+        lines.append(
+            "| {runner} | {perf} | {internal_wall} | {browser_rss} | {proc_count} | {nodes} | {task} | {heap} | {model_obs} | {total_tokens} |".format(
+                runner=row.get("runner", "-"),
+                perf=perf,
+                internal_wall=format_value(
+                    "runner_internal_wall_clock_ms_p95",
+                    row.get("runner_internal_wall_clock_ms_p95"),
+                ),
+                browser_rss=format_value("browser_rss_bytes_p95", row.get("browser_rss_bytes_p95")),
+                proc_count=format_value(
+                    "process_count_at_peak_p95",
+                    row.get("process_count_at_peak_p95"),
+                ),
+                nodes=format_value("browser_nodes_p95", row.get("browser_nodes_p95")),
+                task=format_value(
+                    "browser_task_duration_ms_p95",
+                    row.get("browser_task_duration_ms_p95"),
+                ),
+                heap=format_value(
+                    "browser_js_heap_used_bytes_p95",
+                    row.get("browser_js_heap_used_bytes_p95"),
+                ),
+                model_obs=format_value(
+                    "model_input_observations_p95",
+                    row.get("model_input_observations_p95"),
+                ),
+                total_tokens=format_value(
+                    "total_model_input_tokens_p95",
+                    row.get("total_model_input_tokens_p95"),
+                ),
+            )
+        )
+
+    tempo_row = next(
+        (row for row in rows if isinstance(row, dict) and row.get("runner") == "tempo-cdp-agent"),
+        None,
+    )
+    if isinstance(tempo_row, dict) and tempo_row.get("tempo_total_wall_clock_ms_p95") is not None:
+        lines.extend(
+            [
+                "",
+                "## Tempo Phase Timings",
+                "",
+                "| Phase | p95 |",
+                "| --- | ---: |",
+                "| CLI report total | {value} |".format(
+                    value=format_value(
+                        "tempo_total_wall_clock_ms_p95",
+                        tempo_row.get("tempo_total_wall_clock_ms_p95"),
+                    )
+                ),
+                "| Runtime setup | {value} |".format(
+                    value=format_value(
+                        "tempo_runtime_setup_ms_p95",
+                        tempo_row.get("tempo_runtime_setup_ms_p95"),
+                    )
+                ),
+                "| Structured probe | {value} |".format(
+                    value=format_value(
+                        "tempo_structured_probe_ms_p95",
+                        tempo_row.get("tempo_structured_probe_ms_p95"),
+                    )
+                ),
+                "| Driver launch | {value} |".format(
+                    value=format_value(
+                        "tempo_driver_launch_ms_p95",
+                        tempo_row.get("tempo_driver_launch_ms_p95"),
+                    )
+                ),
+                "| Agent run | {value} |".format(
+                    value=format_value(
+                        "tempo_agent_run_ms_p95",
+                        tempo_row.get("tempo_agent_run_ms_p95"),
+                    )
+                ),
+                "| Driver close | {value} |".format(
+                    value=format_value(
+                        "tempo_driver_close_ms_p95",
+                        tempo_row.get("tempo_driver_close_ms_p95"),
+                    )
+                ),
+            ]
+        )
+
     notes = gap_report.get("comparison_notes", [])
     if isinstance(notes, list) and notes:
         lines.extend(["", "## Notes", ""])
