@@ -4439,11 +4439,10 @@ mod tests {
     }
 
     #[test]
-    fn browser_config_leaves_request_interception_to_tempo_policy_layer() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let config = CdpConfig::default()
-            .browser_config(temp.path())
-            .expect("browser config");
+    fn browser_config_leaves_request_interception_to_tempo_policy_layer(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let config = CdpConfig::default().browser_config(temp.path())?;
 
         assert!(
             !config.request_intercept,
@@ -4453,6 +4452,7 @@ mod tests {
             !config.cache_enabled,
             "launch keeps the previous no-cache behavior while avoiding duplicate Fetch.enable"
         );
+        Ok(())
     }
 
     #[test]
