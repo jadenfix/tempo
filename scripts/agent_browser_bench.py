@@ -978,6 +978,18 @@ def tempo_final_oracle_from_report(report: dict, journal: Path) -> dict:
     }
 
 
+def cdp_launch_profile(
+    *,
+    has_agent_automation_profile: bool,
+    has_playwright_lifecycle: bool,
+) -> str:
+    if has_agent_automation_profile:
+        return "agent-automation"
+    if has_playwright_lifecycle:
+        return "playwright-lifecycle"
+    return "tempo-default"
+
+
 def checkout_oracle_from_page(page: object, source: str) -> dict:
     value = page.evaluate(
         """() => {
@@ -1073,6 +1085,7 @@ def run_tempo(url: str, chrome: str, output_dir: Path) -> dict:
         report.get("status", {}).get("state") in {"completed", "already_complete"}
         and final_oracle.get("submitted") is True
     )
+    has_agent_automation_profile = env.get("TEMPO_CDP_BENCH_AGENT_AUTOMATION") == "1"
     has_playwright_lifecycle = env.get("TEMPO_CDP_BENCH_PLAYWRIGHT_LIFECYCLE_ARGS") == "1"
     lifecycle_overrides = (
         ["BackForwardCache", "PaintHolding", "RenderDocument"]
@@ -1135,8 +1148,10 @@ def run_tempo(url: str, chrome: str, output_dir: Path) -> dict:
         "tempo_cli_prebuilt": cmd[0] != "cargo",
         "tempo_engine": str(report.get("engine", "")),
         "tempo_runtime_flavor": runtime_flavor,
-        "cdp_launch_profile": (
-            "playwright-lifecycle" if has_playwright_lifecycle else "tempo-default"
+        "cdp_benchmark_profile": env.get("TEMPO_LINUX_AGENT_BENCH_PROFILE", "default"),
+        "cdp_launch_profile": cdp_launch_profile(
+            has_agent_automation_profile=has_agent_automation_profile,
+            has_playwright_lifecycle=has_playwright_lifecycle,
         ),
         "cdp_browser_profile_contract": (
             "automation-default" if has_playwright_lifecycle else "browser-realistic"
@@ -2316,6 +2331,7 @@ def comparison_row(runner: str, runner_summary: dict, runner_metrics: list[dict]
             row.pop(field, None)
     if "cdp_browser_profile_contract" in first_metric:
         for field in (
+            "cdp_benchmark_profile",
             "cdp_browser_profile_contract",
             "cdp_launch_profile",
             "cdp_lifecycle_overrides",
