@@ -2766,11 +2766,30 @@ where
 /// selects which elements become set-of-marks labels, so enrichment covers the
 /// same elements that survive into the compiled observation.
 fn top_ranked_indices(elements: &[InteractiveElement], limit: usize) -> Vec<usize> {
-    let mut indices: Vec<usize> = (0..elements.len()).collect();
-    // Stable sort by rank descending; equal ranks retain their original
-    // (document) order, matching the marks compositor's selection.
-    indices.sort_by(|&a, &b| elements[b].rank.total_cmp(&elements[a].rank));
-    indices.truncate(limit);
+    if limit == 0 || elements.is_empty() {
+        return Vec::new();
+    }
+
+    let mut indices: Vec<usize> = Vec::with_capacity(limit.min(elements.len()));
+    for index in 0..elements.len() {
+        let insertion = indices.iter().position(|&selected| {
+            elements[index]
+                .rank
+                .total_cmp(&elements[selected].rank)
+                .is_gt()
+        });
+        match insertion {
+            Some(position) => {
+                indices.insert(position, index);
+                if indices.len() > limit {
+                    indices.pop();
+                }
+            }
+            None if indices.len() < limit => indices.push(index),
+            None => {}
+        }
+    }
+
     // Enrich in document order for deterministic, natural traversal.
     indices.sort_unstable();
     indices
@@ -5913,6 +5932,7 @@ mod tests {
         // Cap of 2: the two highest ranks are the three 0.9s; ties break by
         // document order, so indices 1 and 2 win and are returned in order.
         assert_eq!(top_ranked_indices(&elements, 2), vec![1, 2]);
+        assert_eq!(top_ranked_indices(&elements, 0), Vec::<usize>::new());
         // A cap at/above the length keeps every index in document order.
         assert_eq!(top_ranked_indices(&elements, 16), vec![0, 1, 2, 3, 4]);
     }
