@@ -30,6 +30,7 @@ EXPECTED_RUNNERS = {
 }
 TEMPO_RUNNER = "tempo-cdp-agent"
 RAW_CHROME_RUNNER = "raw-chrome-cdp"
+TEMPO_RUNTIME_FLAVORS = {"multi-thread", "current-thread"}
 AGENT_STYLE_RUNNERS = {
     "tempo-cdp-agent",
     "synthetic-playwright-ax",
@@ -483,6 +484,11 @@ def validate_metric(metric: dict[str, Any], iterations: int, output_dir: Path) -
         if metric.get("tempo_engine") != "cdp":
             raise ValidationError(
                 f"tempo-cdp-agent.tempo_engine must be cdp, got {metric.get('tempo_engine')!r}"
+            )
+        if metric.get("tempo_runtime_flavor") not in TEMPO_RUNTIME_FLAVORS:
+            raise ValidationError(
+                "tempo-cdp-agent.tempo_runtime_flavor must be one of "
+                f"{sorted(TEMPO_RUNTIME_FLAVORS)}, got {metric.get('tempo_runtime_flavor')!r}"
             )
         require_int(metric, "max_compact_observation_bytes", positive=True)
         require_int(metric, "max_compact_observation_tokens", positive=True)
@@ -1474,6 +1480,10 @@ def validate_tempo_derived_artifacts(
     run_report = load_json(run_report_path)
     if run_report.get("engine") != "cdp":
         raise ValidationError("tempo-run.json engine must be cdp")
+    if run_report.get("runtime_flavor") not in TEMPO_RUNTIME_FLAVORS:
+        raise ValidationError("tempo-run.json runtime_flavor must be multi-thread or current-thread")
+    if run_report.get("runtime_flavor") != tempo.get("tempo_runtime_flavor"):
+        raise ValidationError("tempo-run.json runtime_flavor must match tempo metric")
     if run_report.get("status", {}).get("state") != "completed":
         raise ValidationError("tempo-run.json status.state must be completed")
     if int(run_report.get("actions_completed", -1)) != int(tempo["step_count"]):

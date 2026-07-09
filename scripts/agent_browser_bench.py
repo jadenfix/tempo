@@ -39,6 +39,7 @@ AGENT_STYLE_RUNNERS = {
     "external-browser-use-dom-loop",
     "real-browser-use",
 }
+TEMPO_RUNTIME_FLAVORS = {"multi-thread", "current-thread"}
 BROWSER_PERFORMANCE_METRIC_NAMES = [
     "Documents",
     "Frames",
@@ -934,6 +935,9 @@ def run_tempo(url: str, chrome: str, output_dir: Path) -> dict:
     web_metrics = report.get("web_performance_metrics")
     if not isinstance(web_metrics, dict):
         raise RuntimeError("tempo run report missing web_performance_metrics")
+    runtime_flavor = report.get("runtime_flavor")
+    if runtime_flavor not in TEMPO_RUNTIME_FLAVORS:
+        raise RuntimeError(f"tempo run report missing valid runtime_flavor: {runtime_flavor!r}")
     final_oracle = tempo_final_oracle_from_report(report, journal)
     success = (
         report.get("status", {}).get("state") in {"completed", "already_complete"}
@@ -994,7 +998,7 @@ def run_tempo(url: str, chrome: str, output_dir: Path) -> dict:
         "tempo_cli": cmd[0],
         "tempo_cli_prebuilt": cmd[0] != "cargo",
         "tempo_engine": str(report.get("engine", "")),
-        "tempo_runtime_flavor": str(report.get("runtime_flavor", "")),
+        "tempo_runtime_flavor": runtime_flavor,
         "cdp_launch_profile": (
             "playwright-lifecycle"
             if env.get("TEMPO_CDP_BENCH_PLAYWRIGHT_LIFECYCLE_ARGS") == "1"
