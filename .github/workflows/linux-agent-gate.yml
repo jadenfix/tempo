@@ -17,6 +17,7 @@ on:
         options:
           - default
           - lifecycle
+          - key-events
           - insert-text
           - no-incognito
           - cache

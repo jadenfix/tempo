@@ -28,5 +28,7 @@ if [[ "$MODE" == "--full" ]]; then
 else
   cargo test -p tempo-engine-cdp live_cdp_driver_navigates_observes_acts_and_screenshots -- --nocapture --test-threads=1
   cargo test -p tempo-engine-cdp live_cdp_driver_passes_conformance_v2 -- --nocapture --test-threads=1
+  cargo test -p tempo-engine-cdp live_cdp_type_action_preserves_editor_semantics -- --nocapture --test-threads=1
+  cargo test -p tempo-engine-cdp live_cdp_insert_text_type_action_preserves_editor_semantics -- --nocapture --test-threads=1
 fi
 cargo test -p tempo-agent live_cdp -- --nocapture --test-threads=1

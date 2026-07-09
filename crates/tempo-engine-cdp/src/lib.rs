@@ -101,9 +101,14 @@ pub const TEMPO_CDP_NO_SANDBOX_ENV: &str = "TEMPO_CDP_NO_SANDBOX";
 /// Playwright baselines with matching BFCache/RenderDocument behavior.
 pub const TEMPO_CDP_BENCH_PLAYWRIGHT_LIFECYCLE_ARGS_ENV: &str =
     "TEMPO_CDP_BENCH_PLAYWRIGHT_LIFECYCLE_ARGS";
-/// Benchmark-only text dispatch profile that uses CDP `Input.insertText`
-/// instead of per-character key events for semantic Type actions.
+/// Backwards-compatible benchmark opt-in for CDP `Input.insertText`.
+///
+/// `Input.insertText` is now the default semantic Type dispatch path, so this
+/// env var is retained as a no-op for older benchmark profile wiring.
 pub const TEMPO_CDP_BENCH_INSERT_TEXT_TYPE_ENV: &str = "TEMPO_CDP_BENCH_INSERT_TEXT_TYPE";
+/// Benchmark-only compatibility profile that uses per-character key events for
+/// semantic Type actions instead of the default CDP `Input.insertText` path.
+pub const TEMPO_CDP_KEY_EVENT_TYPE_ENV: &str = "TEMPO_CDP_KEY_EVENT_TYPE";
 /// Benchmark-only launch profile that uses the fresh temp `user_data_dir`
 /// directly instead of adding an incognito BrowserContext on top.
 pub const TEMPO_CDP_BENCH_NO_INCOGNITO_ENV: &str = "TEMPO_CDP_BENCH_NO_INCOGNITO";
@@ -153,9 +158,10 @@ pub struct CdpConfig {
     /// Extra Chromium command-line arguments. Intended for narrowly scoped
     /// fixtures and platform integration knobs.
     pub args: Vec<String>,
-    /// Benchmark-only Type dispatch mode. Defaults off until event-semantics
-    /// tests prove it can become the normal semantic Type path.
-    pub bench_insert_text_type: bool,
+    /// Semantic Type dispatch mode. Defaults to CDP `Input.insertText` because
+    /// it preserves input/editable mutation semantics without synthesizing a
+    /// per-character keyboard event stream.
+    pub insert_text_type: bool,
     /// Benchmark-only launch mode that relies on Tempo's fresh temp profile for
     /// storage isolation instead of wrapping it in an incognito context.
     pub bench_no_incognito: bool,
@@ -228,9 +234,11 @@ impl CdpConfig {
         }
     }
 
-    pub fn with_bench_insert_text_type_env_opt_in(mut self) -> Self {
-        if env_flag_enabled(TEMPO_CDP_BENCH_INSERT_TEXT_TYPE_ENV) {
-            self.bench_insert_text_type = true;
+    pub fn with_type_dispatch_env_opt_ins(mut self) -> Self {
+        if env_flag_enabled(TEMPO_CDP_KEY_EVENT_TYPE_ENV) {
+            self.insert_text_type = false;
+        } else if env_flag_enabled(TEMPO_CDP_BENCH_INSERT_TEXT_TYPE_ENV) {
+            self.insert_text_type = true;
         }
         self
     }
@@ -362,7 +370,7 @@ impl Default for CdpConfig {
             no_sandbox: false,
             launch_timeout: Duration::from_secs(20),
             args: Vec::new(),
-            bench_insert_text_type: false,
+            insert_text_type: true,
             bench_no_incognito: false,
             bench_enable_cache: false,
             bench_suppress_desktop: false,
@@ -1210,7 +1218,7 @@ impl CdpTempoDriver {
             Action::Type { node, text } => {
                 let cursor = self.request_policy_cursor();
                 let text = text.clone();
-                let use_insert_text = self.launch_config.bench_insert_text_type;
+                let use_insert_text = self.launch_config.insert_text_type;
                 let page = self.page()?.clone();
                 let grounding = self
                     .with_node_element(node, |element| {
@@ -5112,12 +5120,12 @@ mod tests {
     }
 
     #[test]
-    fn default_type_dispatch_uses_key_events_until_bench_insert_text_opt_in() {
-        assert!(!CdpConfig::default().bench_insert_text_type);
-        let config = CdpConfig::default().with_bench_insert_text_type_env_opt_in();
+    fn default_type_dispatch_uses_insert_text_unless_key_events_opt_in() {
+        assert!(CdpConfig::default().insert_text_type);
+        let config = CdpConfig::default().with_type_dispatch_env_opt_ins();
         assert_eq!(
-            config.bench_insert_text_type,
-            env_flag_enabled(TEMPO_CDP_BENCH_INSERT_TEXT_TYPE_ENV)
+            config.insert_text_type,
+            !env_flag_enabled(TEMPO_CDP_KEY_EVENT_TYPE_ENV)
         );
     }
 
@@ -6172,12 +6180,12 @@ mod tests {
 
     async fn assert_live_cdp_type_action_semantics(
         chrome: &str,
-        bench_insert_text_type: bool,
+        insert_text_type: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut config = CdpConfig::default()
             .with_executable(chrome)
             .with_no_sandbox_env_opt_in();
-        config.bench_insert_text_type = bench_insert_text_type;
+        config.insert_text_type = insert_text_type;
         let mut driver = CdpTempoDriver::launch_with(config).await?;
         driver
             .evaluate_script(
@@ -6235,7 +6243,7 @@ mod tests {
             "ordinary input type=email should accept Type text"
         );
         assert_trusted_input_events(&after_email, "email");
-        assert_document_key_events(&after_email, bench_insert_text_type);
+        assert_document_key_events(&after_email, insert_text_type);
 
         let _ = driver
             .act(&Action::Type {
@@ -6354,7 +6362,7 @@ mod tests {
         }
     }
 
-    fn assert_document_key_events(value: &serde_json::Value, bench_insert_text_type: bool) {
+    fn assert_document_key_events(value: &serde_json::Value, insert_text_type: bool) {
         let document_key_events = events(value).iter().filter(|event| {
             event.get("scope").and_then(serde_json::Value::as_str) == Some("document")
                 && matches!(
@@ -6363,7 +6371,7 @@ mod tests {
                 )
         });
         let document_key_event_count = document_key_events.count();
-        if bench_insert_text_type {
+        if insert_text_type {
             assert_eq!(
                 document_key_event_count, 0,
                 "Input.insertText Type dispatch should not synthesize document keydown/keyup events"

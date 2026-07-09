@@ -29,7 +29,9 @@ async fn run() -> Result<(), String> {
     {
         config = config.with_executable(chrome);
     }
-    config = config.with_no_sandbox_env_opt_in();
+    config = config
+        .with_no_sandbox_env_opt_in()
+        .with_type_dispatch_env_opt_ins();
 
     let mut driver = CdpTempoDriver::launch_with(config)
         .await

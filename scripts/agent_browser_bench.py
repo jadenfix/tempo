@@ -1158,7 +1158,7 @@ def run_tempo(url: str, chrome: str, output_dir: Path) -> dict:
         ),
         "cdp_lifecycle_overrides": lifecycle_overrides,
         "cdp_type_dispatch": (
-            "insert-text" if env.get("TEMPO_CDP_BENCH_INSERT_TEXT_TYPE") == "1" else "key-events"
+            "key-events" if env.get("TEMPO_CDP_KEY_EVENT_TYPE") == "1" else "insert-text"
         ),
         "cdp_browser_context": (
             "fresh-profile"
