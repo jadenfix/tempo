@@ -203,7 +203,6 @@ impl CdpConfig {
             .launch_timeout(self.launch_timeout)
             .request_timeout(CDP_REQUEST_TIMEOUT)
             .user_data_dir(user_data_dir)
-            .enable_request_intercept()
             .disable_cache();
         if !self.bench_no_incognito {
             builder = builder.incognito();
@@ -4433,6 +4432,23 @@ mod tests {
         assert!(args
             .iter()
             .any(|arg| arg == "--proxy-server=http://127.0.0.1:9001"));
+    }
+
+    #[test]
+    fn browser_config_leaves_request_interception_to_tempo_policy_layer() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = CdpConfig::default()
+            .browser_config(temp.path())
+            .expect("browser config");
+
+        assert!(
+            !config.request_intercept,
+            "Tempo installs Fetch interception explicitly in install_request_policy"
+        );
+        assert!(
+            !config.cache_enabled,
+            "launch keeps the previous no-cache behavior while avoiding duplicate Fetch.enable"
+        );
     }
 
     #[test]
