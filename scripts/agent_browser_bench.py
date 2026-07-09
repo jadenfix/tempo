@@ -624,9 +624,12 @@ def tempo_final_oracle_from_report(report: dict, journal: Path) -> dict:
     if isinstance(final_page_state, dict):
         final_page_state.setdefault("source", "tempo-final-page-state")
         return final_page_state
-    fallback = tempo_final_oracle(journal)
-    fallback["error"] = "missing_final_page_state"
-    return fallback
+    return {
+        "submitted": False,
+        "source": "tempo-final-page-state",
+        "error": "missing_final_page_state",
+        "journal": str(journal),
+    }
 
 
 def checkout_oracle_from_page(page: object, source: str) -> dict:
