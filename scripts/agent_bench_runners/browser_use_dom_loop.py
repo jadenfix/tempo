@@ -32,6 +32,97 @@ def launch_args() -> list[str]:
     return args
 
 
+def checkout_oracle_from_page(page: object) -> dict:
+    value = page.evaluate(
+        """() => {
+          const email = document.querySelector('#email')?.value || '';
+          const remember = document.querySelector('#remember')?.getAttribute('aria-checked') === 'true';
+          const status = document.querySelector('#status');
+          const statusText = status?.textContent?.trim() || '';
+          const statusDone = status?.dataset?.done === 'true';
+          return {
+            email_value: email,
+            email_matches: email === 'agent@example.com',
+            remember_checked: remember,
+            remember_checked_inferred: false,
+            status_text: statusText,
+            status_done: statusDone,
+            submitted: email === 'agent@example.com' && remember && statusDone && statusText === 'Order submitted',
+            source: 'external-browser-use-dom-loop'
+          };
+        }"""
+    )
+    return (
+        value
+        if isinstance(value, dict)
+        else {"submitted": False, "source": "external-browser-use-dom-loop"}
+    )
+
+
+def cdp_performance_metrics(page: object) -> dict:
+    cdp = page.context.new_cdp_session(page)
+    cdp.send("Performance.enable")
+    response = cdp.send("Performance.getMetrics")
+    metrics = response.get("metrics", []) if isinstance(response, dict) else []
+    return {
+        str(metric["name"]): metric["value"]
+        for metric in metrics
+        if isinstance(metric, dict)
+        and isinstance(metric.get("name"), str)
+        and isinstance(metric.get("value"), (int, float))
+        and not isinstance(metric.get("value"), bool)
+    }
+
+
+def metric_value_to_int(name: str, value: int | float) -> int:
+    if name.endswith("Duration"):
+        return int(round(float(value) * 1000))
+    return int(round(float(value)))
+
+
+WEB_PERFORMANCE_ROW_FIELDS = {
+    "navigation_duration_ms": "web_navigation_duration_ms_p95",
+    "dom_content_loaded_ms": "web_dom_content_loaded_ms_p95",
+    "load_event_ms": "web_load_event_ms_p95",
+    "response_end_ms": "web_response_end_ms_p95",
+    "resource_count": "web_resource_count_p95",
+    "resource_transfer_size_bytes": "web_resource_transfer_size_bytes_p95",
+    "resource_decoded_body_size_bytes": "web_resource_decoded_body_size_bytes_p95",
+    "first_paint_ms": "web_first_paint_ms_p95",
+    "first_contentful_paint_ms": "web_first_contentful_paint_ms_p95",
+    "long_task_count": "web_long_task_count_p95",
+    "long_task_duration_ms": "web_long_task_duration_ms_p95",
+}
+
+
+def web_performance_metrics(page: object) -> dict:
+    value = page.evaluate(
+        """() => {
+          const n = (value) => Number.isFinite(Number(value)) ? Math.round(Number(value)) : 0;
+          const nav = performance.getEntriesByType('navigation')[0] || null;
+          const resources = performance.getEntriesByType('resource');
+          const paints = {};
+          for (const entry of performance.getEntriesByType('paint')) paints[entry.name] = n(entry.startTime);
+          const longTasks = performance.getEntriesByType('longtask');
+          const sum = (entries, field) => entries.reduce((total, entry) => total + n(entry[field]), 0);
+          return {
+            navigation_duration_ms: nav ? n(nav.duration) : 0,
+            dom_content_loaded_ms: nav ? n(nav.domContentLoadedEventEnd) : 0,
+            load_event_ms: nav ? n(nav.loadEventEnd) : 0,
+            response_end_ms: nav ? n(nav.responseEnd) : 0,
+            resource_count: resources.length,
+            resource_transfer_size_bytes: sum(resources, 'transferSize'),
+            resource_decoded_body_size_bytes: sum(resources, 'decodedBodySize'),
+            first_paint_ms: paints['first-paint'] || 0,
+            first_contentful_paint_ms: paints['first-contentful-paint'] || 0,
+            long_task_count: longTasks.length,
+            long_task_duration_ms: sum(longTasks, 'duration')
+          };
+        }"""
+    )
+    return value if isinstance(value, dict) else {}
+
+
 DOM_SERIALIZER = r"""
 (() => {
   const roleFor = (element) => {
@@ -102,6 +193,9 @@ def run(url: str, chrome: str, output: Path) -> dict:
     step_count = 0
     final_status = ""
     started = time.monotonic()
+    final_oracle: dict = {"submitted": False, "source": "external-browser-use-dom-loop"}
+    browser_metrics: dict = {}
+    web_metrics: dict = {}
     try:
         with sync_playwright() as playwright:
             with tempfile.TemporaryDirectory(prefix="tempo-browser-use-dom-profile-") as profile_dir:
@@ -141,7 +235,10 @@ def run(url: str, chrome: str, output: Path) -> dict:
                         timeout=5000,
                     )
                     final_status = page.locator("#status").inner_text(timeout=5000)
-                    success = page.locator("#status").get_attribute("data-done") == "true"
+                    final_oracle = checkout_oracle_from_page(page)
+                    success = bool(final_oracle.get("submitted"))
+                    browser_metrics = cdp_performance_metrics(page)
+                    web_metrics = web_performance_metrics(page)
                 finally:
                     context.close()
     except Exception as error:  # noqa: BLE001
@@ -158,11 +255,13 @@ def run(url: str, chrome: str, output: Path) -> dict:
         {
             "actions": actions,
             "final_status": final_status,
+            "final_oracle": final_oracle,
             "success": success,
         },
     )
-    return {
+    report = {
         "success": success,
+        "final_oracle": final_oracle,
         "wall_clock_ms": wall_ms,
         "step_count": step_count,
         "retry_count": 0,
@@ -181,6 +280,29 @@ def run(url: str, chrome: str, output: Path) -> dict:
         "model_input_path": str(model_input_path),
         "action_trace_path": str(action_trace_path),
     }
+    report["browser_performance_metrics_available"] = True
+    report["browser_performance_metrics"] = browser_metrics
+    for source_name, field_name in {
+        "Documents": "browser_documents_p95",
+        "Frames": "browser_frames_p95",
+        "JSEventListeners": "browser_js_event_listeners_p95",
+        "Nodes": "browser_nodes_p95",
+        "LayoutCount": "browser_layout_count_p95",
+        "RecalcStyleCount": "browser_recalc_style_count_p95",
+        "LayoutDuration": "browser_layout_duration_ms_p95",
+        "RecalcStyleDuration": "browser_recalc_style_duration_ms_p95",
+        "ScriptDuration": "browser_script_duration_ms_p95",
+        "TaskDuration": "browser_task_duration_ms_p95",
+        "JSHeapUsedSize": "browser_js_heap_used_bytes_p95",
+        "JSHeapTotalSize": "browser_js_heap_total_bytes_p95",
+    }.items():
+        if source_name in browser_metrics:
+            report[field_name] = metric_value_to_int(source_name, browser_metrics[source_name])
+    report["web_performance_metrics_available"] = bool(web_metrics)
+    report["web_performance_metrics"] = web_metrics
+    for source_name, field_name in WEB_PERFORMANCE_ROW_FIELDS.items():
+        report[field_name] = int(web_metrics.get(source_name, 0))
+    return report
 
 
 def main() -> int:
