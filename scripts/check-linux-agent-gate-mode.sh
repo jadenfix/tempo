@@ -78,6 +78,14 @@ require(
     and '--cache-from "type=local,src=${DOCKER_CACHE_DIR}"' in text,
     'Docker command must support GitHub Actions and local Docker layer cache backends',
 )
+require(
+    'cargo test -p tempo-engine-cdp --test tempod_live tempod_http_mcp_and_bidi_drive_live_cdp_browser' in text,
+    'Linux gate must run the broad tempod live MCP/BiDi smoke on every live-CDP path',
+)
+require(
+    'cargo test -p tempo-headless --test tempod_process live_cdp' in text,
+    'Linux gate must run the spawned tempod process live-CDP smoke',
+)
 smoke_job = job_block("docker-smoke-amd64")
 full_job = job_block("docker-full-amd64")
 smoke_if = job_if("docker-smoke-amd64", smoke_job)
