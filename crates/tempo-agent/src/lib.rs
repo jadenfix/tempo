@@ -1054,6 +1054,8 @@ impl AgentRunner {
             };
             let triple = agent.record_next_outcome(outcome)?;
             report.actions_completed += 1;
+            let needs_future_origin = agent.next_step().is_some();
+            let should_refresh_origin = side_effects_may_have_occurred && needs_future_origin;
 
             let (next_origin, observation_budget) = self
                 .refresh_post_action_origin(
@@ -1062,7 +1064,7 @@ impl AgentRunner {
                     driver,
                     current_origin.as_ref(),
                     &planned.action,
-                    side_effects_may_have_occurred,
+                    should_refresh_origin,
                 )
                 .await?;
             current_origin = next_origin;
@@ -1470,12 +1472,12 @@ impl AgentRunner {
         driver: &mut D,
         current_origin: Option<&Origin>,
         action: &Action,
-        side_effects_may_have_occurred: bool,
+        should_refresh_origin: bool,
     ) -> Result<(Option<Origin>, Option<ObservationBudget>), AgentError>
     where
         D: DriverTrait + ?Sized,
     {
-        if !side_effects_may_have_occurred {
+        if !should_refresh_origin {
             return Ok((current_origin.cloned(), None));
         }
 
@@ -2996,8 +2998,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runner_refreshes_origin_without_post_action_full_observe() -> TestResult {
-        let root = unique_dir("runner-cheap-post-action-origin")?;
+    async fn runner_skips_post_action_origin_refresh_after_final_step() -> TestResult {
+        let root = unique_dir("runner-final-step-origin-refresh")?;
         remove_dir_if_exists(&root)?;
         fs::create_dir_all(&root)?;
         let journal_path = root.join("session.jsonl");
@@ -3023,10 +3025,13 @@ mod tests {
             driver.observe_calls, 0,
             "the runner should execute from the current observation seq without issuing a redundant full observe"
         );
-        assert_eq!(driver.current_url_calls, 1);
+        assert_eq!(
+            driver.current_url_calls, 0,
+            "the final planned step does not need a refreshed origin for a future policy gate"
+        );
         assert_eq!(
             driver.evaluate_script_calls, 0,
-            "the runner should use the direct current_url primitive when available"
+            "the final planned step should not fall back to JavaScript URL refresh"
         );
 
         remove_dir_if_exists(&root)?;
@@ -3069,6 +3074,10 @@ mod tests {
         assert_eq!(report.actions_completed, 3);
         assert_eq!(driver.act_calls, 3);
         assert_eq!(driver.observe_calls, 0);
+        assert_eq!(
+            driver.current_url_calls, 2,
+            "only actions with a following policy gate need post-action URL refresh"
+        );
         assert_eq!(report.observations, 1);
         assert!(report
             .steps
@@ -3148,9 +3157,14 @@ mod tests {
         let journal_path = root.join("session.jsonl");
         let task = DriverTask::new(
             "https://example.com",
-            vec![Action::Click {
-                node: NodeId("submit".into()),
-            }],
+            vec![
+                Action::Click {
+                    node: NodeId("submit".into()),
+                },
+                Action::Click {
+                    node: NodeId("submit".into()),
+                },
+            ],
         );
         let mut driver = FailingDriver::new(TransportFailurePoint::None)
             .with_elements(vec![button("submit")])
@@ -3169,6 +3183,7 @@ mod tests {
         assert_eq!(report.observations, 2);
         assert_eq!(report.model_input_observations, 1);
         assert!(report.steps[0].observation_budget.is_some());
+        assert_eq!(report.steps[1].observation_budget, None);
         assert_eq!(
             driver.observe_calls, 1,
             "the fallback records one post-action observe without a redundant pre-action observe"
@@ -3601,9 +3616,14 @@ mod tests {
         let journal_path = root.join("session.jsonl");
         let task = DriverTask::new(
             "https://example.com",
-            vec![Action::Click {
-                node: NodeId("submit".into()),
-            }],
+            vec![
+                Action::Click {
+                    node: NodeId("submit".into()),
+                },
+                Action::Click {
+                    node: NodeId("submit".into()),
+                },
+            ],
         );
         let mut driver = FailingDriver::new(TransportFailurePoint::PostActionObserve)
             .with_elements(vec![button("submit")])
