@@ -113,6 +113,12 @@ pub const TEMPO_CDP_BENCH_ENABLE_CACHE_ENV: &str = "TEMPO_CDP_BENCH_ENABLE_CACHE
 /// Benchmark-only launch profile that suppresses Linux desktop-integration
 /// helper probes so process-count metrics stay focused on browser work.
 pub const TEMPO_CDP_BENCH_SUPPRESS_DESKTOP_ENV: &str = "TEMPO_CDP_BENCH_SUPPRESS_DESKTOP";
+/// Benchmark-only headless flag profile used to compare chromiumoxide's bare
+/// `--headless` launch arg against Tempo's normal `--headless=new` launch.
+///
+/// Chrome 132+ maps bare `--headless` to the modern Chrome headless
+/// implementation; old headless is a separate `chrome-headless-shell` binary.
+pub const TEMPO_CDP_BENCH_HEADLESS_FLAG_ENV: &str = "TEMPO_CDP_BENCH_HEADLESS_FLAG";
 
 /// Driver-local counters for CDP observation work.
 ///
@@ -157,6 +163,9 @@ pub struct CdpConfig {
     /// synthetic browser benchmarks because production launches should inherit
     /// the user's desktop environment normally.
     pub bench_suppress_desktop: bool,
+    /// Benchmark-only headless flag experiment. Defaults off so product launches
+    /// pass Chrome's explicit newer headless flag.
+    pub bench_headless_flag: bool,
     /// Initial URL policy installed before the browser starts issuing traffic.
     url_policy: UrlPolicy,
     /// Trusted-fixture optimization: rely on Tempo's mandatory policy proxy for
@@ -255,6 +264,18 @@ impl CdpConfig {
         self
     }
 
+    pub fn with_bench_headless_flag(mut self) -> Self {
+        self.bench_headless_flag = true;
+        self
+    }
+
+    pub fn with_bench_headless_flag_env_opt_in(mut self) -> Self {
+        if env_flag_enabled(TEMPO_CDP_BENCH_HEADLESS_FLAG_ENV) {
+            self.bench_headless_flag = true;
+        }
+        self
+    }
+
     pub fn with_allow_all_url_policy(mut self) -> Self {
         self.url_policy = UrlPolicy::allow_all();
         self
@@ -267,7 +288,11 @@ impl CdpConfig {
 
     fn browser_config(&self, user_data_dir: &Path) -> Result<BrowserConfig, TransportError> {
         let mut builder = BrowserConfig::builder()
-            .headless_mode(HeadlessMode::New)
+            .headless_mode(if self.bench_headless_flag {
+                HeadlessMode::True
+            } else {
+                HeadlessMode::New
+            })
             .launch_timeout(self.launch_timeout)
             .request_timeout(CDP_REQUEST_TIMEOUT)
             .user_data_dir(user_data_dir);
@@ -319,6 +344,7 @@ impl Default for CdpConfig {
             bench_no_incognito: false,
             bench_enable_cache: false,
             bench_suppress_desktop: false,
+            bench_headless_flag: false,
             url_policy: UrlPolicy::block_private(),
             proxy_only_request_policy: false,
         }
@@ -4988,6 +5014,31 @@ mod tests {
         assert_eq!(
             envs.get("XDG_CURRENT_DESKTOP").map(String::as_str),
             Some("tempo-bench")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn default_launch_uses_new_headless_until_headless_flag_benchmark_opt_in(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        assert!(
+            !CdpConfig::default().bench_headless_flag,
+            "default CDP launches must keep Chrome's newer headless mode"
+        );
+
+        let temp = tempfile::tempdir()?;
+        let default_config = CdpConfig::default().browser_config(temp.path())?;
+        assert!(
+            format!("{default_config:?}").contains("headless: New"),
+            "default CDP launches should use chromiumoxide HeadlessMode::New"
+        );
+
+        let headless_flag_config = CdpConfig::default()
+            .with_bench_headless_flag()
+            .browser_config(temp.path())?;
+        assert!(
+            format!("{headless_flag_config:?}").contains("headless: True"),
+            "headless-flag benchmark profile should use chromiumoxide HeadlessMode::True"
         );
         Ok(())
     }
