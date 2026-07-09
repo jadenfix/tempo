@@ -335,6 +335,9 @@ impl DriverTrait for TestDriver {
         expression: &str,
         await_promise: bool,
     ) -> Result<serde_json::Value, TransportError> {
+        if expression == "window.location.href" {
+            return Ok(serde_json::Value::String(self.url.clone()));
+        }
         Ok(serde_json::json!({
             "expression": expression,
             "awaitPromise": await_promise,

@@ -59,9 +59,7 @@ def checkout_oracle_from_page(page: object) -> dict:
     )
 
 
-def cdp_performance_metrics(page: object) -> dict:
-    cdp = page.context.new_cdp_session(page)
-    cdp.send("Performance.enable")
+def cdp_performance_metrics(cdp: object) -> dict:
     response = cdp.send("Performance.getMetrics")
     metrics = response.get("metrics", []) if isinstance(response, dict) else []
     return {
@@ -270,6 +268,8 @@ def run(url: str, chrome: str, output: Path) -> dict:
                 )
                 try:
                     page = context.new_page()
+                    cdp = page.context.new_cdp_session(page)
+                    cdp.send("Performance.enable")
                     page.goto(url, wait_until="load", timeout=15000)
 
                     snapshot = observe(page)
@@ -300,7 +300,7 @@ def run(url: str, chrome: str, output: Path) -> dict:
                     final_status = page.locator("#status").inner_text(timeout=5000)
                     final_oracle = checkout_oracle_from_page(page)
                     success = bool(final_oracle.get("submitted"))
-                    browser_metrics = cdp_performance_metrics(page)
+                    browser_metrics = cdp_performance_metrics(cdp)
                     web_metrics = web_performance_metrics(page)
                 finally:
                     context.close()

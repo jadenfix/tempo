@@ -321,6 +321,17 @@ def validate_processes_at_peak(metric: dict[str, Any]) -> None:
         )
 
 
+def validate_optional_memory_total(metric: dict[str, Any], total_field: str, map_field: str) -> None:
+    if total_field not in metric and map_field not in metric:
+        return
+    runner = metric.get("runner", "<unknown>")
+    require_int(metric, total_field)
+    require_int_map(metric, map_field)
+    total = sum(int(value) for value in metric[map_field].values())
+    if total != int(metric[total_field]):
+        raise ValidationError(f"{runner}.{map_field} sum must equal {total_field}")
+
+
 def artifact_path(output_dir: Path, stored_path: str) -> Path:
     path = Path(stored_path)
     if path.exists():
@@ -361,6 +372,11 @@ def validate_metric(metric: dict[str, Any], iterations: int, output_dir: Path) -
     require_int_map(metric, "rss_at_peak_by_process_type_bytes", positive=True)
     require_int_map(metric, "peak_rss_by_process_type_bytes", positive=True)
     require_int_map(metric, "process_count_at_peak_by_type", positive=True)
+    validate_optional_memory_total(metric, "max_pss_bytes", "pss_at_peak_by_process_type_bytes")
+    validate_optional_memory_total(metric, "max_uss_bytes", "uss_at_peak_by_process_type_bytes")
+    for field in ("peak_pss_by_process_type_bytes", "peak_uss_by_process_type_bytes"):
+        if field in metric:
+            require_int_map(metric, field)
     rss_at_peak_total = sum(int(value) for value in metric["rss_at_peak_by_command_bytes"].values())
     if rss_at_peak_total != int(metric["max_rss_bytes"]):
         raise ValidationError(
@@ -478,8 +494,14 @@ def validate_browser_performance_metrics(metric: dict[str, Any]) -> None:
         value = metrics.get(name)
         if not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0:
             raise ValidationError(f"{runner}.browser_performance_metrics.{name} must be >= 0")
-    for field in BROWSER_PERFORMANCE_ROW_FIELDS.values():
+    for source_name, field in BROWSER_PERFORMANCE_ROW_FIELDS.items():
         require_int(metric, field)
+        expected = metric_value_to_int(source_name, metrics[source_name])
+        if int(metric[field]) != expected:
+            raise ValidationError(
+                f"{runner}.{field} must equal browser_performance_metrics.{source_name} "
+                f"converted to row units: expected {expected}, got {metric[field]}"
+            )
 
 
 def validate_web_performance_metrics(metric: dict[str, Any]) -> None:
@@ -489,12 +511,37 @@ def validate_web_performance_metrics(metric: dict[str, Any]) -> None:
     metrics = metric.get("web_performance_metrics")
     if not isinstance(metrics, dict) or not metrics:
         raise ValidationError(f"{runner}.web_performance_metrics must be populated")
+    names = set(str(name) for name in metrics)
+    expected_names = set(WEB_PERFORMANCE_ROW_FIELDS)
+    if names != expected_names:
+        missing = sorted(expected_names - names)
+        extra = sorted(names - expected_names)
+        raise ValidationError(
+            f"{runner}.web_performance_metrics key coverage mismatch: "
+            f"missing={missing} extra={extra}"
+        )
     for name in WEB_PERFORMANCE_ROW_FIELDS:
         value = metrics.get(name)
         if not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0:
             raise ValidationError(f"{runner}.web_performance_metrics.{name} must be >= 0")
-    for field in WEB_PERFORMANCE_ROW_FIELDS.values():
+    if int(metrics["first_contentful_paint_ms"]) <= 0:
+        raise ValidationError(
+            f"{runner}.web_performance_metrics.first_contentful_paint_ms must be > 0"
+        )
+    for source_name, field in WEB_PERFORMANCE_ROW_FIELDS.items():
         require_int(metric, field)
+        expected = metric_value_to_int(source_name, metrics[source_name])
+        if int(metric[field]) != expected:
+            raise ValidationError(
+                f"{runner}.{field} must equal web_performance_metrics.{source_name} "
+                f"converted to row units: expected {expected}, got {metric[field]}"
+            )
+
+
+def metric_value_to_int(name: str, value: int | float) -> int:
+    if name.endswith("Duration"):
+        return int(round(float(value) * 1000))
+    return int(round(float(value)))
 
 
 def validate_browser_performance_metric_key_coverage(metrics: list[dict[str, Any]]) -> None:
