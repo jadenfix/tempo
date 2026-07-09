@@ -113,6 +113,31 @@ where
     execute_action_grounded(driver, action, Grounding::TrustMatchingDiff).await
 }
 
+/// Execute a single action using a caller-supplied current observation sequence
+/// as the grounding base. This preserves [`execute_action`]'s post-action
+/// grounding semantics while avoiding a redundant pre-action full observation
+/// for callers that already hold a valid current observation `seq`.
+pub async fn execute_action_since<D>(
+    driver: &mut D,
+    action: &Action,
+    base_seq: u64,
+) -> Result<ActionExecution, TransportError>
+where
+    D: DriverTrait + ?Sized,
+{
+    let outcome = driver.act(action).await?;
+    finish_execution(
+        driver,
+        outcome,
+        base_seq,
+        1,
+        action.side_effect(),
+        driver.engine(),
+        Grounding::TrustMatchingDiff,
+    )
+    .await
+}
+
 /// [`execute_action`], but the grounding diff always comes from an independent
 /// post-action `observe_diff`. Use where the diff is a verification witness
 /// (e.g. replay divergence detection) rather than a latency-sensitive product.
@@ -669,6 +694,60 @@ mod tests {
     }
 
     #[test]
+    fn execute_action_since_applied_with_matching_base_skips_observe_and_rediff(
+    ) -> Result<(), String> {
+        let mut driver = ContractDriver::new();
+        let action = Action::Click {
+            node: NodeId("button".into()),
+        };
+        let execution = block_on(execute_action_since(&mut driver, &action, 10))
+            .map_err(|error| error.to_string())?;
+        assert!(execution.applied());
+        assert_eq!(execution.since_seq, 10);
+        assert_eq!(execution.seq, 11);
+        assert_eq!(driver.observe_calls, 0);
+        assert!(driver.observe_diff_calls.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn execute_action_since_step_error_uses_supplied_base_for_rediff() -> Result<(), String> {
+        let mut driver = ContractDriver::new();
+        let action = Action::Click {
+            node: NodeId("missing".into()),
+        };
+        let execution = block_on(execute_action_since(&mut driver, &action, 10))
+            .map_err(|error| error.to_string())?;
+        assert_eq!(
+            execution.status,
+            ExecutionStatus::StepError {
+                reason: "node not found".into()
+            }
+        );
+        assert_eq!(execution.since_seq, 10);
+        assert_eq!(execution.seq, 10);
+        assert_eq!(driver.observe_calls, 0);
+        assert_eq!(driver.observe_diff_calls, vec![10]);
+        Ok(())
+    }
+
+    #[test]
+    fn execute_action_since_applied_with_mismatched_base_regrounds() -> Result<(), String> {
+        let mut driver = ContractDriver::new();
+        let action = Action::Click {
+            node: NodeId("button".into()),
+        };
+        let execution = block_on(execute_action_since(&mut driver, &action, 9))
+            .map_err(|error| error.to_string())?;
+        assert!(execution.applied());
+        assert_eq!(execution.since_seq, 9);
+        assert_eq!(execution.seq, 11);
+        assert_eq!(driver.observe_calls, 0);
+        assert_eq!(driver.observe_diff_calls, vec![9]);
+        Ok(())
+    }
+
+    #[test]
     fn applied_batch_with_matching_base_skips_forced_rediff() -> Result<(), String> {
         let mut driver = ContractDriver::new();
         let batch = ActionBatch {
@@ -846,6 +925,7 @@ mod tests {
     #[derive(Debug)]
     struct ContractDriver {
         seq: u64,
+        observe_calls: usize,
         observe_diff_calls: Vec<u64>,
     }
 
@@ -853,6 +933,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 seq: 10,
+                observe_calls: 0,
                 observe_diff_calls: Vec::new(),
             }
         }
@@ -881,6 +962,7 @@ mod tests {
         }
 
         async fn observe(&mut self) -> Result<CompiledObservation, TransportError> {
+            self.observe_calls += 1;
             Ok(self.observation())
         }
 
