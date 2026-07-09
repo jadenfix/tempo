@@ -4,6 +4,80 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 IMAGE="${TEMPO_LINUX_AGENT_IMAGE:-tempo-linux-agent:rust-1.96.1}"
 MODE="${1:---smoke}"
+ALLOW_UNSAFE_HOST_ENV="${TEMPO_AGENT_BENCH_ALLOW_UNSAFE_HOST_ENV:-}"
+UNSAFE_HOST_ENV_KEYS=(
+  ANTHROPIC_API_KEY
+  AWS_ACCESS_KEY_ID
+  AWS_PROFILE
+  AWS_ROLE_ARN
+  AWS_SECRET_ACCESS_KEY
+  AWS_SESSION_TOKEN
+  AWS_WEB_IDENTITY_TOKEN_FILE
+  GOOGLE_API_KEY
+  GOOGLE_APPLICATION_CREDENTIALS
+  OPENAI_API_KEY
+  TEMPO_DURABLE_ENCRYPTION_KEY_HEX
+  TEMPO_OTLP_ENDPOINT
+  TEMPO_OTLP_JSONL
+  TEMPO_TEMPOD_AUTH_TOKEN
+  TEMPO_TEMPOD_AUTH_TOKEN_FILE
+  TEMPO_THREAT_DOMAIN_AUDIT_JSONL
+  TEMPO_THREAT_DOMAIN_CACHE_FILE
+  TEMPO_THREAT_DOMAIN_FAILURE_MODE
+  TEMPO_THREAT_DOMAIN_FILE
+  TEMPO_THREAT_DOMAIN_MAX_STALE_SECONDS
+  TEMPO_THREAT_DOMAIN_METADATA_CACHE_FILE
+  TEMPO_THREAT_DOMAIN_METADATA_URL
+  TEMPO_THREAT_DOMAIN_PUBLIC_KEYS
+  TEMPO_THREAT_DOMAIN_REFRESH_INTERVAL_SECONDS
+  TEMPO_THREAT_DOMAIN_SHA256
+  TEMPO_THREAT_DOMAIN_URL
+)
+
+reject_unsafe_host_env() {
+  if [[ "$ALLOW_UNSAFE_HOST_ENV" == "1" ]]; then
+    return
+  fi
+  local present=()
+  local key
+  for key in "${UNSAFE_HOST_ENV_KEYS[@]}"; do
+    if [[ -n "${!key:-}" ]]; then
+      present+=("$key")
+    fi
+  done
+  if (( ${#present[@]} > 0 )); then
+    local joined
+    printf -v joined '%s, ' "${present[@]}"
+    joined="${joined%, }"
+    echo "refusing to run Linux agent gate with ambient production/secret env vars: ${joined}" >&2
+    echo "unset them, or set TEMPO_AGENT_BENCH_ALLOW_UNSAFE_HOST_ENV=1 for an intentional unsafe-env run" >&2
+    exit 2
+  fi
+}
+
+resolve_local_path() {
+  local path="$1"
+  case "$path" in
+    /*) printf '%s\n' "$path" ;;
+    *) printf '%s\n' "$ROOT/$path" ;;
+  esac
+}
+
+require_cache_under_root() {
+  local label="$1"
+  local path="$2"
+  if [[ "$ALLOW_UNSAFE_HOST_ENV" == "1" ]]; then
+    return
+  fi
+  case "$path" in
+    "$ROOT" | "$ROOT"/*) ;;
+    *)
+      echo "refusing ${label} outside repo root: ${path}" >&2
+      echo "use a relative path under the repo, or set TEMPO_AGENT_BENCH_ALLOW_UNSAFE_HOST_ENV=1 for an intentional unsafe-cache run" >&2
+      exit 2
+      ;;
+  esac
+}
 
 case "$MODE" in
   --smoke | --full | --shell) ;;
@@ -12,6 +86,8 @@ case "$MODE" in
     exit 2
     ;;
 esac
+
+reject_unsafe_host_env
 
 if ! command -v docker >/dev/null 2>&1; then
   echo "docker is required for the Linux agent gate" >&2
@@ -72,11 +148,8 @@ if [[ -n "$DOCKER_CACHE_BACKEND" ]]; then
         echo "TEMPO_LINUX_AGENT_DOCKER_CACHE_DIR is required for local Docker layer caching" >&2
         exit 2
       fi
-      DOCKER_CACHE_DIR="$TEMPO_LINUX_AGENT_DOCKER_CACHE_DIR"
-      case "$DOCKER_CACHE_DIR" in
-        /*) ;;
-        *) DOCKER_CACHE_DIR="$ROOT/$DOCKER_CACHE_DIR" ;;
-      esac
+      DOCKER_CACHE_DIR="$(resolve_local_path "$TEMPO_LINUX_AGENT_DOCKER_CACHE_DIR")"
+      require_cache_under_root "TEMPO_LINUX_AGENT_DOCKER_CACHE_DIR" "$DOCKER_CACHE_DIR"
       DOCKER_CACHE_NEXT="${DOCKER_CACHE_DIR}.next"
       mkdir -p "$(dirname "$DOCKER_CACHE_DIR")"
       rm -rf "$DOCKER_CACHE_NEXT"
@@ -147,11 +220,8 @@ COMMON_MOUNTS=(
 )
 
 if [[ -n "${TEMPO_LINUX_AGENT_CACHE_DIR:-}" ]]; then
-  CACHE_DIR="$TEMPO_LINUX_AGENT_CACHE_DIR"
-  case "$CACHE_DIR" in
-    /*) ;;
-    *) CACHE_DIR="$ROOT/$CACHE_DIR" ;;
-  esac
+  CACHE_DIR="$(resolve_local_path "$TEMPO_LINUX_AGENT_CACHE_DIR")"
+  require_cache_under_root "TEMPO_LINUX_AGENT_CACHE_DIR" "$CACHE_DIR"
   mkdir -p "$CACHE_DIR/cargo-registry" "$CACHE_DIR/cargo-git" "$CACHE_DIR/target"
   COMMON_ENV+=(-e "TEMPO_LINUX_AGENT_CACHE_DIR=${TEMPO_LINUX_AGENT_CACHE_DIR}")
   COMMON_MOUNTS+=(

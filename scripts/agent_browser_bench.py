@@ -106,16 +106,29 @@ ALLOW_UNSAFE_HOST_ENV = "TEMPO_AGENT_BENCH_ALLOW_UNSAFE_HOST_ENV"
 UNSAFE_HOST_ENV_KEYS = {
     "ANTHROPIC_API_KEY",
     "AWS_ACCESS_KEY_ID",
+    "AWS_PROFILE",
+    "AWS_ROLE_ARN",
     "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_WEB_IDENTITY_TOKEN_FILE",
     "GOOGLE_API_KEY",
     "GOOGLE_APPLICATION_CREDENTIALS",
     "OPENAI_API_KEY",
     "TEMPO_DURABLE_ENCRYPTION_KEY_HEX",
     "TEMPO_OTLP_ENDPOINT",
+    "TEMPO_OTLP_JSONL",
     "TEMPO_TEMPOD_AUTH_TOKEN",
     "TEMPO_TEMPOD_AUTH_TOKEN_FILE",
+    "TEMPO_THREAT_DOMAIN_AUDIT_JSONL",
+    "TEMPO_THREAT_DOMAIN_CACHE_FILE",
+    "TEMPO_THREAT_DOMAIN_FAILURE_MODE",
+    "TEMPO_THREAT_DOMAIN_FILE",
+    "TEMPO_THREAT_DOMAIN_MAX_STALE_SECONDS",
+    "TEMPO_THREAT_DOMAIN_METADATA_CACHE_FILE",
     "TEMPO_THREAT_DOMAIN_METADATA_URL",
     "TEMPO_THREAT_DOMAIN_PUBLIC_KEYS",
+    "TEMPO_THREAT_DOMAIN_REFRESH_INTERVAL_SECONDS",
+    "TEMPO_THREAT_DOMAIN_SHA256",
     "TEMPO_THREAT_DOMAIN_URL",
 }
 
@@ -152,6 +165,31 @@ def benchmark_child_env() -> dict[str, str]:
         for key in UNSAFE_HOST_ENV_KEYS:
             env.pop(key, None)
     return env
+
+
+def path_is_under(path: Path, parent: Path) -> bool:
+    try:
+        path.resolve().relative_to(parent.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def assert_safe_output_dir(output_dir: Path) -> None:
+    if os.environ.get(ALLOW_UNSAFE_HOST_ENV) == "1":
+        return
+    allowed_roots = [
+        ROOT / "target",
+        Path(tempfile.gettempdir()),
+        Path("/tmp"),
+    ]
+    if not any(path_is_under(output_dir, allowed_root) for allowed_root in allowed_roots):
+        roots = ", ".join(str(root.resolve()) for root in allowed_roots)
+        raise RuntimeError(
+            f"refusing to clean/write browser benchmark output outside safe roots: {output_dir}. "
+            f"Allowed roots: {roots}. Set {ALLOW_UNSAFE_HOST_ENV}=1 for an intentional "
+            "unsafe-output run."
+        )
 
 
 class StaticServer:
@@ -578,6 +616,7 @@ def chrome_version(chrome: str) -> str:
     try:
         completed = subprocess.run(
             [chrome, "--version"],
+            env=benchmark_child_env(),
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -1067,6 +1106,7 @@ def run_cdp_baseline(chrome: str, url: str, runner: str, snapshot: str | None) -
                         executable_path=chrome,
                         headless=True,
                         args=args,
+                        env=benchmark_child_env(),
                     )
                     try:
                         page = context.new_page()
@@ -2070,6 +2110,7 @@ def main() -> int:
         raise RuntimeError(f"missing fixture: {FIXTURE_HTML}")
 
     output_dir = Path(args.output_dir)
+    assert_safe_output_dir(output_dir)
     clean_output_dir(output_dir)
     iterations = args.iterations if args.iterations is not None else (5 if args.full else 1)
     if iterations < 1:
