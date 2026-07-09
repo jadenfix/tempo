@@ -67,6 +67,15 @@ require(
     'Docker command must support a host-backed Linux agent cache directory',
 )
 require(
+    'BENCH_PROFILE="${TEMPO_LINUX_AGENT_BENCH_PROFILE:-default}"' in text
+    and 'unsupported TEMPO_LINUX_AGENT_BENCH_PROFILE' in text
+    and 'TEMPO_CDP_BENCH_PLAYWRIGHT_LIFECYCLE_ARGS=1' in text
+    and 'TEMPO_CDP_BENCH_INSERT_TEXT_TYPE=1' in text
+    and 'TEMPO_CDP_BENCH_NO_INCOGNITO=1' in text
+    and '-e "TEMPO_LINUX_AGENT_BENCH_PROFILE=${BENCH_PROFILE}"' in text,
+    'Docker command must support named browser benchmark optimization profiles',
+)
+require(
     'TEMPO_LINUX_AGENT_DOCKER_CACHE_BACKEND' in text
     and 'docker buildx build' in text
     and '--driver docker-container' in text
@@ -125,6 +134,12 @@ require(
     'smoke job must enable GitHub Actions Docker layer caching',
 )
 require(
+    'benchmark_profile:' in workflow
+    and 'TEMPO_LINUX_AGENT_BENCH_PROFILE:' in smoke_job
+    and "inputs.benchmark_profile || 'default'" in smoke_job,
+    'smoke job must pass the workflow benchmark profile into the gate',
+)
+require(
     'scripts/agent_bench_runners/*.py' in smoke_job
     and 'scripts/requirements-agent-bench.txt' in smoke_job
     and 'scripts/validate-agent-bench-artifacts.py' in smoke_job,
@@ -165,6 +180,11 @@ require(
     'TEMPO_LINUX_AGENT_DOCKER_CACHE_BACKEND: gha' in full_job
     and 'TEMPO_LINUX_AGENT_DOCKER_CACHE_SCOPE:' in full_job,
     'full job must enable GitHub Actions Docker layer caching',
+)
+require(
+    'TEMPO_LINUX_AGENT_BENCH_PROFILE:' in full_job
+    and "inputs.benchmark_profile || 'default'" in full_job,
+    'full job must pass the workflow benchmark profile into the gate',
 )
 require(
     'scripts/agent_bench_runners/*.py' in full_job

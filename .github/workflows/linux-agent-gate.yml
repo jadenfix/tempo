@@ -11,6 +11,16 @@ on:
           - smoke
           - full
         default: smoke
+      benchmark_profile:
+        description: "Optional browser benchmark optimization profile"
+        type: choice
+        options:
+          - default
+          - lifecycle
+          - insert-text
+          - no-incognito
+          - all
+        default: default
   schedule:
     - cron: "53 10 * * *"
 
@@ -35,6 +45,7 @@ jobs:
       TEMPO_LINUX_AGENT_CACHE_DIR: .tempo-linux-agent-cache
       TEMPO_LINUX_AGENT_DOCKER_CACHE_BACKEND: gha
       TEMPO_LINUX_AGENT_DOCKER_CACHE_SCOPE: docker-smoke-amd64-linux-agent
+      TEMPO_LINUX_AGENT_BENCH_PROFILE: ${{ github.event_name == 'workflow_dispatch' && inputs.benchmark_profile || 'default' }}
     steps:
       - uses: actions/checkout@v4
       - name: Cache Docker Linux agent build artifacts
@@ -73,6 +84,7 @@ jobs:
       TEMPO_LINUX_AGENT_CACHE_DIR: .tempo-linux-agent-cache
       TEMPO_LINUX_AGENT_DOCKER_CACHE_BACKEND: gha
       TEMPO_LINUX_AGENT_DOCKER_CACHE_SCOPE: docker-full-amd64-linux-agent
+      TEMPO_LINUX_AGENT_BENCH_PROFILE: ${{ github.event_name == 'workflow_dispatch' && inputs.benchmark_profile || 'default' }}
     steps:
       - uses: actions/checkout@v4
       - name: Cache Docker Linux agent build artifacts
