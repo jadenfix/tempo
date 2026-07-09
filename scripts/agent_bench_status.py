@@ -68,6 +68,7 @@ def render_status_markdown(
         "desktop integration": {},
         "compositor": {},
         "headless mode": {},
+        "request policy settle": {},
     }
     dimension_fields = {
         "cdp_type_dispatch": "type dispatch",
