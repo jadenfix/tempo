@@ -74,26 +74,13 @@ async def cdp_performance_metrics(browser: Any) -> dict[str, Any]:
     await maybe_await(cdp_client.send.Performance.enable(session_id=session_id))
     response = await maybe_await(cdp_client.send.Performance.getMetrics(session_id=session_id))
     metrics = response.get("metrics", []) if isinstance(response, dict) else []
-    wanted = {
-        "Documents",
-        "Frames",
-        "JSEventListeners",
-        "Nodes",
-        "LayoutCount",
-        "RecalcStyleCount",
-        "LayoutDuration",
-        "RecalcStyleDuration",
-        "ScriptDuration",
-        "TaskDuration",
-        "JSHeapUsedSize",
-        "JSHeapTotalSize",
-    }
     return {
         str(metric["name"]): metric["value"]
         for metric in metrics
         if isinstance(metric, dict)
-        and metric.get("name") in wanted
+        and isinstance(metric.get("name"), str)
         and isinstance(metric.get("value"), (int, float))
+        and not isinstance(metric.get("value"), bool)
     }
 
 

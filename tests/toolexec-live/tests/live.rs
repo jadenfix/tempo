@@ -9,7 +9,7 @@ use tempo_schema::{Provenance, TaintSpan};
 use tempo_toolexec::{
     tainted_sandbox_canary_report, BeatboxClientError, Determinism, ExecuteRequest,
     ExecutionStatus, JobStatus, Lane, Mount, MountMode, Policy, ProvenancedInput, Source,
-    TaintedTransform, ToolExecClient, ToolExecError, ToolJobState, ToolStepStatus,
+    TaintedTransform, ToolExecClient, ToolExecError, ToolExecution, ToolJobState, ToolStepStatus,
 };
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
@@ -119,23 +119,72 @@ async fn real_beatboxd_process_lane_is_unavailable_until_sandbox_exists() -> Tes
     let executor = ToolExecClient::new(beatboxd.base_url());
     let execution = executor.execute_trusted_request(&request).await?;
 
-    assert_eq!(execution.result.status, ExecutionStatus::Denied);
-    assert_eq!(execution.audit.status, ExecutionStatus::Denied);
-    let error = execution
-        .result
-        .error
-        .as_ref()
-        .ok_or("process lane denial must include an error body")?;
-    assert_eq!(error.code, "lane_unavailable");
-    assert!(error.message.contains("Exec is not implemented"));
-    assert_eq!(
-        execution.step_status,
-        ToolStepStatus::StepError {
-            reason: error.message.clone()
+    assert_exec_fail_closed(&execution)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn real_beatboxd_process_lane_job_is_unavailable_until_sandbox_exists() -> TestResult {
+    let beatboxd = RealBeatboxd::spawn().await?;
+    let mut request = live_smoke_request("tempo-toolexec-live-exec-job-unavailable");
+    request.lane = Lane::Exec;
+    request.source = Source::Inline {
+        code: "echo should-not-run".into(),
+    };
+
+    let executor = ToolExecClient::new(beatboxd.base_url());
+    let created = executor.create_trusted_job(&request).await?;
+
+    for _ in 0..50 {
+        let job = executor.get_tool_job(&created.job_id).await?;
+
+        match &job.state {
+            ToolJobState::Finished { execution } => {
+                assert!(job.is_terminal());
+                assert_eq!(job.record.status, JobStatus::Succeeded);
+                assert_exec_fail_closed(execution)?;
+                return Ok(());
+            }
+            ToolJobState::StepError { reason, .. } => {
+                return Err(format!("exec job ended before returning denial: {reason}").into());
+            }
+            ToolJobState::Pending { .. } => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
         }
+    }
+
+    Err("exec job did not finish within polling window".into())
+}
+
+#[tokio::test]
+async fn real_beatboxd_process_lane_denial_has_no_side_effects() -> TestResult {
+    let beatboxd = RealBeatboxd::spawn().await?;
+    let canary = CanaryEndpoint::spawn().await?;
+    let marker_path =
+        std::env::temp_dir().join(format!("tempo-exec-should-not-run-{}", std::process::id()));
+    if marker_path.exists() {
+        std::fs::remove_file(&marker_path)?;
+    }
+    let mut request = live_smoke_request("tempo-toolexec-live-exec-side-effects-denied");
+    request.lane = Lane::Exec;
+    request.source = Source::Inline {
+        code: format!(
+            "printf side-effect > {}; curl -fsS {}",
+            marker_path.display(),
+            canary.url()
+        ),
+    };
+
+    let executor = ToolExecClient::new(beatboxd.base_url());
+    let execution = executor.execute_trusted_request(&request).await?;
+
+    assert_exec_fail_closed(&execution)?;
+    assert!(
+        !marker_path.exists(),
+        "unavailable exec lane must not run filesystem side effects"
     );
-    assert!(execution.audit.effective_isolation.mechanisms.is_empty());
-    assert!(!execution.audit.has_egress());
+    assert_eq!(canary.hit_count(), 0);
     Ok(())
 }
 
@@ -166,6 +215,13 @@ async fn real_beatboxd_integration_contract_keeps_exec_fail_closed() -> TestResu
             .and_then(|substrate| substrate.as_str()),
         Some("os_jail")
     );
+    assert_eq!(
+        exec_capability
+            .get("mechanisms")
+            .and_then(|mechanisms| mechanisms.as_array())
+            .map(Vec::len),
+        Some(0)
+    );
 
     let integration = executor.integration().await?;
     let exec_contract = integration
@@ -186,7 +242,13 @@ async fn real_beatboxd_integration_contract_keeps_exec_fail_closed() -> TestResu
     );
     assert_contract_mentions(
         &exec_contract.required_next_steps,
-        &["command/package", "process", "filesystem", "network", "teardown"],
+        &[
+            "command/package",
+            "process",
+            "filesystem",
+            "network",
+            "teardown",
+        ],
     );
     Ok(())
 }
@@ -285,6 +347,27 @@ fn beatbox_api_error_message(error: ToolExecError, expected_code: &str) -> TestR
         }
         other => Err(format!("expected beatbox API error, got {other}").into()),
     }
+}
+
+fn assert_exec_fail_closed(execution: &ToolExecution) -> TestResult {
+    assert_eq!(execution.result.status, ExecutionStatus::Denied);
+    assert_eq!(execution.audit.status, ExecutionStatus::Denied);
+    let error = execution
+        .result
+        .error
+        .as_ref()
+        .ok_or("process lane denial must include an error body")?;
+    assert_eq!(error.code, "lane_unavailable");
+    assert!(error.message.contains("Exec is not implemented"));
+    assert_eq!(
+        execution.step_status,
+        ToolStepStatus::StepError {
+            reason: error.message.clone()
+        }
+    );
+    assert!(execution.audit.effective_isolation.mechanisms.is_empty());
+    assert!(!execution.audit.has_egress());
+    Ok(())
 }
 
 fn assert_contract_mentions(actual: &[String], needles: &[&str]) {

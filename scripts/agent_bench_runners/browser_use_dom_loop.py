@@ -64,26 +64,13 @@ def cdp_performance_metrics(page: object) -> dict:
     cdp.send("Performance.enable")
     response = cdp.send("Performance.getMetrics")
     metrics = response.get("metrics", []) if isinstance(response, dict) else []
-    wanted = {
-        "Documents",
-        "Frames",
-        "JSEventListeners",
-        "Nodes",
-        "LayoutCount",
-        "RecalcStyleCount",
-        "LayoutDuration",
-        "RecalcStyleDuration",
-        "ScriptDuration",
-        "TaskDuration",
-        "JSHeapUsedSize",
-        "JSHeapTotalSize",
-    }
     return {
         str(metric["name"]): metric["value"]
         for metric in metrics
         if isinstance(metric, dict)
-        and metric.get("name") in wanted
+        and isinstance(metric.get("name"), str)
         and isinstance(metric.get("value"), (int, float))
+        and not isinstance(metric.get("value"), bool)
     }
 
 

@@ -93,15 +93,15 @@ def render_status_markdown(
             "",
             "## Runner Summary",
             "",
-            "| Runner | Success | Cold Wall | Wall p95 | Steady Wall p95 | RSS p95 | Model Tokens p95 | Retries | Failures |",
-            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+            "| Runner | Success | Cold Wall | Wall p95 | Steady Wall p95 | CPU p95 | RSS p95 | Obs p95 | Model Tokens p95 | Retries | Failures |",
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
     )
     for row in rows:
         if not isinstance(row, dict):
             continue
         lines.append(
-            "| {runner} | {success} | {cold_wall} | {wall} | {steady_wall} | {rss} | {tokens} | {retries} | {failures} |".format(
+            "| {runner} | {success} | {cold_wall} | {wall} | {steady_wall} | {cpu} | {rss} | {obs} | {tokens} | {retries} | {failures} |".format(
                 runner=row.get("runner", "-"),
                 success=format_rate(row.get("success_rate")),
                 cold_wall=format_value(
@@ -113,7 +113,9 @@ def render_status_markdown(
                     "steady_state_wall_clock_ms_p95",
                     row.get("steady_state_wall_clock_ms_p95"),
                 ),
+                cpu=format_value("cpu_time_ms_p95", row.get("cpu_time_ms_p95")),
                 rss=format_value("max_rss_bytes_p95", row.get("max_rss_bytes_p95")),
+                obs=format_value("observations_p95", row.get("observations_p95")),
                 tokens=format_value("model_input_tokens_p95", row.get("model_input_tokens_p95")),
                 retries=row.get("retry_count_total", "-"),
                 failures=row.get("failure_count", "-"),
@@ -231,8 +233,8 @@ def render_status_markdown(
             "",
             "## Web Performance Metrics",
             "",
-            "| Runner | Web Perf | Nav p95 | DCL p95 | Load p95 | Response p95 | Resources p95 | Transfer p95 | FCP p95 | Long Tasks p95 | Long Task Dur p95 |",
-            "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+            "| Runner | Web Perf | Nav p95 | DCL p95 | Load p95 | Response p95 | Resources p95 | Transfer p95 | Decoded Body p95 | FP p95 | FCP p95 | Long Tasks p95 | Long Task Dur p95 |",
+            "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
     )
     for row in rows:
@@ -240,7 +242,7 @@ def render_status_markdown(
             continue
         web_perf = "yes" if row.get("web_performance_metrics_available") else "no"
         lines.append(
-            "| {runner} | {web_perf} | {nav} | {dcl} | {load} | {response} | {resources} | {transfer} | {fcp} | {long_count} | {long_duration} |".format(
+            "| {runner} | {web_perf} | {nav} | {dcl} | {load} | {response} | {resources} | {transfer} | {decoded_body} | {first_paint} | {fcp} | {long_count} | {long_duration} |".format(
                 runner=row.get("runner", "-"),
                 web_perf=web_perf,
                 nav=format_value(
@@ -260,6 +262,14 @@ def render_status_markdown(
                 transfer=format_value(
                     "web_resource_transfer_size_bytes_p95",
                     row.get("web_resource_transfer_size_bytes_p95"),
+                ),
+                decoded_body=format_value(
+                    "web_resource_decoded_body_size_bytes_p95",
+                    row.get("web_resource_decoded_body_size_bytes_p95"),
+                ),
+                first_paint=format_value(
+                    "web_first_paint_ms_p95",
+                    row.get("web_first_paint_ms_p95"),
                 ),
                 fcp=format_value(
                     "web_first_contentful_paint_ms_p95",

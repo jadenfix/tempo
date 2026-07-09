@@ -39,6 +39,21 @@ AGENT_STYLE_RUNNERS = {
     "real-browser-use",
 }
 
+BROWSER_PERFORMANCE_METRIC_NAMES = [
+    "Documents",
+    "Frames",
+    "JSEventListeners",
+    "Nodes",
+    "LayoutCount",
+    "RecalcStyleCount",
+    "LayoutDuration",
+    "RecalcStyleDuration",
+    "ScriptDuration",
+    "TaskDuration",
+    "JSHeapUsedSize",
+    "JSHeapTotalSize",
+]
+
 BROWSER_PERFORMANCE_ROW_FIELDS = {
     "Documents": "browser_documents_p95",
     "Frames": "browser_frames_p95",
@@ -430,7 +445,12 @@ def validate_browser_performance_metrics(metric: dict[str, Any]) -> None:
     metrics = metric.get("browser_performance_metrics")
     if not isinstance(metrics, dict) or not metrics:
         raise ValidationError(f"{runner}.browser_performance_metrics must be populated")
-    for name in ("Nodes", "TaskDuration", "JSHeapUsedSize"):
+    for name, value in metrics.items():
+        if not isinstance(name, str):
+            raise ValidationError(f"{runner}.browser_performance_metrics keys must be strings")
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0:
+            raise ValidationError(f"{runner}.browser_performance_metrics.{name} must be >= 0")
+    for name in BROWSER_PERFORMANCE_METRIC_NAMES:
         value = metrics.get(name)
         if not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0:
             raise ValidationError(f"{runner}.browser_performance_metrics.{name} must be >= 0")
@@ -626,6 +646,11 @@ def expected_gap_report(metrics: list[dict[str, Any]], summary: dict[str, Any]) 
             sorted(runner for runner in runners if runner in AGENT_STYLE_RUNNERS),
         ),
         (
+            "observations_p95",
+            "lower_is_better",
+            sorted(runner for runner in runners if runner in AGENT_STYLE_RUNNERS),
+        ),
+        (
             "compact_observation_tokens_p95",
             "lower_is_better",
             sorted(runner for runner in runners if runner in AGENT_STYLE_RUNNERS),
@@ -640,7 +665,13 @@ def expected_gap_report(metrics: list[dict[str, Any]], summary: dict[str, Any]) 
             "lower_is_better",
             sorted(runner for runner in runners if runner in AGENT_STYLE_RUNNERS),
         ),
+        ("cpu_time_ms_p95", "lower_is_better", runners),
     ]
+    ranked_browser_fields = set(BROWSER_PERFORMANCE_ROW_FIELDS.values())
+    for metric_name in browser_performance_metric_names(metrics):
+        field_name = browser_performance_metric_row_field(metric_name)
+        if field_name not in ranked_browser_fields:
+            category_specs.append((field_name, "lower_is_better", runners))
     categories = []
     gaps_to_close = []
     for name, direction, category_runners in category_specs:
@@ -729,6 +760,7 @@ def expected_gap_report(metrics: list[dict[str, Any]], summary: dict[str, Any]) 
             "cpu_time_ms_p95 is row-level only until every runner uses the same resource-accounting scope.",
             "cold_start_wall_clock_ms reports iteration 1; steady_state_wall_clock_ms_p95 ranks iteration 2+ only and is omitted for one-iteration smoke artifacts.",
             "CDP Performance.getMetrics fields are required and ranked for every runner in this CDP-backed benchmark.",
+            "Known CDP runtime fields use stable browser_* category names; any additional numeric Performance.getMetrics values are preserved and ranked as browser_cdp_* categories.",
             "web_* categories come from the browser Performance Timeline APIs and are required for every runner, including Tempo.",
             "Positive deltas mean Tempo is behind that comparison target; negative deltas mean Tempo is ahead.",
         ],
@@ -820,6 +852,7 @@ def comparison_row(
             field_name: optional_metric_percentile(runner_metrics, field_name, 0.95)
             for field_name in BROWSER_PERFORMANCE_ROW_FIELDS.values()
         },
+        **browser_performance_metric_percentile_fields(runner_metrics),
         "cpu_time_ms_p95": percentile(
             [
                 int(metric.get("cpu_user_ms", 0)) + int(metric.get("cpu_system_ms", 0))
@@ -914,6 +947,61 @@ def browser_rss_bytes(metric: dict[str, Any]) -> int:
         for key, value in by_type.items()
         if isinstance(key, str) and (key == "chrome-browser" or key.startswith("chrome-"))
     )
+
+
+def browser_performance_metric_names(metrics: list[dict[str, Any]]) -> list[str]:
+    names = set()
+    for metric in metrics:
+        browser_metrics = metric.get("browser_performance_metrics")
+        if isinstance(browser_metrics, dict):
+            names.update(str(name) for name in browser_metrics)
+    return sorted(names)
+
+
+def browser_performance_metric_row_field(metric_name: str) -> str:
+    if metric_name in BROWSER_PERFORMANCE_ROW_FIELDS:
+        return BROWSER_PERFORMANCE_ROW_FIELDS[metric_name]
+    slug = "".join(char.lower() if char.isalnum() else "_" for char in metric_name).strip("_")
+    while "__" in slug:
+        slug = slug.replace("__", "_")
+    suffix = (
+        "ms"
+        if metric_name.endswith("Duration")
+        else "bytes"
+        if metric_name.endswith("Size")
+        else ""
+    )
+    suffix_part = f"_{suffix}" if suffix else ""
+    return f"browser_cdp_{slug}{suffix_part}_p95"
+
+
+def metric_value_to_int(name: str, value: int | float) -> int:
+    if name.endswith("Duration"):
+        return int(round(float(value) * 1000))
+    return int(round(float(value)))
+
+
+def browser_performance_metric_percentile_fields(
+    runner_metrics: list[dict[str, Any]],
+) -> dict[str, int | None]:
+    fields = {}
+    for metric_name in browser_performance_metric_names(runner_metrics):
+        field_name = browser_performance_metric_row_field(metric_name)
+        if field_name in BROWSER_PERFORMANCE_ROW_FIELDS.values():
+            continue
+        values = []
+        for metric in runner_metrics:
+            browser_metrics = metric.get("browser_performance_metrics")
+            if not isinstance(browser_metrics, dict) or metric_name not in browser_metrics:
+                values = []
+                break
+            raw_value = browser_metrics[metric_name]
+            if not isinstance(raw_value, (int, float)) or isinstance(raw_value, bool):
+                values = []
+                break
+            values.append(metric_value_to_int(metric_name, raw_value))
+        fields[field_name] = percentile(values, 0.95) if values else None
+    return fields
 
 
 def optional_metric_percentile(
