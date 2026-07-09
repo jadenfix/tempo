@@ -30,6 +30,15 @@ EXPECTED_RUNNERS = {
 }
 TEMPO_RUNNER = "tempo-cdp-agent"
 RAW_CHROME_RUNNER = "raw-chrome-cdp"
+DEFAULT_RUNNER_ORDER = (
+    "tempo-cdp-agent",
+    "raw-chrome-cdp",
+    "synthetic-playwright-ax",
+    "synthetic-browser-use-dom",
+    "real-playwright",
+    "external-browser-use-dom-loop",
+    "real-browser-use",
+)
 TEMPO_RUNTIME_FLAVORS = {"multi-thread", "current-thread"}
 AGENT_STYLE_RUNNERS = {
     "tempo-cdp-agent",
@@ -308,6 +317,11 @@ def validate_runner_order_value(value: Any, *, context: str) -> list[str]:
     return runners
 
 
+def expected_runner_order(iteration: int) -> list[str]:
+    offset = (iteration - 1) % len(DEFAULT_RUNNER_ORDER)
+    return list(DEFAULT_RUNNER_ORDER[offset:] + DEFAULT_RUNNER_ORDER[:offset])
+
+
 def validate_runner_order_fields(metric: dict[str, Any]) -> None:
     has_order = "runner_order" in metric
     has_index = "runner_order_index" in metric
@@ -323,6 +337,12 @@ def validate_runner_order_fields(metric: dict[str, Any]) -> None:
         metric["runner_order"],
         context=f"{runner}.runner_order",
     )
+    expected_order = expected_runner_order(int(metric["iteration"]))
+    if runner_order != expected_order:
+        raise ValidationError(
+            f"{runner}.runner_order must match expected rotation for iteration "
+            f"{metric['iteration']}: expected={expected_order} got={runner_order}"
+        )
     require_int(metric, "runner_order_index", positive=True)
     index = int(metric["runner_order_index"])
     if index > len(runner_order):
@@ -354,6 +374,12 @@ def validate_runner_orders_report(
             context=f"runner_orders[{iteration_key}]",
         )
         iteration = int(iteration_key)
+        expected_order = expected_runner_order(iteration)
+        if runner_order != expected_order:
+            raise ValidationError(
+                f"runner_orders[{iteration_key}] must match expected rotation: "
+                f"expected={expected_order} got={runner_order}"
+            )
         iteration_metrics = [
             metric for metric in metrics if int(metric["iteration"]) == iteration
         ]
@@ -1554,6 +1580,12 @@ def validate_iteration_dir(iteration_dir: Path, iteration: int) -> list[dict[str
             report["runner_order"],
             context=f"{iteration_dir}/runner_order",
         )
+        expected_order = expected_runner_order(iteration)
+        if runner_order != expected_order:
+            raise ValidationError(
+                f"{iteration_dir}/runner_order must match expected rotation: "
+                f"expected={expected_order} got={runner_order}"
+            )
         for metric in metrics:
             if metric.get("runner_order") != runner_order:
                 raise ValidationError(

@@ -289,7 +289,7 @@ fi
 if [[ "$MODE" == "--full" ]]; then
   INNER_MODE="--full"
   BENCH_MODE="--full"
-  BENCH_EXPECTED_ITERATIONS="5"
+  BENCH_EXPECTED_ITERATIONS="7"
 else
   INNER_MODE="--smoke"
   BENCH_MODE="--smoke"

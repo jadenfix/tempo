@@ -32,6 +32,15 @@ SUITE = "live-agent-browser-bench"
 CASE_ID = "checkout-submit"
 TEMPO_RUNNER = "tempo-cdp-agent"
 RAW_CHROME_RUNNER = "raw-chrome-cdp"
+DEFAULT_RUNNER_ORDER = (
+    "tempo-cdp-agent",
+    "raw-chrome-cdp",
+    "synthetic-playwright-ax",
+    "synthetic-browser-use-dom",
+    "real-playwright",
+    "external-browser-use-dom-loop",
+    "real-browser-use",
+)
 AGENT_STYLE_RUNNERS = {
     "tempo-cdp-agent",
     "synthetic-playwright-ax",
@@ -2385,7 +2394,10 @@ def main() -> int:
         "--iterations",
         type=int,
         default=None,
-        help="number of benchmark iterations; defaults to 1 for smoke and 5 for --full",
+        help=(
+            "number of benchmark iterations; defaults to 1 for smoke and one "
+            "complete runner-order cycle for --full"
+        ),
     )
     parser.add_argument("--min-success-rate", type=float, default=None)
     parser.add_argument("--max-p95-wall-ms", type=int, default=None)
@@ -2403,7 +2415,11 @@ def main() -> int:
     output_dir = Path(args.output_dir)
     assert_safe_output_dir(output_dir)
     clean_output_dir(output_dir)
-    iterations = args.iterations if args.iterations is not None else (5 if args.full else 1)
+    iterations = (
+        args.iterations
+        if args.iterations is not None
+        else (len(DEFAULT_RUNNER_ORDER) if args.full else 1)
+    )
     if iterations < 1:
         raise RuntimeError("--iterations must be >= 1")
     resolved_chrome_version = chrome_version(args.chrome)
@@ -2462,6 +2478,8 @@ def main() -> int:
                     ),
                 ),
             ]
+            if tuple(runner for runner, _run in runner_plan) != DEFAULT_RUNNER_ORDER:
+                raise RuntimeError("runner plan order does not match DEFAULT_RUNNER_ORDER")
             ordered_runner_plan = rotate_runner_plan(runner_plan, iteration)
             runner_order = [runner for runner, _run in ordered_runner_plan]
             runner_orders[str(iteration)] = runner_order
