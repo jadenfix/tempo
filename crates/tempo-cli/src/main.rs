@@ -1113,14 +1113,13 @@ fn run_cdp_task(config: RunCdpTaskConfig) -> Result<RunCdpTaskReport, CliError> 
         let run_result = runner.run_driver_task(&mut driver, &task).await;
         timings_ms.agent_run_ms = Some(elapsed_ms(agent_run_started));
         let browser_performance_metrics_result = driver.browser_performance_metrics().await;
-        let web_performance_metrics_result = collect_web_performance_metrics(&mut driver).await;
-        let final_page_state = collect_final_page_state(&mut driver).await;
+        let benchmark_page_report_result = collect_benchmark_page_report(&mut driver).await;
         let driver_close_started = Instant::now();
         let close_result = driver.close().await;
         timings_ms.driver_close_ms = Some(elapsed_ms(driver_close_started));
         let report = run_result?;
         let browser_performance_metrics = browser_performance_metrics_result?;
-        let web_performance_metrics = web_performance_metrics_result?;
+        let (web_performance_metrics, final_page_state) = benchmark_page_report_result?;
         close_result?;
         timings_ms.total_wall_clock_ms = elapsed_ms(total_started);
         Ok(RunCdpTaskReport::from_agent_report(
@@ -1132,26 +1131,6 @@ fn run_cdp_task(config: RunCdpTaskConfig) -> Result<RunCdpTaskReport, CliError> 
         ))
     })
 }
-
-const FINAL_PAGE_STATE_SCRIPT: &str = r#"
-(() => {
-  const email = document.querySelector('#email')?.value || '';
-  const remember = document.querySelector('#remember')?.getAttribute('aria-checked') === 'true';
-  const status = document.querySelector('#status');
-  const statusText = status?.textContent?.trim() || '';
-  const statusDone = status?.dataset?.done === 'true';
-  return {
-    email_value: email,
-    email_matches: email === 'agent@example.com',
-    remember_checked: remember,
-    remember_checked_inferred: false,
-    status_text: statusText,
-    status_done: statusDone,
-    submitted: email === 'agent@example.com' && remember && statusDone && statusText === 'Order submitted',
-    source: 'tempo-final-page-state'
-  };
-})()
-"#;
 
 const WEB_PERFORMANCE_METRIC_NAMES: &[&str] = &[
     "navigation_start_ms",
@@ -1188,7 +1167,7 @@ const WEB_PERFORMANCE_METRIC_NAMES: &[&str] = &[
     "long_task_max_duration_ms",
 ];
 
-const WEB_PERFORMANCE_SCRIPT: &str = r#"
+const BENCHMARK_PAGE_REPORT_SCRIPT: &str = r#"
 (async () => {
   const n = (value) => Number.isFinite(Number(value)) ? Math.round(Number(value)) : 0;
   const nav = performance.getEntriesByType('navigation')[0] || null;
@@ -1220,53 +1199,78 @@ const WEB_PERFORMANCE_SCRIPT: &str = r#"
   })();
   const sum = (entries, field) => entries.reduce((total, entry) => total + n(entry[field]), 0);
   const max = (entries, field) => entries.reduce((largest, entry) => Math.max(largest, n(entry[field])), 0);
+  const email = document.querySelector('#email')?.value || '';
+  const remember = document.querySelector('#remember')?.getAttribute('aria-checked') === 'true';
+  const status = document.querySelector('#status');
+  const statusText = status?.textContent?.trim() || '';
+  const statusDone = status?.dataset?.done === 'true';
   return {
-    navigation_start_ms: nav ? n(nav.startTime) : 0,
-    navigation_duration_ms: nav ? n(nav.duration) : 0,
-    worker_start_ms: nav ? n(nav.workerStart) : 0,
-    redirect_start_ms: nav ? n(nav.redirectStart) : 0,
-    redirect_end_ms: nav ? n(nav.redirectEnd) : 0,
-    fetch_start_ms: nav ? n(nav.fetchStart) : 0,
-    domain_lookup_start_ms: nav ? n(nav.domainLookupStart) : 0,
-    domain_lookup_end_ms: nav ? n(nav.domainLookupEnd) : 0,
-    connect_start_ms: nav ? n(nav.connectStart) : 0,
-    connect_end_ms: nav ? n(nav.connectEnd) : 0,
-    secure_connection_start_ms: nav ? n(nav.secureConnectionStart) : 0,
-    request_start_ms: nav ? n(nav.requestStart) : 0,
-    response_start_ms: nav ? n(nav.responseStart) : 0,
-    response_end_ms: nav ? n(nav.responseEnd) : 0,
-    dom_interactive_ms: nav ? n(nav.domInteractive) : 0,
-    dom_content_loaded_start_ms: nav ? n(nav.domContentLoadedEventStart) : 0,
-    dom_content_loaded_ms: nav ? n(nav.domContentLoadedEventEnd) : 0,
-    dom_complete_ms: nav ? n(nav.domComplete) : 0,
-    load_event_start_ms: nav ? n(nav.loadEventStart) : 0,
-    load_event_ms: nav ? n(nav.loadEventEnd) : 0,
-    resource_count: resources.length,
-    resource_transfer_size_bytes: sum(resources, 'transferSize'),
-    resource_encoded_body_size_bytes: sum(resources, 'encodedBodySize'),
-    resource_decoded_body_size_bytes: sum(resources, 'decodedBodySize'),
-    resource_duration_ms: sum(resources, 'duration'),
-    resource_max_duration_ms: max(resources, 'duration'),
-    resource_response_end_ms: max(resources, 'responseEnd'),
-    first_paint_ms: paints['first-paint'] || 0,
-    first_contentful_paint_ms: paints['first-contentful-paint'] || 0,
-    long_task_count: longTasks.length,
-    long_task_duration_ms: sum(longTasks, 'duration'),
-    long_task_max_duration_ms: max(longTasks, 'duration')
+    web_performance_metrics: {
+      navigation_start_ms: nav ? n(nav.startTime) : 0,
+      navigation_duration_ms: nav ? n(nav.duration) : 0,
+      worker_start_ms: nav ? n(nav.workerStart) : 0,
+      redirect_start_ms: nav ? n(nav.redirectStart) : 0,
+      redirect_end_ms: nav ? n(nav.redirectEnd) : 0,
+      fetch_start_ms: nav ? n(nav.fetchStart) : 0,
+      domain_lookup_start_ms: nav ? n(nav.domainLookupStart) : 0,
+      domain_lookup_end_ms: nav ? n(nav.domainLookupEnd) : 0,
+      connect_start_ms: nav ? n(nav.connectStart) : 0,
+      connect_end_ms: nav ? n(nav.connectEnd) : 0,
+      secure_connection_start_ms: nav ? n(nav.secureConnectionStart) : 0,
+      request_start_ms: nav ? n(nav.requestStart) : 0,
+      response_start_ms: nav ? n(nav.responseStart) : 0,
+      response_end_ms: nav ? n(nav.responseEnd) : 0,
+      dom_interactive_ms: nav ? n(nav.domInteractive) : 0,
+      dom_content_loaded_start_ms: nav ? n(nav.domContentLoadedEventStart) : 0,
+      dom_content_loaded_ms: nav ? n(nav.domContentLoadedEventEnd) : 0,
+      dom_complete_ms: nav ? n(nav.domComplete) : 0,
+      load_event_start_ms: nav ? n(nav.loadEventStart) : 0,
+      load_event_ms: nav ? n(nav.loadEventEnd) : 0,
+      resource_count: resources.length,
+      resource_transfer_size_bytes: sum(resources, 'transferSize'),
+      resource_encoded_body_size_bytes: sum(resources, 'encodedBodySize'),
+      resource_decoded_body_size_bytes: sum(resources, 'decodedBodySize'),
+      resource_duration_ms: sum(resources, 'duration'),
+      resource_max_duration_ms: max(resources, 'duration'),
+      resource_response_end_ms: max(resources, 'responseEnd'),
+      first_paint_ms: paints['first-paint'] || 0,
+      first_contentful_paint_ms: paints['first-contentful-paint'] || 0,
+      long_task_count: longTasks.length,
+      long_task_duration_ms: sum(longTasks, 'duration'),
+      long_task_max_duration_ms: max(longTasks, 'duration')
+    },
+    final_page_state: {
+      email_value: email,
+      email_matches: email === 'agent@example.com',
+      remember_checked: remember,
+      remember_checked_inferred: false,
+      status_text: statusText,
+      status_done: statusDone,
+      submitted: email === 'agent@example.com' && remember && statusDone && statusText === 'Order submitted',
+      source: 'tempo-final-page-state'
+    }
   };
 })()
 "#;
 
-async fn collect_web_performance_metrics(
+async fn collect_benchmark_page_report(
     driver: &mut dyn DriverTrait,
-) -> Result<BTreeMap<String, u64>, CliError> {
-    let value = driver.evaluate_script(WEB_PERFORMANCE_SCRIPT, true).await?;
+) -> Result<(BTreeMap<String, u64>, Value), CliError> {
+    let value = driver
+        .evaluate_script(BENCHMARK_PAGE_REPORT_SCRIPT, true)
+        .await?;
     let object = value.as_object().ok_or_else(|| {
-        CliError::Usage("web performance metric script returned non-object".into())
+        CliError::Usage("benchmark page report script returned non-object".into())
     })?;
+    let web_object = object
+        .get("web_performance_metrics")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            CliError::Usage("benchmark page report missing web_performance_metrics".into())
+        })?;
     let mut metrics = BTreeMap::new();
     for key in WEB_PERFORMANCE_METRIC_NAMES {
-        let value = object
+        let value = web_object
             .get(*key)
             .and_then(|value| {
                 value
@@ -1277,23 +1281,20 @@ async fn collect_web_performance_metrics(
             .unwrap_or(0);
         metrics.insert((*key).to_string(), value);
     }
-    Ok(metrics)
-}
-
-async fn collect_final_page_state(driver: &mut dyn DriverTrait) -> Value {
-    match driver.evaluate_script(FINAL_PAGE_STATE_SCRIPT, true).await {
-        Ok(value) if value.is_object() => value,
-        Ok(_) => serde_json::json!({
+    let final_page_state = match object.get("final_page_state") {
+        Some(value) if value.is_object() => value.clone(),
+        Some(_) => serde_json::json!({
             "submitted": false,
             "source": "tempo-final-page-state",
             "error": "final_state_script_returned_non_object"
         }),
-        Err(error) => serde_json::json!({
+        None => serde_json::json!({
             "submitted": false,
             "source": "tempo-final-page-state",
-            "error": error.to_string()
+            "error": "missing_final_page_state"
         }),
-    }
+    };
+    Ok((metrics, final_page_state))
 }
 
 fn non_negative_f64_to_u64(value: f64) -> Option<u64> {
