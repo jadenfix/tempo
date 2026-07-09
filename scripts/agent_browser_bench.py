@@ -102,6 +102,15 @@ WEB_PERFORMANCE_ROW_FIELDS = {
     "long_task_duration_ms": "web_long_task_duration_ms_p95",
     "long_task_max_duration_ms": "web_long_task_max_duration_ms_p95",
 }
+TEMPO_CDP_OBSERVATION_COUNTER_FIELDS = (
+    "snapshot_since_count",
+    "record_snapshot_count",
+    "ax_full_tree_count",
+    "ax_partial_tree_count",
+    "observe_count",
+    "observe_diff_count",
+    "act_batch_count",
+)
 RANKED_WEB_PERFORMANCE_ROW_FIELDS = (
     "web_navigation_duration_ms_p95",
     "web_fetch_start_ms_p95",
@@ -935,6 +944,19 @@ def run_tempo(url: str, chrome: str, output_dir: Path) -> dict:
     web_metrics = report.get("web_performance_metrics")
     if not isinstance(web_metrics, dict):
         raise RuntimeError("tempo run report missing web_performance_metrics")
+    cdp_observation_counters = report.get("cdp_observation_counters")
+    if not isinstance(cdp_observation_counters, dict):
+        raise RuntimeError("tempo run report missing cdp_observation_counters")
+    missing_counter_fields = [
+        field
+        for field in TEMPO_CDP_OBSERVATION_COUNTER_FIELDS
+        if field not in cdp_observation_counters
+    ]
+    if missing_counter_fields:
+        raise RuntimeError(
+            "tempo run report cdp_observation_counters missing fields: "
+            f"{missing_counter_fields}"
+        )
     runtime_flavor = report.get("runtime_flavor")
     if runtime_flavor not in TEMPO_RUNTIME_FLAVORS:
         raise RuntimeError(f"tempo run report missing valid runtime_flavor: {runtime_flavor!r}")
@@ -1024,6 +1046,8 @@ def run_tempo(url: str, chrome: str, output_dir: Path) -> dict:
         ),
         "browser_performance_metrics": browser_metrics,
     }
+    for field in TEMPO_CDP_OBSERVATION_COUNTER_FIELDS:
+        metric[f"cdp_{field}"] = int(cdp_observation_counters[field])
     apply_browser_performance_metrics(metric, browser_metrics)
     apply_web_performance_metrics(
         metric,
@@ -1640,6 +1664,10 @@ def summarize_metrics(metrics: list[dict]) -> dict:
             summary[runner]["max_model_input_tokens"] = summarize_int_field(
                 runner_metrics, "max_model_input_tokens"
             )
+        for field in TEMPO_CDP_OBSERVATION_COUNTER_FIELDS:
+            metric_field = f"cdp_{field}"
+            if any(metric_field in metric for metric in runner_metrics):
+                summary[runner][metric_field] = summarize_int_field(runner_metrics, metric_field)
     return summary
 
 

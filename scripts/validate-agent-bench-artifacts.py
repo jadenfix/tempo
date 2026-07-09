@@ -109,6 +109,15 @@ WEB_PERFORMANCE_ROW_FIELDS = {
     "long_task_duration_ms": "web_long_task_duration_ms_p95",
     "long_task_max_duration_ms": "web_long_task_max_duration_ms_p95",
 }
+TEMPO_CDP_OBSERVATION_COUNTER_FIELDS = (
+    "snapshot_since_count",
+    "record_snapshot_count",
+    "ax_full_tree_count",
+    "ax_partial_tree_count",
+    "observe_count",
+    "observe_diff_count",
+    "act_batch_count",
+)
 RANKED_WEB_PERFORMANCE_ROW_FIELDS = (
     "web_navigation_duration_ms_p95",
     "web_fetch_start_ms_p95",
@@ -395,6 +404,17 @@ def validate_optional_memory_total(metric: dict[str, Any], total_field: str, map
         raise ValidationError(f"{runner}.{map_field} sum must equal {total_field}")
 
 
+def tempo_metric_has_cdp_observation_counters(metric: dict[str, Any]) -> bool:
+    return any(f"cdp_{field}" in metric for field in TEMPO_CDP_OBSERVATION_COUNTER_FIELDS)
+
+
+def validate_tempo_metric_cdp_observation_counters(metric: dict[str, Any]) -> None:
+    if not tempo_metric_has_cdp_observation_counters(metric):
+        return
+    for field in TEMPO_CDP_OBSERVATION_COUNTER_FIELDS:
+        require_int(metric, f"cdp_{field}")
+
+
 def artifact_path(output_dir: Path, stored_path: str) -> Path:
     path = Path(stored_path)
     if path.exists():
@@ -511,6 +531,7 @@ def validate_metric(metric: dict[str, Any], iterations: int, output_dir: Path) -
             raise ValidationError(
                 "tempo-cdp-agent.max_compact_observation_bytes must be <= max_observation_bytes"
             )
+        validate_tempo_metric_cdp_observation_counters(metric)
         validate_tempo_phase_timings(metric)
     validate_browser_performance_metrics(metric)
     validate_web_performance_metrics(metric)
@@ -760,6 +781,10 @@ def expected_summary(metrics: list[dict[str, Any]]) -> dict[str, Any]:
         ):
             if any(field in metric for metric in runner_metrics):
                 runner_summary[field] = summarize_int_field(runner_metrics, field)
+        for field in TEMPO_CDP_OBSERVATION_COUNTER_FIELDS:
+            metric_field = f"cdp_{field}"
+            if any(metric_field in metric for metric in runner_metrics):
+                runner_summary[metric_field] = summarize_int_field(runner_metrics, metric_field)
         summary[runner] = runner_summary
     return summary
 
@@ -1521,6 +1546,29 @@ def validate_tempo_derived_artifacts(
         raise ValidationError("tempo-run.json web_performance_metrics must match tempo metric")
     if run_report.get("final_page_state") != tempo.get("final_oracle"):
         raise ValidationError("tempo-run.json final_page_state must match tempo metric final_oracle")
+    cdp_observation_counters = run_report.get("cdp_observation_counters")
+    metric_has_cdp_counters = tempo_metric_has_cdp_observation_counters(tempo)
+    if cdp_observation_counters is None and not metric_has_cdp_counters:
+        pass
+    else:
+        if not isinstance(cdp_observation_counters, dict):
+            raise ValidationError("tempo-run.json cdp_observation_counters must be an object")
+        validate_tempo_metric_cdp_observation_counters(tempo)
+        missing_counter_fields = [
+            field
+            for field in TEMPO_CDP_OBSERVATION_COUNTER_FIELDS
+            if field not in cdp_observation_counters
+        ]
+        if missing_counter_fields:
+            raise ValidationError(
+                "tempo-run.json cdp_observation_counters missing fields: "
+                f"{missing_counter_fields}"
+            )
+        for field in TEMPO_CDP_OBSERVATION_COUNTER_FIELDS:
+            if int(cdp_observation_counters[field]) != int(tempo[f"cdp_{field}"]):
+                raise ValidationError(
+                    f"tempo-run.json cdp_observation_counters.{field} must match tempo metric"
+                )
     require_applied_steps(run_report_path, run_report.get("steps"), int(tempo["step_count"]))
 
     journal_count = sqlite_journal_entry_count(journal_path)
