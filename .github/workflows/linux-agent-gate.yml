@@ -19,6 +19,7 @@ on:
           - lifecycle
           - insert-text
           - no-incognito
+          - cache
           - all
         default: default
   schedule:

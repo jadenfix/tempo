@@ -107,6 +107,9 @@ pub const TEMPO_CDP_BENCH_INSERT_TEXT_TYPE_ENV: &str = "TEMPO_CDP_BENCH_INSERT_T
 /// Benchmark-only launch profile that uses the fresh temp `user_data_dir`
 /// directly instead of adding an incognito BrowserContext on top.
 pub const TEMPO_CDP_BENCH_NO_INCOGNITO_ENV: &str = "TEMPO_CDP_BENCH_NO_INCOGNITO";
+/// Benchmark-only cache profile used to compare against Playwright/raw Chrome
+/// baselines that do not force `Network.setCacheDisabled(true)`.
+pub const TEMPO_CDP_BENCH_ENABLE_CACHE_ENV: &str = "TEMPO_CDP_BENCH_ENABLE_CACHE";
 
 /// Launch configuration for the CDP fallback lane.
 #[derive(Clone, Debug)]
@@ -129,6 +132,9 @@ pub struct CdpConfig {
     /// Benchmark-only launch mode that relies on Tempo's fresh temp profile for
     /// storage isolation instead of wrapping it in an incognito context.
     pub bench_no_incognito: bool,
+    /// Benchmark-only cache mode. Defaults off so production/local launches keep
+    /// the historical no-cache isolation behavior.
+    pub bench_enable_cache: bool,
     /// Initial URL policy installed before the browser starts issuing traffic.
     url_policy: UrlPolicy,
     /// Trusted-fixture optimization: rely on Tempo's mandatory policy proxy for
@@ -203,6 +209,18 @@ impl CdpConfig {
         self
     }
 
+    pub fn with_bench_enable_cache(mut self) -> Self {
+        self.bench_enable_cache = true;
+        self
+    }
+
+    pub fn with_bench_enable_cache_env_opt_in(mut self) -> Self {
+        if env_flag_enabled(TEMPO_CDP_BENCH_ENABLE_CACHE_ENV) {
+            self.bench_enable_cache = true;
+        }
+        self
+    }
+
     pub fn with_allow_all_url_policy(mut self) -> Self {
         self.url_policy = UrlPolicy::allow_all();
         self
@@ -218,8 +236,10 @@ impl CdpConfig {
             .headless_mode(HeadlessMode::New)
             .launch_timeout(self.launch_timeout)
             .request_timeout(CDP_REQUEST_TIMEOUT)
-            .user_data_dir(user_data_dir)
-            .disable_cache();
+            .user_data_dir(user_data_dir);
+        if !self.bench_enable_cache {
+            builder = builder.disable_cache();
+        }
         if !self.bench_no_incognito {
             builder = builder.incognito();
         }
@@ -258,6 +278,7 @@ impl Default for CdpConfig {
             args: Vec::new(),
             bench_insert_text_type: false,
             bench_no_incognito: false,
+            bench_enable_cache: false,
             url_policy: UrlPolicy::block_private(),
             proxy_only_request_policy: false,
         }
@@ -4502,6 +4523,18 @@ mod tests {
             !config.cache_enabled,
             "launch keeps the previous no-cache behavior while avoiding duplicate Fetch.enable"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn benchmark_cache_profile_leaves_chrome_cache_enabled(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let config = CdpConfig::default()
+            .with_bench_enable_cache()
+            .browser_config(temp.path())?;
+
+        assert!(config.cache_enabled);
         Ok(())
     }
 

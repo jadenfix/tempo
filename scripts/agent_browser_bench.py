@@ -1004,6 +1004,9 @@ def run_tempo(url: str, chrome: str, output_dir: Path) -> dict:
             if env.get("TEMPO_CDP_BENCH_NO_INCOGNITO") == "1"
             else "incognito-context"
         ),
+        "cdp_browser_cache": (
+            "enabled" if env.get("TEMPO_CDP_BENCH_ENABLE_CACHE") == "1" else "disabled"
+        ),
         "tempo_phase_timings_ms": timings,
         "browser_performance_metrics_available": bool(
             report.get("browser_performance_metrics_available")

@@ -91,10 +91,10 @@ esac
 reject_unsafe_host_env
 
 case "$BENCH_PROFILE" in
-  default | lifecycle | insert-text | no-incognito | all) ;;
+  default | lifecycle | insert-text | no-incognito | cache | all) ;;
   *)
     echo "unsupported TEMPO_LINUX_AGENT_BENCH_PROFILE: ${BENCH_PROFILE}" >&2
-    echo "supported values: default, lifecycle, insert-text, no-incognito, all" >&2
+    echo "supported values: default, lifecycle, insert-text, no-incognito, cache, all" >&2
     exit 2
     ;;
 esac
@@ -232,11 +232,15 @@ case "$BENCH_PROFILE" in
   no-incognito)
     COMMON_ENV+=(-e TEMPO_CDP_BENCH_NO_INCOGNITO=1)
     ;;
+  cache)
+    COMMON_ENV+=(-e TEMPO_CDP_BENCH_ENABLE_CACHE=1)
+    ;;
   all)
     COMMON_ENV+=(
       -e TEMPO_CDP_BENCH_PLAYWRIGHT_LIFECYCLE_ARGS=1
       -e TEMPO_CDP_BENCH_INSERT_TEXT_TYPE=1
       -e TEMPO_CDP_BENCH_NO_INCOGNITO=1
+      -e TEMPO_CDP_BENCH_ENABLE_CACHE=1
     )
     ;;
 esac

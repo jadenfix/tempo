@@ -72,6 +72,7 @@ require(
     and 'TEMPO_CDP_BENCH_PLAYWRIGHT_LIFECYCLE_ARGS=1' in text
     and 'TEMPO_CDP_BENCH_INSERT_TEXT_TYPE=1' in text
     and 'TEMPO_CDP_BENCH_NO_INCOGNITO=1' in text
+    and 'TEMPO_CDP_BENCH_ENABLE_CACHE=1' in text
     and '-e "TEMPO_LINUX_AGENT_BENCH_PROFILE=${BENCH_PROFILE}"' in text,
     'Docker command must support named browser benchmark optimization profiles',
 )
