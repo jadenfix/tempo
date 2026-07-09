@@ -31,7 +31,7 @@ use chromiumoxide::cdp::js_protocol::runtime::{
 use chromiumoxide::error::CdpError;
 use chromiumoxide::page::Page;
 use futures::{future::join_all, StreamExt};
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -107,6 +107,12 @@ pub const TEMPO_CDP_BENCH_INSERT_TEXT_TYPE_ENV: &str = "TEMPO_CDP_BENCH_INSERT_T
 /// Benchmark-only launch profile that uses the fresh temp `user_data_dir`
 /// directly instead of adding an incognito BrowserContext on top.
 pub const TEMPO_CDP_BENCH_NO_INCOGNITO_ENV: &str = "TEMPO_CDP_BENCH_NO_INCOGNITO";
+/// Benchmark-only cache profile used to compare against Playwright/raw Chrome
+/// baselines that do not force `Network.setCacheDisabled(true)`.
+pub const TEMPO_CDP_BENCH_ENABLE_CACHE_ENV: &str = "TEMPO_CDP_BENCH_ENABLE_CACHE";
+/// Benchmark-only launch profile that suppresses Linux desktop-integration
+/// helper probes so process-count metrics stay focused on browser work.
+pub const TEMPO_CDP_BENCH_SUPPRESS_DESKTOP_ENV: &str = "TEMPO_CDP_BENCH_SUPPRESS_DESKTOP";
 
 /// Launch configuration for the CDP fallback lane.
 #[derive(Clone, Debug)]
@@ -129,6 +135,19 @@ pub struct CdpConfig {
     /// Benchmark-only launch mode that relies on Tempo's fresh temp profile for
     /// storage isolation instead of wrapping it in an incognito context.
     pub bench_no_incognito: bool,
+    /// Benchmark-only cache mode. Defaults off so production/local launches keep
+    /// the historical no-cache isolation behavior.
+    pub bench_enable_cache: bool,
+    /// Benchmark-only Linux desktop-integration suppression. This is scoped to
+    /// synthetic browser benchmarks because production launches should inherit
+    /// the user's desktop environment normally.
+    pub bench_suppress_desktop: bool,
+    /// Initial URL policy installed before the browser starts issuing traffic.
+    url_policy: UrlPolicy,
+    /// Trusted-fixture optimization: rely on Tempo's mandatory policy proxy for
+    /// HTTP(S) request enforcement instead of also pausing every request via
+    /// CDP Fetch interception.
+    proxy_only_request_policy: bool,
 }
 
 impl CdpConfig {
@@ -197,14 +216,49 @@ impl CdpConfig {
         self
     }
 
+    pub fn with_bench_enable_cache(mut self) -> Self {
+        self.bench_enable_cache = true;
+        self
+    }
+
+    pub fn with_bench_enable_cache_env_opt_in(mut self) -> Self {
+        if env_flag_enabled(TEMPO_CDP_BENCH_ENABLE_CACHE_ENV) {
+            self.bench_enable_cache = true;
+        }
+        self
+    }
+
+    pub fn with_bench_suppress_desktop(mut self) -> Self {
+        self.bench_suppress_desktop = true;
+        self
+    }
+
+    pub fn with_bench_suppress_desktop_env_opt_in(mut self) -> Self {
+        if env_flag_enabled(TEMPO_CDP_BENCH_SUPPRESS_DESKTOP_ENV) {
+            self.bench_suppress_desktop = true;
+        }
+        self
+    }
+
+    pub fn with_allow_all_url_policy(mut self) -> Self {
+        self.url_policy = UrlPolicy::allow_all();
+        self
+    }
+
+    pub fn with_proxy_only_request_policy(mut self) -> Self {
+        self.proxy_only_request_policy = true;
+        self
+    }
+
     fn browser_config(&self, user_data_dir: &Path) -> Result<BrowserConfig, TransportError> {
         let mut builder = BrowserConfig::builder()
             .headless_mode(HeadlessMode::New)
             .launch_timeout(self.launch_timeout)
             .request_timeout(CDP_REQUEST_TIMEOUT)
-            .user_data_dir(user_data_dir)
-            .enable_request_intercept()
-            .disable_cache();
+            .user_data_dir(user_data_dir);
+        if !self.bench_enable_cache {
+            builder = builder.disable_cache();
+        }
         if !self.bench_no_incognito {
             builder = builder.incognito();
         }
@@ -214,8 +268,13 @@ impl CdpConfig {
         if let Some(path) = &self.executable {
             builder = builder.chrome_executable(path);
         }
-        if !self.args.is_empty() {
-            builder = builder.args(self.args.clone());
+        let mut launch_args = self.args.clone();
+        if self.bench_suppress_desktop {
+            launch_args.extend(desktop_suppression_launch_args());
+            builder = builder.envs(desktop_suppression_env());
+        }
+        if !launch_args.is_empty() {
+            builder = builder.args(normalize_chromium_launch_args(launch_args));
         }
         builder.build().map_err(TransportError::Other)
     }
@@ -243,6 +302,10 @@ impl Default for CdpConfig {
             args: Vec::new(),
             bench_insert_text_type: false,
             bench_no_incognito: false,
+            bench_enable_cache: false,
+            bench_suppress_desktop: false,
+            url_policy: UrlPolicy::block_private(),
+            proxy_only_request_policy: false,
         }
     }
 }
@@ -286,8 +349,10 @@ impl CdpTempoDriver {
             .map_err(|error| {
                 TransportError::Other(format!("failed to create private CDP profile: {error}"))
             })?;
-        let url_policy = Arc::new(Mutex::new(UrlPolicy::block_private()));
-        let browser_hardening_policy = Arc::new(Mutex::new(BrowserHardeningPolicy::standard()));
+        let url_policy = Arc::new(Mutex::new(config.url_policy.clone()));
+        let browser_hardening_policy = Arc::new(Mutex::new(
+            BrowserHardeningPolicy::standard().with_url_policy(config.url_policy.clone()),
+        ));
         let blocked_request_url = Arc::new(Mutex::new(None));
         let request_policy_tracker = Arc::new(RequestPolicyTracker::new());
         let policy_proxy = PolicyProxy::start(
@@ -316,20 +381,24 @@ impl CdpTempoDriver {
             }
         };
         close_unmanaged_pages(&browser, &page).await;
-        let request_policy_task = match install_request_policy(
-            &page,
-            browser_hardening_policy.clone(),
-            blocked_request_url.clone(),
-            request_policy_tracker.clone(),
-        )
-        .await
-        {
-            Ok(task) => task,
-            Err(error) => {
-                let _ = browser.close().await;
-                let _ = browser.wait().await;
-                handler_task.abort();
-                return Err(error);
+        let request_policy_task = if launch_config.proxy_only_request_policy {
+            None
+        } else {
+            match install_request_policy(
+                &page,
+                browser_hardening_policy.clone(),
+                blocked_request_url.clone(),
+                request_policy_tracker.clone(),
+            )
+            .await
+            {
+                Ok(task) => Some(task),
+                Err(error) => {
+                    let _ = browser.close().await;
+                    let _ = browser.wait().await;
+                    handler_task.abort();
+                    return Err(error);
+                }
             }
         };
 
@@ -337,7 +406,7 @@ impl CdpTempoDriver {
             browser,
             page: Some(page),
             handler_task,
-            request_policy_task: Some(request_policy_task),
+            request_policy_task,
             policy_proxy: Some(policy_proxy),
             browser_context_id: None,
             profile_dir: Some(profile_dir),
@@ -692,18 +761,22 @@ impl CdpTempoDriver {
             .new_page(page_params)
             .await
             .map_err(map_cdp_error)?;
-        let new_policy_task = match install_request_policy(
-            &new_page,
-            self.browser_hardening_policy.clone(),
-            self.blocked_request_url.clone(),
-            self.request_policy_tracker.clone(),
-        )
-        .await
-        {
-            Ok(task) => task,
-            Err(error) => {
-                let _ = new_page.close().await;
-                return Err(error);
+        let new_policy_task = if self.launch_config.proxy_only_request_policy {
+            None
+        } else {
+            match install_request_policy(
+                &new_page,
+                self.browser_hardening_policy.clone(),
+                self.blocked_request_url.clone(),
+                self.request_policy_tracker.clone(),
+            )
+            .await
+            {
+                Ok(task) => Some(task),
+                Err(error) => {
+                    let _ = new_page.close().await;
+                    return Err(error);
+                }
             }
         };
 
@@ -711,7 +784,7 @@ impl CdpTempoDriver {
             task.abort();
         }
         let old_page = self.page.replace(new_page);
-        self.request_policy_task = Some(new_policy_task);
+        self.request_policy_task = new_policy_task;
         if let Ok(mut guard) = self.probe_context.lock() {
             *guard = None;
         }
@@ -1359,6 +1432,56 @@ fn playwright_lifecycle_launch_args() -> Vec<String> {
     ]
 }
 
+fn desktop_suppression_launch_args() -> Vec<String> {
+    vec![
+        "--no-service-autorun".to_string(),
+        "--disable-search-engine-choice-screen".to_string(),
+        "--disable-features=DialMediaRouteProvider,MediaRouter,OptimizationHints,TranslateUI"
+            .to_string(),
+    ]
+}
+
+fn normalize_chromium_launch_args(args: Vec<String>) -> Vec<String> {
+    let mut merged_disable_features = BTreeSet::new();
+    let mut normalized = Vec::with_capacity(args.len());
+    for arg in args {
+        if let Some(features) = arg.strip_prefix("--disable-features=") {
+            for feature in features
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                merged_disable_features.insert(feature.to_string());
+            }
+        } else {
+            normalized.push(arg);
+        }
+    }
+    if !merged_disable_features.is_empty() {
+        normalized.push(format!(
+            "--disable-features={}",
+            merged_disable_features
+                .into_iter()
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+    }
+    normalized
+}
+
+fn desktop_suppression_env() -> Vec<(String, String)> {
+    vec![
+        ("BROWSER".to_string(), "true".to_string()),
+        (
+            "PATH".to_string(),
+            "/usr/local/sbin:/usr/local/bin:/sbin:/bin".to_string(),
+        ),
+        ("XDG_CURRENT_DESKTOP".to_string(), "tempo-bench".to_string()),
+        ("XDG_SESSION_DESKTOP".to_string(), "tempo-bench".to_string()),
+        ("XDG_UTILS_DEBUG_LEVEL".to_string(), "0".to_string()),
+    ]
+}
+
 impl Drop for CdpTempoDriver {
     fn drop(&mut self) {
         self.handler_task.abort();
@@ -1470,6 +1593,10 @@ impl DriverTrait for CdpTempoDriver {
         }
 
         Ok(extracted)
+    }
+
+    async fn current_url(&mut self) -> Result<Option<String>, TransportError> {
+        self.enforce_current_url_policy().await.map(Some)
     }
 
     async fn evaluate_script(
@@ -2124,6 +2251,11 @@ async fn connect_policy_target(
 ) -> Result<TcpStream, PolicyProxyConnectError> {
     enforce_browser_hardening_policy(url, policy)
         .map_err(|_error| PolicyProxyConnectError::PolicyBlocked)?;
+    if policy.url_policy().is_allow_all() {
+        return TcpStream::connect((host, port))
+            .await
+            .map_err(|_error| PolicyProxyConnectError::UpstreamUnavailable);
+    }
     let mut addrs = tokio::net::lookup_host((host, port))
         .await
         .map_err(|_error| PolicyProxyConnectError::UpstreamUnavailable)?
@@ -2763,11 +2895,30 @@ where
 /// selects which elements become set-of-marks labels, so enrichment covers the
 /// same elements that survive into the compiled observation.
 fn top_ranked_indices(elements: &[InteractiveElement], limit: usize) -> Vec<usize> {
-    let mut indices: Vec<usize> = (0..elements.len()).collect();
-    // Stable sort by rank descending; equal ranks retain their original
-    // (document) order, matching the marks compositor's selection.
-    indices.sort_by(|&a, &b| elements[b].rank.total_cmp(&elements[a].rank));
-    indices.truncate(limit);
+    if limit == 0 || elements.is_empty() {
+        return Vec::new();
+    }
+
+    let mut indices: Vec<usize> = Vec::with_capacity(limit.min(elements.len()));
+    for index in 0..elements.len() {
+        let insertion = indices.iter().position(|&selected| {
+            elements[index]
+                .rank
+                .total_cmp(&elements[selected].rank)
+                .is_gt()
+        });
+        match insertion {
+            Some(position) => {
+                indices.insert(position, index);
+                if indices.len() > limit {
+                    indices.pop();
+                }
+            }
+            None if indices.len() < limit => indices.push(index),
+            None => {}
+        }
+    }
+
     // Enrich in document order for deterministic, natural traversal.
     indices.sort_unstable();
     indices
@@ -2805,35 +2956,33 @@ fn diff_from_base(
         };
     };
 
-    let before: HashMap<_, _> = base
+    let before: HashMap<&str, &InteractiveElement> = base
         .elements
         .iter()
-        .map(|element| (element.node_id.0.clone(), element))
-        .collect();
-    let after: HashMap<_, _> = current
-        .elements
-        .iter()
-        .map(|element| (element.node_id.0.clone(), element))
+        .map(|element| (element.node_id.0.as_str(), element))
         .collect();
 
-    let added = after
+    let current_ids: HashSet<&str> = current
+        .elements
         .iter()
-        .filter(|(node, _)| !before.contains_key(*node))
-        .map(|(_, element)| (*element).clone())
+        .map(|element| element.node_id.0.as_str())
         .collect();
-    let removed = before
+
+    let mut added = Vec::new();
+    let mut changed = Vec::new();
+    for element in &current.elements {
+        match before.get(element.node_id.0.as_str()) {
+            None => added.push(element.clone()),
+            Some(previous) if *previous != element => changed.push(element.clone()),
+            Some(_) => {}
+        }
+    }
+
+    let removed = base
+        .elements
         .iter()
-        .filter(|(node, _)| !after.contains_key(*node))
-        .map(|(_, element)| element.node_id.clone())
-        .collect();
-    let changed = after
-        .iter()
-        .filter_map(|(node, element)| {
-            before
-                .get(node)
-                .filter(|previous| *previous != element)
-                .map(|_| (*element).clone())
-        })
+        .filter(|element| !current_ids.contains(element.node_id.0.as_str()))
+        .map(|element| element.node_id.clone())
         .collect();
 
     ObservationDiff {
@@ -4436,6 +4585,35 @@ mod tests {
     }
 
     #[test]
+    fn browser_config_leaves_request_interception_to_tempo_policy_layer(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let config = CdpConfig::default().browser_config(temp.path())?;
+
+        assert!(
+            !config.request_intercept,
+            "Tempo installs Fetch interception explicitly in install_request_policy"
+        );
+        assert!(
+            !config.cache_enabled,
+            "launch keeps the previous no-cache behavior while avoiding duplicate Fetch.enable"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn benchmark_cache_profile_leaves_chrome_cache_enabled(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let config = CdpConfig::default()
+            .with_bench_enable_cache()
+            .browser_config(temp.path())?;
+
+        assert!(config.cache_enabled);
+        Ok(())
+    }
+
+    #[test]
     fn playwright_lifecycle_launch_args_match_browser_baseline_lifecycle_flags() {
         let args = playwright_lifecycle_launch_args();
 
@@ -4444,6 +4622,72 @@ mod tests {
             .iter()
             .any(|arg| arg == "--disable-features=PaintHolding,RenderDocument"));
         assert!(!args.iter().any(|arg| is_policy_proxy_arg(arg)));
+    }
+
+    #[test]
+    fn normalizes_duplicate_disable_features_launch_args() {
+        let args = normalize_chromium_launch_args(vec![
+            "--disable-features=PaintHolding,RenderDocument".to_string(),
+            "--no-service-autorun".to_string(),
+            "--disable-features=MediaRouter,PaintHolding".to_string(),
+        ]);
+        let disable_features = args
+            .iter()
+            .filter(|arg| arg.starts_with("--disable-features="))
+            .collect::<Vec<_>>();
+
+        assert_eq!(disable_features.len(), 1);
+        assert_eq!(
+            disable_features[0],
+            "--disable-features=MediaRouter,PaintHolding,RenderDocument"
+        );
+        assert!(args.iter().any(|arg| arg == "--no-service-autorun"));
+    }
+
+    #[test]
+    fn desktop_suppression_profile_is_explicit_and_benchmark_only(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        assert!(!CdpConfig::default().bench_suppress_desktop);
+
+        let temp = tempfile::tempdir()?;
+        let config = CdpConfig::default()
+            .with_bench_suppress_desktop()
+            .browser_config(temp.path())?;
+        let Some(envs) = config.process_envs.as_ref() else {
+            return Err("desktop suppression must set Chrome child env vars".into());
+        };
+
+        assert_eq!(envs.get("BROWSER").map(String::as_str), Some("true"));
+        assert_eq!(
+            envs.get("PATH").map(String::as_str),
+            Some("/usr/local/sbin:/usr/local/bin:/sbin:/bin")
+        );
+        assert_eq!(
+            envs.get("XDG_CURRENT_DESKTOP").map(String::as_str),
+            Some("tempo-bench")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cdp_config_defaults_to_fetch_request_policy_and_block_private() {
+        let config = CdpConfig::default();
+
+        assert!(!config.url_policy.is_allow_all());
+        assert!(
+            !config.proxy_only_request_policy,
+            "default launches must keep Fetch request interception installed"
+        );
+    }
+
+    #[test]
+    fn trusted_proxy_only_policy_requires_explicit_config() {
+        let config = CdpConfig::default()
+            .with_allow_all_url_policy()
+            .with_proxy_only_request_policy();
+
+        assert!(config.url_policy.is_allow_all());
+        assert!(config.proxy_only_request_policy);
     }
 
     #[test]
@@ -4622,6 +4866,64 @@ mod tests {
             Some(expected_blocked_url.as_str())
         );
         assert!(request_policy_tracker.has_blocked_since(cursor));
+        drop(proxy);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn policy_proxy_allow_all_forwards_http_loopback(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let origin = TokioTcpListener::bind(("127.0.0.1", 0)).await?;
+        let origin_addr = origin.local_addr()?;
+        let origin_task = tokio::spawn(async move {
+            let (mut stream, _peer) = origin.accept().await?;
+            let mut request = [0_u8; 512];
+            let read = stream.read(&mut request).await?;
+            let request = std::str::from_utf8(&request[..read])
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
+            if !request.starts_with("GET /ok HTTP/1.1") {
+                return Err(std::io::Error::other(format!(
+                    "unexpected forwarded request: {request:?}"
+                )));
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await?;
+            Ok::<(), std::io::Error>(())
+        });
+
+        let blocked_request_url = Arc::new(Mutex::new(None));
+        let request_policy_tracker = Arc::new(RequestPolicyTracker::new());
+        let cursor = request_policy_tracker.cursor();
+        let proxy = PolicyProxy::start(
+            Arc::new(Mutex::new(
+                BrowserHardeningPolicy::standard().with_url_policy(UrlPolicy::allow_all()),
+            )),
+            blocked_request_url.clone(),
+            request_policy_tracker.clone(),
+        )
+        .await?;
+        let mut client = TcpStream::connect(proxy.addr).await?;
+        let request = format!(
+            "GET http://{origin_addr}/ok HTTP/1.1\r\nHost: {origin_addr}\r\nConnection: close\r\n\r\n"
+        );
+        client.write_all(request.as_bytes()).await?;
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await?;
+        let response = std::str::from_utf8(&response)?;
+
+        assert!(response.starts_with("HTTP/1.1 204 No Content"));
+        assert_eq!(
+            blocked_request_url
+                .lock()
+                .map_err(|_error| std::io::Error::other("blocked URL lock poisoned"))?
+                .as_deref(),
+            None
+        );
+        assert!(!request_policy_tracker.has_blocked_since(cursor));
+        origin_task.await??;
         drop(proxy);
         Ok(())
     }
@@ -5893,6 +6195,7 @@ mod tests {
         // Cap of 2: the two highest ranks are the three 0.9s; ties break by
         // document order, so indices 1 and 2 win and are returned in order.
         assert_eq!(top_ranked_indices(&elements, 2), vec![1, 2]);
+        assert_eq!(top_ranked_indices(&elements, 0), Vec::<usize>::new());
         // A cap at/above the length keeps every index in document order.
         assert_eq!(top_ranked_indices(&elements, 16), vec![0, 1, 2, 3, 4]);
     }

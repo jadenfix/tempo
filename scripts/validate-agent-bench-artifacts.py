@@ -30,6 +30,7 @@ EXPECTED_RUNNERS = {
 }
 TEMPO_RUNNER = "tempo-cdp-agent"
 RAW_CHROME_RUNNER = "raw-chrome-cdp"
+TEMPO_RUNTIME_FLAVORS = {"multi-thread", "current-thread"}
 AGENT_STYLE_RUNNERS = {
     "tempo-cdp-agent",
     "synthetic-playwright-ax",
@@ -103,6 +104,27 @@ WEB_PERFORMANCE_ROW_FIELDS = {
     "long_task_duration_ms": "web_long_task_duration_ms_p95",
     "long_task_max_duration_ms": "web_long_task_max_duration_ms_p95",
 }
+RANKED_WEB_PERFORMANCE_ROW_FIELDS = (
+    "web_navigation_duration_ms_p95",
+    "web_fetch_start_ms_p95",
+    "web_request_start_ms_p95",
+    "web_response_start_ms_p95",
+    "web_response_end_ms_p95",
+    "web_dom_interactive_ms_p95",
+    "web_dom_content_loaded_start_ms_p95",
+    "web_dom_content_loaded_ms_p95",
+    "web_dom_complete_ms_p95",
+    "web_load_event_start_ms_p95",
+    "web_load_event_ms_p95",
+    "web_resource_duration_ms_p95",
+    "web_resource_max_duration_ms_p95",
+    "web_resource_response_end_ms_p95",
+    "web_first_paint_ms_p95",
+    "web_first_contentful_paint_ms_p95",
+    "web_long_task_count_p95",
+    "web_long_task_duration_ms_p95",
+    "web_long_task_max_duration_ms_p95",
+)
 
 REQUIRED_METRIC_FIELDS = {
     "runner",
@@ -126,6 +148,8 @@ REQUIRED_METRIC_FIELDS = {
     "rss_at_peak_by_process_type_bytes",
     "peak_rss_by_process_type_bytes",
     "rss_peak_elapsed_ms",
+    "max_process_count",
+    "max_process_count_by_type",
     "process_count_at_peak",
     "process_count_at_peak_by_type",
     "processes_at_peak",
@@ -144,6 +168,7 @@ INT_FIELDS = {
     "cpu_system_ms",
     "max_rss_bytes",
     "rss_peak_elapsed_ms",
+    "max_process_count",
     "process_count_at_peak",
     "iteration",
 }
@@ -258,14 +283,22 @@ def require_int_map(metric: dict[str, Any], field: str, *, positive: bool = Fals
             raise ValidationError(f"{runner}.{field}.{key} must be > 0")
 
 
-def validate_processes_at_peak(metric: dict[str, Any]) -> None:
+def validate_processes_snapshot(
+    metric: dict[str, Any],
+    field: str,
+    expected_count_field: str,
+    expected_count_by_type_field: str,
+    expected_rss_field: str | None = None,
+    expected_by_command_field: str | None = None,
+    expected_by_process_type_field: str | None = None,
+) -> None:
     runner = metric.get("runner", "<unknown>")
-    processes = metric.get("processes_at_peak")
+    processes = metric.get(field)
     if not isinstance(processes, list):
-        raise ValidationError(f"{runner}.processes_at_peak must be an array")
-    if len(processes) != int(metric["process_count_at_peak"]):
+        raise ValidationError(f"{runner}.{field} must be an array")
+    if len(processes) != int(metric[expected_count_field]):
         raise ValidationError(
-            f"{runner}.processes_at_peak length must equal process_count_at_peak"
+            f"{runner}.{field} length must equal {expected_count_field}"
         )
 
     rss_total = 0
@@ -274,7 +307,7 @@ def validate_processes_at_peak(metric: dict[str, Any]) -> None:
     count_by_process_type: dict[str, int] = {}
     for index, process in enumerate(processes):
         if not isinstance(process, dict):
-            raise ValidationError(f"{runner}.processes_at_peak[{index}] must be an object")
+            raise ValidationError(f"{runner}.{field}[{index}] must be an object")
         pid = process.get("pid")
         ppid = process.get("ppid")
         command = process.get("command")
@@ -282,43 +315,68 @@ def validate_processes_at_peak(metric: dict[str, Any]) -> None:
         rss_bytes = process.get("rss_bytes")
         args = process.get("args")
         if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
-            raise ValidationError(f"{runner}.processes_at_peak[{index}].pid must be > 0")
+            raise ValidationError(f"{runner}.{field}[{index}].pid must be > 0")
         if not isinstance(ppid, int) or isinstance(ppid, bool) or ppid < 0:
-            raise ValidationError(f"{runner}.processes_at_peak[{index}].ppid must be >= 0")
+            raise ValidationError(f"{runner}.{field}[{index}].ppid must be >= 0")
         if not isinstance(command, str) or not command:
             raise ValidationError(
-                f"{runner}.processes_at_peak[{index}].command must be a non-empty string"
+                f"{runner}.{field}[{index}].command must be a non-empty string"
             )
         if not isinstance(process_type, str) or not process_type:
             raise ValidationError(
-                f"{runner}.processes_at_peak[{index}].process_type must be a non-empty string"
+                f"{runner}.{field}[{index}].process_type must be a non-empty string"
             )
         if not isinstance(rss_bytes, int) or isinstance(rss_bytes, bool) or rss_bytes <= 0:
-            raise ValidationError(
-                f"{runner}.processes_at_peak[{index}].rss_bytes must be > 0"
-            )
+            raise ValidationError(f"{runner}.{field}[{index}].rss_bytes must be > 0")
         if not isinstance(args, str):
-            raise ValidationError(f"{runner}.processes_at_peak[{index}].args must be a string")
+            raise ValidationError(f"{runner}.{field}[{index}].args must be a string")
 
         rss_total += rss_bytes
         by_command[command] = by_command.get(command, 0) + rss_bytes
         by_process_type[process_type] = by_process_type.get(process_type, 0) + rss_bytes
         count_by_process_type[process_type] = count_by_process_type.get(process_type, 0) + 1
 
-    if rss_total != int(metric["max_rss_bytes"]):
-        raise ValidationError(f"{runner}.processes_at_peak rss sum must equal max_rss_bytes")
-    if dict(sorted(by_command.items())) != metric["rss_at_peak_by_command_bytes"]:
+    if expected_rss_field is not None and rss_total != int(metric[expected_rss_field]):
+        raise ValidationError(f"{runner}.{field} rss sum must equal {expected_rss_field}")
+    if (
+        expected_by_command_field is not None
+        and dict(sorted(by_command.items())) != metric[expected_by_command_field]
+    ):
         raise ValidationError(
-            f"{runner}.processes_at_peak command RSS must match rss_at_peak_by_command_bytes"
+            f"{runner}.{field} command RSS must match {expected_by_command_field}"
         )
-    if dict(sorted(by_process_type.items())) != metric["rss_at_peak_by_process_type_bytes"]:
+    if (
+        expected_by_process_type_field is not None
+        and dict(sorted(by_process_type.items())) != metric[expected_by_process_type_field]
+    ):
         raise ValidationError(
-            f"{runner}.processes_at_peak type RSS must match rss_at_peak_by_process_type_bytes"
+            f"{runner}.{field} type RSS must match {expected_by_process_type_field}"
         )
-    if dict(sorted(count_by_process_type.items())) != metric["process_count_at_peak_by_type"]:
+    if dict(sorted(count_by_process_type.items())) != metric[expected_count_by_type_field]:
         raise ValidationError(
-            f"{runner}.processes_at_peak type counts must match process_count_at_peak_by_type"
+            f"{runner}.{field} type counts must match {expected_count_by_type_field}"
         )
+
+
+def validate_processes_at_peak(metric: dict[str, Any]) -> None:
+    validate_processes_snapshot(
+        metric,
+        "processes_at_peak",
+        "process_count_at_peak",
+        "process_count_at_peak_by_type",
+        "max_rss_bytes",
+        "rss_at_peak_by_command_bytes",
+        "rss_at_peak_by_process_type_bytes",
+    )
+
+
+def validate_processes_at_max_count(metric: dict[str, Any]) -> None:
+    validate_processes_snapshot(
+        metric,
+        "processes_at_max_count",
+        "max_process_count",
+        "max_process_count_by_type",
+    )
 
 
 def validate_optional_memory_total(metric: dict[str, Any], total_field: str, map_field: str) -> None:
@@ -396,6 +454,18 @@ def validate_metric(metric: dict[str, Any], iterations: int, output_dir: Path) -
         raise ValidationError(
             f"{runner}.process_count_at_peak_by_type sum must equal process_count_at_peak"
         )
+    require_int_map(metric, "max_process_count_by_type", positive=True)
+    max_process_count_total = sum(
+        int(value) for value in metric["max_process_count_by_type"].values()
+    )
+    if max_process_count_total != int(metric["max_process_count"]):
+        raise ValidationError(
+            f"{runner}.max_process_count_by_type sum must equal max_process_count"
+        )
+    if "processes_at_max_count" in metric:
+        validate_processes_at_max_count(metric)
+    if int(metric["max_process_count"]) < int(metric["process_count_at_peak"]):
+        raise ValidationError(f"{runner}.max_process_count must be >= process_count_at_peak")
     validate_processes_at_peak(metric)
     if not 1 <= int(metric["iteration"]) <= iterations:
         raise ValidationError(f"{runner}.iteration is outside expected range: {metric['iteration']}")
@@ -414,6 +484,11 @@ def validate_metric(metric: dict[str, Any], iterations: int, output_dir: Path) -
         if metric.get("tempo_engine") != "cdp":
             raise ValidationError(
                 f"tempo-cdp-agent.tempo_engine must be cdp, got {metric.get('tempo_engine')!r}"
+            )
+        if metric.get("tempo_runtime_flavor") not in TEMPO_RUNTIME_FLAVORS:
+            raise ValidationError(
+                "tempo-cdp-agent.tempo_runtime_flavor must be one of "
+                f"{sorted(TEMPO_RUNTIME_FLAVORS)}, got {metric.get('tempo_runtime_flavor')!r}"
             )
         require_int(metric, "max_compact_observation_bytes", positive=True)
         require_int(metric, "max_compact_observation_tokens", positive=True)
@@ -693,11 +768,14 @@ def expected_gap_report(metrics: list[dict[str, Any]], summary: dict[str, Any]) 
         ("steady_state_wall_clock_ms_p95", "lower_is_better", runners),
         ("max_rss_bytes_p95", "lower_is_better", runners),
         ("browser_rss_bytes_p95", "lower_is_better", runners),
+        ("browser_peak_rss_bytes_p95", "lower_is_better", runners),
         ("max_pss_bytes_p95", "lower_is_better", runners),
         ("browser_pss_bytes_p95", "lower_is_better", runners),
+        ("browser_peak_pss_bytes_p95", "lower_is_better", runners),
         ("max_uss_bytes_p95", "lower_is_better", runners),
         ("browser_uss_bytes_p95", "lower_is_better", runners),
-        ("process_count_at_peak_p95", "lower_is_better", runners),
+        ("browser_peak_uss_bytes_p95", "lower_is_better", runners),
+        ("max_process_count_p95", "lower_is_better", runners),
         ("browser_documents_p95", "lower_is_better", runners),
         ("browser_frames_p95", "lower_is_better", runners),
         ("browser_js_event_listeners_p95", "lower_is_better", runners),
@@ -714,9 +792,6 @@ def expected_gap_report(metrics: list[dict[str, Any]], summary: dict[str, Any]) 
         ("web_dom_content_loaded_ms_p95", "lower_is_better", runners),
         ("web_load_event_ms_p95", "lower_is_better", runners),
         ("web_response_end_ms_p95", "lower_is_better", runners),
-        ("web_resource_count_p95", "lower_is_better", runners),
-        ("web_resource_transfer_size_bytes_p95", "lower_is_better", runners),
-        ("web_resource_decoded_body_size_bytes_p95", "lower_is_better", runners),
         ("web_first_paint_ms_p95", "lower_is_better", runners),
         ("web_first_contentful_paint_ms_p95", "lower_is_better", runners),
         ("web_long_task_count_p95", "lower_is_better", runners),
@@ -758,15 +833,9 @@ def expected_gap_report(metrics: list[dict[str, Any]], summary: dict[str, Any]) 
             "lower_is_better",
             sorted(runner for runner in runners if runner in AGENT_STYLE_RUNNERS),
         ),
-        ("cpu_time_ms_p95", "lower_is_better", runners),
     ]
-    ranked_browser_fields = set(BROWSER_PERFORMANCE_ROW_FIELDS.values())
-    for metric_name in browser_performance_metric_names(metrics):
-        field_name = browser_performance_metric_row_field(metric_name)
-        if field_name not in ranked_browser_fields:
-            category_specs.append((field_name, "lower_is_better", runners))
     ranked_category_fields = {name for name, _direction, _runners in category_specs}
-    for field_name in WEB_PERFORMANCE_ROW_FIELDS.values():
+    for field_name in RANKED_WEB_PERFORMANCE_ROW_FIELDS:
         if field_name not in ranked_category_fields:
             category_specs.append((field_name, "lower_is_better", runners))
             ranked_category_fields.add(field_name)
@@ -858,8 +927,10 @@ def expected_gap_report(metrics: list[dict[str, Any]], summary: dict[str, Any]) 
             "cpu_time_ms_p95 is row-level only until every runner uses the same resource-accounting scope.",
             "cold_start_wall_clock_ms reports iteration 1; steady_state_wall_clock_ms_p95 ranks iteration 2+ only and is omitted for one-iteration smoke artifacts.",
             "CDP Performance.getMetrics fields are required and ranked for every runner in this CDP-backed benchmark.",
-            "Known CDP runtime fields use stable browser_* category names; any additional numeric Performance.getMetrics values are preserved and ranked as browser_cdp_* categories.",
+            "Known CDP runtime fields use stable browser_* category names; any additional numeric Performance.getMetrics values are preserved as browser_cdp_* row fields but not ranked until promoted to the stable contract.",
             "web_* categories come from the browser Performance Timeline APIs and are required for every runner, including Tempo.",
+            "Web resource count and byte fields are preserved as parity/integrity metrics, not ranked lower-is-better optimization categories.",
+            "browser_rss_bytes_p95/browser_pss_bytes_p95/browser_uss_bytes_p95 report Chrome memory at the process-tree RSS/PSS/USS peak; browser_peak_* fields report Chrome process-type peaks even when they occur at a different sample.",
             "Positive deltas mean Tempo is behind that comparison target; negative deltas mean Tempo is ahead.",
         ],
         "rows": rows,
@@ -985,6 +1056,13 @@ def comparison_row(
             [browser_rss_bytes(metric) for metric in runner_metrics],
             0.95,
         ),
+        "browser_peak_rss_bytes_p95": percentile(
+            [
+                browser_memory_bytes(metric, "peak_rss_by_process_type_bytes")
+                for metric in runner_metrics
+            ],
+            0.95,
+        ),
         "max_pss_bytes_p95": optional_metric_percentile(
             runner_metrics,
             "max_pss_bytes",
@@ -993,6 +1071,13 @@ def comparison_row(
         "browser_pss_bytes_p95": optional_percentile(
             [
                 browser_memory_bytes(metric, "pss_at_peak_by_process_type_bytes")
+                for metric in runner_metrics
+            ],
+            0.95,
+        ),
+        "browser_peak_pss_bytes_p95": optional_percentile(
+            [
+                browser_memory_bytes(metric, "peak_pss_by_process_type_bytes")
                 for metric in runner_metrics
             ],
             0.95,
@@ -1009,8 +1094,22 @@ def comparison_row(
             ],
             0.95,
         ),
+        "browser_peak_uss_bytes_p95": optional_percentile(
+            [
+                browser_memory_bytes(metric, "peak_uss_by_process_type_bytes")
+                for metric in runner_metrics
+            ],
+            0.95,
+        ),
         "process_count_at_peak_p95": percentile(
             [int(metric.get("process_count_at_peak", 0)) for metric in runner_metrics],
+            0.95,
+        ),
+        "max_process_count_p95": percentile(
+            [
+                int(metric.get("max_process_count", metric.get("process_count_at_peak", 0)))
+                for metric in runner_metrics
+            ],
             0.95,
         ),
         "web_performance_metrics_available": all(
@@ -1380,6 +1479,10 @@ def validate_tempo_derived_artifacts(
     run_report = load_json(run_report_path)
     if run_report.get("engine") != "cdp":
         raise ValidationError("tempo-run.json engine must be cdp")
+    if run_report.get("runtime_flavor") not in TEMPO_RUNTIME_FLAVORS:
+        raise ValidationError("tempo-run.json runtime_flavor must be multi-thread or current-thread")
+    if run_report.get("runtime_flavor") != tempo.get("tempo_runtime_flavor"):
+        raise ValidationError("tempo-run.json runtime_flavor must match tempo metric")
     if run_report.get("status", {}).get("state") != "completed":
         raise ValidationError("tempo-run.json status.state must be completed")
     if int(run_report.get("actions_completed", -1)) != int(tempo["step_count"]):

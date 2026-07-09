@@ -119,6 +119,11 @@ impl UrlPolicy {
         }
     }
 
+    /// Whether this policy intentionally skips URL and resolved-socket blocking.
+    pub const fn is_allow_all(&self) -> bool {
+        matches!(self.mode, UrlPolicyMode::AllowAll)
+    }
+
     /// Evaluate a target URL without issuing network traffic.
     pub fn check(&self, url: &str) -> UrlPolicyVerdict {
         if self.mode == UrlPolicyMode::AllowAll {
@@ -4983,6 +4988,9 @@ mod tests {
 
     #[test]
     fn url_policy_allow_all_skips_resolved_socket_guard() -> Result<(), UrlBlocked> {
+        assert!(UrlPolicy::allow_all().is_allow_all());
+        assert!(!UrlPolicy::block_private().is_allow_all());
+
         UrlPolicy::allow_all().enforce_resolved_ip(
             "file:///etc/passwd",
             IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
