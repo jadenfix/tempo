@@ -91,10 +91,10 @@ esac
 reject_unsafe_host_env
 
 case "$BENCH_PROFILE" in
-  default | lifecycle | key-events | insert-text | no-incognito | cache | desktop | runtime | no-forced-compositor | headless-flag | min-process | trusted-policy | trusted-parity | trusted-browser-default | trusted-loopback-direct | trusted-min-process | agent-automation | all) ;;
+  default | lifecycle | key-events | insert-text | no-incognito | cache | desktop | runtime | no-forced-compositor | headless-flag | min-process | trusted-policy | trusted-parity | trusted-browser-default | trusted-loopback-direct | trusted-min-process | trusted-min-process-desktop | agent-automation | all) ;;
   *)
     echo "unsupported TEMPO_LINUX_AGENT_BENCH_PROFILE: ${BENCH_PROFILE}" >&2
-    echo "supported values: default, lifecycle, key-events, insert-text, no-incognito, cache, desktop, runtime, no-forced-compositor, headless-flag, min-process, trusted-policy, trusted-parity, trusted-browser-default, trusted-loopback-direct, trusted-min-process, agent-automation, all" >&2
+    echo "supported values: default, lifecycle, key-events, insert-text, no-incognito, cache, desktop, runtime, no-forced-compositor, headless-flag, min-process, trusted-policy, trusted-parity, trusted-browser-default, trusted-loopback-direct, trusted-min-process, trusted-min-process-desktop, agent-automation, all" >&2
     exit 2
     ;;
 esac
@@ -280,6 +280,14 @@ case "$BENCH_PROFILE" in
       -e TEMPO_CDP_BENCH_TRUSTED_POLICY=1
       -e TEMPO_CDP_BENCH_TRUSTED_LOOPBACK_DIRECT=1
       -e TEMPO_CDP_BENCH_MIN_PROCESS=1
+    )
+    ;;
+  trusted-min-process-desktop)
+    COMMON_ENV+=(
+      -e TEMPO_CDP_BENCH_TRUSTED_POLICY=1
+      -e TEMPO_CDP_BENCH_TRUSTED_LOOPBACK_DIRECT=1
+      -e TEMPO_CDP_BENCH_MIN_PROCESS=1
+      -e TEMPO_CDP_BENCH_SUPPRESS_DESKTOP=1
     )
     ;;
   agent-automation | all)

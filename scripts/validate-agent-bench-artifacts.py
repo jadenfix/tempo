@@ -758,11 +758,13 @@ def validate_metric(metric: dict[str, Any], iterations: int, output_dir: Path) -
             "trusted-browser-default",
             "trusted-loopback-direct",
             "trusted-min-process",
+            "trusted-min-process-desktop",
         }:
             raise ValidationError(
                 "tempo-cdp-agent trusted-settled request policy rows must use "
                 "cdp_benchmark_profile='trusted-policy', 'trusted-parity', "
-                "'trusted-browser-default', 'trusted-loopback-direct', or 'trusted-min-process'"
+                "'trusted-browser-default', 'trusted-loopback-direct', "
+                "'trusted-min-process', or 'trusted-min-process-desktop'"
             )
         if benchmark_profile == "trusted-parity":
             expected_trusted_parity = {
@@ -802,23 +804,26 @@ def validate_metric(metric: dict[str, Any], iterations: int, output_dir: Path) -
                         f"tempo-cdp-agent trusted-loopback-direct rows must set {field}="
                         f"{expected_value!r}, got {actual_value!r}"
                     )
-        elif benchmark_profile == "trusted-min-process":
+        elif benchmark_profile in {"trusted-min-process", "trusted-min-process-desktop"}:
             expected_trusted_min_process = {
                 "cdp_request_policy_grace": "trusted-settled",
                 "cdp_request_policy_transport": "direct-loopback",
                 "cdp_launch_profile": "bench-min-process",
             }
+            if benchmark_profile == "trusted-min-process-desktop":
+                expected_trusted_min_process["cdp_desktop_integration"] = "suppressed"
             for field, expected_value in expected_trusted_min_process.items():
                 actual_value = metric.get(field)
                 if actual_value != expected_value:
                     raise ValidationError(
-                        f"tempo-cdp-agent trusted-min-process rows must set {field}="
+                        f"tempo-cdp-agent {benchmark_profile} rows must set {field}="
                         f"{expected_value!r}, got {actual_value!r}"
                     )
         elif metric.get("cdp_request_policy_transport") == "direct-loopback":
             raise ValidationError(
                 "tempo-cdp-agent direct-loopback transport rows must use "
-                "cdp_benchmark_profile='trusted-loopback-direct' or 'trusted-min-process'"
+                "cdp_benchmark_profile='trusted-loopback-direct', "
+                "'trusted-min-process', or 'trusted-min-process-desktop'"
             )
         compositor_stages = metric.get("cdp_compositor_stages")
         if compositor_stages is not None and compositor_stages not in {

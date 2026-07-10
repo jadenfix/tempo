@@ -155,6 +155,23 @@ require(
     and 'TEMPO_CDP_BENCH_MIN_PROCESS=1' in trusted_min_process,
     'trusted-min-process profile must combine direct loopback with min-process launch flags',
 )
+trusted_min_process_desktop_match = re.search(
+    r'^\s*trusted-min-process-desktop\)\n(?P<body>.*?)\n\s*;;',
+    text,
+    flags=re.M | re.S,
+)
+require(
+    trusted_min_process_desktop_match is not None,
+    'Linux agent gate must wire trusted-min-process-desktop profile',
+)
+trusted_min_process_desktop = trusted_min_process_desktop_match.group('body')
+require(
+    'TEMPO_CDP_BENCH_TRUSTED_POLICY=1' in trusted_min_process_desktop
+    and 'TEMPO_CDP_BENCH_TRUSTED_LOOPBACK_DIRECT=1' in trusted_min_process_desktop
+    and 'TEMPO_CDP_BENCH_MIN_PROCESS=1' in trusted_min_process_desktop
+    and 'TEMPO_CDP_BENCH_SUPPRESS_DESKTOP=1' in trusted_min_process_desktop,
+    'trusted-min-process-desktop profile must combine direct loopback, min-process launch flags, and desktop suppression',
+)
 require(
     'TEMPO_LINUX_AGENT_DOCKER_CACHE_BACKEND' in text
     and 'docker buildx build' in text
