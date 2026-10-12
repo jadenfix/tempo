@@ -51,9 +51,8 @@ jobs:
           arguments: >
             --all-features
             --locked
+            --config deny-servo.toml
           manifest-path: crates/tempo-engine-servo/Cargo.toml
           command: >
-            check
-            --config deny-servo.toml
-            advisories bans sources licenses
+            check advisories bans sources licenses
           rust-version: "1.96.1"
